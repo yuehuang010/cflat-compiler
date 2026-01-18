@@ -1,0 +1,16 @@
+int foobar = 0;
+double foocat;
+
+struct smallerCat;
+
+struct favoriteCat {
+    int count;
+    int count1 = 1;
+    int count2 = 2;
+};
+
+int main(int argc, char** argv) {
+    int local = 11;
+    foobar = 10;
+    return 0;
+}
