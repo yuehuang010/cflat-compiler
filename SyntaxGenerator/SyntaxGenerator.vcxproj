@@ -111,7 +111,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(VcpkgRoot)\installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir)\Generated;$(VcpkgRoot)\installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -127,7 +127,7 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(VcpkgRoot)\installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir)\Generated;$(VcpkgRoot)\installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -135,27 +135,25 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="CBaseListener.cpp" />
-    <ClCompile Include="CLexer.cpp" />
-    <ClCompile Include="CListener.cpp" />
-    <ClCompile Include="CParser.cpp" />
     <ClCompile Include="SyntaxGenerator.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="C.interp" />
-    <None Include="C.tokens" />
-    <None Include="CLexer.interp" />
-    <None Include="CLexer.tokens" />
+    <CustomBuild Include="C.g4">
+      <FileType>Document</FileType>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\antlr4.exe -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\antlr4.exe -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ClCompile</OutputItemType>
+      <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Release|x64'">ClCompile</OutputItemType>
+    </CustomBuild>
+    <None Include="antlr4.exe" />
     <None Include="testfile.cflat">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
     </None>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="CBaseListener.h" />
-    <ClInclude Include="CLexer.h" />
-    <ClInclude Include="CListener.h" />
-    <ClInclude Include="CParser.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

@@ -18,38 +18,12 @@
     <ClCompile Include="SyntaxGenerator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="CBaseListener.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="CLexer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="CListener.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="CParser.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="C.interp" />
-    <None Include="C.tokens" />
-    <None Include="CLexer.interp" />
-    <None Include="CLexer.tokens" />
     <None Include="testfile.cflat" />
+    <None Include="antlr4.exe" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="CBaseListener.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="CLexer.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="CListener.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="CParser.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
+    <CustomBuild Include="C.g4" />
   </ItemGroup>
 </Project>
