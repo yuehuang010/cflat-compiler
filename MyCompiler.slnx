@@ -4,5 +4,4 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="MyCompiler/MyCompiler.vcxproj" Id="b1474897-ea2c-420d-84a5-c2b4b59cad24" />
-  <Project Path="SyntaxGenerator/SyntaxGenerator.vcxproj" Id="1517f86f-660f-4bc4-9d59-d591dd4b5688" />
 </Solution>

@@ -18,5 +18,21 @@
     <ClCompile Include="MyCompiler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MyCompilerLLVM.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MyListener.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="MyCompilerLLVM.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="testfile.cflat" />
+    <None Include="antlr4.exe" />
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C.g4" />
   </ItemGroup>
 </Project>
