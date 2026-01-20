@@ -9,6 +9,10 @@ struct favoriteCat {
     int count2 = 2;
 };
 
+class smallCat {
+    double tiny;
+};
+
 int main(int argc, char** argv) {
     int local = 11;
     foobar = 10;

@@ -203,20 +203,19 @@ typeSpecifier
     | 'signed'
     | 'unsigned'
     | 'bool'
-    | structOrUnionSpecifier
-    | enumSpecifier
-    // | typedefName
-    | 'typeof' '(' constantExpression ')' // GCC extension
+    | structClassUnion
+    | 'enum'
     ;
 
 structOrUnionSpecifier
-    : structOrUnion Identifier '{' structDeclarationList '}'
-    | structOrUnion Identifier
+    : structClassUnion Identifier '{' structDeclarationList '}'
+    | structClassUnion Identifier
     ;
 
-structOrUnion
+structClassUnion
     : 'struct'
     | 'union'
+    | 'class'
     ;
 
 structDeclarationList
@@ -447,13 +446,18 @@ translationUnit
     ;
 
 externalDeclaration
-    : functionDefinition
-    | declaration
+    : declaration
+    | functionDefinition
+    | structClassUnionDefinition
     | ';' // stray ;
     ;
 
 functionDefinition
-    : declarationSpecifiers? declarator declarationList? compoundStatement
+    : declarationSpecifiers? directDeclarator '(' parameterTypeList ')' declarationList? compoundStatement
+    ;
+
+structClassUnionDefinition
+    : declarationSpecifiers? directDeclarator '{' declarationList '}' ';'
     ;
 
 declarationList

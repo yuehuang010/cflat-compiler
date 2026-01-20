@@ -20,26 +20,49 @@ private:
 		return false;
 	}
 
+	bool isStructClassUnion(antlr4::ParserRuleContext* ctx) {
+		if (ctx->getRuleIndex() == CParser::RuleStructClassUnionDefinition)
+			return true;
+		return false;
+	}
+
 	std::string getFunctionName(CParser::FunctionDefinitionContext* ctx) {
 		std::string name;
-		auto decl = ctx->declarator();
-		auto directDecl = decl->directDeclarator();
+		auto directDecl1 = ctx->directDeclarator();
+		auto directDecl2 = directDecl1->directDeclarator();
 
-		auto directDecl2 = directDecl->directDeclarator();
 		if (directDecl2 != nullptr)
 			name = directDecl2->getText();
 		else
-			name = directDecl->getText();
+			name = directDecl1->getText();
 
 		return name;
 	}
 
-	std::string getParentFullName(antlr4::ParserRuleContext* ctx) {
+	std::string getStructClassUnionName(CParser::StructClassUnionDefinitionContext* ctx) {
+		std::string name;
+		auto directDecl1 = ctx->directDeclarator();
+		auto directDecl2 = ctx->directDeclarator();
+
+		if (directDecl2 != nullptr)
+			name = directDecl2->getText();
+		else
+			name = directDecl1->getText();
+
+		return name;
+	}
+
+	std::string getScopeName(antlr4::ParserRuleContext* ctx) {
 		std::string name;
 
 		while (ctx) {
 			if (isFunctionOrNamespace(ctx)) {
 				auto funcName = getFunctionName((CParser::FunctionDefinitionContext*)ctx);
+				name += "::";
+				name += funcName;
+			}
+			else if (isStructClassUnion(ctx)) {
+				auto funcName = getStructClassUnionName((CParser::StructClassUnionDefinitionContext*)ctx);
 				name += "::";
 				name += funcName;
 			}
@@ -58,33 +81,48 @@ private:
 
 public:
 	void enterDeclaration(CParser::DeclarationContext* ctx) override {
-		std::cout << "enterDeclaration: " << ctx->getText() << std::endl;
+		// std::cout << "enterDeclaration: " << ctx->getText() << std::endl;
 		auto list = ctx->initDeclaratorList();
 		auto spec = ctx->declarationSpecifiers();
-		if (!list || list->isEmpty()) {
+		std::string specText = "";
 
-			if (spec) {
-				std::cout << "spec: " << spec->getText() << std::endl;
-			}
-			return;
+		if (spec) {
+			specText = spec->getText();
 		}
 
 		auto declarVec = list->initDeclarator();
 
-		auto fullname = getParentFullName(ctx);
+		auto fullname = getScopeName(ctx);
 		for (auto decl : declarVec) {
 			auto declarator = decl->declarator();
 			auto direct = declarator->directDeclarator();
 			auto text = fullname + "::" + direct->getText();
 			declaration.push_back(text);
-			std::cout << "Declaration: " << text << "\n";
+			// std::cout << "declarator: " << specText << " " << text << "\n";
 		}
 	}
 	void exitDeclaration(CParser::DeclarationContext* ctx) override {
 		// std::cout << "exitDeclaration: " << ctx->getText() << "\n";
 	}
 	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override {
-		// std::cout << "enterExternalDeclaration: " << ctx->getText() << "\n";
+		auto decl = ctx->declaration();
+		auto func = ctx->functionDefinition();
+		auto dataStruct = ctx->structClassUnionDefinition();
+		std::string empty;
+
+		std::string declText = decl == nullptr ? "" : "declaration";
+		std::string funcText = func == nullptr ? "" : "function";
+		std::string dataStructText = dataStruct == nullptr ? "" : "struct";
+
+		//std::cout << "enterExternalDeclaration: " << ctx->getText()
+		//	<< (decl == nullptr) ? empty : decl->getText()
+		//	<< (func == nullptr) ? empty : func->getText()
+		//	<< "\n";
+		std::cout << "enterExternalDeclaration: " << ctx->getText() << " : "
+			<< declText
+			<< funcText
+			<< dataStructText
+			<< "\n";
 	}
 	void exitExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override {
 		// std::cout << "exitExternalDeclaration: " << ctx->getText() << "\n";
@@ -123,7 +161,7 @@ bool Parse(std::ifstream& stream) {
 	//}
 
 	auto computeUnit = parser.compilationUnit();
-	// std::cout << "\nCompilation Unit\n";
+	// std::cout << "\nCompilation Unit\n" << computeUnit->toInfoString(&parser);
 
 	MyListener* mylistener = new MyListener();
 	auto walker = antlr4::tree::ParseTreeWalker();
@@ -134,7 +172,6 @@ bool Parse(std::ifstream& stream) {
 
 	return true;
 }
-
 
 int main() {
 
