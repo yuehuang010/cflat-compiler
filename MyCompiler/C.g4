@@ -63,7 +63,7 @@ argumentExpressionList
     ;
 
 unaryExpression
-    : ('++' | '--' | 'sizeof')* (
+    : ('sizeof')* (
         postfixExpression
         | unaryOperator castExpression
         | ('sizeof' | '_Alignof') '(' typeName ')'
@@ -159,7 +159,7 @@ constantExpression
     ;
 
 declaration
-    : declarationSpecifiers initDeclaratorList? ';'
+    : declarationSpecifiers initDeclaratorList ';'
     | staticAssertDeclaration
     ;
 
@@ -169,7 +169,7 @@ declarationSpecifiers
 
 declarationSpecifier
     : storageClassSpecifier
-    | typeSpecifier
+    | typeSpecifier pointer?
     | typeQualifier
     | functionSpecifier
     | alignmentSpecifier
@@ -273,23 +273,23 @@ alignmentSpecifier
     ;
 
 declarator
-    : pointer? directDeclarator
-    ;
-
-directDeclarator
-    : Identifier
-    | '(' declarator ')'
+    : directDeclarator
     | directDeclarator '[' typeQualifierList? assignmentExpression? ']'
     | directDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
     | directDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
     | directDeclarator '[' typeQualifierList? '*' ']'
     | directDeclarator '(' parameterTypeList ')'
     | directDeclarator '(' identifierList? ')'
+    ;
+
+directDeclarator
+    : Identifier
     | Identifier ':' DigitSequence         // bit field
+    | '(' declarator ')'
     ;
 
 pointer
-    : (('*' | '^') typeQualifierList?)+ // ^ - Blocks language extension
+    : ('*' typeQualifierList?)+ // ^ - Blocks language extension
     ;
 
 typeQualifierList
@@ -453,7 +453,7 @@ externalDeclaration
     ;
 
 functionDefinition
-    : declarationSpecifiers? directDeclarator '(' parameterTypeList ')' declarationList? compoundStatement
+    : declarationSpecifiers? directDeclarator '(' parameterTypeList? ')' compoundStatement
     ;
 
 structClassUnionDefinition

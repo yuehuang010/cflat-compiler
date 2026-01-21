@@ -10,6 +10,6 @@ int main()
 	std::cout << "MyCompilerLLVM\n";
 
 	MyCompilerLLVM compiler;
-	compiler.Compile("testfile.cflat");
+	compiler.Compile("testfile2.cflat");
 	std::cout << "Done.\n";
 }

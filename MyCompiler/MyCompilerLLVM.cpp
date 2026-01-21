@@ -34,9 +34,6 @@ bool MyCompilerLLVM::Compile(std::string filename)
 
 	stream.close();
 
-	// compile to IR
-	// IR to bitcode.
-	GenerateIR();
 	SaveToFile(".\\out.ll");
 
 	return true;
