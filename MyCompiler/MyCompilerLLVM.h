@@ -8,8 +8,6 @@
 #include <llvm\IR\Verifier.h>
 #include <antlr4-runtime.h>
 
-
-
 class MyCompilerLLVM
 {
 public:
@@ -20,14 +18,30 @@ public:
 		Subtract,
 		Multiply,
 		Divide,
+		Equal, // ==
+		NotEqual, // !=
+		Greater, // >
+		GreaterEqual, // >=
+		Less, // <
+		LessEqual, // <=
+	};
+
+	class StackState
+	{
+	public:
+		std::unordered_map<std::string, llvm::AllocaInst*> namedVariable;
+		llvm::BasicBlock* continueBlock = nullptr; // continue;
+		llvm::BasicBlock* resumeBlock = nullptr; // break;
 	};
 
 private:
 	std::unique_ptr<llvm::IRBuilder<>> builder;
 	std::unique_ptr<llvm::Module> module;
 	std::unique_ptr<llvm::LLVMContext> context;
-	std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> stackNamedVariable;
+	// std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> stackNamedVariable;
+	std::vector<StackState> stackNamedVariable;
 	std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
+	llvm::Function* currentFunction;
 
 private:
 	// Create Function Proto or Signature
@@ -46,11 +60,7 @@ private:
 		auto entry = CreateBasicBlock("entry", fn);
 		builder->SetInsertPoint(entry);
 		stackNamedVariable.emplace_back();
-	}
-
-	llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr)
-	{
-		return llvm::BasicBlock::Create(*context, name, fn);
+		currentFunction = fn;
 	}
 
 	llvm::Value* gen() { return builder->getInt32(43); }
@@ -68,6 +78,23 @@ private:
 		llvm::raw_fd_ostream outLL(filename, errorCode);
 		module->print(outLL, nullptr);
 	}
+	operation ParseOperation(std::string operationText)
+	{
+		if (operationText == "+") { return operation::Add; }
+		else if (operationText == "*") { return operation::Multiply; }
+		else if (operationText == "-") { return operation::Subtract; }
+		else if (operationText == "/") { return operation::Divide; }
+		else if (operationText == "==") { return operation::Equal; }
+		else if (operationText == "!=") { return operation::NotEqual; }
+		else if (operationText == ">") { return operation::Greater; }
+		else if (operationText == ">=") { return operation::GreaterEqual; }
+		else if (operationText == "<") { return operation::Less; }
+		else if (operationText == "<=") { return operation::LessEqual; }
+
+		__debugbreak();
+		return operation::None;
+	}
+
 
 public:
 	MyCompilerLLVM() { Init(); }
@@ -99,7 +126,7 @@ public:
 	llvm::AllocaInst* CreateVariable(std::string name, std::string typeName)
 	{
 		auto alloc = builder->CreateAlloca(GetType(typeName), nullptr, name);
-		stackNamedVariable.back()[name] = alloc;
+		stackNamedVariable.back().namedVariable[name] = alloc;
 		return alloc;
 	}
 
@@ -213,10 +240,12 @@ public:
 		return builder->CreateGlobalStringPtr(text, name);
 	}
 
-	llvm::Value* CreateOperation(operation op, llvm::Value* left, llvm::Value* right)
+	llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
 	{
 		if (left == nullptr)
 			return right;
+
+		operation op = ParseOperation(oper);
 
 		// NSW (No Signed Wrap) and NUS(No Unsigned Wrap)
 		switch (op)
@@ -233,10 +262,71 @@ public:
 		case operation::Divide: {
 			return builder->CreateSDiv(left, right);
 		}
+		case operation::Equal: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
+		}
+		case operation::NotEqual: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
+		}
+		case operation::Greater: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_SGT, left, right);
+		}
+		case operation::GreaterEqual: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_SGE, left, right);
+		}
+		case operation::Less: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_SLT, left, right);
+		}
+		case operation::LessEqual: {
+			return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
+		}
 		}
 
 		__debugbreak();
 		return right;
+	}
+
+	llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr)
+	{
+		if (fn == nullptr)
+			fn = currentFunction;
+
+		return llvm::BasicBlock::Create(*context, name, fn);
+	}
+
+	llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
+	{
+		auto branchInst = builder->CreateCondBr(cond, trueBlock, falseBlock);
+		builder->SetInsertPoint(trueBlock);
+		return branchInst;
+	}
+
+	/// <summary>
+	/// Exit the current BasicBlock and then jump to resumeBlock.
+	/// </summary>
+	/// <param name="resumeBlock"></param>
+	/// <returns></returns>
+	llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack = true)
+	{
+		if (exitBlackStack)
+			stackNamedVariable.pop_back();
+
+		if (resumeBlock)
+			return builder->CreateBr(resumeBlock);
+
+		return nullptr;
+	}
+
+	void InitializeBlock(llvm::BasicBlock* block, bool enterBlockStack = true, llvm::BasicBlock* continueBlock = nullptr, llvm::BasicBlock* resumeBlock = nullptr)
+	{
+		if (enterBlockStack)
+		{
+			auto& stack = stackNamedVariable.emplace_back();
+			stack.continueBlock = continueBlock;
+			stack.resumeBlock = resumeBlock;
+		}
+
+		builder->SetInsertPoint(block);
 	}
 
 	void CreateFunctionDeclaration(std::string name, llvm::FunctionType* functionType = nullptr)
@@ -244,17 +334,17 @@ public:
 		module->getOrInsertFunction(name, functionType);
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string name, llvm::FunctionType* returnType = nullptr)
+	llvm::Function* CreateFunctionDefinition(std::string name, llvm::FunctionType* functionType = nullptr)
 	{
 		auto fn = module->getFunction(name);
-		if (returnType == nullptr)
+		if (functionType == nullptr)
 		{
-			returnType = llvm::FunctionType::get(builder->getVoidTy(), false);
+			functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
 		}
 
 		if (fn == nullptr)
 		{
-			fn = createFunctionProto(name, returnType);
+			fn = createFunctionProto(name, functionType);
 		}
 
 		createFunctionBlock(fn);
@@ -293,11 +383,15 @@ public:
 
 	llvm::AllocaInst* GetLocalVariable(std::string name)
 	{
-		auto lastBlock = stackNamedVariable.back();
-		auto result = lastBlock.find(name);
-		if (result != lastBlock.end())
+		for (auto stackframe = stackNamedVariable.rbegin(); stackframe != stackNamedVariable.rend(); ++stackframe)
 		{
-			return result->second;
+			auto nameVal = stackframe->namedVariable;
+			auto result = nameVal.find(name);
+
+			if (result != nameVal.end())
+			{
+				return result->second;
+			}
 		}
 
 		return nullptr;
@@ -319,11 +413,27 @@ public:
 		return builder->CreateCall(func, arg);
 	}
 
-	llvm::Value* CreateReturnCall(llvm::Value* value)
+	void CreateReturnCall(llvm::Value* value)
 	{
-		auto result = builder->CreateRet(value);
-		stackNamedVariable.pop_back();
-		return result;
+		builder->CreateRet(value);
+	}
+
+	void CreateBreakCall()
+	{
+		auto continueBlock = stackNamedVariable.back().continueBlock;
+		if (continueBlock)
+		{
+			auto result = builder->CreateBr(continueBlock);
+		}
+	}
+
+	void CreateContinueCall()
+	{
+		auto continueBlock = stackNamedVariable.back().continueBlock;
+		if (continueBlock)
+		{
+			auto result = builder->CreateBr(continueBlock);
+		}
 	}
 
 	bool Compile(std::string filename);

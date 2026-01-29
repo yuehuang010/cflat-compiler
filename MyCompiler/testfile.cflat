@@ -18,15 +18,36 @@ int myfunction(int argc) {
     return var;
 }
 
+
+int testIfElseStatement() {
+    int count = 10;
+    
+    if (count == 10)
+    {
+        count = 1;
+    }
+    else
+    {
+        count = 2;
+    }
+
+    if (count == 1)
+    {
+        count == 11;
+    }
+
+    return count;
+}
+
+
 int main(int argc, char** argv) {
     int myVar1 = 4 + 6;
     int myVar2 = 11;
     int myVar3;
     myVar3 = myVar1 + 12 + myVar2;
-    myVar3 = 100;
     foobar = 10;
 
-    printf("Hello World");
+    printf("Hello World %d", myVar3);
 
-    return myVar3;
+    return 0;
 }

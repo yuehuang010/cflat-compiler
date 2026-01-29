@@ -12,4 +12,6 @@ int main()
 	MyCompilerLLVM compiler;
 	compiler.Compile("testfile2.cflat");
 	std::cout << "Done.\n";
+
+	// Run C:\source\vcpkg\installed\x64-windows\tools\llvm\lli.exe out.ll
 }

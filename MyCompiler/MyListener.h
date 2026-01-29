@@ -146,49 +146,163 @@ public:
 			auto returnType = this->getFunctionReturnType(func);
 			CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
 			auto params = this->ParseParamaterTypeList(paramTypeList);
-			auto ft = GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr);
-			auto fn = this->compilerLLVM->CreateFunctionDefinition(name, ft);
-
-			auto blockItems = func->compoundStatement()->blockItemList()->blockItem();
+			auto fn = this->compilerLLVM->CreateFunctionDefinition(name, GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
 
 			global_scope = false;
+			this->compilerLLVM->InitializeBlock(&fn->front(), true, &fn->back(), &fn->back());
 
-			for (const auto& blockItem : blockItems)
-			{
-				auto decl = blockItem->declaration();
-				auto statement = blockItem->statement();
+			auto blockItemList = func->compoundStatement()->blockItemList();
+			ParseBlockItemList(blockItemList);
 
-				if (decl != nullptr)
-				{
-					this->ParseDeclaration(decl);
-				}
-				else if (statement != nullptr)
-				{
-					std::cout << statement->getText() << std::endl;
-					auto jump = statement->jumpStatement();
-					auto expressStatement = statement->expressionStatement();
-					if (jump != nullptr)
-					{
-						if (jump->Return())
-						{
-							auto express = jump->expression();
-							auto right = ParseExpression(express);
-							this->compilerLLVM->CreateReturnCall(right);
-						}
-					}
-					else if (expressStatement != nullptr)
-					{
-						auto express = expressStatement->expression();
-						if (express != nullptr)
-						{
-							ParseExpression(express);
-						}
-					}
-				}
-			}
+			// Pop the stack
+			this->compilerLLVM->CreateBlockBreak(nullptr);
 
 			global_scope = true;
 		}
+	}
+
+	void ParseBlockItemList(CParser::BlockItemListContext* ctx)
+	{
+		auto blockItems = ctx->blockItem();
+
+		for (const auto& blockItem : blockItems)
+		{
+			auto decl = blockItem->declaration();
+			auto statement = blockItem->statement();
+
+			if (decl != nullptr)
+			{
+				this->ParseDeclaration(decl);
+			}
+			else if (statement != nullptr)
+			{
+				ParseStatement(statement);
+			}
+		}
+	}
+
+	void ParseStatement(CParser::StatementContext* statement)
+	{
+		auto jump = statement->jumpStatement();
+		auto expressStatement = statement->expressionStatement();
+		auto iterationStatement = statement->iterationStatement();
+		auto selectionStatement = statement->selectionStatement();
+		auto compoundStatement = statement->compoundStatement();
+
+		if (jump != nullptr)
+		{
+			if (jump->Return())
+			{
+				auto express = jump->expression();
+				auto right = ParseExpression(express);
+				this->compilerLLVM->CreateReturnCall(right);
+				return;
+			}
+			else if (jump->Continue())
+			{
+				this->compilerLLVM->CreateContinueCall();
+				return;
+			}
+			else if (jump->Break())
+			{
+				this->compilerLLVM->CreateBreakCall();
+				return;
+			}
+		}
+		else if (expressStatement != nullptr)
+		{
+			auto express = expressStatement->expression();
+			if (express != nullptr)
+			{
+				ParseExpression(express);
+				return;
+			}
+		}
+		else if (iterationStatement != nullptr)
+		{
+			/*
+			iterationStatement
+				: While '(' expression ')' statement
+				| Do statement While '(' expression ')' ';'
+				| For '(' forCondition ')' statement
+				;
+			*/
+
+			if (iterationStatement->While())
+			{
+				auto expression = iterationStatement->expression();
+				auto innerStatement = iterationStatement->statement();
+
+				auto blockStart = this->compilerLLVM->CreateBasicBlock("whileStart");
+				auto blockInner = this->compilerLLVM->CreateBasicBlock("whileInner");
+				auto blockResume = this->compilerLLVM->CreateBasicBlock("whileResume");
+
+				this->compilerLLVM->CreateBlockBreak(blockStart, false);
+
+				this->compilerLLVM->InitializeBlock(blockStart, true, blockStart, blockResume);
+				auto condition = ParseExpression(expression);
+				this->compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+
+				this->compilerLLVM->InitializeBlock(blockInner, false);
+				ParseStatement(innerStatement);
+				this->compilerLLVM->CreateBlockBreak(blockStart);
+
+				// resume
+				this->compilerLLVM->InitializeBlock(blockResume, false);
+
+				return;
+			}
+		}
+		else if (selectionStatement)
+		{
+			/*
+			selectionStatement
+				: 'if' '(' expression ')' statement ('else' statement)?
+				| 'switch' '(' expression ')' statement
+				;
+			*/
+
+			if (selectionStatement->If())
+			{
+				auto expression = selectionStatement->expression();
+				auto innerStatement = selectionStatement->statement();
+
+				// Parse condition value before CreateBlock
+				auto condition = ParseExpression(expression);
+
+				auto blockIf = this->compilerLLVM->CreateBasicBlock("ifTrue");
+				llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : this->compilerLLVM->CreateBasicBlock("ifFalse");
+
+				auto blockResume = this->compilerLLVM->CreateBasicBlock("ifResume");
+
+				this->compilerLLVM->CreateConditionJump(condition, blockIf, blockElse ? blockElse : blockResume);
+
+				this->compilerLLVM->InitializeBlock(blockIf, true, blockResume, blockResume);
+				ParseStatement(innerStatement[0]);
+
+				this->compilerLLVM->CreateBlockBreak(blockResume);
+
+				if (blockElse != nullptr)
+				{
+					// else statement
+					this->compilerLLVM->InitializeBlock(blockElse, true, blockResume, blockResume);
+					ParseStatement(innerStatement[1]);
+					this->compilerLLVM->CreateBlockBreak(blockResume);
+				}
+
+				// resume
+				this->compilerLLVM->InitializeBlock(blockResume, false);
+				return;
+			}
+		}
+		else if (compoundStatement)
+		{
+			auto blockList = compoundStatement->blockItemList();
+			ParseBlockItemList(blockList);
+			return;
+		}
+
+		__debugbreak();
 	}
 
 	std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationContext* ctx)
@@ -268,17 +382,6 @@ public:
 		}
 
 		return allocList;
-	}
-
-	MyCompilerLLVM::operation ParseOperation(std::string operationText)
-	{
-		if (operationText == "+") { return MyCompilerLLVM::operation::Add; }
-		else if (operationText == "*") { return MyCompilerLLVM::operation::Multiply; }
-		else if (operationText == "-") { return MyCompilerLLVM::operation::Subtract; }
-		else if (operationText == "/") { return MyCompilerLLVM::operation::Divide; }
-
-		__debugbreak();
-		return MyCompilerLLVM::operation::None;
 	}
 
 	llvm::Value* ParseAssignmentExpression(CParser::AssignmentExpressionContext* ctx)
@@ -394,12 +497,16 @@ public:
 	llvm::Value* ParseEqualityExpression(CParser::EqualityExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->relationalExpression();
-		if (nextCtxs.size())
+		if (nextCtxs.size() == 1)
 		{
-			for (const auto& nextCtx : nextCtxs)
-			{
-				return ParseRelationalExpression(nextCtx);
-			}
+			return ParseRelationalExpression(nextCtxs[0]);
+		}
+		else if (nextCtxs.size() == 2)
+		{
+			auto left = ParseRelationalExpression(nextCtxs[0]);
+			auto right = ParseRelationalExpression(nextCtxs[1]);
+
+			return this->compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
 		}
 
 		__debugbreak();
@@ -408,12 +515,16 @@ public:
 	llvm::Value* ParseRelationalExpression(CParser::RelationalExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->shiftExpression();
-		if (nextCtxs.size())
+		if (nextCtxs.size() == 1)
 		{
-			for (const auto& nextCtx : nextCtxs)
-			{
-				return ParseShiftExpression(nextCtx);
-			}
+			return ParseShiftExpression(nextCtxs[0]);
+		}
+		else if (nextCtxs.size() == 2)
+		{
+			auto left = ParseShiftExpression(nextCtxs[0]);
+			auto right = ParseShiftExpression(nextCtxs[1]);
+
+			return this->compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
 		}
 
 		__debugbreak();
@@ -450,7 +561,7 @@ public:
 			for (const auto& nextCtx : nextCtxs)
 			{
 				rvalue = ParseMultiplicativeExpression(nextCtx);
-				lvalue = this->compilerLLVM->CreateOperation(ParseOperation(ctx->children[count * 2 + 1]->getText()), lvalue, rvalue);
+				lvalue = this->compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
 			}
 
 			return lvalue;
@@ -476,7 +587,7 @@ public:
 			for (const auto& nextCtx : nextCtxs)
 			{
 				rvalue = ParseCastExpression(nextCtx);
-				lvalue = this->compilerLLVM->CreateOperation(ParseOperation(ctx->children[count * 2 + 1]->getText()), lvalue, rvalue);
+				lvalue = this->compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
 			}
 
 			return lvalue;
@@ -513,7 +624,7 @@ public:
 		if (primaryCtx != nullptr)
 		{
 			auto argumentList = ctx->argumentExpressionList();
-			if (argumentList.size() > 0)
+			if (argumentList.size() > 0 || (ctx->LeftParen().size() && ctx->RightParen().size()))
 			{
 				// Function Callsite
 				std::string functoinName = primaryCtx->getText();
@@ -521,11 +632,14 @@ public:
 
 				std::vector<llvm::Value*> argVec;
 
-				auto assignmentExpressionCtx = argumentList[0]->assignmentExpression();
-
-				for (const auto& argument : assignmentExpressionCtx)
+				if (argumentList.size() > 0)
 				{
-					argVec.push_back(this->ParseAssignmentExpression(argument));
+					auto assignmentExpressionCtx = argumentList[0]->assignmentExpression();
+
+					for (const auto& argument : assignmentExpressionCtx)
+					{
+						argVec.push_back(this->ParseAssignmentExpression(argument));
+					}
 				}
 
 				return this->compilerLLVM->CreateFunctionCall(fn, argVec);
@@ -577,7 +691,11 @@ public:
 				// try getting global variable
 				auto gVar = this->compilerLLVM->GetGlobalVariable(name);
 				if (gVar == nullptr)
+				{
+					std::cout << "Undefined variable : " << name << "\n";
 					__debugbreak();
+					return nullptr;
+				}
 
 				if (lValue)
 					return gVar;
@@ -597,26 +715,6 @@ public:
 
 	llvm::Value* ParseExpression(CParser::ExpressionContext* ctx)
 	{
-		/*
-		expression : printf("Hello World")
-assignmentExpression : printf("Hello World")
-conditionalExpression : printf("Hello World")
-logicalOrExpression : printf("Hello World")
-logicalAndExpression : printf("Hello World")
-inclusiveOrExpression : printf("Hello World")
-exclusiveOrExpression : printf("Hello World")
-andExpression : printf("Hello World")
-equalityExpression : printf("Hello World")
-relationalExpression : printf("Hello World")
-shiftExpression : printf("Hello World")
-additiveExpression : printf("Hello World")
-multiplicativeExpression : printf("Hello World")
-castExpression : printf("Hello World")
-unaryExpression : printf("Hello World")
-postfixExpression : printf("Hello World")
-primaryExpression : printf
-*/
-
 		auto assignCtxs = ctx->assignmentExpression();
 		if (assignCtxs.size() > 0)
 		{
@@ -666,6 +764,6 @@ primaryExpression : printf
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
 	{
-		std::cout << parser->getRuleNames()[ctx->getRuleIndex()] << " : " << ctx->getText() << "\n";
+		std::cout << parser->getRuleNames()[ctx->getRuleIndex()] << " : " << ctx->getText() << std::endl;
 	}
 };

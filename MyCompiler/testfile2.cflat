@@ -1,10 +1,26 @@
-int myfunction() {
+
+
+
+void printf(char* argv, ...);
+
+
+int myfunction2() {
     int count = 10;
-    
     while (count > 0)
     {
+        int index = 0;
         count = count - 1;
+
+        if (count == 5)
+            break;
     }
 
     return count;
 }
+
+int main() {
+    int myVar = myfunction2();
+    printf("Hello World %d", myVar);
+    return 0;
+}
+

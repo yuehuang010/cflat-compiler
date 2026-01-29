@@ -429,11 +429,9 @@ forExpression
 
 jumpStatement
     : (
-        'goto' Identifier
-        | 'continue'
+        'continue'
         | 'break'
         | 'return' expression?
-        | 'goto' unaryExpression // GCC extension
     ) ';'
     ;
 
