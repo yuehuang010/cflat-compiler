@@ -11,9 +11,19 @@
 class MyListener : public CBaseListener
 {
 private:
+	class DecrementTracker
+	{
+	public:
+		llvm::AllocaInst* storage;
+		int change = 0;
+	};
+
 	std::vector<std::string> declaration;
 	CParser* parser;
 	MyCompilerLLVM* compilerLLVM;
+	// std::vector<DecrementTracker> PlusPlus;
+	std::unordered_map<llvm::Value*, int> PlusPlus;
+
 	bool global_scope = true;
 
 	struct Type
@@ -154,6 +164,12 @@ public:
 			auto blockItemList = func->compoundStatement()->blockItemList();
 			ParseBlockItemList(blockItemList);
 
+			// if return is void, then this might need a implicit return;
+			if (returnType == "void")
+			{
+				this->compilerLLVM->CreateReturnCall(nullptr);
+			}
+
 			// Pop the stack
 			this->compilerLLVM->CreateBlockBreak(nullptr);
 
@@ -215,6 +231,19 @@ public:
 			if (express != nullptr)
 			{
 				ParseExpression(express);
+				if (PlusPlus.size() > 0)
+				{
+					for (auto increment : PlusPlus)
+					{
+						auto destination = increment.first;
+						auto amount = increment.second;
+
+						this->compilerLLVM->CreateIncrement(destination, amount);
+					}
+
+					PlusPlus.clear();
+				}
+
 				return;
 			}
 		}
@@ -245,7 +274,7 @@ public:
 
 				this->compilerLLVM->InitializeBlock(blockInner, false);
 				ParseStatement(innerStatement);
-				this->compilerLLVM->CreateBlockBreak(blockStart);
+				this->compilerLLVM->CreateContinueCall();
 
 				// resume
 				this->compilerLLVM->InitializeBlock(blockResume, false);
@@ -277,7 +306,7 @@ public:
 
 				this->compilerLLVM->CreateConditionJump(condition, blockIf, blockElse ? blockElse : blockResume);
 
-				this->compilerLLVM->InitializeBlock(blockIf, true, blockResume, blockResume);
+				this->compilerLLVM->InitializeBlock(blockIf, true);
 				ParseStatement(innerStatement[0]);
 
 				this->compilerLLVM->CreateBlockBreak(blockResume);
@@ -285,7 +314,7 @@ public:
 				if (blockElse != nullptr)
 				{
 					// else statement
-					this->compilerLLVM->InitializeBlock(blockElse, true, blockResume, blockResume);
+					this->compilerLLVM->InitializeBlock(blockElse, true);
 					ParseStatement(innerStatement[1]);
 					this->compilerLLVM->CreateBlockBreak(blockResume);
 				}
@@ -408,6 +437,9 @@ public:
 			{
 				return compilerLLVM->CreateAssignment(right, gVar);
 			}
+
+			__debugbreak();
+			return nullptr;
 		}
 
 		__debugbreak();
@@ -623,6 +655,8 @@ public:
 		auto primaryCtx = ctx->primaryExpression();
 		if (primaryCtx != nullptr)
 		{
+			auto plusplus = ctx->PlusPlus().size();
+			auto minusminus = ctx->MinusMinus().size();
 			auto argumentList = ctx->argumentExpressionList();
 			if (argumentList.size() > 0 || (ctx->LeftParen().size() && ctx->RightParen().size()))
 			{
@@ -646,7 +680,25 @@ public:
 			}
 			else
 			{
-				auto primaryExpression = ParsePrimaryExpression(primaryCtx, lValue);
+				auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
+
+				if (storage != nullptr)
+				{
+					// lValue return storage.  Don't support increment on lValues.
+					if (lValue)
+						return storage;
+
+					if (plusplus > 0)
+					{
+						PlusPlus[storage] += plusplus;
+					}
+
+					if (minusminus > 0)
+					{
+						PlusPlus[storage] -= minusminus;
+					}
+				}
+
 				return primaryExpression;
 			}
 		}
@@ -655,13 +707,7 @@ public:
 		return nullptr;
 	}
 
-	/// <summary>
-	/// Get Primary Expression
-	/// </summary>
-	/// <param name="ctx">Context</param>
-	/// <param name="lValue">If true, return the storage itself.</param>
-	/// <returns></returns>
-	llvm::Value* ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx, bool lValue = false)
+	std::tuple< llvm::Value*, llvm::Value*> ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
 	{
 		auto expressionCtx = ctx->expression();
 		auto identifier = ctx->Identifier();
@@ -670,15 +716,15 @@ public:
 
 		if (expressionCtx != nullptr)
 		{
-			return ParseExpression(expressionCtx);
+			return std::tuple(ParseExpression(expressionCtx), nullptr);
 		}
 		else if (stringLiteral.size() > 0)
 		{
-			return this->compilerLLVM->CreateGlobalString("", ctx->getText());
+			return std::tuple(this->compilerLLVM->CreateGlobalString("", ctx->getText()), nullptr);
 		}
 		else if (constant)
 		{
-			return this->compilerLLVM->CreateConstant("int", constant->getText());
+			return std::tuple(this->compilerLLVM->CreateConstant("int", constant->getText()), nullptr);
 		}
 		else if (identifier)
 		{
@@ -694,23 +740,17 @@ public:
 				{
 					std::cout << "Undefined variable : " << name << "\n";
 					__debugbreak();
-					return nullptr;
+					return std::tuple(nullptr, nullptr);
 				}
 
-				if (lValue)
-					return gVar;
-				else
-					return this->compilerLLVM->CreateLoad(gVar);
+				return std::tuple(this->compilerLLVM->CreateLoad(gVar), gVar);
 			}
 
-			if (lValue)
-				return alloc;
-			else
-				return this->compilerLLVM->CreateLoad(alloc);
+			return std::tuple(this->compilerLLVM->CreateLoad(alloc), alloc);
 		}
 
 		__debugbreak();
-		return nullptr;
+		return std::tuple(nullptr, nullptr);
 	}
 
 	llvm::Value* ParseExpression(CParser::ExpressionContext* ctx)
@@ -764,6 +804,6 @@ public:
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
 	{
-		std::cout << parser->getRuleNames()[ctx->getRuleIndex()] << " : " << ctx->getText() << std::endl;
+		// std::cout << parser->getRuleNames()[ctx->getRuleIndex()] << " : " << ctx->getText() << std::endl;
 	}
 };

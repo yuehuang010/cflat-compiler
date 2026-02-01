@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <ranges>
 
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\LLVMContext.h>
@@ -32,6 +33,12 @@ public:
 		std::unordered_map<std::string, llvm::AllocaInst*> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
+
+		void ClearBlock()
+		{
+			continueBlock = nullptr;
+			resumeBlock = nullptr;
+		}	
 	};
 
 private:
@@ -128,6 +135,29 @@ public:
 		auto alloc = builder->CreateAlloca(GetType(typeName), nullptr, name);
 		stackNamedVariable.back().namedVariable[name] = alloc;
 		return alloc;
+	}
+
+	llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
+	{
+		llvm::LoadInst* loadInst;
+		if (auto alloc = llvm::dyn_cast<llvm::AllocaInst>(destination))
+		{
+			loadInst = CreateLoad(alloc);
+		}
+		else if (auto gVar = llvm::dyn_cast<llvm::GlobalVariable>(destination))
+		{
+			loadInst = CreateLoad(gVar);
+		}
+		else
+		{
+			__debugbreak();
+			return nullptr;
+		}
+
+		auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
+		// auto value = builder->getInt32(amount);
+		auto newValue = CreateOperation(operation::Add, loadInst, value);
+		return builder->CreateStore(newValue, destination);
 	}
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::AllocaInst* destination)
@@ -246,6 +276,13 @@ public:
 			return right;
 
 		operation op = ParseOperation(oper);
+		return CreateOperation(op, left, right);
+	}
+
+	llvm::Value* CreateOperation(operation op, llvm::Value* left, llvm::Value* right)
+	{
+		if (left == nullptr)
+			return right;
 
 		// NSW (No Signed Wrap) and NUS(No Unsigned Wrap)
 		switch (op)
@@ -383,9 +420,9 @@ public:
 
 	llvm::AllocaInst* GetLocalVariable(std::string name)
 	{
-		for (auto stackframe = stackNamedVariable.rbegin(); stackframe != stackNamedVariable.rend(); ++stackframe)
+		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto nameVal = stackframe->namedVariable;
+			auto nameVal = stackframe.namedVariable;
 			auto result = nameVal.find(name);
 
 			if (result != nameVal.end())
@@ -415,24 +452,49 @@ public:
 
 	void CreateReturnCall(llvm::Value* value)
 	{
-		builder->CreateRet(value);
+		// check if break has already been inserted.
+		if (builder->GetInsertBlock()->getTerminator() != nullptr)
+			return;
+
+		if (value == nullptr)
+			builder->CreateRetVoid();
+		else
+			builder->CreateRet(value);
 	}
 
 	void CreateBreakCall()
 	{
-		auto continueBlock = stackNamedVariable.back().continueBlock;
-		if (continueBlock)
+		// check if break has already been inserted.
+		if (builder->GetInsertBlock()->getTerminator() != nullptr)
+			return;
+
+		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto result = builder->CreateBr(continueBlock);
+			auto resumeBlock = stackframe.resumeBlock;
+			if (resumeBlock)
+			{
+				auto result = builder->CreateBr(resumeBlock);
+				// stackNamedVariable.back().ClearBlock();
+				break;
+			}
 		}
 	}
 
 	void CreateContinueCall()
 	{
-		auto continueBlock = stackNamedVariable.back().continueBlock;
-		if (continueBlock)
+		// check if break has already been inserted.
+		if (builder->GetInsertBlock()->getTerminator() != nullptr)
+			return;
+
+		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto result = builder->CreateBr(continueBlock);
+			auto continueBlock = stackframe.continueBlock;
+			if (continueBlock)
+			{
+				auto result = builder->CreateBr(continueBlock);
+				/// stackNamedVariable.back().ClearBlock();
+				break;
+			}
 		}
 	}
 

@@ -18,9 +18,30 @@ int myfunction2() {
     return count;
 }
 
+void myWhileLoopPrint()
+{
+    int counter = 10;
+    while (counter > 0)
+    {
+        printf("myWhileLoopPrint: %d\n", counter);
+        counter--;
+    }
+}
+
 int main() {
     int myVar = myfunction2();
-    printf("Hello World %d", myVar);
+    printf("myfunction2 returned %d\n", myVar);
+
+    myWhileLoopPrint();
+
+    int counterP = 0;
+    counterP++;
+    printf("Test 2: %d\n", counterP);
+
+    int counterM = 0;
+    counterM--;
+    printf("Test 3: %d\n", counterM);
+
     return 0;
 }
 
