@@ -27,9 +27,17 @@ public:
 		LessEqual, // <=
 	};
 
+	struct TypeAndValue
+	{
+		std::string TypeName;
+		std::string VariableName;
+		bool pointer : 1 = false;
+	};
+
 	class StackState
 	{
 	public:
+		std::unordered_map<std::string, llvm::Argument*> functionArgument;
 		std::unordered_map<std::string, llvm::AllocaInst*> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
@@ -61,12 +69,22 @@ private:
 		return fn;
 	}
 
-	void createFunctionBlock(llvm::Function* fn)
+	void createFunctionBlock(llvm::Function* fn, std::vector<MyCompilerLLVM::TypeAndValue> arguments)
 	{
 		// all function starts at "entry" block
 		auto entry = CreateBasicBlock("entry", fn);
 		builder->SetInsertPoint(entry);
-		stackNamedVariable.emplace_back();
+		auto& stateState = stackNamedVariable.emplace_back();
+
+		// populate function arguments
+		auto itr_nameArg = arguments.begin();
+		for (auto& arg : fn->args())
+		{
+			arg.setName(itr_nameArg->VariableName);
+			stateState.functionArgument[itr_nameArg->VariableName] = &arg;
+			itr_nameArg++;
+		}
+
 		currentFunction = fn;
 	}
 
@@ -178,6 +196,11 @@ public:
 	llvm::LoadInst* CreateLoad(llvm::GlobalVariable* gVar)
 	{
 		return builder->CreateLoad(gVar->getType(), gVar);
+	}
+
+	llvm::LoadInst* CreateLoad(llvm::Argument* funcArgument)
+	{
+		return builder->CreateLoad(funcArgument->getType(), funcArgument);
 	}
 
 	llvm::Value* CreateConstant(std::string typeName, std::string initialValue)
@@ -371,7 +394,21 @@ public:
 		module->getOrInsertFunction(name, functionType);
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string name, llvm::FunctionType* functionType = nullptr)
+	llvm::FunctionType* GetFunctionType(std::string returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+	{
+		std::vector<llvm::Type*> types;
+		types.reserve(arguments.size());
+
+		for (const MyCompilerLLVM::TypeAndValue& arg : arguments)
+		{
+			types.push_back(GetType(arg.TypeName, arg.pointer));
+		}
+
+		auto ft = llvm::FunctionType::get(GetType(returnType), types, varargs);
+		return ft;
+	}
+
+	llvm::Function* CreateFunctionDefinition(std::string name, std::vector<MyCompilerLLVM::TypeAndValue> arguments, llvm::FunctionType* functionType)
 	{
 		auto fn = module->getFunction(name);
 		if (functionType == nullptr)
@@ -384,7 +421,7 @@ public:
 			fn = createFunctionProto(name, functionType);
 		}
 
-		createFunctionBlock(fn);
+		createFunctionBlock(fn, arguments);
 
 		return fn;
 	}
@@ -423,6 +460,22 @@ public:
 		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
 			auto nameVal = stackframe.namedVariable;
+			auto result = nameVal.find(name);
+
+			if (result != nameVal.end())
+			{
+				return result->second;
+			}
+		}
+
+		return nullptr;
+	}
+
+	llvm::Argument* GetFunctionArgument(std::string name)
+	{
+		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		{
+			auto nameVal = stackframe.functionArgument;
 			auto result = nameVal.find(name);
 
 			if (result != nameVal.end())

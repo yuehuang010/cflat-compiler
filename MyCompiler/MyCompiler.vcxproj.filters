@@ -29,9 +29,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="testfile.cflat" />
+    <None Include="testfile.c" />
     <None Include="antlr4.exe" />
-    <None Include="testfile2.cflat" />
+    <None Include="testfile2.c" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C.g4" />

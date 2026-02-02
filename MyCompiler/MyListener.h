@@ -18,19 +18,10 @@ private:
 		int change = 0;
 	};
 
-	std::vector<std::string> declaration;
 	CParser* parser;
 	MyCompilerLLVM* compilerLLVM;
-	// std::vector<DecrementTracker> PlusPlus;
 	std::unordered_map<llvm::Value*, int> PlusPlus;
-
 	bool global_scope = true;
-
-	struct Type
-	{
-		std::string Name;
-		bool pointer : 1 = false;
-	};
 
 	bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
 	{
@@ -60,9 +51,9 @@ private:
 		return directDecl->getText();
 	}
 
-	Type getTypeSpecifier(CParser::DeclarationSpecifiersContext* declSpecs)
+	MyCompilerLLVM::TypeAndValue getTypeSpecifier(CParser::DeclarationSpecifiersContext* declSpecs)
 	{
-		Type declType;
+		MyCompilerLLVM::TypeAndValue declType;
 		std::string typeName;
 		auto declSpecList = declSpecs->declarationSpecifier();
 
@@ -71,7 +62,7 @@ private:
 			auto typeSpec = declSpec->typeSpecifier();
 			if (typeSpec != nullptr)
 			{
-				declType.Name = typeSpec->getText();
+				declType.TypeName = typeSpec->getText();
 				declType.pointer = declSpec->pointer() != nullptr;
 				break;
 			}
@@ -84,7 +75,7 @@ private:
 	{
 		auto declSpecs = ctx->declarationSpecifiers();
 
-		return getTypeSpecifier(declSpecs).Name;
+		return getTypeSpecifier(declSpecs).TypeName;
 	}
 
 	std::string getStructClassUnionName(CParser::StructClassUnionDefinitionContext* ctx)
@@ -156,9 +147,10 @@ public:
 			auto returnType = this->getFunctionReturnType(func);
 			CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
 			auto params = this->ParseParamaterTypeList(paramTypeList);
-			auto fn = this->compilerLLVM->CreateFunctionDefinition(name, GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
+			auto fn = this->compilerLLVM->CreateFunctionDefinition(name, params, this->compilerLLVM->GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
 
 			global_scope = false;
+
 			this->compilerLLVM->InitializeBlock(&fn->front(), true, &fn->back(), &fn->back());
 
 			auto blockItemList = func->compoundStatement()->blockItemList();
@@ -365,10 +357,10 @@ public:
 			if (paramTypeList != nullptr)
 			{
 				// If there is parameter list, then it is a function.
-				std::vector<Type> params = ParseParamaterTypeList(paramTypeList);
+				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParamaterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				auto ft = GetFunctionType(typeName, params, ellipsis);
+				auto ft = this->compilerLLVM->GetFunctionType(typeName, params, ellipsis);
 				this->compilerLLVM->CreateFunctionDeclaration(direct->getText(), ft);
 			}
 			else if (direct != nullptr)
@@ -707,6 +699,11 @@ public:
 		return nullptr;
 	}
 
+	/// <summary>
+	/// The Value and Storage if applicaple.
+	/// </summary>
+	/// <param name="ctx"></param>
+	/// <returns>Returns the load instruction and storage if writable.</returns>
 	std::tuple< llvm::Value*, llvm::Value*> ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
 	{
 		auto expressionCtx = ctx->expression();
@@ -720,7 +717,10 @@ public:
 		}
 		else if (stringLiteral.size() > 0)
 		{
-			return std::tuple(this->compilerLLVM->CreateGlobalString("", ctx->getText()), nullptr);
+			// TODO handle encoding u8,u,U,L
+			std::string rawText = ctx->getText();
+			rawText = ProcessRawText(rawText);
+			return std::tuple(this->compilerLLVM->CreateGlobalString("", rawText), nullptr);
 		}
 		else if (constant)
 		{
@@ -734,16 +734,23 @@ public:
 
 			if (alloc == nullptr)
 			{
-				// try getting global variable
-				auto gVar = this->compilerLLVM->GetGlobalVariable(name);
-				if (gVar == nullptr)
+				auto funcArgument = this->compilerLLVM->GetFunctionArgument(name);
+
+				if (funcArgument == nullptr)
 				{
-					std::cout << "Undefined variable : " << name << "\n";
-					__debugbreak();
-					return std::tuple(nullptr, nullptr);
+					// try getting global variable
+					auto gVar = this->compilerLLVM->GetGlobalVariable(name);
+					if (gVar == nullptr)
+					{
+						std::cout << "Undefined variable : " << name << "\n";
+						__debugbreak();
+						return std::tuple(nullptr, nullptr);
+					}
+
+					return std::tuple(this->compilerLLVM->CreateLoad(gVar), gVar);
 				}
 
-				return std::tuple(this->compilerLLVM->CreateLoad(gVar), gVar);
+				return std::tuple(funcArgument, nullptr);
 			}
 
 			return std::tuple(this->compilerLLVM->CreateLoad(alloc), alloc);
@@ -751,6 +758,46 @@ public:
 
 		__debugbreak();
 		return std::tuple(nullptr, nullptr);
+	}
+
+	std::string ProcessRawText(std::string rawText)
+	{
+		std::string output;
+		bool escape = false;
+		auto itr = rawText.begin();
+
+		if (*itr == '"')
+		{
+			// skip the first quote
+			itr++;
+		}
+
+		while (itr != rawText.end())
+		{
+			char c = *itr;
+			if (escape)
+			{
+				if (c == 'n')
+					output += '\n';
+
+				escape = false;
+			}
+			else if (c == '\\')
+			{
+				escape = true;
+			}
+			else
+			{
+				output += c;
+			}
+
+			itr++;
+		}
+
+		// Remove the last quote
+		output.pop_back();
+
+		return output;
 	}
 
 	llvm::Value* ParseExpression(CParser::ExpressionContext* ctx)
@@ -771,9 +818,9 @@ public:
 		return nullptr;
 	}
 
-	std::vector<MyListener::Type> ParseParamaterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+	std::vector<MyCompilerLLVM::TypeAndValue> ParseParamaterTypeList(CParser::ParameterTypeListContext* paramTypeList)
 	{
-		std::vector<MyListener::Type> params;
+		std::vector<MyCompilerLLVM::TypeAndValue> params;
 
 		if (paramTypeList == nullptr)
 			return params;
@@ -783,23 +830,12 @@ public:
 
 		for (auto paramDecl : paramDeclList)
 		{
-			params.push_back(this->getTypeSpecifier(paramDecl->declarationSpecifiers()));
+			MyCompilerLLVM::TypeAndValue paramType = this->getTypeSpecifier(paramDecl->declarationSpecifiers());
+			paramType.VariableName = paramDecl->declarator()->directDeclarator()->getText();
+			params.push_back(paramType);
 		}
 
 		return params;
-	}
-
-	llvm::FunctionType* GetFunctionType(std::string returnType, std::vector<MyListener::Type> arguments, bool varargs = false)
-	{
-		std::vector<llvm::Type*> types;
-		types.reserve(arguments.size());
-
-		for (const MyListener::Type& arg : arguments)
-		{
-			types.push_back(this->compilerLLVM->GetType(arg.Name, arg.pointer));
-		}
-
-		return llvm::FunctionType::get(this->compilerLLVM->GetType(returnType), types, varargs);
 	}
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
