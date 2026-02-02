@@ -1,15 +1,29 @@
 void printf(const char* argv, ...);
 
-int Test(const char* testName, int expected, int actual)
+//
+//int Test(const char* testName, int expected, int actual)
+//{
+//    if (expected == actual)
+//    {
+//        printf("%s passed.\n", testName);
+//        return 1;
+//    }
+//
+//    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+//    return 0;
+//}
+
+
+bool Test(const char* testName, bool expected, bool actual)
 {
     if (expected == actual)
     {
         printf("%s passed.\n", testName);
-        return 1;
+        return true;
     }
 
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-    return 0;
+    printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+    return false;
 }
 
 int mySimpleFunction(int argc)
@@ -18,8 +32,10 @@ int mySimpleFunction(int argc)
     return var;
 }
 
+
+
 int main() {
-    Test("mySimpleFunction", 11, mySimpleFunction(11));
+    Test("Testing True", true, true);
+    // Test("mySimpleFunction", 11, mySimpleFunction(11));
     return 0;
 }
-

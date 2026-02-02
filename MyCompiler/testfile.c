@@ -14,9 +14,31 @@ int Test(const char* testName, int expected, int actual) {
     return 0;
 }
 
+bool TestBool(const char* testName, bool expected, bool actual)
+{
+    if (expected == actual)
+    {
+        printf("%s passed.\n", testName);
+        return true;
+    }
+
+    printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+    return false;
+}
+
 int myFunctionArgument(int argc) {
     int var = argc;
     return var;
+}
+
+void testEmptyFunction() {}
+void testEmptyIfStatement()
+{
+    if (true) {}
+    else {}
+
+    if (false) {}
+    else {}
 }
 
 int myWhileLoopBreak() {
@@ -74,14 +96,42 @@ int testIfElseStatement() {
     return count;
 }
 
+int testConditional()
+{
+    int count = 10;
+    count = (count == 10) ? 11 : 12;
+    return count;
+}
+
+int testMultipleBreaks()
+{
+    int n = 10;
+    while (n == 10)
+    {
+        return 20;
+        break;
+        continue;
+    }
+
+    return n;
+}
 
 int main(int argc, char** argv) {
+    bool result = true;
+    testEmptyFunction();
+    testEmptyIfStatement();
+    result &= Test("testConditional", 12, testConditional());
+    result &= Test("testIfElseStatement", 11, testIfElseStatement());
+    result &= Test("myWhileLoopNotEnter", 0, myWhileLoopNotEnter());
+    result &= Test("myWhileLoopDecrement", 0, myWhileLoopDecrement());
+    result &= Test("myWhileLoopBreak", 5, myWhileLoopBreak());
+    result &= Test("mySimpleFunction", 11, myFunctionArgument(11));
+    result &= Test("testMultipleBreaks", 20, testMultipleBreaks());
 
-    Test("testIfElseStatement", 11, testIfElseStatement());
-    Test("myWhileLoopNotEnter", 0, myWhileLoopNotEnter());
-    Test("myWhileLoopDecrement", 0, myWhileLoopDecrement());
-    Test("myWhileLoopBreak", 5, myWhileLoopBreak());
-    Test("mySimpleFunction", 11, myFunctionArgument(11));
-    Test("myWhileLoopDecrement", 0, myWhileLoopDecrement());
+    if (result)
+    {
+        printf("All Test Passed\n");
+    }
+
     return 0;
 }

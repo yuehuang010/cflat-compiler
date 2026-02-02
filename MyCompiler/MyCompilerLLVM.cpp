@@ -36,5 +36,21 @@ bool MyCompilerLLVM::Compile(std::string filename)
 
 	SaveToFile(".\\out.ll");
 
+	// validate that the stack is empty.
+	if (stackNamedVariable.size() > 0)
+	{
+		for (const auto& stack : stackNamedVariable)
+		{
+			std::cout << "Stack is not empty:\n";
+			for (const auto& funcVariable : stack.functionArgument) {
+				std::cout << "function var: " << funcVariable.first << "\n";
+			}
+			for (const auto& namedVariable : stack.namedVariable)
+			{
+				std::cout << "namedVar var: " << namedVariable.first << "\n";
+			}
+		}
+	}
+
 	return true;
 }

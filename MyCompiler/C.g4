@@ -33,9 +33,9 @@
 
 grammar C;
 
-primaryExpression
-    : Identifier
-    | Constant
+primaryExpression 
+    : Constant
+    | Identifier
     | StringLiteral+
     | '(' expression ')'
     ;
@@ -823,6 +823,16 @@ Ellipsis
     : '...'
     ;
 
+// Antlr matches Rules by the order they appear in the grammer.
+// Thus, declaring Constant before Identifier.
+Constant
+    : IntegerConstant
+    | BooleanConstant
+    | FloatingConstant
+    //|   EnumerationConstant
+    | CharacterConstant
+    ;
+
 Identifier
     : IdentifierNondigit (IdentifierNondigit | Digit)*
     ;
@@ -848,13 +858,6 @@ fragment UniversalCharacterName
 
 fragment HexQuad
     : HexadecimalDigit HexadecimalDigit HexadecimalDigit HexadecimalDigit
-    ;
-
-Constant
-    : IntegerConstant
-    | FloatingConstant
-    //|   EnumerationConstant
-    | CharacterConstant
     ;
 
 fragment IntegerConstant
@@ -914,6 +917,19 @@ fragment LongSuffix
 fragment LongLongSuffix
     : 'll'
     | 'LL'
+    ;
+
+BooleanConstant
+    : TRUE
+    | FALSE
+    ;
+
+TRUE 
+    : 'true'
+    ;
+
+FALSE 
+    : 'false'
     ;
 
 fragment FloatingConstant

@@ -46,7 +46,7 @@ public:
 		{
 			continueBlock = nullptr;
 			resumeBlock = nullptr;
-		}	
+		}
 	};
 
 private:
@@ -74,14 +74,17 @@ private:
 		// all function starts at "entry" block
 		auto entry = CreateBasicBlock("entry", fn);
 		builder->SetInsertPoint(entry);
-		auto& stateState = stackNamedVariable.emplace_back();
+		auto& stackState = stackNamedVariable.emplace_back();
+
+		stackState.continueBlock = &fn->back();
+		stackState.resumeBlock = &fn->back();
 
 		// populate function arguments
 		auto itr_nameArg = arguments.begin();
 		for (auto& arg : fn->args())
 		{
 			arg.setName(itr_nameArg->VariableName);
-			stateState.functionArgument[itr_nameArg->VariableName] = &arg;
+			stackState.functionArgument[itr_nameArg->VariableName] = &arg;
 			itr_nameArg++;
 		}
 
@@ -361,6 +364,11 @@ public:
 		return branchInst;
 	}
 
+	llvm::Value* CreateSelect(llvm::Value* cond, llvm::Value* falseValue, llvm::Value* trueValue)
+	{
+		return builder->CreateSelect(cond, trueValue, falseValue);
+	}
+
 	/// <summary>
 	/// Exit the current BasicBlock and then jump to resumeBlock.
 	/// </summary>
@@ -372,7 +380,11 @@ public:
 			stackNamedVariable.pop_back();
 
 		if (resumeBlock)
-			return builder->CreateBr(resumeBlock);
+		{
+			// check if break has already been inserted.
+			if (builder->GetInsertBlock()->getTerminator() == nullptr)
+				return builder->CreateBr(resumeBlock);
+		}
 
 		return nullptr;
 	}
@@ -389,9 +401,17 @@ public:
 		builder->SetInsertPoint(block);
 	}
 
-	void CreateFunctionDeclaration(std::string name, llvm::FunctionType* functionType = nullptr)
+	void CreateFunctionDeclaration(std::string functionName, llvm::FunctionType* functionType = nullptr)
 	{
-		module->getOrInsertFunction(name, functionType);
+		if (module->getFunction(functionName) == nullptr)
+		{
+			module->getOrInsertFunction(functionName, functionType);
+		}
+		else
+		{
+			std::cout << "Function already exists:" << functionName << "\n";
+			__debugbreak();
+		}
 	}
 
 	llvm::FunctionType* GetFunctionType(std::string returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
@@ -408,9 +428,9 @@ public:
 		return ft;
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string name, std::vector<MyCompilerLLVM::TypeAndValue> arguments, llvm::FunctionType* functionType)
+	llvm::Function* CreateFunctionDefinition(std::string functionName, std::vector<MyCompilerLLVM::TypeAndValue> arguments, llvm::FunctionType* functionType)
 	{
-		auto fn = module->getFunction(name);
+		auto fn = module->getFunction(functionName);
 		if (functionType == nullptr)
 		{
 			functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
@@ -418,7 +438,12 @@ public:
 
 		if (fn == nullptr)
 		{
-			fn = createFunctionProto(name, functionType);
+			fn = createFunctionProto(functionName, functionType);
+		}
+		else
+		{
+			std::cout << "Function already exists : " << functionName << "\n";
+			__debugbreak();
 		}
 
 		createFunctionBlock(fn, arguments);

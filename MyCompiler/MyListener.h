@@ -1,6 +1,7 @@
 #pragma once
 #include <iostream>
 #include <unordered_map>
+#include <format>
 
 #include "CParser.h"
 #include "CLexer.h"
@@ -117,9 +118,6 @@ private:
 				break;
 		}
 
-		//if (!name.empty())
-		//	std::cout << "Function: " << name << "\n";
-
 		return name;
 	}
 
@@ -151,10 +149,12 @@ public:
 
 			global_scope = false;
 
-			this->compilerLLVM->InitializeBlock(&fn->front(), true, &fn->back(), &fn->back());
+			this->compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
 
 			auto blockItemList = func->compoundStatement()->blockItemList();
-			ParseBlockItemList(blockItemList);
+
+			if (blockItemList)
+				ParseBlockItemList(blockItemList);
 
 			// if return is void, then this might need a implicit return;
 			if (returnType == "void")
@@ -180,7 +180,7 @@ public:
 
 			if (decl != nullptr)
 			{
-				this->ParseDeclaration(decl);
+				ParseDeclaration(decl);
 			}
 			else if (statement != nullptr)
 			{
@@ -271,6 +271,9 @@ public:
 				// resume
 				this->compilerLLVM->InitializeBlock(blockResume, false);
 
+				// pop the stack
+				this->compilerLLVM->CreateBlockBreak(nullptr, true);
+
 				return;
 			}
 		}
@@ -319,7 +322,8 @@ public:
 		else if (compoundStatement)
 		{
 			auto blockList = compoundStatement->blockItemList();
-			ParseBlockItemList(blockList);
+			if (blockList)
+				ParseBlockItemList(blockList);
 			return;
 		}
 
@@ -437,17 +441,40 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseConditionalExpression(CParser::ConditionalExpressionContext* ctx)
 	{
 		auto logicCtx = ctx->logicalOrExpression();
+		auto expressionFalse = ctx->expression();
+		auto expressionTrue = ctx->conditionalExpression();
+
 		if (logicCtx != nullptr)
 		{
-			return ParseLogicalOrExpression(logicCtx);
+			auto expression = ParseLogicalOrExpression(logicCtx);
+
+			// Both expression should exist or not exist.
+			if ((expressionFalse != nullptr) != (expressionTrue != nullptr))
+			{
+				std::cout << "Conditional Expression require both true and false parts.\n";
+				__debugbreak();
+				return nullptr;
+			}
+			else if (expressionFalse != nullptr && (expressionTrue != nullptr))
+			{
+				auto falseValue = ParseExpression(expressionFalse);
+				auto trueValue = ParseConditionalExpression(expressionTrue);
+
+				auto selectValue = compilerLLVM->CreateSelect(expression, falseValue, trueValue);
+				return selectValue;
+			}
+
+			return expression;
 		}
 
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseLogicalOrExpression(CParser::LogicalOrExpressionContext* ctx)
 	{
 		auto logicCtxs = ctx->logicalAndExpression();
@@ -462,6 +489,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseLogicalAndExpression(CParser::LogicalAndExpressionContext* ctx)
 	{
 		auto incluiveCtxs = ctx->inclusiveOrExpression();
@@ -476,6 +504,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseInclusiveOrExpression(CParser::InclusiveOrExpressionContext* ctx)
 	{
 		auto excluiveCtxs = ctx->exclusiveOrExpression();
@@ -490,6 +519,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseExclusiveOrExpression(CParser::ExclusiveOrExpressionContext* ctx)
 	{
 		auto andCtxs = ctx->andExpression();
@@ -504,6 +534,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseAndExpression(CParser::AndExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->equalityExpression();
@@ -518,6 +549,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseEqualityExpression(CParser::EqualityExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->relationalExpression();
@@ -536,6 +568,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseRelationalExpression(CParser::RelationalExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->shiftExpression();
@@ -554,6 +587,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseShiftExpression(CParser::ShiftExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->additiveExpression();
@@ -568,6 +602,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseAdditiveExpression(CParser::AdditiveExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->multiplicativeExpression();
@@ -594,6 +629,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseMultiplicativeExpression(CParser::MultiplicativeExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->castExpression();
@@ -620,6 +656,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseCastExpression(CParser::CastExpressionContext* ctx)
 	{
 		auto unaryCtx = ctx->unaryExpression();
@@ -631,6 +668,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParseUnaryExpression(CParser::UnaryExpressionContext* ctx, bool lValue = false)
 	{
 		auto postFixCtx = ctx->postfixExpression();
@@ -642,6 +680,7 @@ public:
 		__debugbreak();
 		return nullptr;
 	}
+
 	llvm::Value* ParsePostfixExpression(CParser::PostfixExpressionContext* ctx, bool lValue = false)
 	{
 		auto primaryCtx = ctx->primaryExpression();
@@ -676,7 +715,7 @@ public:
 
 				if (storage != nullptr)
 				{
-					// lValue return storage.  Don't support increment on lValues.
+					// Disable lValue don't support increment.
 					if (lValue)
 						return storage;
 
@@ -724,7 +763,16 @@ public:
 		}
 		else if (constant)
 		{
-			return std::tuple(this->compilerLLVM->CreateConstant("int", constant->getText()), nullptr);
+			if (constant->getText() == "true")
+			{
+				return std::tuple(this->compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+			}
+			else if (constant->getText() == "false")
+			{
+				return std::tuple(this->compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+			}
+			else
+				return std::tuple(this->compilerLLVM->CreateConstant("int", constant->getText()), nullptr);
 		}
 		else if (identifier)
 		{
@@ -838,8 +886,15 @@ public:
 		return params;
 	}
 
+	void PrintContext(antlr4::ParserRuleContext* ctx)
+	{
+		int line = ctx->getStart()->getLine();
+		int column = ctx->getStart()->getCharPositionInLine();
+		std::cout << std::format("[{}:{}] {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText());
+	}
+
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
 	{
-		// std::cout << parser->getRuleNames()[ctx->getRuleIndex()] << " : " << ctx->getText() << std::endl;
+		// PrintContext(ctx);
 	}
 };
