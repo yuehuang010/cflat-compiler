@@ -2,12 +2,14 @@
 
 #include <deque>
 #include <ranges>
+#include <variant>
 
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
 #include <antlr4-runtime.h>
+#include <CParser.h>
 
 class MyCompilerLLVM
 {
@@ -31,7 +33,16 @@ public:
 	{
 		std::string TypeName;
 		std::string VariableName;
+
+		// Used for delayed Initialization
+		CParser::InitializerContext* Initializer = nullptr;
 		bool pointer : 1 = false;
+	};
+
+	struct StructData
+	{
+		llvm::StructType* StructType;
+		std::vector<TypeAndValue> StructFields;
 	};
 
 	class StackState
@@ -49,13 +60,17 @@ public:
 		}
 	};
 
+	using ConstantVariant = std::variant<bool, int, int64_t, float, double>;
+
 private:
 	std::unique_ptr<llvm::IRBuilder<>> builder;
 	std::unique_ptr<llvm::Module> module;
 	std::unique_ptr<llvm::LLVMContext> context;
-	// std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> stackNamedVariable;
+
 	std::vector<StackState> stackNamedVariable;
 	std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
+	std::unordered_map<std::string, StructData> dataStructures;
+
 	llvm::Function* currentFunction;
 
 private:
@@ -135,35 +150,36 @@ public:
 		context.release();
 	}
 
-	llvm::GlobalVariable* CreateGlobalVariable(std::string name, std::string typeName, llvm::ConstantInt* initValue)
+	llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::ConstantInt* initValue)
 	{
 		auto gVar = new llvm::GlobalVariable(
 			*module,
-			GetType(typeName), // Type: int32
+			GetType(typeValue), // Type: int32
 			false, // isConstant
 			llvm::GlobalValue::ExternalLinkage,
 			initValue, // Initial value
-			name // Name
+			typeValue.VariableName // Name
 		);
 
-		globalNamedVariable[name] = gVar;
+		globalNamedVariable[typeValue.VariableName] = gVar;
 
 		return gVar;
 	}
 
-	llvm::AllocaInst* CreateVariable(std::string name, std::string typeName)
+	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr)
 	{
-		auto alloc = builder->CreateAlloca(GetType(typeName), nullptr, name);
-		stackNamedVariable.back().namedVariable[name] = alloc;
+		auto alloc = builder->CreateAlloca(GetType(typeValue, autoType), nullptr, typeValue.VariableName);
+		stackNamedVariable.back().namedVariable[typeValue.VariableName] = alloc;
 		return alloc;
 	}
 
 	llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
 	{
-		llvm::LoadInst* loadInst;
+		llvm::LoadInst* loadInst = CreateLoad(destination, true);
+		/*
 		if (auto alloc = llvm::dyn_cast<llvm::AllocaInst>(destination))
 		{
-			loadInst = CreateLoad(alloc);
+			loadInst = CreateLoad(alloc, true);
 		}
 		else if (auto gVar = llvm::dyn_cast<llvm::GlobalVariable>(destination))
 		{
@@ -173,12 +189,39 @@ public:
 		{
 			__debugbreak();
 			return nullptr;
-		}
+		}*/
 
 		auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
 		// auto value = builder->getInt32(amount);
 		auto newValue = CreateOperation(operation::Add, loadInst, value);
 		return builder->CreateStore(newValue, destination);
+	}
+
+	/// <summary>
+	/// Initialize a constant in the structInstance;
+	/// </summary>
+	/// <param name="structInstance"></param>
+	/// <param name="newValue"></param>
+	/// <param name="index"></param>
+	/// <returns></returns>
+	llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index)
+	{
+		return builder->CreateInsertValue(structInstance, newValue, index);
+	}
+
+	llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "")
+	{
+		return builder->CreateStructGEP(structType, structAlloc, index, variableName);
+	}
+
+	llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index)
+	{
+		return builder->CreateExtractValue(structInstance, index);
+	}
+
+	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination)
+	{
+		return builder->CreateStore(value, destination);
 	}
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::AllocaInst* destination)
@@ -204,6 +247,120 @@ public:
 	llvm::LoadInst* CreateLoad(llvm::Argument* funcArgument)
 	{
 		return builder->CreateLoad(funcArgument->getType(), funcArgument);
+	}
+
+	llvm::LoadInst* CreateLoad(llvm::Value* value, bool mine)
+	{
+		llvm::Type* type = nullptr;
+
+		if (auto* allocaInst = llvm::dyn_cast<llvm::AllocaInst>(value))
+		{
+			// If it's a direct alloca, we know the type it was created with
+			type = allocaInst->getAllocatedType();
+		}
+		else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value))
+		{
+			// If it's a GEP (e.g., from CreateStructGEP), get the element type
+			type = gep->getResultElementType();
+		}
+		else if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value))
+		{
+			// If it's a global variable
+			type = global->getValueType();
+		}
+
+		return builder->CreateLoad(type, value);
+	}
+
+	llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType)
+	{
+		/*
+		HANDLE_CAST_INST(38, Trunc   , TruncInst   )  // Truncate integers
+		HANDLE_CAST_INST(39, ZExt    , ZExtInst    )  // Zero extend integers
+		HANDLE_CAST_INST(40, SExt    , SExtInst    )  // Sign extend integers
+		HANDLE_CAST_INST(41, FPToUI  , FPToUIInst  )  // floating point -> UInt
+		HANDLE_CAST_INST(42, FPToSI  , FPToSIInst  )  // floating point -> SInt
+		HANDLE_CAST_INST(43, UIToFP  , UIToFPInst  )  // UInt -> floating point
+		HANDLE_CAST_INST(44, SIToFP  , SIToFPInst  )  // SInt -> floating point
+		HANDLE_CAST_INST(45, FPTrunc , FPTruncInst )  // Truncate floating point
+		HANDLE_CAST_INST(46, FPExt   , FPExtInst   )  // Extend floating point
+		HANDLE_CAST_INST(47, PtrToInt, PtrToIntInst)  // Pointer -> Integer
+		HANDLE_CAST_INST(48, IntToPtr, IntToPtrInst)  // Integer -> Pointer
+		HANDLE_CAST_INST(49, BitCast , BitCastInst )  // Type cast
+		HANDLE_CAST_INST(50, AddrSpaceCast, AddrSpaceCastInst)  // addrspace cast
+		*/
+
+		/*
+		builder->CreateBitCast(value, dest_type, name): Converts a pointer value to a pointer type with a different pointee type. This is the most common use case for "reinterpreting" a pointer.
+		builder->CreatePtrToInt(value, dest_int_type, name): Converts a pointer to an integer type. The integer type should typically be intptr_t or uintptr_t to ensure it is large enough to hold the address.
+		builder->CreateIntToPtr(value, dest_ptr_type, name): Converts an integer value back to a pointer type.
+		builder->CreateAddrSpaceCast(value, dest_ptr_type, name): Converts a pointer in one address space to a pointer in a different address space.
+		*/
+
+		auto op = llvm::Instruction::CastOps::BitCast;
+		return CreateCast(op, value, destType);
+	}
+
+
+	llvm::Value* CreateCast(llvm::Instruction::CastOps op, llvm::Value* value, llvm::Type* destType)
+	{
+		return builder->CreateCast(op, value, destType);
+	}
+
+	// Returns default constructor
+	llvm::StructType* CreateStructType(std::string name, std::vector<MyCompilerLLVM::TypeAndValue> typeAndValues)
+	{
+		std::vector<llvm::Type*> types;
+
+		for (auto typeValue : typeAndValues)
+		{
+			types.emplace_back(GetType(typeValue));
+		}
+
+		llvm::StructType* myStruct = llvm::StructType::create(types, name);
+		dataStructures[name].StructType = myStruct;
+		dataStructures[name].StructFields = typeAndValues;
+
+		// Create default constructor
+		auto funcDef = CreateFunctionDefinition(name, {}, llvm::FunctionType::get(myStruct, {}, false));
+		return myStruct;
+	}
+
+	llvm::Value* CreateConstant(ConstantVariant constantVariant)
+	{
+		llvm::Value* value = nullptr;
+
+		if (auto* v = std::get_if<bool>(&constantVariant))
+		{
+			if (*v) { value = builder->getTrue(); }
+			else { value = builder->getFalse(); }
+		}
+		else if (auto* v = std::get_if<int>(&constantVariant))
+		{
+			value = builder->getInt32(*v);
+		}
+		else if (auto* v = std::get_if<int64_t>(&constantVariant))
+		{
+			value = builder->getInt64(*v);
+		}
+		else if (auto* v = std::get_if<float>(&constantVariant))
+		{
+			auto floatType = builder->getFloatTy();
+			value = llvm::ConstantFP::get(builder->getFloatTy(), *v);
+			// auto doubleVal = llvm::ConstantFP::get(builder->getDoubleTy(), *v);
+			// value = builder->CreateFPTrunc(doubleVal, floatType);
+		}
+		else  if (auto* v = std::get_if<double>(&constantVariant))
+		{
+			double upConvert = *v;
+			value = llvm::ConstantFP::get(builder->getDoubleTy(), *v);
+		}
+		else
+		{
+			__debugbreak;
+		}
+
+		return value;
 	}
 
 	llvm::Value* CreateConstant(std::string typeName, std::string initialValue)
@@ -302,6 +459,7 @@ public:
 			return right;
 
 		operation op = ParseOperation(oper);
+
 		return CreateOperation(op, left, right);
 	}
 
@@ -414,14 +572,14 @@ public:
 		}
 	}
 
-	llvm::FunctionType* GetFunctionType(std::string returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+	llvm::FunctionType* GetFunctionType(MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
 	{
 		std::vector<llvm::Type*> types;
 		types.reserve(arguments.size());
 
 		for (const MyCompilerLLVM::TypeAndValue& arg : arguments)
 		{
-			types.push_back(GetType(arg.TypeName, arg.pointer));
+			types.push_back(GetType(arg));
 		}
 
 		auto ft = llvm::FunctionType::get(GetType(returnType), types, varargs);
@@ -451,9 +609,10 @@ public:
 		return fn;
 	}
 
-	llvm::Type* GetType(std::string typeName, bool pointer = false)
+	llvm::Type* GetType(MyCompilerLLVM::TypeAndValue typeAndValue, llvm::Type* autoType = nullptr)
 	{
 		llvm::Type* type = nullptr;
+		auto typeName = typeAndValue.TypeName;
 
 		if (typeName == "void") { type = builder->getVoidTy(); }
 		else if (typeName == "char") { type = builder->getInt8Ty(); }
@@ -463,13 +622,22 @@ public:
 		else if (typeName == "float") { type = builder->getFloatTy(); }
 		else if (typeName == "double") { type = builder->getDoubleTy(); }
 		else if (typeName == "bool") { type = builder->getInt1Ty(); }
+		else if (typeName == "auto" && autoType != nullptr) { type = autoType; }
 		else
 		{
-			std::cout << "Unknown value: " << typeName << "\n";
-			type = builder->getVoidTy();
+			auto result = dataStructures.find(typeName);
+			if (result != dataStructures.end())
+			{
+				type = result->second.StructType;
+			}
+			else
+			{
+				std::cout << "Unknown value: " << typeName << "\n";
+				type = builder->getVoidTy();
+			}
 		}
 
-		if (pointer)
+		if (typeAndValue.pointer)
 			return type->getPointerTo();
 
 		return type;
@@ -521,6 +689,30 @@ public:
 		}
 
 		return nullptr;
+	}
+
+	StructData GetDatastructure(std::string structName)
+	{
+		auto result = dataStructures.find(structName);
+		if (result != dataStructures.end())
+		{
+			return result->second;
+		}
+
+		return {};
+	}
+
+	StructData GetDatastructure(llvm::StructType* structType)
+	{
+		for (auto [_, structData] : dataStructures)
+		{
+			if (structData.StructType == structType)
+			{
+				return structData;
+			}
+		}
+
+		return {};
 	}
 
 	llvm::Value* CreateFunctionCall(llvm::Function* func, std::vector<llvm::Value*> arg)
@@ -578,4 +770,3 @@ public:
 
 	bool Compile(std::string filename);
 };
-

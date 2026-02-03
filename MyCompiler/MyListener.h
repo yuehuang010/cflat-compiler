@@ -2,6 +2,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <format>
+#include <variant>
 
 #include "CParser.h"
 #include "CLexer.h"
@@ -52,7 +53,7 @@ private:
 		return directDecl->getText();
 	}
 
-	MyCompilerLLVM::TypeAndValue getTypeSpecifier(CParser::DeclarationSpecifiersContext* declSpecs)
+	MyCompilerLLVM::TypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
 	{
 		MyCompilerLLVM::TypeAndValue declType;
 		std::string typeName;
@@ -72,11 +73,11 @@ private:
 		return declType;
 	}
 
-	std::string getFunctionReturnType(CParser::FunctionDefinitionContext* ctx)
+	MyCompilerLLVM::TypeAndValue getFunctionReturnType(CParser::FunctionDefinitionContext* ctx)
 	{
 		auto declSpecs = ctx->declarationSpecifiers();
 
-		return getTypeSpecifier(declSpecs).TypeName;
+		return ParseDeclarationSpecifiers(declSpecs);
 	}
 
 	std::string getStructClassUnionName(CParser::StructClassUnionDefinitionContext* ctx)
@@ -157,7 +158,7 @@ public:
 				ParseBlockItemList(blockItemList);
 
 			// if return is void, then this might need a implicit return;
-			if (returnType == "void")
+			if (returnType.TypeName == "void")
 			{
 				this->compilerLLVM->CreateReturnCall(nullptr);
 			}
@@ -166,6 +167,10 @@ public:
 			this->compilerLLVM->CreateBlockBreak(nullptr);
 
 			global_scope = true;
+		}
+		else if (dataStruct != nullptr)
+		{
+			ParseStructClassUnionDefinition(dataStruct);
 		}
 	}
 
@@ -330,15 +335,51 @@ public:
 		__debugbreak();
 	}
 
+	std::vector<MyCompilerLLVM::TypeAndValue> ParseDeclarationList(CParser::DeclarationListContext* ctx)
+	{
+		std::vector<MyCompilerLLVM::TypeAndValue> result;
+
+		if (ctx)
+		{
+			auto declList = ctx->declaration();
+
+			for (auto decl : declList)
+			{
+				auto direct = decl->declarationSpecifiers();
+				auto typeAndValue = ParseDeclarationSpecifiers(direct);
+
+				auto initDeclList = decl->initDeclaratorList()->initDeclarator();
+				for (auto initDecl : initDeclList)
+				{
+					auto declarator = initDecl->declarator();
+					auto initializer = initDecl->initializer();
+
+					std::string name = declarator->directDeclarator()->getText();
+					typeAndValue.VariableName = name;
+					typeAndValue.Initializer = initializer;
+
+					result.push_back(typeAndValue);  // Should copy?
+				}
+			}
+		}
+
+		return result;
+	}
+
 	std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationContext* ctx)
 	{
 		std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
 		auto declSpec = ctx->declarationSpecifiers();
-		std::string typeName = declSpec->getText();
+		auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
 
 		auto initDecl = ctx->initDeclaratorList();
 		auto initDeclarVec = initDecl->initDeclarator();
+
+		if (typeAndValue.TypeName.empty())
+		{
+			__debugbreak();
+		}
 
 		// auto fullname = getScopeName(ctx);
 		for (auto initDecl : initDeclarVec)
@@ -364,17 +405,19 @@ public:
 				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParamaterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				auto ft = this->compilerLLVM->GetFunctionType(typeName, params, ellipsis);
+				auto ft = this->compilerLLVM->GetFunctionType(typeAndValue, params, ellipsis);
 				this->compilerLLVM->CreateFunctionDeclaration(direct->getText(), ft);
 			}
 			else if (direct != nullptr)
 			{
 				auto identList = declarator->identifierList();
 				std::string name = direct->getText();
+				typeAndValue.VariableName = name;
+
 				if (identList != nullptr)
 				{
 					// TODO
-					std::cout << "declarator identList: " << typeName << " " << name << "\n";
+					std::cout << "declarator identList: " << typeAndValue.TypeName << " " << name << "\n";
 				}
 
 				llvm::Value* right = nullptr;
@@ -391,11 +434,11 @@ public:
 				if (global_scope)
 				{
 					auto constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(right);
-					this->compilerLLVM->CreateGlobalVariable(name, typeName, constant);
+					this->compilerLLVM->CreateGlobalVariable(typeAndValue, constant);
 				}
 				else
 				{
-					auto alloc = this->compilerLLVM->CreateVariable(name, typeName);
+					auto alloc = this->compilerLLVM->CreateLocalVariable(typeAndValue, right->getType());
 					allocList.push_back(std::pair(name, alloc));
 
 					if (right != nullptr)
@@ -413,29 +456,24 @@ public:
 	{
 		auto condCtx = ctx->conditionalExpression();
 		auto assignmentOp = ctx->assignmentOperator();
+		auto unaryCtx = ctx->unaryExpression();
+
 		if (condCtx != nullptr)
 		{
 			return ParseConditionalExpression(condCtx);
 		}
 		else if (assignmentOp != nullptr)
 		{
-			auto unaryCtx = ctx->unaryExpression();
 			auto assignCtx = ctx->assignmentExpression();
 
 			auto destination = ParseUnaryExpression(unaryCtx, true);
 			auto right = ParseAssignmentExpression(assignCtx);
 
-			if (auto alloc = llvm::dyn_cast<llvm::AllocaInst>(destination))
-			{
-				return compilerLLVM->CreateAssignment(right, alloc);
-			}
-			else if (auto gVar = llvm::dyn_cast<llvm::GlobalVariable>(destination))
-			{
-				return compilerLLVM->CreateAssignment(right, gVar);
-			}
-
-			__debugbreak();
-			return nullptr;
+			return compilerLLVM->CreateAssignment(right, destination);
+		}
+		else if (unaryCtx)
+		{
+			return ParseUnaryExpression(unaryCtx, false);
 		}
 
 		__debugbreak();
@@ -634,15 +672,15 @@ public:
 	{
 		auto nextCtxs = ctx->castExpression();
 
-		llvm::Value* lvalue = nullptr;
-		llvm::Value* rvalue = nullptr;
-
 		if (nextCtxs.size() == 1)
 		{
 			return ParseCastExpression(nextCtxs[0]);
 		}
 		else if (nextCtxs.size() > 1)
 		{
+			llvm::Value* lvalue = nullptr;
+			llvm::Value* rvalue = nullptr;
+
 			int count = 0;
 			for (const auto& nextCtx : nextCtxs)
 			{
@@ -659,22 +697,101 @@ public:
 
 	llvm::Value* ParseCastExpression(CParser::CastExpressionContext* ctx)
 	{
+		/*
+		castExpression : (int*)&num_f
+		typeName : int*
+		specifierQualifierList : int
+		typeSpecifier : int
+		abstractDeclarator : *
+		pointer : *
+		castExpression : &num_f
+		unaryExpression : &num_f
+		unaryOperator : &
+		castExpression : num_f
+		unaryExpression : num_f
+		postfixExpression : num_f
+		primaryExpression : num_f
+		*/
+
+
 		auto unaryCtx = ctx->unaryExpression();
+		auto castExp = ctx->castExpression();
+		auto typeName = ctx->typeName();
+
 		if (unaryCtx != nullptr)
 		{
 			return ParseUnaryExpression(unaryCtx);
+		}
+		else if (castExp && typeName)
+		{
+			auto rvalue = ParseCastExpression(castExp);
+			auto destTypeName = ParseTypeName(typeName);
+			auto type = compilerLLVM->GetType(destTypeName);
+
+			return compilerLLVM->CreateCast(rvalue, type);
 		}
 
 		__debugbreak();
 		return nullptr;
 	}
 
+	MyCompilerLLVM::TypeAndValue ParseTypeName(CParser::TypeNameContext* ctx)
+	{
+		auto specCtx = ctx->specifierQualifierList();
+		auto abstractDecl = ctx->abstractDeclarator();
+
+		MyCompilerLLVM::TypeAndValue typeValue;
+
+		if (specCtx)
+		{
+			auto typeQualfier = specCtx->typeQualifier();
+			auto typeSpecs = specCtx->typeSpecifier();
+
+			if (typeSpecs.size() > 0)
+			{
+				// TODO Collect all of them.
+				typeValue.TypeName = typeSpecs[0]->getText();
+			}
+		}
+		else
+		{
+			// undefined type.
+			__debugbreak();
+			return typeValue;
+		}
+
+		if (abstractDecl && abstractDecl->pointer())
+		{
+			typeValue.pointer = true;
+		}
+
+		return typeValue;
+	}
+
+
 	llvm::Value* ParseUnaryExpression(CParser::UnaryExpressionContext* ctx, bool lValue = false)
 	{
 		auto postFixCtx = ctx->postfixExpression();
+		auto castExpCtx = ctx->castExpression();
+		auto unaryOperator = ctx->unaryOperator();
+
 		if (postFixCtx != nullptr)
 		{
 			return ParsePostfixExpression(postFixCtx, lValue);
+		}
+		else if (unaryOperator && castExpCtx)
+		{
+			/* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
+
+			auto castExpression = ParseCastExpression(castExpCtx);
+
+			if (unaryOperator->getText() == "&")
+			{
+				// llvm will convert alloc into pointer type.
+			}
+
+			// TODO, unaryOperator
+			return castExpression;
 		}
 
 		__debugbreak();
@@ -712,10 +829,47 @@ public:
 			else
 			{
 				auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
+				uint32_t count = 0;
+
+				if (primaryExpression->getType()->isStructTy())
+				{
+					auto ident = ctx->Identifier(count);
+					while ((ident = ctx->Identifier(count)) != nullptr)
+					{
+						auto structType = llvm::dyn_cast<llvm::StructType>(primaryExpression->getType());
+						auto datastrcture = compilerLLVM->GetDatastructure(structType);
+						uint32_t fieldCount = -1;
+						std::string identName = ident->getText();
+						for (auto field : datastrcture.StructFields)
+						{
+							fieldCount++;
+							if (field.VariableName == identName)
+							{
+								break;
+							}
+						}
+
+						if (fieldCount == -1)
+						{
+							__debugbreak();
+						}
+
+						// primaryExpression = compilerLLVM->CreateExtractValue(primaryExpression, { fieldCount });
+
+						auto destAlloc = compilerLLVM->CreateStructGEP(structType, storage, fieldCount);
+
+						if (storage != nullptr)
+							storage = destAlloc;
+
+						// primaryExpression = compilerLLVM->CreateLoad(structType->getTypeAtIndex(fieldCount), destAlloc);
+						primaryExpression = compilerLLVM->CreateLoad(destAlloc, true);
+						count++;
+					}
+				}
 
 				if (storage != nullptr)
 				{
-					// Disable lValue don't support increment.
+					// Disable increment on lValue.
 					if (lValue)
 						return storage;
 
@@ -772,7 +926,13 @@ public:
 				return std::tuple(this->compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
 			}
 			else
-				return std::tuple(this->compilerLLVM->CreateConstant("int", constant->getText()), nullptr);
+			{
+				std::string constantRaw = constant->getText();
+				auto number = ParseNumberConstant(constantRaw);
+
+				auto value = compilerLLVM->CreateConstant(number);
+				return { value, nullptr };
+			}
 		}
 		else if (identifier)
 		{
@@ -866,6 +1026,55 @@ public:
 		return nullptr;
 	}
 
+	void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx)
+	{
+		auto decl = ctx->directDeclarator();
+		std::string structName = decl->getText();
+		auto declarationList = ctx->declarationList();
+		std::vector<llvm::Type*> types;
+		auto declList = ParseDeclarationList(declarationList);
+
+		auto structType = compilerLLVM->CreateStructType(structName, declList);
+		llvm::Value* structVal = llvm::UndefValue::get(structType);
+
+		MyCompilerLLVM::TypeAndValue myStruct;
+		myStruct.TypeName = structName;
+		myStruct.VariableName = "_" + structName;
+
+		auto myStructAlloc = this->compilerLLVM->CreateLocalVariable(myStruct);
+		unsigned int structIndex = 0;
+
+		for (auto typeValue : declList)
+		{
+			auto initilizer = typeValue.Initializer;
+			llvm::Value* rvalue;
+			if (initilizer != nullptr)
+			{
+				auto assignmentExpression = initilizer->assignmentExpression();
+				if (assignmentExpression != nullptr)
+				{
+					rvalue = ParseAssignmentExpression(assignmentExpression);
+
+					if (rvalue != nullptr)
+					{
+						// auto constValue = compilerLLVM->CreateConstant("int", "10);
+						structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
+						// llvm::Value* structField = compilerLLVM->CreateStructGEP(structType, myStructAlloc, structIndex, typeValue.VariableName);
+						// this->compilerLLVM->CreateAssignment(rvalue, structField);
+					}
+
+				}
+			}
+
+			structIndex++;
+		}
+
+		// close constructor.
+		compilerLLVM->CreateReturnCall(structVal);
+		// Pop the stack
+		this->compilerLLVM->CreateBlockBreak(nullptr);
+	}
+
 	std::vector<MyCompilerLLVM::TypeAndValue> ParseParamaterTypeList(CParser::ParameterTypeListContext* paramTypeList)
 	{
 		std::vector<MyCompilerLLVM::TypeAndValue> params;
@@ -878,12 +1087,45 @@ public:
 
 		for (auto paramDecl : paramDeclList)
 		{
-			MyCompilerLLVM::TypeAndValue paramType = this->getTypeSpecifier(paramDecl->declarationSpecifiers());
+			MyCompilerLLVM::TypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
 			paramType.VariableName = paramDecl->declarator()->directDeclarator()->getText();
 			params.push_back(paramType);
 		}
 
 		return params;
+	}
+
+	MyCompilerLLVM::ConstantVariant ParseNumberConstant(std::string rawNumber)
+	{
+		char lastChar = std::tolower(rawNumber.back());
+
+		if (lastChar == 'f')
+		{
+			// Parse as float, excluding the 'f' suffix
+			return std::stof(rawNumber.substr(0, rawNumber.size() - 1));
+		}
+		else if (lastChar == 'd' || lastChar == '.' || rawNumber.find('.') != std::string::npos)
+		{
+			// Parse as double, keeping the 'd' if present or removing nothing
+			size_t end = (lastChar == 'd') ? rawNumber.size() - 1 : rawNumber.size();
+			return std::stod(rawNumber.substr(0, end));
+		}
+		else if (lastChar == 'l')
+		{
+			size_t end = rawNumber.size() - 1;
+
+			// capture ll
+			if (rawNumber[end] == 'l' || rawNumber[end] == 'L')
+				end--;
+
+			return std::stoll(rawNumber.substr(0, end));
+		}
+		else
+		{
+			return std::stoi(rawNumber);
+		}
+
+		return 0;
 	}
 
 	void PrintContext(antlr4::ParserRuleContext* ctx)

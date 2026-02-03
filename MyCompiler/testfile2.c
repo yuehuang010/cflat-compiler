@@ -1,41 +1,32 @@
 void printf(const char* argv, ...);
 
-//
-//int Test(const char* testName, int expected, int actual)
-//{
-//    if (expected == actual)
-//    {
-//        printf("%s passed.\n", testName);
-//        return 1;
-//    }
-//
-//    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-//    return 0;
-//}
+float g_num_f = 111.f;
 
+/*
+int : 100
+int : 0X000064
+long : 100
+long : 0X00000000000064
+float : 100.000000
+float : 0X42C80000
+double : 100.000000
+double : 0X4059000000000000
+*/
 
-bool Test(const char* testName, bool expected, bool actual)
+struct myStruct
 {
-    if (expected == actual)
-    {
-        printf("%s passed.\n", testName);
-        return true;
-    }
+	int num1 = 1;
+	int num2 = 2;
+	int num3 = 3;
+	int result = 0;
+};
 
-    printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
-    return false;
-}
-
-int mySimpleFunction(int argc)
+int main()
 {
-    int var = argc;
-    return var;
-}
+	auto myS = myStruct();
+	myS.num1++;
+	myS.result = myS.num1 + myS.num2 + myS.num3;
+	int num = myS.num1 + myS.num2 + myS.num3;
 
-
-
-int main() {
-    Test("Testing True", true, true);
-    // Test("mySimpleFunction", 11, mySimpleFunction(11));
-    return 0;
+	return 0;
 }

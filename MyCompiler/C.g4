@@ -66,7 +66,7 @@ unaryExpression
     : ('sizeof')* (
         postfixExpression
         | unaryOperator castExpression
-        | ('sizeof' | '_Alignof') '(' typeName ')'
+        | ('sizeof' | 'alignof') '(' typeName ')'
         | '&&' Identifier // GCC extension address of label
     )
     ;
@@ -131,8 +131,8 @@ conditionalExpression
     ;
 
 assignmentExpression
-    : conditionalExpression
-    | unaryExpression assignmentOperator assignmentExpression
+    : unaryExpression assignmentOperator assignmentExpression
+    | conditionalExpression
     | DigitSequence // for
     ;
 
@@ -188,7 +188,6 @@ storageClassSpecifier
     | 'extern'
     | 'static'
     | 'thread_local'
-    | 'auto'
     | 'register'
     ;
 
@@ -205,6 +204,7 @@ typeSpecifier
     | 'bool'
     | structClassUnion
     | 'enum'
+    | 'auto'
     ;
 
 structOrUnionSpecifier
@@ -229,7 +229,7 @@ structDeclaration // The first two rules have priority order and cannot be simpl
     ;
 
 specifierQualifierList
-    : (typeSpecifier | typeQualifier) specifierQualifierList?
+    : typeQualifier? (typeSpecifier)*
     ;
 
 structDeclaratorList
@@ -319,7 +319,7 @@ typeName
 
 abstractDeclarator
     : pointer
-    | pointer? directAbstractDeclarator
+//    | pointer? directAbstractDeclarator
     ;
 
 directAbstractDeclarator

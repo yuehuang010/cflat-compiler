@@ -1,9 +1,11 @@
-int foobar = 0;
-double foocat;
 
 void printf(const char* argv, ...);
 
-int Test(const char* testName, int expected, int actual) {
+int foobar = 0;
+double foocat;
+
+int Test(const char* testName, int actual, int expected)
+{
     if (expected == actual)
     {
         printf("%s passed.\n", testName);
@@ -14,8 +16,9 @@ int Test(const char* testName, int expected, int actual) {
     return 0;
 }
 
-bool TestBool(const char* testName, bool expected, bool actual)
+bool TestBool(const char* testName, bool actual)
 {
+    bool expected = true;
     if (expected == actual)
     {
         printf("%s passed.\n", testName);
@@ -116,17 +119,43 @@ int testMultipleBreaks()
     return n;
 }
 
+bool testFloatPoint()
+{
+    //float num1 = 10.0f;
+    //float num2 = 11.0f;
+
+    //return num1 > num2;
+    return true;
+}
+
+struct MyStruct
+{
+    int num1 = 1;
+    int num2 = 2;
+    int num3 = 3;
+};
+
+int testStruct()
+{
+    auto myStruct = MyStruct();
+    myStruct.num1 = 100;
+    myStruct.num2++;
+    return myStruct.num1 + myStruct.num2 + myStruct.num3;
+}
+
 int main(int argc, char** argv) {
     bool result = true;
     testEmptyFunction();
     testEmptyIfStatement();
-    result &= Test("testConditional", 12, testConditional());
-    result &= Test("testIfElseStatement", 11, testIfElseStatement());
-    result &= Test("myWhileLoopNotEnter", 0, myWhileLoopNotEnter());
-    result &= Test("myWhileLoopDecrement", 0, myWhileLoopDecrement());
-    result &= Test("myWhileLoopBreak", 5, myWhileLoopBreak());
-    result &= Test("mySimpleFunction", 11, myFunctionArgument(11));
-    result &= Test("testMultipleBreaks", 20, testMultipleBreaks());
+    result &= Test("testConditional", testConditional(), 12);
+    result &= Test("testIfElseStatement", testIfElseStatement(), 11);
+    result &= Test("myWhileLoopNotEnter", myWhileLoopNotEnter(), 0);
+    result &= Test("myWhileLoopDecrement", myWhileLoopDecrement(), 0);
+    result &= Test("myWhileLoopBreak", myWhileLoopBreak(), 5);
+    result &= Test("mySimpleFunction", myFunctionArgument(11), 11);
+    result &= Test("testMultipleBreaks", testMultipleBreaks(), 20);
+    // result &= TestBool("testFloatPoint", testFloatPoint());
+    result &= Test("testStruct", testStruct(), 106);
 
     if (result)
     {
