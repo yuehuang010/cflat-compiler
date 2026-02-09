@@ -51,7 +51,7 @@ public:
 		std::unordered_map<std::string, llvm::Argument*> functionArgument;
 		std::unordered_map<std::string, llvm::AllocaInst*> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
-		llvm::BasicBlock* resumeBlock = nullptr; // break;
+		llvm::BasicBlock* resumeBlock = nullptr; // break;r;
 
 		void ClearBlock()
 		{
@@ -60,7 +60,7 @@ public:
 		}
 	};
 
-	using ConstantVariant = std::variant<bool, int, int64_t, float, double>;
+	using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
 
 private:
 	std::unique_ptr<llvm::IRBuilder<>> builder;
@@ -150,13 +150,37 @@ public:
 		context.release();
 	}
 
-	llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::ConstantInt* initValue)
+	llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue)
 	{
+		llvm::Type* destinationType = GetType(typeValue);
+		if (initValue)
+		{
+			if (auto intValue = llvm::dyn_cast<llvm::ConstantInt>(initValue))
+			{
+				if (intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
+				{
+					initValue = builder->getIntN(destinationType->getIntegerBitWidth(), intValue->getZExtValue());
+				}
+			}
+			else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
+			{
+				if (fpValue->getType()->getScalarSizeInBits() == destinationType->getScalarSizeInBits())
+				{
+					initValue = llvm::ConstantFP::get(destinationType, fpValue->getValueAPF());
+				}
+			}
+		}
+		else
+		{
+			// initialize to 0
+			initValue = CreateConstant(typeValue.TypeName, "0");
+		}
+
 		auto gVar = new llvm::GlobalVariable(
 			*module,
-			GetType(typeValue), // Type: int32
+			destinationType,
 			false, // isConstant
-			llvm::GlobalValue::ExternalLinkage,
+			llvm::GlobalValue::LinkageTypes::ExternalLinkage,
 			initValue, // Initial value
 			typeValue.VariableName // Name
 		);
@@ -175,24 +199,9 @@ public:
 
 	llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
 	{
-		llvm::LoadInst* loadInst = CreateLoad(destination, true);
-		/*
-		if (auto alloc = llvm::dyn_cast<llvm::AllocaInst>(destination))
-		{
-			loadInst = CreateLoad(alloc, true);
-		}
-		else if (auto gVar = llvm::dyn_cast<llvm::GlobalVariable>(destination))
-		{
-			loadInst = CreateLoad(gVar);
-		}
-		else
-		{
-			__debugbreak();
-			return nullptr;
-		}*/
+		llvm::LoadInst* loadInst = CreateLoad(destination);
 
 		auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
-		// auto value = builder->getInt32(amount);
 		auto newValue = CreateOperation(operation::Add, loadInst, value);
 		return builder->CreateStore(newValue, destination);
 	}
@@ -200,15 +209,14 @@ public:
 	/// <summary>
 	/// Initialize a constant in the structInstance;
 	/// </summary>
-	/// <param name="structInstance"></param>
-	/// <param name="newValue"></param>
-	/// <param name="index"></param>
-	/// <returns></returns>
 	llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index)
 	{
 		return builder->CreateInsertValue(structInstance, newValue, index);
 	}
 
+	/// <summary>
+	/// Get the Storage position in a struct.
+	/// </summary>
 	llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "")
 	{
 		return builder->CreateStructGEP(structType, structAlloc, index, variableName);
@@ -221,35 +229,79 @@ public:
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination)
 	{
+		value = Upconvert(value, destination);
 		return builder->CreateStore(value, destination);
 	}
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::AllocaInst* destination)
 	{
+		value = Upconvert(value, destination);
 		return builder->CreateStore(value, destination);
 	}
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::GlobalVariable* destination)
 	{
+		value = Upconvert(value, destination);
 		return builder->CreateStore(value, destination);
 	}
 
-	llvm::LoadInst* CreateLoad(llvm::AllocaInst* alloc)
+	//llvm::LoadInst* CreateLoad(llvm::AllocaInst* alloc)
+	//{
+	//	return builder->CreateLoad(alloc->getAllocatedType(), alloc);
+	//}
+
+	//llvm::LoadInst* CreateLoad(llvm::GlobalVariable* gVar)
+	//{
+	//	return builder->CreateLoad(gVar->getType(), gVar);
+	//}
+
+	//llvm::LoadInst* CreateLoad(llvm::Argument* funcArgument)
+	//{
+	//	return builder->CreateLoad(funcArgument->getType(), funcArgument);
+	//}
+
+	llvm::LoadInst* CreateLoad(llvm::Value* value)
 	{
-		return builder->CreateLoad(alloc->getAllocatedType(), alloc);
+		llvm::Type* type = GetTypeFromStorage(value);
+		return builder->CreateLoad(type, value);
 	}
 
-	llvm::LoadInst* CreateLoad(llvm::GlobalVariable* gVar)
+	llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination)
 	{
-		return builder->CreateLoad(gVar->getType(), gVar);
+		auto destType = GetTypeFromStorage(destination);
+		return Upconvert(value, destType);
 	}
 
-	llvm::LoadInst* CreateLoad(llvm::Argument* funcArgument)
+	llvm::Value* Upconvert(llvm::Value* value, llvm::Type* destType)
 	{
-		return builder->CreateLoad(funcArgument->getType(), funcArgument);
+		auto srcType = value->getType();
+		if (srcType->isIntegerTy() && destType->isIntegerTy())
+		{
+			auto targetSize = destType->getIntegerBitWidth();
+			auto srcSize = srcType->getIntegerBitWidth();
+
+			// upconvert is needed
+			if (srcSize < targetSize)
+			{
+				return builder->CreateZExt(value, destType);
+			}
+		}
+		else if (srcType->isFloatingPointTy() && destType->isFloatingPointTy())
+		{
+			auto targetSize = destType->getScalarSizeInBits();
+			auto srcSize = srcType->getScalarSizeInBits();
+
+			// upconvert is needed
+			if (srcSize < targetSize)
+			{
+				return builder->CreateFPExt(value, destType);
+			}
+		}
+
+		return value;
 	}
 
-	llvm::LoadInst* CreateLoad(llvm::Value* value, bool mine)
+	llvm::Type* GetTypeFromStorage(llvm::Value* value)
 	{
 		llvm::Type* type = nullptr;
 
@@ -268,8 +320,12 @@ public:
 			// If it's a global variable
 			type = global->getValueType();
 		}
+		else
+		{
+			type = value->getType();
+		}
 
-		return builder->CreateLoad(type, value);
+		return type;
 	}
 
 	llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType)
@@ -335,6 +391,14 @@ public:
 			if (*v) { value = builder->getTrue(); }
 			else { value = builder->getFalse(); }
 		}
+		else if (auto* v = std::get_if<char>(&constantVariant))
+		{
+			value = builder->getInt8(*v);
+		}
+		else if (auto* v = std::get_if<short>(&constantVariant))
+		{
+			value = builder->getInt16(*v);
+		}
 		else if (auto* v = std::get_if<int>(&constantVariant))
 		{
 			value = builder->getInt32(*v);
@@ -363,9 +427,9 @@ public:
 		return value;
 	}
 
-	llvm::Value* CreateConstant(std::string typeName, std::string initialValue)
+	llvm::Constant* CreateConstant(std::string typeName, std::string initialValue)
 	{
-		llvm::Value* value = nullptr;
+		llvm::Constant* value = nullptr;
 
 		if (typeName == "char")
 		{
@@ -407,26 +471,24 @@ public:
 
 			value = builder->getInt64(initValue);
 		}
-		//else if (typeName == "float")
-		//{
-		//	float initValue = 0;
-		//	if (!initialValue.empty())
-		//	{
-		//		initValue = std::stof(initialValue);
-		//	}
-
-		//	value = builder->getFP(initValue);
-		//}
-		//else if (typeName == "double")
-		//{
-		//	double initValue = 0;
-		//	if (!initialValue.empty())
-		//	{
-		//		initValue = std::stoi(initialValue);
-		//	}
-
-		//	value = builder->getInt8(initValue);
-		//}
+		else if (typeName == "float")
+		{
+			float initValue = 0;
+			if (!initialValue.empty())
+			{
+				initValue = std::stof(initialValue);
+			}
+			value = llvm::ConstantFP::get(builder->getFloatTy(), initValue);
+		}
+		else if (typeName == "double")
+		{
+			double initValue = 0;
+			if (!initialValue.empty())
+			{
+				initValue = std::stoi(initialValue);
+			}
+			value = llvm::ConstantFP::get(builder->getDoubleTy(), initValue);
+		}
 		else if (typeName == "bool")
 		{
 			if (!initialValue.empty() && initialValue == "true")
@@ -468,39 +530,83 @@ public:
 		if (left == nullptr)
 			return right;
 
-		// NSW (No Signed Wrap) and NUS(No Unsigned Wrap)
-		switch (op)
+		// Upconvert both
+		left = Upconvert(left, right);
+		right = Upconvert(right, left);
+
+		// Note: NSW (No Signed Wrap) and NUS(No Unsigned Wrap)
+
+		if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
 		{
-		case operation::Add: {
-			return builder->CreateAdd(left, right);
+			switch (op)
+			{
+			case operation::Add: {
+				return builder->CreateFAdd(left, right);
+			}
+			case operation::Subtract: {
+				return builder->CreateFSub(left, right);
+			}
+			case operation::Multiply: {
+				return builder->CreateFMul(left, right);
+			}
+			case operation::Divide: {
+				return builder->CreateFDiv(left, right);
+			}
+			case operation::Equal: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_EQ, left, right);
+			}
+			case operation::NotEqual: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_NE, left, right);
+			}
+			case operation::Greater: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGT, left, right);
+			}
+			case operation::GreaterEqual: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGE, left, right);
+			}
+			case operation::Less: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLT, left, right);
+			}
+			case operation::LessEqual: {
+				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLE, left, right);
+			}
+			}
 		}
-		case operation::Subtract: {
-			return builder->CreateSub(left, right);
-		}
-		case operation::Multiply: {
-			return builder->CreateMul(left, right);
-		}
-		case operation::Divide: {
-			return builder->CreateSDiv(left, right);
-		}
-		case operation::Equal: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
-		}
-		case operation::NotEqual: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
-		}
-		case operation::Greater: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_SGT, left, right);
-		}
-		case operation::GreaterEqual: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_SGE, left, right);
-		}
-		case operation::Less: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_SLT, left, right);
-		}
-		case operation::LessEqual: {
-			return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
-		}
+		else
+		{
+			switch (op)
+			{
+			case operation::Add: {
+				return builder->CreateAdd(left, right);
+			}
+			case operation::Subtract: {
+				return builder->CreateSub(left, right);
+			}
+			case operation::Multiply: {
+				return builder->CreateMul(left, right);
+			}
+			case operation::Divide: {
+				return builder->CreateSDiv(left, right);
+			}
+			case operation::Equal: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
+			}
+			case operation::NotEqual: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
+			}
+			case operation::Greater: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGT, left, right);
+			}
+			case operation::GreaterEqual: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGE, left, right);
+			}
+			case operation::Less: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLT, left, right);
+			}
+			case operation::LessEqual: {
+				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
+			}
+			}
 		}
 
 		__debugbreak();
@@ -717,6 +823,57 @@ public:
 
 	llvm::Value* CreateFunctionCall(llvm::Function* func, std::vector<llvm::Value*> arg)
 	{
+		// Perform Default Argument Promotions for Variadic arguments
+		if (func->isVarArg())
+		{
+			std::vector<llvm::Value*> newArg;
+			int varArgStart = func->arg_size();
+			for (auto value : arg)
+			{
+				if (varArgStart > 0)
+				{
+					auto destArgument = func->getArg(func->arg_size() - varArgStart);
+					auto srcArg = Upconvert(value, destArgument);
+					newArg.push_back(srcArg);
+					varArgStart--;
+					continue;
+				}
+
+				auto valueType = value->getType();
+
+				// Convert 16bit 32bit float to double and non-32bit int to 64bit.
+				if (valueType->isIntegerTy(8) /*|| valueType->isIntegerTy(16)*/)
+				{
+					auto newValue = builder->CreateSExt(value, builder->getInt32Ty(), "conv");
+					newArg.push_back(newValue);
+				}
+				else if (valueType->is16bitFPTy() || valueType->isFloatTy())
+				{
+					auto newValue = builder->CreateFPExt(value, builder->getDoubleTy(), "conv");
+					newArg.push_back(newValue);
+				}
+				else
+				{
+					newArg.push_back(value);
+				}
+			}
+
+			arg = newArg;
+		}
+		else
+		{
+			std::vector<llvm::Value*> newArg;
+
+			for (int i = 0; i < arg.size(); i++)
+			{
+				auto srcArgument = arg[i];
+				auto destArgument = func->getArg(i);
+				newArg.push_back(Upconvert(srcArgument, destArgument));
+			}
+
+			arg = newArg;
+		}
+
 		return builder->CreateCall(func, arg);
 	}
 
@@ -729,7 +886,10 @@ public:
 		if (value == nullptr)
 			builder->CreateRetVoid();
 		else
+		{
+			value = Upconvert(value, currentFunction->getReturnType());
 			builder->CreateRet(value);
+		}
 	}
 
 	void CreateBreakCall()

@@ -1,8 +1,9 @@
 
 void printf(const char* argv, ...);
 
-int foobar = 0;
-double foocat;
+int fooInt = 0;
+double fooDouble;
+float fooFloat = 10.f;
 
 int Test(const char* testName, int actual, int expected)
 {
@@ -27,6 +28,13 @@ bool TestBool(const char* testName, bool actual)
 
     printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
     return false;
+}
+
+void testGlobalVariable()
+{
+    int num = fooInt;
+    float num2 = fooFloat;
+    double num3 = fooDouble;
 }
 
 int myFunctionArgument(int argc) {
@@ -119,15 +127,6 @@ int testMultipleBreaks()
     return n;
 }
 
-bool testFloatPoint()
-{
-    //float num1 = 10.0f;
-    //float num2 = 11.0f;
-
-    //return num1 > num2;
-    return true;
-}
-
 struct MyStruct
 {
     int num1 = 1;
@@ -143,6 +142,46 @@ int testStruct()
     return myStruct.num1 + myStruct.num2 + myStruct.num3;
 }
 
+
+short testShortAdd()
+{
+    short num1 = 10;
+    short num2 = 10;
+    return num1 + num2;
+}
+
+int testIntAdd()
+{
+    int num1 = 10;
+    int num2 = 10;
+    return num1 + num2;
+}
+
+double testDoubleAdd()
+{
+    double num1 = 10.0;
+    double num2 = 10.0;
+    return num1 + num2;
+}
+
+float testFloatAdd()
+{
+    float num1 = 10.0f;
+    float num2 = 10.0f;
+    return num1 + num2;
+}
+
+int testOrderOfOperation()
+{
+    int num1 = 1;
+    int num2 = 2;
+    int num3 = 3;
+    int num4 = 4;
+
+    int num5 = num1 + num2 * num3 + num4;
+    return num5;
+}
+
 int main(int argc, char** argv) {
     bool result = true;
     testEmptyFunction();
@@ -154,8 +193,12 @@ int main(int argc, char** argv) {
     result &= Test("myWhileLoopBreak", myWhileLoopBreak(), 5);
     result &= Test("mySimpleFunction", myFunctionArgument(11), 11);
     result &= Test("testMultipleBreaks", testMultipleBreaks(), 20);
-    // result &= TestBool("testFloatPoint", testFloatPoint());
     result &= Test("testStruct", testStruct(), 106);
+    result &= Test("testShortAdd", testShortAdd(), 20);
+    result &= Test("testIntAdd", testIntAdd(), 20);
+    result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);
+    testFloatAdd();
+    testDoubleAdd();
 
     if (result)
     {

@@ -433,12 +433,12 @@ public:
 
 				if (global_scope)
 				{
-					auto constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(right);
+					auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
 					this->compilerLLVM->CreateGlobalVariable(typeAndValue, constant);
 				}
 				else
 				{
-					auto alloc = this->compilerLLVM->CreateLocalVariable(typeAndValue, right->getType());
+					auto alloc = this->compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr);
 					allocList.push_back(std::pair(name, alloc));
 
 					if (right != nullptr)
@@ -854,15 +854,12 @@ public:
 							__debugbreak();
 						}
 
-						// primaryExpression = compilerLLVM->CreateExtractValue(primaryExpression, { fieldCount });
-
 						auto destAlloc = compilerLLVM->CreateStructGEP(structType, storage, fieldCount);
 
 						if (storage != nullptr)
 							storage = destAlloc;
 
-						// primaryExpression = compilerLLVM->CreateLoad(structType->getTypeAtIndex(fieldCount), destAlloc);
-						primaryExpression = compilerLLVM->CreateLoad(destAlloc, true);
+						primaryExpression = compilerLLVM->CreateLoad(destAlloc);
 						count++;
 					}
 				}
@@ -1057,10 +1054,8 @@ public:
 
 					if (rvalue != nullptr)
 					{
-						// auto constValue = compilerLLVM->CreateConstant("int", "10);
+						rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
 						structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
-						// llvm::Value* structField = compilerLLVM->CreateStructGEP(structType, myStructAlloc, structIndex, typeValue.VariableName);
-						// this->compilerLLVM->CreateAssignment(rvalue, structField);
 					}
 
 				}
@@ -1122,7 +1117,19 @@ public:
 		}
 		else
 		{
-			return std::stoi(rawNumber);
+			auto number = std::stoi(rawNumber);
+			if (number < std::numeric_limits<int16_t>::max())
+			{
+				short value = number;
+				return value;
+			}
+			else if (number < std::numeric_limits<int8_t>::max())
+			{
+				char value = number;
+				return value;
+			}
+
+			return number;
 		}
 
 		return 0;
