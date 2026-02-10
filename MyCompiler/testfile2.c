@@ -1,18 +1,28 @@
 void printf(const char* argv, ...);
 
-int fooInt = 0;
-double fooDouble;
-float fooFloat = 10.f;
-
-void testGlobalVariable()
+struct MyStruct
 {
-    int num = fooInt;
-    float num2 = fooFloat;
-    double num3 = fooDouble;
+    int num1 = 1;
+    int num2 = 2;
+    int num3 = 3;
+};
+
+struct MyStruct2
+{
+    auto myStruct = MyStruct();
+};
+
+
+MyStruct2 Function()
+{
+    auto myStruct = MyStruct2();
+    return myStruct;
 }
 
 int main()
 {
-    testGlobalVariable();
+    auto mystruct2 = Function();
+
+    printf("mystruct2.myStruct.num1 = %d", mystruct2.myStruct.num1);
 	return 0;
 }

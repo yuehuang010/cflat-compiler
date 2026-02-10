@@ -14,7 +14,7 @@
 class MyCompilerLLVM
 {
 public:
-	enum class operation
+	enum class Operation
 	{
 		None,
 		Add,
@@ -106,8 +106,6 @@ private:
 		currentFunction = fn;
 	}
 
-	llvm::Value* gen() { return builder->getInt32(43); }
-
 	void Init()
 	{
 		context = std::make_unique<llvm::LLVMContext>();
@@ -121,23 +119,22 @@ private:
 		llvm::raw_fd_ostream outLL(filename, errorCode);
 		module->print(outLL, nullptr);
 	}
-	operation ParseOperation(std::string operationText)
+	Operation ParseOperation(std::string operationText)
 	{
-		if (operationText == "+") { return operation::Add; }
-		else if (operationText == "*") { return operation::Multiply; }
-		else if (operationText == "-") { return operation::Subtract; }
-		else if (operationText == "/") { return operation::Divide; }
-		else if (operationText == "==") { return operation::Equal; }
-		else if (operationText == "!=") { return operation::NotEqual; }
-		else if (operationText == ">") { return operation::Greater; }
-		else if (operationText == ">=") { return operation::GreaterEqual; }
-		else if (operationText == "<") { return operation::Less; }
-		else if (operationText == "<=") { return operation::LessEqual; }
+		if (operationText == "+") { return Operation::Add; }
+		else if (operationText == "*") { return Operation::Multiply; }
+		else if (operationText == "-") { return Operation::Subtract; }
+		else if (operationText == "/") { return Operation::Divide; }
+		else if (operationText == "==") { return Operation::Equal; }
+		else if (operationText == "!=") { return Operation::NotEqual; }
+		else if (operationText == ">") { return Operation::Greater; }
+		else if (operationText == ">=") { return Operation::GreaterEqual; }
+		else if (operationText == "<") { return Operation::Less; }
+		else if (operationText == "<=") { return Operation::LessEqual; }
 
 		__debugbreak();
-		return operation::None;
+		return Operation::None;
 	}
-
 
 public:
 	MyCompilerLLVM() { Init(); }
@@ -202,7 +199,7 @@ public:
 		llvm::LoadInst* loadInst = CreateLoad(destination);
 
 		auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
-		auto newValue = CreateOperation(operation::Add, loadInst, value);
+		auto newValue = CreateOperation(Operation::Add, loadInst, value);
 		return builder->CreateStore(newValue, destination);
 	}
 
@@ -244,21 +241,6 @@ public:
 		value = Upconvert(value, destination);
 		return builder->CreateStore(value, destination);
 	}
-
-	//llvm::LoadInst* CreateLoad(llvm::AllocaInst* alloc)
-	//{
-	//	return builder->CreateLoad(alloc->getAllocatedType(), alloc);
-	//}
-
-	//llvm::LoadInst* CreateLoad(llvm::GlobalVariable* gVar)
-	//{
-	//	return builder->CreateLoad(gVar->getType(), gVar);
-	//}
-
-	//llvm::LoadInst* CreateLoad(llvm::Argument* funcArgument)
-	//{
-	//	return builder->CreateLoad(funcArgument->getType(), funcArgument);
-	//}
 
 	llvm::LoadInst* CreateLoad(llvm::Value* value)
 	{
@@ -363,23 +345,42 @@ public:
 		return builder->CreateCast(op, value, destType);
 	}
 
-	// Returns default constructor
+	// Create StructType or OpaqueStruct
 	llvm::StructType* CreateStructType(std::string name, std::vector<MyCompilerLLVM::TypeAndValue> typeAndValues)
 	{
-		std::vector<llvm::Type*> types;
-
-		for (auto typeValue : typeAndValues)
+		if (typeAndValues.size() > 0)
 		{
-			types.emplace_back(GetType(typeValue));
+
+			std::vector<llvm::Type*> types;
+
+			for (auto typeValue : typeAndValues)
+			{
+				types.emplace_back(GetType(typeValue));
+			}
+
+			auto mystuct = dataStructures.find(name);
+			if (mystuct == dataStructures.end())
+			{
+				llvm::StructType* myStruct = llvm::StructType::create(types, name);
+				dataStructures[name].StructType = myStruct;
+				dataStructures[name].StructFields = typeAndValues;
+
+				return myStruct;
+			}
+			
+			// existing struct;
+			auto& structData = mystuct->second;
+			structData.StructFields = typeAndValues;
+			structData.StructType->setBody(types);
+
+			return structData.StructType;
 		}
-
-		llvm::StructType* myStruct = llvm::StructType::create(types, name);
-		dataStructures[name].StructType = myStruct;
-		dataStructures[name].StructFields = typeAndValues;
-
-		// Create default constructor
-		auto funcDef = CreateFunctionDefinition(name, {}, llvm::FunctionType::get(myStruct, {}, false));
-		return myStruct;
+		else
+		{
+			llvm::StructType* opaqueStruct = llvm::StructType::create(*context, name);
+			dataStructures[name].StructType = opaqueStruct;
+			return opaqueStruct;
+		}
 	}
 
 	llvm::Value* CreateConstant(ConstantVariant constantVariant)
@@ -520,12 +521,12 @@ public:
 		if (left == nullptr)
 			return right;
 
-		operation op = ParseOperation(oper);
+		Operation op = ParseOperation(oper);
 
 		return CreateOperation(op, left, right);
 	}
 
-	llvm::Value* CreateOperation(operation op, llvm::Value* left, llvm::Value* right)
+	llvm::Value* CreateOperation(Operation op, llvm::Value* left, llvm::Value* right)
 	{
 		if (left == nullptr)
 			return right;
@@ -540,34 +541,34 @@ public:
 		{
 			switch (op)
 			{
-			case operation::Add: {
+			case Operation::Add: {
 				return builder->CreateFAdd(left, right);
 			}
-			case operation::Subtract: {
+			case Operation::Subtract: {
 				return builder->CreateFSub(left, right);
 			}
-			case operation::Multiply: {
+			case Operation::Multiply: {
 				return builder->CreateFMul(left, right);
 			}
-			case operation::Divide: {
+			case Operation::Divide: {
 				return builder->CreateFDiv(left, right);
 			}
-			case operation::Equal: {
+			case Operation::Equal: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_EQ, left, right);
 			}
-			case operation::NotEqual: {
+			case Operation::NotEqual: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_NE, left, right);
 			}
-			case operation::Greater: {
+			case Operation::Greater: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGT, left, right);
 			}
-			case operation::GreaterEqual: {
+			case Operation::GreaterEqual: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGE, left, right);
 			}
-			case operation::Less: {
+			case Operation::Less: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLT, left, right);
 			}
-			case operation::LessEqual: {
+			case Operation::LessEqual: {
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
 			}
@@ -576,34 +577,34 @@ public:
 		{
 			switch (op)
 			{
-			case operation::Add: {
+			case Operation::Add: {
 				return builder->CreateAdd(left, right);
 			}
-			case operation::Subtract: {
+			case Operation::Subtract: {
 				return builder->CreateSub(left, right);
 			}
-			case operation::Multiply: {
+			case Operation::Multiply: {
 				return builder->CreateMul(left, right);
 			}
-			case operation::Divide: {
+			case Operation::Divide: {
 				return builder->CreateSDiv(left, right);
 			}
-			case operation::Equal: {
+			case Operation::Equal: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
 			}
-			case operation::NotEqual: {
+			case Operation::NotEqual: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
 			}
-			case operation::Greater: {
+			case Operation::Greater: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGT, left, right);
 			}
-			case operation::GreaterEqual: {
+			case Operation::GreaterEqual: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGE, left, right);
 			}
-			case operation::Less: {
+			case Operation::Less: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLT, left, right);
 			}
-			case operation::LessEqual: {
+			case Operation::LessEqual: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
 			}

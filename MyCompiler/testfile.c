@@ -142,6 +142,18 @@ int testStruct()
     return myStruct.num1 + myStruct.num2 + myStruct.num3;
 }
 
+struct MyStruct2
+{
+    MyStruct myStruct = MyStruct();
+};
+
+int testInnerStruct()
+{
+    auto myStruct = MyStruct2();
+    myStruct.myStruct.num1 = 100;
+    myStruct.myStruct.num2++;
+    return myStruct.myStruct.num1 + myStruct.myStruct.num2 + myStruct.myStruct.num3;
+}
 
 short testShortAdd()
 {
@@ -194,6 +206,7 @@ int main(int argc, char** argv) {
     result &= Test("mySimpleFunction", myFunctionArgument(11), 11);
     result &= Test("testMultipleBreaks", testMultipleBreaks(), 20);
     result &= Test("testStruct", testStruct(), 106);
+    result &= Test("testInnerStruct", testInnerStruct(), 106);
     result &= Test("testShortAdd", testShortAdd(), 20);
     result &= Test("testIntAdd", testIntAdd(), 20);
     result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);

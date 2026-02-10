@@ -205,6 +205,7 @@ typeSpecifier
     | structClassUnion
     | 'enum'
     | 'auto'
+    | Identifier
     ;
 
 structOrUnionSpecifier

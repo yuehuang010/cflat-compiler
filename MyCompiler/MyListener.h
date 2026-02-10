@@ -1029,9 +1029,37 @@ public:
 		std::string structName = decl->getText();
 		auto declarationList = ctx->declarationList();
 		std::vector<llvm::Type*> types;
+
 		auto declList = ParseDeclarationList(declarationList);
 
-		auto structType = compilerLLVM->CreateStructType(structName, declList);
+		// Create a opaqueStruct to initialize default constructor.
+		auto structType = compilerLLVM->CreateStructType(structName, {});
+
+		// Create default constructor
+		auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, {}, llvm::FunctionType::get(structType, {}, false));
+
+		std::vector<llvm::Value*> initilizers;
+		for (auto& typeValue : declList)
+		{
+			auto initilizer = typeValue.Initializer;
+			llvm::Value* rvalue = nullptr;
+			if (initilizer != nullptr)
+			{
+				auto assignmentExpression = initilizer->assignmentExpression();
+				if (assignmentExpression != nullptr)
+				{
+					rvalue = ParseAssignmentExpression(assignmentExpression);
+					if (typeValue.TypeName == "auto")
+					{
+						typeValue.TypeName = rvalue->getType()->getStructName();
+					}
+				}
+			}
+
+			initilizers.push_back(rvalue);
+		}
+
+		structType = compilerLLVM->CreateStructType(structName, declList);
 		llvm::Value* structVal = llvm::UndefValue::get(structType);
 
 		MyCompilerLLVM::TypeAndValue myStruct;
@@ -1041,24 +1069,12 @@ public:
 		auto myStructAlloc = this->compilerLLVM->CreateLocalVariable(myStruct);
 		unsigned int structIndex = 0;
 
-		for (auto typeValue : declList)
+		for (auto rvalue : initilizers)
 		{
-			auto initilizer = typeValue.Initializer;
-			llvm::Value* rvalue;
-			if (initilizer != nullptr)
+			if (rvalue != nullptr)
 			{
-				auto assignmentExpression = initilizer->assignmentExpression();
-				if (assignmentExpression != nullptr)
-				{
-					rvalue = ParseAssignmentExpression(assignmentExpression);
-
-					if (rvalue != nullptr)
-					{
-						rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
-						structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
-					}
-
-				}
+				rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
+				structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
 			}
 
 			structIndex++;
