@@ -686,7 +686,7 @@ public:
 
 		for (const MyCompilerLLVM::TypeAndValue& arg : arguments)
 		{
-			types.push_back(GetType(arg));
+			types.emplace_back(GetType(arg));
 		}
 
 		auto ft = llvm::FunctionType::get(GetType(returnType), types, varargs);
@@ -765,6 +765,38 @@ public:
 			if (result != nameVal.end())
 			{
 				return result->second;
+			}
+		}
+
+		return nullptr;
+	}
+
+	llvm::Value* GetMemberVariable(std::string name)
+	{
+		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		{
+			auto functionArguments = stackframe.functionArgument;
+			
+			if (functionArguments.size() > 0)
+			{
+				auto memberStructName = functionArguments.begin()->first;
+				auto memberStructInstance = functionArguments.begin()->second;
+				
+				auto dataStuctResult = dataStructures.at(memberStructName.substr(0, memberStructName.size()-2));
+				int count = 0;
+				for (const auto& structField : dataStuctResult.StructFields)
+				{
+					if (structField.VariableName == name)
+					{
+						// TODO Found it.
+						auto ret = CreateExtractValue(memberStructInstance, count);
+						// auto ret = CreateStructGEP(dataStuctResult.StructType, memberStructInstance, count, name);
+						return ret;
+					}
+					count++;
+				}
+
+				return nullptr;
 			}
 		}
 

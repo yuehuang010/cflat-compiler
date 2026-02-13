@@ -23,7 +23,8 @@ private:
 	CParser* parser;
 	MyCompilerLLVM* compilerLLVM;
 	std::unordered_map<llvm::Value*, int> PlusPlus;
-	bool global_scope = true;
+	bool global_scope = true; // true when parsing an entry in the global scope.
+	const bool debugPrint = true;
 
 	bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
 	{
@@ -131,6 +132,9 @@ public:
 
 	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
 	{
+		if (debugPrint)
+			return;
+
 		auto func = ctx->functionDefinition();
 		auto dataStruct = ctx->structClassUnionDefinition();
 		auto decl = ctx->declaration();
@@ -141,31 +145,8 @@ public:
 		}
 		else if (func != nullptr)
 		{
-			// Create Function Definition
-			auto name = this->getFunctionName(func);
-			auto returnType = this->getFunctionReturnType(func);
-			CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
-			auto params = this->ParseParamaterTypeList(paramTypeList);
-			auto fn = this->compilerLLVM->CreateFunctionDefinition(name, params, this->compilerLLVM->GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
-
 			global_scope = false;
-
-			this->compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
-
-			auto blockItemList = func->compoundStatement()->blockItemList();
-
-			if (blockItemList)
-				ParseBlockItemList(blockItemList);
-
-			// if return is void, then this might need a implicit return;
-			if (returnType.TypeName == "void")
-			{
-				this->compilerLLVM->CreateReturnCall(nullptr);
-			}
-
-			// Pop the stack
-			this->compilerLLVM->CreateBlockBreak(nullptr);
-
+			ParseFunction(func);
 			global_scope = true;
 		}
 		else if (dataStruct != nullptr)
@@ -208,17 +189,17 @@ public:
 			{
 				auto express = jump->expression();
 				auto right = ParseExpression(express);
-				this->compilerLLVM->CreateReturnCall(right);
+				compilerLLVM->CreateReturnCall(right);
 				return;
 			}
 			else if (jump->Continue())
 			{
-				this->compilerLLVM->CreateContinueCall();
+				compilerLLVM->CreateContinueCall();
 				return;
 			}
 			else if (jump->Break())
 			{
-				this->compilerLLVM->CreateBreakCall();
+				compilerLLVM->CreateBreakCall();
 				return;
 			}
 		}
@@ -235,7 +216,7 @@ public:
 						auto destination = increment.first;
 						auto amount = increment.second;
 
-						this->compilerLLVM->CreateIncrement(destination, amount);
+						compilerLLVM->CreateIncrement(destination, amount);
 					}
 
 					PlusPlus.clear();
@@ -259,25 +240,25 @@ public:
 				auto expression = iterationStatement->expression();
 				auto innerStatement = iterationStatement->statement();
 
-				auto blockStart = this->compilerLLVM->CreateBasicBlock("whileStart");
-				auto blockInner = this->compilerLLVM->CreateBasicBlock("whileInner");
-				auto blockResume = this->compilerLLVM->CreateBasicBlock("whileResume");
+				auto blockStart = compilerLLVM->CreateBasicBlock("whileStart");
+				auto blockInner = compilerLLVM->CreateBasicBlock("whileInner");
+				auto blockResume = compilerLLVM->CreateBasicBlock("whileResume");
 
-				this->compilerLLVM->CreateBlockBreak(blockStart, false);
+				compilerLLVM->CreateBlockBreak(blockStart, false);
 
-				this->compilerLLVM->InitializeBlock(blockStart, true, blockStart, blockResume);
+				compilerLLVM->InitializeBlock(blockStart, true, blockStart, blockResume);
 				auto condition = ParseExpression(expression);
-				this->compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+				compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
 
-				this->compilerLLVM->InitializeBlock(blockInner, false);
+				compilerLLVM->InitializeBlock(blockInner, false);
 				ParseStatement(innerStatement);
-				this->compilerLLVM->CreateContinueCall();
+				compilerLLVM->CreateContinueCall();
 
 				// resume
-				this->compilerLLVM->InitializeBlock(blockResume, false);
+				compilerLLVM->InitializeBlock(blockResume, false);
 
 				// pop the stack
-				this->compilerLLVM->CreateBlockBreak(nullptr, true);
+				compilerLLVM->CreateBlockBreak(nullptr, true);
 
 				return;
 			}
@@ -299,28 +280,28 @@ public:
 				// Parse condition value before CreateBlock
 				auto condition = ParseExpression(expression);
 
-				auto blockIf = this->compilerLLVM->CreateBasicBlock("ifTrue");
-				llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : this->compilerLLVM->CreateBasicBlock("ifFalse");
+				auto blockIf = compilerLLVM->CreateBasicBlock("ifTrue");
+				llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compilerLLVM->CreateBasicBlock("ifFalse");
 
-				auto blockResume = this->compilerLLVM->CreateBasicBlock("ifResume");
+				auto blockResume = compilerLLVM->CreateBasicBlock("ifResume");
 
-				this->compilerLLVM->CreateConditionJump(condition, blockIf, blockElse ? blockElse : blockResume);
+				compilerLLVM->CreateConditionJump(condition, blockIf, blockElse ? blockElse : blockResume);
 
-				this->compilerLLVM->InitializeBlock(blockIf, true);
+				compilerLLVM->InitializeBlock(blockIf, true);
 				ParseStatement(innerStatement[0]);
 
-				this->compilerLLVM->CreateBlockBreak(blockResume);
+				compilerLLVM->CreateBlockBreak(blockResume);
 
 				if (blockElse != nullptr)
 				{
 					// else statement
-					this->compilerLLVM->InitializeBlock(blockElse, true);
+					compilerLLVM->InitializeBlock(blockElse, true);
 					ParseStatement(innerStatement[1]);
-					this->compilerLLVM->CreateBlockBreak(blockResume);
+					compilerLLVM->CreateBlockBreak(blockResume);
 				}
 
 				// resume
-				this->compilerLLVM->InitializeBlock(blockResume, false);
+				compilerLLVM->InitializeBlock(blockResume, false);
 				return;
 			}
 		}
@@ -335,15 +316,48 @@ public:
 		__debugbreak();
 	}
 
-	std::vector<MyCompilerLLVM::TypeAndValue> ParseDeclarationList(CParser::DeclarationListContext* ctx)
+	void ParseFunction(CParser::FunctionDefinitionContext* func, std::string structName = {})
+	{
+		// Create Function Definition
+		auto name = this->getFunctionName(func);
+		auto returnType = this->getFunctionReturnType(func);
+		CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
+		auto params = this->ParseParamaterTypeList(paramTypeList);
+
+		if (!structName.empty())
+		{
+			MyCompilerLLVM::TypeAndValue typeValue{
+			.TypeName = structName,
+			.VariableName = structName + "__"};
+			params.insert(params.begin(), typeValue);
+		}
+
+		auto fn = compilerLLVM->CreateFunctionDefinition(name, params, compilerLLVM->GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
+
+		compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
+
+		auto blockItemList = func->compoundStatement()->blockItemList();
+
+		if (blockItemList)
+			ParseBlockItemList(blockItemList);
+
+		// if return is void, then this might need a implicit return;
+		if (returnType.TypeName == "void")
+		{
+			compilerLLVM->CreateReturnCall(nullptr);
+		}
+
+		// Pop the stack
+		compilerLLVM->CreateBlockBreak(nullptr);
+	}
+
+	std::vector<MyCompilerLLVM::TypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
 	{
 		std::vector<MyCompilerLLVM::TypeAndValue> result;
 
-		if (ctx)
+		if (ctx.size() > 0)
 		{
-			auto declList = ctx->declaration();
-
-			for (auto decl : declList)
+			for (auto decl : ctx)
 			{
 				auto direct = decl->declarationSpecifiers();
 				auto typeAndValue = ParseDeclarationSpecifiers(direct);
@@ -405,8 +419,8 @@ public:
 				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParamaterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				auto ft = this->compilerLLVM->GetFunctionType(typeAndValue, params, ellipsis);
-				this->compilerLLVM->CreateFunctionDeclaration(direct->getText(), ft);
+				auto ft = compilerLLVM->GetFunctionType(typeAndValue, params, ellipsis);
+				compilerLLVM->CreateFunctionDeclaration(direct->getText(), ft);
 			}
 			else if (direct != nullptr)
 			{
@@ -434,16 +448,16 @@ public:
 				if (global_scope)
 				{
 					auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
-					this->compilerLLVM->CreateGlobalVariable(typeAndValue, constant);
+					compilerLLVM->CreateGlobalVariable(typeAndValue, constant);
 				}
 				else
 				{
-					auto alloc = this->compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr);
+					auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr);
 					allocList.push_back(std::pair(name, alloc));
 
 					if (right != nullptr)
 					{
-						this->compilerLLVM->CreateAssignment(right, alloc);
+						compilerLLVM->CreateAssignment(right, alloc);
 					}
 				}
 			}
@@ -600,7 +614,7 @@ public:
 			auto left = ParseRelationalExpression(nextCtxs[0]);
 			auto right = ParseRelationalExpression(nextCtxs[1]);
 
-			return this->compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
+			return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
 		}
 
 		__debugbreak();
@@ -619,7 +633,7 @@ public:
 			auto left = ParseShiftExpression(nextCtxs[0]);
 			auto right = ParseShiftExpression(nextCtxs[1]);
 
-			return this->compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
+			return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
 		}
 
 		__debugbreak();
@@ -658,7 +672,7 @@ public:
 			for (const auto& nextCtx : nextCtxs)
 			{
 				rvalue = ParseMultiplicativeExpression(nextCtx);
-				lvalue = this->compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+				lvalue = compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
 			}
 
 			return lvalue;
@@ -685,7 +699,7 @@ public:
 			for (const auto& nextCtx : nextCtxs)
 			{
 				rvalue = ParseCastExpression(nextCtx);
-				lvalue = this->compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+				lvalue = compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
 			}
 
 			return lvalue;
@@ -810,7 +824,26 @@ public:
 			{
 				// Function Callsite
 				std::string functoinName = primaryCtx->getText();
-				auto fn = this->compilerLLVM->GetFunction(functoinName);
+				auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
+
+				llvm::Function* fn;
+
+				if (primaryExpression->getType()->isStructTy())
+				{
+					uint32_t count = 0;
+					auto ident = ctx->Identifier(count);
+					while ((ident = ctx->Identifier(count)) != nullptr)
+					{
+						auto structType = llvm::dyn_cast<llvm::StructType>(primaryExpression->getType());
+						auto datastrcture = compilerLLVM->GetDatastructure(structType);
+						uint32_t fieldCount = -1;
+						std::string identName = ident->getText();
+					}
+				}
+				else
+				{
+					fn = compilerLLVM->GetFunction(functoinName);
+				}
 
 				std::vector<llvm::Value*> argVec;
 
@@ -824,15 +857,16 @@ public:
 					}
 				}
 
-				return this->compilerLLVM->CreateFunctionCall(fn, argVec);
+				return compilerLLVM->CreateFunctionCall(fn, argVec);
 			}
 			else
 			{
 				auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
-				uint32_t count = 0;
 
+				// Parse the next Identifier
 				if (primaryExpression->getType()->isStructTy())
 				{
+					uint32_t count = 0;
 					auto ident = ctx->Identifier(count);
 					while ((ident = ctx->Identifier(count)) != nullptr)
 					{
@@ -910,17 +944,17 @@ public:
 			// TODO handle encoding u8,u,U,L
 			std::string rawText = ctx->getText();
 			rawText = ProcessRawText(rawText);
-			return std::tuple(this->compilerLLVM->CreateGlobalString("", rawText), nullptr);
+			return std::tuple(compilerLLVM->CreateGlobalString("", rawText), nullptr);
 		}
 		else if (constant)
 		{
 			if (constant->getText() == "true")
 			{
-				return std::tuple(this->compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+				return std::tuple(compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
 			}
 			else if (constant->getText() == "false")
 			{
-				return std::tuple(this->compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+				return std::tuple(compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
 			}
 			else
 			{
@@ -935,30 +969,37 @@ public:
 		{
 			std::string name = identifier->getText();
 
-			auto alloc = this->compilerLLVM->GetLocalVariable(name);
+			auto alloc = compilerLLVM->GetLocalVariable(name);
 
 			if (alloc == nullptr)
 			{
-				auto funcArgument = this->compilerLLVM->GetFunctionArgument(name);
+				auto funcArgument = compilerLLVM->GetFunctionArgument(name);
 
 				if (funcArgument == nullptr)
 				{
-					// try getting global variable
-					auto gVar = this->compilerLLVM->GetGlobalVariable(name);
-					if (gVar == nullptr)
+					auto memberVar = compilerLLVM->GetMemberVariable(name);
+
+					if (memberVar == nullptr)
 					{
-						std::cout << "Undefined variable : " << name << "\n";
-						__debugbreak();
-						return std::tuple(nullptr, nullptr);
+						// try getting global variable
+						auto gVar = compilerLLVM->GetGlobalVariable(name);
+						if (gVar == nullptr)
+						{
+							std::cout << "Undefined variable : " << name << "\n";
+							__debugbreak();
+							return std::tuple(nullptr, nullptr);
+						}
+
+						return std::tuple(compilerLLVM->CreateLoad(gVar), gVar);
 					}
 
-					return std::tuple(this->compilerLLVM->CreateLoad(gVar), gVar);
+					return std::tuple(memberVar, nullptr);
 				}
 
 				return std::tuple(funcArgument, nullptr);
 			}
 
-			return std::tuple(this->compilerLLVM->CreateLoad(alloc), alloc);
+			return std::tuple(compilerLLVM->CreateLoad(alloc), alloc);
 		}
 
 		__debugbreak();
@@ -1027,7 +1068,7 @@ public:
 	{
 		auto decl = ctx->directDeclarator();
 		std::string structName = decl->getText();
-		auto declarationList = ctx->declarationList();
+		auto declarationList = ctx->declaration();
 		std::vector<llvm::Type*> types;
 
 		auto declList = ParseDeclarationList(declarationList);
@@ -1066,7 +1107,7 @@ public:
 		myStruct.TypeName = structName;
 		myStruct.VariableName = "_" + structName;
 
-		auto myStructAlloc = this->compilerLLVM->CreateLocalVariable(myStruct);
+		auto myStructAlloc = compilerLLVM->CreateLocalVariable(myStruct);
 		unsigned int structIndex = 0;
 
 		for (auto rvalue : initilizers)
@@ -1083,7 +1124,18 @@ public:
 		// close constructor.
 		compilerLLVM->CreateReturnCall(structVal);
 		// Pop the stack
-		this->compilerLLVM->CreateBlockBreak(nullptr);
+		compilerLLVM->CreateBlockBreak(nullptr);
+
+
+		// Parse member functions
+		auto functionList = ctx->functionDefinition();
+
+		for (auto func : functionList)
+		{
+			global_scope = false;
+			ParseFunction(func, structName);
+			global_scope = true;
+		}
 	}
 
 	std::vector<MyCompilerLLVM::TypeAndValue> ParseParamaterTypeList(CParser::ParameterTypeListContext* paramTypeList)
@@ -1160,6 +1212,7 @@ public:
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
 	{
-		// PrintContext(ctx);
+		if (debugPrint)
+			PrintContext(ctx);
 	}
 };

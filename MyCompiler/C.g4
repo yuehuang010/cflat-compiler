@@ -456,11 +456,7 @@ functionDefinition
     ;
 
 structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator '{' declarationList '}' ';'
-    ;
-
-declarationList
-    : declaration+
+    : declarationSpecifiers? directDeclarator '{' (declaration | functionDefinition)* '}' ';'
     ;
 
 Auto

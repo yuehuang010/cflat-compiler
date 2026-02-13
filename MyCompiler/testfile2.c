@@ -5,24 +5,21 @@ struct MyStruct
     int num1 = 1;
     int num2 = 2;
     int num3 = 3;
+
+    int Total() 
+    {
+        return num1 + num2 + num3;
+        // return 10;
+    }
 };
-
-struct MyStruct2
-{
-    auto myStruct = MyStruct();
-};
-
-
-MyStruct2 Function()
-{
-    auto myStruct = MyStruct2();
-    return myStruct;
-}
 
 int main()
 {
-    auto mystruct2 = Function();
+    auto myStruct = MyStruct();
 
-    printf("mystruct2.myStruct.num1 = %d", mystruct2.myStruct.num1);
+    int total;
+    total = myStruct.Total();
+    // total = Total(myStruct);
+    printf("myStruct.Total() = %d", total);
 	return 0;
 }
