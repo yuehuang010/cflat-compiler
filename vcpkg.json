@@ -1,0 +1,8 @@
+{
+  "name": "mycompiler",
+  "version": "1.0",
+  "dependencies": [
+    "antlr4",
+    "llvm"
+  ]
+}

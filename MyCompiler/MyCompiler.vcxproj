@@ -74,6 +74,9 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" />
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" />
   <PropertyGroup Label="Vcpkg" Condition="'$(Configuration)|$(Platform)'=='Release|x64'" />
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -109,7 +112,7 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(IntDir)\Generated;$(VcpkgRoot)\installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir)\Generated;$(VcpkgManifestRoot)\vcpkg_installed\x64-windows\include\antlr4-runtime;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -143,7 +146,7 @@
   <ItemGroup>
     <CustomBuild Include="C.g4">
       <FileType>Document</FileType>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\antlr4.exe -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\antlr4.bat -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
       <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\antlr4.exe -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
@@ -154,6 +157,7 @@
       <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Generating Antlr4 %(identity)</Message>
       <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Generating Antlr4 %(identity)</Message>
     </CustomBuild>
+    <None Include="antlr4.bat" />
     <None Include="antlr4.exe" />
     <None Include="testfile.c">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
