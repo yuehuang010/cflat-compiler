@@ -24,7 +24,7 @@ private:
 	MyCompilerLLVM* compilerLLVM;
 	std::unordered_map<llvm::Value*, int> PlusPlus;
 	bool global_scope = true; // true when parsing an entry in the global scope.
-	const bool debugPrint = true;
+	const bool debugPrint = false;
 
 	bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
 	{
@@ -146,7 +146,7 @@ public:
 		else if (func != nullptr)
 		{
 			global_scope = false;
-			ParseFunction(func);
+			ParseFunctionDefinition(func);
 			global_scope = true;
 		}
 		else if (dataStruct != nullptr)
@@ -316,7 +316,7 @@ public:
 		__debugbreak();
 	}
 
-	void ParseFunction(CParser::FunctionDefinitionContext* func, std::string structName = {})
+	void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {})
 	{
 		// Create Function Definition
 		auto name = this->getFunctionName(func);
@@ -328,7 +328,8 @@ public:
 		{
 			MyCompilerLLVM::TypeAndValue typeValue{
 			.TypeName = structName,
-			.VariableName = structName + "__"};
+			.VariableName = structName + "__",
+			.pointer = true};
 			params.insert(params.begin(), typeValue);
 		}
 
@@ -395,7 +396,6 @@ public:
 			__debugbreak();
 		}
 
-		// auto fullname = getScopeName(ctx);
 		for (auto initDecl : initDeclarVec)
 		{
 			/*
@@ -782,7 +782,6 @@ public:
 		return typeValue;
 	}
 
-
 	llvm::Value* ParseUnaryExpression(CParser::UnaryExpressionContext* ctx, bool lValue = false)
 	{
 		auto postFixCtx = ctx->postfixExpression();
@@ -816,7 +815,7 @@ public:
 	{
 		/*
 		* postfixExpression
-			: (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') 
+			: (primaryExpression | '(' typeName ')' '{' initializerList ','? '}')
 			(
 				'[' expression ']'
 				| '(' argumentExpressionList? ')'
@@ -826,49 +825,139 @@ public:
 			)*
 		*/
 
+		std::string fulltext = ctx->getText();
+
 		if (auto primaryCtx = ctx->primaryExpression())
 		{
 			size_t prevRuleId = 0;
-			CParser::PrimaryExpressionContext* prevPrimary = nullptr;
-			llvm::Value* primaryValue;
-			llvm::Value* primaryStorage;
+			size_t prevToken = 0;
+			std::string primaryIdentifier;
+			llvm::Value* primaryValue = nullptr;
+			llvm::Value* primaryStorage = nullptr;
+			llvm::StructType* structType = nullptr;
+			llvm::Value* structValue = nullptr;
+			llvm::Value* structStorage = nullptr;
+			int functionArgCounter = 0;
 
 			for (auto parseTree : ctx->children)
 			{
-				if (auto ruleContext = dynamic_cast<antlr4::RuleContext*>(parseTree))
+				if (parseTree->getTreeType() == antlr4::tree::ParseTreeType::TERMINAL)
 				{
-					auto ruleID = ruleContext->getRuleIndex();
-					switch (ruleID)
+					auto terminal = dynamic_cast<antlr4::tree::TerminalNode*>(parseTree);
+					auto tokenType = terminal->getSymbol()->getType();
+					switch (tokenType)
 					{
 					case CParser::LeftBracket:
 					case CParser::RightBracket:
 					case CParser::LeftParen:
 					case CParser::RightParen:
 					case CParser::Dot:
-					case CParser::Arrow:
-					case CParser::PlusPlus: { prevRuleId = ruleID; break; }
-					case CParser::MinusMinus: { prevRuleId = ruleID; break; }
+					case CParser::Arrow: { prevToken = tokenType; break; }
+					case CParser::PlusPlus: { if (primaryStorage) { PlusPlus[primaryStorage]++; }  break; }
+					case CParser::MinusMinus: { if (primaryStorage) { PlusPlus[primaryStorage]--; }break; }
+					case CParser::Identifier:
+					{
+						if (structType)
+						{
+							primaryIdentifier = terminal->getText();
+							auto datastrcture = compilerLLVM->GetDatastructure(structType);
+							uint32_t fieldCount = 0;
+
+							for (auto field : datastrcture.StructFields)
+							{
+								if (field.VariableName == primaryIdentifier)
+								{
+									break;
+								}
+								fieldCount++;
+							}
+
+							if (fieldCount < datastrcture.StructFields.size())
+							{
+								primaryStorage = compilerLLVM->CreateStructGEP(structType, structStorage, fieldCount);
+								primaryValue = compilerLLVM->CreateLoad(primaryStorage);
+							}
+							else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
+							{
+								// Not a field, then try a function.
+								primaryValue = func;
+								primaryStorage = nullptr;
+							}
+							else
+							{
+								__debugbreak();
+							}
+						}
+						else
+						{
+							std::tie(primaryValue, primaryStorage) = ParseIdentifier(primaryIdentifier);
+						}
+
+						if (primaryValue && primaryValue->getType()->isStructTy())
+						{
+							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
+							structValue = primaryValue;
+							structStorage = primaryStorage;
+						}
+						//if (!primaryStorage)
+						//{
+						//	// TODO: verify use case when to clear.
+						//	structType = nullptr;
+						//	structValue = nullptr;
+						//}
+
+						break;
+					}
+					}
+				}
+				else if (parseTree->getTreeType() == antlr4::tree::ParseTreeType::RULE)
+				{
+					auto ruleContext = dynamic_cast<antlr4::RuleContext*>(parseTree);
+					auto ruleID = ruleContext->getRuleIndex();
+					switch (ruleID)
+					{
 					case CParser::RulePrimaryExpression:
 					{
-						prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
-						auto [primaryValue, primaryStorage] = ParsePrimaryExpression(prevPrimary);
+						auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
+						primaryIdentifier = prevPrimary->getText();
+						std::tie(primaryValue, primaryStorage) = ParsePrimaryExpression(prevPrimary);
+
+						if (primaryValue && primaryValue->getType()->isStructTy())
+						{
+							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
+							structValue = primaryValue;
+							structStorage = primaryStorage;
+						}
+						if (!primaryStorage)
+						{
+							structType = nullptr;
+							structValue = nullptr;
+							structStorage = nullptr;
+						}
 
 						break;
 					}
 					case CParser::RuleExpression:
 					{
-						// TODO bracket expression
+						// TODO: bracket expression
 						break;
 					}
 					case CParser::RuleArgumentExpressionList:
 					{
-						std::string functoinName = prevPrimary->getText();
-						auto fn = compilerLLVM->GetFunction(functoinName);
-						auto argumentList = ctx->argumentExpressionList();
+						// Create Function Call
+						std::string functionName = primaryIdentifier;
+						auto func = compilerLLVM->GetFunction(functionName);
+
 						std::vector<llvm::Value*> argVec;
+						if (structType)
+						{
+							argVec.push_back(structStorage);
+						}
+
+						auto argumentList = ctx->argumentExpressionList();
 						if (argumentList.size() > 0)
 						{
-							auto assignmentExpressionCtx = argumentList[0]->assignmentExpression();
+							auto assignmentExpressionCtx = argumentList[functionArgCounter]->assignmentExpression();
 
 							for (const auto& argument : assignmentExpressionCtx)
 							{
@@ -876,13 +965,23 @@ public:
 							}
 						}
 
-						primaryValue = compilerLLVM->CreateFunctionCall(fn, argVec);
+						primaryValue = compilerLLVM->CreateFunctionCall(func, argVec);
 						primaryStorage = nullptr;
-						break;
-					}
-					case CParser::Identifier: {
-						std::string name = ruleContext->getText();
-						auto [primaryValue, primaryStorage] = ParseIdentifier(name);
+
+						if (primaryValue->getType()->isStructTy())
+						{
+							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
+							MyCompilerLLVM::TypeAndValue myVar {
+								.VariableName = functionName + "_ret",
+								.pointer = true
+							};
+
+							structStorage = compilerLLVM->CreateAlloca(structType->getPointerTo());
+							compilerLLVM->CreateAssignment(primaryValue, structStorage);
+							structValue = primaryValue;
+						}
+
+						functionArgCounter++;
 						break;
 					}
 
@@ -891,132 +990,10 @@ public:
 				}
 			}
 
-			auto plusplus = ctx->PlusPlus().size();
-			auto minusminus = ctx->MinusMinus().size();
-			auto argumentList = ctx->argumentExpressionList();
-			if (argumentList.size() > 0 || (ctx->LeftParen().size() && ctx->RightParen().size()))
-			{
-				// Function Callsite
+			if (lValue)
+				return primaryStorage;
 
-				//llvm::Function* fn;
-
-				//if ()
-				//{
-				//	auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
-				//	primaryExpression->getType()->isStructTy()
-				//	auto structType = llvm::dyn_cast<llvm::StructType>(primaryExpression->getType());
-				//	auto datastrcture = compilerLLVM->GetDatastructure(structType);
-				//	
-				//	if (datastrcture.StructType == nullptr) {
-				//		// TODO error, datastructure not found
-				//	}
-
-				//	//uint32_t count = 0;
-				//	//std::string fucntionName;
-				//	//auto ident = ctx->Identifier(count);
-				//	//while ((ident = ctx->Identifier(count)) != nullptr)
-				//	//{
-				//	//	uint32_t fieldCount = -1;
-				//	//	fucntionName = ident->getText();
-
-				//	//	//TODO
-				//	//	break;
-				//	//}
-
-				//	auto structName = datastrcture.StructType->getName();
-
-				//	fn = compilerLLVM->GetFunction(functoinName);
-
-				//	std::vector<llvm::Value*> argVec;
-
-				//	argVec.push_back(primaryExpression);
-
-				//	if (argumentList.size() > 0) {
-				//		auto assignmentExpressionCtx = argumentList[0]->assignmentExpression();
-
-				//		for (const auto& argument : assignmentExpressionCtx) {
-				//			argVec.push_back(this->ParseAssignmentExpression(argument));
-				//		}
-				//	}
-
-				//	return compilerLLVM->CreateFunctionCall(fn, argVec);
-				//}
-				//else
-				//{
-				//	std::string functoinName = primaryCtx->getText();
-				//	fn = compilerLLVM->GetFunction(functoinName);
-
-				//	std::vector<llvm::Value*> argVec;
-
-				//	if (argumentList.size() > 0) {
-				//		auto assignmentExpressionCtx = argumentList[0]->assignmentExpression();
-
-				//		for (const auto& argument : assignmentExpressionCtx) {
-				//			argVec.push_back(this->ParseAssignmentExpression(argument));
-				//		}
-				//	}
-
-				//	return compilerLLVM->CreateFunctionCall(fn, argVec);
-				//}
-			}
-			else
-			{
-				auto [primaryExpression, storage] = ParsePrimaryExpression(primaryCtx);
-
-				// Parse the next Identifier
-				if (primaryExpression->getType()->isStructTy())
-				{
-					uint32_t count = 0;
-					auto ident = ctx->Identifier(count);
-					while ((ident = ctx->Identifier(count)) != nullptr)
-					{
-						auto structType = llvm::dyn_cast<llvm::StructType>(primaryExpression->getType());
-						auto datastrcture = compilerLLVM->GetDatastructure(structType);
-						uint32_t fieldCount = -1;
-						std::string identName = ident->getText();
-						for (auto field : datastrcture.StructFields)
-						{
-							fieldCount++;
-							if (field.VariableName == identName)
-							{
-								break;
-							}
-						}
-
-						if (fieldCount == -1)
-						{
-							__debugbreak();
-						}
-
-						auto destAlloc = compilerLLVM->CreateStructGEP(structType, storage, fieldCount);
-
-						if (storage != nullptr)
-							storage = destAlloc;
-
-						primaryExpression = compilerLLVM->CreateLoad(destAlloc);
-						count++;
-					}
-				}
-
-				if (storage != nullptr)
-				{
-					// Disable increment on lValue.
-					if (lValue)
-						return storage;
-
-					if (plusplus > 0)
-					{
-						PlusPlus[storage] += plusplus;
-					}
-
-					if (minusminus > 0)
-					{
-						PlusPlus[storage] -= minusminus;
-					}
-				}
-
-				return primaryExpression;
-			}
+			return primaryValue;
 		}
 
 		__debugbreak();
@@ -1026,7 +1003,6 @@ public:
 	/// <summary>
 	/// The Value and Storage if applicaple.
 	/// </summary>
-	/// <param name="ctx"></param>
 	/// <returns>Returns the load instruction and storage if writable.</returns>
 	std::tuple< llvm::Value*, llvm::Value*> ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
 	{
@@ -1088,7 +1064,7 @@ public:
 
 		if (auto memberVar = compilerLLVM->GetMemberVariable(name))
 		{
-			return std::tuple(memberVar, nullptr);
+			return std::tuple(compilerLLVM->CreateLoad(memberVar), memberVar);
 		}
 
 		// try getting global variable
@@ -1208,7 +1184,7 @@ public:
 		myStruct.TypeName = structName;
 		myStruct.VariableName = "_" + structName;
 
-		auto myStructAlloc = compilerLLVM->CreateLocalVariable(myStruct);
+		// auto myStructAlloc = compilerLLVM->CreateLocalVariable(myStruct);
 		unsigned int structIndex = 0;
 
 		for (auto rvalue : initilizers)
@@ -1234,7 +1210,7 @@ public:
 		for (auto func : functionList)
 		{
 			global_scope = false;
-			ParseFunction(func, structName);
+			ParseFunctionDefinition(func, structName);
 			global_scope = true;
 		}
 	}

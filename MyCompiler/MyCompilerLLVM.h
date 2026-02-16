@@ -194,6 +194,11 @@ public:
 		return alloc;
 	}
 
+	llvm::AllocaInst* CreateAlloca(llvm::Type* type)
+	{
+		return builder->CreateAlloca(type, nullptr);
+	}
+
 	llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
 	{
 		llvm::LoadInst* loadInst = CreateLoad(destination);
@@ -771,6 +776,9 @@ public:
 		return nullptr;
 	}
 
+	/// <summary>
+	/// Get the member variable from a member function.
+	/// </summary>
 	llvm::Value* GetMemberVariable(std::string name)
 	{
 		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
@@ -781,21 +789,23 @@ public:
 			{
 				auto memberStructName = functionArguments.begin()->first;
 				auto memberStructInstance = functionArguments.begin()->second;
-				
-				auto dataStuctResult = dataStructures.at(memberStructName.substr(0, memberStructName.size()-2));
-				int count = 0;
-				for (const auto& structField : dataStuctResult.StructFields)
+				auto trunName = memberStructName.substr(0, memberStructName.size() - 2);
+				auto findResult = dataStructures.find(trunName);
+				if (findResult != dataStructures.end())
 				{
-					if (structField.VariableName == name)
+					int count = 0;
+					for (const auto& structField : findResult->second.StructFields)
 					{
-						// TODO Found it.
-						auto ret = CreateExtractValue(memberStructInstance, count);
-						// auto ret = CreateStructGEP(dataStuctResult.StructType, memberStructInstance, count, name);
-						return ret;
+						if (structField.VariableName == name)
+						{
+							return CreateStructGEP(findResult->second.StructType, memberStructInstance, count);
+							// Note: Using Extract as it is not writable.
+							// auto ret = CreateExtractValue(memberStructInstance, count);
+							// return ret;
+						}
+						count++;
 					}
-					count++;
 				}
-
 				return nullptr;
 			}
 		}

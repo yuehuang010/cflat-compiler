@@ -13,5 +13,5 @@ int main()
 	compiler.Compile("testfile2.c");
 	std::cout << "Done.\n";
 
-	// Run C:\source\vcpkg\installed\x64-windows\tools\llvm\lli.exe out.ll
+	// Run ..\vcpkg_installed\x64-windows\x64-windows\tools\llvm\lli.exe out.ll
 }

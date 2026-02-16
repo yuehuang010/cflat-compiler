@@ -132,6 +132,19 @@ struct MyStruct
     int num1 = 1;
     int num2 = 2;
     int num3 = 3;
+
+    int Total()
+    {
+        return num1 + num2 + num3;
+    }
+
+    int Add(int addition)
+    {
+        num1 = num1 + addition;
+        num2 = num2 + addition;
+        num3 = num3 + addition;
+        return num1 + num2 + num3;
+    }
 };
 
 int testStruct()
@@ -140,6 +153,12 @@ int testStruct()
     myStruct.num1 = 100;
     myStruct.num2++;
     return myStruct.num1 + myStruct.num2 + myStruct.num3;
+}
+
+int testStructFunctionCall()
+{
+    MyStruct myStruct = MyStruct();
+    return myStruct.Add(10);
 }
 
 struct MyStruct2
@@ -206,6 +225,7 @@ int main(int argc, char** argv) {
     result &= Test("mySimpleFunction", myFunctionArgument(11), 11);
     result &= Test("testMultipleBreaks", testMultipleBreaks(), 20);
     result &= Test("testStruct", testStruct(), 106);
+    result &= Test("testStructFunctionCall", testStructFunctionCall(), 36);
     result &= Test("testInnerStruct", testInnerStruct(), 106);
     result &= Test("testShortAdd", testShortAdd(), 20);
     result &= Test("testIntAdd", testIntAdd(), 20);

@@ -51,7 +51,7 @@ genericAssociation
 postfixExpression
     : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') (
         '[' expression ']'
-        | '(' argumentExpressionList? ')'
+        | '(' argumentExpressionList ')'
         | ('.' | '->') Identifier
         | '++'
         | '--'
@@ -59,7 +59,7 @@ postfixExpression
     ;
 
 argumentExpressionList
-    : assignmentExpression (',' assignmentExpression)*
+    : (assignmentExpression (',' assignmentExpression)*)?
     ;
 
 unaryExpression

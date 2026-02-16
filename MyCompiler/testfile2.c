@@ -1,25 +1,46 @@
 void printf(const char* argv, ...);
 
-struct MyStruct
+struct Negative
 {
-    int num1 = 1;
-    int num2 = 2;
-    int num3 = 3;
+    int negNumber = 10;
 
-    int Total() 
+    int GetNumber()
     {
-        return num1 + num2 + num3;
-        // return 10;
+        return negNumber;
+    }
+};
+
+struct Positive
+{
+    int posNumber = 5;
+
+    Negative neg = Negative();
+
+    Negative GetNegative()
+    {
+        return neg;
+    }
+
+    int GetNum()
+    {
+        return posNumber;
     }
 };
 
 int main()
 {
-    auto myStruct = MyStruct();
+    int number = 10;
+    printf("number=%d\n", number);
 
-    int total;
-    total = myStruct.Total();
-    // total = Total(myStruct);
-    printf("myStruct.Total() = %d", total);
-	return 0;
+    auto pos = Positive();
+
+
+    int number2 = pos.GetNegative().GetNumber();
+
+    printf("number2=%d\n", number2);
+    printf("number3=%d\n", pos.GetNegative().GetNumber());
+    auto neg = pos.GetNegative();
+    int number4 = neg.GetNumber();
+    printf("number4=%d\n", number4);
+    return 0;
 }
