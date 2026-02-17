@@ -27,6 +27,18 @@ public:
 		GreaterEqual, // >=
 		Less, // <
 		LessEqual, // <=
+		Assignment, //     : '='
+		MultiplyAssignment, // '*='
+		DivideAssignment, // '/='
+		ModAssignment, // '%='
+		AddAssignment, // '+='
+		MinusAssignment, // '-='
+		LeftShiftAssignment, // '<<='
+		RightShiftAssignment, // '>>='
+		AndAssignment, // '&='
+		XorAssignment, // '^='
+		OrAssignment, // '|='
+
 	};
 
 	struct TypeAndValue
@@ -130,7 +142,16 @@ private:
 		else if (operationText == ">") { return Operation::Greater; }
 		else if (operationText == ">=") { return Operation::GreaterEqual; }
 		else if (operationText == "<") { return Operation::Less; }
-		else if (operationText == "<=") { return Operation::LessEqual; }
+		else if (operationText == "*=") { return Operation::MultiplyAssignment; }
+		else if (operationText == "/=") { return Operation::DivideAssignment; }
+		else if (operationText == "%=") { return Operation::ModAssignment; }
+		else if (operationText == "+=") { return Operation::AddAssignment; }
+		else if (operationText == "-=") { return Operation::MinusAssignment; }
+		else if (operationText == "<<=") { return Operation::LeftShiftAssignment; }
+		else if (operationText == ">>=") { return Operation::RightShiftAssignment; }
+		else if (operationText == "&=") { return Operation::AndAssignment; }
+		else if (operationText == "^=") { return Operation::XorAssignment; }
+		else if (operationText == "|=") { return Operation::OrAssignment; }
 
 		__debugbreak();
 		return Operation::None;
@@ -230,18 +251,6 @@ public:
 	}
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination)
-	{
-		value = Upconvert(value, destination);
-		return builder->CreateStore(value, destination);
-	}
-
-	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::AllocaInst* destination)
-	{
-		value = Upconvert(value, destination);
-		return builder->CreateStore(value, destination);
-	}
-
-	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::GlobalVariable* destination)
 	{
 		value = Upconvert(value, destination);
 		return builder->CreateStore(value, destination);
@@ -546,15 +555,19 @@ public:
 		{
 			switch (op)
 			{
+			case Operation::AddAssignment:
 			case Operation::Add: {
 				return builder->CreateFAdd(left, right);
 			}
+			case Operation::MinusAssignment:
 			case Operation::Subtract: {
 				return builder->CreateFSub(left, right);
 			}
+			case Operation::MultiplyAssignment:
 			case Operation::Multiply: {
 				return builder->CreateFMul(left, right);
 			}
+			case Operation::DivideAssignment:
 			case Operation::Divide: {
 				return builder->CreateFDiv(left, right);
 			}
@@ -582,15 +595,19 @@ public:
 		{
 			switch (op)
 			{
+			case Operation::AddAssignment:
 			case Operation::Add: {
 				return builder->CreateAdd(left, right);
 			}
+			case Operation::MinusAssignment:
 			case Operation::Subtract: {
 				return builder->CreateSub(left, right);
 			}
+			case Operation::MultiplyAssignment:
 			case Operation::Multiply: {
 				return builder->CreateMul(left, right);
 			}
+			case Operation::DivideAssignment:
 			case Operation::Divide: {
 				return builder->CreateSDiv(left, right);
 			}

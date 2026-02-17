@@ -329,7 +329,7 @@ public:
 			MyCompilerLLVM::TypeAndValue typeValue{
 			.TypeName = structName,
 			.VariableName = structName + "__",
-			.pointer = true};
+			.pointer = true };
 			params.insert(params.begin(), typeValue);
 		}
 
@@ -478,10 +478,17 @@ public:
 		}
 		else if (assignmentOp != nullptr)
 		{
+			auto operatorText = ctx->assignmentOperator()->getText();
 			auto assignCtx = ctx->assignmentExpression();
 
 			auto destination = ParseUnaryExpression(unaryCtx, true);
 			auto right = ParseAssignmentExpression(assignCtx);
+
+			if (operatorText != "=")
+			{
+				auto left = compilerLLVM->CreateLoad(destination);
+				right = compilerLLVM->CreateOperation(operatorText, left, right);
+			}
 
 			return compilerLLVM->CreateAssignment(right, destination);
 		}
@@ -971,11 +978,6 @@ public:
 						if (primaryValue->getType()->isStructTy())
 						{
 							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
-							MyCompilerLLVM::TypeAndValue myVar {
-								.VariableName = functionName + "_ret",
-								.pointer = true
-							};
-
 							structStorage = compilerLLVM->CreateAlloca(structType->getPointerTo());
 							compilerLLVM->CreateAssignment(primaryValue, structStorage);
 							structValue = primaryValue;
@@ -1154,55 +1156,59 @@ public:
 		auto structType = compilerLLVM->CreateStructType(structName, {});
 
 		// Create default constructor
-		auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, {}, llvm::FunctionType::get(structType, {}, false));
-
-		std::vector<llvm::Value*> initilizers;
-		for (auto& typeValue : declList)
 		{
-			auto initilizer = typeValue.Initializer;
-			llvm::Value* rvalue = nullptr;
-			if (initilizer != nullptr)
+			auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, {}, llvm::FunctionType::get(structType, {}, false));
+
+			std::vector<llvm::Value*> initilizers;
+			for (auto& typeValue : declList)
 			{
-				auto assignmentExpression = initilizer->assignmentExpression();
-				if (assignmentExpression != nullptr)
+				auto initilizer = typeValue.Initializer;
+				llvm::Value* rvalue = nullptr;
+				if (initilizer != nullptr)
 				{
-					rvalue = ParseAssignmentExpression(assignmentExpression);
-					if (typeValue.TypeName == "auto")
+					auto assignmentExpression = initilizer->assignmentExpression();
+					if (assignmentExpression != nullptr)
 					{
-						typeValue.TypeName = rvalue->getType()->getStructName();
+						rvalue = ParseAssignmentExpression(assignmentExpression);
+						if (typeValue.TypeName == "auto")
+						{
+							typeValue.TypeName = rvalue->getType()->getStructName();
+						}
 					}
 				}
+				else
+				{
+					std::cout << "Uninitialize field \"" << structName << "::" << typeValue.VariableName << "\".\n";
+				}
+
+				initilizers.push_back(rvalue);
 			}
 
-			initilizers.push_back(rvalue);
-		}
+			structType = compilerLLVM->CreateStructType(structName, declList);
+			llvm::Value* structVal = llvm::UndefValue::get(structType);
 
-		structType = compilerLLVM->CreateStructType(structName, declList);
-		llvm::Value* structVal = llvm::UndefValue::get(structType);
+			MyCompilerLLVM::TypeAndValue myStruct;
+			myStruct.TypeName = structName;
+			myStruct.VariableName = "_" + structName;
 
-		MyCompilerLLVM::TypeAndValue myStruct;
-		myStruct.TypeName = structName;
-		myStruct.VariableName = "_" + structName;
+			unsigned int structIndex = 0;
 
-		// auto myStructAlloc = compilerLLVM->CreateLocalVariable(myStruct);
-		unsigned int structIndex = 0;
-
-		for (auto rvalue : initilizers)
-		{
-			if (rvalue != nullptr)
+			for (auto rvalue : initilizers)
 			{
-				rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
-				structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
+				if (rvalue != nullptr)
+				{
+					rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
+					structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
+				}
+
+				structIndex++;
 			}
 
-			structIndex++;
+			// close constructor.
+			compilerLLVM->CreateReturnCall(structVal);
+			// Pop the stack
+			compilerLLVM->CreateBlockBreak(nullptr);
 		}
-
-		// close constructor.
-		compilerLLVM->CreateReturnCall(structVal);
-		// Pop the stack
-		compilerLLVM->CreateBlockBreak(nullptr);
-
 
 		// Parse member functions
 		auto functionList = ctx->functionDefinition();
