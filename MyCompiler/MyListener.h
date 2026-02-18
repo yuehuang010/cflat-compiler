@@ -13,17 +13,10 @@
 class MyListener : public CBaseListener
 {
 private:
-	class DecrementTracker
-	{
-	public:
-		llvm::AllocaInst* storage;
-		int change = 0;
-	};
-
 	CParser* parser;
 	MyCompilerLLVM* compilerLLVM;
 	std::unordered_map<llvm::Value*, int> PlusPlus;
-	bool global_scope = true; // true when parsing an entry in the global scope.
+	bool global_scope = true; // true when parsing an entity in the global scope.
 	const bool debugPrint = false;
 
 	bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
@@ -322,7 +315,7 @@ public:
 		auto name = this->getFunctionName(func);
 		auto returnType = this->getFunctionReturnType(func);
 		CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
-		auto params = this->ParseParamaterTypeList(paramTypeList);
+		auto params = this->ParseParameterTypeList(paramTypeList);
 
 		if (!structName.empty())
 		{
@@ -373,7 +366,7 @@ public:
 					typeAndValue.VariableName = name;
 					typeAndValue.Initializer = initializer;
 
-					result.push_back(typeAndValue);  // Should copy?
+					result.push_back(typeAndValue);  // Copy
 				}
 			}
 		}
@@ -416,7 +409,7 @@ public:
 			if (paramTypeList != nullptr)
 			{
 				// If there is parameter list, then it is a function.
-				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParamaterTypeList(paramTypeList);
+				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParameterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
 				auto ft = compilerLLVM->GetFunctionType(typeAndValue, params, ellipsis);
@@ -481,7 +474,8 @@ public:
 			auto operatorText = ctx->assignmentOperator()->getText();
 			auto assignCtx = ctx->assignmentExpression();
 
-			auto destination = ParseUnaryExpression(unaryCtx, true);
+			auto namedVar = ParseUnaryExpression(unaryCtx);
+			auto destination = namedVar.Storage;
 			auto right = ParseAssignmentExpression(assignCtx);
 
 			if (operatorText != "=")
@@ -494,7 +488,9 @@ public:
 		}
 		else if (unaryCtx)
 		{
-			return ParseUnaryExpression(unaryCtx, false);
+			auto namedVar = ParseUnaryExpression(unaryCtx);
+			auto destination = LoadNamedVariable(namedVar);
+			return destination;
 		}
 
 		__debugbreak();
@@ -689,13 +685,27 @@ public:
 		return nullptr;
 	}
 
+	llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable &namedVar)
+	{
+		if (namedVar.Primary != nullptr)
+			return namedVar.Primary;
+
+		if (namedVar.Storage != nullptr)
+		{
+			return compilerLLVM->CreateLoad(namedVar.Storage);
+		}
+
+		return nullptr;
+	}
+
 	llvm::Value* ParseMultiplicativeExpression(CParser::MultiplicativeExpressionContext* ctx)
 	{
 		auto nextCtxs = ctx->castExpression();
 
 		if (nextCtxs.size() == 1)
 		{
-			return ParseCastExpression(nextCtxs[0]);
+			auto namedVar = ParseCastExpression(nextCtxs[0]);
+			return LoadNamedVariable(namedVar);;
 		}
 		else if (nextCtxs.size() > 1)
 		{
@@ -705,7 +715,8 @@ public:
 			int count = 0;
 			for (const auto& nextCtx : nextCtxs)
 			{
-				rvalue = ParseCastExpression(nextCtx);
+				auto namedVar = ParseCastExpression(nextCtx);
+				rvalue = LoadNamedVariable(namedVar);
 				lvalue = compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
 			}
 
@@ -716,7 +727,7 @@ public:
 		return nullptr;
 	}
 
-	llvm::Value* ParseCastExpression(CParser::CastExpressionContext* ctx)
+	MyCompilerLLVM::NamedVariable ParseCastExpression(CParser::CastExpressionContext* ctx, bool lvalue = false)
 	{
 		/*
 		castExpression : (int*)&num_f
@@ -734,7 +745,6 @@ public:
 		primaryExpression : num_f
 		*/
 
-
 		auto unaryCtx = ctx->unaryExpression();
 		auto castExp = ctx->castExpression();
 		auto typeName = ctx->typeName();
@@ -745,15 +755,26 @@ public:
 		}
 		else if (castExp && typeName)
 		{
-			auto rvalue = ParseCastExpression(castExp);
+			auto namedVar = ParseCastExpression(castExp);
 			auto destTypeName = ParseTypeName(typeName);
 			auto type = compilerLLVM->GetType(destTypeName);
 
-			return compilerLLVM->CreateCast(rvalue, type);
+			if (namedVar.Storage)
+			{
+				// If storage is available, then load it with new type.
+				namedVar.Primary = compilerLLVM->CreateLoad(type, namedVar.Storage);
+			}
+			else
+			{
+				// Otherwise cast it.
+				namedVar.Primary = compilerLLVM->CreateCast(namedVar.Primary, type);
+			}
+
+			return namedVar;
 		}
 
 		__debugbreak();
-		return nullptr;
+		return {};
 	}
 
 	MyCompilerLLVM::TypeAndValue ParseTypeName(CParser::TypeNameContext* ctx)
@@ -789,7 +810,7 @@ public:
 		return typeValue;
 	}
 
-	llvm::Value* ParseUnaryExpression(CParser::UnaryExpressionContext* ctx, bool lValue = false)
+	MyCompilerLLVM::NamedVariable ParseUnaryExpression(CParser::UnaryExpressionContext* ctx)
 	{
 		auto postFixCtx = ctx->postfixExpression();
 		auto castExpCtx = ctx->castExpression();
@@ -797,28 +818,50 @@ public:
 
 		if (postFixCtx != nullptr)
 		{
-			return ParsePostfixExpression(postFixCtx, lValue);
+			return ParsePostfixExpression(postFixCtx);
 		}
 		else if (unaryOperator && castExpCtx)
 		{
 			/* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
 
-			auto castExpression = ParseCastExpression(castExpCtx);
+			std::string opText = unaryOperator->getText();
+			auto namedVar = ParseCastExpression(castExpCtx);
 
-			if (unaryOperator->getText() == "&")
+			if (opText == "&")
 			{
-				// llvm will convert alloc into pointer type.
+				if (!namedVar.Storage)
+				{
+					LogErrorContext(ctx, "Unable to get an Address-of an object without a Storage.");
+				}
+
+				// namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage->getType()->getPointerTo(), namedVar.Storage);
+				namedVar.Primary = namedVar.Storage;
+				namedVar.Storage = nullptr;
+			}
+			else if (opText == "*")
+			{
+				if (!namedVar.Storage)
+				{
+					LogErrorContext(ctx, "Unable to dereference an object without a Storage.");
+				}
+
+				if (!namedVar.Storage->getType()->isPointerTy())
+				{
+					LogErrorContext(ctx, "Unable to dereference a non-pointer.");
+				}
+
+				namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
 			}
 
 			// TODO, unaryOperator
-			return castExpression;
+			return namedVar;
 		}
 
 		__debugbreak();
-		return nullptr;
+		return {};
 	}
 
-	llvm::Value* ParsePostfixExpression(CParser::PostfixExpressionContext* ctx, bool lValue = false)
+	MyCompilerLLVM::NamedVariable ParsePostfixExpression(CParser::PostfixExpressionContext* ctx, bool lValue = false)
 	{
 		/*
 		* postfixExpression
@@ -838,12 +881,10 @@ public:
 		{
 			size_t prevRuleId = 0;
 			size_t prevToken = 0;
+			MyCompilerLLVM::NamedVariable namedVar;
+			MyCompilerLLVM::NamedVariable structVar;
 			std::string primaryIdentifier;
-			llvm::Value* primaryValue = nullptr;
-			llvm::Value* primaryStorage = nullptr;
-			llvm::StructType* structType = nullptr;
-			llvm::Value* structValue = nullptr;
-			llvm::Value* structStorage = nullptr;
+
 			int functionArgCounter = 0;
 
 			for (auto parseTree : ctx->children)
@@ -860,14 +901,14 @@ public:
 					case CParser::RightParen:
 					case CParser::Dot:
 					case CParser::Arrow: { prevToken = tokenType; break; }
-					case CParser::PlusPlus: { if (primaryStorage) { PlusPlus[primaryStorage]++; }  break; }
-					case CParser::MinusMinus: { if (primaryStorage) { PlusPlus[primaryStorage]--; }break; }
+					case CParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; }  break; }
+					case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; }break; }
 					case CParser::Identifier:
 					{
-						if (structType)
+						if (structVar.BaseType)
 						{
 							primaryIdentifier = terminal->getText();
-							auto datastrcture = compilerLLVM->GetDatastructure(structType);
+							auto datastrcture = compilerLLVM->GetDatastructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 							uint32_t fieldCount = 0;
 
 							for (auto field : datastrcture.StructFields)
@@ -881,36 +922,34 @@ public:
 
 							if (fieldCount < datastrcture.StructFields.size())
 							{
-								primaryStorage = compilerLLVM->CreateStructGEP(structType, structStorage, fieldCount);
-								primaryValue = compilerLLVM->CreateLoad(primaryStorage);
+								namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldCount);
+								namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+								namedVar.BaseType = namedVar.Primary->getType();
 							}
 							else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
 							{
-								// Not a field, then try a function.
-								primaryValue = func;
-								primaryStorage = nullptr;
+								// Not a field, then it might be a function.
+								namedVar = {};
 							}
 							else
 							{
-								__debugbreak();
+								LogErrorContext(ctx, std::format("Unknown identifier '{}'.", primaryIdentifier));
 							}
 						}
 						else
 						{
-							std::tie(primaryValue, primaryStorage) = ParseIdentifier(primaryIdentifier);
+							namedVar = ParseIdentifier(terminal);
 						}
 
-						if (primaryValue && primaryValue->getType()->isStructTy())
+						if (namedVar.BaseType && namedVar.BaseType->isStructTy())
 						{
-							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
-							structValue = primaryValue;
-							structStorage = primaryStorage;
+							structVar = namedVar;
 						}
-						//if (!primaryStorage)
+						//if (!namedVar.Storage)
 						//{
 						//	// TODO: verify use case when to clear.
-						//	structType = nullptr;
-						//	structValue = nullptr;
+						//	structVar.BaseType = nullptr;
+						//	structVar.Primary = nullptr;
 						//}
 
 						break;
@@ -927,19 +966,23 @@ public:
 					{
 						auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
 						primaryIdentifier = prevPrimary->getText();
-						std::tie(primaryValue, primaryStorage) = ParsePrimaryExpression(prevPrimary);
 
-						if (primaryValue && primaryValue->getType()->isStructTy())
+						namedVar.Primary = ParsePrimaryExpression(prevPrimary);
+						namedVar.Storage = nullptr;
+
+						if (namedVar.Primary == nullptr)
 						{
-							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
-							structValue = primaryValue;
-							structStorage = primaryStorage;
+							// Try identifier.
+							namedVar = ParseIdentifier(prevPrimary->Identifier());
 						}
-						if (!primaryStorage)
+
+						if (namedVar.BaseType && namedVar.BaseType->isStructTy())
 						{
-							structType = nullptr;
-							structValue = nullptr;
-							structStorage = nullptr;
+							structVar = namedVar;
+						}
+						if (!namedVar.Storage)
+						{
+							structVar = {};
 						}
 
 						break;
@@ -956,9 +999,9 @@ public:
 						auto func = compilerLLVM->GetFunction(functionName);
 
 						std::vector<llvm::Value*> argVec;
-						if (structType)
+						if (structVar.BaseType)
 						{
-							argVec.push_back(structStorage);
+							argVec.push_back(structVar.Storage);
 						}
 
 						auto argumentList = ctx->argumentExpressionList();
@@ -968,19 +1011,21 @@ public:
 
 							for (const auto& argument : assignmentExpressionCtx)
 							{
+								std::string name = argument->getText();
 								argVec.push_back(this->ParseAssignmentExpression(argument));
 							}
 						}
 
-						primaryValue = compilerLLVM->CreateFunctionCall(func, argVec);
-						primaryStorage = nullptr;
+						namedVar.Primary = compilerLLVM->CreateFunctionCall(func, argVec);
+						namedVar.Storage = nullptr;
+						namedVar.BaseType = namedVar.Primary->getType();
 
-						if (primaryValue->getType()->isStructTy())
+						if (namedVar.BaseType->isStructTy())
 						{
-							structType = llvm::dyn_cast<llvm::StructType>(primaryValue->getType());
-							structStorage = compilerLLVM->CreateAlloca(structType->getPointerTo());
-							compilerLLVM->CreateAssignment(primaryValue, structStorage);
-							structValue = primaryValue;
+							structVar.BaseType = llvm::dyn_cast<llvm::StructType>(namedVar.Primary->getType());
+							structVar.Storage = compilerLLVM->CreateAlloca(structVar.BaseType->getPointerTo());
+							compilerLLVM->CreateAssignment(namedVar.Primary, structVar.Storage);
+							structVar.Primary = namedVar.Primary;
 						}
 
 						functionArgCounter++;
@@ -992,97 +1037,96 @@ public:
 				}
 			}
 
-			if (lValue)
-				return primaryStorage;
 
-			return primaryValue;
+			return namedVar;
 		}
 
 		__debugbreak();
-		return nullptr;
+		return {};
 	}
 
-	/// <summary>
-	/// The Value and Storage if applicaple.
-	/// </summary>
-	/// <returns>Returns the load instruction and storage if writable.</returns>
-	std::tuple< llvm::Value*, llvm::Value*> ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
+	llvm::Value* ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
 	{
 		auto expressionCtx = ctx->expression();
-		auto identifier = ctx->Identifier();
 		auto constant = ctx->Constant();
 		auto stringLiteral = ctx->StringLiteral();
 
 		if (expressionCtx != nullptr)
 		{
-			return std::tuple(ParseExpression(expressionCtx), nullptr);
+			return ParseExpression(expressionCtx);
 		}
 		else if (stringLiteral.size() > 0)
 		{
 			// TODO handle encoding u8,u,U,L
 			std::string rawText = ctx->getText();
 			rawText = ProcessRawText(rawText);
-			return std::tuple(compilerLLVM->CreateGlobalString("", rawText), nullptr);
+			return compilerLLVM->CreateGlobalString("", rawText);
 		}
 		else if (constant)
 		{
 			if (constant->getText() == "true")
 			{
-				return std::tuple(compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+				return compilerLLVM->CreateConstant("bool", constant->getText());
 			}
 			else if (constant->getText() == "false")
 			{
-				return std::tuple(compilerLLVM->CreateConstant("bool", constant->getText()), nullptr);
+				return compilerLLVM->CreateConstant("bool", constant->getText());
 			}
 			else
 			{
 				std::string constantRaw = constant->getText();
 				auto number = ParseNumberConstant(constantRaw);
 				auto value = compilerLLVM->CreateConstant(number);
-				return { value, nullptr };
+				return value;
 			}
 		}
-		else if (identifier)
-		{
-			std::string name = identifier->getText();
-			return ParseIdentifier(name);
-		}
 
-		__debugbreak();
-		return std::tuple(nullptr, nullptr);
+		return nullptr;
 	}
 
-	std::tuple< llvm::Value*, llvm::Value*> ParseIdentifier(std::string name)
+	MyCompilerLLVM::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node)
 	{
-		if (auto alloc = compilerLLVM->GetLocalVariable(name))
+		if (!node)
+			return {};
+
+		std::string name = node->getText();
+		MyCompilerLLVM::NamedVariable namedVar = {};
+		namedVar = compilerLLVM->GetLocalVariable(name);
+		if (namedVar.Storage != nullptr)
 		{
-			return std::tuple(compilerLLVM->CreateLoad(alloc), alloc);
+			return namedVar;
 		}
 
 		if (auto funcArgument = compilerLLVM->GetFunctionArgument(name))
 		{
-			return std::tuple(funcArgument, nullptr);
+			namedVar.Primary = funcArgument;
+			namedVar.BaseType = funcArgument->getType();
+			return namedVar;
 		}
 
 		if (auto memberVar = compilerLLVM->GetMemberVariable(name))
 		{
-			return std::tuple(compilerLLVM->CreateLoad(memberVar), memberVar);
+			namedVar.Storage = memberVar;
+			namedVar.BaseType = memberVar->getType();
+			return namedVar;
 		}
 
 		// try getting global variable
 		if (auto gVar = compilerLLVM->GetGlobalVariable(name))
 		{
-			return std::tuple(compilerLLVM->CreateLoad(gVar), gVar);
+			namedVar.Storage = gVar;
+			namedVar.BaseType = gVar->getType();
+			return namedVar;
 		}
 
 		if (auto func = compilerLLVM->GetFunction(name))
 		{
-			return std::tuple(func, nullptr);
+			namedVar.Primary = func;
+			return namedVar;
 		}
 
-		std::cout << "Undefined variable : " << name << "\n";
-		__debugbreak();
-		return std::tuple(nullptr, nullptr);
+		LogErrorContext(node, std::format("Undefined variable {}.", name));
+		return {};
 	}
 
 	std::string ProcessRawText(std::string rawText)
@@ -1221,7 +1265,7 @@ public:
 		}
 	}
 
-	std::vector<MyCompilerLLVM::TypeAndValue> ParseParamaterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+	std::vector<MyCompilerLLVM::TypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
 	{
 		std::vector<MyCompilerLLVM::TypeAndValue> params;
 
@@ -1234,8 +1278,20 @@ public:
 		for (auto paramDecl : paramDeclList)
 		{
 			MyCompilerLLVM::TypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
-			paramType.VariableName = paramDecl->declarator()->directDeclarator()->getText();
-			params.push_back(paramType);
+			if (auto declarer = paramDecl->declarator())
+			{
+				if (auto directDeclarer = declarer->directDeclarator())
+				{
+					paramType.VariableName = directDeclarer->getText();
+					params.push_back(paramType);
+				}
+			}
+
+			if (paramType.VariableName == "")
+			{
+				PrintContext(paramDecl);
+				std::cout << "Function parameter name is missing.\n";
+			}
 		}
 
 		return params;
@@ -1284,6 +1340,23 @@ public:
 		}
 
 		return 0;
+	}
+
+	void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage)
+	{
+		auto symbol = ctx->getSymbol();
+		int line = symbol->getLine();
+		int column = symbol->getCharPositionInLine();
+		std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
+		__debugbreak();
+	}
+
+	void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage)
+	{
+		int line = ctx->getStart()->getLine();
+		int column = ctx->getStart()->getCharPositionInLine();
+		std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
+		__debugbreak();
 	}
 
 	void PrintContext(antlr4::ParserRuleContext* ctx)

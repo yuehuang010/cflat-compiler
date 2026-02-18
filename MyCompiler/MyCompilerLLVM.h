@@ -48,7 +48,15 @@ public:
 
 		// Used for delayed Initialization
 		CParser::InitializerContext* Initializer = nullptr;
-		bool pointer : 1 = false;
+		bool pointer = false;
+	};
+
+	struct NamedVariable
+	{
+		MyCompilerLLVM::TypeAndValue TypeAndValue;
+		llvm::Type* BaseType = nullptr;
+		llvm::Value* Primary = nullptr;
+		llvm::Value* Storage = nullptr;
 	};
 
 	struct StructData
@@ -61,9 +69,9 @@ public:
 	{
 	public:
 		std::unordered_map<std::string, llvm::Argument*> functionArgument;
-		std::unordered_map<std::string, llvm::AllocaInst*> namedVariable;
+		std::unordered_map<std::string, NamedVariable> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
-		llvm::BasicBlock* resumeBlock = nullptr; // break;r;
+		llvm::BasicBlock* resumeBlock = nullptr; // break;
 
 		void ClearBlock()
 		{
@@ -210,8 +218,13 @@ public:
 
 	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr)
 	{
-		auto alloc = builder->CreateAlloca(GetType(typeValue, autoType), nullptr, typeValue.VariableName);
-		stackNamedVariable.back().namedVariable[typeValue.VariableName] = alloc;
+		auto type = GetType(typeValue, autoType);
+		auto alloc = builder->CreateAlloca(type, nullptr, typeValue.VariableName);
+		auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+		namedVariable.Storage = alloc;
+		namedVariable.TypeAndValue = typeValue;
+		namedVariable.BaseType = type;
+
 		return alloc;
 	}
 
@@ -259,6 +272,11 @@ public:
 	llvm::LoadInst* CreateLoad(llvm::Value* value)
 	{
 		llvm::Type* type = GetTypeFromStorage(value);
+		return builder->CreateLoad(type, value);
+	}
+
+	llvm::LoadInst* CreateLoad(llvm::Type* type, llvm::Value* value)
+	{
 		return builder->CreateLoad(type, value);
 	}
 
@@ -349,10 +367,9 @@ public:
 		builder->CreateAddrSpaceCast(value, dest_ptr_type, name): Converts a pointer in one address space to a pointer in a different address space.
 		*/
 
-		auto op = llvm::Instruction::CastOps::BitCast;
+		auto op = llvm::Instruction::CastOps::IntToPtr;
 		return CreateCast(op, value, destType);
 	}
-
 
 	llvm::Value* CreateCast(llvm::Instruction::CastOps op, llvm::Value* value, llvm::Type* destType)
 	{
@@ -550,7 +567,6 @@ public:
 		right = Upconvert(right, left);
 
 		// Note: NSW (No Signed Wrap) and NUS(No Unsigned Wrap)
-
 		if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
 		{
 			switch (op)
@@ -629,6 +645,16 @@ public:
 			case Operation::LessEqual: {
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
+			case Operation::AndAssignment:
+			{
+				return builder->CreateAnd(left, right);
+			}
+			case Operation::OrAssignment:
+			{
+				return builder->CreateOr(left, right);
+			}
+			case Operation::XorAssignment:
+				return builder->CreateXor(left, right);
 			}
 		}
 
@@ -659,8 +685,6 @@ public:
 	/// <summary>
 	/// Exit the current BasicBlock and then jump to resumeBlock.
 	/// </summary>
-	/// <param name="resumeBlock"></param>
-	/// <returns></returns>
 	llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack = true)
 	{
 		if (exitBlackStack)
@@ -767,7 +791,12 @@ public:
 		}
 
 		if (typeAndValue.pointer)
+		{
+			// Note: LLVM doesn't have void ptr, instead use i8 ptr.
+			if (type->isVoidTy())
+				return builder->getInt8Ty()->getPointerTo();
 			return type->getPointerTo();
+		}
 
 		return type;
 	}
@@ -777,11 +806,11 @@ public:
 		return module->getFunction(functionName);
 	}
 
-	llvm::AllocaInst* GetLocalVariable(std::string name)
+	NamedVariable GetLocalVariable(std::string name)
 	{
 		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto nameVal = stackframe.namedVariable;
+			auto& nameVal = stackframe.namedVariable;
 			auto result = nameVal.find(name);
 
 			if (result != nameVal.end())
@@ -790,7 +819,7 @@ public:
 			}
 		}
 
-		return nullptr;
+		return {};
 	}
 
 	/// <summary>
@@ -816,9 +845,6 @@ public:
 						if (structField.VariableName == name)
 						{
 							return CreateStructGEP(findResult->second.StructType, memberStructInstance, count);
-							// Note: Using Extract as it is not writable.
-							// auto ret = CreateExtractValue(memberStructInstance, count);
-							// return ret;
 						}
 						count++;
 					}
@@ -964,7 +990,6 @@ public:
 			if (resumeBlock)
 			{
 				auto result = builder->CreateBr(resumeBlock);
-				// stackNamedVariable.back().ClearBlock();
 				break;
 			}
 		}
@@ -982,7 +1007,6 @@ public:
 			if (continueBlock)
 			{
 				auto result = builder->CreateBr(continueBlock);
-				/// stackNamedVariable.back().ClearBlock();
 				break;
 			}
 		}

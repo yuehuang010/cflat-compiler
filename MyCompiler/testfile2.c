@@ -1,11 +1,20 @@
 void printf(const char* argv, ...);
+void* malloc(int size)
+{
+    printf("malloc size = %d\n", size);
+    return (void*)size;
+}
 
-int main()
+void free(void* ptr)
+{
+    printf("free ptr = %p\n", ptr);
+}
+
+void testPointers()
 {
     int number = 10;
-    number += 20;
-    number *= 2;
-    printf("number=%d\n", number);
+    printf("number=%d, &number=%p\n", number, &number);
 
-    return 0;
+    auto mall = malloc(10);
+    free(mall);
 }

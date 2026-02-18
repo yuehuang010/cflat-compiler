@@ -168,10 +168,10 @@ struct MyStruct2
 
 int testInnerStruct()
 {
-    auto myStruct = MyStruct2();
-    myStruct.myStruct.num1 = 100;
-    myStruct.myStruct.num2++;
-    return myStruct.myStruct.num1 + myStruct.myStruct.num2 + myStruct.myStruct.num3;
+    auto myStruct2 = MyStruct2();
+    myStruct2.myStruct.num1 = 100;
+    myStruct2.myStruct.num2++;
+    return myStruct2.myStruct.num1 + myStruct2.myStruct.num2 + myStruct2.myStruct.num3;
 }
 
 short testShortAdd()
@@ -213,10 +213,32 @@ int testOrderOfOperation()
     return num5;
 }
 
+void* malloc(int size)
+{
+    printf("malloc size = %d\n", size);
+    return (void*)size;
+}
+
+void free(void* ptr)
+{
+    printf("free ptr = %p\n", ptr);
+}
+
+void testPointers()
+{
+    int number = 10;
+    printf("number=%d, &number=%p\n", number, &number);
+
+    auto mall = malloc(10);
+    free(mall);
+}
+
+
 int main(int argc, char** argv) {
     bool result = true;
     testEmptyFunction();
     testEmptyIfStatement();
+    testPointers;
     result &= Test("testConditional", testConditional(), 12);
     result &= Test("testIfElseStatement", testIfElseStatement(), 11);
     result &= Test("myWhileLoopNotEnter", myWhileLoopNotEnter(), 0);
