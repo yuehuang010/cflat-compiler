@@ -48,7 +48,8 @@ public:
 
 		// Used for delayed Initialization
 		CParser::InitializerContext* Initializer = nullptr;
-		bool pointer = false;
+		CParser::AssignmentExpressionContext* ArraySize = nullptr;
+		bool Pointer = false;
 	};
 
 	struct NamedVariable
@@ -216,10 +217,10 @@ public:
 		return gVar;
 	}
 
-	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr)
+	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr)
 	{
 		auto type = GetType(typeValue, autoType);
-		auto alloc = builder->CreateAlloca(type, nullptr, typeValue.VariableName);
+		auto alloc = builder->CreateAlloca(type, arraySize, typeValue.VariableName);
 		auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
 		namedVariable.Storage = alloc;
 		namedVariable.TypeAndValue = typeValue;
@@ -256,6 +257,11 @@ public:
 	llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "")
 	{
 		return builder->CreateStructGEP(structType, structAlloc, index, variableName);
+	}
+
+	llvm::Value* CreateGEP(llvm::Type* type, llvm::Value* ptr, llvm::Value* offset, std::string name = "")
+	{
+		return builder->CreateGEP(type, ptr, offset, name);
 	}
 
 	llvm::Value* CreateExtractValue(llvm::Value* structInstance, unsigned int index)
@@ -328,6 +334,11 @@ public:
 		{
 			// If it's a GEP (e.g., from CreateStructGEP), get the element type
 			type = gep->getResultElementType();
+
+			if (type == nullptr)
+			{
+				type = gep->getSourceElementType();
+			}
 		}
 		else if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(value))
 		{
@@ -337,6 +348,11 @@ public:
 		else
 		{
 			type = value->getType();
+		}
+
+		if (type == nullptr)
+		{
+			__debugbreak();
 		}
 
 		return type;
@@ -790,7 +806,7 @@ public:
 			}
 		}
 
-		if (typeAndValue.pointer)
+		if (typeAndValue.Pointer)
 		{
 			// Note: LLVM doesn't have void ptr, instead use i8 ptr.
 			if (type->isVoidTy())

@@ -59,7 +59,8 @@ private:
 			if (typeSpec != nullptr)
 			{
 				declType.TypeName = typeSpec->getText();
-				declType.pointer = declSpec->pointer() != nullptr;
+				declType.Pointer = declSpec->pointer() != nullptr;
+				declType.ArraySize = declSpec->assignmentExpression();
 				break;
 			}
 		}
@@ -322,7 +323,7 @@ public:
 			MyCompilerLLVM::TypeAndValue typeValue{
 			.TypeName = structName,
 			.VariableName = structName + "__",
-			.pointer = true };
+			.Pointer = true };
 			params.insert(params.begin(), typeValue);
 		}
 
@@ -389,6 +390,12 @@ public:
 			__debugbreak();
 		}
 
+		llvm::Value* arraySize = nullptr;
+		if (typeAndValue.ArraySize)
+		{
+			arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
+		}
+
 		for (auto initDecl : initDeclarVec)
 		{
 			/*
@@ -424,7 +431,7 @@ public:
 				if (identList != nullptr)
 				{
 					// TODO
-					std::cout << "declarator identList: " << typeAndValue.TypeName << " " << name << "\n";
+					LogErrorContext(ctx, "Not Yet Implemented.");
 				}
 
 				llvm::Value* right = nullptr;
@@ -445,7 +452,7 @@ public:
 				}
 				else
 				{
-					auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr);
+					auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize);
 					allocList.push_back(std::pair(name, alloc));
 
 					if (right != nullptr)
@@ -685,7 +692,7 @@ public:
 		return nullptr;
 	}
 
-	llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable &namedVar)
+	llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
 	{
 		if (namedVar.Primary != nullptr)
 			return namedVar.Primary;
@@ -804,7 +811,7 @@ public:
 
 		if (abstractDecl && abstractDecl->pointer())
 		{
-			typeValue.pointer = true;
+			typeValue.Pointer = true;
 		}
 
 		return typeValue;
@@ -834,7 +841,6 @@ public:
 					LogErrorContext(ctx, "Unable to get an Address-of an object without a Storage.");
 				}
 
-				// namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage->getType()->getPointerTo(), namedVar.Storage);
 				namedVar.Primary = namedVar.Storage;
 				namedVar.Storage = nullptr;
 			}
@@ -847,7 +853,7 @@ public:
 
 				if (!namedVar.Storage->getType()->isPointerTy())
 				{
-					LogErrorContext(ctx, "Unable to dereference a non-pointer.");
+					LogErrorContext(ctx, "Unable to dereference a non-Pointer.");
 				}
 
 				namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
@@ -989,7 +995,17 @@ public:
 					}
 					case CParser::RuleExpression:
 					{
-						// TODO: bracket expression
+						auto expressCtx = dynamic_cast<CParser::ExpressionContext*>(ruleContext);
+						auto rvalue = ParseExpression(expressCtx);
+
+						if (!(rvalue && rvalue->getType()->isIntegerTy()))
+						{
+							LogErrorContext(expressCtx, "Expecting be an integer type.");
+						}
+
+						namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue, "array");
+						// namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+
 						break;
 					}
 					case CParser::RuleArgumentExpressionList:

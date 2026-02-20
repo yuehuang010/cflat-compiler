@@ -30,11 +30,11 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="testfile.c" />
-    <None Include="antlr4.exe" />
     <None Include="testfile2.c" />
     <None Include="antlr4.bat">
       <Filter>Source Files</Filter>
     </None>
+    <None Include="testfile3.c" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C.g4" />

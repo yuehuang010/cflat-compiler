@@ -1,20 +1,60 @@
 void printf(const char* argv, ...);
-void* malloc(int size)
+
+int Test(const char* testName, int actual, int expected)
 {
-    printf("malloc size = %d\n", size);
-    return (void*)size;
+	if (expected == actual)
+	{
+		printf("%s passed.\n", testName);
+		return 1;
+	}
+
+	printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+	return 0;
 }
 
-void free(void* ptr)
+bool TestBool(const char* testName, bool actual)
 {
-    printf("free ptr = %p\n", ptr);
+	bool expected = true;
+	if (expected == actual)
+	{
+		printf("%s passed.\n", testName);
+		return true;
+	}
+
+	printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+	return false;
 }
 
-void testPointers()
+int testArray()
 {
-    int number = 10;
-    printf("number=%d, &number=%p\n", number, &number);
+	int arraySize = 30;
+	int[arraySize] array;
 
-    auto mall = malloc(10);
-    free(mall);
+	int i = 0;
+	while (i < arraySize)
+	{
+		array[i] = i;
+		i++;
+	}
+	
+	int sum = 0;
+	i = 0;
+	while (i < arraySize)
+	{
+		sum += array[i];
+		i++;
+	}
+
+	return sum;
+}
+
+void main()
+{
+	bool result = true;
+	result &= Test("testArray", testArray(), 435);
+
+	if (result)
+	{
+		printf("All Test Passed\n");
+	}
 }

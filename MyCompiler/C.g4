@@ -169,7 +169,7 @@ declarationSpecifiers
 
 declarationSpecifier
     : storageClassSpecifier
-    | typeSpecifier pointer?
+    | typeSpecifier (pointer | '[' assignmentExpression ']')?
     | typeQualifier
     | functionSpecifier
     | alignmentSpecifier
@@ -275,10 +275,10 @@ alignmentSpecifier
 
 declarator
     : directDeclarator
-    | directDeclarator '[' typeQualifierList? assignmentExpression? ']'
-    | directDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-    | directDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-    | directDeclarator '[' typeQualifierList? '*' ']'
+    // | directDeclarator '[' typeQualifierList? assignmentExpression? ']'
+    // | directDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
+    // | directDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
+    // | directDeclarator '[' typeQualifierList? '*' ']'
     | directDeclarator '(' parameterTypeList ')'
     | directDeclarator '(' identifierList? ')'
     ;

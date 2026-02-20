@@ -142,6 +142,11 @@
     <ClCompile Include="MyCompilerLLVM.h" />
     <ClCompile Include="MyListener.h" />
     <ClCompile Include="MyCompiler.cpp" />
+    <None Include="testfile3.c">
+      <FileType>CppCode</FileType>
+      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
+      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C.g4">
