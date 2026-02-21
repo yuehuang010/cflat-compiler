@@ -3,6 +3,7 @@
 #include <deque>
 #include <ranges>
 #include <variant>
+#include <format>
 
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\LLVMContext.h>
@@ -414,7 +415,7 @@ public:
 
 				return myStruct;
 			}
-			
+
 			// existing struct;
 			auto& structData = mystuct->second;
 			structData.StructFields = typeAndValues;
@@ -588,37 +589,47 @@ public:
 			switch (op)
 			{
 			case Operation::AddAssignment:
-			case Operation::Add: {
+			case Operation::Add:
+			{
 				return builder->CreateFAdd(left, right);
 			}
 			case Operation::MinusAssignment:
-			case Operation::Subtract: {
+			case Operation::Subtract:
+			{
 				return builder->CreateFSub(left, right);
 			}
 			case Operation::MultiplyAssignment:
-			case Operation::Multiply: {
+			case Operation::Multiply:
+			{
 				return builder->CreateFMul(left, right);
 			}
 			case Operation::DivideAssignment:
-			case Operation::Divide: {
+			case Operation::Divide:
+			{
 				return builder->CreateFDiv(left, right);
 			}
-			case Operation::Equal: {
+			case Operation::Equal:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_EQ, left, right);
 			}
-			case Operation::NotEqual: {
+			case Operation::NotEqual:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_NE, left, right);
 			}
-			case Operation::Greater: {
+			case Operation::Greater:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGT, left, right);
 			}
-			case Operation::GreaterEqual: {
+			case Operation::GreaterEqual:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGE, left, right);
 			}
-			case Operation::Less: {
+			case Operation::Less:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLT, left, right);
 			}
-			case Operation::LessEqual: {
+			case Operation::LessEqual:
+			{
 				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
 			}
@@ -628,37 +639,47 @@ public:
 			switch (op)
 			{
 			case Operation::AddAssignment:
-			case Operation::Add: {
+			case Operation::Add:
+			{
 				return builder->CreateAdd(left, right);
 			}
 			case Operation::MinusAssignment:
-			case Operation::Subtract: {
+			case Operation::Subtract:
+			{
 				return builder->CreateSub(left, right);
 			}
 			case Operation::MultiplyAssignment:
-			case Operation::Multiply: {
+			case Operation::Multiply:
+			{
 				return builder->CreateMul(left, right);
 			}
 			case Operation::DivideAssignment:
-			case Operation::Divide: {
+			case Operation::Divide:
+			{
 				return builder->CreateSDiv(left, right);
 			}
-			case Operation::Equal: {
+			case Operation::Equal:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
 			}
-			case Operation::NotEqual: {
+			case Operation::NotEqual:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
 			}
-			case Operation::Greater: {
+			case Operation::Greater:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGT, left, right);
 			}
-			case Operation::GreaterEqual: {
+			case Operation::GreaterEqual:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SGE, left, right);
 			}
-			case Operation::Less: {
+			case Operation::Less:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLT, left, right);
 			}
-			case Operation::LessEqual: {
+			case Operation::LessEqual:
+			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
 			case Operation::AndAssignment:
@@ -846,7 +867,7 @@ public:
 		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
 		{
 			auto functionArguments = stackframe.functionArgument;
-			
+
 			if (functionArguments.size() > 0)
 			{
 				auto memberStructName = functionArguments.begin()->first;
@@ -1026,6 +1047,18 @@ public:
 				break;
 			}
 		}
+	}
+
+	std::string GetNameOfCurrentInsertionBlock()
+	{
+		llvm::BasicBlock* currentBlock = builder->GetInsertBlock();
+		return std::format("{}::{}", currentBlock->getParent()->getName().str(), currentBlock->getName().str());
+	}
+
+	void DumpCurrentInsertionPoint(std::string prefix = "")
+	{
+		llvm::BasicBlock* currentBlock = builder->GetInsertBlock();
+		llvm::outs() << prefix << "Current insertion block: " << currentBlock->getParent()->getName() << "::" << currentBlock->getName() << "\n";
 	}
 
 	bool Compile(std::string filename);

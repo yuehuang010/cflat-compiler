@@ -203,19 +203,6 @@ public:
 			if (express != nullptr)
 			{
 				ParseExpression(express);
-				if (PlusPlus.size() > 0)
-				{
-					for (auto increment : PlusPlus)
-					{
-						auto destination = increment.first;
-						auto amount = increment.second;
-
-						compilerLLVM->CreateIncrement(destination, amount);
-					}
-
-					PlusPlus.clear();
-				}
-
 				return;
 			}
 		}
@@ -227,6 +214,9 @@ public:
 				| Do statement While '(' expression ')' ';'
 				| For '(' forCondition ')' statement
 				;
+			forCondition
+				: (forDeclaration | expression?) ';' forExpression? ';' forExpression?
+				;
 			*/
 
 			if (iterationStatement->While())
@@ -234,19 +224,107 @@ public:
 				auto expression = iterationStatement->expression();
 				auto innerStatement = iterationStatement->statement();
 
-				auto blockStart = compilerLLVM->CreateBasicBlock("whileStart");
+				auto blockCondition = compilerLLVM->CreateBasicBlock("whileCondition");
 				auto blockInner = compilerLLVM->CreateBasicBlock("whileInner");
 				auto blockResume = compilerLLVM->CreateBasicBlock("whileResume");
 
-				compilerLLVM->CreateBlockBreak(blockStart, false);
+				compilerLLVM->CreateBlockBreak(blockCondition, false);
 
-				compilerLLVM->InitializeBlock(blockStart, true, blockStart, blockResume);
+				compilerLLVM->InitializeBlock(blockCondition, true, blockCondition, blockResume);
 				auto condition = ParseExpression(expression);
 				compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
 
 				compilerLLVM->InitializeBlock(blockInner, false);
 				ParseStatement(innerStatement);
 				compilerLLVM->CreateContinueCall();
+
+				// resume
+				compilerLLVM->InitializeBlock(blockResume, false);
+
+				// pop the stack
+				compilerLLVM->CreateBlockBreak(nullptr, true);
+
+				return;
+			}
+			else if (iterationStatement->Do())
+			{
+				auto expression = iterationStatement->expression();
+				auto innerStatement = iterationStatement->statement();
+
+				auto blockInner = compilerLLVM->CreateBasicBlock("doWhileInner");
+				auto blockCondition = compilerLLVM->CreateBasicBlock("doWhileCondition");
+				auto blockResume = compilerLLVM->CreateBasicBlock("doWhileResume");
+
+				compilerLLVM->CreateBlockBreak(blockInner, false);
+
+				compilerLLVM->InitializeBlock(blockInner, true, blockCondition, blockResume);
+				ParseStatement(innerStatement);
+				compilerLLVM->CreateContinueCall();
+
+				compilerLLVM->InitializeBlock(blockCondition, false);
+				auto condition = ParseExpression(expression);
+				compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+
+				// resume
+				compilerLLVM->InitializeBlock(blockResume, false);
+
+				// pop the stack
+				compilerLLVM->CreateBlockBreak(nullptr, true);
+			}
+			else if (iterationStatement->For())
+			{
+				/*
+				forCondition
+					: (forDeclaration | expression ? ) ';' forExpression ? ';' forExpression ?
+				*/
+
+				auto forCondition = iterationStatement->forCondition();
+				auto declaration = forCondition->forDeclaration();
+				auto expressionCtx = forCondition->expression();
+				auto forIncrementCtx = forCondition->forExpression();
+				auto compareCtx = forCondition->assignmentExpression();
+				auto innerStatement = iterationStatement->statement();
+				
+				auto blockInit = compilerLLVM->CreateBasicBlock("forInit");
+				auto blockCondition = compilerLLVM->CreateBasicBlock("forCondition");
+				auto blockInner = compilerLLVM->CreateBasicBlock("forInner");
+				auto blockIncrement = compilerLLVM->CreateBasicBlock("forIncrement");
+				auto blockResume = compilerLLVM->CreateBasicBlock("forResume");
+
+				compilerLLVM->CreateBlockBreak(blockInit, false);
+
+				// Init => (Condition => Inner => Increment =>Condition)
+
+				// initialization
+				compilerLLVM->InitializeBlock(blockInit, true, blockIncrement, blockResume);
+				if (declaration)
+					ParseForDeclaration(declaration);
+				if (expressionCtx)
+					ParseExpression(expressionCtx);
+
+				compilerLLVM->CreateContinueCall();
+
+				// Condition
+				compilerLLVM->InitializeBlock(blockCondition, false);
+				auto condition = ParseAssignmentExpression(compareCtx);
+				compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+
+				// Inner statement
+				compilerLLVM->InitializeBlock(blockInner, false);
+				ParseStatement(innerStatement);
+				compilerLLVM->CreateContinueCall();
+
+				// Increment
+				compilerLLVM->InitializeBlock(blockIncrement, false);
+
+				auto assignments = forIncrementCtx->assignmentExpression();
+				for (auto assign : assignments)
+				{
+					ParseAssignmentExpression(assign);
+					ProcessPlusPlus();
+				}
+
+				compilerLLVM->CreateBlockBreak(blockCondition, false);
 
 				// resume
 				compilerLLVM->InitializeBlock(blockResume, false);
@@ -375,14 +453,25 @@ public:
 		return result;
 	}
 
+	std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseForDeclaration(CParser::ForDeclarationContext* ctx)
+	{
+		auto declSpec = ctx->declarationSpecifiers();
+		auto initDecl = ctx->initDeclaratorList();
+		return ParseDeclaration(declSpec, initDecl);
+	}
+
 	std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationContext* ctx)
+	{
+		auto declSpec = ctx->declarationSpecifiers();
+		auto initDecl = ctx->initDeclaratorList();
+		return ParseDeclaration(declSpec, initDecl);
+	}
+
+	std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationSpecifiersContext* declSpec, CParser::InitDeclaratorListContext* initDecl)
 	{
 		std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
-		auto declSpec = ctx->declarationSpecifiers();
 		auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
-
-		auto initDecl = ctx->initDeclaratorList();
 		auto initDeclarVec = initDecl->initDeclarator();
 
 		if (typeAndValue.TypeName.empty())
@@ -431,7 +520,7 @@ public:
 				if (identList != nullptr)
 				{
 					// TODO
-					LogErrorContext(ctx, "Not Yet Implemented.");
+					LogErrorContext(identList, "Not Yet Implemented.");
 				}
 
 				llvm::Value* right = nullptr;
@@ -881,8 +970,6 @@ public:
 			)*
 		*/
 
-		std::string fulltext = ctx->getText();
-
 		if (auto primaryCtx = ctx->primaryExpression())
 		{
 			size_t prevRuleId = 0;
@@ -907,8 +994,8 @@ public:
 					case CParser::RightParen:
 					case CParser::Dot:
 					case CParser::Arrow: { prevToken = tokenType; break; }
-					case CParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; }  break; }
-					case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; }break; }
+					case CParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
+					case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
 					case CParser::Identifier:
 					{
 						if (structVar.BaseType)
@@ -1004,7 +1091,6 @@ public:
 						}
 
 						namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue, "array");
-						// namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
 
 						break;
 					}
@@ -1052,7 +1138,6 @@ public:
 					}
 				}
 			}
-
 
 			return namedVar;
 		}
@@ -1194,6 +1279,7 @@ public:
 			for (const auto& assignCtx : assignCtxs)
 			{
 				left = this->ParseAssignmentExpression(assignCtx);
+				ProcessPlusPlus();
 			}
 
 			return left;
@@ -1201,6 +1287,22 @@ public:
 
 		__debugbreak();
 		return nullptr;
+	}
+
+	void ProcessPlusPlus()
+	{
+		if (PlusPlus.size() > 0)
+		{
+			for (auto increment : PlusPlus)
+			{
+				auto destination = increment.first;
+				auto amount = increment.second;
+
+				compilerLLVM->CreateIncrement(destination, amount);
+			}
+
+			PlusPlus.clear();
+		}
 	}
 
 	void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx)
@@ -1375,11 +1477,11 @@ public:
 		__debugbreak();
 	}
 
-	void PrintContext(antlr4::ParserRuleContext* ctx)
+	void PrintContext(antlr4::ParserRuleContext* ctx, std::string suffix = "")
 	{
 		int line = ctx->getStart()->getLine();
 		int column = ctx->getStart()->getCharPositionInLine();
-		std::cout << std::format("[{}:{}] {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText());
+		std::cout << std::format("[{}:{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
 	}
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override

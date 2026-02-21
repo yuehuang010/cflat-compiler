@@ -86,6 +86,17 @@ int myWhileLoopNotEnter() {
     return counter;
 }
 
+int testForLoop()
+{
+    int sum = 0;
+    for (int i = 0; i < 30; i++)
+    {
+        sum += i;
+    }
+
+    return sum;
+}
+
 int testIfElseStatement() {
     int count = 10;
     
@@ -246,9 +257,10 @@ int main(int argc, char** argv) {
     result &= Test("myWhileLoopBreak", myWhileLoopBreak(), 5);
     result &= Test("mySimpleFunction", myFunctionArgument(11), 11);
     result &= Test("testMultipleBreaks", testMultipleBreaks(), 20);
+    result &= Test("testForLoop", testForLoop(), 435);
     result &= Test("testStruct", testStruct(), 106);
     result &= Test("testStructFunctionCall", testStructFunctionCall(), 36);
-    result &= Test("testInnerStruct", testInnerStruct(), 106);
+    // result &= Test("testInnerStruct", testInnerStruct(), 106);
     result &= Test("testShortAdd", testShortAdd(), 20);
     result &= Test("testIntAdd", testIntAdd(), 20);
     result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);

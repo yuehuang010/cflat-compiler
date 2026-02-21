@@ -9,9 +9,16 @@
 #include "CBaseListener.h"
 #include "MyCompilerLLVM.h"
 #include "MyListener.h"
+#include <filesystem>
 
 bool MyCompilerLLVM::Compile(std::string filename)
 {
+	if (!std::filesystem::exists(filename))
+	{
+		std::cout << "File doesn't exists.\n";
+		return false;
+	}
+
 	std::ifstream stream;
 	stream.open(filename);
 	antlr4::ANTLRInputStream input(stream);

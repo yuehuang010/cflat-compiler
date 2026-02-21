@@ -1,28 +1,54 @@
 void printf(const char* argv, ...);
 
-int testArray()
+//int testArray()
+//{
+//	int arraySize = 30;
+//	int[arraySize] array;
+//
+//	int i = 0;
+//	while (i < arraySize)
+//	{
+//		array[i] = i;
+//		i++;
+//	}
+//	
+//	i = 0;
+//	while (i < arraySize)
+//	{
+//		printf("array[%d]=%d\n", i, array[i]);
+//		i++;
+//	}
+//
+//	return 0;
+//}
+
+//int testDoWhileLoop()
+//{
+//	int count = 30;
+//	do
+//	{
+//		printf("%d\n", count);
+//		count--;
+//	}
+//	while (count > 0);
+//
+//	return 0;
+//}
+
+int testForLoop()
 {
-	int arraySize = 30;
-	int[arraySize] array;
-
-	int i = 0;
-	while (i < arraySize)
+	int sum = 0;
+	for (int i = 0; i < 30; i++)
 	{
-		array[i] = i;
-		i++;
-	}
-	
-	i = 0;
-	while (i < arraySize)
-	{
-		printf("array[i]=%d\n", i, array[i]);
-		i++;
+		sum += i;
 	}
 
-	return 0;
+	return sum;
 }
 
 void main()
 {
-	testArray();
+	// testArray();
+	// testDoWhileLoop();
+	testForLoop();
 }
