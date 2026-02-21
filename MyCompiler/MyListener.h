@@ -1124,10 +1124,7 @@ public:
 
 						if (namedVar.BaseType->isStructTy())
 						{
-							structVar.BaseType = llvm::dyn_cast<llvm::StructType>(namedVar.Primary->getType());
-							structVar.Storage = compilerLLVM->CreateAlloca(structVar.BaseType->getPointerTo());
-							compilerLLVM->CreateAssignment(namedVar.Primary, structVar.Storage);
-							structVar.Primary = namedVar.Primary;
+							structVar = namedVar;
 						}
 
 						functionArgCounter++;

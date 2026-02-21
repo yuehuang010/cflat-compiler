@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
     bool result = true;
     testEmptyFunction();
     testEmptyIfStatement();
-    testPointers;
+    testPointers();
     result &= Test("testConditional", testConditional(), 12);
     result &= Test("testIfElseStatement", testIfElseStatement(), 11);
     result &= Test("myWhileLoopNotEnter", myWhileLoopNotEnter(), 0);
@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
     result &= Test("testForLoop", testForLoop(), 435);
     result &= Test("testStruct", testStruct(), 106);
     result &= Test("testStructFunctionCall", testStructFunctionCall(), 36);
-    // result &= Test("testInnerStruct", testInnerStruct(), 106);
+    result &= Test("testInnerStruct", testInnerStruct(), 106);
     result &= Test("testShortAdd", testShortAdd(), 20);
     result &= Test("testIntAdd", testIntAdd(), 20);
     result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);

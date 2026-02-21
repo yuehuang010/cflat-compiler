@@ -1,54 +1,36 @@
 void printf(const char* argv, ...);
 
-//int testArray()
-//{
-//	int arraySize = 30;
-//	int[arraySize] array;
-//
-//	int i = 0;
-//	while (i < arraySize)
-//	{
-//		array[i] = i;
-//		i++;
-//	}
-//	
-//	i = 0;
-//	while (i < arraySize)
-//	{
-//		printf("array[%d]=%d\n", i, array[i]);
-//		i++;
-//	}
-//
-//	return 0;
-//}
-
-//int testDoWhileLoop()
-//{
-//	int count = 30;
-//	do
-//	{
-//		printf("%d\n", count);
-//		count--;
-//	}
-//	while (count > 0);
-//
-//	return 0;
-//}
-
-int testForLoop()
+struct MyStruct
 {
-	int sum = 0;
-	for (int i = 0; i < 30; i++)
-	{
-		sum += i;
-	}
+	int num1 = 1;
+	int num2 = 2;
+	int num3 = 3;
+};
 
-	return sum;
+
+struct MyStruct2
+{
+	MyStruct myStruct = MyStruct();
+};
+
+
+int testInnerStruct()
+{
+	MyStruct2 myStruct2 = MyStruct2();
+	myStruct2.myStruct.num1 = 100;
+	myStruct2.myStruct.num2++;
+	// return myStruct2.myStruct.num1;
+	return myStruct2.myStruct.num1 + myStruct2.myStruct.num2 + myStruct2.myStruct.num3;
+}
+
+int testStruct()
+{
+	MyStruct myStruct = MyStruct();
+	return myStruct.num1 + myStruct.num2 + myStruct.num3;
 }
 
 void main()
 {
-	// testArray();
-	// testDoWhileLoop();
-	testForLoop();
+	printf("%d\n", testInnerStruct());
+	printf("%d\n", testStruct());
 }
