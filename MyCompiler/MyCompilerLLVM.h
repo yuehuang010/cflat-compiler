@@ -46,25 +46,39 @@ public:
 	{
 		std::string TypeName;
 		std::string VariableName;
+		bool Pointer = false;
+	};
 
+	struct DeclTypeAndValue : public TypeAndValue
+	{
 		// Used for delayed Initialization
 		CParser::InitializerContext* Initializer = nullptr;
+
+		// Used for array
 		CParser::AssignmentExpressionContext* ArraySize = nullptr;
-		bool Pointer = false;
 	};
 
 	struct NamedVariable
 	{
+	public:
 		MyCompilerLLVM::TypeAndValue TypeAndValue;
 		llvm::Type* BaseType = nullptr;
 		llvm::Value* Primary = nullptr;
 		llvm::Value* Storage = nullptr;
+
+		llvm::Value* GetValue() const
+		{
+			if (Primary)
+				return Primary;
+			
+			return Storage;
+		}
 	};
 
 	struct StructData
 	{
 		llvm::StructType* StructType;
-		std::vector<TypeAndValue> StructFields;
+		std::vector<DeclTypeAndValue> StructFields;
 	};
 
 	class StackState
@@ -82,6 +96,16 @@ public:
 		}
 	};
 
+	class FunctionSymbol
+	{
+	public:
+		std::string Name;
+		llvm::Function* function;
+		TypeAndValue returnType;
+		std::vector<TypeAndValue> Parameters;
+		bool variadic = false;
+	};
+
 	using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
 
 private:
@@ -92,6 +116,7 @@ private:
 	std::vector<StackState> stackNamedVariable;
 	std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
 	std::unordered_map<std::string, StructData> dataStructures;
+	std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
 
 	llvm::Function* currentFunction;
 
@@ -272,7 +297,15 @@ public:
 
 	llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination)
 	{
-		value = Upconvert(value, destination);
+		auto destType = GetTypeFromStorage(destination);
+		if (destType == builder->getInt1Ty())
+		{
+			value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
+		}
+		else
+		{
+			value = Upconvert(value, destType);
+		}
 		return builder->CreateStore(value, destination);
 	}
 
@@ -394,14 +427,13 @@ public:
 	}
 
 	// Create StructType or OpaqueStruct
-	llvm::StructType* CreateStructType(std::string name, std::vector<MyCompilerLLVM::TypeAndValue> typeAndValues)
+	llvm::StructType* CreateStructType(std::string name, std::vector<MyCompilerLLVM::DeclTypeAndValue> typeAndValues)
 	{
 		if (typeAndValues.size() > 0)
 		{
-
 			std::vector<llvm::Type*> types;
 
-			for (auto typeValue : typeAndValues)
+			for (const auto& typeValue : typeAndValues)
 			{
 				types.emplace_back(GetType(typeValue));
 			}
@@ -749,11 +781,32 @@ public:
 		builder->SetInsertPoint(block);
 	}
 
-	void CreateFunctionDeclaration(std::string functionName, llvm::FunctionType* functionType = nullptr)
+	void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
 	{
+		auto functionType = GetFunctionType(returnType, arguments, varargs);
+
 		if (module->getFunction(functionName) == nullptr)
 		{
-			module->getOrInsertFunction(functionName, functionType);
+			auto funcCallee = module->getOrInsertFunction(functionName, functionType);
+			llvm::Value* calleeValue = funcCallee.getCallee();
+
+			if (llvm::Function* fn = llvm::dyn_cast<llvm::Function>(calleeValue))
+			{
+				auto& sym = functionTable[functionName];
+				FunctionSymbol funcSym = {
+					.Name = functionName,
+					.function = fn,
+					.returnType = returnType,
+					.variadic = fn->isVarArg(),
+				};
+
+				for (const auto& arg : arguments)
+				{
+					funcSym.Parameters.push_back(arg);
+				}
+
+				sym.push_back(funcSym);
+			}
 		}
 		else
 		{
@@ -776,25 +829,43 @@ public:
 		return ft;
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string functionName, std::vector<MyCompilerLLVM::TypeAndValue> arguments, llvm::FunctionType* functionType)
+	llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
 	{
+		llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
+
 		auto fn = module->getFunction(functionName);
 		if (functionType == nullptr)
 		{
 			functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
 		}
 
-		if (fn == nullptr)
-		{
-			fn = createFunctionProto(functionName, functionType);
-		}
-		else
+		if (fn != nullptr)
 		{
 			std::cout << "Function already exists : " << functionName << "\n";
 			__debugbreak();
 		}
 
+		fn = createFunctionProto(functionName, functionType);
+
 		createFunctionBlock(fn, arguments);
+
+		{
+			auto& sym = functionTable[functionName];
+			FunctionSymbol funcSym = {
+				.Name = functionName,
+				.function = fn,
+				.returnType = returnType,
+				.variadic = fn->isVarArg(),
+			};
+
+			for (const auto& arg : arguments)
+			{
+				funcSym.Parameters.push_back(arg);
+			}
+
+			sym.push_back(funcSym);
+		}
+
 
 		return fn;
 	}
@@ -802,7 +873,7 @@ public:
 	llvm::Type* GetType(MyCompilerLLVM::TypeAndValue typeAndValue, llvm::Type* autoType = nullptr)
 	{
 		llvm::Type* type = nullptr;
-		auto typeName = typeAndValue.TypeName;
+		const auto& typeName = typeAndValue.TypeName;
 
 		if (typeName == "void") { type = builder->getVoidTy(); }
 		else if (typeName == "char") { type = builder->getInt8Ty(); }
@@ -838,6 +909,168 @@ public:
 		return type;
 	}
 
+	std::vector<MyCompilerLLVM::NamedVariable> MatchFunction(const std::vector<MyCompilerLLVM::NamedVariable>& inputArguments, const std::vector<MyCompilerLLVM::TypeAndValue>& targetArguments)
+	{
+		// Two pass match.
+		// 1) first named arguments
+		// 2) remaining argument fills in the blank.
+
+		const size_t inputSize = inputArguments.size();
+		if (inputSize != targetArguments.size())
+			return {};
+
+		// A map from input to target Argument
+		std::vector<int> posMap(inputSize, -1);
+
+		int posIndex = 0;
+		for (const auto& input : inputArguments)
+		{
+			if (input.TypeAndValue.VariableName != "")
+			{
+				auto it = std::find_if(targetArguments.begin(), targetArguments.end(), [&](const auto& typeAndName)
+					{
+						return input.TypeAndValue.VariableName == typeAndName.VariableName;
+					});
+
+				if (it != targetArguments.end())
+				{
+					posMap[posIndex] = std::distance(targetArguments.begin(), it);
+				}
+				else
+				{
+					// named but none matched.
+					__debugbreak();
+				}
+			}
+
+			posIndex++;
+		}
+
+		// Create a used map for the target parameters
+		std::vector<bool> usedTargetMap(inputSize);
+		for (int pos : posMap)
+		{
+			if (pos >= 0)
+			{
+				usedTargetMap[pos] = true;
+			}
+		}
+
+		// iterate through non-named variables and assign to the next available posMap.
+		bool successful = true;
+		posIndex = 0;
+		int inputIndex = 0;
+		int targetIndex = 0;
+
+		for (const auto& input : inputArguments)
+		{
+			if (posIndex >= inputSize)
+			{
+				// run out of possible positions
+				// TODO: handle variadic arguments.
+				successful = false;
+				break;
+			}
+
+			if (input.TypeAndValue.VariableName == "")
+			{
+				// search for next empty pos
+				while (targetIndex < inputSize)
+				{
+					if (!usedTargetMap[targetIndex])
+					{
+						posMap[posIndex] = targetIndex;
+						targetIndex++;
+						break;
+					}
+					targetIndex++;
+				}
+			}
+
+			posIndex++;
+		}
+
+		if (successful && std::find(posMap.begin(), posMap.end(), -1) != posMap.end())
+		{
+			successful = false;
+		}
+
+		if (!successful)
+		{
+			return {};
+		}
+
+		// recombine
+		std::vector<MyCompilerLLVM::NamedVariable> result(inputSize);
+		for (int i = 0; i < inputSize; i++)
+		{
+			result[posMap[i]] = inputArguments[i];
+		}
+		return result;
+	}
+
+	llvm::Value* CreateFunctionCall2(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
+	{
+		llvm::Function* ft = nullptr;
+		llvm::Value* result = nullptr;
+
+		auto funcSym = functionTable.find(functionName);
+		if (funcSym != functionTable.end())
+		{
+			const auto& candidates = funcSym->second;
+			for (const auto& candidate : candidates)
+			{
+				if (candidate.variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
+				{
+					// TODO: support variadic
+					ft = candidate.function;
+					ft = candidate.function;
+
+					// convert parameter to vector of llvm::value*
+					std::vector<llvm::Value*> argList;
+					for (const auto& arg : arguments)
+					{
+						argList.push_back(arg.GetValue());
+					}
+
+					result = CreateFunctionCall(ft, argList);
+					break;
+				}
+				else
+				{
+					auto matched = MatchFunction(arguments, candidate.Parameters);
+					if (matched.size() > 0)
+					{
+						if (ft != nullptr)
+						{
+							// resolved into duplicate or ambiguous.
+							__debugbreak();
+						}
+
+						ft = candidate.function;
+
+						// convert matched parameter to vector of llvm::value*
+						std::vector<llvm::Value*> argList;
+						for (const auto& arg : matched)
+						{
+							argList.push_back(arg.GetValue());
+						}
+
+						result = CreateFunctionCall(ft, argList);
+					}
+				}
+			}
+		}
+
+		if (ft == nullptr)
+		{
+			// failed to resolve
+			 __debugbreak();
+		}
+
+		return result;
+	}
+
 	llvm::Function* GetFunction(std::string functionName)
 	{
 		return module->getFunction(functionName);
@@ -864,16 +1097,16 @@ public:
 	/// </summary>
 	llvm::Value* GetMemberVariable(std::string name)
 	{
-		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto functionArguments = stackframe.functionArgument;
+			const auto& functionArguments = stackFrame.functionArgument;
 
 			if (functionArguments.size() > 0)
 			{
-				auto memberStructName = functionArguments.begin()->first;
-				auto memberStructInstance = functionArguments.begin()->second;
-				auto trunName = memberStructName.substr(0, memberStructName.size() - 2);
-				auto findResult = dataStructures.find(trunName);
+				const auto& memberStructName = functionArguments.begin()->first;
+				const auto& memberStructInstance = functionArguments.begin()->second;
+				auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
+				auto findResult = dataStructures.find(truncName);
 				if (findResult != dataStructures.end())
 				{
 					int count = 0;
@@ -895,9 +1128,9 @@ public:
 
 	llvm::Argument* GetFunctionArgument(std::string name)
 	{
-		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto nameVal = stackframe.functionArgument;
+			const auto& nameVal = stackFrame.functionArgument;
 			auto result = nameVal.find(name);
 
 			if (result != nameVal.end())
@@ -920,7 +1153,7 @@ public:
 		return nullptr;
 	}
 
-	StructData GetDatastructure(std::string structName)
+	StructData GetDataStructure(std::string structName)
 	{
 		auto result = dataStructures.find(structName);
 		if (result != dataStructures.end())
@@ -931,9 +1164,9 @@ public:
 		return {};
 	}
 
-	StructData GetDatastructure(llvm::StructType* structType)
+	StructData GetDataStructure(llvm::StructType* structType)
 	{
-		for (auto [_, structData] : dataStructures)
+		for (const auto& [_, structData] : dataStructures)
 		{
 			if (structData.StructType == structType)
 			{

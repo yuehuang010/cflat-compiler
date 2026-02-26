@@ -47,9 +47,9 @@ private:
 		return directDecl->getText();
 	}
 
-	MyCompilerLLVM::TypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
+	MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
 	{
-		MyCompilerLLVM::TypeAndValue declType;
+		MyCompilerLLVM::DeclTypeAndValue declType;
 		std::string typeName;
 		auto declSpecList = declSpecs->declarationSpecifier();
 
@@ -284,7 +284,7 @@ public:
 				auto forIncrementCtx = forCondition->forExpression();
 				auto compareCtx = forCondition->assignmentExpression();
 				auto innerStatement = iterationStatement->statement();
-				
+
 				auto blockInit = compilerLLVM->CreateBasicBlock("forInit");
 				auto blockCondition = compilerLLVM->CreateBasicBlock("forCondition");
 				auto blockInner = compilerLLVM->CreateBasicBlock("forInner");
@@ -401,11 +401,12 @@ public:
 			MyCompilerLLVM::TypeAndValue typeValue{
 			.TypeName = structName,
 			.VariableName = structName + "__",
-			.Pointer = true };
+			.Pointer = true
+			};
 			params.insert(params.begin(), typeValue);
 		}
 
-		auto fn = compilerLLVM->CreateFunctionDefinition(name, params, compilerLLVM->GetFunctionType(returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr));
+		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr);
 
 		compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
 
@@ -424,9 +425,9 @@ public:
 		compilerLLVM->CreateBlockBreak(nullptr);
 	}
 
-	std::vector<MyCompilerLLVM::TypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
+	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
 	{
-		std::vector<MyCompilerLLVM::TypeAndValue> result;
+		std::vector<MyCompilerLLVM::DeclTypeAndValue> result;
 
 		if (ctx.size() > 0)
 		{
@@ -508,8 +509,7 @@ public:
 				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParameterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				auto ft = compilerLLVM->GetFunctionType(typeAndValue, params, ellipsis);
-				compilerLLVM->CreateFunctionDeclaration(direct->getText(), ft);
+				compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, params, ellipsis);
 			}
 			else if (direct != nullptr)
 			{
@@ -808,7 +808,7 @@ public:
 			llvm::Value* lvalue = nullptr;
 			llvm::Value* rvalue = nullptr;
 
-			int count = 0;
+			size_t count = 0;
 			for (const auto& nextCtx : nextCtxs)
 			{
 				auto namedVar = ParseCastExpression(nextCtx);
@@ -1001,10 +1001,10 @@ public:
 						if (structVar.BaseType)
 						{
 							primaryIdentifier = terminal->getText();
-							auto datastrcture = compilerLLVM->GetDatastructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
+							auto datastrcture = compilerLLVM->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 							uint32_t fieldCount = 0;
 
-							for (auto field : datastrcture.StructFields)
+							for (const auto& field : datastrcture.StructFields)
 							{
 								if (field.VariableName == primaryIdentifier)
 								{
@@ -1082,6 +1082,8 @@ public:
 					}
 					case CParser::RuleExpression:
 					{
+						// Bracket [] operation
+
 						auto expressCtx = dynamic_cast<CParser::ExpressionContext*>(ruleContext);
 						auto rvalue = ParseExpression(expressCtx);
 
@@ -1090,7 +1092,18 @@ public:
 							LogErrorContext(expressCtx, "Expecting be an integer type.");
 						}
 
-						namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue, "array");
+						namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
+						namedVar.BaseType = namedVar.Storage->getType();
+						namedVar.Primary = nullptr;
+
+						if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+						{
+							structVar = namedVar;
+						}
+						if (!namedVar.Storage)
+						{
+							structVar = {};
+						}
 
 						break;
 					}
@@ -1098,27 +1111,37 @@ public:
 					{
 						// Create Function Call
 						std::string functionName = primaryIdentifier;
-						auto func = compilerLLVM->GetFunction(functionName);
 
-						std::vector<llvm::Value*> argVec;
+						std::vector<MyCompilerLLVM::NamedVariable> arguments;
 						if (structVar.BaseType)
 						{
-							argVec.push_back(structVar.Storage);
+							auto argumentNamedVar = structVar; // Copy;
+							argumentNamedVar.TypeAndValue.VariableName = "";
+							arguments.push_back(argumentNamedVar);
 						}
 
 						auto argumentList = ctx->argumentExpressionList();
 						if (argumentList.size() > 0)
 						{
-							auto assignmentExpressionCtx = argumentList[functionArgCounter]->assignmentExpression();
+							auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
 
-							for (const auto& argument : assignmentExpressionCtx)
+							for (const auto& namedArgument : namedArgCtx)
 							{
-								std::string name = argument->getText();
-								argVec.push_back(this->ParseAssignmentExpression(argument));
+								auto argName = namedArgument->Identifier();
+								auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+								MyCompilerLLVM::NamedVariable namedVar;
+
+								if (argName)
+								{
+									namedVar.TypeAndValue.VariableName = argName->getText();
+								}
+								namedVar.Primary = argValue;
+
+								arguments.emplace_back(namedVar);
 							}
 						}
 
-						namedVar.Primary = compilerLLVM->CreateFunctionCall(func, argVec);
+						namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
 						namedVar.Storage = nullptr;
 						namedVar.BaseType = namedVar.Primary->getType();
 
@@ -1313,10 +1336,12 @@ public:
 
 		// Create a opaqueStruct to initialize default constructor.
 		auto structType = compilerLLVM->CreateStructType(structName, {});
-
+		MyCompilerLLVM::TypeAndValue returnType{
+			.TypeName = structName,
+		};
 		// Create default constructor
 		{
-			auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, {}, llvm::FunctionType::get(structType, {}, false));
+			auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, returnType, {});
 
 			std::vector<llvm::Value*> initilizers;
 			for (auto& typeValue : declList)

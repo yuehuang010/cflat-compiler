@@ -48,10 +48,30 @@ int testArray()
 	return sum;
 }
 
+int myFunction(int x, int y, int z)
+{
+	// printf("x=%d,y=%d,z=%d: ", x, y, z);
+	int pair_xy = (x + y) * (x + y + 1) / 2 + y;
+	return (pair_xy + z) * (pair_xy + z + 1) / 2 + z;
+}
+
+bool testNamedParameters()
+{
+	bool result = true;
+	int expected = myFunction(1, 2, 3);
+	result &= Test("InOrder", myFunction(x:1, y : 2, z : 3), expected);
+	result &= Test("OutOfOrderName", myFunction( y:2, z:3, x:1), expected);
+	result &= Test("MixedInOrder", myFunction(x:1, y:2, 3), expected);
+	result &= Test("MixedOutOfOrder", myFunction(z:3, 1, 2 ), expected);
+
+	return result;
+}
+
 void main()
 {
 	bool result = true;
 	result &= Test("testArray", testArray(), 435);
+	result &= testNamedParameters();
 
 	if (result)
 	{

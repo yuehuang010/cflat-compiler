@@ -59,7 +59,11 @@ postfixExpression
     ;
 
 argumentExpressionList
-    : (assignmentExpression (',' assignmentExpression)*)?
+    : (argumentNamedExpression (',' argumentNamedExpression)*)?
+    ;
+
+argumentNamedExpression
+    : (Identifier ':')? assignmentExpression 
     ;
 
 unaryExpression
@@ -67,7 +71,6 @@ unaryExpression
         postfixExpression
         | unaryOperator castExpression
         | ('sizeof' | 'alignof') '(' typeName ')'
-        | '&&' Identifier // GCC extension address of label
     )
     ;
 
@@ -275,10 +278,6 @@ alignmentSpecifier
 
 declarator
     : directDeclarator
-    // | directDeclarator '[' typeQualifierList? assignmentExpression? ']'
-    // | directDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-    // | directDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-    // | directDeclarator '[' typeQualifierList? '*' ']'
     | directDeclarator '(' parameterTypeList ')'
     | directDeclarator '(' identifierList? ')'
     ;
@@ -323,19 +322,19 @@ abstractDeclarator
 //    | pointer? directAbstractDeclarator
     ;
 
-directAbstractDeclarator
-    : '(' abstractDeclarator ')'
-    | '[' typeQualifierList? assignmentExpression? ']'
-    | '[' 'static' typeQualifierList? assignmentExpression ']'
-    | '[' typeQualifierList 'static' assignmentExpression ']'
-    | '[' '*' ']'
-    | '(' parameterTypeList? ')'
-    | directAbstractDeclarator '[' typeQualifierList? assignmentExpression? ']'
-    | directAbstractDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-    | directAbstractDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-    | directAbstractDeclarator '[' '*' ']'
-    | directAbstractDeclarator '(' parameterTypeList? ')'
-    ;
+// directAbstractDeclarator
+//     : '(' abstractDeclarator ')'
+//     | '[' typeQualifierList? assignmentExpression? ']'
+//     | '[' 'static' typeQualifierList? assignmentExpression ']'
+//     | '[' typeQualifierList 'static' assignmentExpression ']'
+//     | '[' '*' ']'
+//     | '(' parameterTypeList? ')'
+//     | directAbstractDeclarator '[' typeQualifierList? assignmentExpression? ']'
+//     | directAbstractDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
+//     | directAbstractDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
+//     | directAbstractDeclarator '[' '*' ']'
+//     | directAbstractDeclarator '(' parameterTypeList? ')'
+//     ;
 
 typedefName
     : Identifier

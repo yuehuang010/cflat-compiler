@@ -11,7 +11,7 @@ int main()
 
 	MyCompilerLLVM compiler;
 	compiler.Compile("testfile.c");  // Baseline C standard
-	// compiler.Compile("testfile2.c");  // Modified C like synatx
+	// compiler.Compile("testfile2.c");  // Modified C like syntax
 	// compiler.Compile("testfile3.c");  // Test file
 	std::cout << "Done.\n";
 
