@@ -62,15 +62,15 @@ public:
 	{
 	public:
 		MyCompilerLLVM::TypeAndValue TypeAndValue;
-		llvm::Type* BaseType = nullptr;
-		llvm::Value* Primary = nullptr;
-		llvm::Value* Storage = nullptr;
+		llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
+		llvm::Value* Primary = nullptr;  // The value or result
+		llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
 
 		llvm::Value* GetValue() const
 		{
 			if (Primary)
 				return Primary;
-			
+
 			return Storage;
 		}
 	};
@@ -84,7 +84,7 @@ public:
 	class StackState
 	{
 	public:
-		std::unordered_map<std::string, llvm::Argument*> functionArgument;
+		std::unordered_map<std::string, NamedVariable> functionArgument;
 		std::unordered_map<std::string, NamedVariable> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
@@ -146,7 +146,16 @@ private:
 		for (auto& arg : fn->args())
 		{
 			arg.setName(itr_nameArg->VariableName);
-			stackState.functionArgument[itr_nameArg->VariableName] = &arg;
+
+			NamedVariable namedVar
+			{
+				.TypeAndValue = *itr_nameArg, 
+				.BaseType = GetType(*itr_nameArg, nullptr, false),
+				.Primary = itr_nameArg->Pointer ? nullptr : &arg,
+				.Storage = itr_nameArg->Pointer ? &arg : nullptr,
+			};
+
+			stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
 			itr_nameArg++;
 		}
 
@@ -880,7 +889,7 @@ public:
 		return fn;
 	}
 
-	llvm::Type* GetType(MyCompilerLLVM::TypeAndValue typeAndValue, llvm::Type* autoType = nullptr)
+	llvm::Type* GetType(MyCompilerLLVM::TypeAndValue typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true)
 	{
 		llvm::Type* type = nullptr;
 		const auto& typeName = typeAndValue.TypeName;
@@ -908,7 +917,7 @@ public:
 			}
 		}
 
-		if (typeAndValue.Pointer)
+		if (allowPointer && typeAndValue.Pointer)
 		{
 			// Note: LLVM doesn't have void ptr, instead use i8 ptr.
 			if (type->isVoidTy())
@@ -1034,7 +1043,6 @@ public:
 				{
 					// TODO: support variadic
 					ft = candidate.function;
-					ft = candidate.function;
 
 					// convert parameter to vector of llvm::value*
 					std::vector<llvm::Value*> argList;
@@ -1061,9 +1069,27 @@ public:
 
 						// convert matched parameter to vector of llvm::value*
 						std::vector<llvm::Value*> argList;
+						auto candParamItr = candidate.Parameters.begin();
 						for (const auto& arg : matched)
 						{
-							argList.push_back(arg.GetValue());
+							if (candParamItr->Pointer)
+							{
+								argList.push_back(arg.GetValue());
+							}
+							else
+							{
+								llvm::Value* value = nullptr;
+								if (arg.Primary == nullptr)
+								{
+									value = CreateLoad(arg.Storage);
+								}
+								else
+								{
+									value = arg.Primary;
+								}
+
+								argList.push_back(value);
+							}
 						}
 
 						result = CreateFunctionCall(ft, argList);
@@ -1075,7 +1101,7 @@ public:
 		if (ft == nullptr)
 		{
 			// failed to resolve
-			 __debugbreak();
+			__debugbreak();
 		}
 
 		return result;
@@ -1088,9 +1114,9 @@ public:
 
 	NamedVariable GetLocalVariable(std::string name)
 	{
-		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto& nameVal = stackframe.namedVariable;
+			auto& nameVal = stackFrame.namedVariable;
 			auto result = nameVal.find(name);
 
 			if (result != nameVal.end())
@@ -1114,7 +1140,7 @@ public:
 			if (functionArguments.size() > 0)
 			{
 				const auto& memberStructName = functionArguments.begin()->first;
-				const auto& memberStructInstance = functionArguments.begin()->second;
+				const auto& memberStructInstance = functionArguments.begin()->second.Storage;
 				auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
 				auto findResult = dataStructures.find(truncName);
 				if (findResult != dataStructures.end())
@@ -1136,7 +1162,7 @@ public:
 		return nullptr;
 	}
 
-	llvm::Argument* GetFunctionArgument(std::string name)
+	NamedVariable GetFunctionArgument(std::string name)
 	{
 		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
@@ -1149,7 +1175,7 @@ public:
 			}
 		}
 
-		return nullptr;
+		return {};
 	}
 
 	llvm::GlobalVariable* GetGlobalVariable(std::string name)
@@ -1264,9 +1290,9 @@ public:
 		if (builder->GetInsertBlock()->getTerminator() != nullptr)
 			return;
 
-		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto resumeBlock = stackframe.resumeBlock;
+			auto resumeBlock = stackFrame.resumeBlock;
 			if (resumeBlock)
 			{
 				auto result = builder->CreateBr(resumeBlock);
@@ -1281,9 +1307,9 @@ public:
 		if (builder->GetInsertBlock()->getTerminator() != nullptr)
 			return;
 
-		for (const auto& stackframe : std::ranges::reverse_view(stackNamedVariable))
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
-			auto continueBlock = stackframe.continueBlock;
+			auto continueBlock = stackFrame.continueBlock;
 			if (continueBlock)
 			{
 				auto result = builder->CreateBr(continueBlock);

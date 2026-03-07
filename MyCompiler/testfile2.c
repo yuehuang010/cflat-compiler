@@ -67,11 +67,31 @@ bool testNamedParameters()
 	return result;
 }
 
+struct MyStruct
+{
+	int num1 = 1;
+	int num2 = 2;
+	int num3 = 3;
+};
+
+int TotalByValue(MyStruct mystruct)
+{
+	return mystruct.num1 + mystruct.num2 + mystruct.num2;
+}
+
+int TotalByPointer(MyStruct* mystruct)
+{
+	return mystruct->num1 + mystruct->num2 + mystruct->num2;
+}
+
 void main()
 {
+	MyStruct my = MyStruct();
 	bool result = true;
 	result &= Test("testArray", testArray(), 435);
 	result &= testNamedParameters();
+	result &= Test("testTotalByValue", my.TotalByValue(), 5);
+	result &= Test("testTotalByPointer", my.TotalByPointer(), 5);
 
 	if (result)
 	{

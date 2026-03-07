@@ -783,14 +783,22 @@ public:
 
 	llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
 	{
-		if (namedVar.Primary != nullptr)
-			return namedVar.Primary;
-
-		if (namedVar.Storage != nullptr)
+		if (namedVar.TypeAndValue.Pointer)
 		{
-			return compilerLLVM->CreateLoad(namedVar.Storage);
+			return namedVar.GetValue();
+		}
+		else
+		{
+			if (namedVar.Primary != nullptr)
+				return namedVar.Primary;
+
+			if (namedVar.Storage != nullptr)
+			{
+				return compilerLLVM->CreateLoad(namedVar.Storage);
+			}
 		}
 
+		__debugbreak();
 		return nullptr;
 	}
 
@@ -1001,23 +1009,32 @@ public:
 						if (structVar.BaseType)
 						{
 							primaryIdentifier = terminal->getText();
-							auto datastrcture = compilerLLVM->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
-							uint32_t fieldCount = 0;
+							auto dataStructure = compilerLLVM->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
+							uint32_t fieldIndex = 0;
 
-							for (const auto& field : datastrcture.StructFields)
+							for (const auto& field : dataStructure.StructFields)
 							{
 								if (field.VariableName == primaryIdentifier)
 								{
 									break;
 								}
-								fieldCount++;
+								fieldIndex++;
 							}
 
-							if (fieldCount < datastrcture.StructFields.size())
+							if (fieldIndex < dataStructure.StructFields.size())
 							{
-								namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldCount);
-								namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
-								namedVar.BaseType = namedVar.Primary->getType();
+								if (structVar.Storage)
+								{
+									namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+									namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+									namedVar.BaseType = namedVar.Primary->getType();
+								}
+								else if (structVar.Primary)
+								{
+									namedVar.Storage = nullptr;
+									namedVar.Primary = compilerLLVM->CreateExtractValue(structVar.Primary, fieldIndex);
+									namedVar.BaseType = namedVar.Primary->getType();
+								}
 							}
 							else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
 							{
@@ -1058,8 +1075,8 @@ public:
 					case CParser::RulePrimaryExpression:
 					{
 						auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
-						primaryIdentifier = prevPrimary->getText();
 
+						primaryIdentifier = prevPrimary->getText();
 						namedVar.Primary = ParsePrimaryExpression(prevPrimary);
 						namedVar.Storage = nullptr;
 
@@ -1073,8 +1090,7 @@ public:
 						{
 							structVar = namedVar;
 						}
-
-						if (!namedVar.Storage)
+						else if (!namedVar.Storage)
 						{
 							structVar = {};
 						}
@@ -1101,8 +1117,7 @@ public:
 						{
 							structVar = namedVar;
 						}
-
-						if (!namedVar.Storage)
+						else if (!namedVar.Storage)
 						{
 							structVar = {};
 						}
@@ -1117,7 +1132,7 @@ public:
 						std::vector<MyCompilerLLVM::NamedVariable> arguments;
 						if (structVar.BaseType)
 						{
-							auto argumentNamedVar = structVar; // Copy;
+							MyCompilerLLVM::NamedVariable argumentNamedVar = structVar; // Copy;
 							argumentNamedVar.TypeAndValue.VariableName = "";
 							arguments.push_back(argumentNamedVar);
 						}
@@ -1225,11 +1240,10 @@ public:
 			return namedVar;
 		}
 
-		if (auto funcArgument = compilerLLVM->GetFunctionArgument(name))
+		auto funcArgument = compilerLLVM->GetFunctionArgument(name);
+		if (funcArgument.GetValue() != nullptr)
 		{
-			namedVar.Primary = funcArgument;
-			namedVar.BaseType = funcArgument->getType();
-			return namedVar;
+			return funcArgument;
 		}
 
 		if (auto memberVar = compilerLLVM->GetMemberVariable(name))
