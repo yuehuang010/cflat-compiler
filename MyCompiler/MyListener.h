@@ -1073,6 +1073,7 @@ public:
 						{
 							structVar = namedVar;
 						}
+
 						if (!namedVar.Storage)
 						{
 							structVar = {};
@@ -1100,6 +1101,7 @@ public:
 						{
 							structVar = namedVar;
 						}
+
 						if (!namedVar.Storage)
 						{
 							structVar = {};
@@ -1185,13 +1187,18 @@ public:
 		}
 		else if (constant)
 		{
-			if (constant->getText() == "true")
+			std::string constantText = constant->getText();
+			if (constantText == "true")
 			{
-				return compilerLLVM->CreateConstant("bool", constant->getText());
+				return compilerLLVM->CreateConstant("bool", constantText);
 			}
-			else if (constant->getText() == "false")
+			else if (constantText == "false")
 			{
-				return compilerLLVM->CreateConstant("bool", constant->getText());
+				return compilerLLVM->CreateConstant("bool", constantText);
+			}
+			else if (constantText == "nullptr")
+			{
+				return compilerLLVM->CreateConstant("nullptr", constantText);
 			}
 			else
 			{

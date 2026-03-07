@@ -827,6 +827,7 @@ Constant
     | FloatingConstant
     //|   EnumerationConstant
     | CharacterConstant
+    | NullPtrConstant
     ;
 
 Identifier
@@ -913,6 +914,10 @@ fragment LongSuffix
 fragment LongLongSuffix
     : 'll'
     | 'LL'
+    ;
+
+NullPtrConstant
+    : 'nullptr'
     ;
 
 BooleanConstant

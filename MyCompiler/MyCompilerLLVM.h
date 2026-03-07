@@ -582,6 +582,11 @@ public:
 				value = builder->getFalse();
 			}
 		}
+		else if (typeName == "nullptr")
+		{
+			// create a i8 null pointer
+			value = llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo());
+		}
 		else
 		{
 			std::cout << "Unknown value: " << typeName << "\n";
@@ -741,6 +746,11 @@ public:
 
 	llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
 	{
+		if (cond->getType()->isPointerTy())
+		{
+			cond = builder->CreateIsNotNull(cond);
+		}
+
 		auto branchInst = builder->CreateCondBr(cond, trueBlock, falseBlock);
 		builder->SetInsertPoint(trueBlock);
 		return branchInst;
