@@ -50,7 +50,7 @@ bool MyCompilerLLVM::Compile(std::string filename)
 		{
 			std::cout << "Stack is not empty:\n";
 			for (const auto& funcVariable : stack.functionArgument) {
-				std::cout << "function var: " << funcVariable.first << "\n";
+				std::cout << "Function var: " << funcVariable.first << "\n";
 			}
 			for (const auto& namedVariable : stack.namedVariable)
 			{

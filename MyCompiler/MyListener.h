@@ -56,6 +56,7 @@ private:
 		for (auto declSpec : declSpecList)
 		{
 			auto typeSpec = declSpec->typeSpecifier();
+			auto storageSpec = declSpec->storageClassSpecifier();
 			if (typeSpec != nullptr)
 			{
 				declType.TypeName = typeSpec->getText();
@@ -63,12 +64,16 @@ private:
 				declType.ArraySize = declSpec->assignmentExpression();
 				break;
 			}
+			else if (storageSpec)
+			{
+				declType.external = storageSpec->Extern() != nullptr;
+			}
 		}
 
 		return declType;
 	}
 
-	MyCompilerLLVM::TypeAndValue getFunctionReturnType(CParser::FunctionDefinitionContext* ctx)
+	MyCompilerLLVM::DeclTypeAndValue getFunctionReturnType(CParser::FunctionDefinitionContext* ctx)
 	{
 		auto declSpecs = ctx->declarationSpecifiers();
 
@@ -406,7 +411,7 @@ public:
 			params.insert(params.begin(), typeValue);
 		}
 
-		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, paramTypeList && paramTypeList->Ellipsis() != nullptr);
+		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, returnType.external, paramTypeList && paramTypeList->Ellipsis() != nullptr);
 
 		compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
 
@@ -509,7 +514,7 @@ public:
 				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParameterTypeList(paramTypeList);
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, params, ellipsis);
+				compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, params, typeAndValue.external, ellipsis);
 			}
 			else if (direct != nullptr)
 			{
@@ -1153,6 +1158,7 @@ public:
 									namedVar.TypeAndValue.VariableName = argName->getText();
 								}
 								namedVar.Primary = argValue;
+								namedVar.BaseType = argValue->getType();
 
 								arguments.emplace_back(namedVar);
 							}

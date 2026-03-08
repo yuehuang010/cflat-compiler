@@ -47,6 +47,82 @@ public:
 		std::string TypeName;
 		std::string VariableName;
 		bool Pointer = false;
+
+		bool IsTypeMatch(const TypeAndValue& other) const
+		{
+			if (TypeName == other.TypeName)
+			{
+				return true;
+			}
+
+			return false;
+		}
+
+		bool IsTypePromotion(const TypeAndValue& other) const
+		{
+			if (Pointer != other.Pointer)
+				return false;
+
+			int otherBitSize = other.IsInteger();
+			if (otherBitSize != -1)
+			{
+				int myBitSize = IsInteger();
+				if (myBitSize != -1)
+					return myBitSize < otherBitSize;
+			}
+
+			otherBitSize = other.IsFloatingPoint();
+			if (otherBitSize != -1)
+			{
+				int myBitSize = IsFloatingPoint();
+				if (myBitSize != -1)
+					return myBitSize < otherBitSize;
+			}
+
+			return false;
+		}
+
+		int IsInteger() const
+		{
+			if (TypeName == "char")
+				return 8;
+			if (TypeName == "short")
+				return 16;
+			if (TypeName == "int")
+				return 32;
+			if (TypeName == "long")
+				return 64;
+
+			return -1;
+		}
+
+		int IsFloatingPoint() const
+		{
+			if (TypeName == "float")
+				return 32;
+
+			if (TypeName == "double")
+			{
+				return 64;
+			}
+
+			return -1;
+		}
+
+		std::string ToUniqueString() const
+		{
+			std::string type = TypeName;
+
+			if (Pointer)
+			{
+				// Note: LLVM doesn't have void ptr, instead use i8 ptr.
+				if (TypeName == "void")
+					return "U8Ptr";
+				return type + "Ptr";
+			}
+
+			return type;
+		}
 	};
 
 	struct DeclTypeAndValue : public TypeAndValue
@@ -56,6 +132,7 @@ public:
 
 		// Used for array
 		CParser::AssignmentExpressionContext* ArraySize = nullptr;
+		bool external = false;
 	};
 
 	struct NamedVariable
@@ -99,11 +176,11 @@ public:
 	class FunctionSymbol
 	{
 	public:
-		std::string Name;
-		llvm::Function* function;
-		TypeAndValue returnType;
+		std::string UniqueName;
+		llvm::Function* Function;
+		TypeAndValue ReturnType;
 		std::vector<TypeAndValue> Parameters;
-		bool variadic = false;
+		bool Variadic = false;
 	};
 
 	using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
@@ -149,7 +226,7 @@ private:
 
 			NamedVariable namedVar
 			{
-				.TypeAndValue = *itr_nameArg, 
+				.TypeAndValue = *itr_nameArg,
 				.BaseType = GetType(*itr_nameArg, nullptr, false),
 				.Primary = itr_nameArg->Pointer ? nullptr : &arg,
 				.Storage = itr_nameArg->Pointer ? &arg : nullptr,
@@ -329,13 +406,13 @@ public:
 		return builder->CreateLoad(type, value);
 	}
 
-	llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination)
+	llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination) const
 	{
 		auto destType = GetTypeFromStorage(destination);
 		return Upconvert(value, destType);
 	}
 
-	llvm::Value* Upconvert(llvm::Value* value, llvm::Type* destType)
+	llvm::Value* Upconvert(llvm::Value* value, llvm::Type* destType) const
 	{
 		auto srcType = value->getType();
 		if (srcType->isIntegerTy() && destType->isIntegerTy())
@@ -364,7 +441,45 @@ public:
 		return value;
 	}
 
-	llvm::Type* GetTypeFromStorage(llvm::Value* value)
+	/// <summary>
+	/// Compare bit width.
+	/// </summary>
+	/// <returns>Returns -1 for in compatible type, 0 for same, positive number for possible Upconvert.</returns>
+	int CompareUpconvert(llvm::Type* srcType, llvm::Type* destType) const
+	{
+		if (srcType->isPointerTy() || destType->isPointerTy())
+		{
+			return 0;
+		}
+
+		// auto srcType = value->getType();
+		if (srcType->isIntegerTy() && destType->isIntegerTy())
+		{
+			auto targetSize = destType->getIntegerBitWidth();
+			auto srcSize = srcType->getIntegerBitWidth();
+
+			// upconvert is needed
+			if (srcSize <= targetSize)
+			{
+				return targetSize - srcSize;
+			}
+		}
+		else if (srcType->isFloatingPointTy() && destType->isFloatingPointTy())
+		{
+			auto targetSize = destType->getScalarSizeInBits();
+			auto srcSize = srcType->getScalarSizeInBits();
+
+			// upconvert is needed
+			if (srcSize <= targetSize)
+			{
+				return targetSize - srcSize;
+			}
+		}
+
+		return -1;
+	}
+
+	llvm::Type* GetTypeFromStorage(llvm::Value* value) const
 	{
 		llvm::Type* type = nullptr;
 
@@ -656,27 +771,27 @@ public:
 			}
 			case Operation::Equal:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_EQ, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_OEQ, left, right);
 			}
 			case Operation::NotEqual:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_NE, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_ONE, left, right);
 			}
 			case Operation::Greater:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGT, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_OGT, left, right);
 			}
 			case Operation::GreaterEqual:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SGE, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_OGE, left, right);
 			}
 			case Operation::Less:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLT, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_OLT, left, right);
 			}
 			case Operation::LessEqual:
 			{
-				return builder->CreateFCmp(llvm::ICmpInst::ICMP_SLE, left, right);
+				return builder->CreateFCmp(llvm::ICmpInst::FCMP_OLE, left, right);
 			}
 			}
 		}
@@ -800,37 +915,36 @@ public:
 		builder->SetInsertPoint(block);
 	}
 
-	void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+	void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false)
 	{
 		auto functionType = GetFunctionType(returnType, arguments, varargs);
+		std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
-		if (module->getFunction(functionName) == nullptr)
-		{
-			auto funcCallee = module->getOrInsertFunction(functionName, functionType);
-			llvm::Value* calleeValue = funcCallee.getCallee();
-
-			if (llvm::Function* fn = llvm::dyn_cast<llvm::Function>(calleeValue))
-			{
-				auto& sym = functionTable[functionName];
-				FunctionSymbol funcSym = {
-					.Name = functionName,
-					.function = fn,
-					.returnType = returnType,
-					.variadic = fn->isVarArg(),
-				};
-
-				for (const auto& arg : arguments)
-				{
-					funcSym.Parameters.push_back(arg);
-				}
-
-				sym.push_back(funcSym);
-			}
-		}
-		else
+		if (module->getFunction(mangledName) != nullptr)
 		{
 			std::cout << "Function already exists:" << functionName << "\n";
 			__debugbreak();
+		}
+
+		auto funcCallee = module->getOrInsertFunction(mangledName, functionType);
+		llvm::Value* calleeValue = funcCallee.getCallee();
+
+		if (llvm::Function* fn = llvm::dyn_cast<llvm::Function>(calleeValue))
+		{
+			auto& symList = functionTable[functionName];
+			FunctionSymbol funcSym = {
+				.UniqueName = mangledName,
+				.Function = fn,
+				.ReturnType = returnType,
+				.Variadic = fn->isVarArg(),
+			};
+
+			for (const auto& arg : arguments)
+			{
+				funcSym.Parameters.push_back(arg);
+			}
+
+			symList.push_back(funcSym);
 		}
 	}
 
@@ -848,11 +962,27 @@ public:
 		return ft;
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+	std::string ComputeMangledName(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+	{
+		std::string argumentString = {};
+		
+		for (const auto& argument : arguments)
+		{
+			argumentString += argument.ToUniqueString();
+		}
+
+		std::string uniqueName = std::format("_{}_{}_{}_", functionName, returnType.ToUniqueString(), argumentString);
+
+		return uniqueName;
+	}
+
+	llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false)
 	{
 		llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
 
-		auto fn = module->getFunction(functionName);
+		std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
+
+		auto fn = module->getFunction(mangledName);
 		if (functionType == nullptr)
 		{
 			functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
@@ -864,17 +994,17 @@ public:
 			__debugbreak();
 		}
 
-		fn = createFunctionProto(functionName, functionType);
+		fn = createFunctionProto(mangledName, functionType);
 
 		createFunctionBlock(fn, arguments);
 
 		{
-			auto& sym = functionTable[functionName];
+			auto& symList = functionTable[functionName];
 			FunctionSymbol funcSym = {
-				.Name = functionName,
-				.function = fn,
-				.returnType = returnType,
-				.variadic = fn->isVarArg(),
+				.UniqueName = mangledName,
+				.Function = fn,
+				.ReturnType = returnType,
+				.Variadic = fn->isVarArg(),
 			};
 
 			for (const auto& arg : arguments)
@@ -882,14 +1012,14 @@ public:
 				funcSym.Parameters.push_back(arg);
 			}
 
-			sym.push_back(funcSym);
+			symList.push_back(funcSym);
 		}
 
 
 		return fn;
 	}
 
-	llvm::Type* GetType(MyCompilerLLVM::TypeAndValue typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true)
+	llvm::Type* GetType(const MyCompilerLLVM::TypeAndValue &typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
 	{
 		llvm::Type* type = nullptr;
 		const auto& typeName = typeAndValue.TypeName;
@@ -928,11 +1058,76 @@ public:
 		return type;
 	}
 
+	std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
+	{
+		std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
+		// int score = 0; // 2 for promotionMatch, 1 for implicitMatch
+
+		for (const auto& pair : candidates)
+		{
+			const auto& [arguments, candidate] = pair;
+
+			if (candidate.Variadic)
+			{
+				// TODO: Support overload for variadic.
+				return pair;
+			}
+
+			bool perfectMatch = true;
+			bool promotionMatch = true;
+			bool implicitMatch = true;
+
+			auto candidateParamItr = candidate.Parameters.begin();
+			for (const auto& arg : arguments)
+			{
+				int result = -1;
+				if (arg.TypeAndValue.TypeName != "")
+				{
+					result = arg.TypeAndValue.IsTypeMatch(*candidateParamItr) ? 0 : -1;
+				}
+				else
+				{
+					auto candidateParam = GetType(*candidateParamItr);
+					result = CompareUpconvert(arg.BaseType, candidateParam);
+				}
+
+				if (result != 0)
+				{
+					perfectMatch = false;
+				}
+
+				if (result < 0)
+				{
+					promotionMatch = false;
+					implicitMatch = false;
+				}
+
+				if (!(perfectMatch || promotionMatch || implicitMatch))
+				{
+					// quick break if matches is no longer possible.
+					break;
+				}
+
+				++candidateParamItr;
+			}
+
+			if (perfectMatch)
+				return pair;
+
+			if (promotionMatch || implicitMatch)
+			{
+				possibleResult = pair;
+			}
+		}
+
+		return possibleResult;
+	}
+
 	std::vector<MyCompilerLLVM::NamedVariable> MatchFunction(const std::vector<MyCompilerLLVM::NamedVariable>& inputArguments, const std::vector<MyCompilerLLVM::TypeAndValue>& targetArguments)
 	{
 		// Two pass match.
-		// 1) first named arguments
-		// 2) remaining argument fills in the blank.
+		// 1) Align named arguments
+		// 2) Fill remaining argument fills in the blank.
 
 		const size_t inputSize = inputArguments.size();
 		if (inputSize != targetArguments.size())
@@ -1030,28 +1225,19 @@ public:
 
 	llvm::Value* CreateFunctionCall2(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
 	{
-		llvm::Function* ft = nullptr;
-		llvm::Value* result = nullptr;
-
 		auto funcSym = functionTable.find(functionName);
 		if (funcSym != functionTable.end())
 		{
 			const auto& candidates = funcSym->second;
+
+			std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
+
 			for (const auto& candidate : candidates)
 			{
-				if (candidate.variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
+				if (candidate.Variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
 				{
-					// TODO: support variadic
-					ft = candidate.function;
-
-					// convert parameter to vector of llvm::value*
-					std::vector<llvm::Value*> argList;
-					for (const auto& arg : arguments)
-					{
-						argList.push_back(arg.GetValue());
-					}
-
-					result = CreateFunctionCall(ft, argList);
+					// TODO: support named parameters variadic
+					resolvedCandidate.emplace_back(arguments, candidate);
 					break;
 				}
 				else
@@ -1059,56 +1245,57 @@ public:
 					auto matched = MatchFunction(arguments, candidate.Parameters);
 					if (matched.size() > 0)
 					{
-						if (ft != nullptr)
-						{
-							// resolved into duplicate or ambiguous.
-							__debugbreak();
-						}
-
-						ft = candidate.function;
-
-						// convert matched parameter to vector of llvm::value*
-						std::vector<llvm::Value*> argList;
-						auto candParamItr = candidate.Parameters.begin();
-						for (const auto& arg : matched)
-						{
-							if (candParamItr->Pointer)
-							{
-								argList.push_back(arg.GetValue());
-							}
-							else
-							{
-								llvm::Value* value = nullptr;
-								if (arg.Primary == nullptr)
-								{
-									value = CreateLoad(arg.Storage);
-								}
-								else
-								{
-									value = arg.Primary;
-								}
-
-								argList.push_back(value);
-							}
-						}
-
-						result = CreateFunctionCall(ft, argList);
+						resolvedCandidate.emplace_back(matched, candidate);
 					}
 				}
 			}
+
+			if (resolvedCandidate.size() > 0)
+			{
+				const auto& [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
+
+				// convert parameter to vector of llvm::value*
+				std::vector<llvm::Value*> argList;
+				auto candParamItr = candidate.Parameters.begin();
+				for (const auto& arg : matched)
+				{
+					if (candParamItr->Pointer)
+					{
+						argList.push_back(arg.GetValue());
+					}
+					else
+					{
+						llvm::Value* value = nullptr;
+						if (arg.Primary == nullptr)
+						{
+							value = CreateLoad(arg.Storage);
+						}
+						else
+						{
+							value = arg.Primary;
+						}
+
+						argList.push_back(value);
+					}
+				}
+
+				return CreateFunctionCall(candidate.Function, argList);
+			}
 		}
 
-		if (ft == nullptr)
-		{
-			// failed to resolve
-			__debugbreak();
-		}
-
-		return result;
+		__debugbreak();
+		return nullptr;
 	}
 
 	llvm::Function* GetFunction(std::string functionName)
 	{
+		auto functionSym = functionTable.find(functionName);
+
+		if (functionSym != functionTable.end())
+		{
+			return functionSym->second.front().Function;
+		}
+
 		return module->getFunction(functionName);
 	}
 

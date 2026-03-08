@@ -819,7 +819,7 @@ Ellipsis
     : '...'
     ;
 
-// Antlr matches Rules by the order they appear in the grammer.
+// Antlr matches Rules by the order they appear in the grammar.
 // Thus, declaring Constant before Identifier.
 Constant
     : IntegerConstant

@@ -1,4 +1,4 @@
-void printf(const char* argv, ...);
+extern void printf(const char* argv, ...);
 
 int Test(const char* testName, int actual, int expected)
 {
@@ -84,14 +84,37 @@ int TotalByPointer(MyStruct* mystruct)
 	return mystruct->num1 + mystruct->num2 + mystruct->num2;
 }
 
-void main()
+struct MyStruct1
+{
+	int num = 1;
+	int Read() { return num; }
+};
+
+struct MyStruct2
+{
+	int num = 2;
+	int Read() { return num; }
+};
+
+// Overloaded Extension function
+int ReadExt(MyStruct1 my) { return my.num; }
+int ReadExt(MyStruct2 my) { return my.num; }
+
+extern void main()
 {
 	MyStruct my = MyStruct();
+	MyStruct1 struct1 = MyStruct1();
+	MyStruct2 struct2 = MyStruct2();
+
 	bool result = true;
 	result &= Test("testArray", testArray(), 435);
 	result &= testNamedParameters();
 	result &= Test("testTotalByValue", my.TotalByValue(), 5);
 	result &= Test("testTotalByPointer", my.TotalByPointer(), 5);
+	result &= Test("struct1.Read", struct1.Read(), 1);
+	result &= Test("struct2.Read", struct2.Read(), 2);
+	result &= Test("struct1.ReadExt", struct1.ReadExt(), 1);
+	result &= Test("struct2.ReadExt", struct2.ReadExt(), 2);
 
 	if (result)
 	{

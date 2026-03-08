@@ -1,25 +1,50 @@
 
-void printf(const char* argv, ...);
+extern void printf(const char* argv, ...);
 
 int fooInt = 0;
 double fooDouble;
 float fooFloat = 10.f;
 
-int Test(const char* testName, int actual, int expected)
+bool Test(const char* testName, int actual, int expected)
 {
 	if (expected == actual)
 	{
 		printf("%s passed.\n", testName);
-		return 1;
+		return true;
 	}
 
 	printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-	return 0;
+	return false;
 }
 
-bool TestBool(const char* testName, bool actual)
+bool Test(const char* testName, float actual, float expected)
+{
+	if (expected == actual)
+	{
+		printf("%s passed (float).\n", testName);
+		return true;
+	}
+
+	printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
+	return false;
+}
+
+bool Test(const char* testName, double actual, double expected)
+{
+	if (expected == actual)
+	{
+		printf("%s passed (double).\n", testName);
+		return true;
+	}
+
+	printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
+	return false;
+}
+
+bool Test(const char* testName, bool actual)
 {
 	bool expected = true;
+	printf("expected %s.\n", testName);
 	if (expected == actual)
 	{
 		printf("%s passed.\n", testName);
@@ -249,12 +274,32 @@ void testPointers()
 }
 
 
-int main(int argc, char** argv)
+extern int main(int argc, char** argv)
 {
+	// Test the tests
+	if (Test("TestInt", 1, 1))
+	{
+		printf("Test function working.\n");
+	}
+
+	if (Test("Test", 1.0f, 1.0f))
+	{
+		printf("Test function working.\n");
+	}
+
+	if (Test("Test", 1.0, 1.0))
+	{
+		printf("Test function working.\n");
+	}
+
+	if (Test("TestBool", true))
+	{
+		printf("TestBool function working.\n");
+	}
+
 	bool result = true;
 	testEmptyFunction();
 	testEmptyIfStatement();
-	Test("name", 1, 1);
 	testPointers();
 	result &= Test("testConditional", testConditional(), 12);
 	result &= Test("testIfElseStatement", testIfElseStatement(), 11);
@@ -270,8 +315,8 @@ int main(int argc, char** argv)
 	result &= Test("testShortAdd", testShortAdd(), 20);
 	result &= Test("testIntAdd", testIntAdd(), 20);
 	result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);
-	testFloatAdd();
-	testDoubleAdd();
+	result &= Test("testFloatAdd", testFloatAdd(), 20.0f);
+	result &= Test("testDoubleAdd", testDoubleAdd(), 20.0);
 
 	if (result)
 	{
