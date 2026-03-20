@@ -44,7 +44,6 @@ bool Test(const char* testName, double actual, double expected)
 bool Test(const char* testName, bool actual)
 {
 	bool expected = true;
-	printf("expected %s.\n", testName);
 	if (expected == actual)
 	{
 		printf("%s passed.\n", testName);
@@ -76,6 +75,52 @@ void testEmptyIfStatement()
 
 	if (false) {}
 	else {}
+}
+
+int shortCircuitCounter = 0;
+
+bool FuncTrue() { shortCircuitCounter++; return true; }
+
+bool FuncFalse() { shortCircuitCounter++; return false; }
+
+bool testLogicalAnd()
+{
+	return FuncTrue() && !FuncFalse();
+}
+
+bool testLogicalOr()
+{
+	return FuncFalse() || FuncTrue();
+}
+
+bool testShortCircuit()
+{
+	bool result = true;
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() || FuncFalse() || FuncTrue()", FuncFalse() || FuncTrue() || FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() || FuncFalse() || FuncFalse()", FuncFalse() || FuncFalse() || FuncFalse());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() && FuncTrue() && FuncTrue()", FuncFalse() && FuncTrue() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() && FuncFalse() && FuncTrue()", FuncTrue() && FuncFalse() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
+
+	return result;
 }
 
 int myWhileLoopBreak()
@@ -277,27 +322,18 @@ void testPointers()
 extern int main(int argc, char** argv)
 {
 	// Test the tests
-	if (Test("TestInt", 1, 1))
-	{
-		printf("Test function working.\n");
-	}
-
-	if (Test("Test", 1.0f, 1.0f))
-	{
-		printf("Test function working.\n");
-	}
-
-	if (Test("Test", 1.0, 1.0))
-	{
-		printf("Test function working.\n");
-	}
-
-	if (Test("TestBool", true))
-	{
-		printf("TestBool function working.\n");
-	}
-
 	bool result = true;
+	result &= Test("TestInt", 1, 1);
+	result &= Test("TestFloat", 1.0f, 1.0f);
+	result &= Test("TestDouble", 1.0, 1.0);
+	result &= Test("TestBool", true);
+
+	if (!result)
+	{
+		printf("Test function is broken.\n");
+		return 0;
+	}
+
 	testEmptyFunction();
 	testEmptyIfStatement();
 	testPointers();
@@ -317,6 +353,8 @@ extern int main(int argc, char** argv)
 	result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);
 	result &= Test("testFloatAdd", testFloatAdd(), 20.0f);
 	result &= Test("testDoubleAdd", testDoubleAdd(), 20.0);
+	result &= Test("testLogicalAnd", testLogicalAnd());
+	result &= Test("testLogicalOr", testLogicalOr());
 
 	if (result)
 	{

@@ -17,7 +17,7 @@ private:
 	MyCompilerLLVM* compilerLLVM;
 	std::unordered_map<llvm::Value*, int> PlusPlus;
 	bool global_scope = true; // true when parsing an entity in the global scope.
-	const bool debugPrint = false;
+	constexpr static bool debugPrint = false;
 
 	bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
 	{
@@ -131,7 +131,7 @@ public:
 
 	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
 	{
-		if (debugPrint)
+		if constexpr (debugPrint)
 			return;
 
 		auto func = ctx->functionDefinition();
@@ -235,7 +235,7 @@ public:
 
 				compilerLLVM->CreateBlockBreak(blockCondition, false);
 
-				compilerLLVM->InitializeBlock(blockCondition, true, blockCondition, blockResume);
+				compilerLLVM->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
 				auto condition = ParseExpression(expression);
 				compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
 
@@ -262,7 +262,7 @@ public:
 
 				compilerLLVM->CreateBlockBreak(blockInner, false);
 
-				compilerLLVM->InitializeBlock(blockInner, true, blockCondition, blockResume);
+				compilerLLVM->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
 				ParseStatement(innerStatement);
 				compilerLLVM->CreateContinueCall();
 
@@ -301,7 +301,7 @@ public:
 				// Init => (Condition => Inner => Increment =>Condition)
 
 				// initialization
-				compilerLLVM->InitializeBlock(blockInit, true, blockIncrement, blockResume);
+				compilerLLVM->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
 				if (declaration)
 					ParseForDeclaration(declaration);
 				if (expressionCtx)
@@ -355,26 +355,29 @@ public:
 				auto innerStatement = selectionStatement->statement();
 
 				// Parse condition value before CreateBlock
-				auto condition = ParseExpression(expression);
-
-				auto blockIf = compilerLLVM->CreateBasicBlock("ifTrue");
-				llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compilerLLVM->CreateBasicBlock("ifFalse");
-
+				auto blockCondition = compilerLLVM->CreateBasicBlock("ifCondition");
+				auto blockTrue = compilerLLVM->CreateBasicBlock("ifTrue");
 				auto blockResume = compilerLLVM->CreateBasicBlock("ifResume");
+				llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compilerLLVM->CreateBasicBlock("ifFalse");
+				auto blockFalse = blockElse ? blockElse : blockResume;
 
-				compilerLLVM->CreateConditionJump(condition, blockIf, blockElse ? blockElse : blockResume);
+				compilerLLVM->CreateBlockBreak(blockCondition, false);
 
-				compilerLLVM->InitializeBlock(blockIf, true);
+				compilerLLVM->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
+				auto condition = ParseExpression(expression);
+				compilerLLVM->CreateConditionJump(condition, blockTrue, blockFalse);
+
+				compilerLLVM->InitializeBlock(blockTrue, false);
 				ParseStatement(innerStatement[0]);
 
-				compilerLLVM->CreateBlockBreak(blockResume);
+				compilerLLVM->CreateBlockBreak(blockResume, true);
 
 				if (blockElse != nullptr)
 				{
 					// else statement
 					compilerLLVM->InitializeBlock(blockElse, true);
 					ParseStatement(innerStatement[1]);
-					compilerLLVM->CreateBlockBreak(blockResume);
+					compilerLLVM->CreateBlockBreak(blockResume, true);
 				}
 
 				// resume
@@ -413,7 +416,7 @@ public:
 
 		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, returnType.external, paramTypeList && paramTypeList->Ellipsis() != nullptr);
 
-		compilerLLVM->InitializeBlock(&fn->front(), false, &fn->back(), &fn->back());
+		compilerLLVM->InitializeBlock(&fn->front(), false);
 
 		auto blockItemList = func->compoundStatement()->blockItemList();
 
@@ -427,7 +430,7 @@ public:
 		}
 
 		// Pop the stack
-		compilerLLVM->CreateBlockBreak(nullptr);
+		compilerLLVM->CreateBlockBreak(nullptr, true);
 	}
 
 	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
@@ -529,10 +532,10 @@ public:
 				}
 
 				llvm::Value* right = nullptr;
-				auto initilizer = initDecl->initializer();
-				if (initilizer != nullptr)
+				auto initializer = initDecl->initializer();
+				if (initializer != nullptr)
 				{
-					auto assignmentExpression = initilizer->assignmentExpression();
+					auto assignmentExpression = initializer->assignmentExpression();
 					if (assignmentExpression != nullptr)
 					{
 						right = ParseAssignmentExpression(assignmentExpression);
@@ -634,12 +637,33 @@ public:
 	llvm::Value* ParseLogicalOrExpression(CParser::LogicalOrExpressionContext* ctx)
 	{
 		auto logicCtxs = ctx->logicalAndExpression();
-		if (logicCtxs.size())
+		if (logicCtxs.size() == 1)
 		{
+			return ParseLogicalAndExpression(logicCtxs[0]);
+		}
+		else if (logicCtxs.size() > 1)
+		{
+			llvm::Value* left = nullptr;
+			auto elseBlock = compilerLLVM->GetElseBlock();
+
 			for (const auto& logicCtx : logicCtxs)
 			{
-				return ParseLogicalAndExpression(logicCtx);
+				if (left == nullptr)
+				{
+					left = ParseLogicalAndExpression(logicCtx);
+				}
+				else
+				{
+					auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
+					auto branch = compilerLLVM->CreateConditionJump(left, elseBlock, falseBlock);
+
+					compilerLLVM->InitializeBlock(falseBlock, false);
+					llvm::Value* right = ParseLogicalAndExpression(logicCtx);
+					left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::OrAssignment, left, right);
+				}
 			}
+
+			return left;
 		}
 
 		__debugbreak();
@@ -648,13 +672,33 @@ public:
 
 	llvm::Value* ParseLogicalAndExpression(CParser::LogicalAndExpressionContext* ctx)
 	{
-		auto incluiveCtxs = ctx->inclusiveOrExpression();
-		if (incluiveCtxs.size())
+		auto inclusiveCtxs = ctx->inclusiveOrExpression();
+
+		if (inclusiveCtxs.size() == 1)
 		{
-			for (const auto& incluCtx : incluiveCtxs)
+			return ParseInclusiveOrExpression(inclusiveCtxs[0]);
+		}
+		else if (inclusiveCtxs.size() > 1)
+		{
+			llvm::Value* left = nullptr;
+			for (const auto& inclusiveCtx : inclusiveCtxs)
 			{
-				return ParseInclusiveOrExpression(incluCtx);
+				if (left == nullptr)
+				{
+					left = ParseInclusiveOrExpression(inclusiveCtx);
+				}
+				else
+				{
+					auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
+					auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, compilerLLVM->GetElseBlock());
+
+					compilerLLVM->InitializeBlock(trueBlock, false);
+					llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
+					left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::AndAssignment, left, right);
+				}
 			}
+
+			return left;
 		}
 
 		__debugbreak();
@@ -663,12 +707,12 @@ public:
 
 	llvm::Value* ParseInclusiveOrExpression(CParser::InclusiveOrExpressionContext* ctx)
 	{
-		auto excluiveCtxs = ctx->exclusiveOrExpression();
-		if (excluiveCtxs.size())
+		auto exclusiveCtxs = ctx->exclusiveOrExpression();
+		if (exclusiveCtxs.size())
 		{
-			for (const auto& excluCtx : excluiveCtxs)
+			for (const auto& exclusiveCtx : exclusiveCtxs)
 			{
-				return ParseExclusiveOrExpression(excluCtx);
+				return ParseExclusiveOrExpression(exclusiveCtx);
 			}
 		}
 
@@ -959,6 +1003,17 @@ public:
 				}
 
 				namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+			}
+			else if (opText == "!")
+			{
+				auto newValue = this->LoadNamedVariable(namedVar);
+				namedVar.Primary = compilerLLVM->CreateNot(newValue);
+				namedVar.Storage = nullptr;
+			}
+			else
+			{
+				LogErrorContext(ctx, std::format("{} operator is not yet implemented.", opText));
+				__debugbreak();
 			}
 
 			// TODO, unaryOperator
@@ -1418,7 +1473,7 @@ public:
 			// close constructor.
 			compilerLLVM->CreateReturnCall(structVal);
 			// Pop the stack
-			compilerLLVM->CreateBlockBreak(nullptr);
+			compilerLLVM->CreateBlockBreak(nullptr, true);
 		}
 
 		// Parse member functions
@@ -1535,7 +1590,7 @@ public:
 
 	void enterEveryRule(antlr4::ParserRuleContext* ctx) override
 	{
-		if (debugPrint)
+		if constexpr (debugPrint)
 			PrintContext(ctx);
 	}
 };

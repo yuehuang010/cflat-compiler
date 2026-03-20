@@ -165,11 +165,13 @@ public:
 		std::unordered_map<std::string, NamedVariable> namedVariable;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
+		llvm::BasicBlock* elseBlock = nullptr; // short-circuit condition.
 
 		void ClearBlock()
 		{
 			continueBlock = nullptr;
 			resumeBlock = nullptr;
+			elseBlock = nullptr;
 		}
 	};
 
@@ -860,6 +862,11 @@ public:
 		return right;
 	}
 
+	llvm::Value* CreateNot(llvm::Value* value)
+	{
+		return builder->CreateNot(value);
+	}
+
 	llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr)
 	{
 		if (fn == nullptr)
@@ -880,6 +887,11 @@ public:
 		return branchInst;
 	}
 
+	llvm::PHINode* CreatePHINode(std::string name, int reserve)
+	{
+		return builder->CreatePHI(builder->getInt1Ty(), reserve, name);
+	}
+
 	llvm::Value* CreateSelect(llvm::Value* cond, llvm::Value* falseValue, llvm::Value* trueValue)
 	{
 		return builder->CreateSelect(cond, trueValue, falseValue);
@@ -888,7 +900,7 @@ public:
 	/// <summary>
 	/// Exit the current BasicBlock and then jump to resumeBlock.
 	/// </summary>
-	llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack = true)
+	llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack)
 	{
 		if (exitBlackStack)
 			stackNamedVariable.pop_back();
@@ -903,13 +915,14 @@ public:
 		return nullptr;
 	}
 
-	void InitializeBlock(llvm::BasicBlock* block, bool enterBlockStack = true, llvm::BasicBlock* continueBlock = nullptr, llvm::BasicBlock* resumeBlock = nullptr)
+	void InitializeBlock(llvm::BasicBlock* block, bool enterBlockStack, llvm::BasicBlock* continueBlock = nullptr, llvm::BasicBlock* resumeBlock = nullptr, llvm::BasicBlock* elseBlock = nullptr)
 	{
 		if (enterBlockStack)
 		{
 			auto& stack = stackNamedVariable.emplace_back();
 			stack.continueBlock = continueBlock;
 			stack.resumeBlock = resumeBlock;
+			stack.elseBlock = elseBlock;
 		}
 
 		builder->SetInsertPoint(block);
@@ -1469,6 +1482,20 @@ public:
 			value = Upconvert(value, currentFunction->getReturnType());
 			builder->CreateRet(value);
 		}
+	}
+
+	llvm::BasicBlock* GetElseBlock()
+	{
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+		{
+			auto elseBlock = stackFrame.elseBlock;
+			if (elseBlock)
+			{
+				return elseBlock;
+			}
+		}
+
+		return nullptr;
 	}
 
 	void CreateBreakCall()

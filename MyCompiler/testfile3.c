@@ -1,45 +1,105 @@
 extern void printf(const char* argv, ...);
 
-int Add(int a, int b)
+
+bool Test(const char* testName, int actual, int expected)
 {
-	printf("Adding Int.\n");
-	return a + b;
+	if (expected == actual)
+	{
+		printf("%s passed.\n", testName);
+		return true;
+	}
+
+	printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+	return false;
 }
 
-float Add(float a, float b)
+bool Test(const char* testName, float actual, float expected)
 {
-	printf("Adding float.\n");
-	return a + b;
+	if (expected == actual)
+	{
+		printf("%s passed (float).\n", testName);
+		return true;
+	}
+
+	printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
+	return false;
 }
 
-struct MyStruct1
+bool Test(const char* testName, double actual, double expected)
 {
-	int num = 1;
-	int Read() { printf("Reading MyStruct1.\n");  return num; }
-};
+	if (expected == actual)
+	{
+		printf("%s passed (double).\n", testName);
+		return true;
+	}
 
-struct MyStruct2
+	printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
+	return false;
+}
+
+bool Test(const char* testName, bool actual)
 {
-	int num = 2;
-	int Read() { printf("Reading MyStruct2.\n"); return num; }
-};
+	bool expected = true;
+	if (expected == actual)
+	{
+		printf("%s passed.\n", testName);
+		return true;
+	}
 
-int ReadExt(MyStruct1 my) { printf("ReadExt MyStruct1.\n"); return my.num; }
-int ReadExt(MyStruct2 my) { printf("ReadExt MyStruct2.\n"); return my.num; }
+	printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+	return false;
+}
+
+
+int shortCircuitCounter = 0;
+
+bool FuncTrue() { shortCircuitCounter++; return true; }
+
+bool FuncFalse() { shortCircuitCounter++; return false; }
+
+//bool testLogicalAnd()
+//{
+//	return FuncTrue() && !FuncFalse();
+//}
+//
+//bool testLogicalOr()
+//{
+//	return FuncFalse() || FuncTrue();
+//}
+
+bool testShortCircuit()
+{
+	bool result = true;
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() || FuncFalse() || FuncTrue()", FuncFalse() || FuncTrue() || FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() || FuncFalse() || FuncFalse()", FuncFalse() || FuncFalse() || FuncFalse());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncFalse() && FuncTrue() && FuncTrue()", FuncFalse() && FuncTrue() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() && FuncFalse() && FuncTrue()", FuncTrue() && FuncFalse() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
+
+	shortCircuitCounter = 0;
+	result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue());
+	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
+
+	return result;
+}
 
 extern void main()
 {
-	MyStruct1 struct1 = MyStruct1();
-	MyStruct2 struct2 = MyStruct2();
-
-	printf("struct1.Read=%d\n", struct1.Read());
-	printf("struct2.Read=%d\n", struct2.Read());
-	printf("struct1.ReadExt=%d\n", struct1.ReadExt());
-	printf("struct2.ReadExt=%d\n", struct2.ReadExt());
-
-	auto number = Add(1, 2);
-	printf("number=%d\n", number);
-
-	auto number_float = Add(1.f, 2.f);
-	printf("number=%f\n", number_float);
+	//testLogicalAnd();
+	//testLogicalOr();
+	 testShortCircuit();
 }
