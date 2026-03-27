@@ -1,19 +1,17 @@
 
 extern void printf(const char* argv, ...);
 
-int fooInt = 0;
-double fooDouble;
-float fooFloat = 10.f;
+bool TestVerbose = true;
 
 bool Test(const char* testName, int actual, int expected)
 {
 	if (expected == actual)
 	{
-		printf("%s passed.\n", testName);
+		if (TestVerbose) printf("%s passed.\n", testName);
 		return true;
 	}
 
-	printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+	if (TestVerbose) printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
 	return false;
 }
 
@@ -21,11 +19,11 @@ bool Test(const char* testName, float actual, float expected)
 {
 	if (expected == actual)
 	{
-		printf("%s passed (float).\n", testName);
+		if (TestVerbose) printf("%s passed (float).\n", testName);
 		return true;
 	}
 
-	printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
+	if (TestVerbose) printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
 	return false;
 }
 
@@ -33,26 +31,29 @@ bool Test(const char* testName, double actual, double expected)
 {
 	if (expected == actual)
 	{
-		printf("%s passed (double).\n", testName);
+		if (TestVerbose) printf("%s passed (double).\n", testName);
 		return true;
 	}
 
-	printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
+	if (TestVerbose) printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
 	return false;
 }
 
-bool Test(const char* testName, bool actual)
+bool Test(const char* testName, bool actual, bool expected)
 {
-	bool expected = true;
 	if (expected == actual)
 	{
-		printf("%s passed.\n", testName);
+		if (TestVerbose) printf("%s passed.\n", testName);
 		return true;
 	}
 
-	printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+	if (TestVerbose) printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
 	return false;
 }
+
+int fooInt = 0;
+double fooDouble;
+float fooFloat = 10.f;
 
 void testGlobalVariable()
 {
@@ -95,30 +96,33 @@ bool testLogicalOr()
 
 bool testShortCircuit()
 {
+	TestVerbose = false;
 	bool result = true;
 	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue());
+	result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue(), true);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
 
 	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() || FuncFalse() || FuncTrue()", FuncFalse() || FuncTrue() || FuncTrue());
+	result &= Test("FuncFalse() || FuncFalse() || FuncTrue()", FuncFalse() || FuncTrue() || FuncTrue(), true);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
 
 	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() || FuncFalse() || FuncFalse()", FuncFalse() || FuncFalse() || FuncFalse());
+	result &= Test("FuncFalse() || FuncFalse() || FuncFalse()", FuncFalse() || FuncFalse() || FuncFalse(), false);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
 
 	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() && FuncTrue() && FuncTrue()", FuncFalse() && FuncTrue() && FuncTrue());
+	result &= Test("FuncFalse() && FuncTrue() && FuncTrue()", FuncFalse() && FuncTrue() && FuncTrue(), false);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
 
 	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() && FuncFalse() && FuncTrue()", FuncTrue() && FuncFalse() && FuncTrue());
+	result &= Test("FuncTrue() && FuncFalse() && FuncTrue()", FuncTrue() && FuncFalse() && FuncTrue(), false);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
 
 	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue());
+	result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue(), true);
 	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
+
+	TestVerbose = true;
 
 	return result;
 }
@@ -326,7 +330,7 @@ extern int main(int argc, char** argv)
 	result &= Test("TestInt", 1, 1);
 	result &= Test("TestFloat", 1.0f, 1.0f);
 	result &= Test("TestDouble", 1.0, 1.0);
-	result &= Test("TestBool", true);
+	result &= Test("TestBool", true, true);
 
 	if (!result)
 	{
@@ -353,8 +357,9 @@ extern int main(int argc, char** argv)
 	result &= Test("testOrderOfOperation", testOrderOfOperation(), 11);
 	result &= Test("testFloatAdd", testFloatAdd(), 20.0f);
 	result &= Test("testDoubleAdd", testDoubleAdd(), 20.0);
-	result &= Test("testLogicalAnd", testLogicalAnd());
-	result &= Test("testLogicalOr", testLogicalOr());
+	result &= Test("testLogicalAnd", testLogicalAnd(), true);
+	result &= Test("testLogicalOr", testLogicalOr(), true);
+	result &= Test("testShortCircuit", testShortCircuit(), true);
 
 	if (result)
 	{

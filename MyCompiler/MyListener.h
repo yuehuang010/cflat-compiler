@@ -637,6 +637,7 @@ public:
 	llvm::Value* ParseLogicalOrExpression(CParser::LogicalOrExpressionContext* ctx)
 	{
 		auto logicCtxs = ctx->logicalAndExpression();
+
 		if (logicCtxs.size() == 1)
 		{
 			return ParseLogicalAndExpression(logicCtxs[0]);
@@ -646,21 +647,54 @@ public:
 			llvm::Value* left = nullptr;
 			auto elseBlock = compilerLLVM->GetElseBlock();
 
-			for (const auto& logicCtx : logicCtxs)
+			if (elseBlock)
 			{
-				if (left == nullptr)
+				for (const auto& logicCtx : logicCtxs)
 				{
-					left = ParseLogicalAndExpression(logicCtx);
-				}
-				else
-				{
-					auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
-					auto branch = compilerLLVM->CreateConditionJump(left, elseBlock, falseBlock);
+					if (left == nullptr)
+					{
+						left = ParseLogicalAndExpression(logicCtx);
+					}
+					else
+					{
+						auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
+						auto branch = compilerLLVM->CreateConditionJump(left, elseBlock, falseBlock);
 
-					compilerLLVM->InitializeBlock(falseBlock, false);
-					llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-					left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::OrAssignment, left, right);
+						compilerLLVM->InitializeBlock(falseBlock, false);
+						llvm::Value* right = ParseLogicalAndExpression(logicCtx);
+						left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+					}
 				}
+			}
+			else
+			{
+				MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+				auto resultStorage = compilerLLVM->CreateAlloca(compilerLLVM->GetType(boolValue));
+				auto resumeBlock = compilerLLVM->CreateBasicBlock("resumeOR");
+
+				for (const auto& logicCtx : logicCtxs)
+				{
+					if (left == nullptr)
+					{
+						left = ParseLogicalAndExpression(logicCtx);
+						compilerLLVM->CreateAssignment(left, resultStorage);
+					}
+					else
+					{
+						auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
+						auto branch = compilerLLVM->CreateConditionJump(left, resumeBlock, falseBlock);
+
+						compilerLLVM->InitializeBlock(falseBlock, false);
+						llvm::Value* right = ParseLogicalAndExpression(logicCtx);
+						left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+						compilerLLVM->CreateAssignment(left, resultStorage);
+					}
+				}
+
+				compilerLLVM->CreateBlockBreak(resumeBlock, false);
+
+				compilerLLVM->InitializeBlock(resumeBlock, false);
+				return compilerLLVM->CreateLoad(resultStorage);
 			}
 
 			return left;
@@ -681,23 +715,57 @@ public:
 		else if (inclusiveCtxs.size() > 1)
 		{
 			llvm::Value* left = nullptr;
-			for (const auto& inclusiveCtx : inclusiveCtxs)
-			{
-				if (left == nullptr)
-				{
-					left = ParseInclusiveOrExpression(inclusiveCtx);
-				}
-				else
-				{
-					auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
-					auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, compilerLLVM->GetElseBlock());
+			auto elseBlock = compilerLLVM->GetElseBlock();
 
-					compilerLLVM->InitializeBlock(trueBlock, false);
-					llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-					left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::AndAssignment, left, right);
+			if (elseBlock)
+			{
+				for (const auto& inclusiveCtx : inclusiveCtxs)
+				{
+					if (left == nullptr)
+					{
+						left = ParseInclusiveOrExpression(inclusiveCtx);
+					}
+					else
+					{
+						auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
+						auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, compilerLLVM->GetElseBlock());
+
+						compilerLLVM->InitializeBlock(trueBlock, false);
+						llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
+						left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+					}
 				}
 			}
+			else
+			{
+				MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+				auto resultStorage = compilerLLVM->CreateAlloca(compilerLLVM->GetType(boolValue));
+				auto resumeBlock = compilerLLVM->CreateBasicBlock("resumeAND");
 
+				for (const auto& inclusiveCtx : inclusiveCtxs)
+				{
+					if (left == nullptr)
+					{
+						left = ParseInclusiveOrExpression(inclusiveCtx);
+						compilerLLVM->CreateAssignment(left, resultStorage);
+					}
+					else
+					{
+						auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
+						auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, resumeBlock);
+
+						compilerLLVM->InitializeBlock(trueBlock, false);
+						llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
+						left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+						compilerLLVM->CreateAssignment(left, resultStorage);
+					}
+				}
+
+				compilerLLVM->CreateBlockBreak(resumeBlock, false);
+
+				compilerLLVM->InitializeBlock(resumeBlock, false);
+				return compilerLLVM->CreateLoad(resultStorage);
+			}
 			return left;
 		}
 

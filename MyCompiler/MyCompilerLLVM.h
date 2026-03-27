@@ -12,6 +12,9 @@
 #include <antlr4-runtime.h>
 #include <CParser.h>
 
+
+
+
 class MyCompilerLLVM
 {
 public:
@@ -36,8 +39,10 @@ public:
 		MinusAssignment, // '-='
 		LeftShiftAssignment, // '<<='
 		RightShiftAssignment, // '>>='
+		LogicalAnd, // '&&'
 		AndAssignment, // '&='
 		XorAssignment, // '^='
+		LogicalOr, // '||'
 		OrAssignment, // '|='
 
 	};
@@ -123,6 +128,7 @@ public:
 
 			return type;
 		}
+
 	};
 
 	struct DeclTypeAndValue : public TypeAndValue
@@ -166,6 +172,7 @@ public:
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
 		llvm::BasicBlock* elseBlock = nullptr; // short-circuit condition.
+		bool isFunction = false;
 
 		void ClearBlock()
 		{
@@ -219,6 +226,7 @@ private:
 
 		stackState.continueBlock = &fn->back();
 		stackState.resumeBlock = &fn->back();
+		stackState.isFunction = true;
 
 		// populate function arguments
 		auto itr_nameArg = arguments.begin();
@@ -845,10 +853,12 @@ public:
 			{
 				return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
 			}
+			case Operation::LogicalAnd:
 			case Operation::AndAssignment:
 			{
 				return builder->CreateAnd(left, right);
 			}
+			case Operation::LogicalOr:
 			case Operation::OrAssignment:
 			{
 				return builder->CreateOr(left, right);
@@ -1489,7 +1499,7 @@ public:
 		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
 		{
 			auto elseBlock = stackFrame.elseBlock;
-			if (elseBlock)
+			if (elseBlock || stackFrame.isFunction)
 			{
 				return elseBlock;
 			}
