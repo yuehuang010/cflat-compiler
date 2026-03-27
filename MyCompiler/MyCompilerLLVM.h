@@ -9,11 +9,12 @@
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
+#include <llvm\IR\DIBuilder.h>
+#include <llvm\Bitcode\BitcodeWriter.h>
+#include <llvm\Support\FileSystem.h>
 #include <antlr4-runtime.h>
 #include <CParser.h>
-
-
-
+#include "ArgParser.h"
 
 class MyCompilerLLVM
 {
@@ -206,6 +207,11 @@ private:
 
 	llvm::Function* currentFunction;
 
+	std::unique_ptr<llvm::DIBuilder> diBuilder;
+	llvm::DIFile* diFile = nullptr;
+	llvm::DICompileUnit* compileUnit = nullptr;
+	llvm::DISubprogram* currentSubprogram = nullptr;
+
 private:
 	// Create Function Proto or Signature
 	llvm::Function* createFunctionProto(std::string name, llvm::FunctionType* returnType)
@@ -249,6 +255,34 @@ private:
 		currentFunction = fn;
 	}
 
+	llvm::DIType* GetDIType(const TypeAndValue& typeValue)
+	{
+		using namespace llvm::dwarf;
+		llvm::DIType* baseType = nullptr;
+
+		if (typeValue.TypeName == "int")
+			baseType = diBuilder->createBasicType("int", 32, DW_ATE_signed);
+		else if (typeValue.TypeName == "char")
+			baseType = diBuilder->createBasicType("char", 8, DW_ATE_signed_char);
+		else if (typeValue.TypeName == "short")
+			baseType = diBuilder->createBasicType("short", 16, DW_ATE_signed);
+		else if (typeValue.TypeName == "long")
+			baseType = diBuilder->createBasicType("long", 64, DW_ATE_signed);
+		else if (typeValue.TypeName == "float")
+			baseType = diBuilder->createBasicType("float", 32, DW_ATE_float);
+		else if (typeValue.TypeName == "double")
+			baseType = diBuilder->createBasicType("double", 64, DW_ATE_float);
+		else if (typeValue.TypeName == "bool")
+			baseType = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
+		else
+			baseType = diBuilder->createUnspecifiedType(typeValue.TypeName);
+
+		if (typeValue.Pointer)
+			return diBuilder->createPointerType(baseType, 64);
+
+		return baseType;
+	}
+
 	void Init()
 	{
 		context = std::make_unique<llvm::LLVMContext>();
@@ -256,12 +290,44 @@ private:
 		builder = std::make_unique<llvm::IRBuilder<>>(*context);
 	}
 
-	void SaveToFile(std::string filename)
+	bool VerifyModule()
+	{
+		std::string errors;
+		llvm::raw_string_ostream errorStream(errors);
+		if (llvm::verifyModule(*module, &errorStream))
+		{
+			std::cerr << "Module verification failed:\n" << errorStream.str() << "\n";
+			return false;
+		}
+		return true;
+	}
+
+	bool SaveToFile(std::string filename)
 	{
 		std::error_code errorCode;
 		llvm::raw_fd_ostream outLL(filename, errorCode);
+		if (errorCode)
+		{
+			std::cerr << "Error: could not write IR to '" << filename << "': " << errorCode.message() << "\n";
+			return false;
+		}
 		module->print(outLL, nullptr);
+		return true;
 	}
+
+	bool WriteBitcode(std::string filename)
+	{
+		std::error_code errorCode;
+		llvm::raw_fd_ostream outBC(filename, errorCode, llvm::sys::fs::OF_None);
+		if (errorCode)
+		{
+			std::cerr << "Error: could not write bitcode to '" << filename << "': " << errorCode.message() << "\n";
+			return false;
+		}
+		llvm::WriteBitcodeToFile(*module, outBC);
+		return true;
+	}
+
 	Operation ParseOperation(std::string operationText)
 	{
 		if (operationText == "+") { return Operation::Add; }
@@ -297,6 +363,33 @@ public:
 
 		// context is last to be released.
 		context.release();
+	}
+
+	void InitDebugInfo(const std::string& filename, const std::string& directory)
+	{
+		diBuilder = std::make_unique<llvm::DIBuilder>(*module);
+		module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+		module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+		diFile = diBuilder->createFile(filename, directory);
+		compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "MyCompiler", false, "", 0);
+	}
+
+	void FinalizeDebugInfo()
+	{
+		if (diBuilder)
+			diBuilder->finalize();
+	}
+
+	void SetCurrentDebugLocation(int line, int col = 0)
+	{
+		if (!currentSubprogram || !diBuilder) return;
+		builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, (unsigned)line, (unsigned)col, currentSubprogram));
+	}
+
+	void ClearCurrentSubprogram()
+	{
+		currentSubprogram = nullptr;
+		builder->SetCurrentDebugLocation(llvm::DebugLoc());
 	}
 
 	llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue)
@@ -339,7 +432,7 @@ public:
 		return gVar;
 	}
 
-	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr)
+	llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, int line = 0)
 	{
 		auto type = GetType(typeValue, autoType);
 		auto alloc = builder->CreateAlloca(type, arraySize, typeValue.VariableName);
@@ -347,6 +440,15 @@ public:
 		namedVariable.Storage = alloc;
 		namedVariable.TypeAndValue = typeValue;
 		namedVariable.BaseType = type;
+
+		if (diBuilder && currentSubprogram && line > 0)
+		{
+			auto diType = GetDIType(typeValue);
+			auto diVar = diBuilder->createAutoVariable(currentSubprogram, typeValue.VariableName, diFile, (unsigned)line, diType);
+			diBuilder->insertDeclare(alloc, diVar, diBuilder->createExpression(),
+				llvm::DILocation::get(*context, (unsigned)line, 0, currentSubprogram),
+				builder->GetInsertBlock());
+		}
 
 		return alloc;
 	}
@@ -451,6 +553,7 @@ public:
 		return value;
 	}
 
+	
 	/// <summary>
 	/// Compare bit width.
 	/// </summary>
@@ -988,7 +1091,7 @@ public:
 	std::string ComputeMangledName(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
 	{
 		std::string argumentString = {};
-		
+
 		for (const auto& argument : arguments)
 		{
 			argumentString += argument.ToUniqueString();
@@ -999,7 +1102,7 @@ public:
 		return uniqueName;
 	}
 
-	llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false)
+	llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, int line = 0)
 	{
 		llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
 
@@ -1020,6 +1123,20 @@ public:
 		fn = createFunctionProto(mangledName, functionType);
 
 		createFunctionBlock(fn, arguments);
+
+		if (diBuilder && diFile && line > 0)
+		{
+			auto funcDIType = diBuilder->createSubroutineType(diBuilder->getOrCreateTypeArray({}));
+			auto sp = diBuilder->createFunction(
+				diFile, functionName, fn->getName(),
+				diFile, (unsigned)line, funcDIType, (unsigned)line,
+				llvm::DINode::FlagPrototyped,
+				llvm::DISubprogram::SPFlagDefinition
+			);
+			fn->setSubprogram(sp);
+			currentSubprogram = sp;
+			builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, (unsigned)line, 0, sp));
+		}
 
 		{
 			auto& symList = functionTable[functionName];
@@ -1042,7 +1159,7 @@ public:
 		return fn;
 	}
 
-	llvm::Type* GetType(const MyCompilerLLVM::TypeAndValue &typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
+	llvm::Type* GetType(const MyCompilerLLVM::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
 	{
 		llvm::Type* type = nullptr;
 		const auto& typeName = typeAndValue.TypeName;
@@ -1554,5 +1671,5 @@ public:
 		llvm::outs() << prefix << "Current insertion block: " << currentBlock->getParent()->getName() << "::" << currentBlock->getName() << "\n";
 	}
 
-	bool Compile(std::string filename);
+	bool Compile(const ArgParser& args);
 };

@@ -176,6 +176,8 @@ public:
 
 	void ParseStatement(CParser::StatementContext* statement)
 	{
+		compilerLLVM->SetCurrentDebugLocation(statement->getStart()->getLine());
+
 		auto jump = statement->jumpStatement();
 		auto expressStatement = statement->expressionStatement();
 		auto iterationStatement = statement->iterationStatement();
@@ -403,6 +405,7 @@ public:
 		auto returnType = this->getFunctionReturnType(func);
 		CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
 		auto params = this->ParseParameterTypeList(paramTypeList);
+		int line = func->getStart()->getLine();
 
 		if (!structName.empty())
 		{
@@ -414,7 +417,7 @@ public:
 			params.insert(params.begin(), typeValue);
 		}
 
-		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, returnType.external, paramTypeList && paramTypeList->Ellipsis() != nullptr);
+		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, returnType.external, paramTypeList && paramTypeList->Ellipsis() != nullptr, line);
 
 		compilerLLVM->InitializeBlock(&fn->front(), false);
 
@@ -431,6 +434,7 @@ public:
 
 		// Pop the stack
 		compilerLLVM->CreateBlockBreak(nullptr, true);
+		compilerLLVM->ClearCurrentSubprogram();
 	}
 
 	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
@@ -480,6 +484,7 @@ public:
 	{
 		std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
+		int line = declSpec->getStart()->getLine();
 		auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
 		auto initDeclarVec = initDecl->initDeclarator();
 
@@ -549,7 +554,7 @@ public:
 				}
 				else
 				{
-					auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize);
+					auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line);
 					allocList.push_back(std::pair(name, alloc));
 
 					if (right != nullptr)

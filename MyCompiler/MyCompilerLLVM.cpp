@@ -2,6 +2,7 @@
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
+#include <llvm\Bitcode\BitcodeWriter.h>
 #include <antlr4-runtime.h>
 
 #include "CParser.h"
@@ -11,37 +12,48 @@
 #include "MyListener.h"
 #include <filesystem>
 
-bool MyCompilerLLVM::Compile(std::string filename)
+bool MyCompilerLLVM::Compile(const ArgParser& args)
 {
+	auto filename = args.getPositional(0).value_or("");
+	auto outputPath = args.getOption("output").value_or(".\\out.ll");
+	auto bitcodePath = args.getOption("bitcode").value_or("");
+	bool debugInfo = args.hasFlag("debug-info");
+
 	if (!std::filesystem::exists(filename))
 	{
 		std::cout << "File doesn't exists.\n";
 		return false;
 	}
 
-	std::ifstream stream;
-	stream.open(filename);
-	antlr4::ANTLRInputStream input(stream);
+	if (debugInfo)
+	{
+		std::filesystem::path filePath = std::filesystem::absolute(filename);
+		InitDebugInfo(filePath.filename().string(), filePath.parent_path().string());
+	}
 
-	CLexer lexer(&input);
-	antlr4::CommonTokenStream tokens(&lexer);
-	CParser parser(&tokens);
+	{
+		std::ifstream stream;
+		stream.open(filename);
+		antlr4::ANTLRInputStream input(stream);
 
-	tokens.fill();
-	//for (auto token : tokens.getTokens()) {
-	//	std::cout << token->toString() << std::endl;
-	//}
+		CLexer lexer(&input);
+		antlr4::CommonTokenStream tokens(&lexer);
+		CParser parser(&tokens);
 
-	auto computeUnit = parser.compilationUnit();
+		tokens.fill();
+		//for (auto token : tokens.getTokens()) {
+		//	std::cout << token->toString() << std::endl;
+		//}
 
-	MyListener* mylistener = new MyListener(&parser, this);
-	auto walker = antlr4::tree::ParseTreeWalker();
-	walker.walk(mylistener, computeUnit);
-	delete mylistener;
+		auto computeUnit = parser.compilationUnit();
 
-	stream.close();
+		auto myListener = std::make_unique<MyListener>(&parser, this);
+		auto walker = antlr4::tree::ParseTreeWalker();
+		walker.walk(myListener.get(), computeUnit);
+		stream.close();
+	}
 
-	SaveToFile(".\\out.ll");
+	FinalizeDebugInfo();
 
 	// validate that the stack is empty.
 	if (stackNamedVariable.size() > 0)
@@ -49,7 +61,8 @@ bool MyCompilerLLVM::Compile(std::string filename)
 		for (const auto& stack : stackNamedVariable)
 		{
 			std::cout << "Stack is not empty:\n";
-			for (const auto& funcVariable : stack.functionArgument) {
+			for (const auto& funcVariable : stack.functionArgument)
+			{
 				std::cout << "Function var: " << funcVariable.first << "\n";
 			}
 			for (const auto& namedVariable : stack.namedVariable)
@@ -58,6 +71,16 @@ bool MyCompilerLLVM::Compile(std::string filename)
 			}
 		}
 	}
+
+
+	if (!VerifyModule())
+		return false;
+
+	if (!SaveToFile(outputPath))
+		return false;
+
+	if (!bitcodePath.empty() && !WriteBitcode(bitcodePath))
+		return false;
 
 	return true;
 }
