@@ -139,6 +139,10 @@ public:
 
 		// Used for array
 		CParser::AssignmentExpressionContext* ArraySize = nullptr;
+
+		// Used for default parameter values
+		CParser::AssignmentExpressionContext* DefaultValue = nullptr;
+
 		bool external = false;
 	};
 

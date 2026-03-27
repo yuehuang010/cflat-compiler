@@ -363,7 +363,7 @@ extern int main(int argc, char** argv)
 
 	if (result)
 	{
-		printf("All Test Passed\n");
+		printf("All Test Passed.\n");
 	}
 
 	return 0;

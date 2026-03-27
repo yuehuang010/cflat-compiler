@@ -398,6 +398,71 @@ public:
 		__debugbreak();
 	}
 
+	void GenerateDefaultParamOverloads(
+		const std::string& name,
+		const MyCompilerLLVM::DeclTypeAndValue& returnType,
+		const std::vector<MyCompilerLLVM::DeclTypeAndValue>& params,
+		bool varargs,
+		int line)
+	{
+		int firstDefault = -1;
+		for (int i = 0; i < (int)params.size(); i++)
+		{
+			if (params[i].DefaultValue != nullptr)
+			{
+				firstDefault = i;
+				break;
+			}
+		}
+
+		if (firstDefault < 0)
+			return;
+
+		// For each number of omitted trailing defaults, generate a wrapper that
+		// fills them in and forwards to the full function.
+		// e.g. f(int a, int b = 10, int c = 20):
+		//   wrapper(int a, int b) -> f(a, b, 20)
+		//   wrapper(int a)        -> f(a, 10, 20)
+		for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
+		{
+			std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
+
+			auto wrapperFn = compilerLLVM->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
+			compilerLLVM->InitializeBlock(&wrapperFn->front(), false);
+
+			// Build the full argument list for the forwarding call
+			std::vector<MyCompilerLLVM::NamedVariable> callArgs;
+
+			for (int i = 0; i < cutoff; i++)
+			{
+				callArgs.push_back(compilerLLVM->GetFunctionArgument(params[i].VariableName));
+			}
+
+			for (int i = cutoff; i < (int)params.size(); i++)
+			{
+				auto defaultVal = ParseAssignmentExpression(params[i].DefaultValue);
+				MyCompilerLLVM::NamedVariable namedVar;
+				namedVar.Primary = defaultVal;
+				namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
+				callArgs.push_back(namedVar);
+			}
+
+			if (returnType.TypeName == "void")
+			{
+				compilerLLVM->CreateFunctionCall2(name, callArgs);
+				compilerLLVM->CreateReturnCall(nullptr);
+			}
+			else
+			{
+				auto result = compilerLLVM->CreateFunctionCall2(name, callArgs);
+				compilerLLVM->CreateReturnCall(result);
+			}
+
+			compilerLLVM->CreateBlockBreak(nullptr, true);
+			compilerLLVM->ClearCurrentSubprogram();
+		}
+	}
+
 	void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {})
 	{
 		// Create Function Definition
@@ -406,18 +471,20 @@ public:
 		CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
 		auto params = this->ParseParameterTypeList(paramTypeList);
 		int line = func->getStart()->getLine();
+		bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
 		if (!structName.empty())
 		{
-			MyCompilerLLVM::TypeAndValue typeValue{
-			.TypeName = structName,
-			.VariableName = structName + "__",
-			.Pointer = true
-			};
+			MyCompilerLLVM::DeclTypeAndValue typeValue;
+			typeValue.TypeName = structName;
+			typeValue.VariableName = structName + "__";
+			typeValue.Pointer = true;
 			params.insert(params.begin(), typeValue);
 		}
 
-		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, params, returnType.external, paramTypeList && paramTypeList->Ellipsis() != nullptr, line);
+		std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+
+		auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
 
 		compilerLLVM->InitializeBlock(&fn->front(), false);
 
@@ -435,6 +502,8 @@ public:
 		// Pop the stack
 		compilerLLVM->CreateBlockBreak(nullptr, true);
 		compilerLLVM->ClearCurrentSubprogram();
+
+		GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
 	}
 
 	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
@@ -519,10 +588,23 @@ public:
 			if (paramTypeList != nullptr)
 			{
 				// If there is parameter list, then it is a function.
-				std::vector<MyCompilerLLVM::TypeAndValue> params = ParseParameterTypeList(paramTypeList);
+				auto declParams = ParseParameterTypeList(paramTypeList);
+				std::vector<MyCompilerLLVM::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
 				bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-				compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, params, typeAndValue.external, ellipsis);
+				compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
+
+				// Declare overloads for each suffix of omitted default parameters
+				int firstDefault = -1;
+				for (int i = 0; i < (int)declParams.size(); i++)
+				{
+					if (declParams[i].DefaultValue != nullptr) { firstDefault = i; break; }
+				}
+				for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
+				{
+					std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
+					compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false);
+				}
 			}
 			else if (direct != nullptr)
 			{
@@ -1560,9 +1642,9 @@ public:
 		}
 	}
 
-	std::vector<MyCompilerLLVM::TypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
 	{
-		std::vector<MyCompilerLLVM::TypeAndValue> params;
+		std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
 
 		if (paramTypeList == nullptr)
 			return params;
@@ -1572,15 +1654,17 @@ public:
 
 		for (auto paramDecl : paramDeclList)
 		{
-			MyCompilerLLVM::TypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
+			MyCompilerLLVM::DeclTypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
 			if (auto declarer = paramDecl->declarator())
 			{
 				if (auto directDeclarer = declarer->directDeclarator())
 				{
 					paramType.VariableName = directDeclarer->getText();
-					params.push_back(paramType);
 				}
 			}
+
+			paramType.DefaultValue = paramDecl->assignmentExpression();
+			params.push_back(paramType);
 
 			if (paramType.VariableName == "")
 			{

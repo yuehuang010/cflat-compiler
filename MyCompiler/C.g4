@@ -278,7 +278,7 @@ alignmentSpecifier
 
 declarator
     : directDeclarator
-    | directDeclarator '(' parameterTypeList ')'
+    | directDeclarator '(' parameterTypeList ')' // function declaration
     | directDeclarator '(' identifierList? ')'
     ;
 
@@ -305,7 +305,7 @@ parameterList
     ;
 
 parameterDeclaration
-    : declarationSpecifiers declarator
+    : declarationSpecifiers declarator ('=' assignmentExpression)?
     | declarationSpecifiers abstractDeclarator?
     ;
 

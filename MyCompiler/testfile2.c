@@ -100,6 +100,48 @@ struct MyStruct2
 int ReadExt(MyStruct1 my) { return my.num; }
 int ReadExt(MyStruct2 my) { return my.num; }
 
+// Default parameter tests
+
+int addWithDefault(int x, int y = 5)
+{
+	return x + y;
+}
+
+bool testDefaultSingleParam()
+{
+	bool result = true;
+	result &= Test("add_both_args",  addWithDefault(3, 4), 7);  // 3+4=7
+	result &= Test("add_default_y",  addWithDefault(3),    8);  // 3+5=8
+	return result;
+}
+
+int sumWithDefaults(int x, int y = 10, int z = 20)
+{
+	return x + y + z;
+}
+
+bool testDefaultMultipleParams()
+{
+	bool result = true;
+	result &= Test("sum_all_args",    sumWithDefaults(1, 2, 3), 6);   // 1+2+3=6
+	result &= Test("sum_default_z",   sumWithDefaults(1, 2),    23);  // 1+2+20=23
+	result &= Test("sum_defaults_yz", sumWithDefaults(1),       31);  // 1+10+20=31
+	return result;
+}
+
+int multiplyWithDefault(int x, int factor = 2)
+{
+	return x * factor;
+}
+
+bool testDefaultExpression()
+{
+	bool result = true;
+	result &= Test("multiply_explicit", multiplyWithDefault(5, 3), 15);  // 5*3=15
+	result &= Test("multiply_default",  multiplyWithDefault(5),    10);  // 5*2=10
+	return result;
+}
+
 extern void main()
 {
 	MyStruct my = MyStruct();
@@ -115,9 +157,12 @@ extern void main()
 	result &= Test("struct2.Read", struct2.Read(), 2);
 	result &= Test("struct1.ReadExt", struct1.ReadExt(), 1);
 	result &= Test("struct2.ReadExt", struct2.ReadExt(), 2);
+	result &= testDefaultSingleParam();
+	result &= testDefaultMultipleParams();
+	result &= testDefaultExpression();
 
 	if (result)
 	{
-		printf("All Test Passed\n");
+		printf("All Test Passed.\n");
 	}
 }
