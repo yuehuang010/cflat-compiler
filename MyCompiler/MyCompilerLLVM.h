@@ -58,8 +58,17 @@ public:
         bool IsTypeMatch(const TypeAndValue& other) const
         {
             if (TypeName == other.TypeName)
-            {
                 return true;
+
+            // C-equivalent signed integer types: char=i8, short=i16, int=i32, long=i64
+            int myBits    = IsInteger();
+            int otherBits = other.IsInteger();
+            if (myBits != -1 && myBits == otherBits)
+            {
+                bool myUnsigned    = (IsUnsignedInteger() != -1);
+                bool otherUnsigned = (other.IsUnsignedInteger() != -1);
+                if (myUnsigned == otherUnsigned)
+                    return true;
             }
 
             return false;
@@ -70,20 +79,28 @@ public:
             if (Pointer != other.Pointer)
                 return false;
 
+            // Unsigned integer promotion: u8 < u16 < u32 < u64
+            int myUnsigned    = IsUnsignedInteger();
+            int otherUnsigned = other.IsUnsignedInteger();
+            if (myUnsigned != -1 && otherUnsigned != -1)
+                return myUnsigned < otherUnsigned;
+
+            // Signed integer promotion: char/i8 < short/i16 < int/i32 < long/i64
+            // Do not allow signed <-> unsigned implicit promotion.
             int otherBitSize = other.IsInteger();
-            if (otherBitSize != -1)
+            if (otherBitSize != -1 && other.IsUnsignedInteger() == -1)
             {
                 int myBitSize = IsInteger();
-                if (myBitSize != -1)
+                if (myBitSize != -1 && IsUnsignedInteger() == -1)
                     return myBitSize < otherBitSize;
             }
 
-            otherBitSize = other.IsFloatingPoint();
-            if (otherBitSize != -1)
+            int otherFPSize = other.IsFloatingPoint();
+            if (otherFPSize != -1)
             {
-                int myBitSize = IsFloatingPoint();
-                if (myBitSize != -1)
-                    return myBitSize < otherBitSize;
+                int myFPSize = IsFloatingPoint();
+                if (myFPSize != -1)
+                    return myFPSize < otherFPSize;
             }
 
             return false;
@@ -91,14 +108,26 @@ public:
 
         int IsInteger() const
         {
-            if (TypeName == "char")
+            if (TypeName == "char"  || TypeName == "i8"  || TypeName == "u8")
                 return 8;
-            if (TypeName == "short")
+            if (TypeName == "short" || TypeName == "i16" || TypeName == "u16")
                 return 16;
-            if (TypeName == "int")
+            if (TypeName == "int"   || TypeName == "i32" || TypeName == "u32")
                 return 32;
-            if (TypeName == "long")
+            if (TypeName == "long"  || TypeName == "i64" || TypeName == "u64")
                 return 64;
+
+            return -1;
+        }
+
+        // Returns the bit width if this is an unsigned integer type, -1 otherwise.
+        // C equivalents: u8=uint8_t, u16=uint16_t, u32=uint32_t, u64=uint64_t
+        int IsUnsignedInteger() const
+        {
+            if (TypeName == "u8")  return 8;
+            if (TypeName == "u16") return 16;
+            if (TypeName == "u32") return 32;
+            if (TypeName == "u64") return 64;
 
             return -1;
         }
@@ -327,6 +356,24 @@ private:
             baseType = diBuilder->createBasicType("double", 64, DW_ATE_float);
         else if (typeValue.TypeName == "bool")
             baseType = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
+        // Explicit-width signed integer types (C equivalents: int8_t, int16_t, int32_t, int64_t)
+        else if (typeValue.TypeName == "i8")
+            baseType = diBuilder->createBasicType("i8",  8,  DW_ATE_signed);
+        else if (typeValue.TypeName == "i16")
+            baseType = diBuilder->createBasicType("i16", 16, DW_ATE_signed);
+        else if (typeValue.TypeName == "i32")
+            baseType = diBuilder->createBasicType("i32", 32, DW_ATE_signed);
+        else if (typeValue.TypeName == "i64")
+            baseType = diBuilder->createBasicType("i64", 64, DW_ATE_signed);
+        // Explicit-width unsigned integer types (C equivalents: uint8_t, uint16_t, uint32_t, uint64_t)
+        else if (typeValue.TypeName == "u8")
+            baseType = diBuilder->createBasicType("u8",  8,  DW_ATE_unsigned);
+        else if (typeValue.TypeName == "u16")
+            baseType = diBuilder->createBasicType("u16", 16, DW_ATE_unsigned);
+        else if (typeValue.TypeName == "u32")
+            baseType = diBuilder->createBasicType("u32", 32, DW_ATE_unsigned);
+        else if (typeValue.TypeName == "u64")
+            baseType = diBuilder->createBasicType("u64", 64, DW_ATE_unsigned);
         else
             baseType = diBuilder->createUnspecifiedType(typeValue.TypeName);
 
@@ -460,7 +507,7 @@ public:
         auto ifaceIt = interfaceTable.find(interfaceName);
         if (ifaceIt == interfaceTable.end())
         {
-            std::cout << "Unknown interface: '" << interfaceName << "'\n";
+            std::cout << std::format("Unknown interface: '{}'\n", interfaceName);
             return;
         }
 
@@ -495,8 +542,7 @@ public:
 
             if (!found)
             {
-                std::cout << "Class '" << structName << "' does not implement '"
-                    << interfaceName << "::" << method.Name << "'\n";
+                std::cout << std::format("Class '{}' does not implement '{}::{}'\n", structName, interfaceName, method.Name);
             }
         }
     }
@@ -622,7 +668,7 @@ public:
         }
         else
         {
-            value = Upconvert(value, destType);
+            value = CreateCast(value, destType);
         }
         return builder->CreateStore(value, destination);
     }
@@ -749,33 +795,67 @@ public:
         return type;
     }
 
-    llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType)
+    llvm::Value* CreateCast(llvm::Value* value, llvm::Type* destType, bool isSigned = false)
     {
-        /*
-        HANDLE_CAST_INST(38, Trunc   , TruncInst   )  // Truncate integers
-        HANDLE_CAST_INST(39, ZExt    , ZExtInst    )  // Zero extend integers
-        HANDLE_CAST_INST(40, SExt    , SExtInst    )  // Sign extend integers
-        HANDLE_CAST_INST(41, FPToUI  , FPToUIInst  )  // floating point -> UInt
-        HANDLE_CAST_INST(42, FPToSI  , FPToSIInst  )  // floating point -> SInt
-        HANDLE_CAST_INST(43, UIToFP  , UIToFPInst  )  // UInt -> floating point
-        HANDLE_CAST_INST(44, SIToFP  , SIToFPInst  )  // SInt -> floating point
-        HANDLE_CAST_INST(45, FPTrunc , FPTruncInst )  // Truncate floating point
-        HANDLE_CAST_INST(46, FPExt   , FPExtInst   )  // Extend floating point
-        HANDLE_CAST_INST(47, PtrToInt, PtrToIntInst)  // Pointer -> Integer
-        HANDLE_CAST_INST(48, IntToPtr, IntToPtrInst)  // Integer -> Pointer
-        HANDLE_CAST_INST(49, BitCast , BitCastInst )  // Type cast
-        HANDLE_CAST_INST(50, AddrSpaceCast, AddrSpaceCastInst)  // addrspace cast
-        */
+        auto srcType = value->getType();
 
-        /*
-        builder->CreateBitCast(value, dest_type, name): Converts a pointer value to a pointer type with a different pointee type. This is the most common use case for "reinterpreting" a pointer.
-        builder->CreatePtrToInt(value, dest_int_type, name): Converts a pointer to an integer type. The integer type should typically be intptr_t or uintptr_t to ensure it is large enough to hold the address.
-        builder->CreateIntToPtr(value, dest_ptr_type, name): Converts an integer value back to a pointer type.
-        builder->CreateAddrSpaceCast(value, dest_ptr_type, name): Converts a pointer in one address space to a pointer in a different address space.
-        */
+        if (srcType == destType)
+            return value;
 
-        auto op = llvm::Instruction::CastOps::IntToPtr;
-        return CreateCast(op, value, destType);
+        // Integer <-> Integer
+        if (srcType->isIntegerTy() && destType->isIntegerTy())
+        {
+            unsigned srcBits = srcType->getIntegerBitWidth();
+            unsigned dstBits = destType->getIntegerBitWidth();
+            if (dstBits < srcBits)
+                return builder->CreateTrunc(value, destType);
+            else if (isSigned)
+                return builder->CreateSExt(value, destType);
+            else
+                return builder->CreateZExt(value, destType);
+        }
+
+        // Float <-> Float
+        if (srcType->isFloatingPointTy() && destType->isFloatingPointTy())
+        {
+            if (destType->getScalarSizeInBits() < srcType->getScalarSizeInBits())
+                return builder->CreateFPTrunc(value, destType);
+            else
+                return builder->CreateFPExt(value, destType);
+        }
+
+        // Integer -> Float
+        if (srcType->isIntegerTy() && destType->isFloatingPointTy())
+        {
+            if (isSigned)
+                return builder->CreateSIToFP(value, destType);
+            else
+                return builder->CreateUIToFP(value, destType);
+        }
+
+        // Float -> Integer
+        if (srcType->isFloatingPointTy() && destType->isIntegerTy())
+        {
+            if (isSigned)
+                return builder->CreateFPToSI(value, destType);
+            else
+                return builder->CreateFPToUI(value, destType);
+        }
+
+        // Pointer -> Integer
+        if (srcType->isPointerTy() && destType->isIntegerTy())
+            return builder->CreatePtrToInt(value, destType);
+
+        // Integer -> Pointer
+        if (srcType->isIntegerTy() && destType->isPointerTy())
+            return builder->CreateIntToPtr(value, destType);
+
+        // Pointer -> Pointer (reinterpret)
+        if (srcType->isPointerTy() && destType->isPointerTy())
+            return builder->CreateBitCast(value, destType);
+
+        // Fallback: BitCast for same-size reinterpretation
+        return builder->CreateBitCast(value, destType);
     }
 
     llvm::Value* CreateCast(llvm::Instruction::CastOps op, llvm::Value* value, llvm::Type* destType)
@@ -873,7 +953,7 @@ public:
     {
         llvm::Constant* value = nullptr;
 
-        if (typeName == "char")
+        if (typeName == "char" || typeName == "i8" || typeName == "u8")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -883,7 +963,7 @@ public:
 
             value = builder->getInt8(initValue);
         }
-        else if (typeName == "short")
+        else if (typeName == "short" || typeName == "i16" || typeName == "u16")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -893,7 +973,7 @@ public:
 
             value = builder->getInt16(initValue);
         }
-        else if (typeName == "int")
+        else if (typeName == "int" || typeName == "i32" || typeName == "u32")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -903,7 +983,7 @@ public:
 
             value = builder->getInt32(initValue);
         }
-        else if (typeName == "long")
+        else if (typeName == "long" || typeName == "i64" || typeName == "u64")
         {
             int initValue = 0;
             if (!initialValue.empty())
@@ -950,7 +1030,7 @@ public:
         }
         else
         {
-            std::cout << "Unknown value: " << typeName << "\n";
+            std::cout << std::format("Unknown value: {}\n", typeName);
             return nullptr;
         }
 
@@ -1264,7 +1344,7 @@ public:
         {
             if (!fn->empty())
             {
-                std::cout << "Function already exists : " << functionName << "\n";
+                std::cout << std::format("Function already exists: {}\n", functionName);
                 __debugbreak();
                 return fn;
             }
@@ -1319,10 +1399,10 @@ public:
         const auto& typeName = typeAndValue.TypeName;
 
         if (typeName == "void") { type = builder->getVoidTy(); }
-        else if (typeName == "char") { type = builder->getInt8Ty(); }
-        else if (typeName == "short") { type = builder->getInt16Ty(); }
-        else if (typeName == "int") { type = builder->getInt32Ty(); }
-        else if (typeName == "long") { type = builder->getInt64Ty(); }
+        else if (typeName == "char"  || typeName == "i8"  || typeName == "u8")  { type = builder->getInt8Ty(); }
+        else if (typeName == "short" || typeName == "i16" || typeName == "u16") { type = builder->getInt16Ty(); }
+        else if (typeName == "int"   || typeName == "i32" || typeName == "u32") { type = builder->getInt32Ty(); }
+        else if (typeName == "long"  || typeName == "i64" || typeName == "u64") { type = builder->getInt64Ty(); }
         else if (typeName == "float") { type = builder->getFloatTy(); }
         else if (typeName == "double") { type = builder->getDoubleTy(); }
         else if (typeName == "bool") { type = builder->getInt1Ty(); }
@@ -1336,7 +1416,7 @@ public:
             }
             else
             {
-                std::cout << "Unknown value: " << typeName << "\n";
+                std::cout << std::format("Unknown value: {}\n", typeName);
                 type = builder->getVoidTy();
             }
         }
@@ -1377,7 +1457,31 @@ public:
                 int result = -1;
                 if (arg.TypeAndValue.TypeName != "")
                 {
-                    result = arg.TypeAndValue.IsTypeMatch(*candidateParamItr) ? 0 : -1;
+                    if (arg.TypeAndValue.IsTypeMatch(*candidateParamItr))
+                        result = 0;
+                    else if (arg.TypeAndValue.IsTypePromotion(*candidateParamItr))
+                        result = arg.TypeAndValue.IsInteger();  // positive: widening
+                    else
+                    {
+                        // Same signedness group: int<->i32, long<->i64, char<->i8, etc.
+                        // Same width  -> perfect match (result=0): int==i32, long==i64.
+                        // Diff width  -> implicit conversion (result=1): i64->int, etc.
+                        int myBits    = arg.TypeAndValue.IsInteger();
+                        int otherBits = candidateParamItr->IsInteger();
+                        bool myUnsigned    = arg.TypeAndValue.IsUnsignedInteger() != -1;
+                        bool otherUnsigned = candidateParamItr->IsUnsignedInteger() != -1;
+                        if (myBits != -1 && otherBits != -1 && myUnsigned == otherUnsigned)
+                            result = (myBits == otherBits) ? 0 : 1;
+
+                        // Float narrowing: double -> float (same group, different width).
+                        if (result < 0)
+                        {
+                            int myFP    = arg.TypeAndValue.IsFloatingPoint();
+                            int otherFP = candidateParamItr->IsFloatingPoint();
+                            if (myFP != -1 && otherFP != -1)
+                                result = (myFP == otherFP) ? 0 : 1;
+                        }
+                    }
                 }
                 else
                 {
@@ -1520,65 +1624,129 @@ public:
     llvm::Value* CreateFunctionCall2(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
     {
         auto funcSym = functionTable.find(functionName);
-        if (funcSym != functionTable.end())
+        if (funcSym == functionTable.end())
         {
-            const auto& candidates = funcSym->second;
+            std::cout << std::format("Error: unknown function '{}'\n", functionName);
+            __debugbreak();
+            return nullptr;
+        }
 
-            std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
+        const auto& candidates = funcSym->second;
 
-            for (const auto& candidate : candidates)
+        std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> resolvedCandidate;
+
+        for (const auto& candidate : candidates)
+        {
+            if (candidate.Variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
             {
-                if (candidate.Variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
-                {
-                    // TODO: support named parameters variadic
-                    resolvedCandidate.emplace_back(arguments, candidate);
-                    break;
-                }
-                else
-                {
-                    auto matched = MatchFunction(arguments, candidate.Parameters);
-                    if (matched.size() > 0)
-                    {
-                        resolvedCandidate.emplace_back(matched, candidate);
-                    }
-                }
+                // TODO: support named parameters variadic
+                resolvedCandidate.emplace_back(arguments, candidate);
+                break;
             }
-
-            if (resolvedCandidate.size() > 0)
+            else
             {
-                const auto& [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
-
-                // convert parameter to vector of llvm::value*
-                std::vector<llvm::Value*> argList;
-                auto candParamItr = candidate.Parameters.begin();
-                for (const auto& arg : matched)
+                auto matched = MatchFunction(arguments, candidate.Parameters);
+                if (matched.size() > 0)
                 {
-                    if (candParamItr->Pointer)
-                    {
-                        argList.push_back(arg.GetValue());
-                    }
-                    else
-                    {
-                        llvm::Value* value = nullptr;
-                        if (arg.Primary == nullptr)
-                        {
-                            value = CreateLoad(arg.Storage);
-                        }
-                        else
-                        {
-                            value = arg.Primary;
-                        }
-
-                        argList.push_back(value);
-                    }
+                    resolvedCandidate.emplace_back(matched, candidate);
                 }
-
-                return CreateFunctionCall(candidate.Function, argList);
             }
         }
 
-        __debugbreak();
-        return nullptr;
+        const auto& [matched, candidate] = ComputeOverloadFunction(resolvedCandidate);
+
+        if (candidate.Function == nullptr)
+        {
+            std::cout << std::format("Error: no overload of '{}' matches the given arguments.\n", functionName);
+
+            // Print the input arguments
+            std::cout << std::format("  Call arguments ({}):\n", arguments.size());
+            for (size_t i = 0; i < arguments.size(); i++)
+            {
+                const auto& arg = arguments[i];
+                std::string typeName = arg.TypeAndValue.TypeName;
+                if (typeName.empty() && arg.BaseType)
+                {
+                    std::string typeStr;
+                    llvm::raw_string_ostream rso(typeStr);
+                    arg.BaseType->print(rso);
+                    typeName = typeStr;
+                }
+                std::string name = arg.TypeAndValue.VariableName.empty() ? "<unnamed>" : arg.TypeAndValue.VariableName;
+                std::cout << std::format("    [{}] {}{} {}\n", i, typeName, arg.TypeAndValue.Pointer ? "*" : "", name);
+            }
+
+            // Print all candidates so the user can see what was available
+            std::cout << std::format("  Candidates ({}):\n", candidates.size());
+            for (const auto& c : candidates)
+            {
+                std::string paramList;
+                for (size_t i = 0; i < c.Parameters.size(); i++)
+                {
+                    if (i > 0) paramList += ", ";
+                    const auto& p = c.Parameters[i];
+                    paramList += std::format("{}{} {}", p.TypeName, p.Pointer ? "*" : "", p.VariableName);
+                }
+                std::cout << std::format("    {}({})\n", c.UniqueName, paramList);
+            }
+
+            // If exactly one resolved candidate passed MatchFunction, show per-argument type comparison
+            if (resolvedCandidate.size() == 1)
+            {
+                const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
+                std::cout << std::format("  Argument mismatch detail (single resolved candidate: {}):\n", resolvedSym.UniqueName);
+                size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
+                for (size_t i = 0; i < count; i++)
+                {
+                    std::string argDesc = i < resolvedArgs.size() ? resolvedArgs[i].TypeAndValue.TypeName : "<missing>";
+                    if (argDesc.empty() && i < resolvedArgs.size() && resolvedArgs[i].BaseType)
+                    {
+                        std::string typeStr;
+                        llvm::raw_string_ostream rso(typeStr);
+                        resolvedArgs[i].BaseType->print(rso);
+                        argDesc = typeStr;
+                    }
+                    bool argPtr = i < resolvedArgs.size() && resolvedArgs[i].TypeAndValue.Pointer;
+                    std::string paramDesc = i < resolvedSym.Parameters.size() ? resolvedSym.Parameters[i].TypeName : "<missing>";
+                    bool paramPtr = i < resolvedSym.Parameters.size() && resolvedSym.Parameters[i].Pointer;
+                    std::cout << std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr ? "*" : "", paramDesc, paramPtr ? "*" : "");
+                }
+            }
+
+            __debugbreak();
+            return nullptr;
+        }
+
+        // convert parameter to vector of llvm::value*
+        std::vector<llvm::Value*> argList;
+        auto candParamItr = candidate.Parameters.begin();
+        for (const auto& arg : matched)
+        {
+            if (candParamItr->Pointer)
+            {
+                argList.push_back(arg.GetValue());
+            }
+            else
+            {
+                llvm::Value* value = nullptr;
+                if (arg.Primary == nullptr)
+                {
+                    value = CreateLoad(arg.Storage);
+                }
+                else
+                {
+                    value = arg.Primary;
+                }
+
+                // Upconvert to match the declared parameter type (e.g. i16 -> i32).
+                value = Upconvert(value, GetType(*candParamItr));
+                argList.push_back(value);
+            }
+            if (candParamItr != candidate.Parameters.end() - 1)
+                ++candParamItr;
+        }
+
+        return CreateFunctionCall(candidate.Function, argList);
     }
 
     llvm::Function* GetFunction(std::string functionName)
@@ -1752,7 +1920,7 @@ public:
                 auto valueType = value->getType();
 
                 // Convert 16bit 32bit float to double and non-32bit int to 64bit.
-                if (valueType->isIntegerTy(8) /*|| valueType->isIntegerTy(16)*/)
+                if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
                 {
                     auto newValue = builder->CreateSExt(value, builder->getInt32Ty(), "conv");
                     newArg.push_back(newValue);

@@ -123,7 +123,7 @@
       "patterns": [
         {
           "name": "storage.type.primitive.myc",
-          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64)\\b"
+          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64)\\b"
         },
         {
           "name": "storage.type.struct.myc",
