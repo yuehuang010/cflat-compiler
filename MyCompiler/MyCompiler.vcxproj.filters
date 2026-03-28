@@ -39,4 +39,9 @@
   <ItemGroup>
     <CustomBuild Include="C.g4" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ArgParser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
 </Project>

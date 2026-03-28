@@ -167,6 +167,7 @@ public:
 	{
 		llvm::StructType* StructType;
 		std::vector<DeclTypeAndValue> StructFields;
+		llvm::Function* Destructor = nullptr;
 	};
 
 	class StackState
@@ -234,6 +235,23 @@ private:
 		llvm::verifyFunction(*fn);
 
 		return fn;
+	}
+
+	void EmitDestructorsForScope(const StackState& frame)
+	{
+		if (builder->GetInsertBlock()->getTerminator() != nullptr)
+			return;
+
+		for (const auto& [varName, namedVar] : frame.namedVariable)
+		{
+			if (namedVar.TypeAndValue.Pointer) continue;
+			auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
+			if (it != dataStructures.end() && it->second.Destructor != nullptr)
+			{
+				auto* fn = it->second.Destructor;
+				builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
+			}
+		}
 	}
 
 	void createFunctionBlock(llvm::Function* fn, std::vector<MyCompilerLLVM::TypeAndValue> arguments)
@@ -408,6 +426,11 @@ public:
 	void CreateInterfaceDefinition(const std::string& name, std::vector<InterfaceMethod> methods)
 	{
 		interfaceTable[name] = std::move(methods);
+	}
+
+	void RegisterDestructor(const std::string& structName, llvm::Function* fn)
+	{
+		dataStructures[structName].Destructor = fn;
 	}
 
 	void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
@@ -1092,7 +1115,10 @@ public:
 	llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack)
 	{
 		if (exitBlackStack)
+		{
+			EmitDestructorsForScope(stackNamedVariable.back());
 			stackNamedVariable.pop_back();
+		}
 
 		if (resumeBlock)
 		{
@@ -1114,7 +1140,10 @@ public:
 			stack.elseBlock = elseBlock;
 		}
 
-		builder->SetInsertPoint(block);
+		if (block)
+		{
+			builder->SetInsertPoint(block);
+		}
 	}
 
 	void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false)
@@ -1677,6 +1706,13 @@ public:
 		// check if break has already been inserted.
 		if (builder->GetInsertBlock()->getTerminator() != nullptr)
 			return;
+
+		// Emit destructors for all scopes from innermost out to the function boundary
+		for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
+		{
+			EmitDestructorsForScope(*it);
+			if (it->isFunction) break;
+		}
 
 		if (value == nullptr)
 			builder->CreateRetVoid();

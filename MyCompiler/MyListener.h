@@ -418,9 +418,11 @@ public:
 		}
 		else if (compoundStatement)
 		{
+			compilerLLVM->InitializeBlock(nullptr, true);
 			auto blockList = compoundStatement->blockItemList();
 			if (blockList)
 				ParseBlockItemList(blockList);
+			compilerLLVM->CreateBlockBreak(nullptr, true);
 			return;
 		}
 
@@ -655,6 +657,15 @@ public:
 					if (assignmentExpression != nullptr)
 					{
 						right = ParseAssignmentExpression(assignmentExpression);
+					}
+				}
+
+				if (right == nullptr && !typeAndValue.Pointer)
+				{
+					auto structData = compilerLLVM->GetDataStructure(typeAndValue.TypeName);
+					if (structData.StructType != nullptr)
+					{
+						LogErrorContext(direct, std::format("({}) struct and class must be initialized on the stack.", typeAndValue.TypeName));
 					}
 				}
 
@@ -1670,12 +1681,47 @@ public:
 			global_scope = true;
 		}
 
+		// Parse destructor
+		for (auto dtor : ctx->destructorDefinition())
+		{
+			global_scope = false;
+			ParseDestructorDefinition(dtor, structName);
+			global_scope = true;
+		}
+
 		// Verify interface implementations
 		for (auto interfaceIdentifier : ctx->Identifier())
 		{
 			std::string interfaceName = interfaceIdentifier->getText();
 			compilerLLVM->VerifyInterfaceImplementation(structName, interfaceName);
 		}
+	}
+
+	void ParseDestructorDefinition(CParser::DestructorDefinitionContext* ctx, const std::string& structName)
+	{
+		MyCompilerLLVM::DeclTypeAndValue thisParam;
+		thisParam.TypeName = structName;
+		thisParam.VariableName = structName + "__";
+		thisParam.Pointer = true;
+
+		std::vector<MyCompilerLLVM::TypeAndValue> params = { thisParam };
+
+		MyCompilerLLVM::TypeAndValue returnType;
+		returnType.TypeName = "void";
+
+		int line = ctx->getStart()->getLine();
+		auto fn = compilerLLVM->CreateFunctionDefinition("~" + structName, returnType, params, false, false, line);
+		compilerLLVM->RegisterDestructor(structName, fn);
+
+		compilerLLVM->InitializeBlock(&fn->front(), false);
+
+		auto blockItemList = ctx->compoundStatement()->blockItemList();
+		if (blockItemList)
+			ParseBlockItemList(blockItemList);
+
+		compilerLLVM->CreateReturnCall(nullptr);
+		compilerLLVM->CreateBlockBreak(nullptr, true);
+		compilerLLVM->ClearCurrentSubprogram();
 	}
 
 	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)

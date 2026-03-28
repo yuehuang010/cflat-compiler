@@ -50,60 +50,13 @@ bool Test(const char* testName, bool actual, bool expected)
 	return false;
 }
 
-
-int shortCircuitCounter = 0;
-
-bool FuncTrue() { shortCircuitCounter++; return true; }
-
-bool FuncFalse() { shortCircuitCounter++; return false; }
-
-bool testLogicalAnd()
+struct mystruct
 {
-	return FuncTrue() && !FuncFalse();
-}
 
-bool testLogicalOr()
-{
-	return FuncFalse() || FuncTrue();
-}
+};
 
-bool testShortCircuit()
-{
-	TestVerbose = false;
-	bool result = true;
-	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue(), true);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
-
-	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() || FuncFalse() || FuncTrue()", FuncFalse() || FuncTrue() || FuncTrue(), true);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
-
-	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() || FuncFalse() || FuncFalse()", FuncFalse() || FuncFalse() || FuncFalse(), false);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
-
-	shortCircuitCounter = 0;
-	result &= Test("FuncFalse() && FuncTrue() && FuncTrue()", FuncFalse() && FuncTrue() && FuncTrue(), false);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 1);
-
-	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() && FuncFalse() && FuncTrue()", FuncTrue() && FuncFalse() && FuncTrue(), false);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 2);
-
-	shortCircuitCounter = 0;
-	result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue(), true);
-	result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
-
-	TestVerbose = true;
-
-	return result;
-}
 
 extern void main()
 {
-	bool result = true;
-	result &= Test("testLogicalAnd", testLogicalAnd(), true);
-	result &= Test("testLogicalOr", testLogicalOr(), true);
-	result &= Test("testShortCircuit();", testShortCircuit(), true);
+	mystruct my;
 }

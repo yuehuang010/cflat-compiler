@@ -100,6 +100,38 @@ struct MyStruct2
 int ReadExt(MyStruct1 my) { return my.num; }
 int ReadExt(MyStruct2 my) { return my.num; }
 
+// Destructor tests
+
+int destructorCallCount = 0;
+
+struct Tracked
+{
+	int id = 0;
+	~Tracked()
+	{
+		destructorCallCount = destructorCallCount + 1;
+	}
+};
+
+bool testDestructor()
+{
+	bool result = true;
+	destructorCallCount = 0;
+
+	{
+		Tracked t = Tracked();
+	}
+	result &= Test("destructor_called_once", destructorCallCount, 1);
+
+	{
+		Tracked a = Tracked();
+		Tracked b = Tracked();
+	}
+	result &= Test("destructor_called_twice", destructorCallCount, 3);
+
+	return result;
+}
+
 // Interface tests
 
 interface IReadable
@@ -180,7 +212,7 @@ bool testDefaultExpression()
 	return result;
 }
 
-extern void main()
+extern int main()
 {
 	MyStruct my = MyStruct();
 	MyStruct1 struct1 = MyStruct1();
@@ -199,9 +231,13 @@ extern void main()
 	result &= testDefaultMultipleParams();
 	result &= testDefaultExpression();
 	result &= testInterface();
+	result &= testDestructor();
 
 	if (result)
 	{
 		printf("All Test Passed.\n");
+		return 0;
 	}
+
+	return 1;
 }

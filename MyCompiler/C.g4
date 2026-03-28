@@ -456,7 +456,11 @@ functionDefinition
     ;
 
 structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition)* '}' ';'
+    : declarationSpecifiers? directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    ;
+
+destructorDefinition
+    : Tilde Identifier '(' ')' compoundStatement
     ;
 
 interfaceDefinition
