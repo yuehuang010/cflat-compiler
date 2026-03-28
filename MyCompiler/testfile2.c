@@ -275,6 +275,81 @@ bool testNameof()
 	return result;
 }
 
+// Namespace tests
+
+int add(int a, int b) { return a + b + 100; }  // global add returns a different value
+
+namespace MathUtils
+{
+	int add(int a, int b) { return a + b; }
+	int multiply(int a, int b) { return a * b; }
+
+	namespace Advanced
+	{
+		int square(int x) { return x * x; }
+		int cube(int x) { return x * x * x; }
+	}
+}
+
+using Math = MathUtils;          // global alias for top-level namespace
+using MathAdv = MathUtils.Advanced;  // global alias for nested namespace
+
+bool testNamespace()
+{
+	bool result = true;
+	result &= Test("namespace_add", MathUtils.add(3, 4), 7);            // 3+4=7
+	result &= Test("namespace_multiply", MathUtils.multiply(3, 4), 12); // 3*4=12
+	result &= Test("global_add", add(3, 4), 107);                       // 3+4+100=107
+	result &= Test("no_collision", MathUtils.add(3, 4) != add(3, 4), 1);
+	result &= Test("global_using_add", Math.add(3, 4), 7);              // global alias resolves to MathUtils.add
+	result &= Test("global_using_multiply", Math.multiply(3, 4), 12);   // global alias resolves to MathUtils.multiply
+	return result;
+}
+
+bool testLocalUsing()
+{
+	using M = MathUtils;  // local alias, only visible in this function
+	bool result = true;
+	result &= Test("local_using_add", M.add(2, 3), 5);
+	result &= Test("local_using_multiply", M.multiply(2, 3), 6);
+	return result;
+}
+
+bool testNestedNamespace()
+{
+	bool result = true;
+	result &= Test("nested_square", MathUtils.Advanced.square(4), 16);    // 4*4=16
+	result &= Test("nested_cube", MathUtils.Advanced.cube(3), 27);        // 3*3*3=27
+
+	using Adv = MathUtils.Advanced;  // local alias for nested namespace
+	result &= Test("nested_using_square", Adv.square(5), 25);             // 5*5=25
+	result &= Test("nested_using_cube", Adv.cube(2), 8);                  // 2*2*2=8
+	return result;
+}
+
+bool testNestedUsing()
+{
+	bool result = true;
+
+	// Global alias for nested namespace
+	result &= Test("global_nested_using_square", MathAdv.square(4), 16);  // 4*4=16
+	result &= Test("global_nested_using_cube", MathAdv.cube(3), 27);      // 3*3*3=27
+
+	// Local alias for nested namespace shadows nothing; verify it works
+	using Adv2 = MathUtils.Advanced;
+	result &= Test("local_nested_using_square", Adv2.square(6), 36);      // 6*6=36
+	result &= Test("local_nested_using_cube", Adv2.cube(4), 64);          // 4*4*4=64
+	return result;
+}
+
+bool testLocalUsingScoped()
+{
+	// 'M' from testLocalUsing is not visible here; only 'Math' global alias is.
+	bool result = true;
+	result &= Test("local_alias_not_leaked", Math.add(1, 2), 3);
+	return result;
+}
+
 extern int main()
 {
 	MyStruct my = MyStruct();
@@ -298,6 +373,11 @@ extern int main()
 	result &= testBuiltinIdentifiers();
 	result &= testTypeof();
 	result &= testNameof();
+	result &= testNamespace();
+	result &= testNestedNamespace();
+	result &= testNestedUsing();
+	result &= testLocalUsing();
+	result &= testLocalUsingScoped();
 
 	if (result)
 	{

@@ -4,6 +4,7 @@
 #include <ranges>
 #include <variant>
 #include <format>
+#include <unordered_set>
 
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\LLVMContext.h>
@@ -175,6 +176,7 @@ public:
 	public:
 		std::unordered_map<std::string, NamedVariable> functionArgument;
 		std::unordered_map<std::string, NamedVariable> namedVariable;
+		std::unordered_map<std::string, std::string> namespaceAliases;
 		llvm::BasicBlock* continueBlock = nullptr; // continue;
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
 		llvm::BasicBlock* elseBlock = nullptr; // short-circuit condition.
@@ -219,6 +221,8 @@ private:
 	std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
 	std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
 	std::unordered_map<std::string, llvm::Constant*> stringPool;
+	std::unordered_set<std::string> namespaceTable;
+	std::unordered_map<std::string, std::string> namespaceAliasTable;
 
 	llvm::Function* currentFunction;
 	std::string sourceFileName;
@@ -1781,6 +1785,32 @@ public:
 		for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
 			if (frame.isFunction) return frame.functionName;
 		return "";
+	}
+
+	void RegisterNamespace(const std::string& name) { namespaceTable.insert(name); }
+	void RegisterNamespaceAlias(const std::string& alias, const std::string& target) { namespaceAliasTable[alias] = target; }
+	void RegisterLocalNamespaceAlias(const std::string& alias, const std::string& target)
+	{
+		if (!stackNamedVariable.empty())
+			stackNamedVariable.back().namespaceAliases[alias] = target;
+		else
+			namespaceAliasTable[alias] = target;
+	}
+	bool IsNamespace(const std::string& name) const
+	{
+		for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+			if (frame.namespaceAliases.count(name)) return true;
+		return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0;
+	}
+	std::string ResolveNamespace(const std::string& name) const
+	{
+		for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+		{
+			auto it = frame.namespaceAliases.find(name);
+			if (it != frame.namespaceAliases.end()) return it->second;
+		}
+		auto it = namespaceAliasTable.find(name);
+		return it != namespaceAliasTable.end() ? it->second : name;
 	}
 
 	std::string GetNameOfCurrentInsertionBlock()

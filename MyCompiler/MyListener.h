@@ -153,34 +153,80 @@ public:
 		compilerLLVM->CreateInterfaceDefinition(name, methods);
 	}
 
-	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
+	void ParseUsingDeclaration(CParser::UsingDeclarationContext* ctx)
 	{
-		if constexpr (debugPrint)
-			return;
+		auto identifiers = ctx->Identifier();
+		std::string alias = identifiers[0]->getText();
+		std::string target;
+		for (size_t i = 1; i < identifiers.size(); i++)
+		{
+			if (!target.empty()) target += ".";
+			target += identifiers[i]->getText();
+		}
+		if (global_scope)
+			compilerLLVM->RegisterNamespaceAlias(alias, target);
+		else
+			compilerLLVM->RegisterLocalNamespaceAlias(alias, target);
+	}
 
+	void ParseExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
+	{
 		auto func = ctx->functionDefinition();
 		auto dataStruct = ctx->structClassUnionDefinition();
 		auto decl = ctx->declaration();
 		auto iface = ctx->interfaceDefinition();
+		auto ns = ctx->namespaceDefinition();
+		auto usingDecl = ctx->usingDeclaration();
 
 		if (iface != nullptr)
 		{
 			ParseInterfaceDefinition(iface);
 		}
+		else if (ns != nullptr)
+		{
+			ParseNamespaceDefinition(ns, namespaceName);
+		}
+		else if (usingDecl != nullptr)
+		{
+			ParseUsingDeclaration(usingDecl);
+		}
 		else if (decl != nullptr)
 		{
-			auto globalDecl = ParseDeclaration(decl);
+			ParseDeclaration(decl);
 		}
 		else if (func != nullptr)
 		{
 			global_scope = false;
-			ParseFunctionDefinition(func);
+			ParseFunctionDefinition(func, {}, namespaceName);
 			global_scope = true;
 		}
 		else if (dataStruct != nullptr)
 		{
 			ParseStructClassUnionDefinition(dataStruct);
 		}
+	}
+
+	void ParseNamespaceDefinition(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
+	{
+		std::string namespaceName = ctx->Identifier()->getText();
+		if (!parentNamespace.empty())
+			namespaceName = parentNamespace + "." + namespaceName;
+		compilerLLVM->RegisterNamespace(namespaceName);
+
+		for (auto* extDecl : ctx->externalDeclaration())
+			ParseExternalDeclaration(extDecl, namespaceName);
+	}
+
+	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
+	{
+		if constexpr (debugPrint)
+			return;
+
+		// Skip nodes nested inside a namespace — they are handled by ParseNamespaceDefinition.
+		if (dynamic_cast<CParser::NamespaceDefinitionContext*>(ctx->parent))
+			return;
+
+		ParseExternalDeclaration(ctx);
 	}
 
 	void ParseBlockItemList(CParser::BlockItemListContext* ctx)
@@ -191,6 +237,7 @@ public:
 		{
 			auto decl = blockItem->declaration();
 			auto statement = blockItem->statement();
+			auto usingDecl = blockItem->usingDeclaration();
 
 			if (decl != nullptr)
 			{
@@ -199,6 +246,10 @@ public:
 			else if (statement != nullptr)
 			{
 				ParseStatement(statement);
+			}
+			else if (usingDecl != nullptr)
+			{
+				ParseUsingDeclaration(usingDecl);
 			}
 		}
 	}
@@ -494,10 +545,12 @@ public:
 		}
 	}
 
-	void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {})
+	void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {})
 	{
 		// Create Function Definition
 		auto name = this->getFunctionName(func);
+		if (!namespaceName.empty())
+			name = namespaceName + "." + name;
 		auto returnType = this->getFunctionReturnType(func);
 		CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
 		auto params = this->ParseParameterTypeList(paramTypeList);
@@ -1240,6 +1293,7 @@ public:
 			MyCompilerLLVM::NamedVariable namedVar;
 			MyCompilerLLVM::NamedVariable structVar;
 			std::string primaryIdentifier;
+			std::string namespaceContext;
 
 			int functionArgCounter = 0;
 
@@ -1261,7 +1315,23 @@ public:
 					case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
 					case CParser::Identifier:
 					{
-						if (structVar.BaseType)
+						if (!namespaceContext.empty())
+						{
+							std::string qualifiedName = namespaceContext + "." + terminal->getText();
+							if (compilerLLVM->IsNamespace(qualifiedName))
+							{
+								namespaceContext = compilerLLVM->ResolveNamespace(qualifiedName);
+								primaryIdentifier = namespaceContext;
+								namedVar = {};
+							}
+							else
+							{
+								primaryIdentifier = qualifiedName;
+								namespaceContext.clear();
+								namedVar = {};
+							}
+						}
+						else if (structVar.BaseType)
 						{
 							primaryIdentifier = terminal->getText();
 							auto dataStructure = compilerLLVM->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
@@ -1334,13 +1404,23 @@ public:
 						auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
 
 						primaryIdentifier = prevPrimary->getText();
-						namedVar.Primary = ParsePrimaryExpression(prevPrimary);
-						namedVar.Storage = nullptr;
 
-						if (namedVar.Primary == nullptr)
+						if (prevPrimary->Identifier() && compilerLLVM->IsNamespace(prevPrimary->Identifier()->getText()))
 						{
-							// Try identifier.
-							namedVar = ParseIdentifier(prevPrimary->Identifier());
+							namespaceContext = compilerLLVM->ResolveNamespace(prevPrimary->Identifier()->getText());
+							namedVar = {};
+							structVar = {};
+						}
+						else
+						{
+							namedVar.Primary = ParsePrimaryExpression(prevPrimary);
+							namedVar.Storage = nullptr;
+
+							if (namedVar.Primary == nullptr)
+							{
+								// Try identifier.
+								namedVar = ParseIdentifier(prevPrimary->Identifier());
+							}
 						}
 
 						if (namedVar.BaseType && namedVar.BaseType->isStructTy())

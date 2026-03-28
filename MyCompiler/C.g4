@@ -398,6 +398,7 @@ blockItemList
 blockItem
     : statement
     | declaration
+    | usingDeclaration
     ;
 
 expressionStatement
@@ -451,7 +452,17 @@ externalDeclaration
     | functionDefinition
     | structClassUnionDefinition
     | interfaceDefinition
+    | namespaceDefinition
+    | usingDeclaration
     | ';' // stray ;
+    ;
+
+usingDeclaration
+    : Using Identifier '=' Identifier ('.' Identifier)* ';'
+    ;
+
+namespaceDefinition
+    : Namespace Identifier '{' (externalDeclaration)* '}'
     ;
 
 functionDefinition
@@ -596,6 +607,14 @@ TypeOf
 
 Interface
     : 'interface'
+    ;
+
+Namespace
+    : 'namespace'
+    ;
+
+Using
+    : 'using'
     ;
 
 Switch
