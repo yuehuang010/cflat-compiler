@@ -1278,6 +1278,7 @@ public:
 
 							if (fieldIndex < dataStructure.StructFields.size())
 							{
+								const auto& fieldType = dataStructure.StructFields[fieldIndex];
 								if (structVar.Storage)
 								{
 									namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
@@ -1290,6 +1291,7 @@ public:
 									namedVar.Primary = compilerLLVM->CreateExtractValue(structVar.Primary, fieldIndex);
 									namedVar.BaseType = namedVar.Primary->getType();
 								}
+								namedVar.TypeAndValue = fieldType;
 							}
 							else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
 							{
@@ -1439,13 +1441,69 @@ public:
 		return {};
 	}
 
+	// Walk down single-child rule nodes to find a UnaryExpressionContext.
+	// Returns nullptr if the path branches or never reaches a unaryExpression.
+	CParser::UnaryExpressionContext* tryGetUnaryExpression(antlr4::RuleContext* ctx)
+	{
+		if (ctx->getRuleIndex() == CParser::RuleUnaryExpression)
+			return dynamic_cast<CParser::UnaryExpressionContext*>(ctx);
+
+		antlr4::RuleContext* singleRuleChild = nullptr;
+		for (auto* child : ctx->children)
+		{
+			if (child->getTreeType() == antlr4::tree::ParseTreeType::RULE)
+			{
+				if (singleRuleChild != nullptr)
+					return nullptr; // multiple rule children — complex expression
+				singleRuleChild = dynamic_cast<antlr4::RuleContext*>(child);
+			}
+		}
+		return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
+	}
+
 	llvm::Value* ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
 	{
 		auto expressionCtx = ctx->expression();
 		auto constant = ctx->Constant();
 		auto stringLiteral = ctx->StringLiteral();
 
-		if (expressionCtx != nullptr)
+		if (ctx->TypeOf())
+		{
+			// typeof(int), typeof(bool), typeof(MyStruct) — type specifier used directly
+			if (auto* ts = ctx->typeSpecifier())
+				return compilerLLVM->CreateGlobalString("typeof", ts->getText());
+
+			// typeof(expr) — navigate down to unaryExpression to read TypeAndValue
+			std::string typeName;
+
+			// ANTLR picks the expression alternative for user-defined type names (Identifier
+			// matches both expression and typeSpecifier); catch them here before evaluating.
+			if (compilerLLVM->GetDataStructure(expressionCtx->getText()).StructType != nullptr)
+				return compilerLLVM->CreateGlobalString("typeof", expressionCtx->getText());
+
+			if (auto* ue = tryGetUnaryExpression(expressionCtx))
+			{
+				auto namedVar = ParseUnaryExpression(ue);
+				typeName = namedVar.TypeAndValue.TypeName;
+				if (namedVar.TypeAndValue.Pointer && !typeName.empty())
+					typeName += "*";
+			}
+
+			return compilerLLVM->CreateGlobalString("typeof", typeName.empty() ? "unknown" : typeName);
+		}
+		else if (ctx->NameOf())
+		{
+			std::string fullText = expressionCtx->getText();
+			// Return just the last identifier after any '.' or '->'
+			size_t dotPos = fullText.rfind('.');
+			size_t arrowPos = fullText.rfind("->");
+			size_t lastSep = 0;
+			if (dotPos != std::string::npos) lastSep = std::max(lastSep, dotPos + 1);
+			if (arrowPos != std::string::npos) lastSep = std::max(lastSep, arrowPos + 2);
+			std::string name = fullText.substr(lastSep);
+			return compilerLLVM->CreateGlobalString("nameof", name);
+		}
+		else if (expressionCtx != nullptr)
 		{
 			return ParseExpression(expressionCtx);
 		}
@@ -1490,6 +1548,32 @@ public:
 
 		std::string name = node->getText();
 		MyCompilerLLVM::NamedVariable namedVar = {};
+
+		if (name == "__FILE__")
+		{
+			auto str = compilerLLVM->CreateGlobalString("__FILE__", compilerLLVM->GetSourceFileName());
+			namedVar.Primary = str;
+			namedVar.BaseType = str->getType();
+			return namedVar;
+		}
+
+		if (name == "__FUNCTION__")
+		{
+			auto str = compilerLLVM->CreateGlobalString("__FUNCTION__", compilerLLVM->GetCurrentFunctionName());
+			namedVar.Primary = str;
+			namedVar.BaseType = str->getType();
+			return namedVar;
+		}
+
+		if (name == "__LINE__")
+		{
+			int line = (int)node->getSymbol()->getLine();
+			auto val = compilerLLVM->CreateConstant("int", std::to_string(line));
+			namedVar.Primary = val;
+			namedVar.BaseType = val->getType();
+			return namedVar;
+		}
+
 		namedVar = compilerLLVM->GetLocalVariable(name);
 		if (namedVar.Storage != nullptr)
 		{

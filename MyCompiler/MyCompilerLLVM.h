@@ -179,6 +179,7 @@ public:
 		llvm::BasicBlock* resumeBlock = nullptr; // break;
 		llvm::BasicBlock* elseBlock = nullptr; // short-circuit condition.
 		bool isFunction = false;
+		std::string functionName;
 
 		void ClearBlock()
 		{
@@ -220,6 +221,7 @@ private:
 	std::unordered_map<std::string, llvm::Constant*> stringPool;
 
 	llvm::Function* currentFunction;
+	std::string sourceFileName;
 
 	std::unique_ptr<llvm::DIBuilder> diBuilder;
 	llvm::DIFile* diFile = nullptr;
@@ -254,7 +256,7 @@ private:
 		}
 	}
 
-	void createFunctionBlock(llvm::Function* fn, std::vector<MyCompilerLLVM::TypeAndValue> arguments)
+	void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<MyCompilerLLVM::TypeAndValue> arguments)
 	{
 		// all function starts at "entry" block
 		auto entry = CreateBasicBlock("entry", fn);
@@ -264,6 +266,7 @@ private:
 		stackState.continueBlock = &fn->back();
 		stackState.resumeBlock = &fn->back();
 		stackState.isFunction = true;
+		stackState.functionName = friendlyName;
 
 		// populate function arguments
 		auto itr_nameArg = arguments.begin();
@@ -1227,7 +1230,7 @@ public:
 
 		fn = createFunctionProto(mangledName, functionType);
 
-		createFunctionBlock(fn, arguments);
+		createFunctionBlock(fn, functionName, arguments);
 
 		if (diBuilder && diFile && line > 0)
 		{
@@ -1769,6 +1772,15 @@ public:
 				break;
 			}
 		}
+	}
+
+	std::string GetSourceFileName() const { return sourceFileName; }
+
+	std::string GetCurrentFunctionName() const
+	{
+		for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+			if (frame.isFunction) return frame.functionName;
+		return "";
 	}
 
 	std::string GetNameOfCurrentInsertionBlock()

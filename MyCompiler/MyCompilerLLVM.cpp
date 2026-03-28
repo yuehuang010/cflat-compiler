@@ -15,6 +15,7 @@
 bool MyCompilerLLVM::Compile(const ArgParser& args)
 {
 	auto filename = args.getPositional(0).value_or("");
+	sourceFileName = std::filesystem::path(filename).filename().string();
 	auto outputPath = args.getOption("output").value_or(".\\out.ll");
 	auto bitcodePath = args.getOption("bitcode").value_or("");
 	bool debugInfo = args.hasFlag("debug-info");

@@ -36,7 +36,7 @@ int testArray()
 		array[i] = i;
 		i++;
 	}
-	
+
 	int sum = 0;
 	i = 0;
 	while (i < arraySize)
@@ -60,9 +60,9 @@ bool testNamedParameters()
 	bool result = true;
 	int expected = myFunction(1, 2, 3);
 	result &= Test("InOrder", myFunction(x:1, y : 2, z : 3), expected);
-	result &= Test("OutOfOrderName", myFunction( y:2, z:3, x:1), expected);
-	result &= Test("MixedInOrder", myFunction(x:1, y:2, 3), expected);
-	result &= Test("MixedOutOfOrder", myFunction(z:3, 1, 2 ), expected);
+	result &= Test("OutOfOrderName", myFunction(y:2, z : 3, x : 1), expected);
+	result &= Test("MixedInOrder", myFunction(x:1, y : 2, 3), expected);
+	result &= Test("MixedOutOfOrder", myFunction(z:3, 1, 2), expected);
 
 	return result;
 }
@@ -163,10 +163,10 @@ bool testInterface()
 	Counter c = Counter();
 	ScaledValue s = ScaledValue();
 
-	result &= Test("counter.Read",       c.Read(),        10);   // 10
-	result &= Test("scaledValue.Read",   s.Read(),         3);   // 3
-	result &= Test("scaledValue.Scale2", s.Scale(2),       6);   // 3*2=6
-	result &= Test("scaledValue.Scale5", s.Scale(5),      15);   // 3*5=15
+	result &= Test("counter.Read", c.Read(), 10);   // 10
+	result &= Test("scaledValue.Read", s.Read(), 3);   // 3
+	result &= Test("scaledValue.Scale2", s.Scale(2), 6);   // 3*2=6
+	result &= Test("scaledValue.Scale5", s.Scale(5), 15);   // 3*5=15
 	return result;
 }
 
@@ -180,8 +180,8 @@ int addWithDefault(int x, int y = 5)
 bool testDefaultSingleParam()
 {
 	bool result = true;
-	result &= Test("add_both_args",  addWithDefault(3, 4), 7);  // 3+4=7
-	result &= Test("add_default_y",  addWithDefault(3),    8);  // 3+5=8
+	result &= Test("add_both_args", addWithDefault(3, 4), 7);  // 3+4=7
+	result &= Test("add_default_y", addWithDefault(3), 8);  // 3+5=8
 	return result;
 }
 
@@ -193,9 +193,9 @@ int sumWithDefaults(int x, int y = 10, int z = 20)
 bool testDefaultMultipleParams()
 {
 	bool result = true;
-	result &= Test("sum_all_args",    sumWithDefaults(1, 2, 3), 6);   // 1+2+3=6
-	result &= Test("sum_default_z",   sumWithDefaults(1, 2),    23);  // 1+2+20=23
-	result &= Test("sum_defaults_yz", sumWithDefaults(1),       31);  // 1+10+20=31
+	result &= Test("sum_all_args", sumWithDefaults(1, 2, 3), 6);   // 1+2+3=6
+	result &= Test("sum_default_z", sumWithDefaults(1, 2), 23);  // 1+2+20=23
+	result &= Test("sum_defaults_yz", sumWithDefaults(1), 31);  // 1+10+20=31
 	return result;
 }
 
@@ -208,7 +208,70 @@ bool testDefaultExpression()
 {
 	bool result = true;
 	result &= Test("multiply_explicit", multiplyWithDefault(5, 3), 15);  // 5*3=15
-	result &= Test("multiply_default",  multiplyWithDefault(5),    10);  // 5*2=10
+	result &= Test("multiply_default", multiplyWithDefault(5), 10);  // 5*2=10
+	return result;
+}
+
+extern int strcmp(const char* a, const char* b);
+
+bool TestStr(const char* testName, const char* actual, const char* expected)
+{
+	if (strcmp(actual, expected) == 0)
+	{
+		printf("%s passed.\n", testName);
+		return true;
+	}
+	printf("%s failed: expected '%s' but got '%s'.\n", testName, expected, actual);
+	return false;
+}
+
+struct NamedThing
+{
+	int value = 42;
+};
+
+bool testBuiltinIdentifiers()
+{
+	bool result = true;
+	result &= TestStr("__FILE__", __FILE__, "testfile2.c");
+	result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
+	result &= Test("__LINE__", __LINE__, 238);
+	return result;
+}
+
+struct TypedThing
+{
+	int count = 0;
+	bool flag = false;
+};
+
+bool testTypeof()
+{
+	bool result = true;
+	int i = 0;
+	bool b = false;
+	TypedThing t = TypedThing();
+
+	result &= TestStr("typeof_int", typeof(i), "int");
+	result &= TestStr("typeof_bool", typeof(b), "bool");
+	result &= TestStr("typeof_struct", typeof(t), "TypedThing");
+	result &= TestStr("typeof_field_int", typeof(t.count), "int");
+	result &= TestStr("typeof_field_bool", typeof(t.flag), "bool");
+	result &= TestStr("typeof_type_int", typeof(int), "int");
+	result &= TestStr("typeof_type_name", typeof(TypedThing), "TypedThing");
+	return result;
+}
+
+bool testNameof()
+{
+	bool result = true;
+	int myVar = 0;
+	NamedThing thing = NamedThing();
+
+	result &= TestStr("nameof_var", nameof(myVar), "myVar");
+	result &= TestStr("nameof_struct", nameof(thing), "thing");
+	result &= TestStr("nameof_field", nameof(thing.value), "value");
+	result &= TestStr("nameof_type", nameof(NamedThing), "NamedThing");
 	return result;
 }
 
@@ -232,6 +295,9 @@ extern int main()
 	result &= testDefaultExpression();
 	result &= testInterface();
 	result &= testDestructor();
+	result &= testBuiltinIdentifiers();
+	result &= testTypeof();
+	result &= testNameof();
 
 	if (result)
 	{

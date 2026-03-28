@@ -33,11 +33,14 @@
 
 grammar C;
 
-primaryExpression 
+primaryExpression
     : Constant
     | Identifier
     | StringLiteral+
     | '(' expression ')'
+    | NameOf '(' expression ')'
+    | TypeOf '(' expression ')'
+    | TypeOf '(' typeSpecifier ')'
     ;
 
 genericAssocList
@@ -581,6 +584,14 @@ Struct
 
 Class
     : 'class'
+    ;
+
+NameOf
+    : 'nameof'
+    ;
+
+TypeOf
+    : 'typeof'
     ;
 
 Interface
