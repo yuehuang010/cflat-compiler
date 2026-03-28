@@ -350,6 +350,119 @@ bool testLocalUsingScoped()
 	return result;
 }
 
+// =============================================================
+// Forward reference tests
+// =============================================================
+
+// Test 1: bar() calls foo() which is defined after bar().
+int bar()
+{
+	return foo();
+}
+
+int foo()
+{
+	return 42;
+}
+
+bool testForwardFunction()
+{
+	bool result = true;
+	result &= Test("bar calls foo (fwd ref)", bar(), 42);
+	return result;
+}
+
+// Test 2: Mutual recursion — no explicit forward declaration needed.
+bool isEven(int n)
+{
+	if (n == 0) return true;
+	return isOdd(n - 1);
+}
+
+bool isOdd(int n)
+{
+	if (n == 0) return false;
+	return isEven(n - 1);
+}
+
+bool testMutualRecursion()
+{
+	bool result = true;
+	result &= Test("isEven(0)", isEven(0), 1);
+	result &= Test("isEven(4)", isEven(4), 1);
+	result &= Test("isOdd(1)",  isOdd(1),  1);
+	result &= Test("isOdd(5)",  isOdd(5),  1);
+	result &= Test("isEven(3) is false", isEven(3), 0);
+	result &= Test("isOdd(4) is false",  isOdd(4),  0);
+	return result;
+}
+
+// Test 3: runAccumulator() calls getTotal() which is defined after the struct.
+int runAccumulator()
+{
+	return getTotal();
+}
+
+struct Accumulator
+{
+	int x = 10;
+	int y = 20;
+	int z = 30;
+
+	int Total()
+	{
+		return x + y + z;
+	}
+};
+
+int getTotal()
+{
+	Accumulator a = Accumulator();
+	return a.Total();
+}
+
+bool testForwardFunctionWithStruct()
+{
+	bool result = true;
+	result &= Test("runAccumulator (fwd ref to getTotal)", runAccumulator(), 60);
+	return result;
+}
+
+// Test 4: Member function calls a member function defined later in the struct.
+struct Calculator
+{
+	int value = 10;
+
+	int ComputeDouble()
+	{
+		return doubleIt();
+	}
+
+	int ComputeSum()
+	{
+		return addThree(5, 3);
+	}
+
+	int doubleIt()
+	{
+		return value * 2;
+	}
+
+	int addThree(int b, int c)
+	{
+		return value + b + c;
+	}
+};
+
+bool testForwardInStruct()
+{
+	bool result = true;
+	Calculator c = Calculator();
+	result &= Test("member calls fwd func (doubleIt)", c.ComputeDouble(), 20);
+	result &= Test("member calls fwd func (addThree)", c.ComputeSum(), 18);
+	return result;
+}
+
 extern int main()
 {
 	MyStruct my = MyStruct();
@@ -378,6 +491,10 @@ extern int main()
 	result &= testNestedUsing();
 	result &= testLocalUsing();
 	result &= testLocalUsingScoped();
+	result &= testForwardFunction();
+	result &= testMutualRecursion();
+	result &= testForwardFunctionWithStruct();
+	result &= testForwardInStruct();
 
 	if (result)
 	{

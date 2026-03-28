@@ -10,6 +10,143 @@
 #include "MyCompilerLLVM.h"
 
 
+// ForwardRefScanner performs a lightweight pre-pass over the AST to register
+// all function signatures and struct type shells before the main code-gen walk.
+// This allows functions and types to be used before their definition in source.
+class ForwardRefScanner
+{
+private:
+	MyCompilerLLVM* compilerLLVM;
+
+	MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
+	{
+		MyCompilerLLVM::DeclTypeAndValue declType;
+		for (auto declSpec : declSpecs->declarationSpecifier())
+		{
+			auto typeSpec = declSpec->typeSpecifier();
+			auto storageSpec = declSpec->storageClassSpecifier();
+			if (typeSpec != nullptr)
+			{
+				declType.TypeName = typeSpec->getText();
+				declType.Pointer = declSpec->pointer() != nullptr;
+				declType.ArraySize = declSpec->assignmentExpression();
+				break;
+			}
+			else if (storageSpec)
+			{
+				declType.external = storageSpec->Extern() != nullptr;
+			}
+		}
+		return declType;
+	}
+
+	std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+	{
+		std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
+		if (paramTypeList == nullptr)
+			return params;
+
+		auto paramList = paramTypeList->parameterList();
+		for (auto paramDecl : paramList->parameterDeclaration())
+		{
+			MyCompilerLLVM::DeclTypeAndValue paramType = ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
+			if (auto declarer = paramDecl->declarator())
+				if (auto directDeclarer = declarer->directDeclarator())
+					paramType.VariableName = directDeclarer->getText();
+			paramType.DefaultValue = paramDecl->assignmentExpression();
+			params.push_back(paramType);
+		}
+		return params;
+	}
+
+	void ScanFunctionDefinition(CParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
+	{
+		std::string name = func->directDeclarator()->getText();
+		if (!namespaceName.empty())
+			name = namespaceName + "." + name;
+
+		auto returnType = ParseDeclarationSpecifiers(func->declarationSpecifiers());
+		auto* paramTypeList = func->parameterTypeList();
+		auto params = ParseParameterTypeList(paramTypeList);
+		bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
+
+		if (!structName.empty())
+		{
+			MyCompilerLLVM::DeclTypeAndValue thisParam;
+			thisParam.TypeName = structName;
+			thisParam.VariableName = structName + "__";
+			thisParam.Pointer = true;
+			params.insert(params.begin(), thisParam);
+		}
+
+		std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+		compilerLLVM->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs);
+
+		// Pre-declare overloads for default parameters
+		int firstDefault = -1;
+		for (int i = 0; i < (int)params.size(); i++)
+		{
+			if (params[i].DefaultValue != nullptr) { firstDefault = i; break; }
+		}
+		for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)params.size(); cutoff++)
+		{
+			std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
+			compilerLLVM->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
+		}
+	}
+
+	void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx)
+	{
+		std::string structName = ctx->directDeclarator()->getText();
+
+		// Register opaque struct so the type is known for pointer/field use
+		compilerLLVM->CreateStructType(structName, {});
+
+		// Pre-declare default constructor
+		MyCompilerLLVM::TypeAndValue returnType{ .TypeName = structName };
+		compilerLLVM->CreateFunctionDeclaration(structName, returnType, {});
+
+		// Pre-declare member functions
+		for (auto func : ctx->functionDefinition())
+			ScanFunctionDefinition(func, structName);
+
+		// Pre-declare destructor
+		for (auto dtor : ctx->destructorDefinition())
+		{
+			MyCompilerLLVM::DeclTypeAndValue thisParam;
+			thisParam.TypeName = structName;
+			thisParam.VariableName = structName + "__";
+			thisParam.Pointer = true;
+			MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
+			compilerLLVM->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
+		}
+	}
+
+public:
+	ForwardRefScanner(MyCompilerLLVM* compiler) : compilerLLVM(compiler) {}
+
+	void ScanExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
+	{
+		if (auto ns = ctx->namespaceDefinition())
+			ScanNamespace(ns, namespaceName);
+		else if (auto func = ctx->functionDefinition())
+			ScanFunctionDefinition(func, {}, namespaceName);
+		else if (auto dataStruct = ctx->structClassUnionDefinition())
+			ScanStructDefinition(dataStruct);
+	}
+
+	void ScanNamespace(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
+	{
+		std::string namespaceName = ctx->Identifier()->getText();
+		if (!parentNamespace.empty())
+			namespaceName = parentNamespace + "." + namespaceName;
+
+		for (auto* extDecl : ctx->externalDeclaration())
+			ScanExternalDeclaration(extDecl, namespaceName);
+	}
+};
+
+
 class MyListener : public CBaseListener
 {
 private:
@@ -1472,6 +1609,14 @@ public:
 							MyCompilerLLVM::NamedVariable argumentNamedVar = structVar; // Copy;
 							argumentNamedVar.TypeAndValue.VariableName = "";
 							arguments.push_back(argumentNamedVar);
+						}
+						else
+						{
+							// Bare call inside a member function — inject 'this' automatically
+							// if the callee is a method of the same struct.
+							auto thisVar = compilerLLVM->GetCurrentMemberThis(functionName);
+							if (thisVar.Storage != nullptr)
+								arguments.push_back(thisVar);
 						}
 
 						auto argumentList = ctx->argumentExpressionList();

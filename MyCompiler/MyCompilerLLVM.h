@@ -788,6 +788,10 @@ public:
 		}
 		else
 		{
+			auto existing = dataStructures.find(name);
+			if (existing != dataStructures.end())
+				return existing->second.StructType;
+
 			llvm::StructType* opaqueStruct = llvm::StructType::create(*context, name);
 			dataStructures[name].StructType = opaqueStruct;
 			return opaqueStruct;
@@ -1159,10 +1163,7 @@ public:
 		std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
 		if (module->getFunction(mangledName) != nullptr)
-		{
-			std::cout << "Function already exists:" << functionName << "\n";
-			__debugbreak();
-		}
+			return;
 
 		auto funcCallee = module->getOrInsertFunction(mangledName, functionType);
 		llvm::Value* calleeValue = funcCallee.getCallee();
@@ -1220,19 +1221,29 @@ public:
 
 		std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
-		auto fn = module->getFunction(mangledName);
 		if (functionType == nullptr)
 		{
 			functionType = llvm::FunctionType::get(builder->getVoidTy(), false);
 		}
 
+		auto fn = module->getFunction(mangledName);
+		bool alreadyDeclared = false;
+
 		if (fn != nullptr)
 		{
-			std::cout << "Function already exists : " << functionName << "\n";
-			__debugbreak();
+			if (!fn->empty())
+			{
+				std::cout << "Function already exists : " << functionName << "\n";
+				__debugbreak();
+				return fn;
+			}
+			// Pre-declared by ForwardRefScanner — reuse the declaration and attach a body.
+			alreadyDeclared = true;
 		}
-
-		fn = createFunctionProto(mangledName, functionType);
+		else
+		{
+			fn = createFunctionProto(mangledName, functionType);
+		}
 
 		createFunctionBlock(fn, functionName, arguments);
 
@@ -1250,6 +1261,7 @@ public:
 			builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, (unsigned)line, 0, sp));
 		}
 
+		if (!alreadyDeclared)
 		{
 			auto& symList = functionTable[functionName];
 			FunctionSymbol funcSym = {
@@ -1266,7 +1278,6 @@ public:
 
 			symList.push_back(funcSym);
 		}
-
 
 		return fn;
 	}
@@ -1599,6 +1610,43 @@ public:
 		}
 
 		return nullptr;
+	}
+
+	/// Returns the implicit 'this' NamedVariable when calling a bare member function
+	/// from within a member function body of the same struct. Returns a default
+	/// NamedVariable (Storage == nullptr) if not in a member context or not a method.
+	NamedVariable GetCurrentMemberThis(const std::string& functionName)
+	{
+		for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+		{
+			const auto& functionArguments = stackFrame.functionArgument;
+			if (functionArguments.empty())
+				continue;
+
+			const auto& firstArgName = functionArguments.begin()->first;
+			if (firstArgName.size() < 2 || firstArgName.substr(firstArgName.size() - 2) != "__")
+				break;
+
+			std::string structName = firstArgName.substr(0, firstArgName.size() - 2);
+
+			auto funcIt = functionTable.find(functionName);
+			if (funcIt == functionTable.end())
+				break;
+
+			for (const auto& sym : funcIt->second)
+			{
+				if (!sym.Parameters.empty() &&
+					sym.Parameters[0].TypeName == structName &&
+					sym.Parameters[0].Pointer)
+				{
+					NamedVariable thisVar = functionArguments.begin()->second;
+					thisVar.TypeAndValue.VariableName = "";
+					return thisVar;
+				}
+			}
+			break;
+		}
+		return {};
 	}
 
 	NamedVariable GetFunctionArgument(std::string name)

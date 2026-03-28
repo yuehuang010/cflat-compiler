@@ -48,6 +48,15 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
 
 		auto computeUnit = parser.compilationUnit();
 
+		// Pre-scan: register all function signatures and struct type shells so
+		// that forward references resolve during the main code-gen walk.
+		{
+			ForwardRefScanner scanner(this);
+			if (auto* tu = computeUnit->translationUnit())
+				for (auto* decl : tu->externalDeclaration())
+					scanner.ScanExternalDeclaration(decl);
+		}
+
 		auto myListener = std::make_unique<MyListener>(&parser, this);
 		auto walker = antlr4::tree::ParseTreeWalker();
 		walker.walk(myListener.get(), computeUnit);
