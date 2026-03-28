@@ -13,7 +13,8 @@ import {
     InitializeResult,
     Hover,
     MarkupKind,
-    InsertTextFormat
+    InsertTextFormat,
+    Location
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 import * as cp from 'child_process';
@@ -48,6 +49,22 @@ const documentSettings = new Map<string, Promise<MycSettings>>();
 const diagnosticTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // ---------------------------------------------------------------------------
+// Symbol table (user-defined symbols for hover / completion enrichment)
+// ---------------------------------------------------------------------------
+
+interface SymbolInfo {
+    kind: 'function' | 'type' | 'variable' | 'macro' | 'namespace';
+    markdown: string;
+    /** 0-based line of the declaration in the source document. */
+    defLine: number;
+    /** 0-based character offset of the symbol name on that line. */
+    defChar: number;
+}
+
+/** Per-document symbol cache, invalidated on every content change. */
+const documentSymbols = new Map<string, Map<string, SymbolInfo>>();
+
+// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 
@@ -68,7 +85,8 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
                 resolveProvider: true,
                 triggerCharacters: ['.', ':', '#', '<']
             },
-            hoverProvider: true
+            hoverProvider: true,
+            definitionProvider: true
         }
     };
 });
@@ -113,6 +131,7 @@ function getDocumentSettings(resource: string): Promise<MycSettings> {
 
 documents.onDidClose(e => {
     documentSettings.delete(e.document.uri);
+    documentSymbols.delete(e.document.uri);
     connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
     const timer = diagnosticTimers.get(e.document.uri);
     if (timer) {
@@ -122,6 +141,7 @@ documents.onDidClose(e => {
 });
 
 documents.onDidChangeContent(change => {
+    documentSymbols.delete(change.document.uri);
     scheduleDiagnostics(change.document);
 });
 
@@ -356,6 +376,13 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
     const word = getWordAtPosition(document, params.position);
     if (!word) return null;
 
+    // User-defined symbols take priority over keyword docs
+    const symbols = getSymbolsForDocument(document);
+    const symInfo = symbols.get(word);
+    if (symInfo) {
+        return { contents: { kind: MarkupKind.Markdown, value: symInfo.markdown } };
+    }
+
     const doc = KEYWORD_DOCS[word];
     if (!doc) return null;
 
@@ -363,6 +390,30 @@ connection.onHover((params: TextDocumentPositionParams): Hover | null => {
         contents: {
             kind: MarkupKind.Markdown,
             value: doc
+        }
+    };
+});
+
+// ---------------------------------------------------------------------------
+// Go to Definition (F12)
+// ---------------------------------------------------------------------------
+
+connection.onDefinition((params: TextDocumentPositionParams): Location | null => {
+    const document = documents.get(params.textDocument.uri);
+    if (!document) return null;
+
+    const word = getWordAtPosition(document, params.position);
+    if (!word) return null;
+
+    const symbols = getSymbolsForDocument(document);
+    const symInfo = symbols.get(word);
+    if (!symInfo) return null;
+
+    return {
+        uri: params.textDocument.uri,
+        range: {
+            start: { line: symInfo.defLine, character: symInfo.defChar },
+            end:   { line: symInfo.defLine, character: symInfo.defChar + word.length }
         }
     };
 });
@@ -378,6 +429,263 @@ function getWordAtPosition(document: TextDocument, position: { line: number; cha
     while (end < text.length && /\w/.test(text[end])) end++;
 
     return start === end ? null : text.slice(start, end);
+}
+
+// ---------------------------------------------------------------------------
+// Symbol extraction
+// ---------------------------------------------------------------------------
+
+function getSymbolsForDocument(document: TextDocument): Map<string, SymbolInfo> {
+    let symbols = documentSymbols.get(document.uri);
+    if (!symbols) {
+        symbols = parseDocumentSymbols(document.getText());
+        documentSymbols.set(document.uri, symbols);
+    }
+    return symbols;
+}
+
+/**
+ * Strip line and block comments, preserving newlines so line numbers stay intact.
+ */
+function removeComments(text: string): string {
+    return text
+        .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
+        .replace(/\/\/[^\n]*/g, m => ' '.repeat(m.length));
+}
+
+/**
+ * Extract members (fields + methods) from a struct/class body string.
+ * The body is the text between the outer `{` and `}` of the aggregate.
+ */
+function extractStructMembers(body: string): string[] {
+    const members: string[] = [];
+    let depth = 0;
+    let segStart = 0;
+
+    const addMember = (segment: string) => {
+        const norm = segment.replace(/\s+/g, ' ').trim();
+        if (!norm || norm.startsWith('#') || norm.length > 150) return;
+
+        if (norm.includes('(')) {
+            // Method — show signature up to closing paren
+            const parenClose = norm.indexOf(')');
+            if (parenClose > -1) {
+                members.push(`    ${norm.slice(0, parenClose + 1)};`);
+            }
+        } else {
+            members.push(`    ${norm};`);
+        }
+    };
+
+    for (let j = 0; j < body.length; j++) {
+        const ch = body[j];
+        if (ch === '{') {
+            depth++;
+        } else if (ch === '}') {
+            depth--;
+            if (depth === 0) {
+                // Inline method body just closed — capture its signature
+                addMember(body.slice(segStart, j + 1));
+                segStart = j + 1;
+            }
+        } else if (ch === ';' && depth === 0) {
+            addMember(body.slice(segStart, j));
+            segStart = j + 1;
+        }
+    }
+
+    return members;
+}
+
+/** Convert a character index in `text` to a 0-based { line, character } position. */
+function indexToPosition(text: string, index: number): { line: number; character: number } {
+    const before = text.slice(0, index);
+    const lines = before.split('\n');
+    return { line: lines.length - 1, character: lines[lines.length - 1].length };
+}
+
+/** Words that cannot be C type names (control-flow keywords, etc.). */
+const CANNOT_BE_TYPE = new Set([
+    'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'default',
+    'break', 'continue', 'return', 'goto', 'using', 'namespace', 'interface',
+    'sizeof', 'typeof', 'nameof', 'alignof'
+]);
+
+/**
+ * Scan a document and produce a symbol table for user-defined identifiers.
+ * Handles: #define macros, namespaces, structs/classes/unions/enums (with
+ * member lists), interfaces, function declarations, and variable declarations.
+ */
+function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
+    const symbols = new Map<string, SymbolInfo>();
+    const clean = removeComments(text);
+
+    // --- #define macros ---
+    const defineRe = /#\s*define\s+([A-Za-z_]\w*)(?:\(([^)]*)\))?\s*(.*)/g;
+    let m: RegExpExecArray | null;
+    while ((m = defineRe.exec(clean)) !== null) {
+        const name = m[1];
+        const params = m[2];
+        const value = m[3].trim();
+        const sig = params !== undefined
+            ? `#define ${name}(${params})${value ? ' ' + value : ''}`
+            : `#define ${name}${value ? ' ' + value : ''}`;
+        const nameIndex = m.index + m[0].indexOf(name);
+        const pos = indexToPosition(clean, nameIndex);
+        symbols.set(name, {
+            kind: 'macro',
+            markdown: `\`\`\`c\n${sig}\n\`\`\``,
+            defLine: pos.line,
+            defChar: pos.character
+        });
+    }
+
+    // --- namespace declarations ---
+    // No brace required: handles both K&R "namespace Foo {" and Allman "namespace Foo\n{"
+    const nsRe = /\bnamespace\s+([A-Za-z_]\w*)/g;
+    while ((m = nsRe.exec(clean)) !== null) {
+        const name = m[1];
+        if (!symbols.has(name)) {
+            const nameIndex = m.index + m[0].indexOf(name);
+            const pos = indexToPosition(clean, nameIndex);
+            symbols.set(name, {
+                kind: 'namespace',
+                markdown: `\`\`\`c\nnamespace ${name} { ... }\n\`\`\``,
+                defLine: pos.line,
+                defChar: pos.character
+            });
+        }
+    }
+
+    // Helper: extract body + position for an aggregate type.
+    const extractAggregate = (keyword: string, name: string, bodyStart: number, nameGlobalIndex: number): void => {
+        let depth = 1;
+        let i = bodyStart;
+        while (i < clean.length && depth > 0) {
+            if (clean[i] === '{') depth++;
+            else if (clean[i] === '}') depth--;
+            i++;
+        }
+        const body = clean.slice(bodyStart, i - 1);
+        const members = extractStructMembers(body);
+        const md = members.length > 0
+            ? `\`\`\`c\n${keyword} ${name} {\n${members.join('\n')}\n}\n\`\`\``
+            : `\`\`\`c\n${keyword} ${name}\n\`\`\``;
+        const pos = indexToPosition(clean, nameGlobalIndex);
+        symbols.set(name, { kind: 'type', markdown: md, defLine: pos.line, defChar: pos.character });
+    };
+
+    // --- struct / class / union / enum ---
+    const aggRe = /\b(struct|class|union|enum)\s+([A-Za-z_]\w*)\s*\{/g;
+    while ((m = aggRe.exec(clean)) !== null) {
+        const nameIndex = m.index + m[0].indexOf(m[2]);
+        extractAggregate(m[1], m[2], m.index + m[0].length, nameIndex);
+    }
+
+    // --- interface (MyC extension) ---
+    const ifaceRe = /\binterface\s+([A-Za-z_]\w*)\s*\{/g;
+    while ((m = ifaceRe.exec(clean)) !== null) {
+        const nameIndex = m.index + m[0].indexOf(m[1]);
+        extractAggregate('interface', m[1], m.index + m[0].length, nameIndex);
+    }
+
+    // --- Function and variable declarations (line-by-line) ---
+    //
+    // Function: [qualifiers] returnType[*] qualName(params) [const] [{;]
+    //   qualName allows Namespace::funcName for out-of-namespace definitions.
+    //   [{;] is optional to handle Allman-style braces (brace on next line).
+    //
+    // Variable: [qualifiers] type[*] name [array] [= ...];
+    //   Pointer separator uses (\s*\*+\s*|\s+) so both "int *p" and "int* p" work.
+
+    // No trailing $ on funcLineRe: dropping it lets single-line bodies
+    // "int f() { return 0; }" match, and avoids failure when removeComments
+    // leaves trailing spaces after the opening brace.
+    const funcLineRe = /^([ \t]*(?:(?:static|extern|inline|virtual)\s+)*)((?:const\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*(?:\s*\*+)?)\s+([A-Za-z_][\w:]*)\s*\(([^)]*)\)(?:\s*const)?\s*[{;]?/;
+    const varLineRe   = /^([ \t]*(?:(?:const|volatile|static|extern|register)\s+)*)((?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[.*?\])?\s*(?:=.*)?\s*;$/;
+    // For-loop variable initializer: for (type name = ...)
+    const forVarRe    = /\bfor\s*\(\s*((?:(?:const|volatile)\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*=/g;
+
+    const addVarSymbol = (
+        name: string, fullType: string,
+        lineIdx: number, defChar: number
+    ) => {
+        if (!symbols.has(name) && !KEYWORD_DOCS[name]) {
+            symbols.set(name, {
+                kind: 'variable',
+                markdown: `\`\`\`c\n${fullType} ${name}\n\`\`\``,
+                defLine: lineIdx,
+                defChar: Math.max(0, defChar)
+            });
+        }
+    };
+
+    // trimEnd() removes trailing spaces left by removeComments (comment text
+    // is replaced with spaces, which would break $ anchors in varLineRe).
+    const lines = clean.split('\n');
+    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+        const rawLine = lines[lineIdx].trimEnd();
+
+        // --- Function pattern ---
+        const fm = funcLineRe.exec(rawLine);
+        if (fm) {
+            const retType = fm[2].trim();
+            const qualName = fm[3];           // may be "Namespace::funcName"
+            const shortName = qualName.split('::').pop()!;
+            const params = fm[4].trim();
+
+            if (!KEYWORD_DOCS[shortName] && !CANNOT_BE_TYPE.has(retType.split(/\s+/)[0])) {
+                const parenIdx = rawLine.indexOf('(');
+                // Column of the short name = last word before '('
+                const beforeParen = parenIdx > 0 ? rawLine.slice(0, parenIdx) : '';
+                const defChar = Math.max(0, beforeParen.lastIndexOf(shortName));
+
+                const info: SymbolInfo = {
+                    kind: 'function',
+                    markdown: `\`\`\`c\n${retType} ${shortName}(${params})\n\`\`\``,
+                    defLine: lineIdx,
+                    defChar
+                };
+                // Register under the short name (for callsite lookup) and qualified name
+                if (!symbols.has(shortName)) symbols.set(shortName, info);
+                if (qualName !== shortName && !symbols.has(qualName)) symbols.set(qualName, info);
+            }
+            continue;
+        }
+
+        // --- Variable pattern (handles int *p and int* p) ---
+        const vm = varLineRe.exec(rawLine);
+        if (vm) {
+            const baseType = vm[2].trim();
+            const sep      = vm[3];               // spacing/stars between type and name
+            const name     = vm[4];
+            const ptrStars = sep.trim();           // just the '*' characters
+            const fullType = ptrStars ? `${baseType}${ptrStars}` : baseType;
+
+            if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
+                const typeEnd = vm[1].length + vm[2].length + vm[3].length;
+                addVarSymbol(name, fullType, lineIdx, vm[0].indexOf(name, typeEnd));
+            }
+        }
+
+        // --- For-loop variable: for (int i = 0; ...) ---
+        forVarRe.lastIndex = 0;
+        let fv: RegExpExecArray | null;
+        while ((fv = forVarRe.exec(rawLine)) !== null) {
+            const baseType = fv[1].trim();
+            const sep      = fv[2];
+            const name     = fv[3];
+            const ptrStars = sep.trim();
+            const fullType = ptrStars ? `${baseType}${ptrStars}` : baseType;
+
+            if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
+                const nameIdx = fv.index + fv[0].lastIndexOf(name);
+                addVarSymbol(name, fullType, lineIdx, nameIdx);
+            }
+        }
+    }
+
+    return symbols;
 }
 
 // ---------------------------------------------------------------------------

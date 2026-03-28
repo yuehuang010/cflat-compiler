@@ -186,8 +186,9 @@
     "struct-declaration": {
       "patterns": [
         {
+          "comment": "struct/class/union/enum keyword followed by a type name — covers declarations AND type-usage positions (variable declarations, casts, parameters)",
           "name": "meta.struct.myc",
-          "match": "\\b(struct|class|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\{|;|,)",
+          "match": "\\b(struct|class|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "storage.type.struct.myc" },
             "2": { "name": "entity.name.type.myc" }
