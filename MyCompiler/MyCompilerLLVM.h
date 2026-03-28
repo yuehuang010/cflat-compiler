@@ -210,6 +210,19 @@ public:
 
 	using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
 
+	struct ReturnBlockEntry
+	{
+		CParser::CompoundStatementContext* Body;
+		std::vector<DeclTypeAndValue> Params;
+		TypeAndValue ReturnType;
+	};
+
+	struct ReturnCaptureContext
+	{
+		llvm::AllocaInst* CaptureAlloca;   // nullptr for void return
+		llvm::BasicBlock* ContinuationBlock;
+	};
+
 private:
 	std::unique_ptr<llvm::IRBuilder<>> builder;
 	std::unique_ptr<llvm::Module> module;
@@ -223,6 +236,8 @@ private:
 	std::unordered_map<std::string, llvm::Constant*> stringPool;
 	std::unordered_set<std::string> namespaceTable;
 	std::unordered_map<std::string, std::string> namespaceAliasTable;
+	std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
+	std::optional<ReturnCaptureContext> returnCapture;
 
 	llvm::Function* currentFunction;
 	std::string sourceFileName;
@@ -545,6 +560,17 @@ public:
 		}
 
 		return alloc;
+	}
+
+	// Register a value directly as a named variable without an alloca.
+	// Used for pointer-type params in return-block inlining so GetValue() returns the pointer itself.
+	void RegisterPrimaryVariable(const TypeAndValue& typeValue, llvm::Value* value)
+	{
+		auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+		namedVariable.Primary = value;
+		namedVariable.Storage = nullptr;
+		namedVariable.TypeAndValue = typeValue;
+		namedVariable.BaseType = value->getType();
 	}
 
 	llvm::AllocaInst* CreateAlloca(llvm::Type* type)
@@ -1096,6 +1122,11 @@ public:
 			fn = currentFunction;
 
 		return llvm::BasicBlock::Create(*context, name, fn);
+	}
+
+	void SwitchToBlock(llvm::BasicBlock* block)
+	{
+		builder->SetInsertPoint(block);
 	}
 
 	llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
@@ -1769,6 +1800,15 @@ public:
 			if (it->isFunction) break;
 		}
 
+		// If we are inlining a return-block, capture the value and branch to continuation.
+		if (returnCapture)
+		{
+			if (value != nullptr && returnCapture->CaptureAlloca != nullptr)
+				builder->CreateStore(value, returnCapture->CaptureAlloca);
+			builder->CreateBr(returnCapture->ContinuationBlock);
+			return;
+		}
+
 		if (value == nullptr)
 			builder->CreateRetVoid();
 		else
@@ -1776,6 +1816,16 @@ public:
 			value = Upconvert(value, currentFunction->getReturnType());
 			builder->CreateRet(value);
 		}
+	}
+
+	void BeginReturnCapture(llvm::AllocaInst* captureAlloca, llvm::BasicBlock* continuationBlock)
+	{
+		returnCapture = { captureAlloca, continuationBlock };
+	}
+
+	void EndReturnCapture()
+	{
+		returnCapture.reset();
 	}
 
 	llvm::BasicBlock* GetElseBlock()
@@ -1833,6 +1883,17 @@ public:
 		for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
 			if (frame.isFunction) return frame.functionName;
 		return "";
+	}
+
+	void RegisterReturnBlock(const std::string& name, CParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType)
+	{
+		returnBlockTable[name] = { body, std::move(params), returnType };
+	}
+
+	const ReturnBlockEntry* GetReturnBlock(const std::string& name) const
+	{
+		auto it = returnBlockTable.find(name);
+		return it != returnBlockTable.end() ? &it->second : nullptr;
 	}
 
 	void RegisterNamespace(const std::string& name) { namespaceTable.insert(name); }

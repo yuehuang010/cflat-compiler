@@ -436,6 +436,7 @@ jumpStatement
         'continue'
         | 'break'
         | 'return' expression?
+        | 'return' compoundStatement
     ) ';'
     ;
 
