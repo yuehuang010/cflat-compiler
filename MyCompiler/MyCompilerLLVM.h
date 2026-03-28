@@ -197,6 +197,13 @@ public:
 		bool Variadic = false;
 	};
 
+	struct InterfaceMethod
+	{
+		std::string Name;
+		TypeAndValue ReturnType;
+		std::vector<TypeAndValue> Parameters; // excludes the implicit 'this' pointer
+	};
+
 	using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
 
 private:
@@ -208,6 +215,7 @@ private:
 	std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
 	std::unordered_map<std::string, StructData> dataStructures;
 	std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
+	std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
 
 	llvm::Function* currentFunction;
 
@@ -394,6 +402,57 @@ public:
 	{
 		currentSubprogram = nullptr;
 		builder->SetCurrentDebugLocation(llvm::DebugLoc());
+	}
+
+	void CreateInterfaceDefinition(const std::string& name, std::vector<InterfaceMethod> methods)
+	{
+		interfaceTable[name] = std::move(methods);
+	}
+
+	void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
+	{
+		auto ifaceIt = interfaceTable.find(interfaceName);
+		if (ifaceIt == interfaceTable.end())
+		{
+			std::cout << "Unknown interface: '" << interfaceName << "'\n";
+			return;
+		}
+
+		for (const auto& method : ifaceIt->second)
+		{
+			bool found = false;
+			auto funcIt = functionTable.find(method.Name);
+			if (funcIt != functionTable.end())
+			{
+				for (const auto& sym : funcIt->second)
+				{
+					// Expect: first param = structName*, remaining params match the interface method's params
+					if (sym.Parameters.size() != method.Parameters.size() + 1)
+						continue;
+					if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer)
+						continue;
+
+					bool paramsMatch = true;
+					for (int i = 0; i < (int)method.Parameters.size(); i++)
+					{
+						if (sym.Parameters[i + 1].TypeName != method.Parameters[i].TypeName ||
+							sym.Parameters[i + 1].Pointer  != method.Parameters[i].Pointer)
+						{
+							paramsMatch = false;
+							break;
+						}
+					}
+
+					if (paramsMatch) { found = true; break; }
+				}
+			}
+
+			if (!found)
+			{
+				std::cout << "Class '" << structName << "' does not implement '"
+					<< interfaceName << "::" << method.Name << "'\n";
+			}
+		}
 	}
 
 	llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue)

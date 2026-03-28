@@ -129,6 +129,30 @@ public:
 		this->compilerLLVM = compilerLLVM;
 	}
 
+	void ParseInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
+	{
+		std::string name = ctx->Identifier()->getText();
+		std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+
+		for (auto method : ctx->interfaceMethod())
+		{
+			MyCompilerLLVM::InterfaceMethod m;
+			m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+			m.Name = method->directDeclarator()->getText();
+
+			auto declParams = ParseParameterTypeList(method->parameterTypeList());
+			for (const auto& p : declParams)
+			{
+				MyCompilerLLVM::TypeAndValue tv = p;
+				m.Parameters.push_back(tv);
+			}
+
+			methods.push_back(std::move(m));
+		}
+
+		compilerLLVM->CreateInterfaceDefinition(name, methods);
+	}
+
 	void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
 	{
 		if constexpr (debugPrint)
@@ -137,8 +161,13 @@ public:
 		auto func = ctx->functionDefinition();
 		auto dataStruct = ctx->structClassUnionDefinition();
 		auto decl = ctx->declaration();
+		auto iface = ctx->interfaceDefinition();
 
-		if (decl != nullptr)
+		if (iface != nullptr)
+		{
+			ParseInterfaceDefinition(iface);
+		}
+		else if (decl != nullptr)
 		{
 			auto globalDecl = ParseDeclaration(decl);
 		}
@@ -1639,6 +1668,13 @@ public:
 			global_scope = false;
 			ParseFunctionDefinition(func, structName);
 			global_scope = true;
+		}
+
+		// Verify interface implementations
+		for (auto interfaceIdentifier : ctx->Identifier())
+		{
+			std::string interfaceName = interfaceIdentifier->getText();
+			compilerLLVM->VerifyInterfaceImplementation(structName, interfaceName);
 		}
 	}
 

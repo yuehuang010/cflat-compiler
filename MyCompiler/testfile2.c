@@ -100,6 +100,44 @@ struct MyStruct2
 int ReadExt(MyStruct1 my) { return my.num; }
 int ReadExt(MyStruct2 my) { return my.num; }
 
+// Interface tests
+
+interface IReadable
+{
+	int Read();
+};
+
+interface IScalable
+{
+	int Scale(int factor);
+};
+
+struct Counter : IReadable
+{
+	int count = 10;
+	int Read() { return count; }
+};
+
+struct ScaledValue : IReadable, IScalable
+{
+	int value = 3;
+	int Read() { return value; }
+	int Scale(int factor) { return value * factor; }
+};
+
+bool testInterface()
+{
+	bool result = true;
+	Counter c = Counter();
+	ScaledValue s = ScaledValue();
+
+	result &= Test("counter.Read",       c.Read(),        10);   // 10
+	result &= Test("scaledValue.Read",   s.Read(),         3);   // 3
+	result &= Test("scaledValue.Scale2", s.Scale(2),       6);   // 3*2=6
+	result &= Test("scaledValue.Scale5", s.Scale(5),      15);   // 3*5=15
+	return result;
+}
+
 // Default parameter tests
 
 int addWithDefault(int x, int y = 5)
@@ -160,6 +198,7 @@ extern void main()
 	result &= testDefaultSingleParam();
 	result &= testDefaultMultipleParams();
 	result &= testDefaultExpression();
+	result &= testInterface();
 
 	if (result)
 	{

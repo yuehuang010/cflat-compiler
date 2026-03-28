@@ -219,7 +219,7 @@ structOrUnionSpecifier
 structClassUnion
     : 'struct'
     | 'union'
-    | 'class'
+    | Class
     ;
 
 structDeclarationList
@@ -447,6 +447,7 @@ externalDeclaration
     : declaration
     | functionDefinition
     | structClassUnionDefinition
+    | interfaceDefinition
     | ';' // stray ;
     ;
 
@@ -455,7 +456,15 @@ functionDefinition
     ;
 
 structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator '{' (declaration | functionDefinition)* '}' ';'
+    : declarationSpecifiers? directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition)* '}' ';'
+    ;
+
+interfaceDefinition
+    : Interface Identifier '{' interfaceMethod* '}' ';'
+    ;
+
+interfaceMethod
+    : declarationSpecifiers directDeclarator '(' parameterTypeList? ')' ';'
     ;
 
 Auto
@@ -564,6 +573,14 @@ Static
 
 Struct
     : 'struct'
+    ;
+
+Class
+    : 'class'
+    ;
+
+Interface
+    : 'interface'
     ;
 
 Switch
