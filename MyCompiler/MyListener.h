@@ -645,7 +645,8 @@ public:
             return;
         }
 
-        __debugbreak();
+        LogErrorContext(statement, "Unhandled statement type.");
+        return;
     }
 
     void GenerateDefaultParamOverloads(
@@ -738,7 +739,7 @@ public:
         if (IsReturnBlockFunction(func))
         {
             auto* blockBody = func->compoundStatement()->blockItemList()->blockItem()[0]
-                                ->statement()->jumpStatement()->compoundStatement();
+                ->statement()->jumpStatement()->compoundStatement();
             compilerLLVM->RegisterReturnBlock(name, blockBody, params, returnType);
             return;
         }
@@ -820,7 +821,8 @@ public:
 
         if (typeAndValue.TypeName.empty())
         {
-            __debugbreak();
+            LogErrorContext(declSpec, "Declaration has an empty type name.");
+            return allocList;
         }
 
         llvm::Value* arraySize = nullptr;
@@ -954,7 +956,7 @@ public:
             return destination;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Unhandled assignment expression form.");
         return nullptr;
     }
 
@@ -971,8 +973,7 @@ public:
             // Both expression should exist or not exist.
             if ((expressionFalse != nullptr) != (expressionTrue != nullptr))
             {
-                std::cout << "Conditional Expression require both true and false parts.\n";
-                __debugbreak();
+                LogErrorContext(ctx, "Conditional expression requires both true and false branches.");
                 return nullptr;
             }
             else if (expressionFalse != nullptr && (expressionTrue != nullptr))
@@ -987,7 +988,7 @@ public:
             return expression;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Conditional expression has no logical-or sub-expression.");
         return nullptr;
     }
 
@@ -1057,7 +1058,7 @@ public:
             return left;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Logical-OR expression has no operands.");
         return nullptr;
     }
 
@@ -1126,7 +1127,7 @@ public:
             return left;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Logical-AND expression has no operands.");
         return nullptr;
     }
 
@@ -1141,7 +1142,7 @@ public:
             }
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Inclusive-OR expression has no operands.");
         return nullptr;
     }
 
@@ -1156,7 +1157,7 @@ public:
             }
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Exclusive-OR expression has no operands.");
         return nullptr;
     }
 
@@ -1171,7 +1172,7 @@ public:
             }
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Bitwise-AND expression has no operands.");
         return nullptr;
     }
 
@@ -1190,7 +1191,7 @@ public:
             return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Equality expression has unexpected operand count.");
         return nullptr;
     }
 
@@ -1209,7 +1210,7 @@ public:
             return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Relational expression has unexpected operand count.");
         return nullptr;
     }
 
@@ -1224,7 +1225,7 @@ public:
             }
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Shift expression has no operands.");
         return nullptr;
     }
 
@@ -1251,7 +1252,7 @@ public:
             return lvalue;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Additive expression has no operands.");
         return nullptr;
     }
 
@@ -1301,7 +1302,7 @@ public:
             return lvalue;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Multiplicative expression has no operands.");
         return nullptr;
     }
 
@@ -1351,7 +1352,7 @@ public:
             return namedVar;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Cast expression has no recognized form.");
         return {};
     }
 
@@ -1376,7 +1377,7 @@ public:
         else
         {
             // undefined type.
-            __debugbreak();
+            LogErrorContext(ctx, "Type name has no specifier-qualifier list.");
             return typeValue;
         }
 
@@ -1438,14 +1439,14 @@ public:
             else
             {
                 LogErrorContext(ctx, std::format("{} operator is not yet implemented.", opText));
-                __debugbreak();
+                return namedVar;
             }
 
             // TODO, unaryOperator
             return namedVar;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Unary expression has no recognized form.");
         return {};
     }
 
@@ -1766,7 +1767,7 @@ public:
                         break;
                     }
 
-                    default: { __debugbreak(); }
+                    default: { LogErrorContext(ctx, std::format("Unexpected token '{}' in postfix expression.", parseTree->getText())); return {}; }
                     }
                 }
             }
@@ -1774,7 +1775,7 @@ public:
             return namedVar;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Postfix expression has no primary expression.");
         return {};
     }
 
@@ -2007,7 +2008,7 @@ public:
             return left;
         }
 
-        __debugbreak();
+        LogErrorContext(ctx, "Expression has no assignment sub-expressions.");
         return nullptr;
     }
 

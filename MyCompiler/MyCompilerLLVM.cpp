@@ -20,6 +20,13 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     auto bitcodePath = args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
 
+    auto outputDir = std::filesystem::path(outputPath).parent_path();
+    if (!outputDir.empty() && !std::filesystem::exists(outputDir))
+    {
+        std::cerr << "Error: output directory '" << outputDir.string() << "' does not exist (-o " << outputPath << ").\n";
+        return false;
+    }
+
     if (!std::filesystem::exists(filename))
     {
         std::cout << "File doesn't exists.\n";

@@ -52,6 +52,14 @@ const diagnosticTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // Symbol table (user-defined symbols for hover / completion enrichment)
 // ---------------------------------------------------------------------------
 
+interface MemberInfo {
+    name: string;
+    type: string;
+    isMethod: boolean;
+    /** Display signature, e.g. "int count" or "void foo(int x)". */
+    signature: string;
+}
+
 interface SymbolInfo {
     kind: 'function' | 'type' | 'variable' | 'macro' | 'namespace';
     markdown: string;
@@ -59,6 +67,10 @@ interface SymbolInfo {
     defLine: number;
     /** 0-based character offset of the symbol name on that line. */
     defChar: number;
+    /** For variable symbols: the resolved base type name (e.g. "MyStruct"). */
+    typeName?: string;
+    /** For type symbols: the struct/class/union members available for member completion. */
+    members?: MemberInfo[];
 }
 
 /** Per-document symbol cache, invalidated on every content change. */
@@ -83,7 +95,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
             textDocumentSync: TextDocumentSyncKind.Incremental,
             completionProvider: {
                 resolveProvider: true,
-                triggerCharacters: ['.', ':', '#', '<']
+                triggerCharacters: ['.', '>', ':', '#', '<']
             },
             hoverProvider: true,
             definitionProvider: true
@@ -457,23 +469,33 @@ function removeComments(text: string): string {
  * Extract members (fields + methods) from a struct/class body string.
  * The body is the text between the outer `{` and `}` of the aggregate.
  */
-function extractStructMembers(body: string): string[] {
-    const members: string[] = [];
+function extractStructMembers(body: string): MemberInfo[] {
+    const members: MemberInfo[] = [];
     let depth = 0;
     let segStart = 0;
 
     const addMember = (segment: string) => {
-        const norm = segment.replace(/\s+/g, ' ').trim();
+        const norm = segment.replace(/\s+/g, ' ').trim().replace(/[;{}]$/, '').trim();
         if (!norm || norm.startsWith('#') || norm.length > 150) return;
 
         if (norm.includes('(')) {
-            // Method — show signature up to closing paren
+            // Method — extract name and return type from signature before '('
+            const parenOpen  = norm.indexOf('(');
             const parenClose = norm.indexOf(')');
-            if (parenClose > -1) {
-                members.push(`    ${norm.slice(0, parenClose + 1)};`);
-            }
+            if (parenClose === -1) return;
+            const beforeParen = norm.slice(0, parenOpen).trim();
+            const nameParts   = beforeParen.split(/\s+/);
+            const name        = nameParts[nameParts.length - 1].replace(/[*&]/g, '');
+            const type        = nameParts.slice(0, nameParts.length - 1).join(' ') || 'void';
+            const signature   = norm.slice(0, parenClose + 1);
+            if (name) members.push({ name, type, isMethod: true, signature });
         } else {
-            members.push(`    ${norm};`);
+            // Field — strip initializer (= ...) then extract type and name
+            const normField = norm.replace(/\s*=.*$/, '').trim();
+            const parts = normField.split(/\s+/);
+            const rawName = parts[parts.length - 1].replace(/\[.*?\]$/, '').replace(/[*&]/g, '');
+            const type    = parts.slice(0, parts.length - 1).join(' ');
+            if (rawName && type) members.push({ name: rawName, type, isMethod: false, signature: `${type} ${rawName}` });
         }
     };
 
@@ -568,11 +590,12 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         }
         const body = clean.slice(bodyStart, i - 1);
         const members = extractStructMembers(body);
-        const md = members.length > 0
-            ? `\`\`\`c\n${keyword} ${name} {\n${members.join('\n')}\n}\n\`\`\``
+        const memberLines = members.map(mb => `    ${mb.signature};`);
+        const md = memberLines.length > 0
+            ? `\`\`\`c\n${keyword} ${name} {\n${memberLines.join('\n')}\n}\n\`\`\``
             : `\`\`\`c\n${keyword} ${name}\n\`\`\``;
         const pos = indexToPosition(clean, nameGlobalIndex);
-        symbols.set(name, { kind: 'type', markdown: md, defLine: pos.line, defChar: pos.character });
+        symbols.set(name, { kind: 'type', markdown: md, defLine: pos.line, defChar: pos.character, members });
     };
 
     // --- struct / class / union / enum ---
@@ -611,11 +634,13 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         lineIdx: number, defChar: number
     ) => {
         if (!symbols.has(name) && !KEYWORD_DOCS[name]) {
+            const typeName = fullType.replace(/\*+$/, '').trim();
             symbols.set(name, {
                 kind: 'variable',
                 markdown: `\`\`\`c\n${fullType} ${name}\n\`\`\``,
                 defLine: lineIdx,
-                defChar: Math.max(0, defChar)
+                defChar: Math.max(0, defChar),
+                typeName
             });
         }
     };
@@ -692,7 +717,32 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
 // Completions
 // ---------------------------------------------------------------------------
 
-connection.onCompletion((_params: TextDocumentPositionParams): CompletionItem[] => {
+connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] => {
+    const document = documents.get(params.textDocument.uri);
+    if (!document) return COMPLETION_ITEMS;
+
+    const textBefore = document.getText().slice(0, document.offsetAt(params.position));
+
+    // Detect member access: <identifier> . <partial>  or  <identifier> -> <partial>
+    const memberMatch = /(\w+)\s*(?:->|\.)\w*$/.exec(textBefore);
+    if (memberMatch) {
+        const varName = memberMatch[1];
+        const symbols = getSymbolsForDocument(document);
+        const varInfo = symbols.get(varName);
+        const typeName = varInfo?.typeName ?? (varInfo?.kind === 'type' ? varName : undefined);
+        if (typeName) {
+            const typeInfo = symbols.get(typeName);
+            if (typeInfo?.members && typeInfo.members.length > 0) {
+                return typeInfo.members.map(mb => ({
+                    label: mb.name,
+                    kind: mb.isMethod ? CompletionItemKind.Method : CompletionItemKind.Field,
+                    detail: mb.signature
+                }));
+            }
+        }
+        return [];  // member access context but type unknown — show nothing
+    }
+
     return COMPLETION_ITEMS;
 });
 

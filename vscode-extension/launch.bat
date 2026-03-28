@@ -47,7 +47,7 @@ echo.
 
 REM --extensionDevelopmentPath loads the extension without installing it.
 REM VSCode opens a NEW "[Extension Development Host]" window with the extension active.
-start "" code --extensionDevelopmentPath="%EXT_PATH%" --new-window "%WORKSPACE%"
+code --extensionDevelopmentPath="%EXT_PATH%" --new-window "%WORKSPACE%"
 
 echo VSCode launched. A new window should appear momentarily.
 echo.
