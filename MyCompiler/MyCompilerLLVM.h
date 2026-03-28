@@ -216,6 +216,7 @@ private:
 	std::unordered_map<std::string, StructData> dataStructures;
 	std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
 	std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
+	std::unordered_map<std::string, llvm::Constant*> stringPool;
 
 	llvm::Function* currentFunction;
 
@@ -898,7 +899,19 @@ public:
 
 	llvm::Value* CreateGlobalString(std::string name, std::string text)
 	{
-		return builder->CreateGlobalStringPtr(text, name);
+		auto it = stringPool.find(text);
+		if (it != stringPool.end())
+			return it->second;
+
+		auto* gv = builder->CreateGlobalString(text, name);
+		auto* ptr = llvm::ConstantExpr::getInBoundsGetElementPtr(
+			gv->getValueType(), gv,
+			llvm::ArrayRef<llvm::Constant*>{
+				llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 0),
+				llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 0)
+			});
+		stringPool[text] = ptr;
+		return ptr;
 	}
 
 	llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
