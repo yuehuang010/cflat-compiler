@@ -492,7 +492,7 @@ destructorDefinition
     ;
 
 interfaceDefinition
-    : Interface Identifier '{' interfaceMethod* '}' ';'
+    : Interface Identifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
     ;
 
 interfaceMethod

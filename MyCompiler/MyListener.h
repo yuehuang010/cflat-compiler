@@ -228,7 +228,13 @@ public:
 
     void ParseInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
     {
-        std::string name = ctx->Identifier()->getText();
+        auto identifiers = ctx->Identifier();
+        std::string name = identifiers[0]->getText();
+
+        std::vector<std::string> parentNames;
+        for (size_t i = 1; i < identifiers.size(); i++)
+            parentNames.push_back(identifiers[i]->getText());
+
         std::vector<MyCompilerLLVM::InterfaceMethod> methods;
 
         for (auto method : ctx->interfaceMethod())
@@ -247,7 +253,7 @@ public:
             methods.push_back(std::move(m));
         }
 
-        compilerLLVM->CreateInterfaceDefinition(name, methods);
+        compilerLLVM->CreateInterfaceDefinition(name, parentNames, methods);
     }
 
     void ParseUsingDeclaration(CParser::UsingDeclarationContext* ctx)
@@ -375,8 +381,15 @@ public:
                 else
                 {
                     auto express = jump->expression();
-                    auto right = ParseExpression(express);
-                    compilerLLVM->CreateReturnCall(right);
+                    if (express != nullptr)
+                    {
+                        auto right = ParseExpression(express);
+                        compilerLLVM->CreateReturnCall(right);
+                    }
+                    else
+                    {
+                        compilerLLVM->CreateReturnCall(nullptr);
+                    }
                 }
                 return;
             }
@@ -1199,7 +1212,18 @@ public:
     {
         if (namedVar.TypeAndValue.Pointer)
         {
-            return namedVar.GetValue();
+            if (namedVar.Primary != nullptr)
+                return namedVar.Primary;
+            if (namedVar.Storage != nullptr)
+            {
+                // Local variables and globals store the pointer value inside an alloca/global.
+                // Function arguments have the pointer value as the argument itself — return directly.
+                if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
+                    llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+                    return compilerLLVM->CreateLoad(namedVar.Storage);
+                return namedVar.Storage;
+            }
+            return nullptr;
         }
         else
         {

@@ -495,9 +495,23 @@ public:
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
     }
 
-    void CreateInterfaceDefinition(const std::string& name, std::vector<InterfaceMethod> methods)
+    void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)
     {
-        interfaceTable[name] = std::move(methods);
+        // Prepend inherited methods from parent interfaces (in order)
+        std::vector<InterfaceMethod> inherited;
+        for (const auto& parentName : parentNames)
+        {
+            auto it = interfaceTable.find(parentName);
+            if (it == interfaceTable.end())
+            {
+                std::cout << std::format("Unknown parent interface: '{}'\n", parentName);
+                continue;
+            }
+            for (const auto& m : it->second)
+                inherited.push_back(m);
+        }
+        inherited.insert(inherited.end(), methods.begin(), methods.end());
+        interfaceTable[name] = std::move(inherited);
     }
 
     void RegisterDestructor(const std::string& structName, llvm::Function* fn)

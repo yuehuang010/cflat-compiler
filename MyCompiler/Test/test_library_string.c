@@ -27,7 +27,7 @@ bool TestStr(const char* testName, const char* actual, const char* expected)
 
 bool testLength()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("hello");
     bool result = true;
     result &= Test("length_hello",  s.Length(), 5);
@@ -40,7 +40,7 @@ bool testLength()
 
 bool testData()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("world");
     bool result = true;
     result &= TestStr("data_world", s.Data(), "world");
@@ -49,7 +49,7 @@ bool testData()
 
 bool testCharAt()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("hello");
     bool result = true;
     result &= Test("charAt_0", s.CharAt(0), 'h');
@@ -60,7 +60,7 @@ bool testCharAt()
 
 bool testEquals()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("hello");
     bool result = true;
     result &= Test("equals_match",    s.Equals("hello"),  true);
@@ -72,7 +72,7 @@ bool testEquals()
 
 bool testStartsWith()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("hello world");
     bool result = true;
     result &= Test("startsWith_match",    s.StartsWith("hello"),       true);
@@ -85,7 +85,7 @@ bool testStartsWith()
 
 bool testEndsWith()
 {
-    String s = String();
+    StringView s = StringView();
     s.Init("hello world");
     bool result = true;
     result &= Test("endsWith_match",    s.EndsWith("world"),        true);
@@ -93,6 +93,66 @@ bool testEndsWith()
     result &= Test("endsWith_mismatch", s.EndsWith("hello"),        false);
     result &= Test("endsWith_longer",   s.EndsWith("!hello world"), false);
     result &= Test("endsWith_empty",    s.EndsWith(""),              true);
+    return result;
+}
+
+bool testStringSet()
+{
+    String s = String();
+    bool result = true;
+    s.Set("hello");
+    result &= Test("string_set_length", s.Length(), 5);
+    result &= TestStr("string_set_data", s.Data(), "hello");
+    s.Set("hi");
+    result &= Test("string_set_overwrite_length", s.Length(), 2);
+    result &= TestStr("string_set_overwrite_data", s.Data(), "hi");
+    s.Set("");
+    result &= Test("string_set_empty_length", s.Length(), 0);
+    s.Free();
+    return result;
+}
+
+bool testStringAppend()
+{
+    String s = String();
+    bool result = true;
+    s.Set("hello");
+    s.Append(" world");
+    result &= Test("string_append_length", s.Length(), 11);
+    result &= TestStr("string_append_data", s.Data(), "hello world");
+    s.Append("!");
+    result &= Test("string_append_again_length", s.Length(), 12);
+    result &= TestStr("string_append_again_data", s.Data(), "hello world!");
+    s.Free();
+    return result;
+}
+
+bool testStringClear()
+{
+    String s = String();
+    bool result = true;
+    s.Set("hello");
+    s.Clear();
+    result &= Test("string_clear_length", s.Length(), 0);
+    s.Set("after_clear");
+    result &= Test("string_after_clear_length", s.Length(), 11);
+    result &= TestStr("string_after_clear_data", s.Data(), "after_clear");
+    s.Free();
+    return result;
+}
+
+bool testStringReadonly()
+{
+    String s = String();
+    bool result = true;
+    s.Set("hello world");
+    result &= Test("string_charAt_0",     s.CharAt(0), 'h');
+    result &= Test("string_charAt_4",     s.CharAt(4), 'o');
+    result &= Test("string_equals_match", s.Equals("hello world"),  true);
+    result &= Test("string_equals_miss",  s.Equals("hello"),        false);
+    result &= Test("string_startsWith",   s.StartsWith("hello"),    true);
+    result &= Test("string_endsWith",     s.EndsWith("world"),      true);
+    s.Free();
     return result;
 }
 
@@ -105,6 +165,10 @@ extern int main()
     result &= testEquals();
     result &= testStartsWith();
     result &= testEndsWith();
+    result &= testStringSet();
+    result &= testStringAppend();
+    result &= testStringClear();
+    result &= testStringReadonly();
 
     if (result)
     {
