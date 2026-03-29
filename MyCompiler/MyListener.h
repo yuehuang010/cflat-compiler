@@ -915,6 +915,33 @@ public:
     llvm::Value* ParseConditionalExpression(CParser::ConditionalExpressionContext* ctx)
     {
         auto logicCtx = ctx->logicalOrExpression();
+
+        if (ctx->QuestionQuestion())
+        {
+            // Null-coalescing: lhs ?? rhs  →  (lhs != null) ? lhs : rhs
+            auto* lhs = ParseLogicalOrExpression(logicCtx);
+            if (!lhs) return nullptr;
+
+            auto* resultAlloca = compilerLLVM->CreateAlloca(lhs->getType());
+
+            auto* nullBlock    = compilerLLVM->CreateBasicBlock("nullcoal_null");
+            auto* notNullBlock = compilerLLVM->CreateBasicBlock("nullcoal_notnull");
+            auto* resumeBlock  = compilerLLVM->CreateBasicBlock("nullcoal_resume");
+
+            compilerLLVM->CreateConditionJump(lhs, notNullBlock, nullBlock);
+            // insert point is now notNullBlock (lhs is not null)
+            compilerLLVM->CreateAssignment(lhs, resultAlloca);
+            compilerLLVM->CreateJump(resumeBlock);
+
+            compilerLLVM->SwitchToBlock(nullBlock);
+            auto* rhs = ParseConditionalExpression(ctx->conditionalExpression());
+            compilerLLVM->CreateAssignment(rhs, resultAlloca);
+            compilerLLVM->CreateJump(resumeBlock);
+
+            compilerLLVM->SwitchToBlock(resumeBlock);
+            return compilerLLVM->CreateLoad(resultAlloca);
+        }
+
         auto expressionFalse = ctx->expression();
         auto expressionTrue = ctx->conditionalExpression();
 
@@ -1399,6 +1426,24 @@ public:
                 namedVar.Primary = compilerLLVM->CreateNot(newValue);
                 namedVar.Storage = nullptr;
             }
+            else if (opText == "-")
+            {
+                auto newValue = this->LoadNamedVariable(namedVar);
+                namedVar.Primary = compilerLLVM->CreateNeg(newValue);
+                namedVar.Storage = nullptr;
+            }
+            else if (opText == "+")
+            {
+                // unary + is a no-op: just load the value
+                namedVar.Primary = this->LoadNamedVariable(namedVar);
+                namedVar.Storage = nullptr;
+            }
+            else if (opText == "~")
+            {
+                auto newValue = this->LoadNamedVariable(namedVar);
+                namedVar.Primary = compilerLLVM->CreateNot(newValue);
+                namedVar.Storage = nullptr;
+            }
             else
             {
                 LogErrorContext(ctx, std::format("{} operator is not yet implemented.", opText));
@@ -1437,6 +1482,7 @@ public:
             std::string namespaceContext;
 
             int functionArgCounter = 0;
+            bool nullConditionalPending = false;
 
             for (auto parseTree : ctx->children)
             {
@@ -1449,9 +1495,10 @@ public:
                     case CParser::LeftBracket:
                     case CParser::RightBracket:
                     case CParser::LeftParen:
-                    case CParser::RightParen:
+                    case CParser::RightParen: { prevToken = tokenType; break; }
                     case CParser::Dot:
-                    case CParser::Arrow: { prevToken = tokenType; break; }
+                    case CParser::Arrow: { prevToken = tokenType; nullConditionalPending = false; break; }
+                    case CParser::QuestionDot: { prevToken = tokenType; nullConditionalPending = true; break; }
                     case CParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
                     case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
                     case CParser::Identifier:
@@ -1490,19 +1537,53 @@ public:
                             if (fieldIndex < dataStructure.StructFields.size())
                             {
                                 const auto& fieldType = dataStructure.StructFields[fieldIndex];
-                                if (structVar.Storage)
+                                if (nullConditionalPending && structVar.Storage != nullptr)
                                 {
-                                    namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                    namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
-                                    namedVar.BaseType = namedVar.Primary->getType();
-                                }
-                                else if (structVar.Primary)
-                                {
+                                    // Null-conditional field access: emit a null check branch
+                                    auto* fieldLLVMType  = compilerLLVM->GetType(fieldType);
+                                    auto* resultAlloca   = compilerLLVM->CreateAlloca(fieldLLVMType);
+
+                                    auto* nullBlock   = compilerLLVM->CreateBasicBlock("nc_null");
+                                    auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
+                                    auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
+
+                                    compilerLLVM->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
+                                    // insert point is now accessBlock
+
+                                    auto* fieldGEP = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                    auto* fieldVal = compilerLLVM->CreateLoad(fieldGEP);
+                                    compilerLLVM->CreateAssignment(fieldVal, resultAlloca);
+                                    compilerLLVM->CreateJump(resumeBlock);
+
+                                    compilerLLVM->SwitchToBlock(nullBlock);
+                                    compilerLLVM->CreateAssignment(llvm::Constant::getNullValue(fieldLLVMType), resultAlloca);
+                                    compilerLLVM->CreateJump(resumeBlock);
+
+                                    compilerLLVM->SwitchToBlock(resumeBlock);
+                                    auto* result = compilerLLVM->CreateLoad(resultAlloca);
+
                                     namedVar.Storage = nullptr;
-                                    namedVar.Primary = compilerLLVM->CreateExtractValue(structVar.Primary, fieldIndex);
-                                    namedVar.BaseType = namedVar.Primary->getType();
+                                    namedVar.Primary = result;
+                                    namedVar.BaseType = result->getType();
+                                    namedVar.TypeAndValue = fieldType;
+                                    nullConditionalPending = false;
                                 }
-                                namedVar.TypeAndValue = fieldType;
+                                else
+                                {
+                                    if (structVar.Storage)
+                                    {
+                                        namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                        namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+                                        namedVar.BaseType = namedVar.Primary->getType();
+                                    }
+                                    else if (structVar.Primary)
+                                    {
+                                        namedVar.Storage = nullptr;
+                                        namedVar.Primary = compilerLLVM->CreateExtractValue(structVar.Primary, fieldIndex);
+                                        namedVar.BaseType = namedVar.Primary->getType();
+                                    }
+                                    namedVar.TypeAndValue = fieldType;
+                                }
                             }
                             else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
                             {
@@ -1734,11 +1815,57 @@ public:
                                 }
                             }
 
-                            namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
-                            namedVar.Storage = nullptr;
-                            namedVar.BaseType = namedVar.Primary->getType();
+                            if (nullConditionalPending && structVar.Storage != nullptr)
+                            {
+                                // Null-conditional method call: gate the call on a null check
+                                auto* retType    = compilerLLVM->GetFunctionReturnType(functionName);
+                                bool  hasResult  = retType && !retType->isVoidTy();
+                                auto* resultAlloca = hasResult ? compilerLLVM->CreateAlloca(retType) : nullptr;
 
-                            if (namedVar.BaseType->isStructTy())
+                                auto* nullBlock   = compilerLLVM->CreateBasicBlock("nc_null");
+                                auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
+                                auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
+
+                                compilerLLVM->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
+                                // insert point is now accessBlock
+
+                                namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+
+                                if (hasResult && namedVar.Primary)
+                                {
+                                    compilerLLVM->CreateAssignment(namedVar.Primary, resultAlloca);
+                                    compilerLLVM->CreateJump(resumeBlock);
+
+                                    compilerLLVM->SwitchToBlock(nullBlock);
+                                    compilerLLVM->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
+                                    compilerLLVM->CreateJump(resumeBlock);
+
+                                    compilerLLVM->SwitchToBlock(resumeBlock);
+                                    auto* result = compilerLLVM->CreateLoad(resultAlloca);
+                                    namedVar.Primary  = result;
+                                    namedVar.BaseType = result->getType();
+                                }
+                                else
+                                {
+                                    compilerLLVM->CreateJump(resumeBlock);
+                                    compilerLLVM->SwitchToBlock(nullBlock);
+                                    compilerLLVM->CreateJump(resumeBlock);
+                                    compilerLLVM->SwitchToBlock(resumeBlock);
+                                    namedVar = {};
+                                }
+
+                                nullConditionalPending = false;
+                            }
+                            else
+                            {
+                                namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = namedVar.Primary->getType();
+                            }
+
+                            if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                                 structVar = namedVar;
                         }
 

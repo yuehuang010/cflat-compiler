@@ -95,7 +95,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
             textDocumentSync: TextDocumentSyncKind.Incremental,
             completionProvider: {
                 resolveProvider: true,
-                triggerCharacters: ['.', '>', ':', '#', '<']
+                triggerCharacters: ['.', '>', ':', '#', '<', '?']
             },
             hoverProvider: true,
             definitionProvider: true
@@ -758,8 +758,8 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
 
     const textBefore = document.getText().slice(0, document.offsetAt(params.position));
 
-    // Detect member access: <identifier> . <partial>  or  <identifier> -> <partial>
-    const memberMatch = /(\w+)\s*(?:->|\.)\w*$/.exec(textBefore);
+    // Detect member access: obj.member  or  obj->member  or  obj?.member (null-conditional)
+    const memberMatch = /(\w+)\s*(?:->|\??\.)\w*$/.exec(textBefore);
     if (memberMatch) {
         const varName = memberMatch[1];
         const symbols = getSymbolsForDocument(document);
@@ -832,6 +832,10 @@ const KEYWORD_DOCS: Record<string, string> = {
     'typedef':  '**typedef** *(storage class)*\n\nCreate a type alias. `typedef int MyInt;`',
     'const':    '**const** *(qualifier)*\n\nMark a variable or pointer as read-only.',
     'inline':   '**inline** *(storage class)*\n\nHint to inline function calls at the call site.',
+
+    // Null-safe operators
+    '?.': '**?.** *(null-conditional operator)*\n\nAccess a member or call a method only if the object is non-null. Returns zero/null if the object is null.\n\n```c\nint v = node?.value;       // field access\nint r = node?.Read();      // method call\n```',
+    '??': '**??** *(null-coalescing operator)*\n\nReturn the left-hand side if it is non-zero/non-null, otherwise evaluate and return the right-hand side.\n\n```c\nint v = node?.value ?? -1;    // -1 if node is null\nconst char* s = name ?? \"unknown\";\n```',
 
     // MyC extensions
     'namespace': '**namespace** *(MyC extension)*\n\nGroup declarations under a named scope.\n\n```c\nnamespace Math {\n    float pi = 3.14159f;\n    float sqrt(float x) { ... }\n}\n```',

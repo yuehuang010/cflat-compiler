@@ -260,6 +260,11 @@
           "match": "->|\\."
         },
         {
+          "comment": "Null-conditional ?. and null-coalescing ?? must be matched before bare ?",
+          "name": "keyword.operator.null-safe.myc",
+          "match": "\\?\\.|\\?\\?"
+        },
+        {
           "name": "keyword.operator.ternary.myc",
           "match": "\\?|:"
         },

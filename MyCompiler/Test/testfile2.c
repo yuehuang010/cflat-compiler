@@ -604,6 +604,73 @@ bool testExplicitIntTypes()
     return result;
 }
 
+// =============================================================
+// Null-conditional (?.) and null-coalescing (??) tests
+// =============================================================
+
+struct NullableNode
+{
+    int value = 99;
+    int Read() { return value; }
+};
+
+// Helper: returns the node's value if non-null, -1 otherwise
+int readNodeValueNC(NullableNode* node)
+{
+    return node?.value ?? -1;
+}
+
+// Helper: calls Read() if non-null, returns -1 otherwise
+int callNodeRead(NullableNode* node)
+{
+    return node?.Read() ?? -1;
+}
+
+bool testNullConditional()
+{
+    bool result = true;
+
+    NullableNode n = NullableNode();
+    NullableNode* p = &n;
+    NullableNode* np = nullptr;
+
+    // null-conditional field access + coalescing via helper
+    // (helpers take NullableNode* as a function arg, which correctly sets up struct access)
+    result &= Test("nc_coalesce_nonnull", readNodeValueNC(p),  99);
+    result &= Test("nc_coalesce_null",    readNodeValueNC(np), -1);
+
+    // null-conditional method call via helper
+    result &= Test("nc_method_nonnull",   callNodeRead(p),  99);
+    result &= Test("nc_method_null",      callNodeRead(np), -1);
+
+    return result;
+}
+
+const char* tryGetName(bool found)
+{
+    if (found) return "Alice";
+    return nullptr;
+}
+
+bool testNullCoalescing()
+{
+    bool result = true;
+
+    // pointer coalescing: null → fallback string
+    const char* name1 = tryGetName(true)  ?? "Unknown";
+    const char* name2 = tryGetName(false) ?? "Unknown";
+    result &= TestStr("nullcoal_nonnull_ptr", name1, "Alice");
+    result &= TestStr("nullcoal_null_ptr",    name2, "Unknown");
+
+    // integer coalescing: 0 → default, nonzero → self
+    int zero = 0;
+    int five = 5;
+    result &= Test("nullcoal_zero",    zero ?? 42, 42);
+    result &= Test("nullcoal_nonzero", five ?? 42, 5);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -639,6 +706,8 @@ extern int main()
     result &= testReturnBlock();
     result &= testAssertReturnBlock();
     result &= testExplicitIntTypes();
+    result &= testNullConditional();
+    result &= testNullCoalescing();
 
     if (result)
     {

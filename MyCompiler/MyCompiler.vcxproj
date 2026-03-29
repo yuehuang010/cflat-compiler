@@ -163,14 +163,6 @@
       <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Generating Antlr4 %(identity)</Message>
     </CustomBuild>
     <None Include="antlr4.bat" />
-    <None Include="testfile.c">
-      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
-      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
-    </None>
-    <None Include="testfile2.c">
-      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
-      <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</DeploymentContent>
-    </None>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ArgParser.h" />

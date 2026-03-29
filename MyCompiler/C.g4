@@ -55,7 +55,7 @@ postfixExpression
     : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') (
         '[' expression ']'
         | '(' argumentExpressionList ')'
-        | ('.' | '->') Identifier
+        | ('.' | '->' | QuestionDot) Identifier
         | '++'
         | '--'
     )*
@@ -134,6 +134,7 @@ logicalOrExpression
 
 conditionalExpression
     : logicalOrExpression ('?' expression ':' conditionalExpression)?
+    | logicalOrExpression QuestionQuestion conditionalExpression
     ;
 
 assignmentExpression
@@ -805,6 +806,14 @@ Not
 
 Tilde
     : '~'
+    ;
+
+QuestionDot
+    : '?.'
+    ;
+
+QuestionQuestion
+    : '??'
     ;
 
 Question

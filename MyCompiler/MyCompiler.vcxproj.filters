@@ -29,8 +29,6 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="testfile.c" />
-    <None Include="testfile2.c" />
     <None Include="antlr4.bat">
       <Filter>Source Files</Filter>
     </None>

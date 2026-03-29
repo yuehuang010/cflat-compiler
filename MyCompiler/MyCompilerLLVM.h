@@ -1223,6 +1223,13 @@ public:
         return builder->CreateNot(value);
     }
 
+    llvm::Value* CreateNeg(llvm::Value* value)
+    {
+        if (value->getType()->isFloatingPointTy())
+            return builder->CreateFNeg(value);
+        return builder->CreateNeg(value);
+    }
+
     llvm::BasicBlock* CreateBasicBlock(std::string name, llvm::Function* fn = nullptr)
     {
         if (fn == nullptr)
@@ -1236,11 +1243,32 @@ public:
         builder->SetInsertPoint(block);
     }
 
+    llvm::BranchInst* CreateJump(llvm::BasicBlock* block)
+    {
+        if (block && builder->GetInsertBlock()->getTerminator() == nullptr)
+            return builder->CreateBr(block);
+        return nullptr;
+    }
+
+    /// Returns the LLVM return type for the first overload of a function, or nullptr if not found.
+    llvm::Type* GetFunctionReturnType(const std::string& functionName) const
+    {
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end() || it->second.empty())
+            return nullptr;
+        return GetType(it->second.front().ReturnType);
+    }
+
     llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
     {
         if (cond->getType()->isPointerTy())
         {
             cond = builder->CreateIsNotNull(cond);
+        }
+        else if (!cond->getType()->isIntegerTy(1))
+        {
+            // Convert non-boolean integer to i1 (nonzero = true)
+            cond = builder->CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0), "tobool");
         }
 
         auto branchInst = builder->CreateCondBr(cond, trueBlock, falseBlock);
