@@ -203,7 +203,7 @@ public:
     class StackState
     {
     public:
-        std::unordered_map<std::string, NamedVariable> functionArgument;
+        std::map<std::string, NamedVariable> functionArgument;
         std::unordered_map<std::string, NamedVariable> namedVariable;
         std::unordered_map<std::string, std::string> namespaceAliases;
         llvm::BasicBlock* continueBlock = nullptr; // continue;
@@ -264,6 +264,8 @@ private:
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
+    std::unordered_set<std::string> importedFiles;
+    std::string importSearchDir;
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
@@ -450,6 +452,7 @@ private:
         else if (operationText == "^=") { return Operation::XorAssignment; }
         else if (operationText == "|=") { return Operation::OrAssignment; }
 
+        std::cout << std::format("Error: unknown operation '{}'\n", operationText);
         __debugbreak();
         return Operation::None;
     }
@@ -715,6 +718,13 @@ public:
                 return builder->CreateFPExt(value, destType);
             }
         }
+        else if (srcType->isIntegerTy() && destType->isPointerTy())
+        {
+            // Integer 0 assigned to a pointer field — produce a proper null/ptr constant.
+            if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
+                return llvm::ConstantExpr::getIntToPtr(constInt, destType);
+            return builder->CreateIntToPtr(value, destType);
+        }
 
         return value;
     }
@@ -789,6 +799,7 @@ public:
 
         if (type == nullptr)
         {
+            std::cout << std::format("Error: GetTypeFromStorage could not resolve type for value '{}'\n", value->getName().str());
             __debugbreak();
         }
 
@@ -943,7 +954,8 @@ public:
         }
         else
         {
-            __debugbreak;
+            std::cout << std::format("Error: CreateConstant encountered unsupported variant type (index {})\n", constantVariant.index());
+            __debugbreak();
         }
 
         return value;
@@ -1187,6 +1199,7 @@ public:
             }
         }
 
+        std::cout << std::format("Error: unhandled operation {} in CreateOperation\n", static_cast<int>(op));
         __debugbreak();
         return right;
     }
@@ -1551,6 +1564,7 @@ public:
                 else
                 {
                     // named but none matched.
+                    std::cout << std::format("Error: named argument '{}' does not match any parameter\n", input.TypeAndValue.VariableName);
                     __debugbreak();
                 }
             }
@@ -1780,7 +1794,7 @@ public:
     /// <summary>
     /// Get the member variable from a member function.
     /// </summary>
-    llvm::Value* GetMemberVariable(std::string name)
+    NamedVariable GetMemberVariable(std::string name)
     {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -1799,16 +1813,21 @@ public:
                     {
                         if (structField.VariableName == name)
                         {
-                            return CreateStructGEP(findResult->second.StructType, memberStructInstance, count);
+                            NamedVariable namedVar;
+                            namedVar.Storage = CreateStructGEP(findResult->second.StructType, memberStructInstance, count);
+                            namedVar.Primary = CreateLoad(namedVar.Storage);
+                            namedVar.BaseType = namedVar.Primary->getType();
+                            namedVar.TypeAndValue = structField;
+                            return namedVar;
                         }
                         count++;
                     }
                 }
-                return nullptr;
+                return {};
             }
         }
 
-        return nullptr;
+        return {};
     }
 
     /// Returns the implicit 'this' NamedVariable when calling a bare member function
@@ -2103,4 +2122,5 @@ public:
     }
 
     bool Compile(const ArgParser& args);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);
 };

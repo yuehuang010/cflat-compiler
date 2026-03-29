@@ -3,7 +3,8 @@ setlocal
 
 set COMPILER=x64\Debug\MyCompiler.exe
 set LLI=vcpkg_installed\x64-windows\x64-windows\tools\llvm\lli.exe
-set SRC=MyCompiler
+set SRC=MyCompiler\Test
+set LIB=MyCompiler\Test\library
 set OUT=out
 
 set ERRORS=0
@@ -12,6 +13,8 @@ if not exist "%OUT%" mkdir "%OUT%"
 
 call :RunTest testfile
 call :RunTest testfile2
+call :RunTest testfile3 -i %LIB%
+call :RunTest test_library_string -i %LIB%
 
 echo.
 if %ERRORS% EQU 0 (
@@ -24,9 +27,10 @@ exit /b 0
 
 :RunTest
 set NAME=%~1
+set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.c -o %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
     set /a ERRORS+=1

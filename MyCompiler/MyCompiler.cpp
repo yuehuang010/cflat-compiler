@@ -13,6 +13,7 @@ int main(int argc, char* argv[])
     args.addOption("output", 'o', "Output IR file path", ".\\out.ll");
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
+    args.addOption("import-dir", 'i', "Directory to search for imported modules");
 
     if (!args.parse(argc, argv))
         return 1;

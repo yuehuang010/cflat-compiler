@@ -16,9 +16,11 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
 {
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
+    importedFiles.insert(std::filesystem::weakly_canonical(filename).string());
     auto outputPath = args.getOption("output").value_or(".\\out.ll");
     auto bitcodePath = args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
+    importSearchDir = args.getOption("import-dir").value_or("");
 
     auto outputDir = std::filesystem::path(outputPath).parent_path();
     if (!outputDir.empty() && !std::filesystem::exists(outputDir))
@@ -55,6 +57,18 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
 
         auto computeUnit = parser.compilationUnit();
 
+        // Process all top-level imports before scanning the main file so that
+        // imported symbols are available to ForwardRefScanner.
+        if (auto* tu = computeUnit->translationUnit()) {
+            for (auto* decl : tu->externalDeclaration()) {
+                if (auto* imp = decl->importDeclaration()) {
+                    std::string raw = imp->StringLiteral()->getText();
+                    std::string importFilename = raw.substr(1, raw.size() - 2);
+                    CompileImportedFile(filename, importFilename);
+                }
+            }
+        }
+
         // Pre-scan: register all function signatures and struct type shells so
         // that forward references resolve during the main code-gen walk.
         {
@@ -90,14 +104,75 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     }
 
 
-    if (!VerifyModule())
+    if (!SaveToFile(outputPath))
         return false;
 
-    if (!SaveToFile(outputPath))
+    if (!VerifyModule())
         return false;
 
     if (!bitcodePath.empty() && !WriteBitcode(bitcodePath))
         return false;
 
+    return true;
+}
+
+bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename)
+{
+    auto importingDir = std::filesystem::path(importingFilePath).parent_path();
+    auto importPath = (importingDir / importFilename).lexically_normal();
+
+    std::error_code ec;
+    auto canonical = std::filesystem::canonical(importPath, ec);
+    if (ec && !importSearchDir.empty())
+    {
+        auto searchPath = (std::filesystem::path(importSearchDir) / importFilename).lexically_normal();
+        canonical = std::filesystem::canonical(searchPath, ec);
+    }
+    if (ec)
+    {
+        std::cerr << "Error: imported file not found: " << importFilename << "\n";
+        return false;
+    }
+    auto canonicalStr = canonical.string();
+    if (importedFiles.count(canonicalStr))
+        return true; // already imported or cycle
+    importedFiles.insert(canonicalStr);
+
+    std::ifstream stream;
+    stream.open(canonicalStr);
+    antlr4::ANTLRInputStream input(stream);
+    CLexer lexer(&input);
+    antlr4::CommonTokenStream tokens(&lexer);
+    CParser parser(&tokens);
+    tokens.fill();
+    auto computeUnit = parser.compilationUnit();
+
+    // Recursively process nested imports before scanning this file's declarations
+    if (auto* tu = computeUnit->translationUnit())
+    {
+        for (auto* decl : tu->externalDeclaration())
+        {
+            if (auto* imp = decl->importDeclaration())
+            {
+                std::string raw = imp->StringLiteral()->getText();
+                std::string nested = raw.substr(1, raw.size() - 2);
+                if (!CompileImportedFile(canonicalStr, nested))
+                    return false;
+            }
+        }
+    }
+
+    // Forward-ref scan the imported file
+    {
+        ForwardRefScanner scanner(this);
+        if (auto* tu = computeUnit->translationUnit())
+            for (auto* decl : tu->externalDeclaration())
+                scanner.ScanExternalDeclaration(decl);
+    }
+
+    // Code-gen walk the imported file
+    auto myListener = std::make_unique<MyListener>(&parser, this);
+    antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
+    stream.close();
     return true;
 }

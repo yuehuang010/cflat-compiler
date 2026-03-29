@@ -1,0 +1,57 @@
+import "testmodule.c";
+
+extern void printf(const char* argv, ...);
+
+int Test(const char* testName, int actual, int expected)
+{
+    if (expected == actual)
+    {
+        printf("%s passed.\n", testName);
+        return 1;
+    }
+    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    return 0;
+}
+
+bool testImportedFunctions()
+{
+    bool result = true;
+    result &= Test("moduleAdd",      moduleAdd(3, 4),      7);
+    result &= Test("moduleMultiply", moduleMultiply(3, 4), 12);
+    return result;
+}
+
+bool testImportedStruct()
+{
+    bool result = true;
+    ModulePoint p = ModulePoint();
+    p.x = 10;
+    p.y = 20;
+    result &= Test("ModulePoint.Sum",    p.Sum(),     30);
+    result &= Test("ModulePoint.Scale2", p.Scale(2),  60);
+    return result;
+}
+
+bool testImportedNamespace()
+{
+    bool result = true;
+    result &= Test("ModuleMath.square", ModuleMath.square(4), 16);
+    result &= Test("ModuleMath.cube",   ModuleMath.cube(3),   27);
+    return result;
+}
+
+extern int main()
+{
+    bool result = true;
+    result &= testImportedFunctions();
+    result &= testImportedStruct();
+    result &= testImportedNamespace();
+
+    if (result)
+    {
+        printf("All Test Passed.\n");
+        return 0;
+    }
+
+    return 1;
+}

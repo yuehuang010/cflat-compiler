@@ -177,20 +177,6 @@ private:
     bool global_scope = true; // true when parsing an entity in the global scope.
     constexpr static bool debugPrint = false;
 
-    bool isFunctionOrNamespace(antlr4::ParserRuleContext* ctx)
-    {
-        if (ctx->getRuleIndex() == CParser::RuleFunctionDefinition)
-            return true;
-        return false;
-    }
-
-    bool isStructClassUnion(antlr4::ParserRuleContext* ctx)
-    {
-        if (ctx->getRuleIndex() == CParser::RuleStructClassUnionDefinition)
-            return true;
-        return false;
-    }
-
     std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
     {
         std::string name;
@@ -198,11 +184,6 @@ private:
         name = directDecl->getText();
 
         return name;
-    }
-
-    std::string getDeclaratorName(CParser::DirectDeclaratorContext* directDecl)
-    {
-        return directDecl->getText();
     }
 
     MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
@@ -236,48 +217,6 @@ private:
         auto declSpecs = ctx->declarationSpecifiers();
 
         return ParseDeclarationSpecifiers(declSpecs);
-    }
-
-    std::string getStructClassUnionName(CParser::StructClassUnionDefinitionContext* ctx)
-    {
-        std::string name;
-        auto directDecl1 = ctx->directDeclarator();
-        auto directDecl2 = ctx->directDeclarator();
-
-        if (directDecl2 != nullptr)
-            name = directDecl2->getText();
-        else
-            name = directDecl1->getText();
-
-        return name;
-    }
-
-    std::string getScopeName(antlr4::ParserRuleContext* ctx)
-    {
-        std::string name;
-
-        while (ctx)
-        {
-            if (isFunctionOrNamespace(ctx))
-            {
-                auto funcName = getFunctionName((CParser::FunctionDefinitionContext*)ctx);
-                name += "::";
-                name += funcName;
-            }
-            else if (isStructClassUnion(ctx))
-            {
-                auto funcName = getStructClassUnionName((CParser::StructClassUnionDefinitionContext*)ctx);
-                name += "::";
-                name += funcName;
-            }
-
-            if (ctx->parent != nullptr)
-                ctx = (antlr4::ParserRuleContext*)ctx->parent;
-            else
-                break;
-        }
-
-        return name;
     }
 
 public:
@@ -1624,8 +1563,24 @@ public:
                             LogErrorContext(expressCtx, "Expecting be an integer type.");
                         }
 
-                        namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
-                        namedVar.BaseType = namedVar.Storage->getType();
+                        if (namedVar.TypeAndValue.Pointer)
+                        {
+                            // Indexing through a pointer (e.g. char* p; p[i]).
+                            // Use the loaded pointer as the GEP base and the
+                            // element type (TypeName without the pointer flag) as element type.
+                            auto elementTypeAndValue = namedVar.TypeAndValue;
+                            elementTypeAndValue.Pointer = false;
+                            auto elementType = compilerLLVM->GetType(elementTypeAndValue);
+                            auto ptrValue = LoadNamedVariable(namedVar);
+                            namedVar.Storage = compilerLLVM->CreateGEP(elementType, ptrValue, rvalue);
+                            namedVar.BaseType = elementType;
+                            namedVar.TypeAndValue.Pointer = false;
+                        }
+                        else
+                        {
+                            namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
+                            namedVar.BaseType = namedVar.Storage->getType();
+                        }
                         namedVar.Primary = nullptr;
 
                         if (namedVar.BaseType && namedVar.BaseType->isStructTy())
@@ -1867,6 +1822,14 @@ public:
             {
                 return compilerLLVM->CreateConstant("nullptr", constantText);
             }
+            else if (constantText.front() == '\'' ||
+                     (constantText.size() > 1 &&
+                      (constantText[0] == 'L' || constantText[0] == 'u' || constantText[0] == 'U') &&
+                      constantText[1] == '\''))
+            {
+                char c = ParseCharLiteral(constantText);
+                return compilerLLVM->CreateConstant(MyCompilerLLVM::ConstantVariant(c));
+            }
             else
             {
                 std::string constantRaw = constant->getText();
@@ -1924,11 +1887,10 @@ public:
             return funcArgument;
         }
 
-        if (auto memberVar = compilerLLVM->GetMemberVariable(name))
+        auto memberVar = compilerLLVM->GetMemberVariable(name);
+        if (memberVar.Storage != nullptr)
         {
-            namedVar.Storage = memberVar;
-            namedVar.BaseType = memberVar->getType();
-            return namedVar;
+            return memberVar;
         }
 
         // try getting global variable
@@ -1953,42 +1915,82 @@ public:
         return {};
     }
 
-    std::string ProcessRawText(std::string rawText)
+    // Consumes one escape sequence starting just after the leading '\'.
+    // Advances itr past the consumed character(s) and returns the decoded char.
+    char ProcessEscapeChar(std::string::const_iterator& itr, const std::string::const_iterator& end)
     {
-        std::string output;
-        bool escape = false;
-        auto itr = rawText.begin();
+        if (itr == end)
+            return '\\';
 
-        if (*itr == '"')
+        char esc = *itr++;
+        if (esc == 'x' || esc == 'X')
         {
-            // skip the first quote
-            itr++;
+            std::string hex;
+            while (itr != end && *itr != '\'' && *itr != '"')
+                hex += *itr++;
+            return static_cast<char>(std::stoi(hex, nullptr, 16));
+        }
+        switch (esc)
+        {
+            case 'n':  return '\n';
+            case 't':  return '\t';
+            case 'r':  return '\r';
+            case '\\': return '\\';
+            case '\'': return '\'';
+            case '"':  return '"';
+            case '0':  return '\0';
+            case 'a':  return '\a';
+            case 'b':  return '\b';
+            case 'f':  return '\f';
+            case 'v':  return '\v';
+            default:   return esc;
+        }
+    }
+
+    char ParseCharLiteral(const std::string& text)
+    {
+        auto itr = text.cbegin();
+
+        // Skip encoding prefix (L, u, U)
+        if (*itr == 'L' || *itr == 'u' || *itr == 'U')
+            ++itr;
+
+        ++itr; // skip opening '
+
+        if (*itr == '\\')
+        {
+            ++itr;
+            return ProcessEscapeChar(itr, text.cend());
         }
 
-        while (itr != rawText.end())
-        {
-            char c = *itr;
-            if (escape)
-            {
-                if (c == 'n')
-                    output += '\n';
+        return *itr;
+    }
 
-                escape = false;
-            }
-            else if (c == '\\')
+    std::string ProcessRawText(const std::string& rawText)
+    {
+        std::string output;
+        auto itr = rawText.cbegin();
+
+        // Skip encoding prefix (u8, u, U, L)
+        if (*itr == 'u' && *(itr + 1) == '8')
+            itr += 2;
+        else if (*itr == 'u' || *itr == 'U' || *itr == 'L')
+            ++itr;
+
+        ++itr; // skip opening "
+
+        while (itr != rawText.cend() && *itr != '"')
+        {
+            if (*itr == '\\')
             {
-                escape = true;
+                ++itr;
+                output += ProcessEscapeChar(itr, rawText.cend());
             }
             else
             {
-                output += c;
+                output += *itr++;
             }
-
-            itr++;
         }
-
-        // Remove the last quote
-        output.pop_back();
 
         return output;
     }

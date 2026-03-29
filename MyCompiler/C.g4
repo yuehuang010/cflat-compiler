@@ -463,11 +463,16 @@ externalDeclaration
     | interfaceDefinition
     | namespaceDefinition
     | usingDeclaration
+    | importDeclaration
     | ';' // stray ;
     ;
 
 usingDeclaration
     : Using Identifier '=' Identifier ('.' Identifier)* ';'
+    ;
+
+importDeclaration
+    : Import StringLiteral ';'
     ;
 
 namespaceDefinition
@@ -624,6 +629,10 @@ Namespace
 
 Using
     : 'using'
+    ;
+
+Import
+    : 'import'
     ;
 
 Switch
