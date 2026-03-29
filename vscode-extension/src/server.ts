@@ -645,6 +645,10 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         }
     };
 
+    // Pending auto-typed variables: resolved after the full symbol pass so that
+    // forward-declared functions/types can be found as the RHS source.
+    const pendingAutos: Array<{ name: string; rhsIdent: string; lineIdx: number; defChar: number }> = [];
+
     // trimEnd() removes trailing spaces left by removeComments (comment text
     // is replaced with spaces, which would break $ anchors in varLineRe).
     const lines = clean.split('\n');
@@ -669,7 +673,8 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
                     kind: 'function',
                     markdown: `\`\`\`c\n${retType} ${shortName}(${params})\n\`\`\``,
                     defLine: lineIdx,
-                    defChar
+                    defChar,
+                    typeName: retType.replace(/\*+$/, '').trim()
                 };
                 // Register under the short name (for callsite lookup) and qualified name
                 if (!symbols.has(shortName)) symbols.set(shortName, info);
@@ -687,7 +692,15 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
             const ptrStars = sep.trim();           // just the '*' characters
             const fullType = ptrStars ? `${baseType}${ptrStars}` : baseType;
 
-            if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
+            if (baseType === 'auto') {
+                // Defer resolution: capture the first identifier on the RHS so we can
+                // resolve the concrete type after all symbols have been collected.
+                const rhsMatch = /=\s*([A-Za-z_]\w*)/.exec(rawLine);
+                if (rhsMatch && !KEYWORD_DOCS[name]) {
+                    const typeEnd = vm[1].length + vm[2].length + vm[3].length;
+                    pendingAutos.push({ name, rhsIdent: rhsMatch[1], lineIdx, defChar: vm[0].indexOf(name, typeEnd) });
+                }
+            } else if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
                 const typeEnd = vm[1].length + vm[2].length + vm[3].length;
                 addVarSymbol(name, fullType, lineIdx, vm[0].indexOf(name, typeEnd));
             }
@@ -708,6 +721,28 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
                 addVarSymbol(name, fullType, lineIdx, nameIdx);
             }
         }
+    }
+
+    // --- Resolve deferred auto-typed variables ---
+    // Now that all symbols are known (including forward-declared functions/types),
+    // look up each auto variable's RHS identifier to find the concrete type.
+    for (const { name, rhsIdent, lineIdx, defChar } of pendingAutos) {
+        if (symbols.has(name) || KEYWORD_DOCS[name]) continue;
+        const rhsInfo = symbols.get(rhsIdent);
+        let resolvedType: string | undefined;
+        if (rhsInfo?.kind === 'type') {
+            resolvedType = rhsIdent;
+        } else if (rhsInfo?.kind === 'variable' || rhsInfo?.kind === 'function') {
+            resolvedType = rhsInfo.typeName;
+        }
+        const displayType = resolvedType ?? 'auto';
+        symbols.set(name, {
+            kind: 'variable',
+            markdown: `\`\`\`c\n${displayType} ${name}\n\`\`\``,
+            defLine: lineIdx,
+            defChar: Math.max(0, defChar),
+            typeName: resolvedType
+        });
     }
 
     return symbols;
