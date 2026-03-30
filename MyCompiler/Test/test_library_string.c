@@ -156,6 +156,33 @@ bool testStringReadonly()
     return result;
 }
 
+int GetLengthViaInterface(IReadonlyString s)
+{
+    return s.Length();
+}
+
+bool TestStrViaInterface(IReadonlyString s, const char* expected)
+{
+    return strcmp(s.Data(), expected) == 0;
+}
+
+bool testInterfaceArg()
+{
+    String s = String();
+    bool result = true;
+    s.Set("hello");
+    result &= Test("iface_length",      GetLengthViaInterface(s), 5);
+    result &= Test("iface_data",        TestStrViaInterface(s, "hello"), true);
+    result &= Test("iface_startsWith",  s.StartsWith("hell"), true);
+
+    StringView sv = StringView();
+    sv.Init("world");
+    result &= Test("iface_sv_length",   GetLengthViaInterface(sv), 5);
+    result &= Test("iface_sv_data",     TestStrViaInterface(sv, "world"), true);
+    s.Free();
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -169,6 +196,7 @@ extern int main()
     result &= testStringAppend();
     result &= testStringClear();
     result &= testStringReadonly();
+    result &= testInterfaceArg();
 
     if (result)
     {

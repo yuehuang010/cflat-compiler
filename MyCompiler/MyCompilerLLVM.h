@@ -54,6 +54,7 @@ public:
         std::string TypeName;
         std::string VariableName;
         bool Pointer = false;
+        bool IsInterface = false;
 
         bool IsTypeMatch(const TypeAndValue& other) const
         {
@@ -198,6 +199,8 @@ public:
         llvm::StructType* StructType;
         std::vector<DeclTypeAndValue> StructFields;
         llvm::Function* Destructor = nullptr;
+        std::vector<std::string> Interfaces;
+        std::unordered_map<std::string, llvm::GlobalVariable*> VTables;
     };
 
     class StackState
@@ -262,6 +265,7 @@ private:
     std::unordered_map<std::string, StructData> dataStructures;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
+    std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
     std::unordered_set<std::string> importedFiles;
@@ -512,11 +516,197 @@ public:
         }
         inherited.insert(inherited.end(), methods.begin(), methods.end());
         interfaceTable[name] = std::move(inherited);
+        interfaceParents[name] = parentNames;
+    }
+
+    bool IsInterfaceType(const std::string& name) const
+    {
+        return interfaceTable.count(name) > 0;
+    }
+
+    llvm::StructType* GetFatPtrType() const
+    {
+        const char* fatPtrName = "__iface_fat_ptr";
+        if (auto* existing = llvm::StructType::getTypeByName(*context, fatPtrName))
+            return existing;
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        return llvm::StructType::create(*context, { ptrTy, ptrTy }, fatPtrName);
+    }
+
+    bool InterfaceInheritsFrom(const std::string& child, const std::string& parent) const
+    {
+        auto it = interfaceParents.find(child);
+        if (it == interfaceParents.end()) return false;
+        for (const auto& p : it->second)
+        {
+            if (p == parent) return true;
+            if (InterfaceInheritsFrom(p, parent)) return true;
+        }
+        return false;
+    }
+
+    bool StructImplementsInterface(const std::string& structName, const std::string& ifaceName) const
+    {
+        auto structIt = dataStructures.find(structName);
+        if (structIt == dataStructures.end()) return false;
+        for (const auto& iface : structIt->second.Interfaces)
+        {
+            if (iface == ifaceName) return true;
+            if (InterfaceInheritsFrom(iface, ifaceName)) return true;
+        }
+        return false;
+    }
+
+    llvm::GlobalVariable* GetOrCreateVTable(const std::string& structName, const std::string& ifaceName)
+    {
+        auto& sd = dataStructures[structName];
+        auto it = sd.VTables.find(ifaceName);
+        if (it != sd.VTables.end()) return it->second;
+
+        auto ifaceIt = interfaceTable.find(ifaceName);
+        if (ifaceIt == interfaceTable.end())
+        {
+            std::cout << std::format("GetOrCreateVTable: unknown interface '{}'\n", ifaceName);
+            return nullptr;
+        }
+
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        std::vector<llvm::Constant*> entries;
+        for (const auto& method : ifaceIt->second)
+        {
+            llvm::Function* fn = nullptr;
+            auto funcIt = functionTable.find(method.Name);
+            if (funcIt != functionTable.end())
+            {
+                for (const auto& sym : funcIt->second)
+                {
+                    if (sym.Parameters.size() > 0 &&
+                        sym.Parameters[0].TypeName == structName &&
+                        sym.Parameters[0].Pointer)
+                    {
+                        fn = sym.Function;
+                        break;
+                    }
+                }
+            }
+            if (fn == nullptr)
+            {
+                std::cout << std::format("GetOrCreateVTable: '{}' does not implement '{}::{}'\n", structName, ifaceName, method.Name);
+                entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
+            }
+            else
+            {
+                entries.push_back(llvm::ConstantExpr::getBitCast(fn, ptrTy));
+            }
+        }
+
+        auto arrTy = llvm::ArrayType::get(ptrTy, entries.size());
+        auto vtableConst = llvm::ConstantArray::get(arrTy, entries);
+        auto vtableGlobal = new llvm::GlobalVariable(
+            *module,
+            arrTy,
+            true,
+            llvm::GlobalValue::InternalLinkage,
+            vtableConst,
+            structName + "_" + ifaceName + "_vtable"
+        );
+
+        sd.VTables[ifaceName] = vtableGlobal;
+        return vtableGlobal;
+    }
+
+    llvm::Value* BuildInterfaceFatPtr(llvm::GlobalVariable* vtable, llvm::Value* dataPtr)
+    {
+        auto fatTy = GetFatPtrType();
+        auto alloca = builder->CreateAlloca(fatTy);
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+
+        auto vtableField = builder->CreateStructGEP(fatTy, alloca, 0);
+        auto vtableAsPtr = builder->CreateBitCast(vtable, ptrTy);
+        builder->CreateStore(vtableAsPtr, vtableField);
+
+        auto dataField = builder->CreateStructGEP(fatTy, alloca, 1);
+        auto dataCast = builder->CreateBitCast(dataPtr, ptrTy);
+        builder->CreateStore(dataCast, dataField);
+
+        return alloca;
+    }
+
+    llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
+        const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs)
+    {
+        auto fatTy = GetFatPtrType();
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+
+        auto vtablePtrField = builder->CreateStructGEP(fatTy, ifacePtr, 0);
+        auto vtablePtr = builder->CreateLoad(ptrTy, vtablePtrField);
+
+        auto dataPtrField = builder->CreateStructGEP(fatTy, ifacePtr, 1);
+        auto dataPtr = builder->CreateLoad(ptrTy, dataPtrField);
+
+        auto ifaceIt = interfaceTable.find(ifaceName);
+        if (ifaceIt == interfaceTable.end())
+        {
+            std::cout << std::format("CallInterfaceMethod: unknown interface '{}'\n", ifaceName);
+            __debugbreak();
+            return nullptr;
+        }
+
+        int methodIdx = -1;
+        const InterfaceMethod* methodInfo = nullptr;
+        for (int i = 0; i < (int)ifaceIt->second.size(); i++)
+        {
+            if (ifaceIt->second[i].Name == methodName)
+            {
+                methodIdx = i;
+                methodInfo = &ifaceIt->second[i];
+                break;
+            }
+        }
+        if (methodIdx < 0)
+        {
+            std::cout << std::format("CallInterfaceMethod: interface '{}' has no method '{}'\n", ifaceName, methodName);
+            __debugbreak();
+            return nullptr;
+        }
+
+        auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx));
+        auto fnPtr = builder->CreateLoad(ptrTy, fnPtrField);
+
+        llvm::Type* retTy = GetType(methodInfo->ReturnType);
+        std::vector<llvm::Type*> paramTypes = { ptrTy };
+        for (const auto& p : methodInfo->Parameters)
+            paramTypes.push_back(GetType(p));
+        auto fnTy = llvm::FunctionType::get(retTy, paramTypes, false);
+
+        std::vector<llvm::Value*> callArgs = { dataPtr };
+        for (size_t i = 0; i < extraArgNVs.size() && i < methodInfo->Parameters.size(); i++)
+        {
+            const auto& nv = extraArgNVs[i];
+            const auto& param = methodInfo->Parameters[i];
+            if (param.Pointer)
+            {
+                callArgs.push_back(nv.GetValue());
+            }
+            else
+            {
+                auto val = nv.Primary != nullptr ? nv.Primary : CreateLoad(nv.Storage);
+                val = Upconvert(val, GetType(param));
+                callArgs.push_back(val);
+            }
+        }
+
+        return builder->CreateCall(fnTy, fnPtr, callArgs);
     }
 
     void RegisterDestructor(const std::string& structName, llvm::Function* fn)
     {
         dataStructures[structName].Destructor = fn;
+    }
+
+    void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
+    {
+        dataStructures[structName].Interfaces = interfaces;
     }
 
     void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
@@ -1464,15 +1654,25 @@ public:
         else if (typeName == "auto" && autoType != nullptr) { type = autoType; }
         else
         {
-            auto result = dataStructures.find(typeName);
-            if (result != dataStructures.end())
+            // Check if it is an interface type first
+            if (interfaceTable.count(typeName) > 0)
             {
-                type = result->second.StructType;
+                // Interface type: represented as a fat pointer {i8*, i8*}
+                // Return the fat ptr struct type (pointer applied below if needed)
+                type = GetFatPtrType();
             }
             else
             {
-                std::cout << std::format("Unknown value: {}\n", typeName);
-                type = builder->getVoidTy();
+                auto result = dataStructures.find(typeName);
+                if (result != dataStructures.end())
+                {
+                    type = result->second.StructType;
+                }
+                else
+                {
+                    std::cout << std::format("Unknown value: {}\n", typeName);
+                    type = builder->getVoidTy();
+                }
             }
         }
 
@@ -1536,12 +1736,31 @@ public:
                             if (myFP != -1 && otherFP != -1)
                                 result = (myFP == otherFP) ? 0 : 1;
                         }
+
+                        // Interface upcast: struct arg can be passed to interface* param
+                        if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer &&
+                            !arg.TypeAndValue.IsInterface && !arg.TypeAndValue.Pointer &&
+                            StructImplementsInterface(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
+                        {
+                            result = 0;
+                        }
                     }
                 }
                 else
                 {
                     auto candidateParam = GetType(*candidateParamItr);
                     result = CompareUpconvert(arg.BaseType, candidateParam);
+
+                    // Interface upcast: struct value (TypeName empty, BaseType is struct) to interface* param
+                    if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer && arg.BaseType)
+                    {
+                        if (auto* st = llvm::dyn_cast<llvm::StructType>(arg.BaseType))
+                        {
+                            auto structName = st->getName().str();
+                            if (!structName.empty() && StructImplementsInterface(structName, candidateParamItr->TypeName))
+                                result = 0;
+                        }
+                    }
                 }
 
                 if (result != 0)
@@ -1778,7 +1997,30 @@ public:
         auto candParamItr = candidate.Parameters.begin();
         for (const auto& arg : matched)
         {
-            if (candParamItr->Pointer)
+            if (candParamItr->IsInterface && candParamItr->Pointer && !arg.TypeAndValue.IsInterface)
+            {
+                // Derive struct name from TypeName if available, else from BaseType
+                std::string structName = arg.TypeAndValue.TypeName;
+                if (structName.empty() && arg.BaseType)
+                {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(arg.BaseType))
+                        structName = st->getName().str();
+                }
+
+                // Build fat pointer: vtable + data ptr
+                auto vtable = GetOrCreateVTable(structName, candParamItr->TypeName);
+                llvm::Value* dataPtr = arg.Storage;
+                if (dataPtr == nullptr)
+                {
+                    // Materialize a pointer to the struct value
+                    auto structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
+                    auto tempAlloca = builder->CreateAlloca(structTy);
+                    builder->CreateStore(arg.Primary, tempAlloca);
+                    dataPtr = tempAlloca;
+                }
+                argList.push_back(BuildInterfaceFatPtr(vtable, dataPtr));
+            }
+            else if (candParamItr->Pointer)
             {
                 argList.push_back(arg.GetValue());
             }

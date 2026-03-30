@@ -47,6 +47,8 @@ private:
                 declType.TypeName = typeSpec->getText();
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
+                declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
+                if (declType.IsInterface) declType.Pointer = true;
                 break;
             }
             else if (storageSpec)
@@ -116,6 +118,30 @@ private:
         }
     }
 
+    void ScanInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
+    {
+        auto identifiers = ctx->Identifier();
+        std::string name = identifiers[0]->getText();
+
+        std::vector<std::string> parentNames;
+        for (size_t i = 1; i < identifiers.size(); i++)
+            parentNames.push_back(identifiers[i]->getText());
+
+        std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+        for (auto method : ctx->interfaceMethod())
+        {
+            MyCompilerLLVM::InterfaceMethod m;
+            m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            m.Name = method->directDeclarator()->getText();
+            auto declParams = ParseParameterTypeList(method->parameterTypeList());
+            for (const auto& p : declParams)
+                m.Parameters.push_back(p);
+            methods.push_back(std::move(m));
+        }
+
+        compilerLLVM->CreateInterfaceDefinition(name, parentNames, methods);
+    }
+
     void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx)
     {
         std::string structName = ctx->directDeclarator()->getText();
@@ -154,6 +180,8 @@ public:
             ScanFunctionDefinition(func, {}, namespaceName);
         else if (auto dataStruct = ctx->structClassUnionDefinition())
             ScanStructDefinition(dataStruct);
+        else if (auto iface = ctx->interfaceDefinition())
+            ScanInterfaceDefinition(iface);
     }
 
     void ScanNamespace(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
@@ -201,6 +229,8 @@ private:
                 declType.TypeName = typeSpec->getText();
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
+                declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
+                if (declType.IsInterface) declType.Pointer = true;
                 break;
             }
             else if (storageSpec)
@@ -1478,6 +1508,7 @@ public:
             size_t prevToken = 0;
             MyCompilerLLVM::NamedVariable namedVar;
             MyCompilerLLVM::NamedVariable structVar;
+            MyCompilerLLVM::NamedVariable interfaceVar;
             std::string primaryIdentifier;
             std::string namespaceContext;
 
@@ -1518,6 +1549,12 @@ public:
                                 namespaceContext.clear();
                                 namedVar = {};
                             }
+                        }
+                        else if (interfaceVar.TypeAndValue.IsInterface)
+                        {
+                            // Method name on interface variable — just record it; dispatch at call site
+                            primaryIdentifier = terminal->getText();
+                            namedVar = {};
                         }
                         else if (structVar.BaseType)
                         {
@@ -1600,16 +1637,16 @@ public:
                             namedVar = ParseIdentifier(terminal);
                         }
 
-                        if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                        if (namedVar.TypeAndValue.IsInterface)
+                        {
+                            interfaceVar = namedVar;
+                            structVar = {};
+                        }
+                        else if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                         {
                             structVar = namedVar;
+                            interfaceVar = {};
                         }
-                        //if (!namedVar.Storage)
-                        //{
-                        //	// TODO: verify use case when to clear.
-                        //	structVar.BaseType = nullptr;
-                        //	structVar.Primary = nullptr;
-                        //}
 
                         break;
                     }
@@ -1645,13 +1682,20 @@ public:
                             }
                         }
 
-                        if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                        if (namedVar.TypeAndValue.IsInterface)
+                        {
+                            interfaceVar = namedVar;
+                            structVar = {};
+                        }
+                        else if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                         {
                             structVar = namedVar;
+                            interfaceVar = {};
                         }
                         else if (!namedVar.Storage)
                         {
                             structVar = {};
+                            interfaceVar = {};
                         }
 
                         break;
@@ -1776,6 +1820,35 @@ public:
                             // The block's 'return' already terminated the caller's basic block.
                             // Return an empty namedVar — callers must tolerate null after a terminator.
                             namedVar = {};
+                        }
+                        else if (interfaceVar.TypeAndValue.IsInterface)
+                        {
+                            // Interface method dispatch via vtable
+                            std::vector<MyCompilerLLVM::NamedVariable> extraArgs;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                for (const auto& namedArgument : namedArgCtx)
+                                {
+                                    auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                    if (!argValue) break;
+                                    MyCompilerLLVM::NamedVariable argVar;
+                                    argVar.Primary = argValue;
+                                    argVar.BaseType = argValue->getType();
+                                    extraArgs.emplace_back(argVar);
+                                }
+                            }
+
+                            namedVar.Primary = compilerLLVM->CallInterfaceMethod(
+                                interfaceVar.Storage,
+                                interfaceVar.TypeAndValue.TypeName,
+                                primaryIdentifier,
+                                extraArgs
+                            );
+                            namedVar.Storage = nullptr;
+                            namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                            interfaceVar = {};
+                            structVar = {};
                         }
                         else
                         {
@@ -2268,12 +2341,13 @@ public:
             global_scope = true;
         }
 
-        // Verify interface implementations
+        // Record interfaces and verify implementations
+        std::vector<std::string> ifaceNames;
         for (auto interfaceIdentifier : ctx->Identifier())
-        {
-            std::string interfaceName = interfaceIdentifier->getText();
+            ifaceNames.push_back(interfaceIdentifier->getText());
+        compilerLLVM->RegisterStructInterfaces(structName, ifaceNames);
+        for (const auto& interfaceName : ifaceNames)
             compilerLLVM->VerifyInterfaceImplementation(structName, interfaceName);
-        }
     }
 
     void ParseDestructorDefinition(CParser::DestructorDefinitionContext* ctx, const std::string& structName)
