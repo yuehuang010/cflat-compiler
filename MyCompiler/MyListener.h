@@ -206,6 +206,21 @@ private:
     bool global_scope = true; // true when parsing an entity in the global scope.
     constexpr static bool debugPrint = false;
 
+    struct SwitchCaseEntry
+    {
+        llvm::ConstantInt* value;
+        llvm::BasicBlock* block;
+    };
+
+    struct SwitchContext
+    {
+        std::unordered_map<CParser::LabeledStatementContext*, SwitchCaseEntry> caseMap;
+        llvm::BasicBlock* defaultBlock = nullptr;
+        llvm::BasicBlock* resumeBlock = nullptr;
+    };
+
+    std::vector<SwitchContext> switchStack;
+
     std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
     {
         std::string name;
@@ -388,6 +403,29 @@ public:
         }
     }
 
+    // Recursively collects case/default labels from a statement (to handle `case 1: case 2: stmt` nesting).
+    void CollectCasesFromStatement(CParser::StatementContext* stmt, SwitchContext& ctx)
+    {
+        if (!stmt) return;
+        auto labeled = stmt->labeledStatement();
+        if (!labeled) return;
+
+        if (labeled->Case())
+        {
+            auto val = llvm::dyn_cast<llvm::ConstantInt>(
+                ParseConditionalExpression(labeled->constantExpression()->conditionalExpression()));
+            if (!val)
+                LogErrorContext(labeled, "case value must be a constant integer expression");
+            ctx.caseMap[labeled] = { val, compilerLLVM->CreateBasicBlock("switchCase") };
+            CollectCasesFromStatement(labeled->statement(), ctx);
+        }
+        else if (labeled->Default())
+        {
+            ctx.defaultBlock = compilerLLVM->CreateBasicBlock("switchDefault");
+            CollectCasesFromStatement(labeled->statement(), ctx);
+        }
+    }
+
     void ParseStatement(CParser::StatementContext* statement)
     {
         compilerLLVM->SetCurrentDebugLocation(statement->getStart()->getLine());
@@ -397,6 +435,33 @@ public:
         auto iterationStatement = statement->iterationStatement();
         auto selectionStatement = statement->selectionStatement();
         auto compoundStatement = statement->compoundStatement();
+        auto labeledStatement = statement->labeledStatement();
+
+        if (labeledStatement != nullptr && !switchStack.empty())
+        {
+            auto& ctx = switchStack.back();
+            llvm::BasicBlock* targetBlock = nullptr;
+
+            if (labeledStatement->Case())
+            {
+                auto it = ctx.caseMap.find(labeledStatement);
+                if (it != ctx.caseMap.end())
+                    targetBlock = it->second.block;
+            }
+            else if (labeledStatement->Default())
+            {
+                targetBlock = ctx.defaultBlock;
+            }
+
+            if (targetBlock)
+            {
+                compilerLLVM->CreateJump(targetBlock);    // fallthrough if no terminator yet
+                compilerLLVM->SwitchToBlock(targetBlock);
+            }
+
+            ParseStatement(labeledStatement->statement());
+            return;
+        }
 
         if (jump != nullptr)
         {
@@ -617,6 +682,48 @@ public:
                 compilerLLVM->InitializeBlock(blockResume, false);
                 return;
             }
+            else if (selectionStatement->Switch())
+            {
+                auto expression = selectionStatement->expression();
+                auto body = selectionStatement->statement(0)->compoundStatement();
+
+                SwitchContext switchCtx;
+                switchCtx.resumeBlock = compilerLLVM->CreateBasicBlock("switchResume");
+
+                // Pre-scan: collect all case/default labels and create their blocks
+                if (body && body->blockItemList())
+                {
+                    for (auto blockItem : body->blockItemList()->blockItem())
+                    {
+                        auto stmt = blockItem->statement();
+                        if (stmt) CollectCasesFromStatement(stmt, switchCtx);
+                    }
+                }
+
+                auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
+
+                // Emit switch instruction
+                auto condVal = ParseExpression(expression);
+                auto switchInst = compilerLLVM->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
+                for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    switchInst->addCase(compilerLLVM->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+
+                // Push scope: break → resumeBlock, no continue (propagates to outer loop)
+                compilerLLVM->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
+
+                switchStack.push_back(switchCtx);
+
+                if (body && body->blockItemList())
+                    ParseBlockItemList(body->blockItemList());
+
+                // Fallthrough at end of switch body → resume
+                compilerLLVM->CreateBlockBreak(switchCtx.resumeBlock, true);
+
+                switchStack.pop_back();
+
+                compilerLLVM->InitializeBlock(switchCtx.resumeBlock, false);
+                return;
+            }
         }
         else if (compoundStatement)
         {
@@ -697,6 +804,48 @@ public:
         }
     }
 
+    // Returns true if the given statement (or any nested statement) contains a return.
+    bool HasReturnStatement(CParser::StatementContext* stmt)
+    {
+        if (!stmt) return false;
+        if (auto* jump = stmt->jumpStatement())
+            return jump->Return() != nullptr;
+        if (auto* compound = stmt->compoundStatement())
+        {
+            auto* bil = compound->blockItemList();
+            if (!bil) return false;
+            for (auto* item : bil->blockItem())
+                if (HasReturnStatement(item->statement()))
+                    return true;
+            return false;
+        }
+        if (auto* sel = stmt->selectionStatement())
+        {
+            for (auto* s : sel->statement())
+                if (HasReturnStatement(s))
+                    return true;
+            return false;
+        }
+        if (auto* iter = stmt->iterationStatement())
+            return HasReturnStatement(iter->statement());
+        if (auto* labeled = stmt->labeledStatement())
+            return HasReturnStatement(labeled->statement());
+        return false;
+    }
+
+    // Returns true if the function body contains at least one return statement.
+    bool FunctionHasReturn(CParser::FunctionDefinitionContext* func)
+    {
+        auto* cs = func->compoundStatement();
+        if (!cs) return false;
+        auto* bil = cs->blockItemList();
+        if (!bil) return false;
+        for (auto* item : bil->blockItem())
+            if (HasReturnStatement(item->statement()))
+                return true;
+        return false;
+    }
+
     void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {})
     {
         // Create Function Definition
@@ -737,6 +886,9 @@ public:
 
         if (blockItemList)
             ParseBlockItemList(blockItemList);
+
+        if (returnType.TypeName != "void" && !compilerLLVM->IsBlockTerminated())
+            LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
 
         // if return is void, then this might need a implicit return;
         if (returnType.TypeName == "void")

@@ -323,6 +323,57 @@ void testPointers()
 }
 
 
+int switchBasic(int x)
+{
+    switch (x)
+    {
+        case 1: return 10;
+        case 2: return 20;
+        case 3: return 30;
+        default: return 0;
+    }
+    return 0;
+}
+
+int switchBreak(int x)
+{
+    int result = 0;
+    switch (x)
+    {
+        case 1: result = 10; break;
+        case 2: result = 20; break;
+        default: result = 99; break;
+    }
+    return result;
+}
+
+int switchNoDefault(int x)
+{
+    int result = 0;
+    switch (x)
+    {
+        case 5: result = 5; break;
+        case 6: result = 6; break;
+    }
+    return result;
+}
+
+int switchFallthrough(int x)
+{
+    int result = 0;
+    switch (x)
+    {
+        case 1:
+        case 2:
+            result = 12;
+            break;
+        case 3:
+            result = 3;
+            break;
+    }
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -360,6 +411,19 @@ extern int main(int argc, char** argv)
     result &= Test("testLogicalAnd", testLogicalAnd(), true);
     result &= Test("testLogicalOr", testLogicalOr(), true);
     result &= Test("testShortCircuit", testShortCircuit(), true);
+
+    result &= Test("switch_case1",     switchBasic(1), 10);
+    result &= Test("switch_case2",     switchBasic(2), 20);
+    result &= Test("switch_case3",     switchBasic(3), 30);
+    result &= Test("switch_default",   switchBasic(9),  0);
+    result &= Test("switch_break1",    switchBreak(1), 10);
+    result &= Test("switch_break2",    switchBreak(2), 20);
+    result &= Test("switch_break_def", switchBreak(7), 99);
+    result &= Test("switch_nodef_hit", switchNoDefault(5), 5);
+    result &= Test("switch_nodef_miss",switchNoDefault(9), 0);
+    result &= Test("switch_fall1",     switchFallthrough(1), 12);
+    result &= Test("switch_fall2",     switchFallthrough(2), 12);
+    result &= Test("switch_fall3",     switchFallthrough(3),  3);
 
     if (result)
     {

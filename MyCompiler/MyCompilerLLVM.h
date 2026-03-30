@@ -1461,6 +1461,18 @@ public:
         return GetType(it->second.front().ReturnType);
     }
 
+    llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases)
+    {
+        if (!cond->getType()->isIntegerTy())
+            LogError("switch expression must be an integer type");
+        return builder->CreateSwitch(cond, defaultBlock, numCases);
+    }
+
+    llvm::ConstantInt* CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType)
+    {
+        return llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(switchType), val->getSExtValue(), true);
+    }
+
     llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
     {
         if (cond->getType()->isPointerTy())
@@ -2320,6 +2332,11 @@ public:
         }
 
         return nullptr;
+    }
+
+    bool IsBlockTerminated()
+    {
+        return builder->GetInsertBlock()->getTerminator() != nullptr;
     }
 
     void CreateBreakCall()
