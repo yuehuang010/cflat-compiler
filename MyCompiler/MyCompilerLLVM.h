@@ -5,6 +5,7 @@
 #include <variant>
 #include <format>
 #include <unordered_set>
+#include <cstdlib>
 
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\LLVMContext.h>
@@ -255,7 +256,24 @@ public:
         llvm::BasicBlock* ContinuationBlock;
     };
 
+    void SetSourceLocation(int line, int column, std::string text)
+    {
+        currentLine = line;
+        currentColumn = column;
+        currentText = std::move(text);
+    }
+
 private:
+    int currentLine = 0;
+    int currentColumn = 0;
+    std::string currentText;
+
+    void LogError(std::string message) const
+    {
+        std::cout << std::format("[{}:{}] {} : {}\n", currentLine, currentColumn, currentText, message);
+        exit(1);
+    }
+
     std::unique_ptr<llvm::IRBuilder<>> builder;
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::LLVMContext> context;
@@ -456,8 +474,7 @@ private:
         else if (operationText == "^=") { return Operation::XorAssignment; }
         else if (operationText == "|=") { return Operation::OrAssignment; }
 
-        std::cout << std::format("Error: unknown operation '{}'\n", operationText);
-        __debugbreak();
+        LogError(std::format("unknown operation '{}'", operationText));
         return Operation::None;
     }
 
@@ -647,8 +664,7 @@ public:
         auto ifaceIt = interfaceTable.find(ifaceName);
         if (ifaceIt == interfaceTable.end())
         {
-            std::cout << std::format("CallInterfaceMethod: unknown interface '{}'\n", ifaceName);
-            __debugbreak();
+            LogError(std::format("unknown interface '{}'", ifaceName));
             return nullptr;
         }
 
@@ -665,8 +681,7 @@ public:
         }
         if (methodIdx < 0)
         {
-            std::cout << std::format("CallInterfaceMethod: interface '{}' has no method '{}'\n", ifaceName, methodName);
-            __debugbreak();
+            LogError(std::format("interface '{}' has no method '{}'", ifaceName, methodName));
             return nullptr;
         }
 
@@ -1003,8 +1018,7 @@ public:
 
         if (type == nullptr)
         {
-            std::cout << std::format("Error: GetTypeFromStorage could not resolve type for value '{}'\n", value->getName().str());
-            __debugbreak();
+            LogError(std::format("GetTypeFromStorage could not resolve type for value '{}'", value->getName().str()));
         }
 
         return type;
@@ -1158,8 +1172,7 @@ public:
         }
         else
         {
-            std::cout << std::format("Error: CreateConstant encountered unsupported variant type (index {})\n", constantVariant.index());
-            __debugbreak();
+            LogError(std::format("CreateConstant encountered unsupported variant type (index {})", constantVariant.index()));
         }
 
         return value;
@@ -1403,8 +1416,7 @@ public:
             }
         }
 
-        std::cout << std::format("Error: unhandled operation {} in CreateOperation\n", static_cast<int>(op));
-        __debugbreak();
+        LogError(std::format("unhandled operation {}", static_cast<int>(op)));
         return right;
     }
 
@@ -1589,8 +1601,7 @@ public:
         {
             if (!fn->empty())
             {
-                std::cout << std::format("Function already exists: {}\n", functionName);
-                __debugbreak();
+                LogError(std::format("function already exists: '{}'", functionName));
                 return fn;
             }
             // Pre-declared by ForwardRefScanner — reuse the declaration and attach a body.
@@ -1825,8 +1836,7 @@ public:
                 else
                 {
                     // named but none matched.
-                    std::cout << std::format("Error: named argument '{}' does not match any parameter\n", input.TypeAndValue.VariableName);
-                    __debugbreak();
+                    LogError(std::format("named argument '{}' does not match any parameter", input.TypeAndValue.VariableName));
                 }
             }
 
@@ -1901,8 +1911,7 @@ public:
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
-            std::cout << std::format("Error: unknown function '{}'\n", functionName);
-            __debugbreak();
+            LogError(std::format("unknown function '{}'", functionName));
             return nullptr;
         }
 
@@ -1932,7 +1941,7 @@ public:
 
         if (candidate.Function == nullptr)
         {
-            std::cout << std::format("Error: no overload of '{}' matches the given arguments.\n", functionName);
+            std::cout << std::format("[{}:{}] {} : no overload of '{}' matches the given arguments.\n", currentLine, currentColumn, currentText, functionName);
 
             // Print the input arguments
             std::cout << std::format("  Call arguments ({}):\n", arguments.size());
@@ -1988,7 +1997,7 @@ public:
                 }
             }
 
-            __debugbreak();
+            exit(1);
             return nullptr;
         }
 

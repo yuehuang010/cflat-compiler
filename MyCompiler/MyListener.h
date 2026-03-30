@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <format>
 #include <variant>
+#include <cstdlib>
 
 #include "CParser.h"
 #include "CLexer.h"
@@ -2462,7 +2463,7 @@ public:
         int line = symbol->getLine();
         int column = symbol->getCharPositionInLine();
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
-        __debugbreak();
+        exit(1);
     }
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage)
@@ -2470,7 +2471,7 @@ public:
         int line = ctx->getStart()->getLine();
         int column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
-        __debugbreak();
+        exit(1);
     }
 
     void PrintContext(antlr4::ParserRuleContext* ctx, std::string suffix = "")
@@ -2484,5 +2485,9 @@ public:
     {
         if constexpr (debugPrint)
             PrintContext(ctx);
+        compilerLLVM->SetSourceLocation(
+            ctx->getStart()->getLine(),
+            ctx->getStart()->getCharPositionInLine(),
+            ctx->getText());
     }
 };
