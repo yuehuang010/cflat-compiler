@@ -63,11 +63,11 @@ public:
                 return true;
 
             // C-equivalent signed integer types: char=i8, short=i16, int=i32, long=i64
-            int myBits    = IsInteger();
+            int myBits = IsInteger();
             int otherBits = other.IsInteger();
             if (myBits != -1 && myBits == otherBits)
             {
-                bool myUnsigned    = (IsUnsignedInteger() != -1);
+                bool myUnsigned = (IsUnsignedInteger() != -1);
                 bool otherUnsigned = (other.IsUnsignedInteger() != -1);
                 if (myUnsigned == otherUnsigned)
                     return true;
@@ -82,7 +82,7 @@ public:
                 return false;
 
             // Unsigned integer promotion: u8 < u16 < u32 < u64
-            int myUnsigned    = IsUnsignedInteger();
+            int myUnsigned = IsUnsignedInteger();
             int otherUnsigned = other.IsUnsignedInteger();
             if (myUnsigned != -1 && otherUnsigned != -1)
                 return myUnsigned < otherUnsigned;
@@ -110,13 +110,13 @@ public:
 
         int IsInteger() const
         {
-            if (TypeName == "char"  || TypeName == "i8"  || TypeName == "u8")
+            if (TypeName == "char" || TypeName == "i8" || TypeName == "u8")
                 return 8;
             if (TypeName == "short" || TypeName == "i16" || TypeName == "u16")
                 return 16;
-            if (TypeName == "int"   || TypeName == "i32" || TypeName == "u32")
+            if (TypeName == "int" || TypeName == "i32" || TypeName == "u32")
                 return 32;
-            if (TypeName == "long"  || TypeName == "i64" || TypeName == "u64")
+            if (TypeName == "long" || TypeName == "i64" || TypeName == "u64")
                 return 64;
 
             return -1;
@@ -256,21 +256,19 @@ public:
         llvm::BasicBlock* ContinuationBlock;
     };
 
-    void SetSourceLocation(int line, int column, std::string text)
+    void SetSourceLocation(int line, int column)
     {
         currentLine = line;
         currentColumn = column;
-        currentText = std::move(text);
     }
 
 private:
     int currentLine = 0;
     int currentColumn = 0;
-    std::string currentText;
 
     void LogError(std::string message) const
     {
-        std::cout << std::format("[{}:{}] {} : {}\n", currentLine, currentColumn, currentText, message);
+        std::cout << std::format("[{}:{}] : {}\n", currentLine, currentColumn, message);
         exit(1);
     }
 
@@ -383,7 +381,7 @@ private:
             baseType = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
         // Explicit-width signed integer types (C equivalents: int8_t, int16_t, int32_t, int64_t)
         else if (typeValue.TypeName == "i8")
-            baseType = diBuilder->createBasicType("i8",  8,  DW_ATE_signed);
+            baseType = diBuilder->createBasicType("i8", 8, DW_ATE_signed);
         else if (typeValue.TypeName == "i16")
             baseType = diBuilder->createBasicType("i16", 16, DW_ATE_signed);
         else if (typeValue.TypeName == "i32")
@@ -392,7 +390,7 @@ private:
             baseType = diBuilder->createBasicType("i64", 64, DW_ATE_signed);
         // Explicit-width unsigned integer types (C equivalents: uint8_t, uint16_t, uint32_t, uint64_t)
         else if (typeValue.TypeName == "u8")
-            baseType = diBuilder->createBasicType("u8",  8,  DW_ATE_unsigned);
+            baseType = diBuilder->createBasicType("u8", 8, DW_ATE_unsigned);
         else if (typeValue.TypeName == "u16")
             baseType = diBuilder->createBasicType("u16", 16, DW_ATE_unsigned);
         else if (typeValue.TypeName == "u32")
@@ -1677,10 +1675,10 @@ public:
         }
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
-        else if (resolvedTypeName == "char"  || resolvedTypeName == "i8"  || resolvedTypeName == "u8")  { type = builder->getInt8Ty(); }
+        else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
         else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
-        else if (resolvedTypeName == "int"   || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
-        else if (resolvedTypeName == "long"  || resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
+        else if (resolvedTypeName == "int" || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
+        else if (resolvedTypeName == "long" || resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
         else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
         else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
         else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }
@@ -1746,11 +1744,12 @@ public:
                 if (arg.TypeAndValue.TypeName != "")
                 {
                     // Resolve enum types for comparison: if either arg or param is an enum, use its backing type
-                    auto resolveName = [&](const std::string& tn) -> std::string {
-                        if (tn.empty()) return tn;
-                        auto it = enumBackingTypes.find(tn);
-                        return (it != enumBackingTypes.end()) ? it->second : tn;
-                    };
+                    auto resolveName = [&](const std::string& tn) -> std::string
+                        {
+                            if (tn.empty()) return tn;
+                            auto it = enumBackingTypes.find(tn);
+                            return (it != enumBackingTypes.end()) ? it->second : tn;
+                        };
 
                     MyCompilerLLVM::TypeAndValue tmpArg = arg.TypeAndValue;
                     MyCompilerLLVM::TypeAndValue tmpParam = *candidateParamItr;
@@ -1767,16 +1766,16 @@ public:
                         // Same signedness group: int<->i32, long<->i64, char<->i8, etc.
                         // Same width  -> perfect match (result=0): int==i32, long==i64.
                         // Diff width  -> implicit conversion (result=1): i64->int, etc.
-                        int myBits    = tmpArg.IsInteger();
+                        int myBits = tmpArg.IsInteger();
                         int otherBits = tmpParam.IsInteger();
-                        bool myUnsigned    = tmpArg.IsUnsignedInteger() != -1;
+                        bool myUnsigned = tmpArg.IsUnsignedInteger() != -1;
                         bool otherUnsigned = tmpParam.IsUnsignedInteger() != -1;
                         if (myBits != -1 && otherBits != -1 && myUnsigned == otherUnsigned)
                             result = (myBits == otherBits) ? 0 : 1;
 
                         if (result < 0)
                         {
-                            int myFP    = tmpArg.IsFloatingPoint();
+                            int myFP = tmpArg.IsFloatingPoint();
                             int otherFP = tmpParam.IsFloatingPoint();
                             if (myFP != -1 && otherFP != -1)
                                 result = (myFP == otherFP) ? 0 : 1;
@@ -1975,7 +1974,7 @@ public:
 
         if (candidate.Function == nullptr)
         {
-            std::cout << std::format("[{}:{}] {} : no overload of '{}' matches the given arguments.\n", currentLine, currentColumn, currentText, functionName);
+            std::cout << std::format("[{}:{}] : no overload of '{}' matches the given arguments.\n", currentLine, currentColumn, functionName);
 
             // Print the input arguments
             std::cout << std::format("  Call arguments ({}):\n", arguments.size());

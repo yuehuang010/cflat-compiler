@@ -3,6 +3,18 @@ extern void printf(const char* argv, ...);
 
 bool TestVerbose = true;
 
+bool Test(const char* testName, long long actual, long long expected)
+{
+    if (expected == actual)
+    {
+        if (TestVerbose) printf("%s passed.\n", testName);
+        return true;
+    }
+
+    if (TestVerbose) printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    return false;
+}
+
 bool Test(const char* testName, int actual, int expected)
 {
     if (expected == actual)
@@ -374,6 +386,22 @@ int switchFallthrough(int x)
     return result;
 }
 
+bool testNumericLiterals()
+{
+    bool result = true;
+    result &= Test("decimal_literal", 123, 123);
+    result &= Test("hex_literal", 0xFF, 255);
+    result &= Test("octal_literal", 077, 63);
+    result &= Test("unsigned_suffix", 123u, 123);
+    result &= Test("long_suffix", 123L, 123);
+    result &= Test("long_long_suffix", 123LL, 123);
+    result &= Test("negative_literal", -42, -42);
+    result &= Test("float_literal_f", 1.5f, 1.5f);
+    result &= Test("double_literal", 1.5, 1.5);
+    result &= Test("scientific_double", 1e3, 1000.0);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -411,7 +439,7 @@ extern int main(int argc, char** argv)
     result &= Test("testLogicalAnd", testLogicalAnd(), true);
     result &= Test("testLogicalOr", testLogicalOr(), true);
     result &= Test("testShortCircuit", testShortCircuit(), true);
-
+    result &= Test("testNumericLiterals", testNumericLiterals(), true);
     result &= Test("switch_case1",     switchBasic(1), 10);
     result &= Test("switch_case2",     switchBasic(2), 20);
     result &= Test("switch_case3",     switchBasic(3), 30);

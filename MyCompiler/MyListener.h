@@ -204,7 +204,7 @@ private:
     MyCompilerLLVM* compilerLLVM;
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
-    constexpr static bool debugPrint = false; 
+    constexpr static bool debugPrint = false;
 
     struct SwitchCaseEntry
     {
@@ -1126,9 +1126,9 @@ public:
 
             auto* resultAlloca = compilerLLVM->CreateAlloca(lhs->getType());
 
-            auto* nullBlock    = compilerLLVM->CreateBasicBlock("nullcoal_null");
+            auto* nullBlock = compilerLLVM->CreateBasicBlock("nullcoal_null");
             auto* notNullBlock = compilerLLVM->CreateBasicBlock("nullcoal_notnull");
-            auto* resumeBlock  = compilerLLVM->CreateBasicBlock("nullcoal_resume");
+            auto* resumeBlock = compilerLLVM->CreateBasicBlock("nullcoal_resume");
 
             compilerLLVM->CreateConditionJump(lhs, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
@@ -1765,10 +1765,10 @@ public:
                                 if (nullConditionalPending && structVar.Storage != nullptr)
                                 {
                                     // Null-conditional field access: emit a null check branch
-                                    auto* fieldLLVMType  = compilerLLVM->GetType(fieldType);
-                                    auto* resultAlloca   = compilerLLVM->CreateAlloca(fieldLLVMType);
+                                    auto* fieldLLVMType = compilerLLVM->GetType(fieldType);
+                                    auto* resultAlloca = compilerLLVM->CreateAlloca(fieldLLVMType);
 
-                                    auto* nullBlock   = compilerLLVM->CreateBasicBlock("nc_null");
+                                    auto* nullBlock = compilerLLVM->CreateBasicBlock("nc_null");
                                     auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
                                     auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
 
@@ -2079,11 +2079,11 @@ public:
                             if (nullConditionalPending && structVar.Storage != nullptr)
                             {
                                 // Null-conditional method call: gate the call on a null check
-                                auto* retType    = compilerLLVM->GetFunctionReturnType(functionName);
-                                bool  hasResult  = retType && !retType->isVoidTy();
+                                auto* retType = compilerLLVM->GetFunctionReturnType(functionName);
+                                bool  hasResult = retType && !retType->isVoidTy();
                                 auto* resultAlloca = hasResult ? compilerLLVM->CreateAlloca(retType) : nullptr;
 
-                                auto* nullBlock   = compilerLLVM->CreateBasicBlock("nc_null");
+                                auto* nullBlock = compilerLLVM->CreateBasicBlock("nc_null");
                                 auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
                                 auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
 
@@ -2105,7 +2105,7 @@ public:
 
                                     compilerLLVM->SwitchToBlock(resumeBlock);
                                     auto* result = compilerLLVM->CreateLoad(resultAlloca);
-                                    namedVar.Primary  = result;
+                                    namedVar.Primary = result;
                                     namedVar.BaseType = result->getType();
                                 }
                                 else
@@ -2121,6 +2121,7 @@ public:
                             }
                             else
                             {
+                                SetSourceLocation(primaryCtx);
                                 namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary->getType();
@@ -2235,9 +2236,9 @@ public:
                 return compilerLLVM->CreateConstant("nullptr", constantText);
             }
             else if (constantText.front() == '\'' ||
-                     (constantText.size() > 1 &&
-                      (constantText[0] == 'L' || constantText[0] == 'u' || constantText[0] == 'U') &&
-                      constantText[1] == '\''))
+                (constantText.size() > 1 &&
+                    (constantText[0] == 'L' || constantText[0] == 'u' || constantText[0] == 'U') &&
+                    constantText[1] == '\''))
             {
                 char c = ParseCharLiteral(constantText);
                 return compilerLLVM->CreateConstant(MyCompilerLLVM::ConstantVariant(c));
@@ -2344,18 +2345,18 @@ public:
         }
         switch (esc)
         {
-            case 'n':  return '\n';
-            case 't':  return '\t';
-            case 'r':  return '\r';
-            case '\\': return '\\';
-            case '\'': return '\'';
-            case '"':  return '"';
-            case '0':  return '\0';
-            case 'a':  return '\a';
-            case 'b':  return '\b';
-            case 'f':  return '\f';
-            case 'v':  return '\v';
-            default:   return esc;
+        case 'n':  return '\n';
+        case 't':  return '\t';
+        case 'r':  return '\r';
+        case '\\': return '\\';
+        case '\'': return '\'';
+        case '"':  return '"';
+        case '0':  return '\0';
+        case 'a':  return '\a';
+        case 'b':  return '\b';
+        case 'f':  return '\f';
+        case 'v':  return '\v';
+        default:   return esc;
         }
     }
 
@@ -2601,47 +2602,120 @@ public:
 
     MyCompilerLLVM::ConstantVariant ParseNumberConstant(std::string rawNumber)
     {
-        char lastChar = std::tolower(rawNumber.back());
+        // Support suffixes: u/U, l/L, ll/LL, f/F, d/D and floating point forms with '.' or exponent.
+        if (rawNumber.empty())
+            return 0;
 
-        if (lastChar == 'f')
+        // Handle optional leading sign
+        bool negative = false;
+        std::string s = rawNumber;
+        if (s[0] == '+' || s[0] == '-')
         {
-            // Parse as float, excluding the 'f' suffix
-            return std::stof(rawNumber.substr(0, rawNumber.size() - 1));
+            negative = (s[0] == '-');
+            s = s.substr(1);
         }
-        else if (lastChar == 'd' || lastChar == '.' || rawNumber.find('.') != std::string::npos)
-        {
-            // Parse as double, keeping the 'd' if present or removing nothing
-            size_t end = (lastChar == 'd') ? rawNumber.size() - 1 : rawNumber.size();
-            return std::stod(rawNumber.substr(0, end));
-        }
-        else if (lastChar == 'l')
-        {
-            size_t end = rawNumber.size() - 1;
 
-            // capture ll
-            if (rawNumber[end] == 'l' || rawNumber[end] == 'L')
-                end--;
+        // Determine if this is a hex literal (0x...)
+        bool isHex = (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
 
-            return std::stoll(rawNumber.substr(0, end));
+        // Extract numeric part and suffix carefully.
+        size_t suffixPos = s.size();
+        if (isHex)
+        {
+            // For hex, scan forward from the "0x" prefix to include all hex digits
+            size_t idx = 2; // skip 0x
+            while (idx < s.size() && std::isxdigit(static_cast<unsigned char>(s[idx]))) ++idx;
+            suffixPos = idx;
         }
         else
         {
-            auto number = std::stoi(rawNumber);
-            if (number < std::numeric_limits<int16_t>::max())
+            // For non-hex, strip trailing letters that belong to known suffix set (u,l,f,d)
+            while (suffixPos > 0)
             {
-                short value = number;
-                return value;
+                char c = s[suffixPos - 1];
+                char lc = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lc == 'u' || lc == 'l' || lc == 'f' || lc == 'd')
+                    --suffixPos;
+                else
+                    break;
             }
-            else if (number < std::numeric_limits<int8_t>::max())
-            {
-                char value = number;
-                return value;
-            }
-
-            return number;
         }
 
-        return 0;
+        std::string numberPart = s.substr(0, suffixPos);
+        std::string suffix = s.substr(suffixPos);
+        for (auto& c : suffix) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        bool hasU = suffix.find('u') != std::string::npos;
+        int lCount = 0;
+        for (char c : suffix) if (c == 'l') ++lCount;
+        bool hasF = suffix.find('f') != std::string::npos;
+        bool hasD = suffix.find('d') != std::string::npos;
+
+        bool looksFloat = (numberPart.find('.') != std::string::npos) ||
+            (numberPart.find('e') != std::string::npos) ||
+            (numberPart.find('E') != std::string::npos);
+
+        // Floating point handling
+        if (hasF || hasD || looksFloat)
+        {
+            try
+            {
+                if (hasF)
+                    return std::stof(numberPart);
+                else
+                    return std::stod(numberPart);
+            }
+            catch (...) { return 0.0; }
+        }
+
+        // Integer handling. Support hex/octal/decimal by using base 0.
+        unsigned long long uval = 0;
+        try
+        {
+            if (numberPart.empty())
+                uval = 0;
+            else
+                uval = std::stoull(numberPart, nullptr, 0);
+        }
+        catch (...) { uval = 0; }
+
+        // If a long/long long suffix is present, prefer 64-bit result.
+        if (lCount >= 1)
+        {
+            if (negative)
+            {
+                long long sval = -static_cast<long long>(uval);
+                return static_cast<int64_t>(sval);
+            }
+            else
+            {
+                return static_cast<int64_t>(uval);
+            }
+        }
+
+        // No explicit long suffix: pick smallest reasonable signed type unless 'u' forces unsigned semantics
+        if (negative)
+        {
+            long long sval = -static_cast<long long>(uval);
+            if (sval >= std::numeric_limits<int>::min() && sval <= std::numeric_limits<int>::max())
+                return static_cast<int>(sval);
+            return static_cast<int64_t>(sval);
+        }
+
+        if (hasU)
+        {
+            if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
+                return static_cast<int>(uval);
+            return static_cast<int64_t>(uval);
+        }
+
+        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int8_t>::max()))
+            return static_cast<char>(uval);
+        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int16_t>::max()))
+            return static_cast<short>(uval);
+        if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
+            return static_cast<int>(uval);
+        return static_cast<int64_t>(uval);
     }
 
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage)
@@ -2668,13 +2742,22 @@ public:
         std::cout << std::format("[{}:{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
     }
 
+    void SetSourceLocation(antlr4::ParserRuleContext* ctx)
+    {
+        compilerLLVM->SetSourceLocation(
+            ctx->getStart()->getLine(),
+            ctx->getStart()->getCharPositionInLine());
+    }
+
     void enterEveryRule(antlr4::ParserRuleContext* ctx) override
     {
         if constexpr (debugPrint)
+        {
             PrintContext(ctx);
-        compilerLLVM->SetSourceLocation(
-            ctx->getStart()->getLine(),
-            ctx->getStart()->getCharPositionInLine(),
-            ctx->getText());
+        }
+        else
+        {
+            SetSourceLocation(ctx);
+        }
     }
 };

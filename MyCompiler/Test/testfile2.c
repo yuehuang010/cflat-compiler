@@ -37,6 +37,15 @@ bool TestBool(const char* testName, bool actual)
     return false;
 }
 
+bool testBuiltinIdentifiers()
+{
+    bool result = true;
+    result &= TestStr("__FILE__", __FILE__, "testfile2.c");
+    result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
+    result &= Test("__LINE__", __LINE__, 45); // Remember to adjust if shifted.
+    return result;
+}
+
 int testArray()
 {
     int arraySize = 30;
@@ -264,14 +273,6 @@ struct NamedThing
     int value = 42;
 };
 
-bool testBuiltinIdentifiers()
-{
-    bool result = true;
-    result &= TestStr("__FILE__", __FILE__, "testfile2.c");
-    result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 272); // Remember to adjust if shifted.
-    return result;
-}
 
 struct TypedThing
 {
