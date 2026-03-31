@@ -804,48 +804,6 @@ public:
         }
     }
 
-    // Returns true if the given statement (or any nested statement) contains a return.
-    bool HasReturnStatement(CParser::StatementContext* stmt)
-    {
-        if (!stmt) return false;
-        if (auto* jump = stmt->jumpStatement())
-            return jump->Return() != nullptr;
-        if (auto* compound = stmt->compoundStatement())
-        {
-            auto* bil = compound->blockItemList();
-            if (!bil) return false;
-            for (auto* item : bil->blockItem())
-                if (HasReturnStatement(item->statement()))
-                    return true;
-            return false;
-        }
-        if (auto* sel = stmt->selectionStatement())
-        {
-            for (auto* s : sel->statement())
-                if (HasReturnStatement(s))
-                    return true;
-            return false;
-        }
-        if (auto* iter = stmt->iterationStatement())
-            return HasReturnStatement(iter->statement());
-        if (auto* labeled = stmt->labeledStatement())
-            return HasReturnStatement(labeled->statement());
-        return false;
-    }
-
-    // Returns true if the function body contains at least one return statement.
-    bool FunctionHasReturn(CParser::FunctionDefinitionContext* func)
-    {
-        auto* cs = func->compoundStatement();
-        if (!cs) return false;
-        auto* bil = cs->blockItemList();
-        if (!bil) return false;
-        for (auto* item : bil->blockItem())
-            if (HasReturnStatement(item->statement()))
-                return true;
-        return false;
-    }
-
     void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {})
     {
         // Create Function Definition
