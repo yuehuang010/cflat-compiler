@@ -151,7 +151,7 @@
       <FileType>Document</FileType>
       <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\antlr4.bat -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\antlr4.exe -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\antlr4.bat -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
