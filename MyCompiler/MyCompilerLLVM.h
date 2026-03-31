@@ -281,6 +281,7 @@ private:
     std::vector<StackState> stackNamedVariable;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, StructData> dataStructures;
+    std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
@@ -1666,15 +1667,24 @@ public:
         llvm::Type* type = nullptr;
         const auto& typeName = typeAndValue.TypeName;
 
-        if (typeName == "void") { type = builder->getVoidTy(); }
-        else if (typeName == "char"  || typeName == "i8"  || typeName == "u8")  { type = builder->getInt8Ty(); }
-        else if (typeName == "short" || typeName == "i16" || typeName == "u16") { type = builder->getInt16Ty(); }
-        else if (typeName == "int"   || typeName == "i32" || typeName == "u32") { type = builder->getInt32Ty(); }
-        else if (typeName == "long"  || typeName == "i64" || typeName == "u64") { type = builder->getInt64Ty(); }
-        else if (typeName == "float") { type = builder->getFloatTy(); }
-        else if (typeName == "double") { type = builder->getDoubleTy(); }
-        else if (typeName == "bool") { type = builder->getInt1Ty(); }
-        else if (typeName == "auto" && autoType != nullptr) { type = autoType; }
+        // Resolve enum type names to their backing type if registered
+        std::string resolvedTypeName = typeName;
+        if (!resolvedTypeName.empty())
+        {
+            auto it = enumBackingTypes.find(resolvedTypeName);
+            if (it != enumBackingTypes.end())
+                resolvedTypeName = it->second;
+        }
+
+        if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
+        else if (resolvedTypeName == "char"  || resolvedTypeName == "i8"  || resolvedTypeName == "u8")  { type = builder->getInt8Ty(); }
+        else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
+        else if (resolvedTypeName == "int"   || resolvedTypeName == "i32" || resolvedTypeName == "u32") { type = builder->getInt32Ty(); }
+        else if (resolvedTypeName == "long"  || resolvedTypeName == "i64" || resolvedTypeName == "u64") { type = builder->getInt64Ty(); }
+        else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
+        else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
+        else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }
+        else if (resolvedTypeName == "auto" && autoType != nullptr) { type = autoType; }
         else
         {
             // Check if it is an interface type first
@@ -1735,32 +1745,44 @@ public:
                 int result = -1;
                 if (arg.TypeAndValue.TypeName != "")
                 {
-                    if (arg.TypeAndValue.IsTypeMatch(*candidateParamItr))
+                    // Resolve enum types for comparison: if either arg or param is an enum, use its backing type
+                    auto resolveName = [&](const std::string& tn) -> std::string {
+                        if (tn.empty()) return tn;
+                        auto it = enumBackingTypes.find(tn);
+                        return (it != enumBackingTypes.end()) ? it->second : tn;
+                    };
+
+                    MyCompilerLLVM::TypeAndValue tmpArg = arg.TypeAndValue;
+                    MyCompilerLLVM::TypeAndValue tmpParam = *candidateParamItr;
+
+                    tmpArg.TypeName = resolveName(tmpArg.TypeName);
+                    tmpParam.TypeName = resolveName(tmpParam.TypeName);
+
+                    if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
-                    else if (arg.TypeAndValue.IsTypePromotion(*candidateParamItr))
-                        result = arg.TypeAndValue.IsInteger();  // positive: widening
+                    else if (tmpArg.IsTypePromotion(tmpParam))
+                        result = tmpArg.IsInteger();  // positive: widening
                     else
                     {
                         // Same signedness group: int<->i32, long<->i64, char<->i8, etc.
                         // Same width  -> perfect match (result=0): int==i32, long==i64.
                         // Diff width  -> implicit conversion (result=1): i64->int, etc.
-                        int myBits    = arg.TypeAndValue.IsInteger();
-                        int otherBits = candidateParamItr->IsInteger();
-                        bool myUnsigned    = arg.TypeAndValue.IsUnsignedInteger() != -1;
-                        bool otherUnsigned = candidateParamItr->IsUnsignedInteger() != -1;
+                        int myBits    = tmpArg.IsInteger();
+                        int otherBits = tmpParam.IsInteger();
+                        bool myUnsigned    = tmpArg.IsUnsignedInteger() != -1;
+                        bool otherUnsigned = tmpParam.IsUnsignedInteger() != -1;
                         if (myBits != -1 && otherBits != -1 && myUnsigned == otherUnsigned)
                             result = (myBits == otherBits) ? 0 : 1;
 
-                        // Float narrowing: double -> float (same group, different width).
                         if (result < 0)
                         {
-                            int myFP    = arg.TypeAndValue.IsFloatingPoint();
-                            int otherFP = candidateParamItr->IsFloatingPoint();
+                            int myFP    = tmpArg.IsFloatingPoint();
+                            int otherFP = tmpParam.IsFloatingPoint();
                             if (myFP != -1 && otherFP != -1)
                                 result = (myFP == otherFP) ? 0 : 1;
                         }
 
-                        // Interface upcast: struct arg can be passed to interface* param
+                        // Interface upcast using original names (interfaces are not enums)
                         if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer &&
                             !arg.TypeAndValue.IsInterface && !arg.TypeAndValue.Pointer &&
                             StructImplementsInterface(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
@@ -2401,6 +2423,15 @@ public:
             stackNamedVariable.back().namespaceAliases[alias] = target;
         else
             namespaceAliasTable[alias] = target;
+    }
+    void RegisterEnumBackingType(const std::string& enumName, const std::string& backingType)
+    {
+        enumBackingTypes[enumName] = backingType;
+    }
+    std::string GetEnumBackingType(const std::string& enumName) const
+    {
+        auto it = enumBackingTypes.find(enumName);
+        return it != enumBackingTypes.end() ? it->second : std::string();
     }
     bool IsNamespace(const std::string& name) const
     {

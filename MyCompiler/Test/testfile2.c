@@ -79,6 +79,22 @@ bool testNamedParameters()
     return result;
 }
 
+// =============================================================
+// Enum tests
+// =============================================================
+
+// Named enum — enumerators should be registered as globals.
+enum MyEnum : u8 { E_ONE = 1, E_TWO, E_THREE = 5 };
+
+bool testEnum()
+{
+    bool result = true;
+    result &= Test("enum_E_ONE", MyEnum.E_ONE, 1);
+    result &= Test("enum_E_TWO", MyEnum.E_TWO, 2);
+    result &= Test("enum_E_THREE", MyEnum.E_THREE, 5);
+    return result;
+}
+
 struct MyStruct
 {
     int num1 = 1;
@@ -169,6 +185,11 @@ struct ScaledValue : IReadable, IScalable
     int Scale(int factor) { return value * factor; }
 };
 
+int extensionIRead(IReadable scaledValue)
+{
+	return scaledValue.Read();
+}
+
 bool testInterface()
 {
     bool result = true;
@@ -177,6 +198,7 @@ bool testInterface()
 
     result &= Test("counter.Read", c.Read(), 10);   // 10
     result &= Test("scaledValue.Read", s.Read(), 3);   // 3
+    result &= Test("scaledValue.Read", s.extensionIRead(), 3);   // 3
     result &= Test("scaledValue.Scale2", s.Scale(2), 6);   // 3*2=6
     result &= Test("scaledValue.Scale5", s.Scale(5), 15);   // 3*5=15
     return result;
@@ -247,7 +269,7 @@ bool testBuiltinIdentifiers()
     bool result = true;
     result &= TestStr("__FILE__", __FILE__, "testfile2.c");
     result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 250);
+    result &= Test("__LINE__", __LINE__, 272); // Remember to adjust if shifted.
     return result;
 }
 
@@ -656,13 +678,13 @@ bool testNullCoalescing()
 {
     bool result = true;
 
-    // pointer coalescing: null → fallback string
+    // pointer coalescing: null -> fallback string
     const char* name1 = tryGetName(true)  ?? "Unknown";
     const char* name2 = tryGetName(false) ?? "Unknown";
     result &= TestStr("nullcoal_nonnull_ptr", name1, "Alice");
     result &= TestStr("nullcoal_null_ptr",    name2, "Unknown");
 
-    // integer coalescing: 0 → default, nonzero → self
+    // integer coalescing: 0 -> default, nonzero -> self
     int zero = 0;
     int five = 5;
     result &= Test("nullcoal_zero",    zero ?? 42, 42);

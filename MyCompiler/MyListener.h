@@ -204,7 +204,7 @@ private:
     MyCompilerLLVM* compilerLLVM;
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
-    constexpr static bool debugPrint = false;
+    constexpr static bool debugPrint = false; 
 
     struct SwitchCaseEntry
     {
@@ -899,9 +899,70 @@ public:
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationContext* ctx)
     {
+        // Handle enum declarations which use the enumSpecifier alternative in the grammar
+        if (auto enumSpec = ctx->enumSpecifier())
+        {
+            ParseEnumSpecifier(enumSpec);
+            return {};
+        }
+
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
         return ParseDeclaration(declSpec, initDecl);
+    }
+
+    void ParseEnumSpecifier(CParser::EnumSpecifierContext* ctx)
+    {
+        if (!ctx) return;
+
+        // enum Identifier : typeSpecifier { enumeratorList }
+        auto id = ctx->Identifier();
+        std::string enumName = id ? id->getText() : "";
+        auto typeSpec = ctx->typeSpecifier();
+        std::string backingType = typeSpec ? typeSpec->getText() : "int";
+
+        // Register enum name as a namespace so members can be referenced as EnumName.Member
+        if (!enumName.empty())
+            compilerLLVM->RegisterNamespace(enumName);
+
+        long long current = 0;
+        auto list = ctx->enumeratorList();
+        if (!list) return;
+
+        for (auto enumerator : list->enumerator())
+        {
+            auto enumConst = enumerator->enumerationConstant();
+            std::string name = enumConst->getText();
+
+            long long value = current;
+            if (auto cexpr = enumerator->constantExpression())
+            {
+                auto cond = cexpr->conditionalExpression();
+                auto valLLVM = llvm::dyn_cast<llvm::ConstantInt>(ParseConditionalExpression(cond));
+                if (!valLLVM)
+                    LogErrorContext(enumerator, "enum value must be a constant integer expression");
+                value = valLLVM->getSExtValue();
+            }
+
+            MyCompilerLLVM::TypeAndValue tv;
+            // Use the enum's declared name as the type for the enumerator variable so
+            // overload resolution can consider enum type. The GetType call will resolve
+            // the enum to its backing type when emitting IR.
+            tv.TypeName = !enumName.empty() ? enumName : backingType;
+            tv.VariableName = enumName.empty() ? name : (enumName + "." + name);
+            tv.Pointer = false;
+
+            // Register the enum's backing type so GetType and overload resolution can
+            // resolve enum types to the underlying integral type.
+            if (!enumName.empty())
+                compilerLLVM->RegisterEnumBackingType(enumName, backingType);
+
+            // Create a typed constant using the backing type
+            llvm::Constant* c = compilerLLVM->CreateConstant(backingType, std::to_string(value));
+            compilerLLVM->CreateGlobalVariable(tv, c);
+
+            current = value + 1;
+        }
     }
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationSpecifiersContext* declSpec, CParser::InitDeclaratorListContext* initDecl)
@@ -1656,9 +1717,25 @@ public:
                             }
                             else
                             {
+                                // Qualified name (e.g. EnumName.Member) — try to resolve as a global
+                                // variable (enum member) or a function. Fall back to leaving
+                                // namedVar empty so later code can handle it.
                                 primaryIdentifier = qualifiedName;
                                 namespaceContext.clear();
-                                namedVar = {};
+
+                                if (auto gVar = compilerLLVM->GetGlobalVariable(primaryIdentifier))
+                                {
+                                    namedVar.Storage = gVar;
+                                    namedVar.BaseType = gVar->getType();
+                                }
+                                else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
+                                {
+                                    namedVar.Primary = func;
+                                }
+                                else
+                                {
+                                    namedVar = {};
+                                }
                             }
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
@@ -1740,7 +1817,7 @@ public:
                             }
                             else
                             {
-                                LogErrorContext(ctx, std::format("Unknown identifier '{}'.", primaryIdentifier));
+                                LogErrorContext(primaryCtx, std::format("Unknown identifier '{}'.", primaryIdentifier));
                             }
                         }
                         else

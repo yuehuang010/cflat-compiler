@@ -167,7 +167,7 @@ constantExpression
 
 declaration
     : declarationSpecifiers initDeclaratorList ';'
-    | staticAssertDeclaration
+    | enumSpecifier ';'
     ;
 
 declarationSpecifiers
@@ -218,7 +218,6 @@ typeSpecifier
     | 'u32'
     | 'u64'
     | structClassUnion
-    | 'enum'
     | 'auto'
     | Identifier
     ;
@@ -258,8 +257,7 @@ structDeclarator
     ;
 
 enumSpecifier
-    : 'enum' Identifier? '{' enumeratorList ','? '}'
-    | 'enum' Identifier
+    : 'enum' Identifier ':' typeSpecifier '{' enumeratorList ','? '}'
     ;
 
 enumeratorList
