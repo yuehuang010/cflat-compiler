@@ -256,21 +256,24 @@ public:
         llvm::BasicBlock* ContinuationBlock;
     };
 
+    private:
+    int currentLine = 0;
+    int currentColumn = 0;
+
     void SetSourceLocation(int line, int column)
     {
         currentLine = line;
         currentColumn = column;
     }
 
-private:
-    int currentLine = 0;
-    int currentColumn = 0;
-
     void LogError(std::string message) const
     {
         std::cout << std::format("[{}:{}] : {}\n", currentLine, currentColumn, message);
         exit(1);
     }
+
+    friend class MyListener;
+    friend class ForwardRefScanner;
 
     std::unique_ptr<llvm::IRBuilder<>> builder;
     std::unique_ptr<llvm::Module> module;
@@ -515,6 +518,29 @@ public:
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
     }
 
+    struct BuilderState
+    {
+        llvm::IRBuilder<>::InsertPoint ip;
+        llvm::Function* function = nullptr;
+        llvm::DISubprogram* subprogram = nullptr;
+    };
+
+    BuilderState SaveBuilderState() const
+    {
+        return { builder->saveIP(), currentFunction, currentSubprogram };
+    }
+
+    void RestoreBuilderState(const BuilderState& state)
+    {
+        builder->restoreIP(state.ip);
+        currentFunction = state.function;
+        currentSubprogram = state.subprogram;
+        if (state.subprogram)
+            builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, 0, 0, state.subprogram));
+        else
+            builder->SetCurrentDebugLocation(llvm::DebugLoc());
+    }
+
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)
     {
         // Prepend inherited methods from parent interfaces (in order)
@@ -538,6 +564,15 @@ public:
     bool IsInterfaceType(const std::string& name) const
     {
         return interfaceTable.count(name) > 0;
+    }
+
+    bool HasInterfaceMethod(const std::string& ifaceName, const std::string& methodName) const
+    {
+        auto it = interfaceTable.find(ifaceName);
+        if (it == interfaceTable.end()) return false;
+        for (const auto& m : it->second)
+            if (m.Name == methodName) return true;
+        return false;
     }
 
     llvm::StructType* GetFatPtrType() const
@@ -721,6 +756,13 @@ public:
     void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
     {
         dataStructures[structName].Interfaces = interfaces;
+    }
+
+    std::vector<std::string> GetStructInterfaces(const std::string& structName) const
+    {
+        auto it = dataStructures.find(structName);
+        if (it == dataStructures.end()) return {};
+        return it->second.Interfaces;
     }
 
     void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
@@ -1942,6 +1984,7 @@ public:
 
     llvm::Value* CreateFunctionCall2(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
     {
+        functionName = ResolveQualifiedName(functionName);
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
@@ -2448,6 +2491,46 @@ public:
         }
         auto it = namespaceAliasTable.find(name);
         return it != namespaceAliasTable.end() ? it->second : name;
+    }
+
+    // Resolves a qualified name (e.g. "MathAdv.MyNumber") to its canonical registered name
+    // by expanding namespace aliases on the leading component and then walking up parent namespaces.
+    std::string ResolveQualifiedName(const std::string& name) const
+    {
+        if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name))
+            return name;
+
+        auto dotPos = name.rfind('.');
+        if (dotPos == std::string::npos)
+            return name;
+
+        std::string lastName = name.substr(dotPos + 1);
+        std::string nsPrefix = name.substr(0, dotPos);
+
+        // Resolve an alias on the first namespace component
+        {
+            auto firstDot = nsPrefix.find('.');
+            std::string firstComp = firstDot == std::string::npos ? nsPrefix : nsPrefix.substr(0, firstDot);
+            std::string restComp  = firstDot == std::string::npos ? std::string{} : nsPrefix.substr(firstDot + 1);
+            std::string resolvedFirst = ResolveNamespace(firstComp);
+            if (resolvedFirst != firstComp)
+                nsPrefix = restComp.empty() ? resolvedFirst : resolvedFirst + "." + restComp;
+        }
+
+        // Walk up from the (possibly expanded) prefix toward the root
+        std::string prefix = nsPrefix;
+        while (true)
+        {
+            std::string candidate = prefix + "." + lastName;
+            if (dataStructures.count(candidate) || interfaceTable.count(candidate) || functionTable.count(candidate))
+                return candidate;
+            auto parentDot = prefix.rfind('.');
+            if (parentDot == std::string::npos)
+                break;
+            prefix = prefix.substr(0, parentDot);
+        }
+
+        return name;
     }
 
     std::string GetNameOfCurrentInsertionBlock()

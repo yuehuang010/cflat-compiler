@@ -169,49 +169,6 @@ bool testDestructor()
     return result;
 }
 
-// Interface tests
-
-interface IReadable
-{
-    int Read();
-};
-
-interface IScalable
-{
-    int Scale(int factor);
-};
-
-struct Counter : IReadable
-{
-    int count = 10;
-    int Read() { return count; }
-};
-
-struct ScaledValue : IReadable, IScalable
-{
-    int value = 3;
-    int Read() { return value; }
-    int Scale(int factor) { return value * factor; }
-};
-
-int extensionIRead(IReadable scaledValue)
-{
-	return scaledValue.Read();
-}
-
-bool testInterface()
-{
-    bool result = true;
-    Counter c = Counter();
-    ScaledValue s = ScaledValue();
-
-    result &= Test("counter.Read", c.Read(), 10);   // 10
-    result &= Test("scaledValue.Read", s.Read(), 3);   // 3
-    result &= Test("scaledValue.Read", s.extensionIRead(), 3);   // 3
-    result &= Test("scaledValue.Scale2", s.Scale(2), 6);   // 3*2=6
-    result &= Test("scaledValue.Scale5", s.Scale(5), 15);   // 3*5=15
-    return result;
-}
 
 // Default parameter tests
 
@@ -628,160 +585,6 @@ bool testExplicitIntTypes()
 }
 
 // =============================================================
-// Generic struct tests (compile-time only monomorphization)
-// =============================================================
-
-struct Box<T>
-{
-    T value;
-};
-
-struct Pair<K, V>
-{
-    K first;
-    V second;
-};
-
-struct Container<T>
-{
-    T data;
-    int count = 0;
-};
-
-struct Stack<T>
-{
-    T elements;
-    int size = 0;
-};
-
-bool testGenericBox()
-{
-    bool result = true;
-
-    // Test Box<int>
-    Box<int> intBox;
-    intBox.value = 42;
-    result &= Test("generic_box_int", intBox.value, 42);
-
-    // Test Box<float> - compare as int representation
-    Box<float> floatBox;
-    floatBox.value = 3.14f;
-    // Note: floating point comparison would need special handling
-
-    // Test Box<i32>
-    Box<i32> i32Box;
-    i32Box.value = 100;
-    result &= Test("generic_box_i32", i32Box.value, 100);
-
-    return result;
-}
-
-bool testGenericPair()
-{
-    bool result = true;
-
-    // Test Pair<int, int>
-    Pair<int, int> intIntPair;
-    intIntPair.first = 10;
-    intIntPair.second = 20;
-    result &= Test("generic_pair_int_int_first", intIntPair.first, 10);
-    result &= Test("generic_pair_int_int_second", intIntPair.second, 20);
-
-    // Test Pair<int, float>
-    Pair<int, float> intFloatPair;
-    intFloatPair.first = 5;
-    intFloatPair.second = 2.5f;
-    result &= Test("generic_pair_int_float_first", intFloatPair.first, 5);
-
-    // Test Pair<i32, i32>
-    Pair<i32, i32> i32Pair;
-    i32Pair.first = 1000;
-    i32Pair.second = 2000;
-    result &= Test("generic_pair_i32_first", i32Pair.first, 1000);
-    result &= Test("generic_pair_i32_second", i32Pair.second, 2000);
-
-    return result;
-}
-
-bool testGenericMultipleInstantiations()
-{
-    bool result = true;
-
-    // Multiple instantiations of Box with different types
-    Box<int> boxInt;
-    Box<i32> boxI32;
-    Box<u32> boxU32;
-    Box<i8> boxI8;
-
-    boxInt.value = 42;
-    boxI32.value = 100;
-    boxU32.value = 200;
-    boxI8.value = 10;
-
-    result &= Test("generic_multi_int", boxInt.value, 42);
-    result &= Test("generic_multi_i32", boxI32.value, 100);
-    result &= Test("generic_multi_u32", boxU32.value, 200);
-    result &= Test("generic_multi_i8", boxI8.value, 10);
-
-    return result;
-}
-
-bool testGenericContainer()
-{
-    bool result = true;
-
-    // Test Container<int>
-    Container<int> intContainer;
-    intContainer.data = 99;
-    intContainer.count = 1;
-    result &= Test("generic_container_int_data", intContainer.data, 99);
-    result &= Test("generic_container_int_count", intContainer.count, 1);
-
-    // Test Container<i64>
-    Container<i64> i64Container;
-    i64Container.data = 200000;
-    i64Container.count = 5;
-    result &= Test("generic_container_i64_data", i64Container.data, 200000);
-    result &= Test("generic_container_i64_count", i64Container.count, 5);
-
-    return result;
-}
-
-bool testGenericStack()
-{
-    bool result = true;
-
-    // Test Stack<int>
-    Stack<int> intStack;
-    intStack.elements = 42;
-    intStack.size = 1;
-    result &= Test("generic_stack_int_elements", intStack.elements, 42);
-    result &= Test("generic_stack_int_size", intStack.size, 1);
-
-    // Test Stack<i32>
-    Stack<i32> i32Stack;
-    i32Stack.elements = 999;
-    i32Stack.size = 10;
-    result &= Test("generic_stack_i32_elements", i32Stack.elements, 999);
-    result &= Test("generic_stack_i32_size", i32Stack.size, 10);
-
-    return result;
-}
-
-int testGenericStructs()
-{
-    bool result = true;
-    printf("=== Generic Struct Tests ===\n");
-    result &= testGenericBox();
-    result &= testGenericPair();
-    result &= testGenericMultipleInstantiations();
-    result &= testGenericContainer();
-    result &= testGenericStack();
-    printf("=== Generic Tests Completed ===\n");
-    return result;
-}
-
-// =============================================================
 // Null-conditional (?.) and null-coalescing (??) tests
 // =============================================================
 
@@ -848,6 +651,34 @@ bool testNullCoalescing()
     return result;
 }
 
+// =============================================================
+// Default keyword tests
+// =============================================================
+
+bool testDefault()
+{
+    bool result = true;
+
+    // Primitive types: default -> zero value
+    int  di = default;
+    bool db = default;
+    i32  di32 = default;
+    i64  di64 = default;
+
+    result &= Test("default_int",  di,   0);
+    result &= Test("default_bool", db,   0);
+    result &= Test("default_i32",  di32, 0);
+    result &= Test("default_i64",  di64, 0);
+
+    // Struct type: default -> calls default constructor, fields get their declared defaults
+    MyStruct ds = default;
+    result &= Test("default_struct_num1", ds.num1, 1);
+    result &= Test("default_struct_num2", ds.num2, 2);
+    result &= Test("default_struct_num3", ds.num3, 3);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -866,7 +697,6 @@ extern int main()
     result &= testDefaultSingleParam();
     result &= testDefaultMultipleParams();
     result &= testDefaultExpression();
-    result &= testInterface();
     result &= testDestructor();
     result &= testBuiltinIdentifiers();
     result &= testTypeof();
@@ -885,6 +715,7 @@ extern int main()
     result &= testExplicitIntTypes();
     result &= testNullConditional();
     result &= testNullCoalescing();
+    result &= testDefault();
 
     if (result)
     {

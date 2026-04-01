@@ -35,7 +35,7 @@ grammar C;
 
 primaryExpression
     : Constant
-    | Identifier genericTypeParameters?
+    | genericIdentifier
     | StringLiteral+
     | '(' expression ')'
     | NameOf '(' expression ')'
@@ -144,8 +144,8 @@ assignmentExpression
     ;
 
 structOrUnionSpecifier
-    : structClassUnion Identifier genericTypeParameters? '{' structDeclarationList '}'
-    | structClassUnion Identifier genericTypeParameters?
+    : structClassUnion genericIdentifier '{' structDeclarationList '}'
+    | structClassUnion genericIdentifier
     ;
 
 assignmentOperator
@@ -225,7 +225,8 @@ typeSpecifier
     | 'u64'
     | structClassUnion
     | 'auto'
-    | Identifier genericTypeParameters?
+    | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
+    | genericIdentifier
     ;
 
 genericTypeParameters
@@ -367,6 +368,7 @@ typedefName
 initializer
     : assignmentExpression
     | '{' initializerList ','? '}'
+    | Default
     ;
 
 initializerList
@@ -493,11 +495,15 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? directDeclarator '(' parameterTypeList? ')' compoundStatement
+    : declarationSpecifiers? directDeclarator genericTypeParameters? '(' parameterTypeList? ')' compoundStatement
     ;
 
 structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator genericTypeParameters? (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : declarationSpecifiers? directDeclarator genericTypeParameters? (':' genericIdentifier (',' genericIdentifier)* | genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    ;
+
+genericIdentifier
+    : Identifier genericTypeParameters?
     ;
 
 destructorDefinition
@@ -505,7 +511,7 @@ destructorDefinition
     ;
 
 interfaceDefinition
-    : Interface Identifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
+    : Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
     ;
 
 interfaceMethod

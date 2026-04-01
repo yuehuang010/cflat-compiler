@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,42 +37,50 @@ class ForwardRefScanner
 private:
     MyCompilerLLVM* compilerLLVM;
 
+    MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
+    {
+        compilerLLVM->SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+        return compilerLLVM;
+    }
+
     MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
     {
+        auto* compiler = Compiler(declSpecs);
         MyCompilerLLVM::DeclTypeAndValue declType;
         for (auto declSpec : declSpecs->declarationSpecifier())
         {
             auto typeSpec = declSpec->typeSpecifier();
             auto storageSpec = declSpec->storageClassSpecifier();
-            if (typeSpec != nullptr)
-            {
-                if (typeSpec->genericTypeParameters() != nullptr)
+                if (typeSpec != nullptr)
                 {
-                    // Generic type instantiation: Box<MyType> → Box__MyType
-                    std::string mangledName = typeSpec->Identifier()->getText();
-                    for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
+                    if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                    {
+                        // Generic type instantiation: Box<MyType> → Box__MyType
+                        std::string mangledName = typeSpec->genericIdentifier()->Identifier()->getText();
+                    for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                     {
                         // Type arguments must be identifiers (user-defined types), not built-in types
-                        if (typeParamSpec->Identifier())
+                        if (typeParamSpec->genericIdentifier() != nullptr && typeParamSpec->genericIdentifier()->Identifier() != nullptr)
                         {
-                            mangledName += "__" + typeParamSpec->Identifier()->getText();
+                            mangledName += "__" + typeParamSpec->genericIdentifier()->Identifier()->getText();
                         }
                     }
                     // Pre-declare opaque struct type and default constructor so that
                     // uses inside function bodies are resolvable before the full
                     // definition is emitted by ProcessPendingInstantiations().
-                    compilerLLVM->CreateStructType(mangledName, {});
+                    compiler->CreateStructType(mangledName, {});
                     MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
-                    compilerLLVM->CreateFunctionDeclaration(mangledName, returnType, {});
+                    compiler->CreateFunctionDeclaration(mangledName, returnType, {});
                     declType.TypeName = mangledName;
                 }
                 else
                 {
-                    declType.TypeName = typeSpec->getText();
+                    declType.TypeName = compiler->ResolveQualifiedName(typeSpec->getText());
                 }
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
-                declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
+                declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
                 break;
             }
@@ -105,8 +113,13 @@ private:
 
     void ScanFunctionDefinition(CParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
     {
+        auto* compiler = Compiler(func);
         // Return-block functions are inlined at call sites — no LLVM proto needed.
         if (IsReturnBlockFunction(func))
+            return;
+
+        // Generic function templates are instantiated on demand — skip pre-declaration.
+        if (func->genericTypeParameters() != nullptr)
             return;
 
         std::string name = func->directDeclarator()->getText();
@@ -128,7 +141,7 @@ private:
         }
 
         std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
-        compilerLLVM->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs);
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs);
 
         // Pre-declare overloads for default parameters
         int firstDefault = -1;
@@ -139,18 +152,23 @@ private:
         for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)params.size(); cutoff++)
         {
             std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
-            compilerLLVM->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
+            compiler->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
         }
     }
 
     void ScanInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
     {
-        auto identifiers = ctx->Identifier();
-        std::string name = identifiers[0]->getText();
+        // Generic interface templates are not pre-declared; they are instantiated on demand.
+        auto* nameGid = ctx->genericIdentifier();
+        if (nameGid && nameGid->genericTypeParameters() != nullptr)
+            return;
+
+        if (!nameGid || !nameGid->Identifier()) return;
+        std::string name = nameGid->Identifier()->getText();
 
         std::vector<std::string> parentNames;
-        for (size_t i = 1; i < identifiers.size(); i++)
-            parentNames.push_back(identifiers[i]->getText());
+        for (auto* term : ctx->Identifier())
+            parentNames.push_back(term->getText());
 
         std::vector<MyCompilerLLVM::InterfaceMethod> methods;
         for (auto method : ctx->interfaceMethod())
@@ -164,23 +182,26 @@ private:
             methods.push_back(std::move(m));
         }
 
-        compilerLLVM->CreateInterfaceDefinition(name, parentNames, methods);
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
     }
 
-    void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx)
+    void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& namespaceName = {})
     {
+        auto* compiler = Compiler(ctx);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
         if (ctx->genericTypeParameters() != nullptr)
             return;
 
         std::string structName = ctx->directDeclarator()->getText();
+        if (!namespaceName.empty())
+            structName = namespaceName + "." + structName;
 
         // Register opaque struct so the type is known for pointer/field use
-        compilerLLVM->CreateStructType(structName, {});
+        compiler->CreateStructType(structName, {});
 
         // Pre-declare default constructor
         MyCompilerLLVM::TypeAndValue returnType{ .TypeName = structName };
-        compilerLLVM->CreateFunctionDeclaration(structName, returnType, {});
+        compiler->CreateFunctionDeclaration(structName, returnType, {});
 
         // Pre-declare member functions
         for (auto func : ctx->functionDefinition())
@@ -194,7 +215,7 @@ private:
             thisParam.VariableName = structName + "__";
             thisParam.Pointer = true;
             MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
-            compilerLLVM->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
+            compiler->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
         }
     }
 
@@ -220,26 +241,34 @@ public:
                     continue;
             }
 
+            // Skip generic function template definitions for the same reason.
+            if (auto* funcDef = dynamic_cast<CParser::FunctionDefinitionContext*>(ruleCtx))
+            {
+                if (funcDef->genericTypeParameters() != nullptr)
+                    continue;
+            }
+
             auto tryPreDeclare = [&](const std::string& baseName, CParser::GenericTypeParametersContext* genericParams)
             {
+        auto* compiler = Compiler(genericParams);
                 std::string mangledName = baseName;
                 for (auto* typeParamSpec : genericParams->typeParameterList()->typeSpecifier())
                     mangledName += "__" + typeParamSpec->getText();
-                compilerLLVM->CreateStructType(mangledName, {});
+                compiler->CreateStructType(mangledName, {});
                 MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
-                compilerLLVM->CreateFunctionDeclaration(mangledName, returnType, {});
+                compiler->CreateFunctionDeclaration(mangledName, returnType, {});
             };
 
             if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
             {
-                if (typeSpec->genericTypeParameters() != nullptr && typeSpec->Identifier() != nullptr)
-                    tryPreDeclare(typeSpec->Identifier()->getText(), typeSpec->genericTypeParameters());
+                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
+                    tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
             }
 
             if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
             {
-                if (primaryExpr->genericTypeParameters() != nullptr && primaryExpr->Identifier() != nullptr)
-                    tryPreDeclare(primaryExpr->Identifier()->getText(), primaryExpr->genericTypeParameters());
+                if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
+                    tryPreDeclare(primaryExpr->genericIdentifier()->Identifier()->getText(), primaryExpr->genericIdentifier()->genericTypeParameters());
             }
 
             ScanGenericTypeUses(ruleCtx);
@@ -253,7 +282,7 @@ public:
         else if (auto func = ctx->functionDefinition())
             ScanFunctionDefinition(func, {}, namespaceName);
         else if (auto dataStruct = ctx->structClassUnionDefinition())
-            ScanStructDefinition(dataStruct);
+            ScanStructDefinition(dataStruct, namespaceName);
         else if (auto iface = ctx->interfaceDefinition())
             ScanInterfaceDefinition(iface);
     }
@@ -275,6 +304,15 @@ class MyListener : public CBaseListener
 private:
     CParser* parser;
     MyCompilerLLVM* compilerLLVM;
+
+    MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
+    {
+        if (ctx)
+            compilerLLVM->SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+        return compilerLLVM;
+    }
+    inline MyCompilerLLVM* Compiler() { return compilerLLVM; }
+
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
@@ -285,6 +323,16 @@ private:
     std::unordered_set<std::string> instantiatedGenerics;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
+
+    // Generic interface templates: maps base name -> (AST context, type param names)
+    std::unordered_map<std::string, CParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
+    std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
+    std::unordered_set<std::string> instantiatedInterfaces;
+
+    // Generic function templates: maps base name -> (AST context, type param names)
+    std::unordered_map<std::string, CParser::FunctionDefinitionContext*> genericFunctionTemplates;
+    std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
+    std::unordered_set<std::string> instantiatedGenericFunctions;
 
     // Queue for pending generic instantiations (delayed until safe to emit code)
     struct PendingInstantiation
@@ -333,13 +381,20 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
-                if (typeSpec->genericTypeParameters() != nullptr)
+                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                 {
                     // Generic type instantiation: Box<MyType> -> Box__MyType
-                    std::string baseName = typeSpec->Identifier()->getText();
+                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                        typeArgs.push_back(typeParamSpec->getText());
+                    for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    {
+                        std::string arg = typeParamSpec->getText();
+                        // Apply active type parameter substitutions (e.g. T -> int inside a template body)
+                        auto substIt = activeTypeSubstitutions.find(arg);
+                        if (substIt != activeTypeSubstitutions.end())
+                            arg = substIt->second;
+                        typeArgs.push_back(arg);
+                    }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     // Just store the mangled name; instantiation is done separately at declaration time
                     declType.TypeName = mangledName;
@@ -351,11 +406,13 @@ private:
                     auto substIt = activeTypeSubstitutions.find(typeName);
                     if (substIt != activeTypeSubstitutions.end())
                         typeName = substIt->second;
+                    // Resolve namespace-qualified type names (alias expansion + parent namespace search)
+                    typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
                     declType.TypeName = typeName;
                 }
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
-                declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
+                declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
                 break;
             }
@@ -375,6 +432,25 @@ private:
         return ParseDeclarationSpecifiers(declSpecs);
     }
 
+    // Returns the default value for a type:
+    //   - struct types (local scope): calls the default constructor.
+    //   - everything else (or global scope): zero-initializes.
+    llvm::Value* GenerateDefaultValue(const MyCompilerLLVM::DeclTypeAndValue& typeValue)
+    {
+        auto* compiler = Compiler();
+        auto* llvmType = compiler->GetType(typeValue);
+        if (!llvmType) return nullptr;
+
+        if (!typeValue.Pointer && llvmType->isStructTy() && !global_scope)
+        {
+            auto structData = compiler->GetDataStructure(typeValue.TypeName);
+            if (structData.StructType != nullptr && compiler->GetFunction(typeValue.TypeName))
+                return compiler->CreateFunctionCall2(typeValue.TypeName, {});
+        }
+
+        return llvm::Constant::getNullValue(llvmType);
+    }
+
 public:
     MyListener(CParser* parser, MyCompilerLLVM* compilerLLVM)
     {
@@ -384,36 +460,177 @@ public:
 
     void ParseInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
     {
-        auto identifiers = ctx->Identifier();
-        std::string name = identifiers[0]->getText();
+        auto* nameGid = ctx->genericIdentifier();
+        if (!nameGid || !nameGid->Identifier()) return;
 
+        std::string name = nameGid->Identifier()->getText();
+
+        // Collect parent interface names from direct Identifier terminals (after ':')
         std::vector<std::string> parentNames;
-        for (size_t i = 1; i < identifiers.size(); i++)
-            parentNames.push_back(identifiers[i]->getText());
+        for (auto* term : ctx->Identifier())
+            parentNames.push_back(term->getText());
+
+        // Generic interface template — store for on-demand instantiation
+        if (nameGid->genericTypeParameters() != nullptr)
+        {
+            auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
+            genericInterfaceTemplates[name] = ctx;
+            genericInterfaceTypeParams[name] = typeParams;
+            return;
+        }
 
         std::vector<MyCompilerLLVM::InterfaceMethod> methods;
-
         for (auto method : ctx->interfaceMethod())
         {
             MyCompilerLLVM::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = method->directDeclarator()->getText();
-
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
                 MyCompilerLLVM::TypeAndValue tv = p;
                 m.Parameters.push_back(tv);
             }
-
             methods.push_back(std::move(m));
         }
 
-        compilerLLVM->CreateInterfaceDefinition(name, parentNames, methods);
+        Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
+    }
+
+    void InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
+                                     const std::unordered_map<std::string, std::string>& substitutions)
+    {
+        if (instantiatedInterfaces.count(mangledName)) return;
+        instantiatedInterfaces.insert(mangledName);
+
+        auto templateIt = genericInterfaceTemplates.find(baseName);
+        if (templateIt == genericInterfaceTemplates.end()) return;
+
+        auto* ctx = templateIt->second;
+
+        // Collect parent interface names
+        std::vector<std::string> parentNames;
+        for (auto* term : ctx->Identifier())
+            parentNames.push_back(term->getText());
+
+        // Apply substitutions to instantiate the interface methods
+        auto savedSubst = activeTypeSubstitutions;
+        for (const auto& [k, v] : substitutions)
+            activeTypeSubstitutions[k] = v;
+
+        std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+        for (auto method : ctx->interfaceMethod())
+        {
+            MyCompilerLLVM::InterfaceMethod m;
+            m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            m.Name = method->directDeclarator()->getText();
+            auto declParams = ParseParameterTypeList(method->parameterTypeList());
+            for (const auto& p : declParams)
+            {
+                MyCompilerLLVM::TypeAndValue tv = p;
+                m.Parameters.push_back(tv);
+            }
+            methods.push_back(std::move(m));
+        }
+
+        activeTypeSubstitutions = savedSubst;
+        Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods);
+    }
+
+    // Instantiate a generic function template with concrete type arguments.
+    // Returns the mangled name of the instantiated function, or empty string on failure.
+    std::string InstantiateGenericFunction(const std::string& baseName, const std::vector<std::string>& typeArgs)
+    {
+        std::string mangledName = MangledGenericName(baseName, typeArgs);
+        if (instantiatedGenericFunctions.count(mangledName)) return mangledName;
+        instantiatedGenericFunctions.insert(mangledName);
+
+        auto templateIt = genericFunctionTemplates.find(baseName);
+        if (templateIt == genericFunctionTemplates.end()) return {};
+
+        const auto& typeParams = genericFunctionTypeParams[baseName];
+        if (typeParams.size() != typeArgs.size()) return {};
+
+        auto savedSubst = activeTypeSubstitutions;
+        for (size_t i = 0; i < typeParams.size(); i++)
+            activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+
+        // Save the current IRBuilder insertion point so that emitting a new
+        // function definition mid-block does not corrupt the caller's block.
+        auto savedState = Compiler(templateIt->second)->SaveBuilderState();
+        ParseFunctionDefinition(templateIt->second, {}, {}, mangledName);
+        Compiler(templateIt->second)->RestoreBuilderState(savedState);
+
+        activeTypeSubstitutions = savedSubst;
+        return mangledName;
+    }
+
+    // Infer the type arguments for a generic function template from the receiver's
+    // interface type name (e.g. "Container__int" → T="int") and instantiate it.
+    // Returns the mangled name of the instantiated function, or empty string on failure.
+    std::string InferAndInstantiateGenericFunction(const std::string& funcName, const std::string& receiverType)
+    {
+        auto templateIt = genericFunctionTemplates.find(funcName);
+        if (templateIt == genericFunctionTemplates.end()) return {};
+
+        auto* funcCtx = templateIt->second;
+        const auto& typeParams = genericFunctionTypeParams[funcName];
+
+        auto* paramTypeList = funcCtx->parameterTypeList();
+        if (!paramTypeList || !paramTypeList->parameterList()) return {};
+
+        auto paramDecls = paramTypeList->parameterList()->parameterDeclaration();
+        if (paramDecls.empty()) return {};
+
+        // Examine the first parameter's type specifier to determine the base interface name
+        for (auto* declSpec : paramDecls[0]->declarationSpecifiers()->declarationSpecifier())
+        {
+            auto* typeSpec = declSpec->typeSpecifier();
+            if (!typeSpec || !typeSpec->genericIdentifier()) continue;
+
+            auto* genId = typeSpec->genericIdentifier();
+            if (!genId->Identifier()) continue;
+
+            std::string baseName = genId->Identifier()->getText();
+            std::string prefix = baseName + "__";
+
+            if (receiverType.size() <= prefix.size() || receiverType.substr(0, prefix.size()) != prefix)
+                continue;
+
+            std::string suffix = receiverType.substr(prefix.size());
+
+            // With a single type parameter the entire suffix is the type argument.
+            // With multiple type parameters split on "__" (works for simple non-generic args).
+            std::vector<std::string> typeArgs;
+            if (typeParams.size() == 1)
+            {
+                typeArgs = { suffix };
+            }
+            else
+            {
+                size_t pos = 0;
+                while (pos < suffix.size())
+                {
+                    size_t next = suffix.find("__", pos);
+                    if (next == std::string::npos)
+                    {
+                        typeArgs.push_back(suffix.substr(pos));
+                        break;
+                    }
+                    typeArgs.push_back(suffix.substr(pos, next - pos));
+                    pos = next + 2;
+                }
+            }
+
+            if (typeArgs.size() == typeParams.size())
+                return InstantiateGenericFunction(funcName, typeArgs);
+        }
+        return {};
     }
 
     void ParseUsingDeclaration(CParser::UsingDeclarationContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto identifiers = ctx->Identifier();
         std::string alias = identifiers[0]->getText();
         std::string target;
@@ -423,9 +640,9 @@ public:
             target += identifiers[i]->getText();
         }
         if (global_scope)
-            compilerLLVM->RegisterNamespaceAlias(alias, target);
+            compiler->RegisterNamespaceAlias(alias, target);
         else
-            compilerLLVM->RegisterLocalNamespaceAlias(alias, target);
+            compiler->RegisterLocalNamespaceAlias(alias, target);
     }
 
     void ParseExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
@@ -461,7 +678,7 @@ public:
         }
         else if (dataStruct != nullptr)
         {
-            ParseStructClassUnionDefinition(dataStruct);
+            ParseStructClassUnionDefinition(dataStruct, {}, namespaceName);
         }
 
         // Process any generic instantiations queued while parsing the above item.
@@ -474,7 +691,7 @@ public:
         std::string namespaceName = ctx->Identifier()->getText();
         if (!parentNamespace.empty())
             namespaceName = parentNamespace + "." + namespaceName;
-        compilerLLVM->RegisterNamespace(namespaceName);
+        Compiler(ctx)->RegisterNamespace(namespaceName);
 
         for (auto* extDecl : ctx->externalDeclaration())
             ParseExternalDeclaration(extDecl, namespaceName);
@@ -520,6 +737,7 @@ public:
     // Recursively collects case/default labels from a statement (to handle `case 1: case 2: stmt` nesting).
     void CollectCasesFromStatement(CParser::StatementContext* stmt, SwitchContext& ctx)
     {
+        auto* compiler = Compiler(stmt);
         if (!stmt) return;
         auto labeled = stmt->labeledStatement();
         if (!labeled) return;
@@ -530,19 +748,20 @@ public:
                 ParseConditionalExpression(labeled->constantExpression()->conditionalExpression()));
             if (!val)
                 LogErrorContext(labeled, "case value must be a constant integer expression");
-            ctx.caseMap[labeled] = { val, compilerLLVM->CreateBasicBlock("switchCase") };
+            ctx.caseMap[labeled] = { val, compiler->CreateBasicBlock("switchCase") };
             CollectCasesFromStatement(labeled->statement(), ctx);
         }
         else if (labeled->Default())
         {
-            ctx.defaultBlock = compilerLLVM->CreateBasicBlock("switchDefault");
+            ctx.defaultBlock = compiler->CreateBasicBlock("switchDefault");
             CollectCasesFromStatement(labeled->statement(), ctx);
         }
     }
 
     void ParseStatement(CParser::StatementContext* statement)
     {
-        compilerLLVM->SetCurrentDebugLocation(statement->getStart()->getLine());
+        auto* compiler = Compiler(statement);
+        compiler->SetCurrentDebugLocation(statement->getStart()->getLine());
 
         auto jump = statement->jumpStatement();
         auto expressStatement = statement->expressionStatement();
@@ -569,8 +788,8 @@ public:
 
             if (targetBlock)
             {
-                compilerLLVM->CreateJump(targetBlock);    // fallthrough if no terminator yet
-                compilerLLVM->SwitchToBlock(targetBlock);
+                compiler->CreateJump(targetBlock);    // fallthrough if no terminator yet
+                compiler->SwitchToBlock(targetBlock);
             }
 
             ParseStatement(labeledStatement->statement());
@@ -583,10 +802,10 @@ public:
             {
                 if (auto* blockBody = jump->compoundStatement())
                 {
-                    compilerLLVM->InitializeBlock(nullptr, true);
+                    compiler->InitializeBlock(nullptr, true);
                     if (auto* blockItems = blockBody->blockItemList())
                         ParseBlockItemList(blockItems);
-                    compilerLLVM->CreateBlockBreak(nullptr, true);
+                    compiler->CreateBlockBreak(nullptr, true);
                 }
                 else
                 {
@@ -594,23 +813,23 @@ public:
                     if (express != nullptr)
                     {
                         auto right = ParseExpression(express);
-                        compilerLLVM->CreateReturnCall(right);
+                        compiler->CreateReturnCall(right);
                     }
                     else
                     {
-                        compilerLLVM->CreateReturnCall(nullptr);
+                        compiler->CreateReturnCall(nullptr);
                     }
                 }
                 return;
             }
             else if (jump->Continue())
             {
-                compilerLLVM->CreateContinueCall();
+                compiler->CreateContinueCall();
                 return;
             }
             else if (jump->Break())
             {
-                compilerLLVM->CreateBreakCall();
+                compiler->CreateBreakCall();
                 return;
             }
         }
@@ -641,25 +860,25 @@ public:
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
 
-                auto blockCondition = compilerLLVM->CreateBasicBlock("whileCondition");
-                auto blockInner = compilerLLVM->CreateBasicBlock("whileInner");
-                auto blockResume = compilerLLVM->CreateBasicBlock("whileResume");
+                auto blockCondition = compiler->CreateBasicBlock("whileCondition");
+                auto blockInner = compiler->CreateBasicBlock("whileInner");
+                auto blockResume = compiler->CreateBasicBlock("whileResume");
 
-                compilerLLVM->CreateBlockBreak(blockCondition, false);
+                compiler->CreateBlockBreak(blockCondition, false);
 
-                compilerLLVM->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
+                compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
                 auto condition = ParseExpression(expression);
-                compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+                compiler->CreateConditionJump(condition, blockInner, blockResume);
 
-                compilerLLVM->InitializeBlock(blockInner, false);
+                compiler->InitializeBlock(blockInner, false);
                 ParseStatement(innerStatement);
-                compilerLLVM->CreateContinueCall();
+                compiler->CreateContinueCall();
 
                 // resume
-                compilerLLVM->InitializeBlock(blockResume, false);
+                compiler->InitializeBlock(blockResume, false);
 
                 // pop the stack
-                compilerLLVM->CreateBlockBreak(nullptr, true);
+                compiler->CreateBlockBreak(nullptr, true);
 
                 return;
             }
@@ -668,25 +887,25 @@ public:
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
 
-                auto blockInner = compilerLLVM->CreateBasicBlock("doWhileInner");
-                auto blockCondition = compilerLLVM->CreateBasicBlock("doWhileCondition");
-                auto blockResume = compilerLLVM->CreateBasicBlock("doWhileResume");
+                auto blockInner = compiler->CreateBasicBlock("doWhileInner");
+                auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
+                auto blockResume = compiler->CreateBasicBlock("doWhileResume");
 
-                compilerLLVM->CreateBlockBreak(blockInner, false);
+                compiler->CreateBlockBreak(blockInner, false);
 
-                compilerLLVM->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
+                compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
                 ParseStatement(innerStatement);
-                compilerLLVM->CreateContinueCall();
+                compiler->CreateContinueCall();
 
-                compilerLLVM->InitializeBlock(blockCondition, false);
+                compiler->InitializeBlock(blockCondition, false);
                 auto condition = ParseExpression(expression);
-                compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+                compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // resume
-                compilerLLVM->InitializeBlock(blockResume, false);
+                compiler->InitializeBlock(blockResume, false);
 
                 // pop the stack
-                compilerLLVM->CreateBlockBreak(nullptr, true);
+                compiler->CreateBlockBreak(nullptr, true);
             }
             else if (iterationStatement->For())
             {
@@ -702,37 +921,37 @@ public:
                 auto compareCtx = forCondition->assignmentExpression();
                 auto innerStatement = iterationStatement->statement();
 
-                auto blockInit = compilerLLVM->CreateBasicBlock("forInit");
-                auto blockCondition = compilerLLVM->CreateBasicBlock("forCondition");
-                auto blockInner = compilerLLVM->CreateBasicBlock("forInner");
-                auto blockIncrement = compilerLLVM->CreateBasicBlock("forIncrement");
-                auto blockResume = compilerLLVM->CreateBasicBlock("forResume");
+                auto blockInit = compiler->CreateBasicBlock("forInit");
+                auto blockCondition = compiler->CreateBasicBlock("forCondition");
+                auto blockInner = compiler->CreateBasicBlock("forInner");
+                auto blockIncrement = compiler->CreateBasicBlock("forIncrement");
+                auto blockResume = compiler->CreateBasicBlock("forResume");
 
-                compilerLLVM->CreateBlockBreak(blockInit, false);
+                compiler->CreateBlockBreak(blockInit, false);
 
                 // Init => (Condition => Inner => Increment =>Condition)
 
                 // initialization
-                compilerLLVM->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
+                compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
                 if (declaration)
                     ParseForDeclaration(declaration);
                 if (expressionCtx)
                     ParseExpression(expressionCtx);
 
-                compilerLLVM->CreateContinueCall();
+                compiler->CreateContinueCall();
 
                 // Condition
-                compilerLLVM->InitializeBlock(blockCondition, false);
+                compiler->InitializeBlock(blockCondition, false);
                 auto condition = ParseAssignmentExpression(compareCtx);
-                compilerLLVM->CreateConditionJump(condition, blockInner, blockResume);
+                compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // Inner statement
-                compilerLLVM->InitializeBlock(blockInner, false);
+                compiler->InitializeBlock(blockInner, false);
                 ParseStatement(innerStatement);
-                compilerLLVM->CreateContinueCall();
+                compiler->CreateContinueCall();
 
                 // Increment
-                compilerLLVM->InitializeBlock(blockIncrement, false);
+                compiler->InitializeBlock(blockIncrement, false);
 
                 auto assignments = forIncrementCtx->assignmentExpression();
                 for (auto assign : assignments)
@@ -741,13 +960,13 @@ public:
                     ProcessPlusPlus();
                 }
 
-                compilerLLVM->CreateBlockBreak(blockCondition, false);
+                compiler->CreateBlockBreak(blockCondition, false);
 
                 // resume
-                compilerLLVM->InitializeBlock(blockResume, false);
+                compiler->InitializeBlock(blockResume, false);
 
                 // pop the stack
-                compilerLLVM->CreateBlockBreak(nullptr, true);
+                compiler->CreateBlockBreak(nullptr, true);
 
                 return;
             }
@@ -767,33 +986,33 @@ public:
                 auto innerStatement = selectionStatement->statement();
 
                 // Parse condition value before CreateBlock
-                auto blockCondition = compilerLLVM->CreateBasicBlock("ifCondition");
-                auto blockTrue = compilerLLVM->CreateBasicBlock("ifTrue");
-                auto blockResume = compilerLLVM->CreateBasicBlock("ifResume");
-                llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compilerLLVM->CreateBasicBlock("ifFalse");
+                auto blockCondition = compiler->CreateBasicBlock("ifCondition");
+                auto blockTrue = compiler->CreateBasicBlock("ifTrue");
+                auto blockResume = compiler->CreateBasicBlock("ifResume");
+                llvm::BasicBlock* blockElse = selectionStatement->Else() == nullptr ? nullptr : compiler->CreateBasicBlock("ifFalse");
                 auto blockFalse = blockElse ? blockElse : blockResume;
 
-                compilerLLVM->CreateBlockBreak(blockCondition, false);
+                compiler->CreateBlockBreak(blockCondition, false);
 
-                compilerLLVM->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
+                compiler->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
                 auto condition = ParseExpression(expression);
-                compilerLLVM->CreateConditionJump(condition, blockTrue, blockFalse);
+                compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
-                compilerLLVM->InitializeBlock(blockTrue, false);
+                compiler->InitializeBlock(blockTrue, false);
                 ParseStatement(innerStatement[0]);
 
-                compilerLLVM->CreateBlockBreak(blockResume, true);
+                compiler->CreateBlockBreak(blockResume, true);
 
                 if (blockElse != nullptr)
                 {
                     // else statement
-                    compilerLLVM->InitializeBlock(blockElse, true);
+                    compiler->InitializeBlock(blockElse, true);
                     ParseStatement(innerStatement[1]);
-                    compilerLLVM->CreateBlockBreak(blockResume, true);
+                    compiler->CreateBlockBreak(blockResume, true);
                 }
 
                 // resume
-                compilerLLVM->InitializeBlock(blockResume, false);
+                compiler->InitializeBlock(blockResume, false);
                 return;
             }
             else if (selectionStatement->Switch())
@@ -802,7 +1021,7 @@ public:
                 auto body = selectionStatement->statement(0)->compoundStatement();
 
                 SwitchContext switchCtx;
-                switchCtx.resumeBlock = compilerLLVM->CreateBasicBlock("switchResume");
+                switchCtx.resumeBlock = compiler->CreateBasicBlock("switchResume");
 
                 // Pre-scan: collect all case/default labels and create their blocks
                 if (body && body->blockItemList())
@@ -818,12 +1037,12 @@ public:
 
                 // Emit switch instruction
                 auto condVal = ParseExpression(expression);
-                auto switchInst = compilerLLVM->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
+                auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
                 for (auto& [labeledCtx, entry] : switchCtx.caseMap)
-                    switchInst->addCase(compilerLLVM->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                    switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
 
                 // Push scope: break → resumeBlock, no continue (propagates to outer loop)
-                compilerLLVM->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
+                compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
 
                 switchStack.push_back(switchCtx);
 
@@ -831,21 +1050,21 @@ public:
                     ParseBlockItemList(body->blockItemList());
 
                 // Fallthrough at end of switch body → resume
-                compilerLLVM->CreateBlockBreak(switchCtx.resumeBlock, true);
+                compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
 
                 switchStack.pop_back();
 
-                compilerLLVM->InitializeBlock(switchCtx.resumeBlock, false);
+                compiler->InitializeBlock(switchCtx.resumeBlock, false);
                 return;
             }
         }
         else if (compoundStatement)
         {
-            compilerLLVM->InitializeBlock(nullptr, true);
+            compiler->InitializeBlock(nullptr, true);
             auto blockList = compoundStatement->blockItemList();
             if (blockList)
                 ParseBlockItemList(blockList);
-            compilerLLVM->CreateBlockBreak(nullptr, true);
+            compiler->CreateBlockBreak(nullptr, true);
             return;
         }
 
@@ -860,6 +1079,7 @@ public:
         bool varargs,
         int line)
     {
+        auto* compiler = Compiler();
         int firstDefault = -1;
         for (int i = 0; i < (int)params.size(); i++)
         {
@@ -882,15 +1102,15 @@ public:
         {
             std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
 
-            auto wrapperFn = compilerLLVM->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
-            compilerLLVM->InitializeBlock(&wrapperFn->front(), false);
+            auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
+            compiler->InitializeBlock(&wrapperFn->front(), false);
 
             // Build the full argument list for the forwarding call
             std::vector<MyCompilerLLVM::NamedVariable> callArgs;
 
             for (int i = 0; i < cutoff; i++)
             {
-                callArgs.push_back(compilerLLVM->GetFunctionArgument(params[i].VariableName));
+                callArgs.push_back(compiler->GetFunctionArgument(params[i].VariableName));
             }
 
             for (int i = cutoff; i < (int)params.size(); i++)
@@ -904,24 +1124,25 @@ public:
 
             if (returnType.TypeName == "void")
             {
-                compilerLLVM->CreateFunctionCall2(name, callArgs);
-                compilerLLVM->CreateReturnCall(nullptr);
+                compiler->CreateFunctionCall2(name, callArgs);
+                compiler->CreateReturnCall(nullptr);
             }
             else
             {
-                auto result = compilerLLVM->CreateFunctionCall2(name, callArgs);
-                compilerLLVM->CreateReturnCall(result);
+                auto result = compiler->CreateFunctionCall2(name, callArgs);
+                compiler->CreateReturnCall(result);
             }
 
-            compilerLLVM->CreateBlockBreak(nullptr, true);
-            compilerLLVM->ClearCurrentSubprogram();
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
         }
     }
 
-    void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {})
+    void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {}, const std::string& nameOverride = {})
     {
+        auto* compiler = Compiler(func);
         // Create Function Definition
-        auto name = this->getFunctionName(func);
+        auto name = nameOverride.empty() ? this->getFunctionName(func) : nameOverride;
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
         auto returnType = this->getFunctionReturnType(func);
@@ -929,6 +1150,15 @@ public:
         auto params = this->ParseParameterTypeList(paramTypeList);
         int line = func->getStart()->getLine();
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
+
+        // If this is a generic function template definition (not an instantiation), store it and return.
+        if (nameOverride.empty() && func->genericTypeParameters() != nullptr)
+        {
+            auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
+            genericFunctionTemplates[name] = func;
+            genericFunctionTypeParams[name] = typeParams;
+            return;
+        }
 
         if (!structName.empty())
         {
@@ -944,7 +1174,7 @@ public:
         {
             auto* blockBody = func->compoundStatement()->blockItemList()->blockItem()[0]
                 ->statement()->jumpStatement()->compoundStatement();
-            compilerLLVM->RegisterReturnBlock(name, blockBody, params, returnType);
+            compiler->RegisterReturnBlock(name, blockBody, params, returnType);
             return;
         }
 
@@ -959,27 +1189,27 @@ public:
             ProcessPendingInstantiations();
         }
 
-        auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
 
-        compilerLLVM->InitializeBlock(&fn->front(), false);
+        compiler->InitializeBlock(&fn->front(), false);
 
         auto blockItemList = func->compoundStatement()->blockItemList();
 
         if (blockItemList)
             ParseBlockItemList(blockItemList);
 
-        if (returnType.TypeName != "void" && !compilerLLVM->IsBlockTerminated())
+        if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
             LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
 
         // if return is void, then this might need a implicit return;
         if (returnType.TypeName == "void")
         {
-            compilerLLVM->CreateReturnCall(nullptr);
+            compiler->CreateReturnCall(nullptr);
         }
 
         // Pop the stack
-        compilerLLVM->CreateBlockBreak(nullptr, true);
-        compilerLLVM->ClearCurrentSubprogram();
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
 
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
@@ -1036,6 +1266,7 @@ public:
 
     void ParseEnumSpecifier(CParser::EnumSpecifierContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         if (!ctx) return;
 
         // enum Identifier : typeSpecifier { enumeratorList }
@@ -1046,7 +1277,7 @@ public:
 
         // Register enum name as a namespace so members can be referenced as EnumName.Member
         if (!enumName.empty())
-            compilerLLVM->RegisterNamespace(enumName);
+            compiler->RegisterNamespace(enumName);
 
         long long current = 0;
         auto list = ctx->enumeratorList();
@@ -1078,11 +1309,11 @@ public:
             // Register the enum's backing type so GetType and overload resolution can
             // resolve enum types to the underlying integral type.
             if (!enumName.empty())
-                compilerLLVM->RegisterEnumBackingType(enumName, backingType);
+                compiler->RegisterEnumBackingType(enumName, backingType);
 
             // Create a typed constant using the backing type
-            llvm::Constant* c = compilerLLVM->CreateConstant(backingType, std::to_string(value));
-            compilerLLVM->CreateGlobalVariable(tv, c);
+            llvm::Constant* c = compiler->CreateConstant(backingType, std::to_string(value));
+            compiler->CreateGlobalVariable(tv, c);
 
             current = value + 1;
         }
@@ -1090,6 +1321,7 @@ public:
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationSpecifiersContext* declSpec, CParser::InitDeclaratorListContext* initDecl)
     {
+        auto* compiler = Compiler(declSpec);
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
         int line = declSpec->getStart()->getLine();
@@ -1137,7 +1369,7 @@ public:
                 std::vector<MyCompilerLLVM::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList->Ellipsis() != nullptr;
-                compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
+                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
 
                 // Declare overloads for each suffix of omitted default parameters
                 int firstDefault = -1;
@@ -1148,7 +1380,7 @@ public:
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
                     std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
-                    compilerLLVM->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false);
+                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false);
                 }
             }
             else if (direct != nullptr)
@@ -1172,11 +1404,15 @@ public:
                     {
                         right = ParseAssignmentExpression(assignmentExpression);
                     }
+                    else if (initializer->Default() != nullptr)
+                    {
+                        right = GenerateDefaultValue(typeAndValue);
+                    }
                 }
 
                 if (right == nullptr && !typeAndValue.Pointer)
                 {
-                    auto structData = compilerLLVM->GetDataStructure(typeAndValue.TypeName);
+                    auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
                     {
                         LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
@@ -1186,16 +1422,16 @@ public:
                 if (global_scope)
                 {
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
-                    compilerLLVM->CreateGlobalVariable(typeAndValue, constant);
+                    compiler->CreateGlobalVariable(typeAndValue, constant);
                 }
                 else
                 {
-                    auto alloc = compilerLLVM->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line);
+                    auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line);
                     allocList.push_back(std::pair(name, alloc));
 
                     if (right != nullptr)
                     {
-                        compilerLLVM->CreateAssignment(right, alloc);
+                        compiler->CreateAssignment(right, alloc);
                     }
                 }
             }
@@ -1206,6 +1442,7 @@ public:
 
     llvm::Value* ParseAssignmentExpression(CParser::AssignmentExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto condCtx = ctx->conditionalExpression();
         auto assignmentOp = ctx->assignmentOperator();
         auto unaryCtx = ctx->unaryExpression();
@@ -1225,11 +1462,11 @@ public:
 
             if (operatorText != "=")
             {
-                auto left = compilerLLVM->CreateLoad(destination);
-                right = compilerLLVM->CreateOperation(operatorText, left, right);
+                auto left = compiler->CreateLoad(destination);
+                right = compiler->CreateOperation(operatorText, left, right);
             }
 
-            return compilerLLVM->CreateAssignment(right, destination);
+            return compiler->CreateAssignment(right, destination);
         }
         else if (unaryCtx)
         {
@@ -1244,6 +1481,7 @@ public:
 
     llvm::Value* ParseConditionalExpression(CParser::ConditionalExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
 
         if (ctx->QuestionQuestion())
@@ -1252,24 +1490,24 @@ public:
             auto* lhs = ParseLogicalOrExpression(logicCtx);
             if (!lhs) return nullptr;
 
-            auto* resultAlloca = compilerLLVM->CreateAlloca(lhs->getType());
+            auto* resultAlloca = compiler->CreateAlloca(lhs->getType());
 
-            auto* nullBlock = compilerLLVM->CreateBasicBlock("nullcoal_null");
-            auto* notNullBlock = compilerLLVM->CreateBasicBlock("nullcoal_notnull");
-            auto* resumeBlock = compilerLLVM->CreateBasicBlock("nullcoal_resume");
+            auto* nullBlock = compiler->CreateBasicBlock("nullcoal_null");
+            auto* notNullBlock = compiler->CreateBasicBlock("nullcoal_notnull");
+            auto* resumeBlock = compiler->CreateBasicBlock("nullcoal_resume");
 
-            compilerLLVM->CreateConditionJump(lhs, notNullBlock, nullBlock);
+            compiler->CreateConditionJump(lhs, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
-            compilerLLVM->CreateAssignment(lhs, resultAlloca);
-            compilerLLVM->CreateJump(resumeBlock);
+            compiler->CreateAssignment(lhs, resultAlloca);
+            compiler->CreateJump(resumeBlock);
 
-            compilerLLVM->SwitchToBlock(nullBlock);
+            compiler->SwitchToBlock(nullBlock);
             auto* rhs = ParseConditionalExpression(ctx->conditionalExpression());
-            compilerLLVM->CreateAssignment(rhs, resultAlloca);
-            compilerLLVM->CreateJump(resumeBlock);
+            compiler->CreateAssignment(rhs, resultAlloca);
+            compiler->CreateJump(resumeBlock);
 
-            compilerLLVM->SwitchToBlock(resumeBlock);
-            return compilerLLVM->CreateLoad(resultAlloca);
+            compiler->SwitchToBlock(resumeBlock);
+            return compiler->CreateLoad(resultAlloca);
         }
 
         auto expressionFalse = ctx->expression();
@@ -1290,7 +1528,7 @@ public:
                 auto falseValue = ParseExpression(expressionFalse);
                 auto trueValue = ParseConditionalExpression(expressionTrue);
 
-                auto selectValue = compilerLLVM->CreateSelect(expression, falseValue, trueValue);
+                auto selectValue = compiler->CreateSelect(expression, falseValue, trueValue);
                 return selectValue;
             }
 
@@ -1303,6 +1541,7 @@ public:
 
     llvm::Value* ParseLogicalOrExpression(CParser::LogicalOrExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
 
         if (logicCtxs.size() == 1)
@@ -1312,7 +1551,7 @@ public:
         else if (logicCtxs.size() > 1)
         {
             llvm::Value* left = nullptr;
-            auto elseBlock = compilerLLVM->GetElseBlock();
+            auto elseBlock = compiler->GetElseBlock();
 
             if (elseBlock)
             {
@@ -1324,44 +1563,44 @@ public:
                     }
                     else
                     {
-                        auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
-                        auto branch = compilerLLVM->CreateConditionJump(left, elseBlock, falseBlock);
+                        auto falseBlock = compiler->CreateBasicBlock("falseOR");
+                        auto branch = compiler->CreateConditionJump(left, elseBlock, falseBlock);
 
-                        compilerLLVM->InitializeBlock(falseBlock, false);
+                        compiler->InitializeBlock(falseBlock, false);
                         llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-                        left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
                     }
                 }
             }
             else
             {
                 MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
-                auto resultStorage = compilerLLVM->CreateAlloca(compilerLLVM->GetType(boolValue));
-                auto resumeBlock = compilerLLVM->CreateBasicBlock("resumeOR");
+                auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+                auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
 
                 for (const auto& logicCtx : logicCtxs)
                 {
                     if (left == nullptr)
                     {
                         left = ParseLogicalAndExpression(logicCtx);
-                        compilerLLVM->CreateAssignment(left, resultStorage);
+                        compiler->CreateAssignment(left, resultStorage);
                     }
                     else
                     {
-                        auto falseBlock = compilerLLVM->CreateBasicBlock("falseOR");
-                        auto branch = compilerLLVM->CreateConditionJump(left, resumeBlock, falseBlock);
+                        auto falseBlock = compiler->CreateBasicBlock("falseOR");
+                        auto branch = compiler->CreateConditionJump(left, resumeBlock, falseBlock);
 
-                        compilerLLVM->InitializeBlock(falseBlock, false);
+                        compiler->InitializeBlock(falseBlock, false);
                         llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-                        left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
-                        compilerLLVM->CreateAssignment(left, resultStorage);
+                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+                        compiler->CreateAssignment(left, resultStorage);
                     }
                 }
 
-                compilerLLVM->CreateBlockBreak(resumeBlock, false);
+                compiler->CreateBlockBreak(resumeBlock, false);
 
-                compilerLLVM->InitializeBlock(resumeBlock, false);
-                return compilerLLVM->CreateLoad(resultStorage);
+                compiler->InitializeBlock(resumeBlock, false);
+                return compiler->CreateLoad(resultStorage);
             }
 
             return left;
@@ -1373,6 +1612,7 @@ public:
 
     llvm::Value* ParseLogicalAndExpression(CParser::LogicalAndExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
 
         if (inclusiveCtxs.size() == 1)
@@ -1382,7 +1622,7 @@ public:
         else if (inclusiveCtxs.size() > 1)
         {
             llvm::Value* left = nullptr;
-            auto elseBlock = compilerLLVM->GetElseBlock();
+            auto elseBlock = compiler->GetElseBlock();
 
             if (elseBlock)
             {
@@ -1394,44 +1634,44 @@ public:
                     }
                     else
                     {
-                        auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
-                        auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, compilerLLVM->GetElseBlock());
+                        auto trueBlock = compiler->CreateBasicBlock("trueAND");
+                        auto branch = compiler->CreateConditionJump(left, trueBlock, compiler->GetElseBlock());
 
-                        compilerLLVM->InitializeBlock(trueBlock, false);
+                        compiler->InitializeBlock(trueBlock, false);
                         llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
                     }
                 }
             }
             else
             {
                 MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
-                auto resultStorage = compilerLLVM->CreateAlloca(compilerLLVM->GetType(boolValue));
-                auto resumeBlock = compilerLLVM->CreateBasicBlock("resumeAND");
+                auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+                auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
 
                 for (const auto& inclusiveCtx : inclusiveCtxs)
                 {
                     if (left == nullptr)
                     {
                         left = ParseInclusiveOrExpression(inclusiveCtx);
-                        compilerLLVM->CreateAssignment(left, resultStorage);
+                        compiler->CreateAssignment(left, resultStorage);
                     }
                     else
                     {
-                        auto trueBlock = compilerLLVM->CreateBasicBlock("trueAND");
-                        auto branch = compilerLLVM->CreateConditionJump(left, trueBlock, resumeBlock);
+                        auto trueBlock = compiler->CreateBasicBlock("trueAND");
+                        auto branch = compiler->CreateConditionJump(left, trueBlock, resumeBlock);
 
-                        compilerLLVM->InitializeBlock(trueBlock, false);
+                        compiler->InitializeBlock(trueBlock, false);
                         llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compilerLLVM->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
-                        compilerLLVM->CreateAssignment(left, resultStorage);
+                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+                        compiler->CreateAssignment(left, resultStorage);
                     }
                 }
 
-                compilerLLVM->CreateBlockBreak(resumeBlock, false);
+                compiler->CreateBlockBreak(resumeBlock, false);
 
-                compilerLLVM->InitializeBlock(resumeBlock, false);
-                return compilerLLVM->CreateLoad(resultStorage);
+                compiler->InitializeBlock(resumeBlock, false);
+                return compiler->CreateLoad(resultStorage);
             }
             return left;
         }
@@ -1497,7 +1737,7 @@ public:
             auto left = ParseRelationalExpression(nextCtxs[0]);
             auto right = ParseRelationalExpression(nextCtxs[1]);
 
-            return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
+            return Compiler(ctx)->CreateOperation(ctx->children[1]->getText(), left, right);
         }
 
         LogErrorContext(ctx, "Equality expression has unexpected operand count.");
@@ -1516,7 +1756,7 @@ public:
             auto left = ParseShiftExpression(nextCtxs[0]);
             auto right = ParseShiftExpression(nextCtxs[1]);
 
-            return compilerLLVM->CreateOperation(ctx->children[1]->getText(), left, right);
+            return Compiler(ctx)->CreateOperation(ctx->children[1]->getText(), left, right);
         }
 
         LogErrorContext(ctx, "Relational expression has unexpected operand count.");
@@ -1555,7 +1795,7 @@ public:
             for (const auto& nextCtx : nextCtxs)
             {
                 rvalue = ParseMultiplicativeExpression(nextCtx);
-                lvalue = compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+                lvalue = Compiler(ctx)->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
             }
 
             return lvalue;
@@ -1567,6 +1807,7 @@ public:
 
     llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
     {
+        auto* compiler = Compiler();
         if (namedVar.TypeAndValue.Pointer)
         {
             if (namedVar.Primary != nullptr)
@@ -1577,7 +1818,7 @@ public:
                 // Function arguments have the pointer value as the argument itself — return directly.
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
                     llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
-                    return compilerLLVM->CreateLoad(namedVar.Storage);
+                    return compiler->CreateLoad(namedVar.Storage);
                 return namedVar.Storage;
             }
             return nullptr;
@@ -1589,7 +1830,7 @@ public:
 
             if (namedVar.Storage != nullptr)
             {
-                return compilerLLVM->CreateLoad(namedVar.Storage);
+                return compiler->CreateLoad(namedVar.Storage);
             }
         }
 
@@ -1616,7 +1857,7 @@ public:
             {
                 auto namedVar = ParseCastExpression(nextCtx);
                 rvalue = LoadNamedVariable(namedVar);
-                lvalue = compilerLLVM->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+                lvalue = Compiler(ctx)->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
             }
 
             return lvalue;
@@ -1628,6 +1869,7 @@ public:
 
     MyCompilerLLVM::NamedVariable ParseCastExpression(CParser::CastExpressionContext* ctx, bool lvalue = false)
     {
+        auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
         auto castExp = ctx->castExpression();
         auto typeName = ctx->typeName();
@@ -1640,17 +1882,17 @@ public:
         {
             auto namedVar = ParseCastExpression(castExp);
             auto destTypeName = ParseTypeName(typeName);
-            auto type = compilerLLVM->GetType(destTypeName);
+            auto type = compiler->GetType(destTypeName);
 
             if (namedVar.Storage)
             {
                 // If storage is available, then load it with new type.
-                namedVar.Primary = compilerLLVM->CreateLoad(type, namedVar.Storage);
+                namedVar.Primary = compiler->CreateLoad(type, namedVar.Storage);
             }
             else
             {
                 // Otherwise cast it.
-                namedVar.Primary = compilerLLVM->CreateCast(namedVar.Primary, type);
+                namedVar.Primary = compiler->CreateCast(namedVar.Primary, type);
             }
 
             return namedVar;
@@ -1695,6 +1937,7 @@ public:
 
     MyCompilerLLVM::NamedVariable ParseUnaryExpression(CParser::UnaryExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto postFixCtx = ctx->postfixExpression();
         auto castExpCtx = ctx->castExpression();
         auto unaryOperator = ctx->unaryOperator();
@@ -1732,18 +1975,18 @@ public:
                     LogErrorContext(ctx, "Unable to dereference a non-Pointer.");
                 }
 
-                namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+                namedVar.Primary = compiler->CreateLoad(namedVar.Storage);
             }
             else if (opText == "!")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compilerLLVM->CreateNot(newValue);
+                namedVar.Primary = compiler->CreateNot(newValue);
                 namedVar.Storage = nullptr;
             }
             else if (opText == "-")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compilerLLVM->CreateNeg(newValue);
+                namedVar.Primary = compiler->CreateNeg(newValue);
                 namedVar.Storage = nullptr;
             }
             else if (opText == "+")
@@ -1755,7 +1998,7 @@ public:
             else if (opText == "~")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compilerLLVM->CreateNot(newValue);
+                namedVar.Primary = compiler->CreateNot(newValue);
                 namedVar.Storage = nullptr;
             }
             else
@@ -1821,9 +2064,9 @@ public:
                         if (!namespaceContext.empty())
                         {
                             std::string qualifiedName = namespaceContext + "." + terminal->getText();
-                            if (compilerLLVM->IsNamespace(qualifiedName))
+                            if (Compiler(ctx)->IsNamespace(qualifiedName))
                             {
-                                namespaceContext = compilerLLVM->ResolveNamespace(qualifiedName);
+                                namespaceContext = Compiler(ctx)->ResolveNamespace(qualifiedName);
                                 primaryIdentifier = namespaceContext;
                                 namedVar = {};
                             }
@@ -1835,12 +2078,12 @@ public:
                                 primaryIdentifier = qualifiedName;
                                 namespaceContext.clear();
 
-                                if (auto gVar = compilerLLVM->GetGlobalVariable(primaryIdentifier))
+                                if (auto gVar = Compiler(ctx)->GetGlobalVariable(primaryIdentifier))
                                 {
                                     namedVar.Storage = gVar;
                                     namedVar.BaseType = gVar->getType();
                                 }
-                                else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
+                                else if (auto func = Compiler(ctx)->GetFunction(primaryIdentifier))
                                 {
                                     namedVar.Primary = func;
                                 }
@@ -1859,7 +2102,7 @@ public:
                         else if (structVar.BaseType)
                         {
                             primaryIdentifier = terminal->getText();
-                            auto dataStructure = compilerLLVM->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
+                            auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
                             uint32_t fieldIndex = 0;
 
                             for (const auto& field : dataStructure.StructFields)
@@ -1877,27 +2120,27 @@ public:
                                 if (nullConditionalPending && structVar.Storage != nullptr)
                                 {
                                     // Null-conditional field access: emit a null check branch
-                                    auto* fieldLLVMType = compilerLLVM->GetType(fieldType);
-                                    auto* resultAlloca = compilerLLVM->CreateAlloca(fieldLLVMType);
+                                    auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
+                                    auto* resultAlloca = Compiler(ctx)->CreateAlloca(fieldLLVMType);
 
-                                    auto* nullBlock = compilerLLVM->CreateBasicBlock("nc_null");
-                                    auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
-                                    auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
+                                    auto* nullBlock = Compiler(ctx)->CreateBasicBlock("nc_null");
+                                    auto* accessBlock = Compiler(ctx)->CreateBasicBlock("nc_access");
+                                    auto* resumeBlock = Compiler(ctx)->CreateBasicBlock("nc_resume");
 
-                                    compilerLLVM->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
+                                    Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
                                     // insert point is now accessBlock
 
-                                    auto* fieldGEP = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                    auto* fieldVal = compilerLLVM->CreateLoad(fieldGEP);
-                                    compilerLLVM->CreateAssignment(fieldVal, resultAlloca);
-                                    compilerLLVM->CreateJump(resumeBlock);
+                                    auto* fieldGEP = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                    auto* fieldVal = Compiler(ctx)->CreateLoad(fieldGEP);
+                                    Compiler(ctx)->CreateAssignment(fieldVal, resultAlloca);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
 
-                                    compilerLLVM->SwitchToBlock(nullBlock);
-                                    compilerLLVM->CreateAssignment(llvm::Constant::getNullValue(fieldLLVMType), resultAlloca);
-                                    compilerLLVM->CreateJump(resumeBlock);
+                                    Compiler(ctx)->SwitchToBlock(nullBlock);
+                                    Compiler(ctx)->CreateAssignment(llvm::Constant::getNullValue(fieldLLVMType), resultAlloca);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
 
-                                    compilerLLVM->SwitchToBlock(resumeBlock);
-                                    auto* result = compilerLLVM->CreateLoad(resultAlloca);
+                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
+                                    auto* result = Compiler(ctx)->CreateLoad(resultAlloca);
 
                                     namedVar.Storage = nullptr;
                                     namedVar.Primary = result;
@@ -1909,22 +2152,22 @@ public:
                                 {
                                     if (structVar.Storage)
                                     {
-                                        namedVar.Storage = compilerLLVM->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                        namedVar.Primary = compilerLLVM->CreateLoad(namedVar.Storage);
+                                        namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                        namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
                                         namedVar.BaseType = namedVar.Primary->getType();
                                     }
                                     else if (structVar.Primary)
                                     {
                                         namedVar.Storage = nullptr;
-                                        namedVar.Primary = compilerLLVM->CreateExtractValue(structVar.Primary, fieldIndex);
+                                        namedVar.Primary = Compiler(ctx)->CreateExtractValue(structVar.Primary, fieldIndex);
                                         namedVar.BaseType = namedVar.Primary->getType();
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                 }
                             }
-                            else if (auto func = compilerLLVM->GetFunction(primaryIdentifier))
+                            else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier))
                             {
-                                // Not a field, then it might be a function.
+                                // Not a field — could be a member function or an extension method template.
                                 namedVar = {};
                             }
                             else
@@ -1964,10 +2207,10 @@ public:
 
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
                         // map it to its mangled constructor name (e.g. Box__MyInt).
-                        if (prevPrimary->Identifier() && prevPrimary->genericTypeParameters())
+                        if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
-                            std::string mangledName = prevPrimary->Identifier()->getText();
-                            for (auto* typeParamSpec : prevPrimary->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                            std::string mangledName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            for (auto* typeParamSpec : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                                 mangledName += "__" + typeParamSpec->getText();
                             primaryIdentifier = mangledName;
                             namedVar = {};
@@ -1976,9 +2219,9 @@ public:
 
                         primaryIdentifier = prevPrimary->getText();
 
-                        if (prevPrimary->Identifier() && compilerLLVM->IsNamespace(prevPrimary->Identifier()->getText()))
+                        if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr && Compiler(ctx)->IsNamespace(prevPrimary->genericIdentifier()->Identifier()->getText()))
                         {
-                            namespaceContext = compilerLLVM->ResolveNamespace(prevPrimary->Identifier()->getText());
+                            namespaceContext = Compiler(ctx)->ResolveNamespace(prevPrimary->genericIdentifier()->Identifier()->getText());
                             namedVar = {};
                             structVar = {};
                         }
@@ -1989,8 +2232,9 @@ public:
 
                             if (namedVar.Primary == nullptr)
                             {
-                                // Try identifier.
-                                namedVar = ParseIdentifier(prevPrimary->Identifier());
+                                // Try identifier (now wrapped in genericIdentifier in the grammar)
+                                if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
+                                    namedVar = ParseIdentifier(prevPrimary->genericIdentifier()->Identifier());
                             }
                         }
 
@@ -2031,15 +2275,15 @@ public:
                             // element type (TypeName without the pointer flag) as element type.
                             auto elementTypeAndValue = namedVar.TypeAndValue;
                             elementTypeAndValue.Pointer = false;
-                            auto elementType = compilerLLVM->GetType(elementTypeAndValue);
+                            auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             auto ptrValue = LoadNamedVariable(namedVar);
-                            namedVar.Storage = compilerLLVM->CreateGEP(elementType, ptrValue, rvalue);
+                            namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue.Pointer = false;
                         }
                         else
                         {
-                            namedVar.Storage = compilerLLVM->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
+                            namedVar.Storage = Compiler(ctx)->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
                             namedVar.BaseType = namedVar.Storage->getType();
                         }
                         namedVar.Primary = nullptr;
@@ -2064,9 +2308,9 @@ public:
 
                         // Check if this is a return-block function — inline it at the call site.
                         // A 'return' inside the block returns from the caller function.
-                        if (const auto* rb = compilerLLVM->GetReturnBlock(functionName))
+                        if (const auto* rb = Compiler(ctx)->GetReturnBlock(functionName))
                         {
-                            compilerLLVM->InitializeBlock(nullptr, true);
+                            Compiler(ctx)->InitializeBlock(nullptr, true);
 
                             // Determine if the first param is an implicit 'this'
                             size_t paramOffset = (!rb->Params.empty() &&
@@ -2084,7 +2328,7 @@ public:
                                 }
                                 else
                                 {
-                                    thisVar = compilerLLVM->GetCurrentMemberThis(functionName);
+                                    thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
                                 }
                                 if (thisVar.Storage != nullptr)
                                 {
@@ -2093,8 +2337,8 @@ public:
                                     tv.TypeName = thisParam.TypeName;
                                     tv.VariableName = thisParam.VariableName;
                                     tv.Pointer = thisParam.Pointer;
-                                    auto* alloca = compilerLLVM->CreateLocalVariable(tv);
-                                    compilerLLVM->CreateAssignment(thisVar.Storage, alloca);
+                                    auto* alloca = Compiler(ctx)->CreateLocalVariable(tv);
+                                    Compiler(ctx)->CreateAssignment(thisVar.Storage, alloca);
                                 }
                             }
 
@@ -2114,12 +2358,12 @@ public:
                                     {
                                         // Pointer params: store value directly as Primary so GetValue()
                                         // returns the pointer itself rather than the alloca address.
-                                        compilerLLVM->RegisterPrimaryVariable(tv, argValue);
+                                        Compiler(ctx)->RegisterPrimaryVariable(tv, argValue);
                                     }
                                     else
                                     {
-                                        auto* alloca = compilerLLVM->CreateLocalVariable(tv);
-                                        compilerLLVM->CreateAssignment(argValue, alloca);
+                                        auto* alloca = Compiler(ctx)->CreateLocalVariable(tv);
+                                        Compiler(ctx)->CreateAssignment(argValue, alloca);
                                     }
                                 }
                             }
@@ -2127,7 +2371,7 @@ public:
                             if (auto* blockItems = rb->Body->blockItemList())
                                 ParseBlockItemList(blockItems);
 
-                            compilerLLVM->CreateBlockBreak(nullptr, true);
+                            Compiler(ctx)->CreateBlockBreak(nullptr, true);
 
                             // The block's 'return' already terminated the caller's basic block.
                             // Return an empty namedVar — callers must tolerate null after a terminator.
@@ -2135,7 +2379,7 @@ public:
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
-                            // Interface method dispatch via vtable
+                            // Collect extra call arguments
                             std::vector<MyCompilerLLVM::NamedVariable> extraArgs;
                             if (argumentList.size() > 0)
                             {
@@ -2147,20 +2391,56 @@ public:
                                     MyCompilerLLVM::NamedVariable argVar;
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+
+                                    // Extract struct name if this is a struct type
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
+                                    {
+                                        auto structName = st->getName().str();
+                                        if (!structName.empty())
+                                            argVar.TypeAndValue.TypeName = structName;
+                                    }
+
                                     extraArgs.emplace_back(argVar);
                                 }
                             }
 
-                            namedVar.Primary = compilerLLVM->CallInterfaceMethod(
-                                interfaceVar.Storage,
-                                interfaceVar.TypeAndValue.TypeName,
-                                primaryIdentifier,
-                                extraArgs
-                            );
-                            namedVar.Storage = nullptr;
-                            namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-                            interfaceVar = {};
-                            structVar = {};
+                            if (Compiler(ctx)->HasInterfaceMethod(interfaceVar.TypeAndValue.TypeName, primaryIdentifier))
+                            {
+                                // Interface method dispatch via vtable
+                                namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
+                                    interfaceVar.Storage,
+                                    interfaceVar.TypeAndValue.TypeName,
+                                    primaryIdentifier,
+                                    extraArgs
+                                );
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                interfaceVar = {};
+                                structVar = {};
+                            }
+                            else
+                            {
+                                // Extension method: find a standalone or generic function and
+                                // pass the interface value as the first argument.
+                                std::string extFuncName;
+                                if (genericFunctionTemplates.count(primaryIdentifier))
+                                    extFuncName = InferAndInstantiateGenericFunction(primaryIdentifier, interfaceVar.TypeAndValue.TypeName);
+                                if (extFuncName.empty())
+                                    extFuncName = primaryIdentifier;
+
+                                std::vector<MyCompilerLLVM::NamedVariable> allArgs;
+                                MyCompilerLLVM::NamedVariable ifaceArg = interfaceVar;
+                                ifaceArg.TypeAndValue.VariableName = "";
+                                allArgs.push_back(ifaceArg);
+                                for (const auto& e : extraArgs)
+                                    allArgs.push_back(e);
+
+                                namedVar.Primary = Compiler(ctx)->CreateFunctionCall2(extFuncName, allArgs);
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                interfaceVar = {};
+                                structVar = {};
+                            }
                         }
                         else
                         {
@@ -2175,7 +2455,7 @@ public:
                             {
                                 // Bare call inside a member function — inject 'this' automatically
                                 // if the callee is a method of the same struct.
-                                auto thisVar = compilerLLVM->GetCurrentMemberThis(functionName);
+                                auto thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
                                 if (thisVar.Storage != nullptr)
                                     arguments.push_back(thisVar);
                             }
@@ -2196,6 +2476,14 @@ public:
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
 
+                                    // Extract struct name if this is a struct type
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
+                                    {
+                                        auto structName = st->getName().str();
+                                        if (!structName.empty())
+                                            argVar.TypeAndValue.TypeName = structName;
+                                    }
+
                                     arguments.emplace_back(argVar);
                                 }
                             }
@@ -2203,41 +2491,57 @@ public:
                             if (nullConditionalPending && structVar.Storage != nullptr)
                             {
                                 // Null-conditional method call: gate the call on a null check
-                                auto* retType = compilerLLVM->GetFunctionReturnType(functionName);
+                                // Resolve generic extension method if needed
+                                std::string resolvedFuncName = functionName;
+                                if (!Compiler(ctx)->GetFunction(functionName) && genericFunctionTemplates.count(functionName))
+                                {
+                                    std::string structTypeName = structVar.TypeAndValue.TypeName;
+                                    if (structTypeName.empty() && structVar.BaseType)
+                                    {
+                                        if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                            structTypeName = st->getName().str();
+                                    }
+                                    for (const auto& iface : Compiler(ctx)->GetStructInterfaces(structTypeName))
+                                    {
+                                        auto inst = InferAndInstantiateGenericFunction(functionName, iface);
+                                        if (!inst.empty()) { resolvedFuncName = inst; break; }
+                                    }
+                                }
+                                auto* retType = Compiler(ctx)->GetFunctionReturnType(resolvedFuncName);
                                 bool  hasResult = retType && !retType->isVoidTy();
-                                auto* resultAlloca = hasResult ? compilerLLVM->CreateAlloca(retType) : nullptr;
+                                auto* resultAlloca = hasResult ? Compiler(ctx)->CreateAlloca(retType) : nullptr;
 
-                                auto* nullBlock = compilerLLVM->CreateBasicBlock("nc_null");
-                                auto* accessBlock = compilerLLVM->CreateBasicBlock("nc_access");
-                                auto* resumeBlock = compilerLLVM->CreateBasicBlock("nc_resume");
+                                auto* nullBlock = Compiler(ctx)->CreateBasicBlock("nc_null");
+                                auto* accessBlock = Compiler(ctx)->CreateBasicBlock("nc_access");
+                                auto* resumeBlock = Compiler(ctx)->CreateBasicBlock("nc_resume");
 
-                                compilerLLVM->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
+                                Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
                                 // insert point is now accessBlock
 
-                                namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
+                                namedVar.Primary = Compiler(ctx)->CreateFunctionCall2(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
 
                                 if (hasResult && namedVar.Primary)
                                 {
-                                    compilerLLVM->CreateAssignment(namedVar.Primary, resultAlloca);
-                                    compilerLLVM->CreateJump(resumeBlock);
+                                    Compiler(ctx)->CreateAssignment(namedVar.Primary, resultAlloca);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
 
-                                    compilerLLVM->SwitchToBlock(nullBlock);
-                                    compilerLLVM->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
-                                    compilerLLVM->CreateJump(resumeBlock);
+                                    Compiler(ctx)->SwitchToBlock(nullBlock);
+                                    Compiler(ctx)->CreateAssignment(llvm::Constant::getNullValue(retType), resultAlloca);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
 
-                                    compilerLLVM->SwitchToBlock(resumeBlock);
-                                    auto* result = compilerLLVM->CreateLoad(resultAlloca);
+                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
+                                    auto* result = Compiler(ctx)->CreateLoad(resultAlloca);
                                     namedVar.Primary = result;
                                     namedVar.BaseType = result->getType();
                                 }
                                 else
                                 {
-                                    compilerLLVM->CreateJump(resumeBlock);
-                                    compilerLLVM->SwitchToBlock(nullBlock);
-                                    compilerLLVM->CreateJump(resumeBlock);
-                                    compilerLLVM->SwitchToBlock(resumeBlock);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
+                                    Compiler(ctx)->SwitchToBlock(nullBlock);
+                                    Compiler(ctx)->CreateJump(resumeBlock);
+                                    Compiler(ctx)->SwitchToBlock(resumeBlock);
                                     namedVar = {};
                                 }
 
@@ -2245,8 +2549,24 @@ public:
                             }
                             else
                             {
-                                SetSourceLocation(primaryCtx);
-                                namedVar.Primary = compilerLLVM->CreateFunctionCall2(functionName, arguments);
+                                // Try generic extension method instantiation if this is a
+                                // generic function template and the struct implements a matching interface.
+                                std::string resolvedFuncName = functionName;
+                                if (!Compiler(primaryCtx)->GetFunction(functionName) && genericFunctionTemplates.count(functionName))
+                                {
+                                    std::string structTypeName = structVar.TypeAndValue.TypeName;
+                                    if (structTypeName.empty() && structVar.BaseType)
+                                    {
+                                        if (auto* st = llvm::dyn_cast<llvm::StructType>(structVar.BaseType))
+                                            structTypeName = st->getName().str();
+                                    }
+                                    for (const auto& iface : Compiler(primaryCtx)->GetStructInterfaces(structTypeName))
+                                    {
+                                        auto inst = InferAndInstantiateGenericFunction(functionName, iface);
+                                        if (!inst.empty()) { resolvedFuncName = inst; break; }
+                                    }
+                                }
+                                namedVar.Primary = Compiler(primaryCtx)->CreateFunctionCall2(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary->getType();
                             }
@@ -2293,6 +2613,7 @@ public:
 
     llvm::Value* ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
     {
+        auto* compiler = Compiler(ctx);
         auto expressionCtx = ctx->expression();
         auto constant = ctx->Constant();
         auto stringLiteral = ctx->StringLiteral();
@@ -2301,15 +2622,15 @@ public:
         {
             // typeof(int), typeof(bool), typeof(MyStruct) — type specifier used directly
             if (auto* ts = ctx->typeSpecifier())
-                return compilerLLVM->CreateGlobalString("typeof", ts->getText());
+                return compiler->CreateGlobalString("typeof", ts->getText());
 
             // typeof(expr) — navigate down to unaryExpression to read TypeAndValue
             std::string typeName;
 
             // ANTLR picks the expression alternative for user-defined type names (Identifier
             // matches both expression and typeSpecifier); catch them here before evaluating.
-            if (compilerLLVM->GetDataStructure(expressionCtx->getText()).StructType != nullptr)
-                return compilerLLVM->CreateGlobalString("typeof", expressionCtx->getText());
+            if (compiler->GetDataStructure(expressionCtx->getText()).StructType != nullptr)
+                return compiler->CreateGlobalString("typeof", expressionCtx->getText());
 
             if (auto* ue = tryGetUnaryExpression(expressionCtx))
             {
@@ -2319,7 +2640,7 @@ public:
                     typeName += "*";
             }
 
-            return compilerLLVM->CreateGlobalString("typeof", typeName.empty() ? "unknown" : typeName);
+            return compiler->CreateGlobalString("typeof", typeName.empty() ? "unknown" : typeName);
         }
         else if (ctx->NameOf())
         {
@@ -2331,7 +2652,7 @@ public:
             if (dotPos != std::string::npos) lastSep = std::max(lastSep, dotPos + 1);
             if (arrowPos != std::string::npos) lastSep = std::max(lastSep, arrowPos + 2);
             std::string name = fullText.substr(lastSep);
-            return compilerLLVM->CreateGlobalString("nameof", name);
+            return compiler->CreateGlobalString("nameof", name);
         }
         else if (expressionCtx != nullptr)
         {
@@ -2342,22 +2663,22 @@ public:
             // TODO handle encoding u8,u,U,L
             std::string rawText = ctx->getText();
             rawText = ProcessRawText(rawText);
-            return compilerLLVM->CreateGlobalString("", rawText);
+            return compiler->CreateGlobalString("", rawText);
         }
         else if (constant)
         {
             std::string constantText = constant->getText();
             if (constantText == "true")
             {
-                return compilerLLVM->CreateConstant("bool", constantText);
+                return compiler->CreateConstant("bool", constantText);
             }
             else if (constantText == "false")
             {
-                return compilerLLVM->CreateConstant("bool", constantText);
+                return compiler->CreateConstant("bool", constantText);
             }
             else if (constantText == "nullptr")
             {
-                return compilerLLVM->CreateConstant("nullptr", constantText);
+                return compiler->CreateConstant("nullptr", constantText);
             }
             else if (constantText.front() == '\'' ||
                 (constantText.size() > 1 &&
@@ -2365,13 +2686,13 @@ public:
                     constantText[1] == '\''))
             {
                 char c = ParseCharLiteral(constantText);
-                return compilerLLVM->CreateConstant(MyCompilerLLVM::ConstantVariant(c));
+                return compiler->CreateConstant(MyCompilerLLVM::ConstantVariant(c));
             }
             else
             {
                 std::string constantRaw = constant->getText();
                 auto number = ParseNumberConstant(constantRaw);
-                auto value = compilerLLVM->CreateConstant(number);
+                auto value = compiler->CreateConstant(number);
                 return value;
             }
         }
@@ -2381,6 +2702,7 @@ public:
 
     MyCompilerLLVM::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node)
     {
+        auto* compiler = Compiler();
         if (!node)
             return {};
 
@@ -2389,7 +2711,7 @@ public:
 
         if (name == "__FILE__")
         {
-            auto str = compilerLLVM->CreateGlobalString("__FILE__", compilerLLVM->GetSourceFileName());
+            auto str = compiler->CreateGlobalString("__FILE__", compiler->GetSourceFileName());
             namedVar.Primary = str;
             namedVar.BaseType = str->getType();
             return namedVar;
@@ -2397,7 +2719,7 @@ public:
 
         if (name == "__FUNCTION__")
         {
-            auto str = compilerLLVM->CreateGlobalString("__FUNCTION__", compilerLLVM->GetCurrentFunctionName());
+            auto str = compiler->CreateGlobalString("__FUNCTION__", compiler->GetCurrentFunctionName());
             namedVar.Primary = str;
             namedVar.BaseType = str->getType();
             return namedVar;
@@ -2406,46 +2728,46 @@ public:
         if (name == "__LINE__")
         {
             int line = (int)node->getSymbol()->getLine();
-            auto val = compilerLLVM->CreateConstant("int", std::to_string(line));
+            auto val = compiler->CreateConstant("int", std::to_string(line));
             namedVar.Primary = val;
             namedVar.BaseType = val->getType();
             return namedVar;
         }
 
-        namedVar = compilerLLVM->GetLocalVariable(name);
+        namedVar = compiler->GetLocalVariable(name);
         if (namedVar.Storage != nullptr || namedVar.Primary != nullptr)
         {
             return namedVar;
         }
 
-        auto funcArgument = compilerLLVM->GetFunctionArgument(name);
+        auto funcArgument = compiler->GetFunctionArgument(name);
         if (funcArgument.GetValue() != nullptr)
         {
             return funcArgument;
         }
 
-        auto memberVar = compilerLLVM->GetMemberVariable(name);
+        auto memberVar = compiler->GetMemberVariable(name);
         if (memberVar.Storage != nullptr)
         {
             return memberVar;
         }
 
         // try getting global variable
-        if (auto gVar = compilerLLVM->GetGlobalVariable(name))
+        if (auto gVar = compiler->GetGlobalVariable(name))
         {
             namedVar.Storage = gVar;
             namedVar.BaseType = gVar->getType();
             return namedVar;
         }
 
-        if (auto func = compilerLLVM->GetFunction(name))
+        if (auto func = compiler->GetFunction(name))
         {
             namedVar.Primary = func;
             return namedVar;
         }
 
         // Return-block functions have no IR entry; they are inlined at the call site.
-        if (compilerLLVM->GetReturnBlock(name) != nullptr)
+        if (compiler->GetReturnBlock(name) != nullptr)
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));
@@ -2567,7 +2889,7 @@ public:
                 auto destination = increment.first;
                 auto amount = increment.second;
 
-                compilerLLVM->CreateIncrement(destination, amount);
+                Compiler()->CreateIncrement(destination, amount);
             }
 
             PlusPlus.clear();
@@ -2595,11 +2917,11 @@ public:
             // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
             if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
             {
-                if (typeSpec->Identifier() && typeSpec->genericTypeParameters())
+                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                 {
-                    std::string baseName = typeSpec->Identifier()->getText();
+                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto* p : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    for (auto* p : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                         typeArgs.push_back(p->getText());
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
@@ -2613,11 +2935,11 @@ public:
             // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
             if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
             {
-                if (primaryExpr->Identifier() && primaryExpr->genericTypeParameters())
+                if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                 {
-                    std::string baseName = primaryExpr->Identifier()->getText();
+                    std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto* p : primaryExpr->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    for (auto* p : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                         typeArgs.push_back(p->getText());
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
@@ -2639,13 +2961,13 @@ public:
         for (auto declSpecItem : declSpec->declarationSpecifier())
         {
             auto typeSpec = declSpecItem->typeSpecifier();
-            if (!typeSpec || !typeSpec->genericTypeParameters())
+            if (!typeSpec || !typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->genericTypeParameters())
                 continue;
 
             // This is a generic type instantiation
-            std::string baseName = typeSpec->Identifier()->getText();
+            std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> typeArgs;
-            for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+            for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                 typeArgs.push_back(typeParamSpec->getText());
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
@@ -2681,7 +3003,9 @@ public:
             // Now safe to instantiate
             auto templateIt = genericStructTemplates.find(pending.templateName);
             if (templateIt == genericStructTemplates.end())
+            {
                 continue; // not a generic template
+            }
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
 
@@ -2696,10 +3020,26 @@ public:
         }
     }
 
-    void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {})
+    void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
+        auto* compiler = Compiler(ctx);
         auto decl = ctx->directDeclarator();
-        std::string structName = nameOverride.empty() ? decl->getText() : nameOverride;
+        std::string baseName = decl->getText();
+        std::string structName;
+
+        // Apply nameOverride first (for generic instantiations), then namespace
+        if (!nameOverride.empty())
+        {
+            structName = nameOverride;
+        }
+        else if (!namespaceName.empty())
+        {
+            structName = namespaceName + "." + baseName;
+        }
+        else
+        {
+            structName = baseName;
+        }
 
         // If this is a generic template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
@@ -2718,13 +3058,13 @@ public:
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
-        auto structType = compilerLLVM->CreateStructType(structName, declList);
+        auto structType = compiler->CreateStructType(structName, declList);
         MyCompilerLLVM::TypeAndValue returnType{
             .TypeName = structName,
         };
         // Create default constructor
         {
-            auto funcDef = compilerLLVM->CreateFunctionDefinition(structName, returnType, {});
+            auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
             std::vector<llvm::Value*> initilizers;
             for (auto& typeValue : declList)
@@ -2741,8 +3081,12 @@ public:
                         {
                             typeValue.TypeName = rvalue->getType()->getStructName();
                             // Re-finalise the struct body now that the auto field type is known.
-                            structType = compilerLLVM->CreateStructType(structName, declList);
+                            structType = compiler->CreateStructType(structName, declList);
                         }
+                    }
+                    else if (initilizer->Default() != nullptr)
+                    {
+                        rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
                 else
@@ -2765,44 +3109,92 @@ public:
             {
                 if (rvalue != nullptr)
                 {
-                    rvalue = compilerLLVM->Upconvert(rvalue, structType->getTypeAtIndex(structIndex));
-                    structVal = compilerLLVM->CreateInsertValue(structVal, rvalue, structIndex);
+                    auto* destType = structType->getTypeAtIndex(structIndex);
+                    rvalue = compiler->Upconvert(rvalue, destType);
+                    if (rvalue->getType() != destType && destType->isStructTy())
+                    {
+                        // Initializer type doesn't match struct field type (e.g. integer 0 used for
+                        // a struct-typed generic field).  Call the field's default constructor when
+                        // one is available; otherwise zero-initialize the aggregate.
+                        std::string fieldTypeName = declList[structIndex].TypeName;
+                        if (compiler->GetFunction(fieldTypeName))
+                            rvalue = compiler->CreateFunctionCall2(fieldTypeName, {});
+                        else
+                            rvalue = llvm::Constant::getNullValue(destType);
+                    }
+                    structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
                 }
 
                 structIndex++;
             }
 
             // close constructor.
-            compilerLLVM->CreateReturnCall(structVal);
+            compiler->CreateReturnCall(structVal);
             // Pop the stack
-            compilerLLVM->CreateBlockBreak(nullptr, true);
+            compiler->CreateBlockBreak(nullptr, true);
         }
 
         // Parse member functions
         auto functionList = ctx->functionDefinition();
 
-        for (auto func : functionList)
         {
-            global_scope = false;
-            ParseFunctionDefinition(func, structName);
-            global_scope = true;
+            bool savedScope = global_scope;
+            for (auto func : functionList)
+            {
+                global_scope = false;
+                ParseFunctionDefinition(func, structName);
+            }
+            global_scope = savedScope;
         }
 
         // Parse destructor
-        for (auto dtor : ctx->destructorDefinition())
         {
-            global_scope = false;
-            ParseDestructorDefinition(dtor, structName);
-            global_scope = true;
+            bool savedScope = global_scope;
+            for (auto dtor : ctx->destructorDefinition())
+            {
+                global_scope = false;
+                ParseDestructorDefinition(dtor, structName);
+            }
+            global_scope = savedScope;
         }
 
         // Record interfaces and verify implementations
         std::vector<std::string> ifaceNames;
-        for (auto interfaceIdentifier : ctx->Identifier())
-            ifaceNames.push_back(interfaceIdentifier->getText());
-        compilerLLVM->RegisterStructInterfaces(structName, ifaceNames);
+        for (auto* genId : ctx->genericIdentifier())
+        {
+            if (!genId->Identifier()) continue;
+            std::string baseName = genId->Identifier()->getText();
+            std::string ifaceName = baseName;
+
+            if (genId->genericTypeParameters() != nullptr)
+            {
+                // Compute concrete type args by applying active substitutions
+                std::vector<std::string> concreteTypeArgs;
+                for (auto* typeSpec : genId->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                {
+                    std::string typeArg = typeSpec->getText();
+                    auto substIt = activeTypeSubstitutions.find(typeArg);
+                    if (substIt != activeTypeSubstitutions.end())
+                        typeArg = substIt->second;
+                    concreteTypeArgs.push_back(typeArg);
+                }
+
+                ifaceName = MangledGenericName(baseName, concreteTypeArgs);
+
+                // Build substitution map for the interface template's type params
+                std::unordered_map<std::string, std::string> ifaceSubstitutions;
+                const auto& ifaceTypeParams = genericInterfaceTypeParams[baseName];
+                for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
+                    ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+
+                InstantiateGenericInterface(baseName, ifaceName, ifaceSubstitutions);
+            }
+
+            ifaceNames.push_back(ifaceName);
+        }
+        compiler->RegisterStructInterfaces(structName, ifaceNames);
         for (const auto& interfaceName : ifaceNames)
-            compilerLLVM->VerifyInterfaceImplementation(structName, interfaceName);
+            compiler->VerifyInterfaceImplementation(structName, interfaceName);
 
         // Process any generic instantiations that were queued during this struct definition
         // ProcessPendingInstantiations();
@@ -2821,12 +3213,12 @@ public:
         for (auto typeSpec : typeParamList->typeSpecifier())
         {
             // Generic type parameters must be simple identifiers, not built-in types
-            if (!typeSpec->Identifier())
+            if (!typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->Identifier())
             {
                 LogErrorContext(typeSpec, "Generic type parameter must be an identifier, not a built-in type");
                 continue;
             }
-            typeParams.push_back(typeSpec->Identifier()->getText());
+            typeParams.push_back(typeSpec->genericIdentifier()->Identifier()->getText());
         }
 
         return typeParams;
@@ -2834,6 +3226,7 @@ public:
 
     void ParseDestructorDefinition(CParser::DestructorDefinitionContext* ctx, const std::string& structName)
     {
+        auto* compiler = Compiler(ctx);
         MyCompilerLLVM::DeclTypeAndValue thisParam;
         thisParam.TypeName = structName;
         thisParam.VariableName = structName + "__";
@@ -2845,18 +3238,18 @@ public:
         returnType.TypeName = "void";
 
         int line = ctx->getStart()->getLine();
-        auto fn = compilerLLVM->CreateFunctionDefinition("~" + structName, returnType, params, false, false, line);
-        compilerLLVM->RegisterDestructor(structName, fn);
+        auto fn = compiler->CreateFunctionDefinition("~" + structName, returnType, params, false, false, line);
+        compiler->RegisterDestructor(structName, fn);
 
-        compilerLLVM->InitializeBlock(&fn->front(), false);
+        compiler->InitializeBlock(&fn->front(), false);
 
         auto blockItemList = ctx->compoundStatement()->blockItemList();
         if (blockItemList)
             ParseBlockItemList(blockItemList);
 
-        compilerLLVM->CreateReturnCall(nullptr);
-        compilerLLVM->CreateBlockBreak(nullptr, true);
-        compilerLLVM->ClearCurrentSubprogram();
+        compiler->CreateReturnCall(nullptr);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
     }
 
     std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
@@ -3042,22 +3435,9 @@ public:
         std::cout << std::format("[{}:{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
     }
 
-    void SetSourceLocation(antlr4::ParserRuleContext* ctx)
-    {
-        compilerLLVM->SetSourceLocation(
-            ctx->getStart()->getLine(),
-            ctx->getStart()->getCharPositionInLine());
-    }
-
     void enterEveryRule(antlr4::ParserRuleContext* ctx) override
     {
         if constexpr (debugPrint)
-        {
             PrintContext(ctx);
-        }
-        else
-        {
-            SetSourceLocation(ctx);
-        }
     }
 };

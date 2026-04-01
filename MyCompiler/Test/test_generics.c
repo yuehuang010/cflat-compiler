@@ -1,0 +1,298 @@
+extern void printf(const char* argv, ...);
+
+int Test(const char* testName, i64 actual, i64 expected)
+{
+    if (expected == actual)
+    {
+        printf("%s passed.\n", testName);
+        return 1;
+    }
+
+    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    return 0;
+}
+
+int Test(const char* testName, int actual, int expected)
+{
+    if (expected == actual)
+    {
+        printf("%s passed.\n", testName);
+        return 1;
+    }
+
+    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    return 0;
+}
+
+// =============================================================
+// Generic struct tests (compile-time only monomorphization)
+// =============================================================
+
+struct Box<T>
+{
+    T value = default;
+};
+
+struct Pair<K, V>
+{
+    K first = default;
+    V second = default;
+};
+
+struct Container<T>
+{
+    T data = default;
+    int count = 0;
+};
+
+struct Stack<T>
+{
+    T elements = default;
+    int size = 0;
+};
+
+bool testGenericBox()
+{
+    bool result = true;
+
+    // Test Box<int>
+    Box<int> intBox = default;
+    intBox.value = 42;
+    result &= Test("generic_box_int", intBox.value, 42);
+
+    // Test Box<float> - compare as int representation
+    Box<float> floatBox = default;
+    floatBox.value = 3.14f;
+    // Note: floating point comparison would need special handling
+
+    // Test Box<i32>
+    Box<i32> i32Box = default;
+    i32Box.value = 100;
+    result &= Test("generic_box_i32", i32Box.value, 100);
+
+    return result;
+}
+
+bool testGenericPair()
+{
+    bool result = true;
+
+    // Test Pair<int, int>
+    Pair<int, int> intIntPair = default;
+    intIntPair.first = 10;
+    intIntPair.second = 20;
+    result &= Test("generic_pair_int_int_first", intIntPair.first, 10);
+    result &= Test("generic_pair_int_int_second", intIntPair.second, 20);
+
+    // Test Pair<int, float>
+    Pair<int, float> intFloatPair = default;
+    intFloatPair.first = 5;
+    intFloatPair.second = 2.5f;
+    result &= Test("generic_pair_int_float_first", intFloatPair.first, 5);
+
+    // Test Pair<i32, i32>
+    Pair<i32, i32> i32Pair = default;
+    i32Pair.first = 1000;
+    i32Pair.second = 2000;
+    result &= Test("generic_pair_i32_first", i32Pair.first, 1000);
+    result &= Test("generic_pair_i32_second", i32Pair.second, 2000);
+
+    return result;
+}
+
+bool testGenericMultipleInstantiations()
+{
+    bool result = true;
+
+    // Multiple instantiations of Box with different types
+    Box<int> boxInt = default;
+    Box<i32> boxI32 = default;
+    Box<u32> boxU32 = default;
+    Box<i8> boxI8 = default;
+
+    boxInt.value = 42;
+    boxI32.value = 100;
+    boxU32.value = 200;
+    boxI8.value = 10;
+
+    result &= Test("generic_multi_int", boxInt.value, 42);
+    result &= Test("generic_multi_i32", boxI32.value, 100);
+    result &= Test("generic_multi_u32", boxU32.value, 200);
+    result &= Test("generic_multi_i8", boxI8.value, 10);
+
+    return result;
+}
+
+bool testGenericContainer()
+{
+    bool result = true;
+
+    // Test Container<int>
+    Container<int> intContainer = default;
+    intContainer.data = 99;
+    intContainer.count = 1;
+    result &= Test("generic_container_int_data", intContainer.data, 99);
+    result &= Test("generic_container_int_count", intContainer.count, 1);
+
+    // Test Container<i64>
+    Container<i64> i64Container = default;
+    i64Container.data = 200000;
+    i64Container.count = 5;
+    result &= Test("generic_container_i64_data", i64Container.data, 200000);
+    result &= Test("generic_container_i64_count", i64Container.count, 5);
+
+    return result;
+}
+
+bool testGenericStack()
+{
+    bool result = true;
+
+    // Test Stack<int>
+    Stack<int> intStack = default;
+    intStack.elements = 42;
+    intStack.size = 1;
+    result &= Test("generic_stack_int_elements", intStack.elements, 42);
+    result &= Test("generic_stack_int_size", intStack.size, 1);
+
+    // Test Stack<i32>
+    Stack<i32> i32Stack = default;
+    i32Stack.elements = 999;
+    i32Stack.size = 10;
+    result &= Test("generic_stack_i32_elements", i32Stack.elements, 999);
+    result &= Test("generic_stack_i32_size", i32Stack.size, 10);
+
+    return result;
+}
+
+int testGenericStructs()
+{
+    bool result = true;
+    printf("=== Generic Struct Tests ===\n");
+    result &= testGenericBox();
+    result &= testGenericPair();
+    result &= testGenericMultipleInstantiations();
+    result &= testGenericContainer();
+    result &= testGenericStack();
+    printf("=== Generic Tests Completed ===\n");
+    return result;
+}
+
+// Interface tests
+
+interface IReadable
+{
+    int Read();
+};
+
+interface IScalable
+{
+    int Scale(int factor);
+};
+
+struct Counter : IReadable
+{
+    int count = 10;
+    int Read() { return count; }
+};
+
+struct ScaledValue : IReadable, IScalable
+{
+    int value = 3;
+    int Read() { return value; }
+    int Scale(int factor) { return value * factor; }
+};
+
+int extensionIRead(IReadable scaledValue)
+{
+    return scaledValue.Read();
+}
+
+bool testInterface()
+{
+    bool result = true;
+    Counter c = Counter();
+    ScaledValue s = ScaledValue();
+
+    result &= Test("counter.Read", c.Read(), 10);   // 10
+    result &= Test("scaledValue.Read", s.Read(), 3);   // 3
+    result &= Test("scaledValue.Read", s.extensionIRead(), 3);   // 3
+    result &= Test("scaledValue.Scale2", s.Scale(2), 6);   // 3*2=6
+    result &= Test("scaledValue.Scale5", s.Scale(5), 15);   // 3*5=15
+    return result;
+}
+
+
+// Generic interface for storing and retrieving a value
+interface Container<T>
+{
+    T Get();
+    void Set(T value);
+};
+
+struct MyInt
+{
+    int x = 5;
+};
+
+// Generic struct template with type parameter T implementing Container<T>
+struct Storage<T> : Container<T>
+{
+    T data = default;
+
+    T Get()
+    {
+        return data;
+    }
+
+    void Set(T value)
+    {
+        data = value;
+    }
+};
+
+T ExtGet<T>(Container<T> container)
+{
+    T value = container.Get();
+    return value;
+}
+
+bool testGenericInterface()
+{
+    bool result = true;
+
+    // Test Storage<int> implementing Container<int>
+    Storage<int> intStorage = default;
+    intStorage.Set(42);
+    result &= Test("generic_interface_int_get", intStorage.Get(), 42);
+    result &= Test("generic_interface_int_getExt", intStorage.ExtGet(), 42);
+
+    // Test Storage<MyInt> implementing Container<MyInt>
+    Storage<MyInt> structStorage = default;
+    MyInt mi = default;
+    mi.x = 99;
+    structStorage.Set(mi);
+    result &= Test("generic_interface_mystruct_get", structStorage.Get().x, 99);
+
+    // Test another Storage<int> with different value
+    Storage<int> anotherIntStorage = default;
+    anotherIntStorage.Set(100);
+    result &= Test("generic_interface_int_get_100", anotherIntStorage.Get(), 100);
+
+    return result;
+}
+
+extern int main()
+{
+    bool result = true;
+    result &= testGenericStructs();
+    result &= testInterface();
+    result &= testGenericInterface();
+    if (result)
+    {
+        printf("All Test Passed.\n");
+        return 0;
+    }
+
+    return 1;
+}

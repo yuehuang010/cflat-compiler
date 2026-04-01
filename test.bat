@@ -13,7 +13,8 @@ if not exist "%OUT%" mkdir "%OUT%"
 
 call :RunTest testfile
 call :RunTest testfile2
-call :RunTest testfile3 -i %LIB%
+call :RunTest test_generics
+call :RunTest testfile_module -i %LIB%
 call :RunTest test_library_string -i %LIB%
 
 echo.

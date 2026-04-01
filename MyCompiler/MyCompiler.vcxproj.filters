@@ -33,9 +33,6 @@
       <Filter>Source Files</Filter>
     </None>
     <None Include="testfile3.c" />
-    <None Include="MyCompiler\testfile3_generics.c">
-      <Filter>Source Files</Filter>
-    </None>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C.g4" />

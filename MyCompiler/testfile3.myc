@@ -78,12 +78,90 @@ struct NullableNode
     int Read() { return value; }
 };
 
+
+// Generic interface for storing and retrieving a value
+interface Container<T>
+{
+	T Get();
+	void Set(T value);
+};
+
+struct MyInt {
+	int x = 5;
+};
+
+// Generic struct template with type parameter T implementing Container<T>
+struct Storage<T> : Container<T>
+{
+	T data = default;
+
+	T Get()
+	{
+		return data;
+	}
+
+	void Set(T value)
+	{
+		data = value;
+	}
+};
+
+// Another generic struct with two fields
+struct Pair<T>
+{
+	T first = default;
+	T second = default;
+};
+
+
+interface IReadable
+{
+    int Read();
+};
+
+interface IScalable
+{
+    int Scale(int factor);
+};
+
+struct Counter : IReadable
+{
+    int count = 10;
+    int Read() { return count; }
+};
+
+struct ScaledValue : IReadable, IScalable
+{
+    int value = 3;
+    int Read() { return value; }
+    int Scale(int factor) { 
+		return value * factor; 
+	}
+};
+
+int extensionIRead(IReadable scaledValue)
+{
+	scaledValue.Read();
+	return scaledValue.Read();
+}
+
 extern void main()
 {
-    NullableNode mynode;
+    NullableNode mynode = default;
     NullableNode* nodePtr = &mynode;
     nodePtr?.Read();
-    
+
     auto myAnimal = Cat.Animal();
-    myAnimal.count = 10;
+	myAnimal.count = 10;
+
+	auto intStorage2 = Storage<int>();
+	intStorage2.Get();
+	
+	Storage<int> intStorage = Storage<int>();
+	intStorage.data = 42;
+	intStorage.Read(100);
+	
+	Counter mycounter = Counter();
+	mycounter.Read();
+	mycounter.count = 10;
 }

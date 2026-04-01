@@ -254,7 +254,8 @@ function runCompiler(
     document: TextDocument
 ): Promise<Diagnostic[]> {
     return new Promise(resolve => {
-        const args = [inputFile, '-o', os.devNull];
+        const outputFile = path.join(os.tmpdir(), `myc_out_${Date.now()}.tmp`);
+        const args = [inputFile, '-o', outputFile];
         connection.console.log(`Running: "${exePath}" ${args.join(' ')}`);
 
         const proc = cp.spawn(exePath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -272,6 +273,9 @@ function runCompiler(
         proc.on('close', () => {
             const output = stderr + '\n' + stdout;
             const diagnostics = parseCompilerOutput(output, document);
+
+            try { fs.unlinkSync(outputFile); } catch { /* ignore */ }
+
             resolve(diagnostics);
         });
 
@@ -530,8 +534,56 @@ function indexToPosition(text: string, index: number): { line: number; character
 const CANNOT_BE_TYPE = new Set([
     'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'default',
     'break', 'continue', 'return', 'goto', 'using', 'namespace', 'interface',
-    'sizeof', 'typeof', 'nameof', 'alignof'
+    'sizeof', 'typeof', 'nameof', 'alignof', 'import', 'alignas', 'volatile', 'stdcall'
 ]);
+
+/**
+ * Parse a raw function parameter-list string into { name, fullType, typeName } triples.
+ * Splits on commas that are NOT inside angle brackets so generic types like
+ * Map<int,int> are kept intact.
+ */
+function extractParams(paramStr: string): Array<{ name: string; fullType: string; typeName: string }> {
+    if (!paramStr) return [];
+
+    // Split on top-level commas only.
+    const parts: string[] = [];
+    let depth = 0, segStart = 0;
+    for (let i = 0; i < paramStr.length; i++) {
+        if      (paramStr[i] === '<') depth++;
+        else if (paramStr[i] === '>') depth--;
+        else if (paramStr[i] === ',' && depth === 0) {
+            parts.push(paramStr.slice(segStart, i).trim());
+            segStart = i + 1;
+        }
+    }
+    parts.push(paramStr.slice(segStart).trim());
+
+    // The last \w+ sequence (after a non-identifier char) is the parameter name;
+    // everything before it is the type.
+    const nameRe = /^(.*[^\w])([A-Za-z_]\w*)(\s*\[.*?\])?\s*$/;
+    const result: Array<{ name: string; fullType: string; typeName: string }> = [];
+
+    for (const part of parts) {
+        const p = part.replace(/=.*$/, '').trim();   // strip default value
+        if (!p || p === '...' || p === 'void') continue;
+
+        const m = nameRe.exec(p);
+        if (!m || !m[1].trim()) continue;            // unnamed / type-only param
+
+        const rawTypePart = m[1].trim();             // e.g. "const int*" or "Storage<int>"
+        const name        = m[2];
+        if (KEYWORD_DOCS[name] || CANNOT_BE_TYPE.has(name)) continue;
+
+        // Separate trailing pointer stars from the base type.
+        const ptrMatch = rawTypePart.match(/(\*+)$/);
+        const ptrStars = ptrMatch ? ptrMatch[1] : '';
+        const baseType = ptrStars ? rawTypePart.slice(0, -ptrStars.length).trim() : rawTypePart;
+        const fullType = ptrStars ? `${baseType}${ptrStars}` : baseType;
+        const typeName = baseType.replace(/<[^>]*>/g, '').trim();
+        result.push({ name, fullType, typeName });
+    }
+    return result;
+}
 
 /**
  * Scan a document and produce a symbol table for user-defined identifiers.
@@ -599,14 +651,16 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
     };
 
     // --- struct / class / union / enum ---
-    const aggRe = /\b(struct|class|union|enum)\s+([A-Za-z_]\w*)\s*\{/g;
+    // [^;{]* allows for generic type parameters (<T>) and inheritance clauses (: Base) before the opening brace.
+    const aggRe = /\b(struct|class|union|enum)\s+([A-Za-z_]\w*)[^;{]*\{/g;
     while ((m = aggRe.exec(clean)) !== null) {
         const nameIndex = m.index + m[0].indexOf(m[2]);
         extractAggregate(m[1], m[2], m.index + m[0].length, nameIndex);
     }
 
     // --- interface (MyC extension) ---
-    const ifaceRe = /\binterface\s+([A-Za-z_]\w*)\s*\{/g;
+    // [^;{]* allows for generic type parameters and inheritance clauses (: Base1, Base2) before the opening brace.
+    const ifaceRe = /\binterface\s+([A-Za-z_]\w*)[^;{]*\{/g;
     while ((m = ifaceRe.exec(clean)) !== null) {
         const nameIndex = m.index + m[0].indexOf(m[1]);
         extractAggregate('interface', m[1], m.index + m[0].length, nameIndex);
@@ -624,17 +678,19 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
     // No trailing $ on funcLineRe: dropping it lets single-line bodies
     // "int f() { return 0; }" match, and avoids failure when removeComments
     // leaves trailing spaces after the opening brace.
-    const funcLineRe = /^([ \t]*(?:(?:static|extern|inline|virtual)\s+)*)((?:const\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*(?:\s*\*+)?)\s+([A-Za-z_][\w:]*)\s*\(([^)]*)\)(?:\s*const)?\s*[{;]?/;
-    const varLineRe   = /^([ \t]*(?:(?:const|volatile|static|extern|register)\s+)*)((?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[.*?\])?\s*(?:=.*)?\s*;$/;
+    const funcLineRe = /^([ \t]*(?:(?:static|extern|inline|virtual)\s+)*)((?:const\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*(?:\s*<[^>]*>)?(?:\s*\*+)?)\s+([A-Za-z_][\w:,]*)\s*\(([^)]*)\)(?:\s*const)?\s*[{;]?/;
+    const varLineRe   = /^([ \t]*(?:(?:const|volatile|static|extern|register)\s+)*)((?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*(?:\s*<[^>]*>)?)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*(?:\[.*?\])?\s*(?:=.*)?\s*;$/;
     // For-loop variable initializer: for (type name = ...)
-    const forVarRe    = /\bfor\s*\(\s*((?:(?:const|volatile)\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*=/g;
+    const forVarRe    = /\bfor\s*\(\s*((?:(?:const|volatile)\s+)?(?:(?:unsigned|signed|long|short)\s+)*(?:(?:struct|class|union|enum)\s+)?[A-Za-z_]\w*(?:\s*<[^>]*>)?)(\s*\*+\s*|\s+)([A-Za-z_]\w*)\s*=/g;
 
     const addVarSymbol = (
         name: string, fullType: string,
         lineIdx: number, defChar: number
     ) => {
         if (!symbols.has(name) && !KEYWORD_DOCS[name]) {
-            const typeName = fullType.replace(/\*+$/, '').trim();
+            // Strip pointer stars and generic params for symbol-table lookup;
+            // the full type is preserved in the markdown hover text.
+            const typeName = fullType.replace(/\*+$/, '').replace(/<[^>]*>/g, '').trim();
             symbols.set(name, {
                 kind: 'variable',
                 markdown: `\`\`\`c\n${fullType} ${name}\n\`\`\``,
@@ -674,11 +730,25 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
                     markdown: `\`\`\`c\n${retType} ${shortName}(${params})\n\`\`\``,
                     defLine: lineIdx,
                     defChar,
-                    typeName: retType.replace(/\*+$/, '').trim()
+                    typeName: retType.replace(/\*+$/, '').replace(/<[^>]*>/g, '').trim()
                 };
                 // Register under the short name (for callsite lookup) and qualified name
                 if (!symbols.has(shortName)) symbols.set(shortName, info);
                 if (qualName !== shortName && !symbols.has(qualName)) symbols.set(qualName, info);
+            }
+
+            // Register each named parameter as a variable symbol so it appears
+            // in general completions and hover inside the function body.
+            for (const { name, fullType, typeName } of extractParams(params)) {
+                if (!symbols.has(name)) {
+                    symbols.set(name, {
+                        kind: 'variable',
+                        markdown: `\`\`\`c\n${fullType} ${name}\n\`\`\``,
+                        defLine: lineIdx,
+                        defChar: 0,
+                        typeName
+                    });
+                }
             }
             continue;
         }
@@ -695,10 +765,17 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
             if (baseType === 'auto') {
                 // Defer resolution: capture the first identifier on the RHS so we can
                 // resolve the concrete type after all symbols have been collected.
-                const rhsMatch = /=\s*([A-Za-z_]\w*)/.exec(rawLine);
+                // This regex handles: simple identifiers, function calls, method calls, constructors, etc.
+                // It extracts the first identifier/qualified name before any special characters like '(', '[', etc.
+                // Supports namespace.type syntax.
+                const rhsMatch = /=\s*(?:new\s+)?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/.exec(rawLine);
                 if (rhsMatch && !KEYWORD_DOCS[name]) {
                     const typeEnd = vm[1].length + vm[2].length + vm[3].length;
                     pendingAutos.push({ name, rhsIdent: rhsMatch[1], lineIdx, defChar: vm[0].indexOf(name, typeEnd) });
+                } else if (!KEYWORD_DOCS[name]) {
+                    // Fallback: auto variable that couldn't be resolved - still add it as 'auto'
+                    const typeEnd = vm[1].length + vm[2].length + vm[3].length;
+                    addVarSymbol(name, 'auto', lineIdx, vm[0].indexOf(name, typeEnd));
                 }
             } else if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
                 const typeEnd = vm[1].length + vm[2].length + vm[3].length;
@@ -728,20 +805,42 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
     // look up each auto variable's RHS identifier to find the concrete type.
     for (const { name, rhsIdent, lineIdx, defChar } of pendingAutos) {
         if (symbols.has(name) || KEYWORD_DOCS[name]) continue;
-        const rhsInfo = symbols.get(rhsIdent);
+
+        // Try to resolve the rhsIdent: could be simple "Animal" or qualified "Cat.Animal"
+        let rhsInfo = symbols.get(rhsIdent);
+
+        // If not found and contains a separator, try just the last part (short name)
+        if (!rhsInfo && rhsIdent.includes('.')) {
+            const shortName = rhsIdent.split('.').pop();
+            if (shortName) {
+                rhsInfo = symbols.get(shortName);
+            }
+        }
+
         let resolvedType: string | undefined;
+        let members: MemberInfo[] | undefined;
         if (rhsInfo?.kind === 'type') {
             resolvedType = rhsIdent;
+            members = rhsInfo.members;
         } else if (rhsInfo?.kind === 'variable' || rhsInfo?.kind === 'function') {
             resolvedType = rhsInfo.typeName;
+            // If the variable/function return type is itself a known type, get its members
+            if (resolvedType) {
+                const resolvedTypeInfo = symbols.get(resolvedType);
+                if (resolvedTypeInfo?.kind === 'type') {
+                    members = resolvedTypeInfo.members;
+                }
+            }
         }
+        // Always add the variable, even if type couldn't be resolved
         const displayType = resolvedType ?? 'auto';
         symbols.set(name, {
             kind: 'variable',
             markdown: `\`\`\`c\n${displayType} ${name}\n\`\`\``,
             defLine: lineIdx,
             defChar: Math.max(0, defChar),
-            typeName: resolvedType
+            typeName: resolvedType,
+            members
         });
     }
 
@@ -764,7 +863,21 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         const varName = memberMatch[1];
         const symbols = getSymbolsForDocument(document);
         const varInfo = symbols.get(varName);
-        const typeName = varInfo?.typeName ?? (varInfo?.kind === 'type' ? varName : undefined);
+
+        // For variable symbols with resolved type and members, use those members directly
+        if (varInfo?.kind === 'variable' && varInfo.members && varInfo.members.length > 0) {
+            return varInfo.members.map(mb => ({
+                label: mb.name,
+                kind: mb.isMethod ? CompletionItemKind.Method : CompletionItemKind.Field,
+                detail: mb.signature
+            }));
+        }
+
+        // Otherwise, try to resolve the type from typeName
+        // Strip generic parameters (e.g. Storage<int> → Storage) so the base
+        // type name can be found in the symbol table.
+        const rawTypeName = varInfo?.typeName ?? (varInfo?.kind === 'type' ? varName : undefined);
+        const typeName = rawTypeName?.replace(/<[^>]*>/g, '').trim();
         if (typeName) {
             const typeInfo = symbols.get(typeName);
             if (typeInfo?.members && typeInfo.members.length > 0) {
@@ -778,7 +891,48 @@ connection.onCompletion((params: TextDocumentPositionParams): CompletionItem[] =
         return [];  // member access context but type unknown — show nothing
     }
 
-    return COMPLETION_ITEMS;
+    // Build completion items from every symbol in the document: local variables,
+    // function parameters, types, functions, macros, and namespaces.
+    // Also surface each field/method of aggregate types so e.g. typing "v"
+    // suggests "value" even without a member-access trigger.
+    const docSymbols = getSymbolsForDocument(document);
+    const userItems: CompletionItem[] = [];
+    const seenMembers = new Set<string>();
+
+    for (const [name, info] of docSymbols) {
+        let kind: CompletionItemKind;
+        switch (info.kind) {
+            case 'function':  kind = CompletionItemKind.Function; break;
+            case 'type':      kind = CompletionItemKind.Struct;   break;
+            case 'variable':  kind = CompletionItemKind.Variable; break;
+            case 'macro':     kind = CompletionItemKind.Constant; break;
+            case 'namespace': kind = CompletionItemKind.Module;   break;
+            default:          kind = CompletionItemKind.Text;     break;
+        }
+        userItems.push({
+            label: name,
+            kind,
+            detail: info.kind,
+            documentation: { kind: MarkupKind.Markdown, value: info.markdown }
+        });
+
+        // Flatten struct/class/interface members so they appear in general completions.
+        if (info.kind === 'type' && info.members) {
+            for (const mb of info.members) {
+                // Deduplicate: if two types share a member name, show the first only.
+                if (seenMembers.has(mb.name)) continue;
+                seenMembers.add(mb.name);
+                userItems.push({
+                    label: mb.name,
+                    kind: mb.isMethod ? CompletionItemKind.Method : CompletionItemKind.Field,
+                    detail: `${mb.isMethod ? 'method' : 'field'} of ${name}`,
+                    documentation: { kind: MarkupKind.Markdown, value: `\`\`\`c\n${mb.signature};\n\`\`\`` }
+                });
+            }
+        }
+    }
+
+    return [...userItems, ...COMPLETION_ITEMS];
 });
 
 connection.onCompletionResolve((item: CompletionItem): CompletionItem => {
@@ -832,14 +986,20 @@ const KEYWORD_DOCS: Record<string, string> = {
     'typedef':  '**typedef** *(storage class)*\n\nCreate a type alias. `typedef int MyInt;`',
     'const':    '**const** *(qualifier)*\n\nMark a variable or pointer as read-only.',
     'inline':   '**inline** *(storage class)*\n\nHint to inline function calls at the call site.',
-
-    // Null-safe operators
+    'register':     '**register** *(storage class)*\n\nHint that the variable should be stored in a CPU register for fast access.',
+    'volatile':     '**volatile** *(qualifier)*\n\nTell the compiler the value may change externally; prevents caching optimizations. Also used for the `volatile(...)` side-effect block.',
+    'restrict':     '**restrict** *(qualifier)*\n\nPointer qualifier asserting that the pointed-to memory is not aliased.',
+    'thread_local': '**thread_local** *(storage class)*\n\nEach thread has its own independent copy of the variable.',
+    'auto':         '**auto** *(type inference)*\n\nInfer the variable type from its initializer.\n\n```c\nauto x = 42;      // int\nauto p = getPoint(); // Point\n```',
+    'alignas':      '**alignas** *(C11 alignment)*\n\nSpecify the alignment requirement of a variable or struct member.\n\n```c\nalignas(16) float vec[4];\nalignas(int) char buf[sizeof(int)];\n```',
+    'stdcall':      '**stdcall** *(calling convention)*\n\nWindows x86 calling convention. The callee cleans the stack.\n\n```c\nvoid stdcall myFunc(int x);\n```',
     '?.': '**?.** *(null-conditional operator)*\n\nAccess a member or call a method only if the object is non-null. Returns zero/null if the object is null.\n\n```c\nint v = node?.value;       // field access\nint r = node?.Read();      // method call\n```',
     '??': '**??** *(null-coalescing operator)*\n\nReturn the left-hand side if it is non-zero/non-null, otherwise evaluate and return the right-hand side.\n\n```c\nint v = node?.value ?? -1;    // -1 if node is null\nconst char* s = name ?? \"unknown\";\n```',
 
     // MyC extensions
     'namespace': '**namespace** *(MyC extension)*\n\nGroup declarations under a named scope.\n\n```c\nnamespace Math {\n    float pi = 3.14159f;\n    float sqrt(float x) { ... }\n}\n```',
     'using':     '**using** *(MyC extension)*\n\nImport a namespace into the current scope.\n\n```c\nusing Math;\nusing Math::sqrt;\n```',
+    'import':    '**import** *(MyC extension)*\n\nImport another source file into the current compilation unit.\n\n```c\nimport "utils.myc";\nimport "math/vector.myc";\n```',
     'interface': '**interface** *(MyC extension)*\n\nDeclare an abstract set of method signatures that a struct must implement.\n\n```c\ninterface Drawable {\n    void draw();\n};\n```',
     'nameof':    '**nameof** *(MyC extension)*\n\nReturn the name of a variable or type as a `const char*` string at compile time.\n\n```c\nconst char* name = nameof(myVariable);\n```',
     'typeof':    '**typeof** *(MyC extension)*\n\nReturn the type name of an expression as a `const char*` string.\n\n```c\nconst char* typeName = typeof(myVar);\n```',
@@ -848,6 +1008,17 @@ const KEYWORD_DOCS: Record<string, string> = {
     'sizeof':         '**sizeof** *(operator)*\n\nReturn the size in bytes of a type or expression.',
     'alignof':        '**alignof** *(C11)*\n\nReturn the alignment requirement of a type.',
     '_Static_assert': '**_Static_assert** *(C11)*\n\nCompile-time assertion. `_Static_assert(sizeof(int) == 4, "int must be 4 bytes");`',
+    'static_assert':  '**static_assert** *(C11)*\n\nCompile-time assertion (MyC lowercase alias). `static_assert(sizeof(int) == 4, "int must be 4 bytes");`',
+
+    // Fixed-width integer types
+    'i8':  '**i8** *(type)*\n\nSigned 8-bit integer. Equivalent to `signed char`.',
+    'i16': '**i16** *(type)*\n\nSigned 16-bit integer. Equivalent to `short`.',
+    'i32': '**i32** *(type)*\n\nSigned 32-bit integer. Equivalent to `int`.',
+    'i64': '**i64** *(type)*\n\nSigned 64-bit integer. Equivalent to `long long`.',
+    'u8':  '**u8** *(type)*\n\nUnsigned 8-bit integer. Equivalent to `unsigned char`.',
+    'u16': '**u16** *(type)*\n\nUnsigned 16-bit integer. Equivalent to `unsigned short`.',
+    'u32': '**u32** *(type)*\n\nUnsigned 32-bit integer. Equivalent to `unsigned int`.',
+    'u64': '**u64** *(type)*\n\nUnsigned 64-bit integer. Equivalent to `unsigned long long`.',
 
     // Constants
     'true':    '**true** *(constant)*\n\nBoolean true (1).',
@@ -916,10 +1087,24 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeKeyword('register', 'storage class'),
     makeKeyword('volatile', 'qualifier'),
     makeKeyword('restrict', 'qualifier'),
+    makeKeyword('thread_local', 'storage class'),
+    makeKeyword('alignas', 'C11 alignment specifier'),
+    makeKeyword('stdcall', 'calling convention'),
+
+    // Fixed-width integer types
+    makeKeyword('i8',  'type — signed 8-bit integer'),
+    makeKeyword('i16', 'type — signed 16-bit integer'),
+    makeKeyword('i32', 'type — signed 32-bit integer'),
+    makeKeyword('i64', 'type — signed 64-bit integer'),
+    makeKeyword('u8',  'type — unsigned 8-bit integer'),
+    makeKeyword('u16', 'type — unsigned 16-bit integer'),
+    makeKeyword('u32', 'type — unsigned 32-bit integer'),
+    makeKeyword('u64', 'type — unsigned 64-bit integer'),
 
     // MyC extensions
     makeKeyword('namespace', 'MyC extension'),
     makeKeyword('using', 'MyC extension'),
+    makeKeyword('import', 'MyC extension'),
     makeKeyword('interface', 'MyC extension'),
     makeKeyword('nameof', 'MyC extension — compile-time name'),
     makeKeyword('typeof', 'MyC extension — compile-time type name'),
@@ -928,13 +1113,15 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeKeyword('sizeof', 'operator'),
     makeKeyword('alignof', 'C11 operator'),
     makeKeyword('_Static_assert', 'C11 compile-time assertion'),
+    makeKeyword('static_assert', 'C11 compile-time assertion'),
     makeKeyword('_Generic', 'C11 generic selection'),
-    makeKeyword('auto', 'storage class'),
+    makeKeyword('auto', 'type inference'),
 
     // Constants
     { label: 'true', kind: CompletionItemKind.Constant, detail: 'boolean constant' },
     { label: 'false', kind: CompletionItemKind.Constant, detail: 'boolean constant' },
     { label: 'NULL', kind: CompletionItemKind.Constant, detail: 'null pointer' },
+    { label: 'nullptr', kind: CompletionItemKind.Constant, detail: 'null pointer constant' },
 
     // Snippets
     makeSnippet('if', 'if (${1:condition})\n{\n\t${2}\n}', 'if statement'),
@@ -949,7 +1136,10 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeSnippet('printf', 'printf("${1}\\n"${2});', 'printf call'),
     makeSnippet('#include', '#include <${1:stdio.h}>', '#include directive'),
     makeSnippet('#define', '#define ${1:NAME} ${2:value}', '#define directive'),
-    makeSnippet('return-block', 'return {\n\t${1}\n};', 'return block (MyC extension)')
+    makeSnippet('return-block', 'return {\n\t${1}\n};', 'return block (MyC extension)'),
+    makeSnippet('import', 'import "${1:file.myc}";', 'import declaration (MyC extension)'),
+    makeSnippet('alignas', 'alignas(${1:alignment})', 'alignas specifier'),
+    makeSnippet('static_assert', 'static_assert(${1:condition}, "${2:message}");', 'compile-time assertion')
 ];
 
 // ---------------------------------------------------------------------------
