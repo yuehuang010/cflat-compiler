@@ -1116,7 +1116,8 @@ public:
             // existing struct;
             auto& structData = mystuct->second;
             structData.StructFields = typeAndValues;
-            structData.StructType->setBody(types);
+            if (structData.StructType->isOpaque())
+                structData.StructType->setBody(types);
 
             return structData.StructType;
         }

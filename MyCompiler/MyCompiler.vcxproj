@@ -138,6 +138,9 @@
   <ItemGroup>
     <ClCompile Include="MyCompilerLLVM.cpp" />
     <ClCompile Include="MyCompilerLLVM.h" />
+    <None Include="MyCompiler\testfile3_generics.c">
+      <FileType>CppCode</FileType>
+    </None>
     <ClCompile Include="MyListener.h" />
     <ClCompile Include="MyCompiler.cpp" />
     <None Include="testfile3.c">

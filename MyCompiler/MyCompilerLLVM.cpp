@@ -73,6 +73,13 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         // that forward references resolve during the main code-gen walk.
         {
             ForwardRefScanner scanner(this);
+            // First pass: pre-declare opaque types and constructors for every
+            // generic instantiation found anywhere in the file (including inside
+            // function bodies), so uses like Box<MyType> b = Box__MyType() resolve.
+            if (auto* tu = computeUnit->translationUnit())
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.ScanGenericTypeUses(decl);
+            // Second pass: register non-generic struct shells and function signatures.
             if (auto* tu = computeUnit->translationUnit())
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);

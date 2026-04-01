@@ -35,7 +35,7 @@ grammar C;
 
 primaryExpression
     : Constant
-    | Identifier
+    | Identifier genericTypeParameters?
     | StringLiteral+
     | '(' expression ')'
     | NameOf '(' expression ')'
@@ -55,7 +55,7 @@ postfixExpression
     : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') (
         '[' expression ']'
         | '(' argumentExpressionList ')'
-        | ('.' | '->' | QuestionDot) Identifier
+        | ('.' | '->' | QuestionDot) Identifier genericTypeParameters?
         | '++'
         | '--'
     )*
@@ -101,15 +101,15 @@ additiveExpression
     ;
 
 shiftExpression
-    : additiveExpression (('<<' | '>>') additiveExpression)*
+    : additiveExpression (('<<' | '>>') additiveExpression)?
     ;
 
 relationalExpression
-    : shiftExpression (('<' | '>' | '<=' | '>=') shiftExpression)*
+    : shiftExpression (('<' | '>' | '<=' | '>=') shiftExpression)?
     ;
 
 equalityExpression
-    : relationalExpression (('==' | '!=') relationalExpression)*
+    : relationalExpression (('==' | '!=') relationalExpression)?
     ;
 
 andExpression
@@ -143,6 +143,11 @@ assignmentExpression
     | DigitSequence // for
     ;
 
+structOrUnionSpecifier
+    : structClassUnion Identifier genericTypeParameters? '{' structDeclarationList '}'
+    | structClassUnion Identifier genericTypeParameters?
+    ;
+
 assignmentOperator
     : '='
     | '*='
@@ -158,7 +163,8 @@ assignmentOperator
     ;
 
 expression
-    : assignmentExpression (',' assignmentExpression)*
+    : assignmentExpression
+    //    : assignmentExpression (',' assignmentExpression)*
     ;
 
 constantExpression
@@ -219,13 +225,21 @@ typeSpecifier
     | 'u64'
     | structClassUnion
     | 'auto'
-    | Identifier
+    | Identifier genericTypeParameters?
     ;
 
-structOrUnionSpecifier
-    : structClassUnion Identifier '{' structDeclarationList '}'
-    | structClassUnion Identifier
+genericTypeParameters
+    : '<' typeParameterList '>'
     ;
+
+typeParameterList
+    : typeSpecifier (',' typeSpecifier)*
+    ;
+
+// typeParameter
+//     : Identifier
+//     | Identifier ':' typeName
+//     ;
 
 structClassUnion
     : 'struct'
@@ -456,10 +470,10 @@ translationUnit
     ;
 
 externalDeclaration
-    : declaration
+    : structClassUnionDefinition
     | functionDefinition
-    | structClassUnionDefinition
     | interfaceDefinition
+    | declaration
     | namespaceDefinition
     | usingDeclaration
     | importDeclaration
@@ -483,7 +497,7 @@ functionDefinition
     ;
 
 structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : declarationSpecifiers? directDeclarator genericTypeParameters? (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 destructorDefinition

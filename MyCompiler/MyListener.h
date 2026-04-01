@@ -1,6 +1,7 @@
 #pragma once
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <format>
 #include <variant>
 #include <cstdlib>
@@ -45,7 +46,30 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
-                declType.TypeName = typeSpec->getText();
+                if (typeSpec->genericTypeParameters() != nullptr)
+                {
+                    // Generic type instantiation: Box<MyType> → Box__MyType
+                    std::string mangledName = typeSpec->Identifier()->getText();
+                    for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    {
+                        // Type arguments must be identifiers (user-defined types), not built-in types
+                        if (typeParamSpec->Identifier())
+                        {
+                            mangledName += "__" + typeParamSpec->Identifier()->getText();
+                        }
+                    }
+                    // Pre-declare opaque struct type and default constructor so that
+                    // uses inside function bodies are resolvable before the full
+                    // definition is emitted by ProcessPendingInstantiations().
+                    compilerLLVM->CreateStructType(mangledName, {});
+                    MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
+                    compilerLLVM->CreateFunctionDeclaration(mangledName, returnType, {});
+                    declType.TypeName = mangledName;
+                }
+                else
+                {
+                    declType.TypeName = typeSpec->getText();
+                }
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
@@ -145,6 +169,10 @@ private:
 
     void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx)
     {
+        // Generic template definitions are not pre-declared; they are instantiated on demand.
+        if (ctx->genericTypeParameters() != nullptr)
+            return;
+
         std::string structName = ctx->directDeclarator()->getText();
 
         // Register opaque struct so the type is known for pointer/field use
@@ -172,6 +200,51 @@ private:
 
 public:
     ForwardRefScanner(MyCompilerLLVM* compiler) : compilerLLVM(compiler) {}
+
+    // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
+    // struct type + default constructor for each generic instantiation found.
+    // This ensures that Box<MyType> references inside function bodies resolve
+    // correctly during the main pass, before ProcessPendingInstantiations runs.
+    void ScanGenericTypeUses(antlr4::RuleContext* ctx)
+    {
+        for (auto* child : ctx->children)
+        {
+            auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
+            if (!ruleCtx) continue;
+
+            // Skip generic template definitions entirely — their bodies contain
+            // unbound type parameters (e.g. T) that are not valid type names.
+            if (auto* structDef = dynamic_cast<CParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            {
+                if (structDef->genericTypeParameters() != nullptr)
+                    continue;
+            }
+
+            auto tryPreDeclare = [&](const std::string& baseName, CParser::GenericTypeParametersContext* genericParams)
+            {
+                std::string mangledName = baseName;
+                for (auto* typeParamSpec : genericParams->typeParameterList()->typeSpecifier())
+                    mangledName += "__" + typeParamSpec->getText();
+                compilerLLVM->CreateStructType(mangledName, {});
+                MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
+                compilerLLVM->CreateFunctionDeclaration(mangledName, returnType, {});
+            };
+
+            if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
+            {
+                if (typeSpec->genericTypeParameters() != nullptr && typeSpec->Identifier() != nullptr)
+                    tryPreDeclare(typeSpec->Identifier()->getText(), typeSpec->genericTypeParameters());
+            }
+
+            if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
+            {
+                if (primaryExpr->genericTypeParameters() != nullptr && primaryExpr->Identifier() != nullptr)
+                    tryPreDeclare(primaryExpr->Identifier()->getText(), primaryExpr->genericTypeParameters());
+            }
+
+            ScanGenericTypeUses(ruleCtx);
+        }
+    }
 
     void ScanExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
@@ -204,6 +277,24 @@ private:
     MyCompilerLLVM* compilerLLVM;
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
+
+    // Generic struct templates: maps base name -> (AST context, type param names)
+    std::unordered_map<std::string, CParser::StructClassUnionDefinitionContext*> genericStructTemplates;
+    std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
+    // Set of already-instantiated mangled names (e.g. "Box__int") to avoid re-instantiation
+    std::unordered_set<std::string> instantiatedGenerics;
+    // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
+    std::unordered_map<std::string, std::string> activeTypeSubstitutions;
+
+    // Queue for pending generic instantiations (delayed until safe to emit code)
+    struct PendingInstantiation
+    {
+        std::string templateName;
+        std::vector<std::string> typeArgs;
+        std::string mangledName;
+    };
+    std::vector<PendingInstantiation> pendingInstantiations;
+
     constexpr static bool debugPrint = false;
 
     struct SwitchCaseEntry
@@ -242,7 +333,26 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
-                declType.TypeName = typeSpec->getText();
+                if (typeSpec->genericTypeParameters() != nullptr)
+                {
+                    // Generic type instantiation: Box<MyType> -> Box__MyType
+                    std::string baseName = typeSpec->Identifier()->getText();
+                    std::vector<std::string> typeArgs;
+                    for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                        typeArgs.push_back(typeParamSpec->getText());
+                    std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    // Just store the mangled name; instantiation is done separately at declaration time
+                    declType.TypeName = mangledName;
+                }
+                else
+                {
+                    typeName = typeSpec->getText();
+                    // Apply active type parameter substitutions (e.g. T -> int inside a template body)
+                    auto substIt = activeTypeSubstitutions.find(typeName);
+                    if (substIt != activeTypeSubstitutions.end())
+                        typeName = substIt->second;
+                    declType.TypeName = typeName;
+                }
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = compilerLLVM->IsInterfaceType(declType.TypeName);
@@ -353,6 +463,10 @@ public:
         {
             ParseStructClassUnionDefinition(dataStruct);
         }
+
+        // Process any generic instantiations queued while parsing the above item.
+        // This is the only safe point: the IRBuilder has no active function/block.
+        ProcessPendingInstantiations();
     }
 
     void ParseNamespaceDefinition(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
@@ -836,6 +950,15 @@ public:
 
         std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
 
+        // Pre-scan declarations in the function body to queue and emit any generic
+        // struct instantiations before the function's IR block is opened.
+        // At this point no basic block is active, so it is safe to emit new functions.
+        if (auto* blockItemList = func->compoundStatement()->blockItemList())
+        {
+            ScanAndQueueGenericTypeUses(blockItemList);
+            ProcessPendingInstantiations();
+        }
+
         auto fn = compilerLLVM->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
 
         compilerLLVM->InitializeBlock(&fn->front(), false);
@@ -971,6 +1094,11 @@ public:
 
         int line = declSpec->getStart()->getLine();
         auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
+
+        // Queue any pending generic instantiation for this declaration's type.
+        // Actual instantiation happens later in ProcessPendingInstantiations() at top-level scope.
+        QueueInstantiateGenericType(declSpec);
+
         auto initDeclarVec = initDecl->initDeclarator();
 
         if (typeAndValue.TypeName.empty())
@@ -1051,7 +1179,7 @@ public:
                     auto structData = compilerLLVM->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
                     {
-                        LogErrorContext(direct, std::format("({}) struct and class must be initialized on the stack.", typeAndValue.TypeName));
+                        LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
                     }
                 }
 
@@ -1500,22 +1628,6 @@ public:
 
     MyCompilerLLVM::NamedVariable ParseCastExpression(CParser::CastExpressionContext* ctx, bool lvalue = false)
     {
-        /*
-        castExpression : (int*)&num_f
-        typeName : int*
-        specifierQualifierList : int
-        typeSpecifier : int
-        abstractDeclarator : *
-        pointer : *
-        castExpression : &num_f
-        unaryExpression : &num_f
-        unaryOperator : &
-        castExpression : num_f
-        unaryExpression : num_f
-        postfixExpression : num_f
-        primaryExpression : num_f
-        */
-
         auto unaryCtx = ctx->unaryExpression();
         auto castExp = ctx->castExpression();
         auto typeName = ctx->typeName();
@@ -1849,6 +1961,18 @@ public:
                     case CParser::RulePrimaryExpression:
                     {
                         auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
+
+                        // If the primary is a generic instantiation (e.g. Box<MyInt>),
+                        // map it to its mangled constructor name (e.g. Box__MyInt).
+                        if (prevPrimary->Identifier() && prevPrimary->genericTypeParameters())
+                        {
+                            std::string mangledName = prevPrimary->Identifier()->getText();
+                            for (auto* typeParamSpec : prevPrimary->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                                mangledName += "__" + typeParamSpec->getText();
+                            primaryIdentifier = mangledName;
+                            namedVar = {};
+                            break;
+                        }
 
                         primaryIdentifier = prevPrimary->getText();
 
@@ -2411,6 +2535,12 @@ public:
     llvm::Value* ParseExpression(CParser::ExpressionContext* ctx)
     {
         auto assignCtxs = ctx->assignmentExpression();
+        auto left = this->ParseAssignmentExpression(assignCtxs);
+        ProcessPlusPlus();
+        return left;
+
+        /*
+        // TODO: handle comma operator.
         if (assignCtxs.size() > 0)
         {
             llvm::Value* left = nullptr;
@@ -2422,6 +2552,7 @@ public:
 
             return left;
         }
+        */
 
         LogErrorContext(ctx, "Expression has no assignment sub-expressions.");
         return nullptr;
@@ -2443,17 +2574,151 @@ public:
         }
     }
 
-    void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx)
+    // Recursively walk any AST subtree and queue generic instantiations found anywhere
+    // (declaration specifiers, initializer expressions, etc.).
+    // Skips generic template struct definition bodies (contain unbound type parameters).
+    void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx)
+    {
+        if (!ctx) return;
+        for (auto* child : ctx->children)
+        {
+            auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
+            if (!ruleCtx) continue;
+
+            // Skip generic template struct definition bodies (contain unbound T)
+            if (auto* structDef = dynamic_cast<CParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            {
+                if (structDef->genericTypeParameters() != nullptr)
+                    continue;
+            }
+
+            // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
+            if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
+            {
+                if (typeSpec->Identifier() && typeSpec->genericTypeParameters())
+                {
+                    std::string baseName = typeSpec->Identifier()->getText();
+                    std::vector<std::string> typeArgs;
+                    for (auto* p : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                        typeArgs.push_back(p->getText());
+                    std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    if (!instantiatedGenerics.count(mangledName))
+                    {
+                        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                        instantiatedGenerics.insert(mangledName);
+                    }
+                }
+            }
+
+            // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
+            if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
+            {
+                if (primaryExpr->Identifier() && primaryExpr->genericTypeParameters())
+                {
+                    std::string baseName = primaryExpr->Identifier()->getText();
+                    std::vector<std::string> typeArgs;
+                    for (auto* p : primaryExpr->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                        typeArgs.push_back(p->getText());
+                    std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    if (!instantiatedGenerics.count(mangledName))
+                    {
+                        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                        instantiatedGenerics.insert(mangledName);
+                    }
+                }
+            }
+
+            ScanAndQueueGenericTypeUses(ruleCtx);
+        }
+    }
+
+    // Check if a declaration uses a generic type and queue it for instantiation if needed.
+    // Instantiation is deferred to avoid interrupting code generation in the current context.
+    void QueueInstantiateGenericType(CParser::DeclarationSpecifiersContext* declSpec)
+    {
+        for (auto declSpecItem : declSpec->declarationSpecifier())
+        {
+            auto typeSpec = declSpecItem->typeSpecifier();
+            if (!typeSpec || !typeSpec->genericTypeParameters())
+                continue;
+
+            // This is a generic type instantiation
+            std::string baseName = typeSpec->Identifier()->getText();
+            std::vector<std::string> typeArgs;
+            for (auto typeParamSpec : typeSpec->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                typeArgs.push_back(typeParamSpec->getText());
+
+            std::string mangledName = MangledGenericName(baseName, typeArgs);
+
+            // Queue the instantiation instead of doing it immediately
+            if (!instantiatedGenerics.count(mangledName))
+            {
+                pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                instantiatedGenerics.insert(mangledName);
+            }
+            break;
+        }
+    }
+
+    // Compute the mangled name for a generic instantiation, e.g. Box<int, float> → "Box__int__float".
+    std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs)
+    {
+        std::string name = baseName;
+        for (const auto& arg : typeArgs)
+            name += "__" + arg;
+        return name;
+    }
+
+    // Process all pending generic instantiations that were queued during parsing.
+    // This is called when it's safe to emit code (e.g., after a declaration completes).
+    void ProcessPendingInstantiations()
+    {
+        while (!pendingInstantiations.empty())
+        {
+            auto pending = pendingInstantiations.back();
+            pendingInstantiations.pop_back();
+
+            // Now safe to instantiate
+            auto templateIt = genericStructTemplates.find(pending.templateName);
+            if (templateIt == genericStructTemplates.end())
+                continue; // not a generic template
+
+            const auto& typeParams = genericStructTypeParams[pending.templateName];
+
+            // Set up type substitutions for this instantiation
+            auto savedSubst = activeTypeSubstitutions;
+            for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
+                activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+
+            ParseStructClassUnionDefinition(templateIt->second, pending.mangledName);
+
+            activeTypeSubstitutions = savedSubst;
+        }
+    }
+
+    void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {})
     {
         auto decl = ctx->directDeclarator();
-        std::string structName = decl->getText();
+        std::string structName = nameOverride.empty() ? decl->getText() : nameOverride;
+
+        // If this is a generic template definition (not an instantiation), store it and return.
+        if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
+        {
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
+            genericStructTemplates[structName] = ctx;
+            genericStructTypeParams[structName] = typeParams;
+            return;
+        }
+
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
 
         auto declList = ParseDeclarationList(declarationList);
 
-        // Create a opaqueStruct to initialize default constructor.
-        auto structType = compilerLLVM->CreateStructType(structName, {});
+        // Build the struct body before opening the constructor function so that
+        // GetFunctionType can resolve the (sized) return type.  Initializer
+        // expressions are evaluated later inside the constructor body.
+        auto structType = compilerLLVM->CreateStructType(structName, declList);
         MyCompilerLLVM::TypeAndValue returnType{
             .TypeName = structName,
         };
@@ -2475,6 +2740,8 @@ public:
                         if (typeValue.TypeName == "auto")
                         {
                             typeValue.TypeName = rvalue->getType()->getStructName();
+                            // Re-finalise the struct body now that the auto field type is known.
+                            structType = compilerLLVM->CreateStructType(structName, declList);
                         }
                     }
                 }
@@ -2486,7 +2753,6 @@ public:
                 initilizers.push_back(rvalue);
             }
 
-            structType = compilerLLVM->CreateStructType(structName, declList);
             llvm::Value* structVal = llvm::UndefValue::get(structType);
 
             MyCompilerLLVM::TypeAndValue myStruct;
@@ -2537,6 +2803,33 @@ public:
         compilerLLVM->RegisterStructInterfaces(structName, ifaceNames);
         for (const auto& interfaceName : ifaceNames)
             compilerLLVM->VerifyInterfaceImplementation(structName, interfaceName);
+
+        // Process any generic instantiations that were queued during this struct definition
+        // ProcessPendingInstantiations();
+    }
+
+    std::vector<std::string> ParseGenericTypeParameters(CParser::GenericTypeParametersContext* genericParams)
+    {
+        std::vector<std::string> typeParams;
+        if (!genericParams)
+            return typeParams;
+
+        auto typeParamList = genericParams->typeParameterList();
+        if (!typeParamList)
+            return typeParams;
+
+        for (auto typeSpec : typeParamList->typeSpecifier())
+        {
+            // Generic type parameters must be simple identifiers, not built-in types
+            if (!typeSpec->Identifier())
+            {
+                LogErrorContext(typeSpec, "Generic type parameter must be an identifier, not a built-in type");
+                continue;
+            }
+            typeParams.push_back(typeSpec->Identifier()->getText());
+        }
+
+        return typeParams;
     }
 
     void ParseDestructorDefinition(CParser::DestructorDefinitionContext* ctx, const std::string& structName)
@@ -2733,6 +3026,13 @@ public:
         int column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
         exit(1);
+    }
+
+    void LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage)
+    {
+        int line = ctx->getStart()->getLine();
+        int column = ctx->getStart()->getCharPositionInLine();
+        std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), warningMessage);
     }
 
     void PrintContext(antlr4::ParserRuleContext* ctx, std::string suffix = "")
