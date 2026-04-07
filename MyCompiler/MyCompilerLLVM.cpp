@@ -5,9 +5,9 @@
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <antlr4-runtime.h>
 
-#include "CParser.h"
-#include "CLexer.h"
-#include "CBaseListener.h"
+#include "CFlatParser.h"
+#include "CFlatLexer.h"
+#include "CFlatBaseListener.h"
 #include "MyCompilerLLVM.h"
 #include "MyListener.h"
 #include <filesystem>
@@ -46,9 +46,9 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         stream.open(filename);
         antlr4::ANTLRInputStream input(stream);
 
-        CLexer lexer(&input);
+        CFlatLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
-        CParser parser(&tokens);
+        CFlatParser parser(&tokens);
 
         tokens.fill();
         //for (auto token : tokens.getTokens()) {
@@ -148,9 +148,9 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     std::ifstream stream;
     stream.open(canonicalStr);
     antlr4::ANTLRInputStream input(stream);
-    CLexer lexer(&input);
+    CFlatLexer lexer(&input);
     antlr4::CommonTokenStream tokens(&lexer);
-    CParser parser(&tokens);
+    CFlatParser parser(&tokens);
     tokens.fill();
     auto computeUnit = parser.compilationUnit();
 

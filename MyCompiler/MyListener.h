@@ -6,15 +6,15 @@
 #include <variant>
 #include <cstdlib>
 
-#include "CParser.h"
-#include "CLexer.h"
-#include "CBaseListener.h"
+#include "CFlatParser.h"
+#include "CFlatLexer.h"
+#include "CFlatBaseListener.h"
 #include "MyCompilerLLVM.h"
 
 
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
-static bool IsReturnBlockFunction(CParser::FunctionDefinitionContext* func)
+static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)
 {
     auto* cs = func->compoundStatement();
     if (!cs) return false;
@@ -43,7 +43,7 @@ private:
         return compilerLLVM;
     }
 
-    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
+    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
         auto* compiler = Compiler(declSpecs);
         MyCompilerLLVM::DeclTypeAndValue declType;
@@ -92,7 +92,7 @@ private:
         return declType;
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
     {
         std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
         if (paramTypeList == nullptr)
@@ -111,7 +111,7 @@ private:
         return params;
     }
 
-    std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
+    std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
             return opId->New() ? "operator new" : "operator delete";
@@ -119,7 +119,7 @@ private:
         return directDecl->getText();
     }
 
-    void ScanFunctionDefinition(CParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
+    void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(func);
         // Return-block functions are inlined at call sites — no LLVM proto needed.
@@ -170,7 +170,7 @@ private:
         }
     }
 
-    void ScanInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
+    void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
     {
         // Generic interface templates are not pre-declared; they are instantiated on demand.
         auto* nameGid = ctx->genericIdentifier();
@@ -199,7 +199,7 @@ private:
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
     }
 
-    void ScanStructDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& namespaceName = {})
+    void ScanStructDefinition(CFlatParser::StructClassUnionDefinitionContext* ctx, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
@@ -249,20 +249,20 @@ public:
 
             // Skip generic template definitions entirely — their bodies contain
             // unbound type parameters (e.g. T) that are not valid type names.
-            if (auto* structDef = dynamic_cast<CParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            if (auto* structDef = dynamic_cast<CFlatParser::StructClassUnionDefinitionContext*>(ruleCtx))
             {
                 if (structDef->genericTypeParameters() != nullptr)
                     continue;
             }
 
             // Skip generic function template definitions for the same reason.
-            if (auto* funcDef = dynamic_cast<CParser::FunctionDefinitionContext*>(ruleCtx))
+            if (auto* funcDef = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx))
             {
                 if (funcDef->genericTypeParameters() != nullptr)
                     continue;
             }
 
-            auto tryPreDeclare = [&](const std::string& baseName, CParser::GenericTypeParametersContext* genericParams)
+            auto tryPreDeclare = [&](const std::string& baseName, CFlatParser::GenericTypeParametersContext* genericParams)
             {
         auto* compiler = Compiler(genericParams);
                 std::string mangledName = baseName;
@@ -273,13 +273,13 @@ public:
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
             };
 
-            if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
+            if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx))
             {
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                     tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
             }
 
-            if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
+            if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
             {
                 if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     tryPreDeclare(primaryExpr->genericIdentifier()->Identifier()->getText(), primaryExpr->genericIdentifier()->genericTypeParameters());
@@ -289,7 +289,7 @@ public:
         }
     }
 
-    void ScanExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
+    void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         if (auto ns = ctx->namespaceDefinition())
             ScanNamespace(ns, namespaceName);
@@ -301,7 +301,7 @@ public:
             ScanInterfaceDefinition(iface);
     }
 
-    void ScanNamespace(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
+    void ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
     {
         std::string namespaceName = ctx->Identifier()->getText();
         if (!parentNamespace.empty())
@@ -313,10 +313,10 @@ public:
 };
 
 
-class MyListener : public CBaseListener
+class MyListener : public CFlatBaseListener
 {
 private:
-    CParser* parser;
+    CFlatParser* parser;
     MyCompilerLLVM* compilerLLVM;
 
     MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
@@ -331,7 +331,7 @@ private:
     bool global_scope = true; // true when parsing an entity in the global scope.
 
     // Generic struct templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CParser::StructClassUnionDefinitionContext*> genericStructTemplates;
+    std::unordered_map<std::string, CFlatParser::StructClassUnionDefinitionContext*> genericStructTemplates;
     std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
     // Set of already-instantiated mangled names (e.g. "Box__int") to avoid re-instantiation
     std::unordered_set<std::string> instantiatedGenerics;
@@ -339,12 +339,12 @@ private:
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
 
     // Generic interface templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
+    std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
     std::unordered_set<std::string> instantiatedInterfaces;
 
     // Generic function templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CParser::FunctionDefinitionContext*> genericFunctionTemplates;
+    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*> genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
     std::unordered_set<std::string> instantiatedGenericFunctions;
 
@@ -367,14 +367,14 @@ private:
 
     struct SwitchContext
     {
-        std::unordered_map<CParser::LabeledStatementContext*, SwitchCaseEntry> caseMap;
+        std::unordered_map<CFlatParser::LabeledStatementContext*, SwitchCaseEntry> caseMap;
         llvm::BasicBlock* defaultBlock = nullptr;
         llvm::BasicBlock* resumeBlock = nullptr;
     };
 
     std::vector<SwitchContext> switchStack;
 
-    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
+    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
         MyCompilerLLVM::DeclTypeAndValue declType;
         std::string typeName;
@@ -430,14 +430,14 @@ private:
         return declType;
     }
 
-    MyCompilerLLVM::DeclTypeAndValue getFunctionReturnType(CParser::FunctionDefinitionContext* ctx)
+    MyCompilerLLVM::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx)
     {
         auto declSpecs = ctx->declarationSpecifiers();
 
         return ParseDeclarationSpecifiers(declSpecs);
     }
 
-    std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
+    std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
             return opId->New() ? "operator new" : "operator delete";
@@ -465,13 +465,13 @@ private:
     }
 
 public:
-    MyListener(CParser* parser, MyCompilerLLVM* compilerLLVM)
+    MyListener(CFlatParser* parser, MyCompilerLLVM* compilerLLVM)
     {
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
     }
 
-    void ParseInterfaceDefinition(CParser::InterfaceDefinitionContext* ctx)
+    void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
     {
         auto* nameGid = ctx->genericIdentifier();
         if (!nameGid || !nameGid->Identifier()) return;
@@ -641,7 +641,7 @@ public:
         return {};
     }
 
-    void ParseUsingDeclaration(CParser::UsingDeclarationContext* ctx)
+    void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto identifiers = ctx->Identifier();
@@ -658,7 +658,7 @@ public:
             compiler->RegisterLocalNamespaceAlias(alias, target);
     }
 
-    void ParseExternalDeclaration(CParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
+    void ParseExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         auto func = ctx->functionDefinition();
         auto dataStruct = ctx->structClassUnionDefinition();
@@ -699,7 +699,7 @@ public:
         ProcessPendingInstantiations();
     }
 
-    void ParseNamespaceDefinition(CParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
+    void ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
     {
         std::string namespaceName = ctx->Identifier()->getText();
         if (!parentNamespace.empty())
@@ -710,19 +710,19 @@ public:
             ParseExternalDeclaration(extDecl, namespaceName);
     }
 
-    void enterExternalDeclaration(CParser::ExternalDeclarationContext* ctx) override
+    void enterExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx) override
     {
         if constexpr (debugPrint)
             return;
 
         // Skip nodes nested inside a namespace — they are handled by ParseNamespaceDefinition.
-        if (dynamic_cast<CParser::NamespaceDefinitionContext*>(ctx->parent))
+        if (dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(ctx->parent))
             return;
 
         ParseExternalDeclaration(ctx);
     }
 
-    void ParseBlockItemList(CParser::BlockItemListContext* ctx)
+    void ParseBlockItemList(CFlatParser::BlockItemListContext* ctx)
     {
         auto blockItems = ctx->blockItem();
 
@@ -748,7 +748,7 @@ public:
     }
 
     // Recursively collects case/default labels from a statement (to handle `case 1: case 2: stmt` nesting).
-    void CollectCasesFromStatement(CParser::StatementContext* stmt, SwitchContext& ctx)
+    void CollectCasesFromStatement(CFlatParser::StatementContext* stmt, SwitchContext& ctx)
     {
         auto* compiler = Compiler(stmt);
         if (!stmt) return;
@@ -771,7 +771,7 @@ public:
         }
     }
 
-    void ParseStatement(CParser::StatementContext* statement)
+    void ParseStatement(CFlatParser::StatementContext* statement)
     {
         auto* compiler = Compiler(statement);
         compiler->SetCurrentDebugLocation(statement->getStart()->getLine());
@@ -1151,7 +1151,7 @@ public:
         }
     }
 
-    void ParseFunctionDefinition(CParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {}, const std::string& nameOverride = {})
+    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {}, const std::string& nameOverride = {})
     {
         auto* compiler = Compiler(func);
         // Create Function Definition
@@ -1159,7 +1159,7 @@ public:
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
         auto returnType = this->getFunctionReturnType(func);
-        CParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
+        CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);
         int line = func->getStart()->getLine();
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
@@ -1227,7 +1227,7 @@ public:
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CParser::DeclarationContext*> ctx)
+    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CFlatParser::DeclarationContext*> ctx)
     {
         std::vector<MyCompilerLLVM::DeclTypeAndValue> result;
 
@@ -1256,14 +1256,14 @@ public:
         return result;
     }
 
-    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseForDeclaration(CParser::ForDeclarationContext* ctx)
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseForDeclaration(CFlatParser::ForDeclarationContext* ctx)
     {
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
         return ParseDeclaration(declSpec, initDecl);
     }
 
-    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationContext* ctx)
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationContext* ctx)
     {
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
@@ -1277,7 +1277,7 @@ public:
         return ParseDeclaration(declSpec, initDecl);
     }
 
-    void ParseEnumSpecifier(CParser::EnumSpecifierContext* ctx)
+    void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         if (!ctx) return;
@@ -1332,7 +1332,7 @@ public:
         }
     }
 
-    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CParser::DeclarationSpecifiersContext* declSpec, CParser::InitDeclaratorListContext* initDecl)
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl)
     {
         auto* compiler = Compiler(declSpec);
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
@@ -1453,7 +1453,7 @@ public:
         return allocList;
     }
 
-    llvm::Value* ParseAssignmentExpression(CParser::AssignmentExpressionContext* ctx)
+    llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto condCtx = ctx->conditionalExpression();
@@ -1492,7 +1492,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseConditionalExpression(CParser::ConditionalExpressionContext* ctx)
+    llvm::Value* ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
@@ -1552,7 +1552,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseLogicalOrExpression(CParser::LogicalOrExpressionContext* ctx)
+    llvm::Value* ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
@@ -1623,7 +1623,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseLogicalAndExpression(CParser::LogicalAndExpressionContext* ctx)
+    llvm::Value* ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
@@ -1693,7 +1693,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseInclusiveOrExpression(CParser::InclusiveOrExpressionContext* ctx)
+    llvm::Value* ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
     {
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size())
@@ -1708,7 +1708,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseExclusiveOrExpression(CParser::ExclusiveOrExpressionContext* ctx)
+    llvm::Value* ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
     {
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size())
@@ -1723,7 +1723,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseAndExpression(CParser::AndExpressionContext* ctx)
+    llvm::Value* ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
     {
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size())
@@ -1738,7 +1738,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseEqualityExpression(CParser::EqualityExpressionContext* ctx)
+    llvm::Value* ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
     {
         auto nextCtxs = ctx->relationalExpression();
         if (nextCtxs.size() == 1)
@@ -1757,7 +1757,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseRelationalExpression(CParser::RelationalExpressionContext* ctx)
+    llvm::Value* ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)
     {
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
@@ -1776,7 +1776,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseShiftExpression(CParser::ShiftExpressionContext* ctx)
+    llvm::Value* ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.size())
@@ -1791,7 +1791,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseAdditiveExpression(CParser::AdditiveExpressionContext* ctx)
+    llvm::Value* ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx)
     {
         auto nextCtxs = ctx->multiplicativeExpression();
 
@@ -1851,7 +1851,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseMultiplicativeExpression(CParser::MultiplicativeExpressionContext* ctx)
+    llvm::Value* ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
     {
         auto nextCtxs = ctx->castExpression();
 
@@ -1880,7 +1880,7 @@ public:
         return nullptr;
     }
 
-    MyCompilerLLVM::NamedVariable ParseCastExpression(CParser::CastExpressionContext* ctx, bool lvalue = false)
+    MyCompilerLLVM::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false)
     {
         auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
@@ -1915,7 +1915,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypeAndValue ParseTypeName(CParser::TypeNameContext* ctx)
+    MyCompilerLLVM::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx)
     {
         auto specCtx = ctx->specifierQualifierList();
         auto abstractDecl = ctx->abstractDeclarator();
@@ -1948,7 +1948,7 @@ public:
         return typeValue;
     }
 
-    MyCompilerLLVM::NamedVariable ParseUnaryExpression(CParser::UnaryExpressionContext* ctx)
+    MyCompilerLLVM::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto postFixCtx = ctx->postfixExpression();
@@ -2036,7 +2036,7 @@ public:
         return {};
     }
 
-    std::string ParseTypeSpecifierName(CParser::TypeSpecifierContext* ctx)
+    std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx)
     {
         if (ctx->genericIdentifier() && ctx->genericIdentifier()->genericTypeParameters())
         {
@@ -2054,7 +2054,7 @@ public:
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
-    MyCompilerLLVM::NamedVariable ParseNewExpression(CParser::NewExpressionContext* ctx)
+    MyCompilerLLVM::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
@@ -2126,7 +2126,7 @@ public:
         return result;
     }
 
-    MyCompilerLLVM::NamedVariable ParseDeleteExpression(CParser::DeleteExpressionContext* ctx)
+    MyCompilerLLVM::NamedVariable ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         bool isArray = ctx->LeftBracket() != nullptr;
@@ -2181,7 +2181,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::NamedVariable ParsePostfixExpression(CParser::PostfixExpressionContext* ctx, bool lValue = false)
+    MyCompilerLLVM::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
         * postfixExpression
@@ -2216,16 +2216,16 @@ public:
                     auto tokenType = terminal->getSymbol()->getType();
                     switch (tokenType)
                     {
-                    case CParser::LeftBracket:
-                    case CParser::RightBracket:
-                    case CParser::LeftParen:
-                    case CParser::RightParen: { prevToken = tokenType; break; }
-                    case CParser::Dot:
-                    case CParser::Arrow: { prevToken = tokenType; nullConditionalPending = false; break; }
-                    case CParser::QuestionDot: { prevToken = tokenType; nullConditionalPending = true; break; }
-                    case CParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
-                    case CParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
-                    case CParser::Identifier:
+                    case CFlatParser::LeftBracket:
+                    case CFlatParser::RightBracket:
+                    case CFlatParser::LeftParen:
+                    case CFlatParser::RightParen: { prevToken = tokenType; break; }
+                    case CFlatParser::Dot:
+                    case CFlatParser::Arrow: { prevToken = tokenType; nullConditionalPending = false; break; }
+                    case CFlatParser::QuestionDot: { prevToken = tokenType; nullConditionalPending = true; break; }
+                    case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
+                    case CFlatParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
+                    case CFlatParser::Identifier:
                     {
                         if (!namespaceContext.empty())
                         {
@@ -2367,9 +2367,9 @@ public:
                     auto ruleID = ruleContext->getRuleIndex();
                     switch (ruleID)
                     {
-                    case CParser::RulePrimaryExpression:
+                    case CFlatParser::RulePrimaryExpression:
                     {
-                        auto prevPrimary = dynamic_cast<CParser::PrimaryExpressionContext*>(parseTree);
+                        auto prevPrimary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parseTree);
 
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
                         // map it to its mangled constructor name (e.g. Box__MyInt).
@@ -2422,11 +2422,11 @@ public:
 
                         break;
                     }
-                    case CParser::RuleExpression:
+                    case CFlatParser::RuleExpression:
                     {
                         // Bracket [] operation
 
-                        auto expressCtx = dynamic_cast<CParser::ExpressionContext*>(ruleContext);
+                        auto expressCtx = dynamic_cast<CFlatParser::ExpressionContext*>(ruleContext);
                         auto rvalue = ParseExpression(expressCtx);
 
                         if (!(rvalue && rvalue->getType()->isIntegerTy()))
@@ -2465,7 +2465,7 @@ public:
 
                         break;
                     }
-                    case CParser::RuleArgumentExpressionList:
+                    case CFlatParser::RuleArgumentExpressionList:
                     {
                         // Create Function Call
                         std::string functionName = primaryIdentifier;
@@ -2759,10 +2759,10 @@ public:
 
     // Walk down single-child rule nodes to find a UnaryExpressionContext.
     // Returns nullptr if the path branches or never reaches a unaryExpression.
-    CParser::UnaryExpressionContext* tryGetUnaryExpression(antlr4::RuleContext* ctx)
+    CFlatParser::UnaryExpressionContext* tryGetUnaryExpression(antlr4::RuleContext* ctx)
     {
-        if (ctx->getRuleIndex() == CParser::RuleUnaryExpression)
-            return dynamic_cast<CParser::UnaryExpressionContext*>(ctx);
+        if (ctx->getRuleIndex() == CFlatParser::RuleUnaryExpression)
+            return dynamic_cast<CFlatParser::UnaryExpressionContext*>(ctx);
 
         antlr4::RuleContext* singleRuleChild = nullptr;
         for (auto* child : ctx->children)
@@ -2777,7 +2777,7 @@ public:
         return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
     }
 
-    llvm::Value* ParsePrimaryExpression(CParser::PrimaryExpressionContext* ctx)
+    llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto expressionCtx = ctx->expression();
@@ -3020,7 +3020,7 @@ public:
         return output;
     }
 
-    llvm::Value* ParseExpression(CParser::ExpressionContext* ctx)
+    llvm::Value* ParseExpression(CFlatParser::ExpressionContext* ctx)
     {
         auto assignCtxs = ctx->assignmentExpression();
         auto left = this->ParseAssignmentExpression(assignCtxs);
@@ -3074,14 +3074,14 @@ public:
             if (!ruleCtx) continue;
 
             // Skip generic template struct definition bodies (contain unbound T)
-            if (auto* structDef = dynamic_cast<CParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            if (auto* structDef = dynamic_cast<CFlatParser::StructClassUnionDefinitionContext*>(ruleCtx))
             {
                 if (structDef->genericTypeParameters() != nullptr)
                     continue;
             }
 
             // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
-            if (auto* typeSpec = dynamic_cast<CParser::TypeSpecifierContext*>(ruleCtx))
+            if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx))
             {
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                 {
@@ -3099,7 +3099,7 @@ public:
             }
 
             // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
-            if (auto* primaryExpr = dynamic_cast<CParser::PrimaryExpressionContext*>(ruleCtx))
+            if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
             {
                 if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                 {
@@ -3122,7 +3122,7 @@ public:
 
     // Check if a declaration uses a generic type and queue it for instantiation if needed.
     // Instantiation is deferred to avoid interrupting code generation in the current context.
-    void QueueInstantiateGenericType(CParser::DeclarationSpecifiersContext* declSpec)
+    void QueueInstantiateGenericType(CFlatParser::DeclarationSpecifiersContext* declSpec)
     {
         for (auto declSpecItem : declSpec->declarationSpecifier())
         {
@@ -3186,7 +3186,7 @@ public:
         }
     }
 
-    void ParseStructClassUnionDefinition(CParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
+    void ParseStructClassUnionDefinition(CFlatParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
         auto decl = ctx->directDeclarator();
@@ -3370,7 +3370,7 @@ public:
         // ProcessPendingInstantiations();
     }
 
-    std::vector<std::string> ParseGenericTypeParameters(CParser::GenericTypeParametersContext* genericParams)
+    std::vector<std::string> ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams)
     {
         std::vector<std::string> typeParams;
         if (!genericParams)
@@ -3394,7 +3394,7 @@ public:
         return typeParams;
     }
 
-    void ParseDestructorDefinition(CParser::DestructorDefinitionContext* ctx, const std::string& structName)
+    void ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName)
     {
         auto* compiler = Compiler(ctx);
         MyCompilerLLVM::DeclTypeAndValue thisParam;
@@ -3422,7 +3422,7 @@ public:
         compiler->ClearCurrentSubprogram();
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CParser::ParameterTypeListContext* paramTypeList)
+    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
     {
         std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
 

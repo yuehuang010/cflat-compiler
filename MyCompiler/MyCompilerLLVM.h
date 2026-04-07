@@ -15,7 +15,7 @@
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <llvm\Support\FileSystem.h>
 #include <antlr4-runtime.h>
-#include <CParser.h>
+#include <CFlatParser.h>
 #include "ArgParser.h"
 
 class MyCompilerLLVM
@@ -167,13 +167,13 @@ public:
     struct DeclTypeAndValue : public TypeAndValue
     {
         // Used for delayed Initialization
-        CParser::InitializerContext* Initializer = nullptr;
+        CFlatParser::InitializerContext* Initializer = nullptr;
 
         // Used for array
-        CParser::AssignmentExpressionContext* ArraySize = nullptr;
+        CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
 
         // Used for default parameter values
-        CParser::AssignmentExpressionContext* DefaultValue = nullptr;
+        CFlatParser::AssignmentExpressionContext* DefaultValue = nullptr;
 
         bool external = false;
     };
@@ -245,7 +245,7 @@ public:
 
     struct ReturnBlockEntry
     {
-        CParser::CompoundStatementContext* Body;
+        CFlatParser::CompoundStatementContext* Body;
         std::vector<DeclTypeAndValue> Params;
         TypeAndValue ReturnType;
     };
@@ -2453,7 +2453,7 @@ public:
         return "";
     }
 
-    void RegisterReturnBlock(const std::string& name, CParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType)
+    void RegisterReturnBlock(const std::string& name, CFlatParser::CompoundStatementContext* body, std::vector<DeclTypeAndValue> params, TypeAndValue returnType)
     {
         returnBlockTable[name] = { body, std::move(params), returnType };
     }

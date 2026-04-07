@@ -1,0 +1,314 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "CFlat",
+  "scopeName": "source.cflat",
+  "fileTypes": ["cb"],
+  "patterns": [
+    { "include": "#preprocessor" },
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#character-literal" },
+    { "include": "#numbers" },
+    { "include": "#keywords-control" },
+    { "include": "#keywords-storage" },
+    { "include": "#keywords-type" },
+    { "include": "#keywords-qualifier" },
+    { "include": "#keywords-myc-extension" },
+    { "include": "#keywords-c11" },
+    { "include": "#constants" },
+    { "include": "#namespace-declaration" },
+    { "include": "#interface-declaration" },
+    { "include": "#struct-declaration" },
+    { "include": "#function-definition" },
+    { "include": "#function-call" },
+    { "include": "#named-parameter" },
+    { "include": "#operators" },
+    { "include": "#punctuation" }
+  ],
+  "repository": {
+    "preprocessor": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.include.cflat",
+          "match": "^\\s*(#\\s*include)\\s+([<\"].*?[>\"])",
+          "captures": {
+            "1": { "name": "keyword.control.directive.include.cflat" },
+            "2": { "name": "string.quoted.other.lt-gt.include.cflat" }
+          }
+        },
+        {
+          "name": "meta.preprocessor.define.cflat",
+          "match": "^\\s*(#\\s*define)\\s+(\\w+)(?:\\(([^)]*)\\))?",
+          "captures": {
+            "1": { "name": "keyword.control.directive.define.cflat" },
+            "2": { "name": "entity.name.function.preprocessor.cflat" },
+            "3": { "name": "variable.parameter.preprocessor.cflat" }
+          }
+        },
+        {
+          "name": "keyword.control.directive.cflat",
+          "match": "^\\s*#\\s*(if|ifdef|ifndef|elif|else|endif|undef|pragma|error|warning|line)\\b"
+        },
+        {
+          "name": "meta.preprocessor.cflat",
+          "match": "^\\s*(#\\s*\\w+).*$",
+          "captures": {
+            "1": { "name": "keyword.control.directive.cflat" }
+          }
+        }
+      ]
+    },
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.cflat",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.cflat",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": { "0": { "name": "punctuation.definition.comment.begin.cflat" } },
+          "endCaptures": { "0": { "name": "punctuation.definition.comment.end.cflat" } }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.cflat",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            { "name": "constant.character.escape.cflat", "match": "\\\\." },
+            { "name": "constant.other.placeholder.cflat", "match": "%[-+0 #]*[0-9]*(?:\\.[0-9]+)?[diouxXeEfFgGaAcsSp%]" }
+          ]
+        }
+      ]
+    },
+    "character-literal": {
+      "name": "string.quoted.single.cflat",
+      "match": "'(?:[^'\\\\]|\\\\.)'",
+      "captures": { "0": { "name": "string.quoted.single.cflat" } }
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.cflat",
+          "match": "\\b[0-9]+\\.[0-9]*([eE][+-]?[0-9]+)?[fFlL]?\\b|\\b[0-9]+[eE][+-]?[0-9]+[fFlL]?\\b"
+        },
+        {
+          "name": "constant.numeric.hex.cflat",
+          "match": "\\b0[xX][0-9a-fA-F]+[uUlLuU]*\\b"
+        },
+        {
+          "name": "constant.numeric.octal.cflat",
+          "match": "\\b0[0-7]+[uUlL]*\\b"
+        },
+        {
+          "name": "constant.numeric.integer.cflat",
+          "match": "\\b[0-9]+[uUlLuU]*\\b"
+        }
+      ]
+    },
+    "keywords-control": {
+      "name": "keyword.control.cflat",
+      "match": "\\b(if|else|switch|case|default|while|do|for|break|continue|return|goto)\\b"
+    },
+    "keywords-storage": {
+      "name": "storage.modifier.cflat",
+      "match": "\\b(typedef|extern|static|register|inline|auto|thread_local|_Thread_local|__inline__|__forceinline)\\b"
+    },
+    "keywords-type": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.cflat",
+          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64)\\b"
+        },
+        {
+          "name": "storage.type.struct.cflat",
+          "match": "\\b(struct|union|enum|class)\\b"
+        }
+      ]
+    },
+    "keywords-qualifier": {
+      "name": "storage.modifier.qualifier.cflat",
+      "match": "\\b(const|volatile|restrict|_Atomic)\\b"
+    },
+    "keywords-myc-extension": {
+      "patterns": [
+        {
+          "name": "keyword.other.namespace.cflat",
+          "match": "\\b(namespace|using)\\b"
+        },
+        {
+          "name": "keyword.other.interface.cflat",
+          "match": "\\binterface\\b"
+        },
+        {
+          "name": "keyword.operator.expression.cflat",
+          "match": "\\b(nameof|typeof|sizeof)\\b"
+        }
+      ]
+    },
+    "keywords-c11": {
+      "name": "keyword.other.c11.cflat",
+      "match": "\\b(_Alignas|_Alignof|alignas|alignof|_Static_assert|static_assert|_Generic|_Noreturn|noreturn)\\b"
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.cflat",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.cflat",
+          "match": "\\b(NULL|nullptr)\\b"
+        }
+      ]
+    },
+    "namespace-declaration": {
+      "name": "meta.namespace.cflat",
+      "match": "\\b(namespace)\\s+([A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\{)",
+      "captures": {
+        "1": { "name": "keyword.other.namespace.cflat" },
+        "2": { "name": "entity.name.namespace.cflat" }
+      }
+    },
+    "interface-declaration": {
+      "name": "meta.interface.cflat",
+      "match": "\\b(interface)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\{)",
+      "captures": {
+        "1": { "name": "keyword.other.interface.cflat" },
+        "2": { "name": "entity.name.type.interface.cflat" }
+      }
+    },
+    "struct-declaration": {
+      "patterns": [
+        {
+          "comment": "struct/class/union/enum keyword followed by a type name — covers declarations AND type-usage positions (variable declarations, casts, parameters)",
+          "name": "meta.struct.cflat",
+          "match": "\\b(struct|class|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.struct.cflat" },
+            "2": { "name": "entity.name.type.cflat" }
+          }
+        },
+        {
+          "comment": "Destructor definition: ~TypeName()",
+          "name": "meta.destructor.cflat",
+          "match": "(~)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "keyword.operator.destructor.cflat" },
+            "2": { "name": "entity.name.function.destructor.cflat" }
+          }
+        }
+      ]
+    },
+    "function-definition": {
+      "comment": "Function definition: returnType funcName(...) {",
+      "name": "meta.function.definition.cflat",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*)\\s+([A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\([^;]*\\)\\s*(?:const\\s*)?(?:\\{|;))",
+      "captures": {
+        "1": { "name": "storage.type.return-type.cflat" },
+        "2": { "name": "entity.name.function.cflat" }
+      }
+    },
+    "function-call": {
+      "name": "meta.function-call.cflat",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\()",
+      "captures": {
+        "1": { "name": "entity.name.function.cflat" }
+      }
+    },
+    "named-parameter": {
+      "comment": "Named parameters like func(x:1, y:2)",
+      "name": "meta.named-parameter.cflat",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*:",
+      "captures": {
+        "1": { "name": "variable.parameter.named.cflat" }
+      }
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arithmetic.cflat",
+          "match": "\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.comparison.cflat",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.cflat",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.bitwise.cflat",
+          "match": "&|\\||\\^|~|<<|>>"
+        },
+        {
+          "name": "keyword.operator.assignment.cflat",
+          "match": "\\+=|-=|\\*=|/=|%=|<<=|>>=|&=|\\|=|\\^=|="
+        },
+        {
+          "name": "keyword.operator.increment.cflat",
+          "match": "\\+\\+|--"
+        },
+        {
+          "name": "keyword.operator.member.cflat",
+          "match": "->|\\."
+        },
+        {
+          "comment": "Null-conditional ?. and null-coalescing ?? must be matched before bare ?",
+          "name": "keyword.operator.null-safe.cflat",
+          "match": "\\?\\.|\\?\\?"
+        },
+        {
+          "name": "keyword.operator.ternary.cflat",
+          "match": "\\?|:"
+        },
+        {
+          "name": "keyword.operator.scope.cflat",
+          "match": "::"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.terminator.statement.cflat",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.comma.cflat",
+          "match": ","
+        },
+        {
+          "name": "punctuation.section.block.begin.cflat",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.section.block.end.cflat",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.section.parens.begin.cflat",
+          "match": "\\("
+        },
+        {
+          "name": "punctuation.section.parens.end.cflat",
+          "match": "\\)"
+        },
+        {
+          "name": "punctuation.section.brackets.begin.cflat",
+          "match": "\\["
+        },
+        {
+          "name": "punctuation.section.brackets.end.cflat",
+          "match": "\\]"
+        }
+      ]
+    }
+  }
+}

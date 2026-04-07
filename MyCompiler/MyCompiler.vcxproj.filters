@@ -35,7 +35,7 @@
     <None Include="testfile3.c" />
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="C.g4" />
+    <CustomBuild Include="CFlat.g4" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ArgParser.h">

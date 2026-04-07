@@ -147,12 +147,12 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="C.g4">
+    <CustomBuild Include="CFlat.g4">
       <FileType>Document</FileType>
       <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(ProjectDir)\antlr4.bat -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">$(IntDir)\Generated\CFlatParser.cpp;$(IntDir)\Generated\CFlatBaseListener.cpp;$(IntDir)\Generated\CFlatLexer.cpp;$(IntDir)\Generated\CFlatListener.cpp</Outputs>
       <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(ProjectDir)\antlr4.bat -o "$(IntDir)\Generated" -Dlanguage=Cpp "%(FullPath)"</Command>
-      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\Generated\CParser.cpp;$(IntDir)\Generated\CBaseListener.cpp;$(IntDir)\Generated\CLexer.cpp;$(IntDir)\Generated\CListener.cpp</Outputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)\Generated\CFlatParser.cpp;$(IntDir)\Generated\CFlatBaseListener.cpp;$(IntDir)\Generated\CFlatLexer.cpp;$(IntDir)\Generated\CFlatListener.cpp</Outputs>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
       <OutputItemType Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ClCompile</OutputItemType>

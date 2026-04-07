@@ -231,8 +231,8 @@ async function validateDocument(document: TextDocument): Promise<void> {
     }
 
     // Write the current document content to a temp file so unsaved changes are diagnosed too
-    const ext = path.extname(uriToFilePath(document.uri)) || '.myc';
-    const tmpFile = path.join(os.tmpdir(), `myc_diag_${Date.now()}${ext}`);
+    const ext = path.extname(uriToFilePath(document.uri)) || '.cb';
+    const tmpFile = path.join(os.tmpdir(), `cflat_diag_${Date.now()}${ext}`);
 
     try {
         fs.writeFileSync(tmpFile, document.getText(), 'utf-8');
@@ -254,7 +254,7 @@ function runCompiler(
     document: TextDocument
 ): Promise<Diagnostic[]> {
     return new Promise(resolve => {
-        const outputFile = path.join(os.tmpdir(), `myc_out_${Date.now()}.tmp`);
+        const outputFile = path.join(os.tmpdir(), `cflat_out_${Date.now()}.tmp`);
         const args = [inputFile, '-o', outputFile];
         connection.console.log(`Running: "${exePath}" ${args.join(' ')}`);
 
@@ -658,7 +658,7 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         extractAggregate(m[1], m[2], m.index + m[0].length, nameIndex);
     }
 
-    // --- interface (MyC extension) ---
+    // --- interface (CFlat extension) ---
     // [^;{]* allows for generic type parameters and inheritance clauses (: Base1, Base2) before the opening brace.
     const ifaceRe = /\binterface\s+([A-Za-z_]\w*)[^;{]*\{/g;
     while ((m = ifaceRe.exec(clean)) !== null) {
@@ -996,13 +996,13 @@ const KEYWORD_DOCS: Record<string, string> = {
     '?.': '**?.** *(null-conditional operator)*\n\nAccess a member or call a method only if the object is non-null. Returns zero/null if the object is null.\n\n```c\nint v = node?.value;       // field access\nint r = node?.Read();      // method call\n```',
     '??': '**??** *(null-coalescing operator)*\n\nReturn the left-hand side if it is non-zero/non-null, otherwise evaluate and return the right-hand side.\n\n```c\nint v = node?.value ?? -1;    // -1 if node is null\nconst char* s = name ?? \"unknown\";\n```',
 
-    // MyC extensions
-    'namespace': '**namespace** *(MyC extension)*\n\nGroup declarations under a named scope.\n\n```c\nnamespace Math {\n    float pi = 3.14159f;\n    float sqrt(float x) { ... }\n}\n```',
-    'using':     '**using** *(MyC extension)*\n\nImport a namespace into the current scope.\n\n```c\nusing Math;\nusing Math::sqrt;\n```',
-    'import':    '**import** *(MyC extension)*\n\nImport another source file into the current compilation unit.\n\n```c\nimport "utils.myc";\nimport "math/vector.myc";\n```',
-    'interface': '**interface** *(MyC extension)*\n\nDeclare an abstract set of method signatures that a struct must implement.\n\n```c\ninterface Drawable {\n    void draw();\n};\n```',
-    'nameof':    '**nameof** *(MyC extension)*\n\nReturn the name of a variable or type as a `const char*` string at compile time.\n\n```c\nconst char* name = nameof(myVariable);\n```',
-    'typeof':    '**typeof** *(MyC extension)*\n\nReturn the type name of an expression as a `const char*` string.\n\n```c\nconst char* typeName = typeof(myVar);\n```',
+    // CFlat extensions
+    'namespace': '**namespace** *(CFlat extension)*\n\nGroup declarations under a named scope.\n\n```c\nnamespace Math {\n    float pi = 3.14159f;\n    float sqrt(float x) { ... }\n}\n```',
+    'using':     '**using** *(CFlat extension)*\n\nImport a namespace into the current scope.\n\n```c\nusing Math;\nusing Math::sqrt;\n```',
+    'import':    '**import** *(CFlat extension)*\n\nImport another source file into the current compilation unit.\n\n```c\nimport "utils.cb";\nimport "math/vector.cb";\n```',
+    'interface': '**interface** *(CFlat extension)*\n\nDeclare an abstract set of method signatures that a struct must implement.\n\n```c\ninterface Drawable {\n    void draw();\n};\n```',
+    'nameof':    '**nameof** *(CFlat extension)*\n\nReturn the name of a variable or type as a `const char*` string at compile time.\n\n```c\nconst char* name = nameof(myVariable);\n```',
+    'typeof':    '**typeof** *(CFlat extension)*\n\nReturn the type name of an expression as a `const char*` string.\n\n```c\nconst char* typeName = typeof(myVar);\n```',
 
     // C11
     'sizeof':         '**sizeof** *(operator)*\n\nReturn the size in bytes of a type or expression.',
@@ -1101,13 +1101,13 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeKeyword('u32', 'type — unsigned 32-bit integer'),
     makeKeyword('u64', 'type — unsigned 64-bit integer'),
 
-    // MyC extensions
-    makeKeyword('namespace', 'MyC extension'),
-    makeKeyword('using', 'MyC extension'),
-    makeKeyword('import', 'MyC extension'),
-    makeKeyword('interface', 'MyC extension'),
-    makeKeyword('nameof', 'MyC extension — compile-time name'),
-    makeKeyword('typeof', 'MyC extension — compile-time type name'),
+    // CFlat extensions
+    makeKeyword('namespace', 'CFlat extension'),
+    makeKeyword('using', 'CFlat extension'),
+    makeKeyword('import', 'CFlat extension'),
+    makeKeyword('interface', 'CFlat extension'),
+    makeKeyword('nameof', 'CFlat extension — compile-time name'),
+    makeKeyword('typeof', 'CFlat extension — compile-time type name'),
 
     // C11
     makeKeyword('sizeof', 'operator'),
@@ -1136,8 +1136,8 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeSnippet('printf', 'printf("${1}\\n"${2});', 'printf call'),
     makeSnippet('#include', '#include <${1:stdio.h}>', '#include directive'),
     makeSnippet('#define', '#define ${1:NAME} ${2:value}', '#define directive'),
-    makeSnippet('return-block', 'return {\n\t${1}\n};', 'return block (MyC extension)'),
-    makeSnippet('import', 'import "${1:file.myc}";', 'import declaration (MyC extension)'),
+    makeSnippet('return-block', 'return {\n\t${1}\n};', 'return block (CFlat extension)'),
+    makeSnippet('import', 'import "${1:file.cb}";', 'import declaration (CFlat extension)'),
     makeSnippet('alignas', 'alignas(${1:alignment})', 'alignas specifier'),
     makeSnippet('static_assert', 'static_assert(${1:condition}, "${2:message}");', 'compile-time assertion')
 ];

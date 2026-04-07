@@ -25,9 +25,9 @@ export function activate(context: vscode.ExtensionContext): void {
     };
 
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: 'file', language: 'myc' }],
+        documentSelector: [{ scheme: 'file', language: 'cflat' }],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{myc,c}')
+            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{cb,c}')
         },
         outputChannelName: 'MyCompiler Language Server'
     };

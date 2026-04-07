@@ -52,7 +52,7 @@ code --extensionDevelopmentPath="%EXT_PATH%" --new-window "%WORKSPACE%"
 echo VSCode launched. A new window should appear momentarily.
 echo.
 echo Tips:
-echo   - Open a .myc file to activate the language server.
+echo   - Open a .cb file to activate the language server.
 echo   - View -> Output -> "MyCompiler Language Server" to see server logs.
 echo   - Press F5 inside the extension source to attach the debugger (port 6009).
 echo   - Run build.bat and restart VSCode to pick up code changes.

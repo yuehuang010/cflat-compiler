@@ -13,18 +13,18 @@
   "contributes": {
     "languages": [
       {
-        "id": "myc",
-        "aliases": ["MyC", "myc", "MyCompiler C"],
-        "extensions": [".myc"],
+        "id": "cflat",
+        "aliases": ["CFlat", "cflat", "C-flat"],
+        "extensions": [".cb"],
         "filenames": [],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
       {
-        "language": "myc",
-        "scopeName": "source.myc",
-        "path": "./syntaxes/myc.tmLanguage.json"
+        "language": "cflat",
+        "scopeName": "source.cflat",
+        "path": "./syntaxes/cflat.tmLanguage.json"
       }
     ],
     "configuration": {
