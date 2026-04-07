@@ -76,7 +76,12 @@ unaryExpression
         | ('sizeof' | 'alignof') '(' typeName ')'
         | newExpression
         | deleteExpression
+        | operatorStringExpression
     )
+    ;
+
+operatorStringExpression
+    : Operator String '(' argumentExpressionList ')'
     ;
 
 unaryOperator
@@ -217,6 +222,7 @@ typeSpecifier
     | 'signed'
     | 'unsigned'
     | 'bool'
+    | 'string'
     | 'i8'
     | 'i16'
     | 'i32'
@@ -485,7 +491,7 @@ externalDeclaration
     ;
 
 usingDeclaration
-    : Using Identifier '=' Identifier ('.' Identifier)* ';'
+    : Using (Identifier | String) '=' Identifier ('.' Identifier)* ';'
     ;
 
 importDeclaration
@@ -513,7 +519,7 @@ destructorDefinition
     ;
 
 newExpression
-    : New typeSpecifier ('(' argumentExpressionList? ')')?
+    : New typeSpecifier ('(' argumentExpressionList ')')?
     | New typeSpecifier '[' assignmentExpression ']'
     ;
 
@@ -523,7 +529,7 @@ deleteExpression
     ;
 
 operatorFunctionId
-    : Operator (New | Delete)
+    : Operator (New | Delete | String)
     ;
 
 interfaceDefinition
@@ -748,6 +754,10 @@ Delete
 
 Operator
     : 'operator'
+    ;
+
+String
+    : 'string'
     ;
 
 LeftParen

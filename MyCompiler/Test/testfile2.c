@@ -1,6 +1,26 @@
 extern void printf(const char* argv, ...);
 extern void* malloc(i64 size);
 extern void free(void* ptr);
+extern i32 strlen(const char* s);
+extern i32 sprintf(char* buf, const char* fmt, ...);
+
+interface IReadOnlyString
+{
+    i8* data();
+    i32 length();
+};
+
+using string = IReadOnlyString;
+
+interface IString
+{
+    string ToString();
+};
+
+string operator string(IString* s)
+{
+    return s->ToString();
+}
 
 void* operator new(long long size)
 {
@@ -55,7 +75,7 @@ bool testBuiltinIdentifiers()
     bool result = true;
     result &= TestStr("__FILE__", __FILE__, "testfile2.c");
     result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 58); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 78); // Remember to adjust if shifted.
     return result;
 }
 
@@ -692,6 +712,109 @@ bool testDefault()
     return result;
 }
 
+// =============================================================
+// string type tests
+// IReadOnlyString: i8* data(); i32 length()
+// 'string' is a user-defined alias for IReadOnlyString (fat pointer).
+// =============================================================
+
+struct StringData : IReadOnlyString
+{
+    i8* buf;
+    i32 len;
+
+    i8* data() { return buf; }
+    i32 length() { return len; }
+
+    ~StringData()
+    {
+        delete[] buf;
+    }
+};
+
+StringData* MakeStringData(char* s, i32 n)
+{
+    StringData* sd = new StringData();
+    sd->len = n;
+    sd->buf = new i8[n + 1];
+    for (int i = 0; i < n; i++)
+    {
+        sd->buf[i] = s[i];
+    }
+    sd->buf[n] = 0;
+    return sd;
+}
+
+string operator string(char* s)
+{
+    StringData* sd = MakeStringData(s, strlen(s));
+    string result = sd;
+    return result;
+}
+
+string operator string(i32 n)
+{
+    char* buf = malloc(32);
+    i32 len = sprintf(buf, "%d", n);
+    StringData* sd = MakeStringData(buf, len);
+    free(buf);
+    string result = sd;
+    return result;
+}
+
+bool testStringType()
+{
+    bool result = true;
+
+    string s = "hello";
+
+    result &= Test("string_length", s.length(), 5);
+    result &= TestStr("string_data", s.data(), "hello");
+
+    string s2 = "world!!";
+    result &= Test("string2_length", s2.length(), 7);
+    result &= TestStr("string2_data", s2.data(), "world!!");
+
+    return result;
+}
+
+// Tests the built-in string literal syntax: string s = "...";
+// A string literal is automatically wrapped in the built-in __StrLit struct
+// which implements IReadOnly via data() -> i8* and length() -> i32.
+bool testStringLiteral()
+{
+    bool result = true;
+
+    // Basic assignment from a string literal
+    string s = "hello";
+    result &= Test("str_lit_length",      s.length(), 5);
+    result &= TestStr("str_lit_data",     s.data(),  "hello");
+
+    // Longer literal — the canonical use case: string s = "My test string";
+    string s2 = "My test string";
+    result &= Test("str_lit_long_length", s2.length(), 14);
+    result &= TestStr("str_lit_long_data", s2.data(), "My test string");
+
+    // Empty string literal
+    string s3 = "";
+    result &= Test("str_lit_empty_length", s3.length(), 0);
+    result &= TestStr("str_lit_empty_data", s3.data(), "");
+
+    // String with escape sequences — \n counts as one character
+    string s4 = "line1\nline2";
+    result &= Test("str_lit_escape_length", s4.length(), 11);
+
+    // Multiple string variables can coexist with independent values
+    string sa = "alpha";
+    string sb = "beta!";
+    result &= Test("str_lit_multi_a_length",  sa.length(), 5);
+    result &= Test("str_lit_multi_b_length",  sb.length(), 5);
+    result &= TestStr("str_lit_multi_a_data", sa.data(), "alpha");
+    result &= TestStr("str_lit_multi_b_data", sb.data(), "beta!");
+
+    return result;
+}
+
 class Node
 {
     int value = 0;
@@ -738,6 +861,44 @@ int testNewWithConstructor()
     return 123;
 }
 
+struct Point : IString
+{
+    i32 x = 0;
+    i32 y = 0;
+
+    string ToString()
+    {
+        return "{x}, {y}";
+    }
+};
+
+bool testFormatString()
+{
+    bool result = true;
+
+    string name = "World";
+    string greeting = "Hello {name}!";
+    result &= TestStr("fmt_simple", greeting.data(), "Hello World!");
+
+    string a = "foo";
+    string b = "bar";
+    string combined = "{a} and {b}";
+    result &= TestStr("fmt_two", combined.data(), "foo and bar");
+
+    string prefix = "pre";
+    string suffix = "suf";
+    string three = "{prefix}-mid-{suffix}";
+    result &= TestStr("fmt_three", three.data(), "pre-mid-suf");
+
+    Point p = Point();
+	p.x = 10;
+	p.y = 20;
+	string pointStr = "Point is {p}.";
+	result &= TestStr("fmt_object", pointStr.data(), "Point is 10, 20.");
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -778,6 +939,9 @@ extern int main()
     result &= Test("testNewDelete", testNewDelete(), 42);
     result &= Test("testNewArray", testNewArray(), 99);
     result &= Test("testNewWithConstructor", testNewWithConstructor(), 123);
+    result &= testStringType();
+    result &= testStringLiteral();
+    result &= testFormatString();
 
     if (result)
     {

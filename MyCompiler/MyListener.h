@@ -77,6 +77,8 @@ private:
                 else
                 {
                     declType.TypeName = compiler->ResolveQualifiedName(typeSpec->getText());
+                    // Resolve type aliases (e.g. "string" → "IReadOnlyString")
+                    declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
                 }
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
@@ -114,7 +116,11 @@ private:
     std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
-            return opId->New() ? "operator new" : "operator delete";
+        {
+            if (opId->New())    return "operator new";
+            if (opId->Delete()) return "operator delete";
+            if (opId->String()) return "operator string";
+        }
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
     }
@@ -139,8 +145,10 @@ private:
         auto params = ParseParameterTypeList(paramTypeList);
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
-        // Operator new/delete are static (no 'this' param), but scoped to struct
-        bool isOperatorFunc = (getFunctionName(func) == "operator new" || getFunctionName(func) == "operator delete");
+        // Operator new/delete/string are static (no 'this' param), but scoped to struct
+        bool isOperatorFunc = (getFunctionName(func) == "operator new"
+                            || getFunctionName(func) == "operator delete"
+                            || getFunctionName(func) == "operator string");
         if (!structName.empty() && isOperatorFunc)
         {
             name = structName + "." + getFunctionName(func);
@@ -289,6 +297,29 @@ public:
         }
     }
 
+    void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto identifiers = ctx->Identifier();
+
+        std::string alias;
+        if (ctx->String())
+            alias = ctx->String()->getText();
+        else if (!identifiers.empty())
+            alias = identifiers[0]->getText();
+
+        std::string target;
+        size_t start = ctx->String() ? 0 : 1;
+        for (size_t i = start; i < identifiers.size(); i++)
+        {
+            if (!target.empty()) target += ".";
+            target += identifiers[i]->getText();
+        }
+
+        if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0)
+            compiler->RegisterTypeAlias(alias, target);
+    }
+
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         if (auto ns = ctx->namespaceDefinition())
@@ -299,6 +330,8 @@ public:
             ScanStructDefinition(dataStruct, namespaceName);
         else if (auto iface = ctx->interfaceDefinition())
             ScanInterfaceDefinition(iface);
+        else if (auto usingDecl = ctx->usingDeclaration())
+            ScanUsingDeclaration(usingDecl);
     }
 
     void ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
@@ -413,6 +446,8 @@ private:
                         typeName = substIt->second;
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
+                    // Resolve type aliases (e.g. "string" → "IReadOnlyString")
+                    typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     declType.TypeName = typeName;
                 }
                 declType.Pointer = declSpec->pointer() != nullptr;
@@ -440,7 +475,11 @@ private:
     std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
-            return opId->New() ? "operator new" : "operator delete";
+        {
+            if (opId->New())    return "operator new";
+            if (opId->Delete()) return "operator delete";
+            if (opId->String()) return "operator string";
+        }
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
     }
@@ -645,14 +684,28 @@ public:
     {
         auto* compiler = Compiler(ctx);
         auto identifiers = ctx->Identifier();
-        std::string alias = identifiers[0]->getText();
+
+        // The alias name may be a plain Identifier or the 'string' keyword token.
+        std::string alias;
+        if (ctx->String())
+            alias = ctx->String()->getText();
+        else if (!identifiers.empty())
+            alias = identifiers[0]->getText();
+
+        // Build the target from the remaining identifiers.
         std::string target;
-        for (size_t i = 1; i < identifiers.size(); i++)
+        size_t start = ctx->String() ? 0 : 1;
+        for (size_t i = start; i < identifiers.size(); i++)
         {
             if (!target.empty()) target += ".";
             target += identifiers[i]->getText();
         }
-        if (global_scope)
+
+        // If the target names a known type (interface or struct), register a type alias.
+        // Otherwise treat it as a namespace alias.
+        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr)
+            compiler->RegisterTypeAlias(alias, target);
+        else if (global_scope)
             compiler->RegisterNamespaceAlias(alias, target);
         else
             compiler->RegisterLocalNamespaceAlias(alias, target);
@@ -942,7 +995,7 @@ public:
 
                 compiler->CreateBlockBreak(blockInit, false);
 
-                // Init => (Condition => Inner => Increment =>Condition)
+                // Init => Condition => Inner => Increment => Condition
 
                 // initialization
                 compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
@@ -951,7 +1004,7 @@ public:
                 if (expressionCtx)
                     ParseExpression(expressionCtx);
 
-                compiler->CreateContinueCall();
+                compiler->CreateBlockBreak(blockCondition, false);
 
                 // Condition
                 compiler->InitializeBlock(blockCondition, false);
@@ -1415,7 +1468,53 @@ public:
                     auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                     {
-                        right = ParseAssignmentExpression(assignmentExpression);
+                        if (typeAndValue.IsInterface)
+                        {
+                            // For interface (string) declarations, preserve NamedVariable type info
+                            // so we can do the struct→interface fat-struct upcast when needed.
+                            auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                            right = LoadNamedVariable(rightNV);
+                            // If RHS is a struct pointer (not already a fat struct), upcast it.
+                            if (right && right->getType() != compiler->GetFatPtrType())
+                            {
+                                std::string structName = rightNV.TypeAndValue.TypeName;
+                                if (!structName.empty())
+                                {
+                                    auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
+                                    right = compiler->BuildInterfaceFatValue(vtable, right);
+                                }
+                                else if (typeAndValue.TypeName == "IReadOnlyString" &&
+                                         right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                                {
+                                    // A raw i8*/char* assigned to a string variable.
+                                    // If it is a compile-time string literal constant (length known at
+                                    // compile time), wrap it directly in __StrLit on the caller's stack.
+                                    // Otherwise call user-defined operator string(char*) for runtime values.
+                                    auto* c = llvm::dyn_cast<llvm::Constant>(right);
+                                    if (c && compiler->IsStringLiteralConstant(c))
+                                    {
+                                        right = compiler->WrapStringLiteralAsIReadOnly(right);
+                                    }
+                                    else if (compiler->GetFunction("operator string"))
+                                    {
+                                        MyCompilerLLVM::NamedVariable argNV;
+                                        argNV.Primary = right;
+                                        argNV.BaseType = right->getType();
+                                        argNV.TypeAndValue.TypeName = "char";
+                                        argNV.TypeAndValue.Pointer = true;
+                                        right = compiler->CreateFunctionCall2("operator string", { argNV });
+                                    }
+                                    else
+                                    {
+                                        right = compiler->WrapStringLiteralAsIReadOnly(right);
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            right = ParseAssignmentExpression(assignmentExpression);
+                        }
                     }
                     else if (initializer->Default() != nullptr)
                     {
@@ -1451,6 +1550,68 @@ public:
         }
 
         return allocList;
+    }
+
+    // Returns a NamedVariable (preserving TypeName) for simple single-child expression chains.
+    // Used by ParseDeclaration to get the struct TypeName for struct→interface upcasting.
+    // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
+    MyCompilerLLVM::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
+    {
+        auto* condCtx = ctx->conditionalExpression();
+        if (condCtx && !ctx->assignmentOperator()
+            && !condCtx->Question() && !condCtx->QuestionQuestion())
+        {
+            auto* lor = condCtx->logicalOrExpression();
+            if (lor)
+            {
+                auto las = lor->logicalAndExpression();
+                if (las.size() == 1)
+                {
+                    auto ios = las[0]->inclusiveOrExpression();
+                    if (ios.size() == 1)
+                    {
+                        auto eos = ios[0]->exclusiveOrExpression();
+                        if (eos.size() == 1)
+                        {
+                            auto ands = eos[0]->andExpression();
+                            if (ands.size() == 1)
+                            {
+                                auto eqs = ands[0]->equalityExpression();
+                                if (eqs.size() == 1)
+                                {
+                                    auto rels = eqs[0]->relationalExpression();
+                                    if (rels.size() == 1)
+                                    {
+                                        auto shs = rels[0]->shiftExpression();
+                                        if (shs.size() == 1)
+                                        {
+                                            auto adds = shs[0]->additiveExpression();
+                                            if (adds.size() == 1)
+                                            {
+                                                auto muls = adds[0]->multiplicativeExpression();
+                                                if (muls.size() == 1)
+                                                {
+                                                    auto casts = muls[0]->castExpression();
+                                                    if (casts.size() == 1)
+                                                    {
+                                                        return ParseCastExpression(casts[0]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back: no TypeName info available
+        MyCompilerLLVM::NamedVariable result;
+        result.Primary = ParseAssignmentExpression(ctx);
+        if (result.Primary) result.BaseType = result.Primary->getType();
+        return result;
     }
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx)
@@ -1967,6 +2128,10 @@ public:
         {
             return ParseDeleteExpression(delCtx);
         }
+        else if (auto* opStrCtx = ctx->operatorStringExpression())
+        {
+            return ParseOperatorStringExpression(opStrCtx);
+        }
         else if (unaryOperator && castExpCtx)
         {
             /* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
@@ -2181,6 +2346,37 @@ public:
         return {};
     }
 
+    MyCompilerLLVM::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        // Collect arguments passed to operator string(...)
+        std::vector<MyCompilerLLVM::NamedVariable> arguments;
+        if (auto* argList = ctx->argumentExpressionList())
+        {
+            for (auto* argExpr : argList->argumentNamedExpression())
+            {
+                llvm::Value* argVal = ParseAssignmentExpression(argExpr->assignmentExpression());
+                if (!argVal) break;
+                MyCompilerLLVM::NamedVariable argVar;
+                argVar.Primary = argVal;
+                argVar.BaseType = argVal->getType();
+                arguments.push_back(argVar);
+            }
+        }
+
+        // Dispatch to the global "operator string" overload matching the argument types.
+        auto result = compiler->CreateFunctionCall2("operator string", arguments);
+        if (!result) { LogErrorContext(ctx, "'operator string' is not defined"); return {}; }
+
+        MyCompilerLLVM::NamedVariable ret;
+        ret.Primary = result;
+        ret.TypeAndValue.TypeName = "IReadOnlyString";
+        ret.TypeAndValue.IsInterface = true;
+        ret.TypeAndValue.Pointer = true;
+        return ret;
+    }
+
     MyCompilerLLVM::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
@@ -2221,7 +2417,30 @@ public:
                     case CFlatParser::LeftParen:
                     case CFlatParser::RightParen: { prevToken = tokenType; break; }
                     case CFlatParser::Dot:
-                    case CFlatParser::Arrow: { prevToken = tokenType; nullConditionalPending = false; break; }
+                    case CFlatParser::Arrow:
+                    {
+                        prevToken = tokenType;
+                        nullConditionalPending = false;
+                        // For '->', load the struct pointer so subsequent field/method lookups work.
+                        if (tokenType == CFlatParser::Arrow
+                            && namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.TypeName.empty()
+                            && !namedVar.TypeAndValue.IsInterface)
+                        {
+                            auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                            if (sd.StructType)
+                            {
+                                // Load the pointer value (handles both local var allocas and direct args)
+                                llvm::Value* ptrVal = LoadNamedVariable(namedVar);
+                                structVar.Storage  = ptrVal;
+                                structVar.Primary  = nullptr;
+                                structVar.BaseType = sd.StructType;
+                                structVar.TypeAndValue = namedVar.TypeAndValue;
+                                structVar.TypeAndValue.Pointer = false;
+                            }
+                        }
+                        break;
+                    }
                     case CFlatParser::QuestionDot: { prevToken = tokenType; nullConditionalPending = true; break; }
                     case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
                     case CFlatParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
@@ -2572,9 +2791,19 @@ public:
 
                             if (Compiler(ctx)->HasInterfaceMethod(interfaceVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
-                                // Interface method dispatch via vtable
+                                // Interface method dispatch via vtable.
+                                // Ensure we have a {i8*,i8*}* pointer (alloca address).
+                                // If the interface value was produced inline (Primary set, no Storage),
+                                // spill it into a temp alloca first.
+                                llvm::Value* ifacePtr = interfaceVar.Storage;
+                                if (ifacePtr == nullptr && interfaceVar.Primary != nullptr)
+                                {
+                                    auto fatTy = Compiler(ctx)->GetFatPtrType();
+                                    ifacePtr = Compiler(ctx)->CreateAlloca(fatTy);
+                                    Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
+                                }
                                 namedVar.Primary = Compiler(ctx)->CallInterfaceMethod(
-                                    interfaceVar.Storage,
+                                    ifacePtr,
                                     interfaceVar.TypeAndValue.TypeName,
                                     primaryIdentifier,
                                     extraArgs
@@ -2777,6 +3006,176 @@ public:
         return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
     }
 
+    // Returns true if rawText (the full StringLiteral token text including quotes)
+    // contains at least one unescaped '{' that starts an interpolation expression.
+    bool HasInterpolation(const std::string& rawText)
+    {
+        bool inEscape = false;
+        for (size_t i = 1; i + 1 < rawText.size(); i++) // skip opening/closing "
+        {
+            char c = rawText[i];
+            if (inEscape) { inEscape = false; continue; }
+            if (c == '\\') { inEscape = true; continue; }
+            if (c == '{') return true;
+        }
+        return false;
+    }
+
+    // Parses a format string literal with {expr} interpolation.
+    // Splits the literal into alternating plain-text and expression segments,
+    // coerces each expression segment to IReadOnlyString via operator string,
+    // stacks all (ptr, len) pairs on the stack and calls __strconcat.
+    llvm::Value* ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx, const std::string& rawText)
+    {
+        auto* compiler = Compiler(ctx);
+        compiler->EnsureStrConcatRegistered();
+
+        // Collect segment data: each entry is {i8* ptr, i32 len} stored in alloca arrays
+        struct Segment { llvm::Value* ptr; llvm::Value* len; };
+        std::vector<Segment> segments;
+
+        auto* i8Ty  = compiler->builder->getInt8Ty();
+        auto* i32Ty = compiler->builder->getInt32Ty();
+
+        // Walk rawText between the outer quotes, splitting on unescaped { ... }
+        // rawText format:  "...{expr}..."  (quotes included)
+        size_t i = 1; // skip opening "
+        size_t end = rawText.size() - 1; // stop before closing "
+        std::string litAccum;
+
+        auto flushLiteral = [&]()
+        {
+            if (litAccum.empty()) return;
+            // Re-encode as a quoted string so ProcessRawText can decode escapes
+            std::string quoted = "\"" + litAccum + "\"";
+            std::string text = ProcessRawText(quoted);
+            auto* gv  = compiler->CreateGlobalString("fmtlit", text);
+            auto* len = compiler->builder->getInt32((int32_t)text.size());
+            segments.push_back({ gv, len });
+            litAccum.clear();
+        };
+
+        bool inEscape = false;
+        while (i < end)
+        {
+            char c = rawText[i];
+            if (inEscape)
+            {
+                litAccum += '\\';
+                litAccum += c;
+                inEscape = false;
+                i++;
+                continue;
+            }
+            if (c == '\\')
+            {
+                inEscape = true;
+                i++;
+                continue;
+            }
+            if (c == '{')
+            {
+                // Find matching '}'
+                size_t exprStart = i + 1;
+                int depth = 1;
+                size_t j = exprStart;
+                while (j < end && depth > 0)
+                {
+                    if (rawText[j] == '{') depth++;
+                    else if (rawText[j] == '}') depth--;
+                    if (depth > 0) j++;
+                }
+                std::string exprText = rawText.substr(exprStart, j - exprStart);
+                i = j + 1; // skip past '}'
+
+                flushLiteral();
+
+                // Re-parse the expression text
+                antlr4::ANTLRInputStream exprInput(exprText);
+                CFlatLexer exprLexer(&exprInput);
+                antlr4::CommonTokenStream exprTokens(&exprLexer);
+                CFlatParser exprParser(&exprTokens);
+                auto* exprCtx = exprParser.assignmentExpression();
+
+                auto nv = ParseAssignmentExpressionNamed(exprCtx);
+
+                llvm::Value* ptr = nullptr;
+                llvm::Value* len = nullptr;
+
+                bool isString = nv.TypeAndValue.TypeName == "IReadOnlyString"
+                             || nv.TypeAndValue.TypeName == "string"
+                             || compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName) == "IReadOnlyString";
+
+                if (isString)
+                {
+                    // Already IReadOnlyString fat ptr — extract data() and length()
+                    auto* fatAlloca = compiler->builder->CreateAlloca(compiler->GetFatPtrType(), nullptr, "fatptr");
+                    llvm::Value* fatVal = nv.Primary ? nv.Primary : compiler->CreateLoad(nv.Storage);
+                    compiler->builder->CreateStore(fatVal, fatAlloca);
+                    ptr = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "data",   {});
+                    len = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "length", {});
+                }
+                else
+                {
+                    // Call operator string to convert to IReadOnlyString
+                    MyCompilerLLVM::NamedVariable arg = nv;
+                    arg.TypeAndValue.VariableName = "";
+                    auto* strFat = compiler->CreateFunctionCall2("operator string", { arg });
+                    if (!strFat)
+                    {
+                        compiler->LogError("no operator string for expression in format string: " + exprText);
+                        return nullptr;
+                    }
+                    auto* fatAlloca = compiler->builder->CreateAlloca(compiler->GetFatPtrType(), nullptr, "fmtfat");
+                    compiler->builder->CreateStore(strFat, fatAlloca);
+                    ptr = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "data",   {});
+                    len = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "length", {});
+                }
+
+                segments.push_back({ ptr, len });
+                continue;
+            }
+            litAccum += c;
+            i++;
+        }
+        flushLiteral();
+
+        if (segments.empty())
+        {
+            // Degenerate: no content at all — return empty string
+            auto* gv = compiler->CreateGlobalString("fmtempty", "");
+            return compiler->WrapStringLiteralAsIReadOnly(gv);
+        }
+
+        int count = (int)segments.size();
+        auto* i32ArrTy = llvm::ArrayType::get(i32Ty, count);
+        auto* ptrArrTy = llvm::ArrayType::get(i8Ty->getPointerTo(), count);
+
+        auto* ptrArr = compiler->builder->CreateAlloca(ptrArrTy, nullptr, "fmtptrs");
+        auto* lenArr = compiler->builder->CreateAlloca(i32ArrTy, nullptr, "fmtlens");
+
+        for (int k = 0; k < count; k++)
+        {
+            auto* ptrGep = compiler->builder->CreateConstInBoundsGEP2_32(ptrArrTy, ptrArr, 0, k);
+            compiler->builder->CreateStore(segments[k].ptr, ptrGep);
+            auto* lenGep = compiler->builder->CreateConstInBoundsGEP2_32(i32ArrTy, lenArr, 0, k);
+            compiler->builder->CreateStore(segments[k].len, lenGep);
+        }
+
+        auto* ptrBase = compiler->builder->CreateConstInBoundsGEP2_32(ptrArrTy, ptrArr, 0, 0);
+        auto* lenBase = compiler->builder->CreateConstInBoundsGEP2_32(i32ArrTy, lenArr, 0, 0);
+
+        MyCompilerLLVM::NamedVariable nvPtrs, nvLens, nvCount;
+        nvPtrs.Primary  = ptrBase;
+        nvPtrs.TypeAndValue = { "i8", "ptrs", true, false };
+        nvLens.Primary  = lenBase;
+        nvLens.TypeAndValue = { "i32", "lens", true, false };
+        nvCount.Primary = compiler->builder->getInt32(count);
+        nvCount.TypeAndValue = { "i32", "count", false, false };
+
+        return compiler->CreateFunctionCall2("__strconcat", { nvPtrs, nvLens, nvCount });
+    }
+
     llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -2828,8 +3227,10 @@ public:
         {
             // TODO handle encoding u8,u,U,L
             std::string rawText = ctx->getText();
-            rawText = ProcessRawText(rawText);
-            return compiler->CreateGlobalString("", rawText);
+            if (HasInterpolation(rawText))
+                return ParseFormatString(ctx, rawText);
+            std::string processed = ProcessRawText(rawText);
+            return compiler->CreateGlobalString("", processed);
         }
         else if (constant)
         {

@@ -631,6 +631,25 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         }
     }
 
+    // --- type aliases: using Alias = Target; ---
+    const aliasRe = /\busing\s+([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*;/g;
+    while ((m = aliasRe.exec(clean)) !== null) {
+        const alias = m[1];
+        const fullTarget = m[2];
+        const targetBase = fullTarget.split('.').pop()!;
+        const nameIndex = m.index + m[0].indexOf(alias);
+        const pos = indexToPosition(clean, nameIndex);
+        if (!symbols.has(alias)) {
+            symbols.set(alias, {
+                kind: 'type',
+                markdown: `\`\`\`c\nusing ${alias} = ${fullTarget};\n\`\`\``,
+                defLine: pos.line,
+                defChar: pos.character,
+                typeName: targetBase
+            });
+        }
+    }
+
     // Helper: extract body + position for an aggregate type.
     const extractAggregate = (keyword: string, name: string, bodyStart: number, nameGlobalIndex: number): void => {
         let depth = 1;
@@ -844,6 +863,17 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         });
     }
 
+    // --- Resolve type alias members ---
+    // Copy members from target type into alias so member completion works through aliases.
+    for (const [, info] of symbols) {
+        if (info.kind === 'type' && info.typeName && !info.members) {
+            const targetInfo = symbols.get(info.typeName);
+            if (targetInfo?.kind === 'type' && targetInfo.members) {
+                info.members = targetInfo.members;
+            }
+        }
+    }
+
     return symbols;
 }
 
@@ -991,6 +1021,7 @@ const KEYWORD_DOCS: Record<string, string> = {
     'restrict':     '**restrict** *(qualifier)*\n\nPointer qualifier asserting that the pointed-to memory is not aliased.',
     'thread_local': '**thread_local** *(storage class)*\n\nEach thread has its own independent copy of the variable.',
     'auto':         '**auto** *(type inference)*\n\nInfer the variable type from its initializer.\n\n```c\nauto x = 42;      // int\nauto p = getPoint(); // Point\n```',
+    'string':       '**string** *(type)*\n\nBuilt-in reference-counted string type (`IReadOnlyString` fat pointer).\n\nSupports **format string** syntax — any `{expr}` inside a string literal is interpolated at runtime:\n\n```c\nstring s = "Hello, {name}! You have {count} items.";\n```\n\nNon-string expressions are coerced via `operator string`.',
     'alignas':      '**alignas** *(C11 alignment)*\n\nSpecify the alignment requirement of a variable or struct member.\n\n```c\nalignas(16) float vec[4];\nalignas(int) char buf[sizeof(int)];\n```',
     'stdcall':      '**stdcall** *(calling convention)*\n\nWindows x86 calling convention. The callee cleans the stack.\n\n```c\nvoid stdcall myFunc(int x);\n```',
     '?.': '**?.** *(null-conditional operator)*\n\nAccess a member or call a method only if the object is non-null. Returns zero/null if the object is null.\n\n```c\nint v = node?.value;       // field access\nint r = node?.Read();      // method call\n```',
@@ -998,7 +1029,7 @@ const KEYWORD_DOCS: Record<string, string> = {
 
     // CFlat extensions
     'namespace': '**namespace** *(CFlat extension)*\n\nGroup declarations under a named scope.\n\n```c\nnamespace Math {\n    float pi = 3.14159f;\n    float sqrt(float x) { ... }\n}\n```',
-    'using':     '**using** *(CFlat extension)*\n\nImport a namespace into the current scope.\n\n```c\nusing Math;\nusing Math::sqrt;\n```',
+    'using':     '**using** *(CFlat extension)*\n\nImport a namespace into scope, or create a type alias.\n\n```c\n// Namespace import\nusing Math;\n// Type alias\nusing Vec2 = Math.Vector2;\n```',
     'import':    '**import** *(CFlat extension)*\n\nImport another source file into the current compilation unit.\n\n```c\nimport "utils.cb";\nimport "math/vector.cb";\n```',
     'interface': '**interface** *(CFlat extension)*\n\nDeclare an abstract set of method signatures that a struct must implement.\n\n```c\ninterface Drawable {\n    void draw();\n};\n```',
     'nameof':    '**nameof** *(CFlat extension)*\n\nReturn the name of a variable or type as a `const char*` string at compile time.\n\n```c\nconst char* name = nameof(myVariable);\n```',
@@ -1069,6 +1100,7 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeKeyword('float', 'type'),
     makeKeyword('double', 'type'),
     makeKeyword('bool', 'type'),
+    makeKeyword('string', 'type — built-in string'),
     makeKeyword('unsigned', 'type modifier'),
     makeKeyword('signed', 'type modifier'),
 
@@ -1138,6 +1170,8 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeSnippet('#define', '#define ${1:NAME} ${2:value}', '#define directive'),
     makeSnippet('return-block', 'return {\n\t${1}\n};', 'return block (CFlat extension)'),
     makeSnippet('import', 'import "${1:file.cb}";', 'import declaration (CFlat extension)'),
+    makeSnippet('using-alias', 'using ${1:Alias} = ${2:TypeName};', 'type alias (CFlat extension)'),
+    makeSnippet('$"', '"${1:text} {${2:expression}}"', 'format string with interpolation'),
     makeSnippet('alignas', 'alignas(${1:alignment})', 'alignas specifier'),
     makeSnippet('static_assert', 'static_assert(${1:condition}, "${2:message}");', 'compile-time assertion')
 ];

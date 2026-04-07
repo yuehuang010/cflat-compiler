@@ -283,6 +283,7 @@ public:
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, StructData> dataStructures;
     std::unordered_map<std::string, std::string> enumBackingTypes;
+    std::unordered_map<std::string, std::string> typeAliases;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
@@ -293,6 +294,8 @@ public:
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
+    std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
+    bool strConcatRegistered = false;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
@@ -348,15 +351,32 @@ private:
         {
             arg.setName(itr_nameArg->VariableName);
 
-            NamedVariable namedVar
+            if (itr_nameArg->IsInterface)
             {
-                .TypeAndValue = *itr_nameArg,
-                .BaseType = GetType(*itr_nameArg, nullptr, false),
-                .Primary = itr_nameArg->Pointer ? nullptr : &arg,
-                .Storage = itr_nameArg->Pointer ? &arg : nullptr,
-            };
-
-            stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
+                // Storage is a {i8*,i8*}* pointer suitable for CallInterfaceMethod GEP.
+                auto fatTy = GetFatPtrType();
+                auto tmp = builder->CreateAlloca(fatTy, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, tmp);
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = fatTy,
+                    .Primary = nullptr,
+                    .Storage = tmp,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
+            else
+            {
+                NamedVariable namedVar
+                {
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = GetType(*itr_nameArg, nullptr, false),
+                    .Primary = itr_nameArg->Pointer ? nullptr : &arg,
+                    .Storage = itr_nameArg->Pointer ? &arg : nullptr,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
             itr_nameArg++;
         }
 
@@ -409,11 +429,218 @@ private:
         return baseType;
     }
 
+    // Registers the built-in __StrLit struct that wraps a string literal as an IReadOnlyString fat pointer.
+    // __StrLit { i8* _ptr, i32 _len } implements IReadOnlyString via data() and length() methods.
+    void RegisterBuiltinStrLit()
+    {
+        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i32Ty = builder->getInt32Ty();
+
+        auto* strLitTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "__StrLit");
+
+        DeclTypeAndValue ptrField;
+        ptrField.TypeName = "i8";
+        ptrField.VariableName = "_ptr";
+        ptrField.Pointer = true;
+
+        DeclTypeAndValue lenField;
+        lenField.TypeName = "i32";
+        lenField.VariableName = "_len";
+
+        dataStructures["__StrLit"].StructType = strLitTy;
+        dataStructures["__StrLit"].StructFields = { ptrField, lenField };
+        dataStructures["__StrLit"].Interfaces = { "IReadOnlyString" };
+
+        // Create __StrLit.data(__StrLit* self) -> i8*
+        {
+            auto* fnTy = llvm::FunctionType::get(ptrTy, { strLitTy->getPointerTo() }, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__StrLit.data", *module);
+            fn->arg_begin()->setName("self");
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* gep = b.CreateStructGEP(strLitTy, fn->arg_begin(), 0);
+            b.CreateRet(b.CreateLoad(ptrTy, gep));
+
+            TypeAndValue selfParam{ "__StrLit", "self", true };
+            FunctionSymbol sym;
+            sym.UniqueName = "__StrLit.data";
+            sym.Function = fn;
+            sym.ReturnType = TypeAndValue{ "i8", "", true };
+            sym.Parameters = { selfParam };
+            functionTable["data"].push_back(sym);
+        }
+
+        // Create __StrLit.length(__StrLit* self) -> i32
+        {
+            auto* fnTy = llvm::FunctionType::get(i32Ty, { strLitTy->getPointerTo() }, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__StrLit.length", *module);
+            fn->arg_begin()->setName("self");
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* gep = b.CreateStructGEP(strLitTy, fn->arg_begin(), 1);
+            b.CreateRet(b.CreateLoad(i32Ty, gep));
+
+            TypeAndValue selfParam{ "__StrLit", "self", true };
+            FunctionSymbol sym;
+            sym.UniqueName = "__StrLit.length";
+            sym.Function = fn;
+            sym.ReturnType = TypeAndValue{ "i32", "", false };
+            sym.Parameters = { selfParam };
+            functionTable["length"].push_back(sym);
+        }
+    }
+
+    void RegisterBuiltinStrConcat()
+    {
+        auto* i8Ty     = builder->getInt8Ty();
+        auto* ptrTy    = i8Ty->getPointerTo();
+        auto* ptrPtrTy = ptrTy->getPointerTo();
+        auto* i32Ty    = builder->getInt32Ty();
+        auto* i32PtrTy = i32Ty->getPointerTo();
+        auto* i64Ty    = builder->getInt64Ty();
+        auto* fatTy    = GetFatPtrType();
+
+        auto* mallocTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
+        auto* mallocFn = llvm::dyn_cast<llvm::Function>(
+            module->getOrInsertFunction("malloc", mallocTy).getCallee());
+
+        auto* fnTy = llvm::FunctionType::get(fatTy, { ptrPtrTy, i32PtrTy, i32Ty }, false);
+        auto* fn   = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__strconcat", *module);
+        auto  argIt    = fn->arg_begin();
+        auto* argPtrs  = &*argIt++;  argPtrs->setName("ptrs");
+        auto* argLens  = &*argIt++;  argLens->setName("lens");
+        auto* argCount = &*argIt;    argCount->setName("count");
+
+        auto* entryBB = llvm::BasicBlock::Create(*context, "entry",    fn);
+        auto* sumCond = llvm::BasicBlock::Create(*context, "sum.cond", fn);
+        auto* sumBody = llvm::BasicBlock::Create(*context, "sum.body", fn);
+        auto* allocBB = llvm::BasicBlock::Create(*context, "alloc",    fn);
+        auto* cpyCond = llvm::BasicBlock::Create(*context, "cpy.cond", fn);
+        auto* cpyBody = llvm::BasicBlock::Create(*context, "cpy.body", fn);
+        auto* cpyNext = llvm::BasicBlock::Create(*context, "cpy.next", fn);
+        auto* nullBB  = llvm::BasicBlock::Create(*context, "null",     fn);
+
+        llvm::IRBuilder<> rb(entryBB);
+        auto* totalA = rb.CreateAlloca(i32Ty, nullptr, "total");
+        auto* bufA   = rb.CreateAlloca(ptrTy, nullptr, "buf");
+        auto* dstA   = rb.CreateAlloca(ptrTy, nullptr, "dst");
+        auto* idxA   = rb.CreateAlloca(i32Ty, nullptr, "idx");
+        rb.CreateStore(rb.getInt32(0), totalA);
+        rb.CreateStore(rb.getInt32(0), idxA);
+        rb.CreateBr(sumCond);
+
+        // Sum loop: total = sum of all segment lengths
+        rb.SetInsertPoint(sumCond);
+        rb.CreateCondBr(rb.CreateICmpSLT(rb.CreateLoad(i32Ty, idxA), argCount), sumBody, allocBB);
+        rb.SetInsertPoint(sumBody);
+        {
+            auto* i   = rb.CreateLoad(i32Ty, idxA);
+            auto* len = rb.CreateLoad(i32Ty, rb.CreateGEP(i32Ty, argLens, i));
+            rb.CreateStore(rb.CreateAdd(rb.CreateLoad(i32Ty, totalA), len), totalA);
+            rb.CreateStore(rb.CreateAdd(i, rb.getInt32(1)), idxA);
+            rb.CreateBr(sumCond);
+        }
+
+        // Allocate buffer: total + 1 bytes
+        rb.SetInsertPoint(allocBB);
+        {
+            auto* total   = rb.CreateLoad(i32Ty, totalA);
+            auto* total64 = rb.CreateSExt(total, i64Ty);
+            auto* buf     = rb.CreateCall(mallocFn, { rb.CreateAdd(total64, rb.getInt64(1)) }, "buf");
+            rb.CreateStore(buf, bufA);
+            rb.CreateStore(buf, dstA);
+            rb.CreateStore(rb.getInt32(0), idxA);
+            rb.CreateBr(cpyCond);
+        }
+
+        // Copy loop: iterate over segments
+        rb.SetInsertPoint(cpyCond);
+        rb.CreateCondBr(rb.CreateICmpSLT(rb.CreateLoad(i32Ty, idxA), argCount), cpyBody, nullBB);
+
+        rb.SetInsertPoint(cpyBody);
+        {
+            auto* i      = rb.CreateLoad(i32Ty, idxA);
+            auto* src    = rb.CreateLoad(ptrTy,  rb.CreateGEP(ptrTy,  argPtrs, i));
+            auto* segLen = rb.CreateLoad(i32Ty,  rb.CreateGEP(i32Ty,  argLens, i));
+            auto* jA     = rb.CreateAlloca(i32Ty, nullptr, "j");
+            rb.CreateStore(rb.getInt32(0), jA);
+            auto* bCond  = llvm::BasicBlock::Create(*context, "b.cond", fn);
+            auto* bBody  = llvm::BasicBlock::Create(*context, "b.body", fn);
+            rb.CreateBr(bCond);
+            rb.SetInsertPoint(bCond);
+            rb.CreateCondBr(rb.CreateICmpSLT(rb.CreateLoad(i32Ty, jA), segLen), bBody, cpyNext);
+            rb.SetInsertPoint(bBody);
+            {
+                auto* j2     = rb.CreateLoad(i32Ty, jA);
+                auto* dstNow = rb.CreateLoad(ptrTy, dstA);
+                auto* byte   = rb.CreateLoad(i8Ty, rb.CreateGEP(i8Ty, src, j2));
+                rb.CreateStore(byte, rb.CreateGEP(i8Ty, dstNow, j2));
+                rb.CreateStore(rb.CreateAdd(j2, rb.getInt32(1)), jA);
+                rb.CreateBr(bCond);
+            }
+        }
+
+        rb.SetInsertPoint(cpyNext);
+        {
+            auto* i      = rb.CreateLoad(i32Ty, idxA);
+            auto* segLen = rb.CreateLoad(i32Ty, rb.CreateGEP(i32Ty, argLens, i));
+            auto* dst    = rb.CreateLoad(ptrTy, dstA);
+            auto* sLen64 = rb.CreateSExt(segLen, i64Ty);
+            rb.CreateStore(rb.CreateGEP(i8Ty, dst, sLen64), dstA);
+            rb.CreateStore(rb.CreateAdd(i, rb.getInt32(1)), idxA);
+            rb.CreateBr(cpyCond);
+        }
+
+        // Null-terminate, heap-allocate __StrLit, return fat ptr
+        rb.SetInsertPoint(nullBB);
+        {
+            rb.CreateStore(rb.getInt8(0), rb.CreateLoad(ptrTy, dstA));
+            auto* strLitTy = llvm::StructType::getTypeByName(*context, "__StrLit");
+            auto* slSize   = llvm::ConstantExpr::getSizeOf(strLitTy);
+            auto* slSize64 = llvm::ConstantExpr::getTruncOrBitCast(slSize, i64Ty);
+            auto* slRaw    = rb.CreateCall(mallocFn, { slSize64 }, "slraw");
+            auto* slPtr    = rb.CreateBitCast(slRaw, strLitTy->getPointerTo(), "sl");
+            rb.CreateStore(rb.CreateLoad(ptrTy,  bufA),   rb.CreateStructGEP(strLitTy, slPtr, 0));
+            rb.CreateStore(rb.CreateLoad(i32Ty, totalA),  rb.CreateStructGEP(strLitTy, slPtr, 1));
+            auto* vtable = GetOrCreateVTable("__StrLit", "IReadOnlyString");
+            auto* fatTy = GetFatPtrType();
+            auto* vtablePtr = rb.CreateBitCast(vtable, ptrTy);
+            auto* dataPtr   = rb.CreateBitCast(slPtr,  ptrTy);
+            llvm::Value* fatVal = llvm::UndefValue::get(fatTy);
+            fatVal = rb.CreateInsertValue(fatVal, vtablePtr, { 0u });
+            fatVal = rb.CreateInsertValue(fatVal, dataPtr,   { 1u });
+            rb.CreateRet(fatVal);
+        }
+
+        FunctionSymbol sym;
+        sym.UniqueName = "__strconcat";
+        sym.Function   = fn;
+        sym.ReturnType = TypeAndValue{ "IReadOnlyString", "", true, true };
+        sym.Parameters = {
+            TypeAndValue{ "i8",  "ptrs",  true,  false },
+            TypeAndValue{ "i32", "lens",  true,  false },
+            TypeAndValue{ "i32", "count", false, false },
+        };
+        functionTable["__strconcat"].push_back(sym);
+    }
+
     void Init()
     {
         context = std::make_unique<llvm::LLVMContext>();
         module = std::make_unique<llvm::Module>("MyCompiler", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
+
+        // Pre-register __StrLit: a built-in struct wrapping a string literal as IReadOnlyString.
+        // IReadOnlyString must be defined in user code; __StrLit's vtable is built on demand.
+        RegisterBuiltinStrLit();
+    }
+
+    // Called lazily from ParseFormatString after IReadOnlyString has been registered.
+    void EnsureStrConcatRegistered()
+    {
+        if (strConcatRegistered) return;
+        strConcatRegistered = true;
+        RegisterBuiltinStrConcat();
     }
 
     bool VerifyModule()
@@ -561,9 +788,20 @@ public:
         interfaceParents[name] = parentNames;
     }
 
+    void RegisterTypeAlias(const std::string& alias, const std::string& target)
+    {
+        typeAliases[alias] = target;
+    }
+
+    std::string ResolveTypeAlias(const std::string& name) const
+    {
+        auto it = typeAliases.find(name);
+        return (it != typeAliases.end()) ? it->second : name;
+    }
+
     bool IsInterfaceType(const std::string& name) const
     {
-        return interfaceTable.count(name) > 0;
+        return interfaceTable.count(ResolveTypeAlias(name)) > 0;
     }
 
     bool HasInterfaceMethod(const std::string& ifaceName, const std::string& methodName) const
@@ -666,21 +904,45 @@ public:
         return vtableGlobal;
     }
 
-    llvm::Value* BuildInterfaceFatPtr(llvm::GlobalVariable* vtable, llvm::Value* dataPtr)
+    llvm::Value* BuildInterfaceFatValue(llvm::GlobalVariable* vtable, llvm::Value* dataPtr)
     {
         auto fatTy = GetFatPtrType();
-        auto alloca = builder->CreateAlloca(fatTy);
         auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        llvm::Value* v = llvm::UndefValue::get(fatTy);
+        v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
+        v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
+        return v;
+    }
 
-        auto vtableField = builder->CreateStructGEP(fatTy, alloca, 0);
-        auto vtableAsPtr = builder->CreateBitCast(vtable, ptrTy);
-        builder->CreateStore(vtableAsPtr, vtableField);
+    // Returns true if the given constant is a pooled string literal (length known at compile time).
+    bool IsStringLiteralConstant(llvm::Constant* c) const
+    {
+        return stringLiteralLenByPtr.count(c) > 0;
+    }
 
-        auto dataField = builder->CreateStructGEP(fatTy, alloca, 1);
-        auto dataCast = builder->CreateBitCast(dataPtr, ptrTy);
-        builder->CreateStore(dataCast, dataField);
+    // Wraps a raw i8* string literal pointer in a __StrLit struct and returns an IReadOnlyString fat pointer.
+    // Called automatically when assigning a string literal to a string-typed variable.
+    llvm::Value* WrapStringLiteralAsIReadOnly(llvm::Value* strLitPtr)
+    {
+        auto* strLitTy = llvm::StructType::getTypeByName(*context, "__StrLit");
+        if (!strLitTy) return strLitPtr;
 
-        return alloca;
+        int32_t len = 0;
+        if (auto* c = llvm::dyn_cast<llvm::Constant>(strLitPtr))
+        {
+            auto it = stringLiteralLenByPtr.find(c);
+            if (it != stringLiteralLenByPtr.end())
+                len = it->second;
+        }
+
+        auto* alloca = builder->CreateAlloca(strLitTy, nullptr, "strlitval");
+        auto* ptrField = builder->CreateStructGEP(strLitTy, alloca, 0);
+        builder->CreateStore(strLitPtr, ptrField);
+        auto* lenField = builder->CreateStructGEP(strLitTy, alloca, 1);
+        builder->CreateStore(builder->getInt32(len), lenField);
+
+        auto* vtable = GetOrCreateVTable("__StrLit", "IReadOnlyString");
+        return BuildInterfaceFatValue(vtable, alloca);
     }
 
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
@@ -1328,6 +1590,7 @@ public:
                 llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 0)
         });
         stringPool[text] = ptr;
+        stringLiteralLenByPtr[ptr] = (int32_t)text.size();
         return ptr;
     }
 
@@ -1722,6 +1985,13 @@ public:
             if (it != enumBackingTypes.end())
                 resolvedTypeName = it->second;
         }
+        // Resolve user-defined type aliases (e.g. string → IReadOnlyString)
+        if (!resolvedTypeName.empty())
+        {
+            auto it = typeAliases.find(resolvedTypeName);
+            if (it != typeAliases.end())
+                resolvedTypeName = it->second;
+        }
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
         else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
@@ -1735,22 +2005,22 @@ public:
         else
         {
             // Check if it is an interface type first
-            if (interfaceTable.count(typeName) > 0)
+            if (interfaceTable.count(resolvedTypeName) > 0)
             {
-                // Interface type: represented as a fat pointer {i8*, i8*}
-                // Return the fat ptr struct type (pointer applied below if needed)
-                type = GetFatPtrType();
+                // Interface values are stored by value as {i8*, i8*} (vtable ptr + data ptr).
+                // Never add ->getPointerTo(): the alloca address itself serves as the {i8*,i8*}*.
+                return GetFatPtrType();
             }
             else
             {
-                auto result = dataStructures.find(typeName);
+                auto result = dataStructures.find(resolvedTypeName);
                 if (result != dataStructures.end())
                 {
                     type = result->second.StructType;
                 }
                 else
                 {
-                    std::cout << std::format("Unknown value: {}\n", typeName);
+                    std::cout << std::format("Unknown value: {}\n", resolvedTypeName);
                     type = builder->getVoidTy();
                 }
             }
@@ -2099,7 +2369,7 @@ public:
                         structName = st->getName().str();
                 }
 
-                // Build fat pointer: vtable + data ptr
+                // Build fat value: vtable + data ptr → {i8*, i8*} by value
                 auto vtable = GetOrCreateVTable(structName, candParamItr->TypeName);
                 llvm::Value* dataPtr = arg.Storage;
                 if (dataPtr == nullptr)
@@ -2110,7 +2380,13 @@ public:
                     builder->CreateStore(arg.Primary, tempAlloca);
                     dataPtr = tempAlloca;
                 }
-                argList.push_back(BuildInterfaceFatPtr(vtable, dataPtr));
+                argList.push_back(BuildInterfaceFatValue(vtable, dataPtr));
+            }
+            else if (candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
+            {
+                // Interface → interface: pass fat struct by value
+                llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
+                argList.push_back(val);
             }
             else if (candParamItr->Pointer)
             {
@@ -2376,7 +2652,26 @@ public:
             builder->CreateRetVoid();
         else
         {
-            value = Upconvert(value, currentFunction->getReturnType());
+            auto* retTy = currentFunction->getReturnType();
+            // Wrap raw i8* string literals into IReadOnlyString fat ptr when needed
+            if (retTy == GetFatPtrType() && value->getType() != GetFatPtrType())
+            {
+                auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+                if (value->getType() == ptrTy)
+                {
+                    if (auto* c = llvm::dyn_cast<llvm::Constant>(value); c && IsStringLiteralConstant(c))
+                        value = WrapStringLiteralAsIReadOnly(value);
+                    else if (GetFunction("operator string"))
+                    {
+                        NamedVariable argNV;
+                        argNV.Primary = value;
+                        argNV.BaseType = ptrTy;
+                        argNV.TypeAndValue = { "char", "", true, false };
+                        value = CreateFunctionCall2("operator string", { argNV });
+                    }
+                }
+            }
+            value = Upconvert(value, retTy);
             builder->CreateRet(value);
         }
     }

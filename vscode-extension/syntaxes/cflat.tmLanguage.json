@@ -17,6 +17,7 @@
     { "include": "#keywords-c11" },
     { "include": "#constants" },
     { "include": "#namespace-declaration" },
+    { "include": "#using-alias" },
     { "include": "#interface-declaration" },
     { "include": "#struct-declaration" },
     { "include": "#function-definition" },
@@ -80,6 +81,20 @@
           "begin": "\"",
           "end": "\"",
           "patterns": [
+            {
+              "name": "meta.interpolation.cflat",
+              "begin": "(?<!\\\\)\\{",
+              "end": "\\}",
+              "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.cflat" } },
+              "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.cflat" } },
+              "contentName": "meta.embedded.expression.cflat",
+              "patterns": [
+                { "include": "#numbers" },
+                { "include": "#constants" },
+                { "include": "#function-call" },
+                { "include": "#operators" }
+              ]
+            },
             { "name": "constant.character.escape.cflat", "match": "\\\\." },
             { "name": "constant.other.placeholder.cflat", "match": "%[-+0 #]*[0-9]*(?:\\.[0-9]+)?[diouxXeEfFgGaAcsSp%]" }
           ]
@@ -123,7 +138,7 @@
       "patterns": [
         {
           "name": "storage.type.primitive.cflat",
-          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64)\\b"
+          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string)\\b"
         },
         {
           "name": "storage.type.struct.cflat",
@@ -166,6 +181,16 @@
           "match": "\\b(NULL|nullptr)\\b"
         }
       ]
+    },
+    "using-alias": {
+      "name": "meta.using-alias.cflat",
+      "match": "\\b(using)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(=)\\s*([A-Za-z_][A-Za-z0-9_.]*)",
+      "captures": {
+        "1": { "name": "keyword.other.namespace.cflat" },
+        "2": { "name": "entity.name.type.alias.cflat" },
+        "3": { "name": "keyword.operator.assignment.cflat" },
+        "4": { "name": "entity.name.type.cflat" }
+      }
     },
     "namespace-declaration": {
       "name": "meta.namespace.cflat",
