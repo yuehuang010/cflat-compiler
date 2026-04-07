@@ -753,6 +753,12 @@ public:
         dataStructures[structName].Destructor = fn;
     }
 
+    /// Returns i64 sizeof(type) as a compile-time constant.
+    llvm::Value* GetTypeSizeBytes(llvm::Type* type)
+    {
+        return llvm::ConstantExpr::getSizeOf(type);
+    }
+
     void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
     {
         dataStructures[structName].Interfaces = interfaces;

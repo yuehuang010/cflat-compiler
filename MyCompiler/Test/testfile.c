@@ -1,5 +1,7 @@
 
 extern void printf(const char* argv, ...);
+extern void* malloc(i64 size);
+extern void free(void* ptr);
 
 bool TestVerbose = true;
 
@@ -314,17 +316,6 @@ int testOrderOfOperation()
     return num5;
 }
 
-void* malloc(int size)
-{
-    printf("malloc size = %d\n", size);
-    return (void*)size;
-}
-
-void free(void* ptr)
-{
-    printf("free ptr = %p\n", ptr);
-}
-
 void testPointers()
 {
     int number = 10;
@@ -333,7 +324,6 @@ void testPointers()
     auto mall = malloc(10);
     free(mall);
 }
-
 
 int switchBasic(int x)
 {

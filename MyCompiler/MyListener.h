@@ -111,6 +111,14 @@ private:
         return params;
     }
 
+    std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
+    {
+        if (auto* opId = ctx->operatorFunctionId())
+            return opId->New() ? "operator new" : "operator delete";
+        auto directDecl = ctx->directDeclarator();
+        return directDecl->getText();
+    }
+
     void ScanFunctionDefinition(CParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(func);
@@ -122,7 +130,7 @@ private:
         if (func->genericTypeParameters() != nullptr)
             return;
 
-        std::string name = func->directDeclarator()->getText();
+        std::string name = getFunctionName(func);
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
 
@@ -131,7 +139,13 @@ private:
         auto params = ParseParameterTypeList(paramTypeList);
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
-        if (!structName.empty())
+        // Operator new/delete are static (no 'this' param), but scoped to struct
+        bool isOperatorFunc = (getFunctionName(func) == "operator new" || getFunctionName(func) == "operator delete");
+        if (!structName.empty() && isOperatorFunc)
+        {
+            name = structName + "." + getFunctionName(func);
+        }
+        else if (!structName.empty())
         {
             MyCompilerLLVM::DeclTypeAndValue thisParam;
             thisParam.TypeName = structName;
@@ -360,15 +374,6 @@ private:
 
     std::vector<SwitchContext> switchStack;
 
-    std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
-    {
-        std::string name;
-        auto directDecl = ctx->directDeclarator();
-        name = directDecl->getText();
-
-        return name;
-    }
-
     MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CParser::DeclarationSpecifiersContext* declSpecs)
     {
         MyCompilerLLVM::DeclTypeAndValue declType;
@@ -430,6 +435,14 @@ private:
         auto declSpecs = ctx->declarationSpecifiers();
 
         return ParseDeclarationSpecifiers(declSpecs);
+    }
+
+    std::string getFunctionName(CParser::FunctionDefinitionContext* ctx)
+    {
+        if (auto* opId = ctx->operatorFunctionId())
+            return opId->New() ? "operator new" : "operator delete";
+        auto directDecl = ctx->directDeclarator();
+        return directDecl->getText();
     }
 
     // Returns the default value for a type:
@@ -1946,6 +1959,14 @@ public:
         {
             return ParsePostfixExpression(postFixCtx);
         }
+        else if (auto* newCtx = ctx->newExpression())
+        {
+            return ParseNewExpression(newCtx);
+        }
+        else if (auto* delCtx = ctx->deleteExpression())
+        {
+            return ParseDeleteExpression(delCtx);
+        }
         else if (unaryOperator && castExpCtx)
         {
             /* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
@@ -2012,6 +2033,151 @@ public:
         }
 
         LogErrorContext(ctx, "Unary expression has no recognized form.");
+        return {};
+    }
+
+    std::string ParseTypeSpecifierName(CParser::TypeSpecifierContext* ctx)
+    {
+        if (ctx->genericIdentifier() && ctx->genericIdentifier()->genericTypeParameters())
+        {
+            // Generic type: Box<int> → Box__int
+            std::string base = ctx->genericIdentifier()->Identifier()->getText();
+            std::vector<std::string> args;
+            for (auto* tp : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                args.push_back(tp->getText());
+            return MangledGenericName(base, args);
+        }
+        std::string name = ctx->getText();
+        // Apply active type substitutions (for generic templates)
+        auto it = activeTypeSubstitutions.find(name);
+        if (it != activeTypeSubstitutions.end()) name = it->second;
+        return Compiler(ctx)->ResolveQualifiedName(name);
+    }
+
+    MyCompilerLLVM::NamedVariable ParseNewExpression(CParser::NewExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
+        bool isArray = ctx->assignmentExpression() != nullptr;
+
+        MyCompilerLLVM::TypeAndValue typeInfo{ .TypeName = typeName };
+        llvm::Type* elemType = compiler->GetType(typeInfo);
+
+        // Compute allocation size
+        llvm::Value* sizeVal = compiler->GetTypeSizeBytes(elemType);
+        if (isArray)
+        {
+            llvm::Value* count = ParseAssignmentExpression(ctx->assignmentExpression());
+            count = compiler->Upconvert(count, compiler->builder->getInt64Ty());
+            sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
+        }
+
+        // Call operator new: class-specific → global
+        llvm::Value* rawPtr = nullptr;
+        std::string opNewName = typeName + ".operator new";
+        MyCompilerLLVM::NamedVariable szArg;
+        szArg.Primary = sizeVal;
+        szArg.BaseType = sizeVal->getType();
+        if (!typeName.empty() && compiler->GetFunction(opNewName))
+        {
+            rawPtr = compiler->CreateFunctionCall2(opNewName, { szArg });
+        }
+        else if (compiler->GetFunction("operator new"))
+        {
+            rawPtr = compiler->CreateFunctionCall2("operator new", { szArg });
+        }
+        else
+        {
+            LogErrorContext(ctx, "'new' requires 'operator new' to be defined");
+            return {};
+        }
+
+        // Bitcast void* → T*
+        llvm::Type* ptrTy = elemType->getPointerTo();
+        llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
+
+        // For non-array new of a class type: call constructor and store result
+        if (!isArray && compiler->GetFunction(typeName))
+        {
+            std::vector<MyCompilerLLVM::NamedVariable> ctorArgs;
+            auto argList = ctx->argumentExpressionList();
+            if (argList != nullptr)
+            {
+                for (auto* namedArg : argList->argumentNamedExpression())
+                {
+                    llvm::Value* argVal = ParseAssignmentExpression(namedArg->assignmentExpression());
+                    if (!argVal) break;
+                    MyCompilerLLVM::NamedVariable argVar;
+                    argVar.Primary = argVal;
+                    argVar.BaseType = argVal->getType();
+                    ctorArgs.push_back(argVar);
+                }
+            }
+            llvm::Value* structVal = compiler->CreateFunctionCall2(typeName, ctorArgs);
+            if (structVal)
+                compiler->builder->CreateStore(structVal, typedPtr);
+        }
+
+        MyCompilerLLVM::NamedVariable result;
+        result.TypeAndValue.TypeName = typeName;
+        result.TypeAndValue.Pointer = true;
+        result.Primary = typedPtr;
+        result.BaseType = ptrTy;
+        return result;
+    }
+
+    MyCompilerLLVM::NamedVariable ParseDeleteExpression(CParser::DeleteExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        bool isArray = ctx->LeftBracket() != nullptr;
+
+        // Parse the pointer expression and determine the pointed-to struct type name.
+        // getPointerElementType() is unavailable with LLVM opaque pointers; use the
+        // AST-level type information from the unary expression instead.
+        std::string typeName;
+        llvm::Value* ptrVal = nullptr;
+        if (auto* ue = tryGetUnaryExpression(ctx->expression()))
+        {
+            auto namedVar = ParseUnaryExpression(ue);
+            typeName = namedVar.TypeAndValue.TypeName;
+            ptrVal = namedVar.Storage ? compiler->CreateLoad(namedVar.Storage) : namedVar.Primary;
+        }
+        else
+        {
+            ptrVal = ParseExpression(ctx->expression());
+        }
+        if (!ptrVal) return {};
+
+        // 1. Call destructor if it exists (non-array only)
+        if (!isArray && !typeName.empty())
+        {
+            auto structData = compiler->GetDataStructure(typeName);
+            if (structData.Destructor)
+                compiler->builder->CreateCall(structData.Destructor, { ptrVal });
+        }
+
+        // 2. Convert to void*
+        auto* voidPtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        llvm::Value* voidPtr = compiler->builder->CreateBitCast(ptrVal, voidPtrTy, "freeptr");
+
+        // 3. Call operator delete: class-specific → global
+        std::string opDelName = typeName + ".operator delete";
+        MyCompilerLLVM::NamedVariable ptrArg;
+        ptrArg.Primary = voidPtr;
+        ptrArg.BaseType = voidPtrTy;
+        if (!typeName.empty() && compiler->GetFunction(opDelName))
+        {
+            compiler->CreateFunctionCall2(opDelName, { ptrArg });
+        }
+        else if (compiler->GetFunction("operator delete"))
+        {
+            compiler->CreateFunctionCall2("operator delete", { ptrArg });
+        }
+        else
+        {
+            LogErrorContext(ctx, "'delete' requires 'operator delete' to be defined");
+        }
+
         return {};
     }
 
@@ -3142,7 +3308,11 @@ public:
             for (auto func : functionList)
             {
                 global_scope = false;
-                ParseFunctionDefinition(func, structName);
+                std::string funcName = getFunctionName(func);
+                if (funcName == "operator new" || funcName == "operator delete")
+                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                else
+                    ParseFunctionDefinition(func, structName);
             }
             global_scope = savedScope;
         }

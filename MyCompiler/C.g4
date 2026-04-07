@@ -74,6 +74,8 @@ unaryExpression
         postfixExpression
         | unaryOperator castExpression
         | ('sizeof' | 'alignof') '(' typeName ')'
+        | newExpression
+        | deleteExpression
     )
     ;
 
@@ -495,7 +497,7 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? directDeclarator genericTypeParameters? '(' parameterTypeList? ')' compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' compoundStatement
     ;
 
 structClassUnionDefinition
@@ -508,6 +510,20 @@ genericIdentifier
 
 destructorDefinition
     : Tilde Identifier '(' ')' compoundStatement
+    ;
+
+newExpression
+    : New typeSpecifier ('(' argumentExpressionList? ')')?
+    | New typeSpecifier '[' assignmentExpression ']'
+    ;
+
+deleteExpression
+    : Delete '[' ']' expression
+    | Delete expression
+    ;
+
+operatorFunctionId
+    : Operator (New | Delete)
     ;
 
 interfaceDefinition
@@ -720,6 +736,18 @@ StaticAssert
 
 ThreadLocal
     : '_Thread_local'
+    ;
+
+New
+    : 'new'
+    ;
+
+Delete
+    : 'delete'
+    ;
+
+Operator
+    : 'operator'
     ;
 
 LeftParen

@@ -1,4 +1,17 @@
 extern void printf(const char* argv, ...);
+extern void* malloc(i64 size);
+extern void free(void* ptr);
+
+void* operator new(long long size)
+{
+    // custom global allocator
+    return malloc(size);
+}
+
+void operator delete(void* ptr)
+{
+    free(ptr);
+}
 
 int Test(const char* testName, i64 actual, i64 expected)
 {
@@ -42,7 +55,7 @@ bool testBuiltinIdentifiers()
     bool result = true;
     result &= TestStr("__FILE__", __FILE__, "testfile2.c");
     result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 45); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 58); // Remember to adjust if shifted.
     return result;
 }
 
@@ -679,6 +692,52 @@ bool testDefault()
     return result;
 }
 
+class Node
+{
+    int value = 0;
+};
+
+int testNewDelete()
+{
+    Node* n = new Node();
+    delete n;
+    return 42;
+}
+
+int testNewArray()
+{
+    int* arr = new int[5];
+    for (int i = 0; i < 5; i++)
+    {
+        arr[i] = i;
+	}
+
+    for (int i = 0; i < 5; i++)
+    {
+        if (arr[i] != i)
+        {
+            printf("testNewArray failed: arr[%d] expected %d but got %d.\n", i, i, arr[i]);
+            delete[] arr;
+            return 1;
+        }
+	}
+
+    delete[] arr;
+    return 99;
+}
+
+class Counter
+{
+    int count = 0;
+};
+
+int testNewWithConstructor()
+{
+    Counter* c = new Counter();
+    delete c;
+    return 123;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -716,6 +775,9 @@ extern int main()
     result &= testNullConditional();
     result &= testNullCoalescing();
     result &= testDefault();
+    result &= Test("testNewDelete", testNewDelete(), 42);
+    result &= Test("testNewArray", testNewArray(), 99);
+    result &= Test("testNewWithConstructor", testNewWithConstructor(), 123);
 
     if (result)
     {
