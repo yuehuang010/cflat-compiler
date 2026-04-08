@@ -16,6 +16,7 @@ call :RunTest testfile2
 call :RunTest test_generics
 call :RunTest testfile_module -i %LIB%
 call :RunTest test_library_string -i %LIB%
+call :RunTestCb test_operators
 
 echo.
 if %ERRORS% EQU 0 (
@@ -34,6 +35,28 @@ echo === %NAME% ===
 %COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
+    set /a ERRORS+=1
+    exit /b
+)
+
+%LLI% %OUT%\%NAME%.ll
+if %ERRORLEVEL% neq 0 (
+    echo FAILED: lli returned error %ERRORLEVEL% for %NAME%.ll
+    set /a ERRORS+=1
+    exit /b
+)
+
+echo PASSED: %NAME%
+exit /b
+
+:RunTestCb
+set NAME=%~1
+set EXTRA=%~2 %~3
+echo === %NAME% ===
+
+%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.ll
+if %ERRORLEVEL% neq 0 (
+    echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
     set /a ERRORS+=1
     exit /b
 )

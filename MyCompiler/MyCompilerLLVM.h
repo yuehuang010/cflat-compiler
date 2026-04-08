@@ -1246,6 +1246,13 @@ public:
                 return builder->CreateFPExt(value, destType);
             }
         }
+        else if (srcType->isIntegerTy() && destType->isFloatingPointTy())
+        {
+            // Integer literal initializer for a float/double field (e.g. float x = 0)
+            if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
+                return llvm::ConstantFP::get(destType, (double)constInt->getSExtValue());
+            return builder->CreateSIToFP(value, destType);
+        }
         else if (srcType->isIntegerTy() && destType->isPointerTy())
         {
             // Integer 0 assigned to a pointer field — produce a proper null/ptr constant.

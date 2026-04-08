@@ -117,9 +117,20 @@ private:
     {
         if (auto* opId = ctx->operatorFunctionId())
         {
-            if (opId->New())    return "operator new";
-            if (opId->Delete()) return "operator delete";
-            if (opId->String()) return "operator string";
+            if (opId->New())          return "operator new";
+            if (opId->Delete())       return "operator delete";
+            if (opId->String())       return "operator string";
+            if (opId->Plus())         return "operator+";
+            if (opId->Minus())        return "operator-";
+            if (opId->Star())         return "operator*";
+            if (opId->Div())          return "operator/";
+            if (opId->Mod())          return "operator%";
+            if (opId->Equal())        return "operator==";
+            if (opId->NotEqual())     return "operator!=";
+            if (opId->Less())         return "operator<";
+            if (opId->LessEqual())    return "operator<=";
+            if (opId->Greater())      return "operator>";
+            if (opId->GreaterEqual()) return "operator>=";
         }
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
@@ -476,9 +487,20 @@ private:
     {
         if (auto* opId = ctx->operatorFunctionId())
         {
-            if (opId->New())    return "operator new";
-            if (opId->Delete()) return "operator delete";
-            if (opId->String()) return "operator string";
+            if (opId->New())          return "operator new";
+            if (opId->Delete())       return "operator delete";
+            if (opId->String())       return "operator string";
+            if (opId->Plus())         return "operator+";
+            if (opId->Minus())        return "operator-";
+            if (opId->Star())         return "operator*";
+            if (opId->Div())          return "operator/";
+            if (opId->Mod())          return "operator%";
+            if (opId->Equal())        return "operator==";
+            if (opId->NotEqual())     return "operator!=";
+            if (opId->Less())         return "operator<";
+            if (opId->LessEqual())    return "operator<=";
+            if (opId->Greater())      return "operator>";
+            if (opId->GreaterEqual()) return "operator>=";
         }
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
@@ -1527,7 +1549,11 @@ public:
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
                     {
-                        LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
+                        // Auto-initialize using the default constructor when available.
+                        if (!global_scope && compiler->GetFunction(typeAndValue.TypeName))
+                            right = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
+                        else
+                            LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
                     }
                 }
 
@@ -1908,10 +1934,12 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            auto left = ParseRelationalExpression(nextCtxs[0]);
+            auto left  = ParseRelationalExpression(nextCtxs[0]);
             auto right = ParseRelationalExpression(nextCtxs[1]);
+            std::string op = ctx->children[1]->getText();
 
-            return Compiler(ctx)->CreateOperation(ctx->children[1]->getText(), left, right);
+            auto* overload = TryBinaryOperatorOverload(left, op, right, ctx);
+            return overload ? overload : Compiler(ctx)->CreateOperation(op, left, right);
         }
 
         LogErrorContext(ctx, "Equality expression has unexpected operand count.");
@@ -1927,10 +1955,12 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            auto left = ParseShiftExpression(nextCtxs[0]);
+            auto left  = ParseShiftExpression(nextCtxs[0]);
             auto right = ParseShiftExpression(nextCtxs[1]);
+            std::string op = ctx->children[1]->getText();
 
-            return Compiler(ctx)->CreateOperation(ctx->children[1]->getText(), left, right);
+            auto* overload = TryBinaryOperatorOverload(left, op, right, ctx);
+            return overload ? overload : Compiler(ctx)->CreateOperation(op, left, right);
         }
 
         LogErrorContext(ctx, "Relational expression has unexpected operand count.");
@@ -1956,20 +1986,21 @@ public:
     {
         auto nextCtxs = ctx->multiplicativeExpression();
 
-        llvm::Value* lvalue = nullptr;
-        llvm::Value* rvalue = nullptr;
-
         if (nextCtxs.size() == 1)
         {
             return ParseMultiplicativeExpression(nextCtxs[0]);
         }
         else if (nextCtxs.size() > 1)
         {
-            int count = 0;
-            for (const auto& nextCtx : nextCtxs)
+            llvm::Value* lvalue = ParseMultiplicativeExpression(nextCtxs[0]);
+
+            for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                rvalue = ParseMultiplicativeExpression(nextCtx);
-                lvalue = Compiler(ctx)->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+                llvm::Value* rvalue = ParseMultiplicativeExpression(nextCtxs[i]);
+                std::string op = ctx->children[i * 2 - 1]->getText();
+
+                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue);
             }
 
             return lvalue;
@@ -2012,6 +2043,48 @@ public:
         return nullptr;
     }
 
+    // If lvalue is a struct type with a user-defined operator, dispatch to it.
+    // Returns the result Value*, or nullptr to fall back to built-in CreateOperation.
+    llvm::Value* TryBinaryOperatorOverload(
+        llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
+        antlr4::ParserRuleContext* ctx)
+    {
+        if (!lvalue) return nullptr;
+        auto* ty = lvalue->getType();
+        if (!ty->isStructTy()) return nullptr;
+        auto* structTy = llvm::cast<llvm::StructType>(ty);
+        if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
+        std::string typeName = structTy->getName().str();
+
+        auto* compiler = Compiler(ctx);
+        // Arithmetic operators in structs are stored as "operator+" (unqualified) with
+        // the struct pointer as first param — overload resolution picks the right one.
+        std::string opName = "operator" + op;
+        if (!compiler->GetFunction(opName)) return nullptr;
+
+        // Materialize a pointer to the struct value for the implicit 'this' parameter.
+        auto* tempAlloca = compiler->CreateAlloca(structTy);
+        compiler->CreateAssignment(lvalue, tempAlloca);
+
+        MyCompilerLLVM::NamedVariable thisNV;
+        thisNV.TypeAndValue.TypeName = typeName;
+        thisNV.TypeAndValue.Pointer  = true;
+        thisNV.Primary = tempAlloca;
+
+        MyCompilerLLVM::NamedVariable rightNV;
+        rightNV.Primary  = rvalue;
+        rightNV.BaseType = rvalue ? rvalue->getType() : nullptr;
+        // Infer TypeName for the right operand so overload matching uses the type-name path.
+        if (rvalue && rvalue->getType()->isStructTy())
+        {
+            auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
+            if (!rst->isLiteral() && rst->hasName())
+                rightNV.TypeAndValue.TypeName = rst->getName().str();
+        }
+
+        return compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+    }
+
     llvm::Value* ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
     {
         auto nextCtxs = ctx->castExpression();
@@ -2019,19 +2092,21 @@ public:
         if (nextCtxs.size() == 1)
         {
             auto namedVar = ParseCastExpression(nextCtxs[0]);
-            return LoadNamedVariable(namedVar);;
+            return LoadNamedVariable(namedVar);
         }
         else if (nextCtxs.size() > 1)
         {
-            llvm::Value* lvalue = nullptr;
-            llvm::Value* rvalue = nullptr;
+            auto firstNV = ParseCastExpression(nextCtxs[0]);
+            llvm::Value* lvalue = LoadNamedVariable(firstNV);
 
-            size_t count = 0;
-            for (const auto& nextCtx : nextCtxs)
+            for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                auto namedVar = ParseCastExpression(nextCtx);
-                rvalue = LoadNamedVariable(namedVar);
-                lvalue = Compiler(ctx)->CreateOperation(ctx->children[count * 2 + 1]->getText(), lvalue, rvalue);
+                auto rightNV = ParseCastExpression(nextCtxs[i]);
+                llvm::Value* rvalue = LoadNamedVariable(rightNV);
+                std::string op = ctx->children[i * 2 - 1]->getText();
+
+                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue);
             }
 
             return lvalue;
