@@ -497,7 +497,7 @@ private:
         {
             auto structData = compiler->GetDataStructure(typeValue.TypeName);
             if (structData.StructType != nullptr && compiler->GetFunction(typeValue.TypeName))
-                return compiler->CreateFunctionCall2(typeValue.TypeName, {});
+                return compiler->CreateOverloadedFunctionCall(typeValue.TypeName, {});
         }
 
         return llvm::Constant::getNullValue(llvmType);
@@ -1190,12 +1190,12 @@ public:
 
             if (returnType.TypeName == "void")
             {
-                compiler->CreateFunctionCall2(name, callArgs);
+                compiler->CreateOverloadedFunctionCall(name, callArgs);
                 compiler->CreateReturnCall(nullptr);
             }
             else
             {
-                auto result = compiler->CreateFunctionCall2(name, callArgs);
+                auto result = compiler->CreateOverloadedFunctionCall(name, callArgs);
                 compiler->CreateReturnCall(result);
             }
 
@@ -1502,7 +1502,7 @@ public:
                                         argNV.BaseType = right->getType();
                                         argNV.TypeAndValue.TypeName = "char";
                                         argNV.TypeAndValue.Pointer = true;
-                                        right = compiler->CreateFunctionCall2("operator string", { argNV });
+                                        right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
                                     }
                                     else
                                     {
@@ -2245,11 +2245,11 @@ public:
         szArg.BaseType = sizeVal->getType();
         if (!typeName.empty() && compiler->GetFunction(opNewName))
         {
-            rawPtr = compiler->CreateFunctionCall2(opNewName, { szArg });
+            rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, { szArg });
         }
         else if (compiler->GetFunction("operator new"))
         {
-            rawPtr = compiler->CreateFunctionCall2("operator new", { szArg });
+            rawPtr = compiler->CreateOverloadedFunctionCall("operator new", { szArg });
         }
         else
         {
@@ -2278,7 +2278,7 @@ public:
                     ctorArgs.push_back(argVar);
                 }
             }
-            llvm::Value* structVal = compiler->CreateFunctionCall2(typeName, ctorArgs);
+            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
             if (structVal)
                 compiler->builder->CreateStore(structVal, typedPtr);
         }
@@ -2332,11 +2332,11 @@ public:
         ptrArg.BaseType = voidPtrTy;
         if (!typeName.empty() && compiler->GetFunction(opDelName))
         {
-            compiler->CreateFunctionCall2(opDelName, { ptrArg });
+            compiler->CreateOverloadedFunctionCall(opDelName, { ptrArg });
         }
         else if (compiler->GetFunction("operator delete"))
         {
-            compiler->CreateFunctionCall2("operator delete", { ptrArg });
+            compiler->CreateOverloadedFunctionCall("operator delete", { ptrArg });
         }
         else
         {
@@ -2366,7 +2366,7 @@ public:
         }
 
         // Dispatch to the global "operator string" overload matching the argument types.
-        auto result = compiler->CreateFunctionCall2("operator string", arguments);
+        auto result = compiler->CreateOverloadedFunctionCall("operator string", arguments);
         if (!result) { LogErrorContext(ctx, "'operator string' is not defined"); return {}; }
 
         MyCompilerLLVM::NamedVariable ret;
@@ -2830,7 +2830,7 @@ public:
                                 for (const auto& e : extraArgs)
                                     allArgs.push_back(e);
 
-                                namedVar.Primary = Compiler(ctx)->CreateFunctionCall2(extFuncName, allArgs);
+                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(extFuncName, allArgs);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                 interfaceVar = {};
@@ -2913,7 +2913,7 @@ public:
                                 Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
                                 // insert point is now accessBlock
 
-                                namedVar.Primary = Compiler(ctx)->CreateFunctionCall2(resolvedFuncName, arguments);
+                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
 
@@ -2961,7 +2961,7 @@ public:
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
                                 }
-                                namedVar.Primary = Compiler(primaryCtx)->CreateFunctionCall2(resolvedFuncName, arguments);
+                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary->getType();
                             }
@@ -3120,7 +3120,7 @@ public:
                     // Call operator string to convert to IReadOnlyString
                     MyCompilerLLVM::NamedVariable arg = nv;
                     arg.TypeAndValue.VariableName = "";
-                    auto* strFat = compiler->CreateFunctionCall2("operator string", { arg });
+                    auto* strFat = compiler->CreateOverloadedFunctionCall("operator string", { arg });
                     if (!strFat)
                     {
                         compiler->LogError("no operator string for expression in format string: " + exprText);
@@ -3173,7 +3173,7 @@ public:
         nvCount.Primary = compiler->builder->getInt32(count);
         nvCount.TypeAndValue = { "i32", "count", false, false };
 
-        return compiler->CreateFunctionCall2("__strconcat", { nvPtrs, nvLens, nvCount });
+        return compiler->CreateOverloadedFunctionCall("__strconcat", { nvPtrs, nvLens, nvCount });
     }
 
     llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
@@ -3685,7 +3685,7 @@ public:
                         // one is available; otherwise zero-initialize the aggregate.
                         std::string fieldTypeName = declList[structIndex].TypeName;
                         if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateFunctionCall2(fieldTypeName, {});
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }

@@ -2258,7 +2258,7 @@ public:
         return result;
     }
 
-    llvm::Value* CreateFunctionCall2(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
+    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
     {
         functionName = ResolveQualifiedName(functionName);
         auto funcSym = functionTable.find(functionName);
@@ -2667,7 +2667,7 @@ public:
                         argNV.Primary = value;
                         argNV.BaseType = ptrTy;
                         argNV.TypeAndValue = { "char", "", true, false };
-                        value = CreateFunctionCall2("operator string", { argNV });
+                        value = CreateOverloadedFunctionCall("operator string", { argNV });
                     }
                 }
             }
