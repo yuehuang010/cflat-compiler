@@ -41,6 +41,13 @@ test.bat
 
 Runs the compiler against test files in `MyCompiler/Test/` and validates output using LLVM's `lli.exe` interpreter.
 
+To run a single test manually:
+
+```bash
+x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out.ll
+lli.exe out.ll
+```
+
 ## Architecture
 
 ### Compilation Pipeline
@@ -61,9 +68,9 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 
 | File | Role |
 |------|------|
-| `C.g4` | ANTLR4 grammar defining CFlat syntax (~1,200 lines) |
+| `CFlat.g4` | ANTLR4 grammar defining CFlat syntax (~1,200 lines) |
 | `MyCompilerLLVM.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
-| `MyListener.h` | AST visitor implementing both passes (~3,600 lines) |
+| `MyListener.h` | AST visitor implementing both passes (~4,100 lines) |
 | `ArgParser.h` | CLI argument parsing |
 | `MyCompiler.cpp` | Entry point |
 
@@ -81,13 +88,27 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 
 ### Language Features Supported
 
-- **Generics**: `struct Box<T> { T value = default; }`
-- **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch
+- **Generics**: `struct Box<T> { T value = default; }` — monomorphized to `Box__int` (double-underscore mangling)
+- **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
 - **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`
+- **Type aliases**: `using M = Math` — expands at reference time (stored in `namespaceAliasTable`)
 - **Module system**: `import "file.cb"` for multi-file compilation
-- **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`
+- **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases: `char=i8`, `short=i16`, `int=i32`, `long=i64`
 - **Null-safe access**: `ptr?.field` (only via function arg pointers)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
 - **Default initialization**: `= default` in generic structs
-- **Operator overloading**: `operator new`, `operator delete`
+- **Operator overloading**: `operator+`, `operator==`, `operator new`, `operator delete`
 - **Function overloads** with type-based resolution and default parameters
+- **Named parameters**: `func(x: 1, y: 2)` — args matched by name, any order
+- **Return-block functions**: `return { ... }` — body inlined at call site (stored in `returnBlockTable`)
+- **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
+
+### Adding New Language Features
+
+| Goal | Where to change |
+|------|----------------|
+| New syntax | Edit `CFlat.g4`; rebuild triggers ANTLR regeneration |
+| New type or IR operation | Add methods to `MyCompilerLLVM.h` |
+| New statement or expression | Add `Parse*()` handler in `MyListener.h` |
+| Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MyListener.h` |
+| New binary operator | `TryBinaryOperatorOverload()` in `MyListener.h` + `Operation` enum in `MyCompilerLLVM.h` |

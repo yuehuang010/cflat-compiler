@@ -534,7 +534,8 @@ function indexToPosition(text: string, index: number): { line: number; character
 const CANNOT_BE_TYPE = new Set([
     'if', 'else', 'while', 'for', 'do', 'switch', 'case', 'default',
     'break', 'continue', 'return', 'goto', 'using', 'namespace', 'interface',
-    'sizeof', 'typeof', 'nameof', 'alignof', 'import', 'alignas', 'volatile', 'stdcall'
+    'sizeof', 'typeof', 'nameof', 'alignof', 'import', 'alignas', 'volatile', 'stdcall',
+    'is', 'as'
 ]);
 
 /**
@@ -782,19 +783,32 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
             const fullType = ptrStars ? `${baseType}${ptrStars}` : baseType;
 
             if (baseType === 'auto') {
-                // Defer resolution: capture the first identifier on the RHS so we can
-                // resolve the concrete type after all symbols have been collected.
-                // This regex handles: simple identifiers, function calls, method calls, constructors, etc.
-                // It extracts the first identifier/qualified name before any special characters like '(', '[', etc.
-                // Supports namespace.type syntax.
-                const rhsMatch = /=\s*(?:new\s+)?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/.exec(rawLine);
-                if (rhsMatch && !KEYWORD_DOCS[name]) {
-                    const typeEnd = vm[1].length + vm[2].length + vm[3].length;
-                    pendingAutos.push({ name, rhsIdent: rhsMatch[1], lineIdx, defChar: vm[0].indexOf(name, typeEnd) });
-                } else if (!KEYWORD_DOCS[name]) {
-                    // Fallback: auto variable that couldn't be resolved - still add it as 'auto'
-                    const typeEnd = vm[1].length + vm[2].length + vm[3].length;
-                    addVarSymbol(name, 'auto', lineIdx, vm[0].indexOf(name, typeEnd));
+                const typeEnd = vm[1].length + vm[2].length + vm[3].length;
+                const defChar = vm[0].indexOf(name, typeEnd);
+
+                // 'as' cast: auto p = expr as Foo;  →  type is Foo*
+                const asMatch = /\bas\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/.exec(rawLine);
+                // 'is' check: auto b = expr is Foo;  →  type is bool
+                const isMatch = /\bis\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/.exec(rawLine);
+
+                if (asMatch && !KEYWORD_DOCS[name]) {
+                    const castType = asMatch[1] + '*';
+                    addVarSymbol(name, castType, lineIdx, defChar);
+                } else if (isMatch && !KEYWORD_DOCS[name]) {
+                    addVarSymbol(name, 'bool', lineIdx, defChar);
+                } else {
+                    // Defer resolution: capture the first identifier on the RHS so we can
+                    // resolve the concrete type after all symbols have been collected.
+                    // This regex handles: simple identifiers, function calls, method calls, constructors, etc.
+                    // It extracts the first identifier/qualified name before any special characters like '(', '[', etc.
+                    // Supports namespace.type syntax.
+                    const rhsMatch = /=\s*(?:new\s+)?([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)/.exec(rawLine);
+                    if (rhsMatch && !KEYWORD_DOCS[name]) {
+                        pendingAutos.push({ name, rhsIdent: rhsMatch[1], lineIdx, defChar });
+                    } else if (!KEYWORD_DOCS[name]) {
+                        // Fallback: auto variable that couldn't be resolved - still add it as 'auto'
+                        addVarSymbol(name, 'auto', lineIdx, defChar);
+                    }
                 }
             } else if (!CANNOT_BE_TYPE.has(baseType.split(/\s+/)[0])) {
                 const typeEnd = vm[1].length + vm[2].length + vm[3].length;
@@ -1034,6 +1048,8 @@ const KEYWORD_DOCS: Record<string, string> = {
     'interface': '**interface** *(CFlat extension)*\n\nDeclare an abstract set of method signatures that a struct must implement.\n\n```c\ninterface Drawable {\n    void draw();\n};\n```',
     'nameof':    '**nameof** *(CFlat extension)*\n\nReturn the name of a variable or type as a `const char*` string at compile time.\n\n```c\nconst char* name = nameof(myVariable);\n```',
     'typeof':    '**typeof** *(CFlat extension)*\n\nReturn the type name of an expression as a `const char*` string.\n\n```c\nconst char* typeName = typeof(myVar);\n```',
+    'is':        '**is** *(CFlat extension)*\n\nType check operator. Tests whether an interface value holds a specific concrete type at runtime. Returns `bool`.\n\nThe type identity is stored in the fat pointer\'s vtable.\n\n```c\nIAnimal* a = getCat();\nif (a is Cat)\n{\n    // a holds a Cat\n}\n```',
+    'as':        '**as** *(CFlat extension)*\n\nSafe cast operator. Extracts the concrete data pointer from an interface fat pointer if it matches the target type; returns `null` otherwise.\n\n```c\nIAnimal* a = getCat();\nCat* c = a as Cat;\nif (c != nullptr)\n{\n    c->purr();\n}\n```',
 
     // C11
     'sizeof':         '**sizeof** *(operator)*\n\nReturn the size in bytes of a type or expression.',
@@ -1140,6 +1156,8 @@ const COMPLETION_ITEMS: CompletionItem[] = [
     makeKeyword('interface', 'CFlat extension'),
     makeKeyword('nameof', 'CFlat extension — compile-time name'),
     makeKeyword('typeof', 'CFlat extension — compile-time type name'),
+    makeKeyword('is', 'CFlat extension — runtime type check'),
+    makeKeyword('as', 'CFlat extension — safe cast'),
 
     // C11
     makeKeyword('sizeof', 'operator'),

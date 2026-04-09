@@ -202,6 +202,7 @@ public:
         llvm::Function* Destructor = nullptr;
         std::vector<std::string> Interfaces;
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables;
+        llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
     };
 
     class StackState
@@ -304,6 +305,7 @@ public:
     llvm::DIFile* diFile = nullptr;
     llvm::DICompileUnit* compileUnit = nullptr;
     llvm::DISubprogram* currentSubprogram = nullptr;
+
 
 private:
     // Create Function Proto or Signature
@@ -861,6 +863,18 @@ public:
 
         auto ptrTy = builder->getInt8Ty()->getPointerTo();
         std::vector<llvm::Constant*> entries;
+
+        // First entry: pointer to unique per-struct type descriptor global (for 'is'/'as' checks)
+        // Lazily create the descriptor here if CreateStructType wasn't called first.
+        if (sd.typeDescriptor == nullptr)
+        {
+            sd.typeDescriptor = new llvm::GlobalVariable(
+                *module, builder->getInt8Ty(), true,
+                llvm::GlobalValue::InternalLinkage,
+                builder->getInt8(0), structName + "_typedesc");
+        }
+        entries.push_back(sd.typeDescriptor);
+
         for (const auto& method : ifaceIt->second)
         {
             llvm::Function* fn = nullptr;
@@ -981,7 +995,8 @@ public:
             return nullptr;
         }
 
-        auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx));
+        // Method indices start at 1 (slot 0 is type ID)
+        auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx + 1));
         auto fnPtr = builder->CreateLoad(ptrTy, fnPtrField);
 
         llvm::Type* retTy = GetType(methodInfo->ReturnType);
@@ -1426,6 +1441,10 @@ public:
                 llvm::StructType* myStruct = llvm::StructType::create(types, name);
                 dataStructures[name].StructType = myStruct;
                 dataStructures[name].StructFields = typeAndValues;
+                dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
+                    *module, builder->getInt8Ty(), true,
+                    llvm::GlobalValue::InternalLinkage,
+                    builder->getInt8(0), name + "_typedesc");
 
                 return myStruct;
             }
@@ -1446,6 +1465,10 @@ public:
 
             llvm::StructType* opaqueStruct = llvm::StructType::create(*context, name);
             dataStructures[name].StructType = opaqueStruct;
+            dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
+                *module, builder->getInt8Ty(), true,
+                llvm::GlobalValue::InternalLinkage,
+                builder->getInt8(0), name + "_typedesc");
             return opaqueStruct;
         }
     }

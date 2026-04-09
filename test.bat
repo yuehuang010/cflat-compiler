@@ -17,6 +17,7 @@ call :RunTest test_generics
 call :RunTest testfile_module -i %LIB%
 call :RunTest test_library_string -i %LIB%
 call :RunTestCb test_operators
+call :RunTestCb test_is_as
 
 echo.
 if %ERRORS% EQU 0 (

@@ -1496,14 +1496,33 @@ public:
                             // so we can do the struct→interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
-                            // If RHS is a struct pointer (not already a fat struct), upcast it.
+                            // If RHS is a struct (not already a fat struct), upcast it to the interface.
                             if (right && right->getType() != compiler->GetFatPtrType())
                             {
                                 std::string structName = rightNV.TypeAndValue.TypeName;
                                 if (!structName.empty())
                                 {
                                     auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
-                                    right = compiler->BuildInterfaceFatValue(vtable, right);
+                                    // BuildInterfaceFatValue needs a *pointer* to the struct data,
+                                    // not the loaded struct value.
+                                    // - Pointer types (e.g. StringData*): the loaded value IS the pointer → use it directly.
+                                    // - Value types (e.g. Point by value): use the alloca address; spill if no storage.
+                                    llvm::Value* dataPtr;
+                                    if (rightNV.TypeAndValue.Pointer)
+                                    {
+                                        // RHS is already a pointer to the struct (e.g. StringData* sd)
+                                        dataPtr = right;
+                                    }
+                                    else
+                                    {
+                                        dataPtr = rightNV.Storage;
+                                        if (!dataPtr)
+                                        {
+                                            dataPtr = compiler->CreateAlloca(right->getType());
+                                            compiler->CreateAssignment(right, dataPtr);
+                                        }
+                                    }
+                                    right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
                                 }
                                 else if (typeAndValue.TypeName == "IReadOnlyString" &&
                                          right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -1605,22 +1624,23 @@ public:
                                 auto eqs = ands[0]->equalityExpression();
                                 if (eqs.size() == 1)
                                 {
-                                    auto rels = eqs[0]->relationalExpression();
-                                    if (rels.size() == 1)
+                                    auto tcs = eqs[0]->typeCheckExpression();
+                                    if (tcs.size() == 1)
                                     {
-                                        auto shs = rels[0]->shiftExpression();
-                                        if (shs.size() == 1)
+                                        auto* relCtx = tcs[0]->relationalExpression();
+                                        auto rels = relCtx ? relCtx->shiftExpression() : std::vector<CFlatParser::ShiftExpressionContext*>{};
+                                        if (rels.size() == 1)
                                         {
-                                            auto adds = shs[0]->additiveExpression();
-                                            if (adds.size() == 1)
+                                            auto shs = rels[0]->additiveExpression();
+                                            if (shs.size() == 1)
                                             {
-                                                auto muls = adds[0]->multiplicativeExpression();
-                                                if (muls.size() == 1)
+                                                auto adds = shs[0]->multiplicativeExpression();
+                                                if (adds.size() == 1)
                                                 {
-                                                    auto casts = muls[0]->castExpression();
-                                                    if (casts.size() == 1)
+                                                    auto muls = adds[0]->castExpression();
+                                                    if (muls.size() == 1)
                                                     {
-                                                        return ParseCastExpression(casts[0]);
+                                                        return ParseCastExpression(muls[0]);
                                                     }
                                                 }
                                             }
@@ -1927,15 +1947,15 @@ public:
 
     llvm::Value* ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
     {
-        auto nextCtxs = ctx->relationalExpression();
+        auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
         {
-            return ParseRelationalExpression(nextCtxs[0]);
+            return ParseTypeCheckExpression(nextCtxs[0]);
         }
         else if (nextCtxs.size() == 2)
         {
-            auto left  = ParseRelationalExpression(nextCtxs[0]);
-            auto right = ParseRelationalExpression(nextCtxs[1]);
+            auto left  = ParseTypeCheckExpression(nextCtxs[0]);
+            auto right = ParseTypeCheckExpression(nextCtxs[1]);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(left, op, right, ctx);
@@ -1944,6 +1964,126 @@ public:
 
         LogErrorContext(ctx, "Equality expression has unexpected operand count.");
         return nullptr;
+    }
+
+    llvm::Value* ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
+    {
+        auto relCtx = ctx->relationalExpression();
+        if (!relCtx)
+        {
+            LogErrorContext(ctx, "Type check expression has no operand.");
+            return nullptr;
+        }
+
+        auto result = ParseRelationalExpression(relCtx);
+
+        // Handle 'is' and 'as' operators
+        auto typeSpecs = ctx->typeSpecifier();
+        if (typeSpecs.size() > 0)
+        {
+            for (size_t i = 0; i < typeSpecs.size(); i++)
+            {
+                std::string op = ctx->children[2 * i + 1]->getText();  // 'is' or 'as' token
+                std::string targetTypeName = ParseTypeSpecifierName(typeSpecs[i]);
+
+                if (op == "is")
+                {
+                    result = GenerateIsCheck(result, targetTypeName, ctx);
+                }
+                else if (op == "as")
+                {
+                    result = GenerateSafeCast(result, targetTypeName, ctx);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Returns the type descriptor pointer loaded from vtable[0].
+    // Works whether interfaceValue is an aggregate {i8*,i8*} or a pointer to one.
+    llvm::Value* LoadTypeDescFromInterface(llvm::Value* interfaceValue, antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+
+        llvm::Value* vtablePtr;
+        if (interfaceValue->getType()->isStructTy())
+        {
+            vtablePtr = compiler->builder->CreateExtractValue(interfaceValue, {0u});
+        }
+        else
+        {
+            auto fatTy = compiler->GetFatPtrType();
+            auto vtablePtrField = compiler->builder->CreateStructGEP(fatTy, interfaceValue, 0);
+            vtablePtr = compiler->builder->CreateLoad(ptrTy, vtablePtrField);
+        }
+
+        // vtable[0] holds the type descriptor pointer
+        auto typeDescField = compiler->builder->CreateGEP(ptrTy, vtablePtr, compiler->builder->getInt32(0));
+        return compiler->builder->CreateLoad(ptrTy, typeDescField);
+    }
+
+    llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeName,
+                                  antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        auto targetIt = compiler->dataStructures.find(targetTypeName);
+        if (targetIt == compiler->dataStructures.end())
+        {
+            LogErrorContext(ctx, std::format("'{}' is not a known struct type for 'is' check", targetTypeName));
+            return nullptr;
+        }
+
+        auto* typeDesc = targetIt->second.typeDescriptor;
+        if (!typeDesc)
+        {
+            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeName));
+            return nullptr;
+        }
+
+        auto loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
+        return compiler->builder->CreateICmpEQ(loadedDesc, typeDesc);
+    }
+
+    llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeName,
+                                  antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+
+        auto targetIt = compiler->dataStructures.find(targetTypeName);
+        if (targetIt == compiler->dataStructures.end())
+        {
+            LogErrorContext(ctx, std::format("'{}' is not a known struct type for 'as' cast", targetTypeName));
+            return nullptr;
+        }
+
+        auto* typeDesc = targetIt->second.typeDescriptor;
+        if (!typeDesc)
+        {
+            LogErrorContext(ctx, std::format("'{}' has no type descriptor", targetTypeName));
+            return nullptr;
+        }
+
+        // Extract data pointer (field 1)
+        llvm::Value* dataPtr;
+        if (interfaceValue->getType()->isStructTy())
+            dataPtr = compiler->builder->CreateExtractValue(interfaceValue, {1u});
+        else
+        {
+            auto fatTy = compiler->GetFatPtrType();
+            auto dataPtrField = compiler->builder->CreateStructGEP(fatTy, interfaceValue, 1);
+            dataPtr = compiler->builder->CreateLoad(ptrTy, dataPtrField);
+        }
+
+        auto loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
+        auto typeMatches = compiler->builder->CreateICmpEQ(loadedDesc, typeDesc);
+
+        // In opaque pointer mode, dataPtr is already the right pointer type — no bitcast needed
+        auto nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(dataPtr->getType()));
+        return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
 
     llvm::Value* ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)

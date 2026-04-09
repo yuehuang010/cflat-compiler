@@ -115,8 +115,15 @@ relationalExpression
     : shiftExpression (('<' | '>' | '<=' | '>=') shiftExpression)?
     ;
 
+typeCheckExpression
+    : relationalExpression (
+        Is typeSpecifier
+        | As typeSpecifier
+    )*
+    ;
+
 equalityExpression
-    : relationalExpression (('==' | '!=') relationalExpression)?
+    : typeCheckExpression (('==' | '!=') typeCheckExpression)?
     ;
 
 andExpression
@@ -660,6 +667,14 @@ NameOf
 
 TypeOf
     : 'typeof'
+    ;
+
+Is
+    : 'is'
+    ;
+
+As
+    : 'as'
     ;
 
 Interface
