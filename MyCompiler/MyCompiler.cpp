@@ -14,6 +14,8 @@ int main(int argc, char* argv[])
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
+    args.addOption("emit-exe", 'e', "Output native executable path (.exe)");
+    args.addOption("platform", 'p', "Target platform: x64 (default) or x86", "x64");
 
     if (!args.parse(argc, argv))
         return 1;

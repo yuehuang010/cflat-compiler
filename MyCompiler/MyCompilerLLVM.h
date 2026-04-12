@@ -12,8 +12,16 @@
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
 #include <llvm\IR\DIBuilder.h>
+#include <llvm\IR\LegacyPassManager.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <llvm\Support\FileSystem.h>
+#include <llvm\Support\MemoryBuffer.h>
+#include <llvm\Support\Path.h>
+#include <llvm\Support\Program.h>
+#include <llvm\Support\TargetSelect.h>
+#include <llvm\Target\TargetMachine.h>
+#include <llvm\MC\TargetRegistry.h>
+#include <llvm\TargetParser\Host.h>
 #include <antlr4-runtime.h>
 #include <CFlatParser.h>
 #include "ArgParser.h"
@@ -680,6 +688,185 @@ private:
             return false;
         }
         llvm::WriteBitcodeToFile(*module, outBC);
+        return true;
+    }
+
+    bool EmitExecutable(const std::string& exePath, const std::string& platform)
+    {
+        std::string triple;
+        std::string clangTarget;
+        std::string cpu;
+        std::string clangBits;
+        if (platform == "x86")
+        {
+            triple = "i686-pc-windows-msvc";
+            clangTarget = "--target=i686-pc-windows-msvc";
+            clangBits = "-m32";
+            cpu = "i686";
+        }
+        else // x64 (default)
+        {
+            triple = "x86_64-pc-windows-msvc";
+            clangTarget = "--target=x86_64-pc-windows-msvc";
+            clangBits = "-m64";
+            cpu = "x86-64";
+        }
+
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+
+        module->setTargetTriple(triple);
+
+        std::string err;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        if (!target)
+        {
+            std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+            return false;
+        }
+
+        llvm::TargetOptions opt;
+        auto TM = std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
+        module->setDataLayout(TM->createDataLayout());
+
+        auto objPath = exePath + ".obj";
+        std::error_code EC;
+        llvm::raw_fd_ostream dest(objPath, EC, llvm::sys::fs::OF_None);
+        if (EC)
+        {
+            std::cerr << "Error: could not write object file '" << objPath << "': " << EC.message() << "\n";
+            return false;
+        }
+
+        llvm::legacy::PassManager pass;
+        if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
+        {
+            std::cerr << "Error: target does not support object file emission\n";
+            return false;
+        }
+        pass.run(*module);
+        dest.flush();
+        dest.close();
+
+        // ---- Find lld-link (prefer vcpkg tools next to clang) ----
+        std::string lldLinkPath;
+        {
+            auto clangErr = llvm::sys::findProgramByName("clang-cl");
+            if (clangErr)
+            {
+                llvm::SmallString<256> candidate(llvm::sys::path::parent_path(*clangErr));
+                llvm::sys::path::append(candidate, "lld-link.exe");
+                if (llvm::sys::fs::exists(candidate))
+                    lldLinkPath = candidate.str().str();
+            }
+            if (lldLinkPath.empty())
+            {
+                auto err = llvm::sys::findProgramByName("lld-link");
+                if (err) lldLinkPath = *err;
+            }
+        }
+        if (lldLinkPath.empty())
+        {
+            llvm::sys::fs::remove(objPath);
+            std::cerr << "Error: lld-link.exe not found\n";
+            return false;
+        }
+
+        const std::string arch = (platform == "x86") ? "x86" : "x64";
+
+        // ---- Find VS install path via vswhere ----
+        std::string vsPath;
+        {
+            const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+            if (llvm::sys::fs::exists(vswhereFixed))
+            {
+                llvm::SmallString<256> outFile;
+                llvm::sys::path::system_temp_directory(true, outFile);
+                llvm::sys::path::append(outFile, "mycompiler_vswhere.txt");
+                std::string outFileStr = outFile.str().str();
+
+                std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
+                std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
+                llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
+
+                if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
+                    vsPath = buf.get()->getBuffer().trim().str();
+                llvm::sys::fs::remove(outFile);
+            }
+        }
+
+        // ---- Find latest MSVC lib path ----
+        std::string msvcLibPath;
+        if (!vsPath.empty())
+        {
+            std::string msvcRoot = vsPath + "\\VC\\Tools\\MSVC";
+            std::string latestVer;
+            std::error_code ec;
+            for (auto it = llvm::sys::fs::directory_iterator(msvcRoot, ec);
+                 it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+            {
+                if (ec) break;
+                auto ver = llvm::sys::path::filename(it->path()).str();
+                if (ver > latestVer) latestVer = ver;
+            }
+            if (!latestVer.empty())
+                msvcLibPath = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
+        }
+
+        // ---- Find latest Windows SDK lib paths ----
+        std::string ucrtLibPath, umLibPath;
+        {
+            std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+            std::string latestSDK;
+            std::error_code ec;
+            for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
+                 it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+            {
+                if (ec) break;
+                auto ver = llvm::sys::path::filename(it->path()).str();
+                if (ver > latestSDK) latestSDK = ver;
+            }
+            if (!latestSDK.empty())
+            {
+                ucrtLibPath = wkLib + "\\" + latestSDK + "\\ucrt\\" + arch;
+                umLibPath   = wkLib + "\\" + latestSDK + "\\um\\"   + arch;
+            }
+        }
+
+        // ---- Invoke lld-link directly with explicit lib paths ----
+        std::vector<std::string> linkArgStrs = {
+            lldLinkPath,
+            "/out:" + exePath,
+            "/subsystem:console",
+        };
+        if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
+        if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
+        if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+        // legacy_stdio_definitions.lib provides printf/scanf as directly linkable
+        // symbols for code that calls them without going through MSVC headers.
+        linkArgStrs.push_back("legacy_stdio_definitions.lib");
+        linkArgStrs.push_back("msvcrt.lib");
+        linkArgStrs.push_back("ucrt.lib");
+        linkArgStrs.push_back("vcruntime.lib");
+        linkArgStrs.push_back("kernel32.lib");
+        linkArgStrs.push_back(objPath);
+
+        std::vector<llvm::StringRef> linkArgs;
+        for (auto& s : linkArgStrs) linkArgs.push_back(s);
+
+        std::cout << "Linking (" << arch << "): " << exePath << "\n";
+
+        std::string linkErr;
+        int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
+        llvm::sys::fs::remove(objPath);
+
+        if (rc != 0)
+        {
+            std::cerr << "Error: linking failed (exit " << rc << "): " << linkErr << "\n";
+            return false;
+        }
         return true;
     }
 

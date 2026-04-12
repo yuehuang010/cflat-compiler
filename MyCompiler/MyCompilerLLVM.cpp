@@ -120,6 +120,11 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     if (!bitcodePath.empty() && !WriteBitcode(bitcodePath))
         return false;
 
+    if (auto exePath = args.getOption("emit-exe"))
+    {
+        if (!EmitExecutable(*exePath, args.getOption("platform").value_or("x64"))) return false;
+    }
+
     return true;
 }
 
