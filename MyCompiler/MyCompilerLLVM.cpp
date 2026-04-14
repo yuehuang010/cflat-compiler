@@ -41,6 +41,14 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         InitDebugInfo(filePath.filename().string(), filePath.parent_path().string());
     }
 
+    // Auto-import the CFlat runtime (provides printf and other builtins).
+    if (!runtimeDir.empty())
+    {
+        auto runtimePath = std::filesystem::path(runtimeDir) / "runtime.cb";
+        if (std::filesystem::exists(runtimePath))
+            CompileImportedFile(runtimePath.string(), "runtime.cb");
+    }
+
     {
         std::ifstream stream;
         stream.open(filename);

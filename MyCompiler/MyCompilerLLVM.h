@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include <llvm\IR\IRBuilder.h>
+#include <llvm\IR\Intrinsics.h>
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
@@ -266,10 +267,10 @@ public:
     };
 
     private:
-    int currentLine = 0;
-    int currentColumn = 0;
+    size_t currentLine = 0;
+    size_t currentColumn = 0;
 
-    void SetSourceLocation(int line, int column)
+    void SetSourceLocation(size_t line, size_t column)
     {
         currentLine = line;
         currentColumn = column;
@@ -300,6 +301,7 @@ public:
     std::unordered_set<std::string> namespaceTable;
     std::unordered_set<std::string> importedFiles;
     std::string importSearchDir;
+    std::string runtimeDir;
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
@@ -653,6 +655,18 @@ private:
         RegisterBuiltinStrConcat();
     }
 
+    void CreateVaStart(llvm::Value* apAlloca)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vastart);
+        builder->CreateCall(fn, {apAlloca});
+    }
+
+    void CreateVaEnd(llvm::Value* apAlloca)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::vaend);
+        builder->CreateCall(fn, {apAlloca});
+    }
+
     bool VerifyModule()
     {
         std::string errors;
@@ -844,9 +858,6 @@ private:
         if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
         if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
         if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
-        // legacy_stdio_definitions.lib provides printf/scanf as directly linkable
-        // symbols for code that calls them without going through MSVC headers.
-        linkArgStrs.push_back("legacy_stdio_definitions.lib");
         linkArgStrs.push_back("msvcrt.lib");
         linkArgStrs.push_back("ucrt.lib");
         linkArgStrs.push_back("vcruntime.lib");
@@ -922,7 +933,7 @@ public:
             diBuilder->finalize();
     }
 
-    void SetCurrentDebugLocation(int line, int col = 0)
+    void SetCurrentDebugLocation(size_t line, size_t col = 0)
     {
         if (!currentSubprogram || !diBuilder) return;
         builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, (unsigned)line, (unsigned)col, currentSubprogram));
@@ -1320,7 +1331,7 @@ public:
         return gVar;
     }
 
-    llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, int line = 0)
+    llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0)
     {
         auto type = GetType(typeValue, autoType);
         auto alloc = builder->CreateAlloca(type, arraySize, typeValue.VariableName);
@@ -1329,7 +1340,7 @@ public:
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
 
-        if (diBuilder && currentSubprogram && line > 0)
+        if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {
             auto diType = GetDIType(typeValue);
             auto diVar = diBuilder->createAutoVariable(currentSubprogram, typeValue.VariableName, diFile, (unsigned)line, diType);
@@ -2123,7 +2134,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, int line = 0)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
 
@@ -2218,6 +2229,7 @@ public:
         else if (resolvedTypeName == "float") { type = builder->getFloatTy(); }
         else if (resolvedTypeName == "double") { type = builder->getDoubleTy(); }
         else if (resolvedTypeName == "bool") { type = builder->getInt1Ty(); }
+        else if (resolvedTypeName == "va_list") { type = llvm::PointerType::getUnqual(*context); }
         else if (resolvedTypeName == "auto" && autoType != nullptr) { type = autoType; }
         else
         {
@@ -2386,7 +2398,7 @@ public:
             return {};
 
         // A map from input to target Argument
-        std::vector<int> posMap(inputSize, -1);
+        std::vector<int64_t> posMap(inputSize, -1);
 
         int posIndex = 0;
         for (const auto& input : inputArguments)
@@ -2414,7 +2426,7 @@ public:
 
         // Create a used map for the target parameters
         std::vector<bool> usedTargetMap(inputSize);
-        for (int pos : posMap)
+        for (int64_t pos : posMap)
         {
             if (pos >= 0)
             {
@@ -2793,12 +2805,12 @@ public:
         if (func->isVarArg())
         {
             std::vector<llvm::Value*> newArg;
-            int varArgStart = func->arg_size();
+            size_t varArgStart = func->arg_size();
             for (auto value : arg)
             {
                 if (varArgStart > 0)
                 {
-                    auto destArgument = func->getArg(func->arg_size() - varArgStart);
+                    auto destArgument = func->getArg(static_cast<unsigned int>(func->arg_size() - varArgStart));
                     auto srcArg = Upconvert(value, destArgument);
                     newArg.push_back(srcArg);
                     varArgStart--;
@@ -3062,6 +3074,8 @@ public:
         llvm::BasicBlock* currentBlock = builder->GetInsertBlock();
         llvm::outs() << prefix << "Current insertion block: " << currentBlock->getParent()->getName() << "::" << currentBlock->getName() << "\n";
     }
+
+    void SetRuntimeDir(const std::string& dir) { runtimeDir = dir; }
 
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);

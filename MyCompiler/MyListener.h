@@ -1165,7 +1165,7 @@ public:
         const MyCompilerLLVM::DeclTypeAndValue& returnType,
         const std::vector<MyCompilerLLVM::DeclTypeAndValue>& params,
         bool varargs,
-        int line)
+        size_t line)
     {
         auto* compiler = Compiler();
         int firstDefault = -1;
@@ -1236,7 +1236,7 @@ public:
         auto returnType = this->getFunctionReturnType(func);
         CFlatParser::ParameterTypeListContext* paramTypeList = func->parameterTypeList();
         auto params = this->ParseParameterTypeList(paramTypeList);
-        int line = func->getStart()->getLine();
+        size_t line = func->getStart()->getLine();
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
         // If this is a generic function template definition (not an instantiation), store it and return.
@@ -1412,7 +1412,7 @@ public:
         auto* compiler = Compiler(declSpec);
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
-        int line = declSpec->getStart()->getLine();
+        size_t line = declSpec->getStart()->getLine();
         auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
 
         // Queue any pending generic instantiation for this declaration's type.
@@ -2906,6 +2906,30 @@ public:
 
                         auto argumentList = ctx->argumentExpressionList();
 
+                        // Handle va_start / va_end — pass the va_list alloca address to the LLVM intrinsic.
+                        if (functionName == "va_start" || functionName == "va_end")
+                        {
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string varName = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto vaVar = Compiler(ctx)->GetLocalVariable(varName);
+                                    if (!vaVar.Storage) vaVar = Compiler(ctx)->GetFunctionArgument(varName);
+                                    if (vaVar.Storage)
+                                    {
+                                        if (functionName == "va_start")
+                                            Compiler(ctx)->CreateVaStart(vaVar.Storage);
+                                        else
+                                            Compiler(ctx)->CreateVaEnd(vaVar.Storage);
+                                    }
+                                }
+                            }
+                            namedVar = {};
+                            break;
+                        }
+
                         // Check if this is a return-block function — inline it at the call site.
                         // A 'return' inside the block returns from the caller function.
                         if (const auto* rb = Compiler(ctx)->GetReturnBlock(functionName))
@@ -3552,6 +3576,10 @@ public:
         if (compiler->GetReturnBlock(name) != nullptr)
             return {};
 
+        // Compiler intrinsics handled at the call site — not in the function table.
+        if (name == "va_start" || name == "va_end")
+            return {};
+
         LogErrorContext(node, std::format("Undefined variable {}.", name));
         return {};
     }
@@ -4023,7 +4051,7 @@ public:
         MyCompilerLLVM::TypeAndValue returnType;
         returnType.TypeName = "void";
 
-        int line = ctx->getStart()->getLine();
+        int line = static_cast<int>(ctx->getStart()->getLine());
         auto fn = compiler->CreateFunctionDefinition("~" + structName, returnType, params, false, false, line);
         compiler->RegisterDestructor(structName, fn);
 
@@ -4193,31 +4221,31 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage)
     {
         auto symbol = ctx->getSymbol();
-        int line = symbol->getLine();
-        int column = symbol->getCharPositionInLine();
+        int line = static_cast<int>(symbol->getLine());
+        int column = static_cast<int>(symbol->getCharPositionInLine());
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
         exit(1);
     }
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage)
     {
-        int line = ctx->getStart()->getLine();
-        int column = ctx->getStart()->getCharPositionInLine();
+        int line = static_cast<int>(ctx->getStart()->getLine());
+        int column = static_cast<int>(ctx->getStart()->getCharPositionInLine());
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
         exit(1);
     }
 
     void LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage)
     {
-        int line = ctx->getStart()->getLine();
-        int column = ctx->getStart()->getCharPositionInLine();
+        size_t line = ctx->getStart()->getLine();
+        size_t column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), warningMessage);
     }
 
     void PrintContext(antlr4::ParserRuleContext* ctx, std::string suffix = "")
     {
-        int line = ctx->getStart()->getLine();
-        int column = ctx->getStart()->getCharPositionInLine();
+        size_t line = ctx->getStart()->getLine();
+        size_t column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{}:{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
     }
 

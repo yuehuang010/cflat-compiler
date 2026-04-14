@@ -2,6 +2,8 @@
 //
 
 #include <iostream>
+#include <filesystem>
+#include <stdlib.h>
 
 #include "MyCompilerLLVM.h"
 #include "ArgParser.h"
@@ -30,7 +32,13 @@ int main(int argc, char* argv[])
 
     std::cout << "MyCompilerLLVM\n";
 
+    // Locate runtime.cb next to this executable.
+    char* pgmptr = nullptr;
+    _get_pgmptr(&pgmptr);
+    std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+
     MyCompilerLLVM compiler;
+    compiler.SetRuntimeDir(runtimeDir);
     compiler.Compile(args);
     std::cout << "Done.\n";
 

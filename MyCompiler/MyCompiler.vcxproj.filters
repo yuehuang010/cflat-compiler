@@ -33,6 +33,7 @@
       <Filter>Source Files</Filter>
     </None>
     <None Include="testfile3.c" />
+    <None Include="runtime.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />

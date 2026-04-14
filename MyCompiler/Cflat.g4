@@ -238,6 +238,7 @@ typeSpecifier
     | 'u16'
     | 'u32'
     | 'u64'
+    | 'va_list'
     | structClassUnion
     | 'auto'
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
