@@ -539,7 +539,8 @@ deleteExpression
 operatorFunctionId
     : Operator (New | Delete | String
                | Plus | Minus | Star | Div | Mod
-               | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual)
+               | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
+               | LeftBracket RightBracket)
     ;
 
 interfaceDefinition
@@ -547,7 +548,7 @@ interfaceDefinition
     ;
 
 interfaceMethod
-    : declarationSpecifiers directDeclarator '(' parameterTypeList? ')' ';'
+    : declarationSpecifiers (directDeclarator | operatorFunctionId) '(' parameterTypeList? ')' ';'
     ;
 
 Auto

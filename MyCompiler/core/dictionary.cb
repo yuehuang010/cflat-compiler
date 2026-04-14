@@ -1,0 +1,182 @@
+// dictionary<K,V> — open-addressed hash map built on the same storage scheme
+// as hashset<T> (parallel status/keys arrays with linear probing), extended
+// with a parallel values array.  K must support == and % (integer-like type,
+// same constraints as hashset<T>).
+
+import "hashset.cb";
+
+interface IDictionary<K, V>
+{
+    int  count();
+    bool contains(K key);
+    V    get(K key);
+    void set(K key, V value);
+    bool add(K key, V value);
+    bool remove(K key);
+};
+
+struct dictionary<K, V>
+{
+    K*    _keys     = nullptr;
+    V*    _values   = nullptr;
+    char* _status   = nullptr;   // 0 = empty, 1 = occupied, 2 = deleted
+    int   _count    = 0;
+    int   _capacity = 0;
+    V     _missing  = default;   // value returned by get() on a miss
+
+    int _slot(K key)
+    {
+        int h = (int)(key % _capacity);
+        if (h < 0) h = h + _capacity;
+        return h;
+    }
+
+    void _init(int cap)
+    {
+        _keys   = new K[cap];
+        _values = new V[cap];
+        _status = new char[cap];
+        int i = 0;
+        while (i < cap)
+        {
+            _status[i] = 0;
+            i++;
+        }
+        _capacity = cap;
+    }
+
+    void _rehash()
+    {
+        K*    oldKeys   = _keys;
+        V*    oldValues = _values;
+        char* oldStatus = _status;
+        int   oldCap    = _capacity;
+
+        _count = 0;
+        _init(_capacity * 2);
+
+        int i = 0;
+        while (i < oldCap)
+        {
+            if (oldStatus[i] == 1) add(oldKeys[i], oldValues[i]);
+            i++;
+        }
+
+        delete[] oldKeys;
+        delete[] oldValues;
+        delete[] oldStatus;
+    }
+
+    // Insert a new entry.  Returns true if added, false if key already present
+    // (existing value is left untouched — use set() to overwrite).
+    bool add(K key, V value)
+    {
+        if (_capacity == 0) _init(8);
+        if (_count * 4 >= _capacity * 3) _rehash();
+
+        int slot = _slot(key);
+        int firstDeleted = -1;
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key) return false;
+            if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
+            slot = (slot + 1) % _capacity;
+        }
+        int insertSlot = slot;
+        if (firstDeleted != -1) insertSlot = firstDeleted;
+        _keys[insertSlot]   = key;
+        _values[insertSlot] = value;
+        _status[insertSlot] = 1;
+        _count++;
+        return true;
+    }
+
+    // Insert or overwrite the value for key.
+    void set(K key, V value)
+    {
+        if (_capacity == 0) _init(8);
+        if (_count * 4 >= _capacity * 3) _rehash();
+
+        int slot = _slot(key);
+        int firstDeleted = -1;
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key)
+            {
+                _values[slot] = value;
+                return;
+            }
+            if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
+            slot = (slot + 1) % _capacity;
+        }
+        int insertSlot = slot;
+        if (firstDeleted != -1) insertSlot = firstDeleted;
+        _keys[insertSlot]   = key;
+        _values[insertSlot] = value;
+        _status[insertSlot] = 1;
+        _count++;
+    }
+
+    // Returns true if key is present.
+    bool contains(K key)
+    {
+        if (_capacity == 0) return false;
+        int slot = _slot(key);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key) return true;
+            slot = (slot + 1) % _capacity;
+        }
+        return false;
+    }
+
+    // Read the value for key.  Returns default(V) if the key is not present.
+    V get(K key)
+    {
+        if (_capacity == 0) return _missing;
+        int slot = _slot(key);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key) return _values[slot];
+            slot = (slot + 1) % _capacity;
+        }
+        return _missing;
+    }
+
+    // Remove an entry by key.  Returns true if removed, false if not found.
+    bool remove(K key)
+    {
+        if (_capacity == 0) return false;
+        int slot = _slot(key);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == key)
+            {
+                _status[slot] = 2;
+                _count--;
+                return true;
+            }
+            slot = (slot + 1) % _capacity;
+        }
+        return false;
+    }
+
+    // Number of entries currently in the dictionary.
+    int count()
+    {
+        return _count;
+    }
+
+    // d[key] — same semantics as get(key): returns default(V) on miss.
+    V operator[](K key)
+    {
+        return get(key);
+    }
+
+    ~dictionary()
+    {
+        if (_keys   != nullptr) delete[] _keys;
+        if (_values != nullptr) delete[] _values;
+        if (_status != nullptr) delete[] _status;
+    }
+};

@@ -1,0 +1,121 @@
+// hashset<T> — unordered set using open addressing with linear probing.
+// T must support == for equality and must be usable as an integer for hashing
+// (i.e., integer primitive types: int, i32, i64, char, u8, u32, etc.).
+
+interface IHashable
+{
+    int hash();
+};
+
+struct hashset<T>
+{
+    T*    _keys   = nullptr;
+    char* _status = nullptr;   // 0 = empty, 1 = occupied, 2 = deleted
+    int   _count  = 0;
+    int   _capacity = 0;
+
+    int _slot(T value)
+    {
+        int h = (int)(value % _capacity);
+        if (h < 0) h = h + _capacity;
+        return h;
+    }
+
+    void _init(int cap)
+    {
+        _keys   = new T[cap];
+        _status = new char[cap];
+        int i = 0;
+        while (i < cap)
+        {
+            _status[i] = 0;
+            i++;
+        }
+        _capacity = cap;
+    }
+
+    void _rehash()
+    {
+        T*    oldKeys   = _keys;
+        char* oldStatus = _status;
+        int   oldCap    = _capacity;
+
+        _count = 0;
+        _init(_capacity * 2);
+
+        int i = 0;
+        while (i < oldCap)
+        {
+            if (oldStatus[i] == 1) add(oldKeys[i]);
+            i++;
+        }
+
+        delete[] oldKeys;
+        delete[] oldStatus;
+    }
+
+    // Insert value. Returns true if added, false if already present.
+    bool add(T value)
+    {
+        if (_capacity == 0) _init(8);
+        if (_count * 4 >= _capacity * 3) _rehash();
+
+        int slot = _slot(value);
+        int firstDeleted = -1;
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == value) return false;
+            if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
+            slot = (slot + 1) % _capacity;
+        }
+        int insertSlot = slot;
+        if (firstDeleted != -1) insertSlot = firstDeleted;
+        _keys[insertSlot] = value;
+        _status[insertSlot] = 1;
+        _count++;
+        return true;
+    }
+
+    // Returns true if value is in the set.
+    bool contains(T value)
+    {
+        if (_capacity == 0) return false;
+        int slot = _slot(value);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == value) return true;
+            slot = (slot + 1) % _capacity;
+        }
+        return false;
+    }
+
+    // Remove value. Returns true if removed, false if not found.
+    bool remove(T value)
+    {
+        if (_capacity == 0) return false;
+        int slot = _slot(value);
+        while (_status[slot] != 0)
+        {
+            if (_status[slot] == 1 && _keys[slot] == value)
+            {
+                _status[slot] = 2;
+                _count--;
+                return true;
+            }
+            slot = (slot + 1) % _capacity;
+        }
+        return false;
+    }
+
+    // Number of elements currently in the set.
+    int count()
+    {
+        return _count;
+    }
+
+    ~hashset()
+    {
+        if (_keys   != nullptr) delete[] _keys;
+        if (_status != nullptr) delete[] _status;
+    }
+};

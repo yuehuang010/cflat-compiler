@@ -1,11 +1,12 @@
 @echo off
 setlocal
 
+set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
 set COMPILER=x64\Debug\MyCompiler.exe
-set LLI=vcpkg_installed\x64-windows\x64-windows\tools\llvm\lli.exe
 set SRC=MyCompiler\Test
 set LIB=MyCompiler\Test\library
 set OUT=out
+
 
 set ERRORS=0
 
@@ -18,6 +19,7 @@ call :RunTest testfile_module -i %LIB%
 call :RunTest test_library_string -i %LIB%
 call :RunTestCb test_operators
 call :RunTestCb test_is_as
+call :RunTestCb test_core
 
 echo.
 if %ERRORS% EQU 0 (
@@ -33,16 +35,16 @@ set NAME=%~1
 set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.ll --emit-exe %OUT%\%NAME%.exe
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
     set /a ERRORS+=1
     exit /b
 )
 
-%LLI% %OUT%\%NAME%.ll
+%OUT%\%NAME%.exe
 if %ERRORLEVEL% neq 0 (
-    echo FAILED: lli returned error %ERRORLEVEL% for %NAME%.ll
+    echo FAILED: %NAME%.exe returned error %ERRORLEVEL%
     set /a ERRORS+=1
     exit /b
 )
@@ -55,16 +57,16 @@ set NAME=%~1
 set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.ll --emit-exe %OUT%\%NAME%.exe
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
     set /a ERRORS+=1
     exit /b
 )
 
-%LLI% %OUT%\%NAME%.ll
+%OUT%\%NAME%.exe
 if %ERRORLEVEL% neq 0 (
-    echo FAILED: lli returned error %ERRORLEVEL% for %NAME%.ll
+    echo FAILED: %NAME%.exe returned error %ERRORLEVEL%
     set /a ERRORS+=1
     exit /b
 )

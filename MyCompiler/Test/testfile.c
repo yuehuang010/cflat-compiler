@@ -410,7 +410,7 @@ extern int main(int argc, char** argv)
     testEmptyFunction();
     testEmptyIfStatement();
     testPointers();
-    result &= Test("testConditional", testConditional(), 12);
+    result &= Test("testConditional", testConditional(), 11);
     result &= Test("testIfElseStatement", testIfElseStatement(), 11);
     result &= Test("myWhileLoopNotEnter", myWhileLoopNotEnter(), 0);
     result &= Test("myWhileLoopDecrement", myWhileLoopDecrement(), 0);

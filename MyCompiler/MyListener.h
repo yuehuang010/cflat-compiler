@@ -29,6 +29,33 @@ static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)
     return jump->Return() != nullptr && jump->compoundStatement() != nullptr;
 }
 
+inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
+{
+    if (opId->New())          return "operator new";
+    if (opId->Delete())       return "operator delete";
+    if (opId->String())       return "operator string";
+    if (opId->Plus())         return "operator+";
+    if (opId->Minus())        return "operator-";
+    if (opId->Star())         return "operator*";
+    if (opId->Div())          return "operator/";
+    if (opId->Mod())          return "operator%";
+    if (opId->Equal())        return "operator==";
+    if (opId->NotEqual())     return "operator!=";
+    if (opId->Less())         return "operator<";
+    if (opId->LessEqual())    return "operator<=";
+    if (opId->Greater())      return "operator>";
+    if (opId->GreaterEqual()) return "operator>=";
+    if (opId->LeftBracket())  return "operator[]";
+    return "";
+}
+
+inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m)
+{
+    if (auto* opId = m->operatorFunctionId())
+        return getOperatorName(opId);
+    return m->directDeclarator()->getText();
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -116,22 +143,7 @@ private:
     std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
-        {
-            if (opId->New())          return "operator new";
-            if (opId->Delete())       return "operator delete";
-            if (opId->String())       return "operator string";
-            if (opId->Plus())         return "operator+";
-            if (opId->Minus())        return "operator-";
-            if (opId->Star())         return "operator*";
-            if (opId->Div())          return "operator/";
-            if (opId->Mod())          return "operator%";
-            if (opId->Equal())        return "operator==";
-            if (opId->NotEqual())     return "operator!=";
-            if (opId->Less())         return "operator<";
-            if (opId->LessEqual())    return "operator<=";
-            if (opId->Greater())      return "operator>";
-            if (opId->GreaterEqual()) return "operator>=";
-        }
+            return ::getOperatorName(opId);
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
     }
@@ -208,7 +220,7 @@ private:
         {
             MyCompilerLLVM::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
-            m.Name = method->directDeclarator()->getText();
+            m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
                 m.Parameters.push_back(p);
@@ -374,23 +386,22 @@ private:
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
-    // Generic struct templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CFlatParser::StructClassUnionDefinitionContext*> genericStructTemplates;
-    std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
-    // Set of already-instantiated mangled names (e.g. "Box__int") to avoid re-instantiation
-    std::unordered_set<std::string> instantiatedGenerics;
+    // Generic template state is shared across all MyListener instances so that
+    // templates declared in an imported file remain visible when the importing
+    // file needs to instantiate them.
+    static inline std::unordered_map<std::string, CFlatParser::StructClassUnionDefinitionContext*> genericStructTemplates;
+    static inline std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
+    static inline std::unordered_set<std::string> instantiatedGenerics;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
 
-    // Generic interface templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
-    std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
-    std::unordered_set<std::string> instantiatedInterfaces;
+    static inline std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
+    static inline std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
+    static inline std::unordered_set<std::string> instantiatedInterfaces;
 
-    // Generic function templates: maps base name -> (AST context, type param names)
-    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*> genericFunctionTemplates;
-    std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
-    std::unordered_set<std::string> instantiatedGenericFunctions;
+    static inline std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*> genericFunctionTemplates;
+    static inline std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
+    static inline std::unordered_set<std::string> instantiatedGenericFunctions;
 
     // Queue for pending generic instantiations (delayed until safe to emit code)
     struct PendingInstantiation
@@ -399,7 +410,7 @@ private:
         std::vector<std::string> typeArgs;
         std::string mangledName;
     };
-    std::vector<PendingInstantiation> pendingInstantiations;
+    static inline std::vector<PendingInstantiation> pendingInstantiations;
 
     constexpr static bool debugPrint = false;
 
@@ -486,22 +497,7 @@ private:
     std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     {
         if (auto* opId = ctx->operatorFunctionId())
-        {
-            if (opId->New())          return "operator new";
-            if (opId->Delete())       return "operator delete";
-            if (opId->String())       return "operator string";
-            if (opId->Plus())         return "operator+";
-            if (opId->Minus())        return "operator-";
-            if (opId->Star())         return "operator*";
-            if (opId->Div())          return "operator/";
-            if (opId->Mod())          return "operator%";
-            if (opId->Equal())        return "operator==";
-            if (opId->NotEqual())     return "operator!=";
-            if (opId->Less())         return "operator<";
-            if (opId->LessEqual())    return "operator<=";
-            if (opId->Greater())      return "operator>";
-            if (opId->GreaterEqual()) return "operator>=";
-        }
+            return ::getOperatorName(opId);
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
     }
@@ -558,7 +554,7 @@ public:
         {
             MyCompilerLLVM::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
-            m.Name = method->directDeclarator()->getText();
+            m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
@@ -597,7 +593,7 @@ public:
         {
             MyCompilerLLVM::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
-            m.Name = method->directDeclarator()->getText();
+            m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
@@ -1730,23 +1726,39 @@ public:
             return compiler->CreateLoad(resultAlloca);
         }
 
-        auto expressionFalse = ctx->expression();
-        auto expressionTrue = ctx->conditionalExpression();
+        // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
+        // — so `expression` is the TRUE branch and `conditionalExpression` is the FALSE branch.
+        auto expressionTrueCtx = ctx->expression();
+        auto expressionFalseCtx = ctx->conditionalExpression();
 
         if (logicCtx != nullptr)
         {
             auto expression = ParseLogicalOrExpression(logicCtx);
 
             // Both expression should exist or not exist.
-            if ((expressionFalse != nullptr) != (expressionTrue != nullptr))
+            if ((expressionFalseCtx != nullptr) != (expressionTrueCtx != nullptr))
             {
                 LogErrorContext(ctx, "Conditional expression requires both true and false branches.");
                 return nullptr;
             }
-            else if (expressionFalse != nullptr && (expressionTrue != nullptr))
+            else if (expressionFalseCtx != nullptr && (expressionTrueCtx != nullptr))
             {
-                auto falseValue = ParseExpression(expressionFalse);
-                auto trueValue = ParseConditionalExpression(expressionTrue);
+                auto trueValue = ParseExpression(expressionTrueCtx);
+                auto falseValue = ParseConditionalExpression(expressionFalseCtx);
+
+                // Align branch types so LLVM select has matching operand types.
+                if (falseValue && trueValue && falseValue->getType() != trueValue->getType())
+                {
+                    auto* ft = falseValue->getType();
+                    auto* tt = trueValue->getType();
+                    if (ft->isIntegerTy() && tt->isIntegerTy())
+                    {
+                        unsigned fb = ft->getIntegerBitWidth();
+                        unsigned tb = tt->getIntegerBitWidth();
+                        if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
+                        else         trueValue  = compiler->Upconvert(trueValue,  ft);
+                    }
+                }
 
                 auto selectValue = compiler->CreateSelect(expression, falseValue, trueValue);
                 return selectValue;
@@ -2444,6 +2456,11 @@ public:
         llvm::Type* elemType = compiler->GetType(typeInfo);
 
         // Compute allocation size
+        if (!elemType || !elemType->isSized())
+        {
+            LogErrorContext(ctx, std::format("'new': cannot compute size of unsized or unresolved type '{}'", typeName));
+            return {};
+        }
         llvm::Value* sizeVal = compiler->GetTypeSizeBytes(elemType);
         if (isArray)
         {
@@ -2862,6 +2879,47 @@ public:
 
                         auto expressCtx = dynamic_cast<CFlatParser::ExpressionContext*>(ruleContext);
                         auto rvalue = ParseExpression(expressCtx);
+
+                        // If the base is a struct value with a user-defined operator[],
+                        // dispatch to it (member call with 'this' as first arg).
+                        if (rvalue && !namedVar.TypeAndValue.Pointer
+                            && structVar.BaseType && structVar.BaseType->isStructTy()
+                            && Compiler(ctx)->GetFunction("operator[]"))
+                        {
+                            MyCompilerLLVM::NamedVariable thisNV = structVar;
+                            thisNV.TypeAndValue.VariableName = "";
+                            if (!thisNV.TypeAndValue.Pointer && thisNV.Storage == nullptr && thisNV.Primary != nullptr)
+                            {
+                                auto* temp = Compiler(ctx)->CreateAlloca(structVar.BaseType);
+                                Compiler(ctx)->CreateAssignment(thisNV.Primary, temp);
+                                thisNV.Storage = temp;
+                            }
+
+                            MyCompilerLLVM::NamedVariable idxNV;
+                            idxNV.Primary  = rvalue;
+                            idxNV.BaseType = rvalue->getType();
+
+                            auto* result = Compiler(ctx)->CreateOverloadedFunctionCall("operator[]", { thisNV, idxNV });
+                            if (result)
+                            {
+                                namedVar.Primary  = result;
+                                namedVar.Storage  = nullptr;
+                                namedVar.BaseType = result->getType();
+                                namedVar.TypeAndValue = {};
+                                if (result->getType()->isStructTy())
+                                {
+                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(result->getType()))
+                                        if (!st->isLiteral() && st->hasName())
+                                            namedVar.TypeAndValue.TypeName = st->getName().str();
+                                    structVar = namedVar;
+                                }
+                                else
+                                {
+                                    structVar = {};
+                                }
+                                break;
+                            }
+                        }
 
                         if (!(rvalue && rvalue->getType()->isIntegerTy()))
                         {
@@ -3814,8 +3872,14 @@ public:
             auto templateIt = genericStructTemplates.find(pending.templateName);
             if (templateIt == genericStructTemplates.end())
             {
+                if (Compiler()->IsVerbose())
+                    std::cout << "[verbose]   skip instantiation '" << pending.mangledName
+                              << "': template '" << pending.templateName << "' not found\n";
                 continue; // not a generic template
             }
+
+            if (Compiler()->IsVerbose())
+                std::cout << "[verbose]   instantiate generic: " << pending.mangledName << "\n";
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
 
@@ -3860,15 +3924,23 @@ public:
             return;
         }
 
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     parse decl list: " << structName << "\n";
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
 
         auto declList = ParseDeclarationList(declarationList);
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
 
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     create struct type: " << structName << "\n";
         auto structType = compiler->CreateStructType(structName, declList);
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     create default ctor: " << structName << "\n";
         MyCompilerLLVM::TypeAndValue returnType{
             .TypeName = structName,
         };
@@ -3947,12 +4019,49 @@ public:
         // Parse member functions
         auto functionList = ctx->functionDefinition();
 
+        // For generic instantiations, pre-declare all member function signatures
+        // so they can forward-reference each other. (Non-generic structs already
+        // get this via ForwardRefScanner::ScanStructDefinition.)
+        if (!nameOverride.empty())
+        {
+            for (auto func : functionList)
+            {
+                if (IsReturnBlockFunction(func)) continue;
+                if (func->genericTypeParameters() != nullptr) continue;
+
+                std::string funcName = getFunctionName(func);
+                bool isOperatorFunc = (funcName == "operator new"
+                                    || funcName == "operator delete"
+                                    || funcName == "operator string");
+                std::string declName = isOperatorFunc ? (structName + "." + funcName) : funcName;
+
+                auto declReturnType = this->getFunctionReturnType(func);
+                auto* declParamList = func->parameterTypeList();
+                auto declParams = this->ParseParameterTypeList(declParamList);
+                bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
+
+                if (!isOperatorFunc)
+                {
+                    MyCompilerLLVM::DeclTypeAndValue thisParam;
+                    thisParam.TypeName = structName;
+                    thisParam.VariableName = structName + "__";
+                    thisParam.Pointer = true;
+                    declParams.insert(declParams.begin(), thisParam);
+                }
+
+                std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs);
+            }
+        }
+
         {
             bool savedScope = global_scope;
             for (auto func : functionList)
             {
                 global_scope = false;
                 std::string funcName = getFunctionName(func);
+                if (compiler->IsVerbose())
+                    std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
                 if (funcName == "operator new" || funcName == "operator delete")
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 else

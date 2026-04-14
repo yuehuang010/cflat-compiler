@@ -1,38 +1,3 @@
-extern void printf(const char* argv, ...);
-extern void* malloc(i64 size);
-extern void free(void* ptr);
-extern i32 strlen(const char* s);
-extern i32 sprintf(char* buf, const char* fmt, ...);
-
-interface IReadOnlyString
-{
-    i8* data();
-    i32 length();
-};
-
-using string = IReadOnlyString;
-
-interface IString
-{
-    string ToString();
-};
-
-string operator string(IString* s)
-{
-    return s->ToString();
-}
-
-void* operator new(long long size)
-{
-    // custom global allocator
-    return malloc(size);
-}
-
-void operator delete(void* ptr)
-{
-    free(ptr);
-}
-
 int Test(const char* testName, i64 actual, i64 expected)
 {
     if (expected == actual)
@@ -75,7 +40,7 @@ bool testBuiltinIdentifiers()
     bool result = true;
     result &= TestStr("__FILE__", __FILE__, "testfile2.c");
     result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 78); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 43); // Remember to adjust if shifted.
     return result;
 }
 

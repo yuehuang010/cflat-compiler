@@ -1,0 +1,96 @@
+// list<T> — mutable growable array (similar to vector<T>).
+// Supports any value type T.
+
+interface IEnumerable<T>
+{
+    int count();
+    T   get(int index);
+};
+
+interface IList<T>
+{
+    int  count();
+    T    get(int index);
+    T    operator[](int index);
+    void set(int index, T value);
+    void add(T value);
+    void removeAt(int index);
+    void clear();
+};
+
+struct list<T>
+{
+    T*  _data     = nullptr;
+    int _size     = 0;
+    int _capacity = 0;
+
+    void _grow()
+    {
+        int newCap = _capacity == 0 ? 4 : _capacity * 2;
+        T* newData = new T[newCap];
+        int i = 0;
+        while (i < _size)
+        {
+            newData[i] = _data[i];
+            i++;
+        }
+        if (_data != nullptr) delete[] _data;
+        _data = newData;
+        _capacity = newCap;
+    }
+
+    // Append a value to the end.
+    void add(T value)
+    {
+        if (_size >= _capacity) _grow();
+        _data[_size] = value;
+        _size++;
+    }
+
+    // Read the element at index.
+    T get(int index)
+    {
+        return _data[index];
+    }
+
+    // Overwrite the element at index.
+    void set(int index, T value)
+    {
+        _data[index] = value;
+    }
+
+    // Remove the element at index, shifting subsequent elements left.
+    void removeAt(int index)
+    {
+        int i = index;
+        while (i < _size - 1)
+        {
+            _data[i] = _data[i + 1];
+            i++;
+        }
+        _size--;
+    }
+
+    // Number of elements currently in the list.
+    int count()
+    {
+        return _size;
+    }
+
+    // Reset the element count to zero without freeing the buffer.
+    void clear()
+    {
+        _size = 0;
+    }
+
+    // l[index] — same semantics as get(index).
+    T operator[](int index)
+    {
+        return _data[index];
+    }
+
+    ~list()
+    {
+        if (_data != nullptr) delete[] _data;
+    }
+};

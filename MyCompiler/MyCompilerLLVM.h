@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <cstdlib>
 
+#pragma warning(push)
+#pragma warning(disable: 4244 4267)
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\Intrinsics.h>
 #include <llvm\IR\LLVMContext.h>
@@ -23,8 +25,11 @@
 #include <llvm\Target\TargetMachine.h>
 #include <llvm\MC\TargetRegistry.h>
 #include <llvm\TargetParser\Host.h>
+#pragma warning(pop)
 #include <antlr4-runtime.h>
 #include <CFlatParser.h>
+#include <CFlatLexer.h>
+#include <fstream>
 #include "ArgParser.h"
 
 class MyCompilerLLVM
@@ -37,6 +42,7 @@ public:
         Subtract,
         Multiply,
         Divide,
+        Modulo, // %
         Equal, // ==
         NotEqual, // !=
         Greater, // >
@@ -302,6 +308,18 @@ public:
     std::unordered_set<std::string> importedFiles;
     std::string importSearchDir;
     std::string runtimeDir;
+    bool verbose = false;
+    // Keep imported parse state alive: generic template ctx pointers point into
+    // these ANTLR parse trees and are accessed later during main-file instantiation.
+    struct ImportedParseState
+    {
+        std::unique_ptr<std::ifstream> stream;
+        std::unique_ptr<antlr4::ANTLRInputStream> input;
+        std::unique_ptr<CFlatLexer> lexer;
+        std::unique_ptr<antlr4::CommonTokenStream> tokens;
+        std::unique_ptr<CFlatParser> parser;
+    };
+    std::vector<ImportedParseState> importedParseStates;
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
@@ -887,6 +905,7 @@ private:
         else if (operationText == "*") { return Operation::Multiply; }
         else if (operationText == "-") { return Operation::Subtract; }
         else if (operationText == "/") { return Operation::Divide; }
+        else if (operationText == "%") { return Operation::Modulo; }
         else if (operationText == "==") { return Operation::Equal; }
         else if (operationText == "!=") { return Operation::NotEqual; }
         else if (operationText == ">") { return Operation::Greater; }
@@ -1866,6 +1885,10 @@ public:
             {
                 return builder->CreateFDiv(left, right);
             }
+            case Operation::Modulo:
+            {
+                return builder->CreateFRem(left, right);
+            }
             case Operation::Equal:
             {
                 return builder->CreateFCmp(llvm::ICmpInst::FCMP_OEQ, left, right);
@@ -1915,6 +1938,10 @@ public:
             case Operation::Divide:
             {
                 return builder->CreateSDiv(left, right);
+            }
+            case Operation::Modulo:
+            {
+                return builder->CreateSRem(left, right);
             }
             case Operation::Equal:
             {
@@ -2683,8 +2710,24 @@ public:
 
             if (functionArguments.size() > 0)
             {
-                const auto& memberStructName = functionArguments.begin()->first;
-                const auto& memberStructInstance = functionArguments.begin()->second.Storage;
+                // The implicit `this` parameter is named "<StructName>__" (trailing
+                // double-underscore). functionArgument is a std::map sorted by key,
+                // so `begin()` is not guaranteed to be `this` — find it explicitly.
+                auto thisIt = functionArguments.end();
+                for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
+                {
+                    const auto& key = it->first;
+                    if (key.size() >= 2 && key.substr(key.size() - 2) == "__")
+                    {
+                        thisIt = it;
+                        break;
+                    }
+                }
+                if (thisIt == functionArguments.end())
+                    return {};
+
+                const auto& memberStructName = thisIt->first;
+                const auto& memberStructInstance = thisIt->second.Storage;
                 auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
                 auto findResult = dataStructures.find(truncName);
                 if (findResult != dataStructures.end())
@@ -3076,6 +3119,8 @@ public:
     }
 
     void SetRuntimeDir(const std::string& dir) { runtimeDir = dir; }
+    void SetVerbose(bool v) { verbose = v; }
+    bool IsVerbose() const { return verbose; }
 
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);

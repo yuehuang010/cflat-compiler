@@ -1,0 +1,203 @@
+import "list.cb";
+import "hashset.cb";
+import "dictionary.cb";
+
+int TestBool(const char* name, bool actual, bool expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+int TestInt(const char* name, int actual, int expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+// ── list<int> ────────────────────────────────────────────────────────────────
+
+int testList()
+{
+    int passed = 0;
+
+    list<int> l;
+
+    // add and count
+    l.add(10);
+    l.add(20);
+    l.add(30);
+    passed += TestInt("list count after 3 adds", l.count(), 3);
+
+    // get
+    passed += TestInt("list get 0", l.get(0), 10);
+    passed += TestInt("list get 1", l.get(1), 20);
+    passed += TestInt("list get 2", l.get(2), 30);
+
+    // operator[]
+    passed += TestInt("list op[] 0", l[0], 10);
+    passed += TestInt("list op[] 1", l[1], 20);
+    passed += TestInt("list op[] 2", l[2], 30);
+
+    // set
+    l.set(1, 99);
+    passed += TestInt("list set", l.get(1), 99);
+
+    // removeAt middle
+    l.set(1, 20);
+    l.removeAt(1);
+    passed += TestInt("list count after removeAt", l.count(), 2);
+    passed += TestInt("list after removeAt[0]",   l.get(0), 10);
+    passed += TestInt("list after removeAt[1]",   l.get(1), 30);
+
+    // clear
+    l.clear();
+    passed += TestInt("list count after clear", l.count(), 0);
+
+    // growth past initial capacity (forces _grow)
+    int i = 0;
+    while (i < 20)
+    {
+        l.add(i);
+        i++;
+    }
+    passed += TestInt("list count after 20 adds", l.count(), 20);
+    passed += TestInt("list growth get[0]",  l.get(0),  0);
+    passed += TestInt("list growth get[19]", l.get(19), 19);
+
+    return passed;
+}
+
+// ── hashset<int> ─────────────────────────────────────────────────────────────
+
+int testHashset()
+{
+    int passed = 0;
+
+    hashset<int> s;
+
+    // add new elements
+    passed += TestBool("hashset add 1",   s.add(1),   true);
+    passed += TestBool("hashset add 2",   s.add(2),   true);
+    passed += TestBool("hashset add 42",  s.add(42),  true);
+    passed += TestInt ("hashset count 3", s.count(),  3);
+
+    // contains
+    passed += TestBool("hashset contains 1",  s.contains(1),  true);
+    passed += TestBool("hashset contains 42", s.contains(42), true);
+    passed += TestBool("hashset contains 99", s.contains(99), false);
+
+    // duplicate add returns false
+    passed += TestBool("hashset dup add 1",  s.add(1),  false);
+    passed += TestInt ("hashset count unchanged", s.count(), 3);
+
+    // remove
+    passed += TestBool("hashset remove 2",         s.remove(2),      true);
+    passed += TestBool("hashset contains 2 after", s.contains(2),    false);
+    passed += TestInt ("hashset count after remove", s.count(),       2);
+    passed += TestBool("hashset remove missing",   s.remove(999),    false);
+
+    // re-add after remove
+    passed += TestBool("hashset re-add 2", s.add(2), true);
+    passed += TestBool("hashset contains 2 re-added", s.contains(2), true);
+
+    // trigger rehash by adding many elements
+    hashset<int> big;
+    int i = 0;
+    while (i < 50)
+    {
+        big.add(i);
+        i++;
+    }
+    passed += TestInt("hashset big count", big.count(), 50);
+    passed += TestBool("hashset big contains 0",  big.contains(0),  true);
+    passed += TestBool("hashset big contains 49", big.contains(49), true);
+    passed += TestBool("hashset big contains 50", big.contains(50), false);
+
+    return passed;
+}
+
+// ── dictionary<int,int> ──────────────────────────────────────────────────────
+
+int testDictionary()
+{
+    int passed = 0;
+
+    dictionary<int, int> d;
+
+    // add new entries
+    passed += TestBool("dict add 1=>100",  d.add(1,  100), true);
+    passed += TestBool("dict add 2=>200",  d.add(2,  200), true);
+    passed += TestBool("dict add 42=>99",  d.add(42, 99),  true);
+    passed += TestInt ("dict count 3",     d.count(),       3);
+
+    // contains / get
+    passed += TestBool("dict contains 1",  d.contains(1),  true);
+    passed += TestBool("dict contains 42", d.contains(42), true);
+    passed += TestBool("dict contains 99", d.contains(99), false);
+    passed += TestInt ("dict get 1",       d.get(1),       100);
+    passed += TestInt ("dict get 2",       d.get(2),       200);
+    passed += TestInt ("dict get 42",      d.get(42),      99);
+    passed += TestInt ("dict get missing", d.get(999),     0);
+
+    // duplicate add leaves existing value alone
+    passed += TestBool("dict dup add 1",   d.add(1, 555),  false);
+    passed += TestInt ("dict get 1 after dup", d.get(1),   100);
+
+    // set overwrites
+    d.set(1, 111);
+    passed += TestInt ("dict get 1 after set", d.get(1),   111);
+    d.set(5, 500); // set on new key inserts
+    passed += TestBool("dict contains 5",  d.contains(5), true);
+    passed += TestInt ("dict get 5",       d.get(5),       500);
+    passed += TestInt ("dict count 4",     d.count(),       4);
+
+    // remove
+    passed += TestBool("dict remove 2",            d.remove(2),     true);
+    passed += TestBool("dict contains 2 after",    d.contains(2),   false);
+    passed += TestInt ("dict count after remove",  d.count(),        3);
+    passed += TestBool("dict remove missing",      d.remove(999),    false);
+
+    // remaining keys still reachable after swap-remove
+    passed += TestInt ("dict get 1 after remove",  d.get(1),        111);
+    passed += TestInt ("dict get 42 after remove", d.get(42),        99);
+    passed += TestInt ("dict get 5 after remove",  d.get(5),        500);
+
+    // re-add after remove
+    passed += TestBool("dict re-add 2",        d.add(2, 222),   true);
+    passed += TestInt ("dict get 2 re-added",  d.get(2),         222);
+
+    // operator[] — same semantics as get()
+    passed += TestInt ("dict op[] 1",       d[1],            111);
+    passed += TestInt ("dict op[] 42",      d[42],            99);
+    passed += TestInt ("dict op[] missing", d[999],            0);
+
+    // bulk inserts to force hashset rehash underneath
+    dictionary<int, int> big;
+    int i = 0;
+    while (i < 50)
+    {
+        big.add(i, i * 10);
+        i++;
+    }
+    passed += TestInt ("dict big count",     big.count(),      50);
+    passed += TestInt ("dict big get 0",     big.get(0),        0);
+    passed += TestInt ("dict big get 49",    big.get(49),     490);
+    passed += TestBool("dict big contains 0",  big.contains(0),  true);
+    passed += TestBool("dict big contains 50", big.contains(50), false);
+
+    return passed;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    passed += testList();
+    passed += testHashset();
+    passed += testDictionary();
+    printf("\n%d checks passed.\n", passed);
+    return 0;
+}
