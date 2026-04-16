@@ -21,11 +21,11 @@ _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 
     ArgParser args;
     args.addPositional("filename", "Source file to compile");
-    args.addOption("output", 'o', "Output IR file path", ".\\out.ll");
+    args.addOption("output", 'o', "Output native executable path (.exe)");
+    args.addOption("out-lli", 'l', "Output LLVM IR file path (.ll)");
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
-    args.addOption("emit-exe", 'e', "Output native executable path (.exe)");
     args.addOption("platform", 'p', "Target platform: x64 (default) or x86", "x64");
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
 

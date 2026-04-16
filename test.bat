@@ -35,7 +35,7 @@ set NAME=%~1
 set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.ll --emit-exe %OUT%\%NAME%.exe
+%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
     set /a ERRORS+=1
@@ -57,7 +57,7 @@ set NAME=%~1
 set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.ll --emit-exe %OUT%\%NAME%.exe
+%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
     set /a ERRORS+=1

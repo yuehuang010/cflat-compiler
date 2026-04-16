@@ -17,21 +17,30 @@ msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
 ## Running
 
 ```bash
-# Compile a source file
-x64/Debug/MyCompiler.exe input.cb -o out.ll
+# Compile to native executable
+x64/Debug/MyCompiler.exe input.cb -o out.exe
+
+# Also dump LLVM IR alongside the exe
+x64/Debug/MyCompiler.exe input.cb -o out.exe --out-lli out.ll
 
 # With options
-MyCompiler.exe input.cb -o output.ll -b output.bc -g -i import-dir/
+MyCompiler.exe input.cb -o out.exe -b out.bc -g -i import-dir/
 
-# Execute the generated IR
+# Execute IR directly (skip -o, dump IR with --out-lli, run via lli)
+x64/Debug/MyCompiler.exe input.cb --out-lli out.ll
 lli.exe out.ll
 ```
 
+The compiler automatically locates `runtime.cb` in the same directory as the executable. Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
+
 **CLI flags** (see `ArgParser.h`):
-- `-o / --output`: Output IR file (default: `.\out.ll`)
+- `-o / --output`: Output native executable path (.exe)
+- `-l / --out-lli`: Output LLVM IR file path (.ll)
 - `-b / --bitcode`: Output LLVM bitcode file (.bc)
 - `-g / --debug-info`: Emit DWARF debug information
 - `-i / --import-dir`: Directory to search for imported modules
+- `-p / --platform`: Target platform — `x64` (default) or `x86`
+- `-v / --verbose`: Print detailed diagnostic messages during compilation
 
 ## Running Tests
 
@@ -39,13 +48,13 @@ lli.exe out.ll
 test.bat
 ```
 
-Runs the compiler against test files in `MyCompiler/Test/` and validates output using LLVM's `lli.exe` interpreter.
+Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` via `--emit-exe` and checks the exit code. Test files include both `.c` (C-compatible) and `.cb` (CFlat) variants.
 
 To run a single test manually:
 
 ```bash
-x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out.ll
-lli.exe out.ll
+x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out/test_operators.exe --out-lli out/test_operators.ll
+out\test_operators.exe
 ```
 
 ## Architecture

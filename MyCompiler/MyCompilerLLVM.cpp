@@ -20,7 +20,8 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
     importedFiles.insert(std::filesystem::weakly_canonical(filename).string());
-    auto outputPath = args.getOption("output").value_or(".\\out.ll");
+    auto exePath = args.getOption("output");
+    auto lliPath = args.getOption("out-lli");
     auto bitcodePath = args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
     importSearchDir = args.getOption("import-dir").value_or("");
@@ -28,17 +29,31 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     if (verbose)
     {
         std::cout << "[verbose] input:        " << filename << "\n";
-        std::cout << "[verbose] output:       " << outputPath << "\n";
+        std::cout << "[verbose] output exe:   " << (exePath ? *exePath : "(none)") << "\n";
+        std::cout << "[verbose] output lli:   " << (lliPath ? *lliPath : "(none)") << "\n";
         std::cout << "[verbose] runtime dir:  " << runtimeDir << "\n";
         std::cout << "[verbose] import dir:   " << (importSearchDir.empty() ? "(none)" : importSearchDir) << "\n";
         std::cout << "[verbose] debug info:   " << (debugInfo ? "yes" : "no") << "\n";
     }
 
-    auto outputDir = std::filesystem::path(outputPath).parent_path();
-    if (!outputDir.empty() && !std::filesystem::exists(outputDir))
+    if (exePath)
     {
-        std::cerr << "Error: output directory '" << outputDir.string() << "' does not exist (-o " << outputPath << ").\n";
-        return false;
+        auto exeDir = std::filesystem::path(*exePath).parent_path();
+        if (!exeDir.empty() && !std::filesystem::exists(exeDir))
+        {
+            std::cerr << "Error: output directory '" << exeDir.string() << "' does not exist (-o " << *exePath << ").\n";
+            return false;
+        }
+    }
+
+    if (lliPath)
+    {
+        auto lliDir = std::filesystem::path(*lliPath).parent_path();
+        if (!lliDir.empty() && !std::filesystem::exists(lliDir))
+        {
+            std::cerr << "Error: output directory '" << lliDir.string() << "' does not exist (--out-lli " << *lliPath << ").\n";
+            return false;
+        }
     }
 
     if (!std::filesystem::exists(filename))
@@ -146,11 +161,14 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         }
     }
 
-    if (verbose) std::cout << "[verbose] writing IR to " << outputPath << "\n";
-    if (!SaveToFile(outputPath))
+    if (lliPath)
     {
-        std::cerr << "Error: failed to save IR to '" << outputPath << "'.\n";
-        return false;
+        if (verbose) std::cout << "[verbose] writing IR to " << *lliPath << "\n";
+        if (!SaveToFile(*lliPath))
+        {
+            std::cerr << "Error: failed to save IR to '" << *lliPath << "'.\n";
+            return false;
+        }
     }
 
     if (verbose) std::cout << "[verbose] verifying module\n";
@@ -170,7 +188,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         }
     }
 
-    if (auto exePath = args.getOption("emit-exe"))
+    if (exePath)
     {
         if (verbose) std::cout << "[verbose] emitting executable to " << *exePath << "\n";
         if (!EmitExecutable(*exePath, args.getOption("platform").value_or("x64")))
