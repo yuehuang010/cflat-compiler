@@ -2765,11 +2765,24 @@ public:
             if (functionArguments.empty())
                 continue;
 
-            const auto& firstArgName = functionArguments.begin()->first;
-            if (firstArgName.size() < 2 || firstArgName.substr(firstArgName.size() - 2) != "__")
+            // Find the implicit 'this' arg — its name ends with "__" (the struct
+            // name followed by "__"). functionArgument is a std::map (sorted
+            // alphabetically), so we can't rely on begin() here.
+            auto thisIt = functionArguments.end();
+            for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
+            {
+                const auto& argName = it->first;
+                if (argName.size() >= 2 && argName.substr(argName.size() - 2) == "__")
+                {
+                    thisIt = it;
+                    break;
+                }
+            }
+            if (thisIt == functionArguments.end())
                 break;
 
-            std::string structName = firstArgName.substr(0, firstArgName.size() - 2);
+            const auto& thisArgName = thisIt->first;
+            std::string structName = thisArgName.substr(0, thisArgName.size() - 2);
 
             auto funcIt = functionTable.find(functionName);
             if (funcIt == functionTable.end())
@@ -2781,7 +2794,7 @@ public:
                     sym.Parameters[0].TypeName == structName &&
                     sym.Parameters[0].Pointer)
                 {
-                    NamedVariable thisVar = functionArguments.begin()->second;
+                    NamedVariable thisVar = thisIt->second;
                     thisVar.TypeAndValue.VariableName = "";
                     return thisVar;
                 }

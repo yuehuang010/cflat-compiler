@@ -683,49 +683,7 @@ bool testDefault()
 // 'string' is a user-defined alias for IReadOnlyString (fat pointer).
 // =============================================================
 
-struct StringData : IReadOnlyString
-{
-    i8* buf;
-    i32 len;
-
-    i8* data() { return buf; }
-    i32 length() { return len; }
-
-    ~StringData()
-    {
-        delete[] buf;
-    }
-};
-
-StringData* MakeStringData(char* s, i32 n)
-{
-    StringData* sd = new StringData();
-    sd->len = n;
-    sd->buf = new i8[n + 1];
-    for (int i = 0; i < n; i++)
-    {
-        sd->buf[i] = s[i];
-    }
-    sd->buf[n] = 0;
-    return sd;
-}
-
-string operator string(char* s)
-{
-    StringData* sd = MakeStringData(s, strlen(s));
-    string result = sd;
-    return result;
-}
-
-string operator string(i32 n)
-{
-    char* buf = malloc(32);
-    i32 len = sprintf(buf, "%d", n);
-    StringData* sd = MakeStringData(buf, len);
-    free(buf);
-    string result = sd;
-    return result;
-}
+// operator string(char*) and operator string(i32) are now provided by core/string.cb.
 
 bool testStringType()
 {

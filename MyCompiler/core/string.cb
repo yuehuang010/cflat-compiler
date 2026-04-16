@@ -1,0 +1,165 @@
+// Core string types.
+//
+// IReadOnlyString is the fat-pointer contract for any readable string:
+//   i8* data()   — pointer to the underlying bytes (null-terminated)
+//   i32 length() — number of bytes, not counting the terminator
+//
+// `string` is a type alias for IReadOnlyString, so every struct that
+// implements data()/length() can be passed wherever a `string` is expected.
+
+interface IReadOnlyString
+{
+    i8* data();
+    i32 length();
+};
+
+using string = IReadOnlyString;
+
+interface IString
+{
+    string ToString();
+};
+
+// Any IString value becomes a string by calling ToString().
+string operator string(IString* s)
+{
+    return s->ToString();
+}
+
+// ── stringdata ───────────────────────────────────────────────────────────────
+// Heap-owned immutable string value. Copies its input buffer and owns it.
+struct stringdata : IReadOnlyString
+{
+    i8* _buf = nullptr;
+    i32 _len = 0;
+
+    i8* data()   { return _buf; }
+    i32 length() { return _len; }
+
+    ~stringdata()
+    {
+        if (_buf != nullptr) delete[] _buf;
+    }
+};
+
+// Copy the first `n` bytes of `s` into a freshly allocated, null-terminated
+// stringdata.  Ownership of the buffer is transferred to the stringdata.
+stringdata* MakeStringData(const char* s, i32 n)
+{
+    stringdata* sd = new stringdata();
+    sd->_len = n;
+    sd->_buf = new i8[n + 1];
+    int i = 0;
+    while (i < n)
+    {
+        sd->_buf[i] = s[i];
+        i++;
+    }
+    sd->_buf[n] = 0;
+    return sd;
+}
+
+// Convert a C string to a `string` by wrapping it in a stringdata.
+string operator string(char* s)
+{
+    stringdata* sd = MakeStringData(s, strlen(s));
+    string result = sd;
+    return result;
+}
+
+// Convert a 32-bit integer to a `string` using sprintf.
+string operator string(i32 n)
+{
+    char* buf = malloc(32);
+    i32 len = sprintf(buf, "%d", n);
+    stringdata* sd = MakeStringData(buf, len);
+    free(buf);
+    string result = sd;
+    return result;
+}
+
+// ── stringbuilder ────────────────────────────────────────────────────────────
+// Mutable, growable string buffer.  Implements IReadOnlyString directly so a
+// stringbuilder can be passed anywhere a `string` is expected.
+struct stringbuilder : IReadOnlyString
+{
+    i8* _data     = nullptr;
+    i32 _length   = 0;
+    i32 _capacity = 0;
+
+    void _ensure(i32 needed)
+    {
+        if (_capacity >= needed) return;
+        i32 newCap = needed * 2;
+        if (newCap < 16) newCap = 16;
+        i8* newData = new i8[newCap];
+        int i = 0;
+        while (i < _length)
+        {
+            newData[i] = _data[i];
+            i++;
+        }
+        newData[_length] = 0;
+        if (_data != nullptr) delete[] _data;
+        _data = newData;
+        _capacity = newCap;
+    }
+
+    // IReadOnlyString
+    i8* data()   { return _data; }
+    i32 length() { return _length; }
+
+    // Append the contents of another string.
+    void append(string s)
+    {
+        i8* src = s.data();
+        i32 addLen = s.length();
+        i32 newLen = _length + addLen;
+        _ensure(newLen + 1);
+        int i = 0;
+        while (i < addLen)
+        {
+            _data[_length + i] = src[i];
+            i++;
+        }
+        _data[newLen] = 0;
+        _length = newLen;
+    }
+
+    // Append a raw C string.
+    void appendCStr(const char* s)
+    {
+        i32 addLen = strlen(s);
+        i32 newLen = _length + addLen;
+        _ensure(newLen + 1);
+        int i = 0;
+        while (i < addLen)
+        {
+            _data[_length + i] = s[i];
+            i++;
+        }
+        _data[newLen] = 0;
+        _length = newLen;
+    }
+
+    // Append a single character.
+    void appendChar(i8 c)
+    {
+        _ensure(_length + 2);
+        _data[_length] = c;
+        _length++;
+        _data[_length] = 0;
+    }
+
+    // Reset length to zero without freeing the buffer.
+    void clear()
+    {
+        _length = 0;
+        if (_data != nullptr) _data[0] = 0;
+    }
+
+    ~stringbuilder()
+    {
+        if (_data != nullptr) delete[] _data;
+    }
+};
