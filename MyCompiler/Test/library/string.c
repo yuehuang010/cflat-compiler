@@ -22,7 +22,7 @@ interface IString : IReadonlyString
     void Free();
 };
 
-struct String : IString
+class String : IString
 {
     char* _data = 0;
     int _length = 0;
@@ -125,7 +125,7 @@ struct String : IString
     }
 };
 
-struct StringView : IReadonlyString
+class StringView : IReadonlyString
 {
     const char* _data = 0;
     int _length = 0;

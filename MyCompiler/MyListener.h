@@ -230,7 +230,7 @@ private:
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
     }
 
-    void ScanStructDefinition(CFlatParser::StructClassUnionDefinitionContext* ctx, const std::string& namespaceName = {})
+    void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
@@ -264,6 +264,40 @@ private:
         }
     }
 
+    void ScanClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& namespaceName = {})
+    {
+        auto* compiler = Compiler(ctx);
+        // Generic template definitions are not pre-declared; they are instantiated on demand.
+        if (ctx->genericTypeParameters() != nullptr)
+            return;
+
+        std::string className = ctx->directDeclarator()->getText();
+        if (!namespaceName.empty())
+            className = namespaceName + "." + className;
+
+        // Register opaque struct so the type is known for pointer/field use
+        compiler->CreateStructType(className, {});
+
+        // Pre-declare default constructor
+        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = className };
+        compiler->CreateFunctionDeclaration(className, returnType, {});
+
+        // Pre-declare member functions
+        for (auto func : ctx->functionDefinition())
+            ScanFunctionDefinition(func, className);
+
+        // Pre-declare destructor
+        for (auto dtor : ctx->destructorDefinition())
+        {
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = className;
+            thisParam.VariableName = className + "__";
+            thisParam.Pointer = true;
+            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
+            compiler->CreateFunctionDeclaration("~" + className, voidReturn, { thisParam });
+        }
+    }
+
 public:
     ForwardRefScanner(MyCompilerLLVM* compiler) : compilerLLVM(compiler) {}
 
@@ -280,9 +314,14 @@ public:
 
             // Skip generic template definitions entirely — their bodies contain
             // unbound type parameters (e.g. T) that are not valid type names.
-            if (auto* structDef = dynamic_cast<CFlatParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            if (auto* structDef = dynamic_cast<CFlatParser::StructDefinitionContext*>(ruleCtx))
             {
                 if (structDef->genericTypeParameters() != nullptr)
+                    continue;
+            }
+            if (auto* classDef = dynamic_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx))
+            {
+                if (classDef->genericTypeParameters() != nullptr)
                     continue;
             }
 
@@ -349,8 +388,10 @@ public:
             ScanNamespace(ns, namespaceName);
         else if (auto func = ctx->functionDefinition())
             ScanFunctionDefinition(func, {}, namespaceName);
-        else if (auto dataStruct = ctx->structClassUnionDefinition())
+        else if (auto dataStruct = ctx->structDefinition())
             ScanStructDefinition(dataStruct, namespaceName);
+        else if (auto classDef = ctx->classDefinition())
+            ScanClassDefinition(classDef, namespaceName);
         else if (auto iface = ctx->interfaceDefinition())
             ScanInterfaceDefinition(iface);
         else if (auto usingDecl = ctx->usingDeclaration())
@@ -389,7 +430,8 @@ private:
     // Generic template state is shared across all MyListener instances so that
     // templates declared in an imported file remain visible when the importing
     // file needs to instantiate them.
-    static inline std::unordered_map<std::string, CFlatParser::StructClassUnionDefinitionContext*> genericStructTemplates;
+    static inline std::unordered_map<std::string, CFlatParser::StructDefinitionContext*> genericStructTemplates;
+    static inline std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*> genericClassTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
     static inline std::unordered_set<std::string> instantiatedGenerics;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
@@ -732,7 +774,8 @@ public:
     void ParseExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         auto func = ctx->functionDefinition();
-        auto dataStruct = ctx->structClassUnionDefinition();
+        auto dataStruct = ctx->structDefinition();
+        auto classDef = ctx->classDefinition();
         auto decl = ctx->declaration();
         auto iface = ctx->interfaceDefinition();
         auto ns = ctx->namespaceDefinition();
@@ -762,7 +805,11 @@ public:
         }
         else if (dataStruct != nullptr)
         {
-            ParseStructClassUnionDefinition(dataStruct, {}, namespaceName);
+            ParseStructDefinition(dataStruct, {}, namespaceName);
+        }
+        else if (classDef != nullptr)
+        {
+            ParseClassDefinition(classDef, {}, namespaceName);
         }
 
         // Process any generic instantiations queued while parsing the above item.
@@ -3775,10 +3822,15 @@ public:
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
             if (!ruleCtx) continue;
 
-            // Skip generic template struct definition bodies (contain unbound T)
-            if (auto* structDef = dynamic_cast<CFlatParser::StructClassUnionDefinitionContext*>(ruleCtx))
+            // Skip generic template struct/class definition bodies (contain unbound T)
+            if (auto* structDef = dynamic_cast<CFlatParser::StructDefinitionContext*>(ruleCtx))
             {
                 if (structDef->genericTypeParameters() != nullptr)
+                    continue;
+            }
+            if (auto* classDef = dynamic_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx))
+            {
+                if (classDef->genericTypeParameters() != nullptr)
                     continue;
             }
 
@@ -3869,8 +3921,9 @@ public:
             pendingInstantiations.pop_back();
 
             // Now safe to instantiate
-            auto templateIt = genericStructTemplates.find(pending.templateName);
-            if (templateIt == genericStructTemplates.end())
+            auto structIt = genericStructTemplates.find(pending.templateName);
+            auto classIt = genericClassTemplates.find(pending.templateName);
+            if (structIt == genericStructTemplates.end() && classIt == genericClassTemplates.end())
             {
                 if (Compiler()->IsVerbose())
                     std::cout << "[verbose]   skip instantiation '" << pending.mangledName
@@ -3888,13 +3941,16 @@ public:
             for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
                 activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
 
-            ParseStructClassUnionDefinition(templateIt->second, pending.mangledName);
+            if (structIt != genericStructTemplates.end())
+                ParseStructDefinition(structIt->second, pending.mangledName);
+            else
+                ParseClassDefinition(classIt->second, pending.mangledName);
 
             activeTypeSubstitutions = savedSubst;
         }
     }
 
-    void ParseStructClassUnionDefinition(CFlatParser::StructClassUnionDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
+    void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
         auto decl = ctx->directDeclarator();
@@ -4081,13 +4137,197 @@ public:
             global_scope = savedScope;
         }
 
+        // Structs cannot implement interfaces — only classes can.
+        compiler->RegisterStructInterfaces(structName, {});
+
+        // Process any generic instantiations that were queued during this struct definition
+        // ProcessPendingInstantiations();
+    }
+
+    void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
+    {
+        auto* compiler = Compiler(ctx);
+        auto decl = ctx->directDeclarator();
+        std::string baseName = decl->getText();
+        std::string structName;
+
+        // Apply nameOverride first (for generic instantiations), then namespace
+        if (!nameOverride.empty())
+        {
+            structName = nameOverride;
+        }
+        else if (!namespaceName.empty())
+        {
+            structName = namespaceName + "." + baseName;
+        }
+        else
+        {
+            structName = baseName;
+        }
+
+        // If this is a generic template definition (not an instantiation), store it and return.
+        if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
+        {
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
+            genericClassTemplates[structName] = ctx;
+            genericStructTypeParams[structName] = typeParams;
+            return;
+        }
+
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     parse decl list: " << structName << "\n";
+        auto declarationList = ctx->declaration();
+        std::vector<llvm::Type*> types;
+
+        auto declList = ParseDeclarationList(declarationList);
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
+
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     create struct type: " << structName << "\n";
+        auto structType = compiler->CreateStructType(structName, declList);
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     create default ctor: " << structName << "\n";
+        MyCompilerLLVM::TypeAndValue returnType{
+            .TypeName = structName,
+        };
+        // Create default constructor
+        {
+            auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
+
+            std::vector<llvm::Value*> initilizers;
+            for (auto& typeValue : declList)
+            {
+                auto initilizer = typeValue.Initializer;
+                llvm::Value* rvalue = nullptr;
+                if (initilizer != nullptr)
+                {
+                    auto assignmentExpression = initilizer->assignmentExpression();
+                    if (assignmentExpression != nullptr)
+                    {
+                        rvalue = ParseAssignmentExpression(assignmentExpression);
+                        if (typeValue.TypeName == "auto")
+                        {
+                            typeValue.TypeName = rvalue->getType()->getStructName();
+                            structType = compiler->CreateStructType(structName, declList);
+                        }
+                    }
+                    else if (initilizer->Default() != nullptr)
+                    {
+                        rvalue = GenerateDefaultValue(typeValue);
+                    }
+                }
+                else
+                {
+                    std::cout << "Uninitialize field \"" << structName << "::" << typeValue.VariableName << "\".\n";
+                }
+
+                initilizers.push_back(rvalue);
+            }
+
+            llvm::Value* structVal = llvm::UndefValue::get(structType);
+
+            MyCompilerLLVM::TypeAndValue myStruct;
+            myStruct.TypeName = structName;
+            myStruct.VariableName = "_" + structName;
+
+            unsigned int structIndex = 0;
+
+            for (auto rvalue : initilizers)
+            {
+                if (rvalue != nullptr)
+                {
+                    auto* destType = structType->getTypeAtIndex(structIndex);
+                    rvalue = compiler->Upconvert(rvalue, destType);
+                    if (rvalue->getType() != destType && destType->isStructTy())
+                    {
+                        std::string fieldTypeName = declList[structIndex].TypeName;
+                        if (compiler->GetFunction(fieldTypeName))
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                        else
+                            rvalue = llvm::Constant::getNullValue(destType);
+                    }
+                    structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
+                }
+
+                structIndex++;
+            }
+
+            compiler->CreateReturnCall(structVal);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // Parse member functions
+        auto functionList = ctx->functionDefinition();
+
+        // For generic instantiations, pre-declare all member function signatures
+        // so they can forward-reference each other.
+        if (!nameOverride.empty())
+        {
+            for (auto func : functionList)
+            {
+                if (IsReturnBlockFunction(func)) continue;
+                if (func->genericTypeParameters() != nullptr) continue;
+
+                std::string funcName = getFunctionName(func);
+                bool isOperatorFunc = (funcName == "operator new"
+                                    || funcName == "operator delete"
+                                    || funcName == "operator string");
+                std::string declName = isOperatorFunc ? (structName + "." + funcName) : funcName;
+
+                auto declReturnType = this->getFunctionReturnType(func);
+                auto* declParamList = func->parameterTypeList();
+                auto declParams = this->ParseParameterTypeList(declParamList);
+                bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
+
+                if (!isOperatorFunc)
+                {
+                    MyCompilerLLVM::DeclTypeAndValue thisParam;
+                    thisParam.TypeName = structName;
+                    thisParam.VariableName = structName + "__";
+                    thisParam.Pointer = true;
+                    declParams.insert(declParams.begin(), thisParam);
+                }
+
+                std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs);
+            }
+        }
+
+        {
+            bool savedScope = global_scope;
+            for (auto func : functionList)
+            {
+                global_scope = false;
+                std::string funcName = getFunctionName(func);
+                if (compiler->IsVerbose())
+                    std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
+                if (funcName == "operator new" || funcName == "operator delete")
+                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                else
+                    ParseFunctionDefinition(func, structName);
+            }
+            global_scope = savedScope;
+        }
+
+        // Parse destructor
+        {
+            bool savedScope = global_scope;
+            for (auto dtor : ctx->destructorDefinition())
+            {
+                global_scope = false;
+                ParseDestructorDefinition(dtor, structName);
+            }
+            global_scope = savedScope;
+        }
+
         // Record interfaces and verify implementations
         std::vector<std::string> ifaceNames;
         for (auto* genId : ctx->genericIdentifier())
         {
             if (!genId->Identifier()) continue;
-            std::string baseName = genId->Identifier()->getText();
-            std::string ifaceName = baseName;
+            std::string ifaceBaseName = genId->Identifier()->getText();
+            std::string ifaceName = ifaceBaseName;
 
             if (genId->genericTypeParameters() != nullptr)
             {
@@ -4102,15 +4342,15 @@ public:
                     concreteTypeArgs.push_back(typeArg);
                 }
 
-                ifaceName = MangledGenericName(baseName, concreteTypeArgs);
+                ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
 
                 // Build substitution map for the interface template's type params
                 std::unordered_map<std::string, std::string> ifaceSubstitutions;
-                const auto& ifaceTypeParams = genericInterfaceTypeParams[baseName];
+                const auto& ifaceTypeParams = genericInterfaceTypeParams[ifaceBaseName];
                 for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
                     ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
 
-                InstantiateGenericInterface(baseName, ifaceName, ifaceSubstitutions);
+                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions);
             }
 
             ifaceNames.push_back(ifaceName);
@@ -4119,7 +4359,7 @@ public:
         for (const auto& interfaceName : ifaceNames)
             compiler->VerifyInterfaceImplementation(structName, interfaceName);
 
-        // Process any generic instantiations that were queued during this struct definition
+        // Process any generic instantiations that were queued during this class definition
         // ProcessPendingInstantiations();
     }
 

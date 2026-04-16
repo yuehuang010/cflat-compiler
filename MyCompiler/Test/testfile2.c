@@ -784,7 +784,7 @@ int testNewWithConstructor()
     return 123;
 }
 
-struct Point : IString
+class Point : IString
 {
     i32 x = 0;
     i32 y = 0;

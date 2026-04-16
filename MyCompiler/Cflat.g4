@@ -488,7 +488,8 @@ translationUnit
     ;
 
 externalDeclaration
-    : structClassUnionDefinition
+    : classDefinition
+    | structDefinition
     | functionDefinition
     | interfaceDefinition
     | declaration
@@ -514,8 +515,13 @@ functionDefinition
     : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' compoundStatement
     ;
 
-structClassUnionDefinition
-    : declarationSpecifiers? directDeclarator genericTypeParameters? (':' genericIdentifier (',' genericIdentifier)* | genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+structDefinition
+    : 'struct' directDeclarator genericTypeParameters? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    | 'union' directDeclarator genericTypeParameters? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    ;
+
+classDefinition
+    : Class directDeclarator genericTypeParameters? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 genericIdentifier

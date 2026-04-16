@@ -28,7 +28,7 @@ string operator string(IString* s)
 
 // ── stringdata ───────────────────────────────────────────────────────────────
 // Heap-owned immutable string value. Copies its input buffer and owns it.
-struct stringdata : IReadOnlyString
+class stringdata : IReadOnlyString
 {
     i8* _buf = nullptr;
     i32 _len = 0;
@@ -81,7 +81,7 @@ string operator string(i32 n)
 // ── stringbuilder ────────────────────────────────────────────────────────────
 // Mutable, growable string buffer.  Implements IReadOnlyString directly so a
 // stringbuilder can be passed anywhere a `string` is expected.
-struct stringbuilder : IReadOnlyString
+class stringbuilder : IReadOnlyString
 {
     i8* _data     = nullptr;
     i32 _length   = 0;

@@ -190,13 +190,13 @@ interface IScalable
     int Scale(int factor);
 };
 
-struct Counter : IReadable
+class Counter : IReadable
 {
     int count = 10;
     int Read() { return count; }
 };
 
-struct ScaledValue : IReadable, IScalable
+class ScaledValue : IReadable, IScalable
 {
     int value = 3;
     int Read() { return value; }
@@ -236,7 +236,7 @@ struct MyInt
 };
 
 // Generic struct template with type parameter T implementing Container<T>
-struct Storage<T> : Container<T>
+class Storage<T> : Container<T>
 {
     T data = default;
 

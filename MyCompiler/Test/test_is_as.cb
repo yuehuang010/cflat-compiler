@@ -5,13 +5,13 @@ interface IShape
     int Area();
 };
 
-struct Circle : IShape
+class Circle : IShape
 {
     int radius = 0;
     int Area() { return radius * radius; }
 };
 
-struct Square : IShape
+class Square : IShape
 {
     int side = 0;
     int Area() { return side * side; }
