@@ -679,8 +679,8 @@ bool testDefault()
 
 // =============================================================
 // string type tests
-// IReadOnlyString: i8* data(); i32 length()
-// 'string' is a user-defined alias for IReadOnlyString (fat pointer).
+// string is a built-in value type: { i8* _ptr, i32 _len }
+// with data() -> i8* and length() -> i32 member functions.
 // =============================================================
 
 // operator string(char*) and operator string(i32) are now provided by core/string.cb.
@@ -702,8 +702,7 @@ bool testStringType()
 }
 
 // Tests the built-in string literal syntax: string s = "...";
-// A string literal is automatically wrapped in the built-in __StrLit struct
-// which implements IReadOnly via data() -> i8* and length() -> i32.
+// A string literal is automatically wrapped in a string struct { _ptr, _len }.
 bool testStringLiteral()
 {
     bool result = true;

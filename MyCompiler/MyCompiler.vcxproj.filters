@@ -33,13 +33,20 @@
       <Filter>Source Files</Filter>
     </None>
     <None Include="testfile3.c" />
-    <None Include="runtime.cb" />
+    <None Include="core\runtime.cb" />
+    <None Include="core\string.cb" />
+    <None Include="core\list.cb" />
+    <None Include="core\hashset.cb" />
+    <None Include="core\dictionary.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ArgParser.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CompilerManager.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

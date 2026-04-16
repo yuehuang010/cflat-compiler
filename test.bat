@@ -20,6 +20,7 @@ call :RunTest test_library_string -i %LIB%
 call :RunTestCb test_operators
 call :RunTestCb test_is_as
 call :RunTestCb test_core
+call :RunTestCb test_core_string
 
 echo.
 if %ERRORS% EQU 0 (

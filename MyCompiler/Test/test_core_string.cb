@@ -1,0 +1,146 @@
+import "string.cb";
+
+int TestBool(const char* name, bool actual, bool expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+int TestInt(const char* name, int actual, int expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+extern int strcmp(const char* a, const char* b);
+
+int TestStr(const char* name, const char* actual, const char* expected)
+{
+    if (strcmp(actual, expected) == 0) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected '%s' got '%s').\n", name, expected, actual);
+    return 0;
+}
+
+// ── string / stringbuilder ────────────────────────────────────────────────────
+
+int testString()
+{
+    int passed = 0;
+
+    // String literal → `string` value type { _ptr, _len }
+    string s = "hello";
+    passed += TestInt("string literal length", s.length(), 5);
+    passed += TestStr("string literal data",   s.data(),   "hello");
+
+    // Empty string literal
+    string empty = "";
+    passed += TestInt("empty string length", empty.length(), 0);
+
+    // stringbuilder — build up a string incrementally
+    stringbuilder sb;
+    passed += TestInt("sb initial length", sb.length(), 0);
+
+    sb.appendCStr("foo");
+    passed += TestInt("sb after appendCStr length", sb.length(), 3);
+    passed += TestStr("sb after appendCStr data",   sb.data(),   "foo");
+
+    sb.appendChar('!');
+    passed += TestInt("sb after appendChar length", sb.length(), 4);
+    passed += TestStr("sb after appendChar data",   sb.data(),   "foo!");
+
+    string view = sb.toString();
+    passed += TestInt("sb toString length", view.length(), 4);
+    passed += TestStr("sb toString data",   view.data(),   "foo!");
+
+    sb.clear();
+    passed += TestInt("sb after clear length", sb.length(), 0);
+
+    return passed;
+}
+
+// ── string operator+ ─────────────────────────────────────────────────────────
+
+int testStringConcat()
+{
+    int passed = 0;
+
+    string a = "hello";
+    string b = " world";
+
+    // string + string
+    string c = a + b;
+    passed += TestInt("concat length",  c.length(), 11);
+    passed += TestStr("concat data",    c.data(),   "hello world");
+
+    // string + const char*
+    string d = a + " there";
+    passed += TestInt("concat char* length", d.length(), 11);
+    passed += TestStr("concat char* data",   d.data(),   "hello there");
+
+    // chained: (a + b) + b  →  "hello world world"
+    string e = c + b;
+    passed += TestInt("chained concat length", e.length(), 17);
+    passed += TestStr("chained concat data",   e.data(),   "hello world world");
+
+    // empty string left operand
+    string empty = "";
+    string f = empty + a;
+    passed += TestInt("empty + s length", f.length(), 5);
+    passed += TestStr("empty + s data",   f.data(),   "hello");
+
+    // empty string right operand
+    string g = a + empty;
+    passed += TestInt("s + empty length", g.length(), 5);
+    passed += TestStr("s + empty data",   g.data(),   "hello");
+
+    return passed;
+}
+
+// ── string + IString ─────────────────────────────────────────────────────────
+
+class Greeting : IString
+{
+    string ToString()
+    {
+        string s = "world";
+        return s;
+    }
+};
+
+int testStringIString()
+{
+    int passed = 0;
+
+    string prefix = "hello ";
+    Greeting g;
+
+    string result = prefix + g;
+    passed += TestInt("istring concat length", result.length(), 11);
+    passed += TestStr("istring concat data",   result.data(),   "hello world");
+
+    // chained: literal + IString
+    string result2 = "goodbye " + g;
+    passed += TestInt("istring literal concat length", result2.length(), 13);
+    passed += TestStr("istring literal concat data",   result2.data(),   "goodbye world");
+
+    return passed;
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    int r;
+
+    r = testString();        passed += r; total += 11;
+    r = testStringConcat();  passed += r; total += 10;
+    r = testStringIString(); passed += r; total += 4;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

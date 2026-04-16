@@ -888,6 +888,26 @@ function parseDocumentSymbols(text: string): Map<string, SymbolInfo> {
         }
     }
 
+    // --- Inject built-in types ---
+    // Only add a built-in symbol if the document does not define it itself.
+    for (const [name, info] of BUILTIN_TYPE_SYMBOLS) {
+        if (!symbols.has(name)) {
+            symbols.set(name, info);
+        }
+    }
+
+    // --- Propagate built-in type members to variables ---
+    // For variables whose typeName resolves to a built-in type, copy the members
+    // so that member-access completion works (e.g. `s.` for a `string s`).
+    for (const [, info] of symbols) {
+        if ((info.kind === 'variable' || info.kind === 'function') && info.typeName && !info.members) {
+            const typeInfo = symbols.get(info.typeName);
+            if (typeInfo?.kind === 'type' && typeInfo.members) {
+                info.members = typeInfo.members;
+            }
+        }
+    }
+
     return symbols;
 }
 
@@ -1035,7 +1055,9 @@ const KEYWORD_DOCS: Record<string, string> = {
     'restrict':     '**restrict** *(qualifier)*\n\nPointer qualifier asserting that the pointed-to memory is not aliased.',
     'thread_local': '**thread_local** *(storage class)*\n\nEach thread has its own independent copy of the variable.',
     'auto':         '**auto** *(type inference)*\n\nInfer the variable type from its initializer.\n\n```c\nauto x = 42;      // int\nauto p = getPoint(); // Point\n```',
-    'string':       '**string** *(type)*\n\nBuilt-in reference-counted string type (`IReadOnlyString` fat pointer).\n\nSupports **format string** syntax — any `{expr}` inside a string literal is interpolated at runtime:\n\n```c\nstring s = "Hello, {name}! You have {count} items.";\n```\n\nNon-string expressions are coerced via `operator string`.',
+    'string':       '**string** *(built-in value type)*\n\nBuilt-in value type `{ i8* _ptr, i32 _len }`. String literals are automatically wrapped into a `string` by the compiler.\n\n**Members:**\n- `i8* data()` — pointer to the null-terminated bytes\n- `i32 length()` — number of bytes (not counting the null terminator)\n\n**Operators:**\n- `string operator+(string b)` — concatenate two strings (allocates a new buffer)\n- `string operator+(const char* b)` — concatenate with a raw C string\n\nSupports **format string** syntax — any `{expr}` inside a string literal is interpolated at runtime:\n\n```c\nstring s = "Hello, {name}! You have {count} items.";\n```\n\nNon-string expressions are coerced via `operator string`.',
+    'stringbuilder': '**stringbuilder** *(struct)*\n\nMutable, growable string buffer defined in `core/string.cb`.\n\n**Members:**\n- `i8* data()` — pointer to the current buffer\n- `i32 length()` — current length in bytes\n- `string toString()` — return a `string` view over the current buffer (do not free the builder while the string is in use)\n- `void append(string s)` — append a `string` value\n- `void appendCStr(const char* s)` — append a raw C string\n- `void appendChar(i8 c)` — append a single character\n- `void clear()` — reset length to zero without freeing\n\n```c\nstringbuilder sb;\nsb.appendCStr("hello");\nsb.appendChar(\'!\');\nstring s = sb.toString();\n```',
+    'IString':      '**IString** *(interface)*\n\nInterface for types that can be converted to a `string`.\n\n**Members:**\n- `string ToString()` — convert to a `string` value\n\nImplementors can be passed anywhere a `string operator string(IString* s)` conversion is accepted.',
     'alignas':      '**alignas** *(C11 alignment)*\n\nSpecify the alignment requirement of a variable or struct member.\n\n```c\nalignas(16) float vec[4];\nalignas(int) char buf[sizeof(int)];\n```',
     'stdcall':      '**stdcall** *(calling convention)*\n\nWindows x86 calling convention. The callee cleans the stack.\n\n```c\nvoid stdcall myFunc(int x);\n```',
     '?.': '**?.** *(null-conditional operator)*\n\nAccess a member or call a method only if the object is non-null. Returns zero/null if the object is null.\n\n```c\nint v = node?.value;       // field access\nint r = node?.Read();      // method call\n```',
@@ -1073,6 +1095,55 @@ const KEYWORD_DOCS: Record<string, string> = {
     'NULL':    '**NULL** *(constant)*\n\nNull pointer constant.',
     'nullptr': '**nullptr** *(constant)*\n\nNull pointer constant (C++ style alias).'
 };
+
+// ---------------------------------------------------------------------------
+// Built-in type symbols
+// Injected into every document's symbol table so member completion and hover
+// work for `string`, `stringbuilder`, and `IString` even when their definitions
+// are not present in the current file (they live in core/string.cb).
+// ---------------------------------------------------------------------------
+
+const BUILTIN_TYPE_SYMBOLS: Map<string, SymbolInfo> = new Map([
+    ['string', {
+        kind: 'type',
+        markdown: KEYWORD_DOCS['string'],
+        defLine: 0,
+        defChar: 0,
+        members: [
+            { name: 'data',   type: 'i8*', isMethod: true,  signature: 'i8* data()' },
+            { name: 'length', type: 'i32', isMethod: true,  signature: 'i32 length()' },
+            { name: '_ptr',   type: 'i8*', isMethod: false, signature: 'i8* _ptr' },
+            { name: '_len',   type: 'i32', isMethod: false, signature: 'i32 _len' },
+        ]
+    }],
+    ['stringbuilder', {
+        kind: 'type',
+        markdown: KEYWORD_DOCS['stringbuilder'],
+        defLine: 0,
+        defChar: 0,
+        members: [
+            { name: 'data',       type: 'i8*',    isMethod: true,  signature: 'i8* data()' },
+            { name: 'length',     type: 'i32',    isMethod: true,  signature: 'i32 length()' },
+            { name: 'toString',   type: 'string', isMethod: true,  signature: 'string toString()' },
+            { name: 'append',     type: 'void',   isMethod: true,  signature: 'void append(string s)' },
+            { name: 'appendCStr', type: 'void',   isMethod: true,  signature: 'void appendCStr(const char* s)' },
+            { name: 'appendChar', type: 'void',   isMethod: true,  signature: 'void appendChar(i8 c)' },
+            { name: 'clear',      type: 'void',   isMethod: true,  signature: 'void clear()' },
+            { name: '_data',      type: 'i8*',    isMethod: false, signature: 'i8* _data' },
+            { name: '_length',    type: 'i32',    isMethod: false, signature: 'i32 _length' },
+            { name: '_capacity',  type: 'i32',    isMethod: false, signature: 'i32 _capacity' },
+        ]
+    }],
+    ['IString', {
+        kind: 'type',
+        markdown: KEYWORD_DOCS['IString'],
+        defLine: 0,
+        defChar: 0,
+        members: [
+            { name: 'ToString', type: 'string', isMethod: true, signature: 'string ToString()' },
+        ]
+    }],
+]);
 
 // ---------------------------------------------------------------------------
 // Completion items

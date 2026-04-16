@@ -31,6 +31,7 @@
 #include <CFlatLexer.h>
 #include <fstream>
 #include "ArgParser.h"
+#include "CompilerManager.h"
 
 class MyCompilerLLVM
 {
@@ -459,14 +460,14 @@ private:
         return baseType;
     }
 
-    // Registers the built-in __StrLit struct that wraps a string literal as an IReadOnlyString fat pointer.
-    // __StrLit { i8* _ptr, i32 _len } implements IReadOnlyString via data() and length() methods.
-    void RegisterBuiltinStrLit()
+    // Registers the built-in `string` value type: { i8* _ptr, i32 _len }.
+    // data() returns _ptr; length() returns _len.  No vtable — direct struct access.
+    void RegisterBuiltinString()
     {
         auto* ptrTy = builder->getInt8Ty()->getPointerTo();
         auto* i32Ty = builder->getInt32Ty();
 
-        auto* strLitTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "__StrLit");
+        auto* strTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "string");
 
         DeclTypeAndValue ptrField;
         ptrField.TypeName = "i8";
@@ -477,42 +478,55 @@ private:
         lenField.TypeName = "i32";
         lenField.VariableName = "_len";
 
-        dataStructures["__StrLit"].StructType = strLitTy;
-        dataStructures["__StrLit"].StructFields = { ptrField, lenField };
-        dataStructures["__StrLit"].Interfaces = { "IReadOnlyString" };
+        dataStructures["string"].StructType = strTy;
+        dataStructures["string"].StructFields = { ptrField, lenField };
 
-        // Create __StrLit.data(__StrLit* self) -> i8*
+        // Create string() default constructor -> string{nullptr, 0}
         {
-            auto* fnTy = llvm::FunctionType::get(ptrTy, { strLitTy->getPointerTo() }, false);
-            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__StrLit.data", *module);
+            auto* fnTy = llvm::FunctionType::get(strTy, {}, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.ctor", *module);
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(llvm::ConstantAggregateZero::get(strTy));
+
+            FunctionSymbol sym;
+            sym.UniqueName = "string.ctor";
+            sym.Function = fn;
+            sym.ReturnType = TypeAndValue{ "string", "", false };
+            sym.Parameters = {};
+            functionTable["string"].push_back(sym);
+        }
+
+        // Create string.data(string self) -> i8*  [by value, extract field 0]
+        {
+            auto* fnTy = llvm::FunctionType::get(ptrTy, { strTy }, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.data", *module);
             fn->arg_begin()->setName("self");
             auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
             llvm::IRBuilder<> b(entry);
-            auto* gep = b.CreateStructGEP(strLitTy, fn->arg_begin(), 0);
-            b.CreateRet(b.CreateLoad(ptrTy, gep));
+            b.CreateRet(b.CreateExtractValue(&*fn->arg_begin(), { 0u }));
 
-            TypeAndValue selfParam{ "__StrLit", "self", true };
+            TypeAndValue selfParam{ "string", "self", false };
             FunctionSymbol sym;
-            sym.UniqueName = "__StrLit.data";
+            sym.UniqueName = "string.data";
             sym.Function = fn;
             sym.ReturnType = TypeAndValue{ "i8", "", true };
             sym.Parameters = { selfParam };
             functionTable["data"].push_back(sym);
         }
 
-        // Create __StrLit.length(__StrLit* self) -> i32
+        // Create string.length(string self) -> i32  [by value, extract field 1]
         {
-            auto* fnTy = llvm::FunctionType::get(i32Ty, { strLitTy->getPointerTo() }, false);
-            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__StrLit.length", *module);
+            auto* fnTy = llvm::FunctionType::get(i32Ty, { strTy }, false);
+            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.length", *module);
             fn->arg_begin()->setName("self");
             auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
             llvm::IRBuilder<> b(entry);
-            auto* gep = b.CreateStructGEP(strLitTy, fn->arg_begin(), 1);
-            b.CreateRet(b.CreateLoad(i32Ty, gep));
+            b.CreateRet(b.CreateExtractValue(&*fn->arg_begin(), { 1u }));
 
-            TypeAndValue selfParam{ "__StrLit", "self", true };
+            TypeAndValue selfParam{ "string", "self", false };
             FunctionSymbol sym;
-            sym.UniqueName = "__StrLit.length";
+            sym.UniqueName = "string.length";
             sym.Function = fn;
             sym.ReturnType = TypeAndValue{ "i32", "", false };
             sym.Parameters = { selfParam };
@@ -528,13 +542,13 @@ private:
         auto* i32Ty    = builder->getInt32Ty();
         auto* i32PtrTy = i32Ty->getPointerTo();
         auto* i64Ty    = builder->getInt64Ty();
-        auto* fatTy    = GetFatPtrType();
+        auto* strTy    = llvm::StructType::getTypeByName(*context, "string");
 
         auto* mallocTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
         auto* mallocFn = llvm::dyn_cast<llvm::Function>(
             module->getOrInsertFunction("malloc", mallocTy).getCallee());
 
-        auto* fnTy = llvm::FunctionType::get(fatTy, { ptrPtrTy, i32PtrTy, i32Ty }, false);
+        auto* fnTy = llvm::FunctionType::get(strTy, { ptrPtrTy, i32PtrTy, i32Ty }, false);
         auto* fn   = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__strconcat", *module);
         auto  argIt    = fn->arg_begin();
         auto* argPtrs  = &*argIt++;  argPtrs->setName("ptrs");
@@ -621,31 +635,20 @@ private:
             rb.CreateBr(cpyCond);
         }
 
-        // Null-terminate, heap-allocate __StrLit, return fat ptr
+        // Null-terminate the concatenated buffer, build and return a string struct by value.
         rb.SetInsertPoint(nullBB);
         {
             rb.CreateStore(rb.getInt8(0), rb.CreateLoad(ptrTy, dstA));
-            auto* strLitTy = llvm::StructType::getTypeByName(*context, "__StrLit");
-            auto* slSize   = llvm::ConstantExpr::getSizeOf(strLitTy);
-            auto* slSize64 = llvm::ConstantExpr::getTruncOrBitCast(slSize, i64Ty);
-            auto* slRaw    = rb.CreateCall(mallocFn, { slSize64 }, "slraw");
-            auto* slPtr    = rb.CreateBitCast(slRaw, strLitTy->getPointerTo(), "sl");
-            rb.CreateStore(rb.CreateLoad(ptrTy,  bufA),   rb.CreateStructGEP(strLitTy, slPtr, 0));
-            rb.CreateStore(rb.CreateLoad(i32Ty, totalA),  rb.CreateStructGEP(strLitTy, slPtr, 1));
-            auto* vtable = GetOrCreateVTable("__StrLit", "IReadOnlyString");
-            auto* fatTy = GetFatPtrType();
-            auto* vtablePtr = rb.CreateBitCast(vtable, ptrTy);
-            auto* dataPtr   = rb.CreateBitCast(slPtr,  ptrTy);
-            llvm::Value* fatVal = llvm::UndefValue::get(fatTy);
-            fatVal = rb.CreateInsertValue(fatVal, vtablePtr, { 0u });
-            fatVal = rb.CreateInsertValue(fatVal, dataPtr,   { 1u });
-            rb.CreateRet(fatVal);
+            llvm::Value* strVal = llvm::UndefValue::get(strTy);
+            strVal = rb.CreateInsertValue(strVal, rb.CreateLoad(ptrTy,  bufA),   { 0u });
+            strVal = rb.CreateInsertValue(strVal, rb.CreateLoad(i32Ty, totalA),  { 1u });
+            rb.CreateRet(strVal);
         }
 
         FunctionSymbol sym;
         sym.UniqueName = "__strconcat";
         sym.Function   = fn;
-        sym.ReturnType = TypeAndValue{ "IReadOnlyString", "", true, true };
+        sym.ReturnType = TypeAndValue{ "string", "", false, false };
         sym.Parameters = {
             TypeAndValue{ "i8",  "ptrs",  true,  false },
             TypeAndValue{ "i32", "lens",  true,  false },
@@ -660,12 +663,11 @@ private:
         module = std::make_unique<llvm::Module>("MyCompiler", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
 
-        // Pre-register __StrLit: a built-in struct wrapping a string literal as IReadOnlyString.
-        // IReadOnlyString must be defined in user code; __StrLit's vtable is built on demand.
-        RegisterBuiltinStrLit();
+        // Pre-register the built-in `string` value type { i8* _ptr, i32 _len }.
+        RegisterBuiltinString();
     }
 
-    // Called lazily from ParseFormatString after IReadOnlyString has been registered.
+    // Called lazily from ParseFormatString after string concat is first needed.
     void EnsureStrConcatRegistered()
     {
         if (strConcatRegistered) return;
@@ -927,14 +929,44 @@ private:
     }
 
 public:
-    MyCompilerLLVM() { Init(); }
+    MyCompilerLLVM()
+    {
+        Init();
+        CompilerManager::Instance().Register(this);
+    }
     ~MyCompilerLLVM()
     {
+        CompilerManager::Instance().Unregister(this);
+
         builder.release();
         module.release();
 
         // context is last to be released.
         context.release();
+    }
+
+    void DumpState() const
+    {
+        std::cerr << "  File: " << (sourceFileName.empty() ? "<unknown>" : sourceFileName) << "\n";
+        std::cerr << "  Location: " << currentLine << ":" << currentColumn << "\n";
+
+        if (currentFunction)
+            std::cerr << "  Function: " << currentFunction->getName().str() << "\n";
+        else
+            std::cerr << "  Function: <none>\n";
+
+        std::cerr << "  Scope depth: " << stackNamedVariable.size() << "\n";
+        if (!stackNamedVariable.empty())
+        {
+            const auto& top = stackNamedVariable.back();
+            std::cerr << "  Top scope locals:";
+            for (const auto& [name, _] : top.namedVariable)
+                std::cerr << " " << name;
+            std::cerr << "\n";
+        }
+
+        std::cerr << "  Structs registered: " << dataStructures.size() << "\n";
+        std::cerr << "  Functions registered: " << functionTable.size() << "\n";
     }
 
     void InitDebugInfo(const std::string& filename, const std::string& directory)
@@ -1116,7 +1148,7 @@ public:
             }
             else
             {
-                entries.push_back(llvm::ConstantExpr::getBitCast(fn, ptrTy));
+                entries.push_back(fn);
             }
         }
 
@@ -1151,12 +1183,12 @@ public:
         return stringLiteralLenByPtr.count(c) > 0;
     }
 
-    // Wraps a raw i8* string literal pointer in a __StrLit struct and returns an IReadOnlyString fat pointer.
+    // Wraps a raw i8* string literal pointer in a string struct { _ptr, _len } by value.
     // Called automatically when assigning a string literal to a string-typed variable.
-    llvm::Value* WrapStringLiteralAsIReadOnly(llvm::Value* strLitPtr)
+    llvm::Value* WrapStringLiteralAsString(llvm::Value* strLitPtr)
     {
-        auto* strLitTy = llvm::StructType::getTypeByName(*context, "__StrLit");
-        if (!strLitTy) return strLitPtr;
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (!strTy) return strLitPtr;
 
         int32_t len = 0;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(strLitPtr))
@@ -1166,14 +1198,10 @@ public:
                 len = it->second;
         }
 
-        auto* alloca = builder->CreateAlloca(strLitTy, nullptr, "strlitval");
-        auto* ptrField = builder->CreateStructGEP(strLitTy, alloca, 0);
-        builder->CreateStore(strLitPtr, ptrField);
-        auto* lenField = builder->CreateStructGEP(strLitTy, alloca, 1);
-        builder->CreateStore(builder->getInt32(len), lenField);
-
-        auto* vtable = GetOrCreateVTable("__StrLit", "IReadOnlyString");
-        return BuildInterfaceFatValue(vtable, alloca);
+        llvm::Value* strVal = llvm::UndefValue::get(strTy);
+        strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });
+        strVal = builder->CreateInsertValue(strVal, builder->getInt32(len), { 1u });
+        return strVal;
     }
 
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
@@ -1250,7 +1278,9 @@ public:
     /// Returns i64 sizeof(type) as a compile-time constant.
     llvm::Value* GetTypeSizeBytes(llvm::Type* type)
     {
-        return llvm::ConstantExpr::getSizeOf(type);
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t size = dl.getTypeAllocSize(type);
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), size);
     }
 
     void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
@@ -1431,7 +1461,17 @@ public:
         }
         else
         {
-            value = CreateCast(value, destType);
+            // When assigning a raw ptr (string literal) into a `string` struct variable,
+            // wrap it into the { _ptr, _len } struct instead of attempting an invalid bitcast.
+            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+            if (strTy && destType == strTy && value->getType()->isPointerTy() && value->getType() != strTy)
+            {
+                value = WrapStringLiteralAsString(value);
+            }
+            else
+            {
+                value = CreateCast(value, destType);
+            }
         }
         return builder->CreateStore(value, destination);
     }
@@ -1489,7 +1529,11 @@ public:
         {
             // Integer 0 assigned to a pointer field — produce a proper null/ptr constant.
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
-                return llvm::ConstantExpr::getIntToPtr(constInt, destType);
+            {
+                if (constInt->isZero())
+                    return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(destType));
+                return builder->CreateIntToPtr(constInt, destType);
+            }
             return builder->CreateIntToPtr(value, destType);
         }
 
@@ -1830,15 +1874,11 @@ public:
             return it->second;
 
         auto* gv = builder->CreateGlobalString(text, name);
-        auto* ptr = llvm::ConstantExpr::getInBoundsGetElementPtr(
-            gv->getValueType(), gv,
-            llvm::ArrayRef<llvm::Constant*>{
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 0),
-                llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), 0)
-        });
-        stringPool[text] = ptr;
-        stringLiteralLenByPtr[ptr] = (int32_t)text.size();
-        return ptr;
+        // In LLVM 18 opaque-pointer mode the GlobalVariable* is already a ptr —
+        // no ConstantExpr GEP needed.
+        stringPool[text] = gv;
+        stringLiteralLenByPtr[gv] = (int32_t)text.size();
+        return gv;
     }
 
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
@@ -2240,7 +2280,7 @@ public:
             if (it != enumBackingTypes.end())
                 resolvedTypeName = it->second;
         }
-        // Resolve user-defined type aliases (e.g. string → IReadOnlyString)
+        // Resolve user-defined type aliases
         if (!resolvedTypeName.empty())
         {
             auto it = typeAliases.find(resolvedTypeName);
@@ -2938,14 +2978,15 @@ public:
         else
         {
             auto* retTy = currentFunction->getReturnType();
-            // Wrap raw i8* string literals into IReadOnlyString fat ptr when needed
-            if (retTy == GetFatPtrType() && value->getType() != GetFatPtrType())
+            // Wrap raw i8* string literals into string struct when returning string
+            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+            if (strTy && retTy == strTy && value->getType() != strTy)
             {
                 auto* ptrTy = builder->getInt8Ty()->getPointerTo();
                 if (value->getType() == ptrTy)
                 {
                     if (auto* c = llvm::dyn_cast<llvm::Constant>(value); c && IsStringLiteralConstant(c))
-                        value = WrapStringLiteralAsIReadOnly(value);
+                        value = WrapStringLiteralAsString(value);
                     else if (GetFunction("operator string"))
                     {
                         NamedVariable argNV;
@@ -3138,3 +3179,18 @@ public:
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);
 };
+
+// Defined here so MyCompilerLLVM is fully declared before DumpState() is called.
+inline void CompilerManager::DumpAllState() const
+{
+    if (compilers_.empty())
+    {
+        std::cerr << "  (no compiler instances registered)\n";
+        return;
+    }
+    for (size_t i = 0; i < compilers_.size(); ++i)
+    {
+        std::cerr << "  [Compiler " << i << "]\n";
+        compilers_[i]->DumpState();
+    }
+}

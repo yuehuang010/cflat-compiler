@@ -104,7 +104,7 @@ private:
                 else
                 {
                     declType.TypeName = compiler->ResolveQualifiedName(typeSpec->getText());
-                    // Resolve type aliases (e.g. "string" → "IReadOnlyString")
+                    // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
                 }
                 declType.Pointer = declSpec->pointer() != nullptr;
@@ -510,7 +510,7 @@ private:
                         typeName = substIt->second;
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
-                    // Resolve type aliases (e.g. "string" → "IReadOnlyString")
+                    // Resolve type aliases (e.g. user-defined aliases)
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     declType.TypeName = typeName;
                 }
@@ -1567,17 +1567,17 @@ public:
                                     }
                                     right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
                                 }
-                                else if (typeAndValue.TypeName == "IReadOnlyString" &&
+                                else if (typeAndValue.TypeName == "string" &&
                                          right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
                                 {
                                     // A raw i8*/char* assigned to a string variable.
                                     // If it is a compile-time string literal constant (length known at
-                                    // compile time), wrap it directly in __StrLit on the caller's stack.
+                                    // compile time), wrap it directly in a string struct on the caller's stack.
                                     // Otherwise call user-defined operator string(char*) for runtime values.
                                     auto* c = llvm::dyn_cast<llvm::Constant>(right);
                                     if (c && compiler->IsStringLiteralConstant(c))
                                     {
-                                        right = compiler->WrapStringLiteralAsIReadOnly(right);
+                                        right = compiler->WrapStringLiteralAsString(right);
                                     }
                                     else if (compiler->GetFunction("operator string"))
                                     {
@@ -1590,7 +1590,7 @@ public:
                                     }
                                     else
                                     {
-                                        right = compiler->WrapStringLiteralAsIReadOnly(right);
+                                        right = compiler->WrapStringLiteralAsString(right);
                                     }
                                 }
                             }
@@ -2249,39 +2249,103 @@ public:
         antlr4::ParserRuleContext* ctx)
     {
         if (!lvalue) return nullptr;
+        auto* compiler = Compiler(ctx);
+
+        // If the LHS is a string literal (ptr to global constant), wrap it
+        // as a %string struct so operator+(string, ...) can match.
+        if (lvalue->getType()->isPointerTy())
+        {
+            if (auto* c = llvm::dyn_cast<llvm::Constant>(lvalue))
+            {
+                if (compiler->stringLiteralLenByPtr.count(c))
+                    lvalue = compiler->WrapStringLiteralAsString(lvalue);
+            }
+        }
+
         auto* ty = lvalue->getType();
         if (!ty->isStructTy()) return nullptr;
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         std::string typeName = structTy->getName().str();
 
-        auto* compiler = Compiler(ctx);
-        // Arithmetic operators in structs are stored as "operator+" (unqualified) with
-        // the struct pointer as first param — overload resolution picks the right one.
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
 
-        // Materialize a pointer to the struct value for the implicit 'this' parameter.
-        auto* tempAlloca = compiler->CreateAlloca(structTy);
-        compiler->CreateAssignment(lvalue, tempAlloca);
+        auto makeRightNV = [&]() {
+            MyCompilerLLVM::NamedVariable rightNV;
+            rightNV.Primary  = rvalue;
+            rightNV.BaseType = rvalue ? rvalue->getType() : nullptr;
+            if (rvalue && rvalue->getType()->isStructTy())
+            {
+                auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
+                if (!rst->isLiteral() && rst->hasName())
+                    rightNV.TypeAndValue.TypeName = rst->getName().str();
+            }
+            else if (rvalue && rvalue->getType()->isPointerTy())
+            {
+                // If the RHS is a string literal (ptr to global constant), wrap it
+                // as a %string struct so operator+(string, string) can match.
+                if (auto* c = llvm::dyn_cast<llvm::Constant>(rvalue))
+                {
+                    if (compiler->stringLiteralLenByPtr.count(c))
+                    {
+                        rightNV.Primary  = compiler->WrapStringLiteralAsString(rvalue);
+                        rightNV.BaseType = rightNV.Primary->getType();
+                        rightNV.TypeAndValue.TypeName = "string";
+                    }
+                }
+            }
+            return rightNV;
+        };
 
-        MyCompilerLLVM::NamedVariable thisNV;
-        thisNV.TypeAndValue.TypeName = typeName;
-        thisNV.TypeAndValue.Pointer  = true;
-        thisNV.Primary = tempAlloca;
-
-        MyCompilerLLVM::NamedVariable rightNV;
-        rightNV.Primary  = rvalue;
-        rightNV.BaseType = rvalue ? rvalue->getType() : nullptr;
-        // Infer TypeName for the right operand so overload matching uses the type-name path.
-        if (rvalue && rvalue->getType()->isStructTy())
+        // Determine whether to pass lvalue by pointer or by value by inspecting the
+        // registered candidates — check if any candidate's first param is a pointer to
+        // this struct type. If so use pointer dispatch; otherwise use value dispatch.
+        bool usePointer = false;
         {
-            auto* rst = llvm::cast<llvm::StructType>(rvalue->getType());
-            if (!rst->isLiteral() && rst->hasName())
-                rightNV.TypeAndValue.TypeName = rst->getName().str();
+            auto funcSym = compiler->functionTable.find(opName);
+            if (funcSym != compiler->functionTable.end())
+            {
+                for (const auto& candidate : funcSym->second)
+                {
+                    if (!candidate.Parameters.empty()
+                        && candidate.Parameters[0].TypeName == typeName
+                        && candidate.Parameters[0].Pointer)
+                    {
+                        usePointer = true;
+                        break;
+                    }
+                }
+            }
         }
 
-        return compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
+        if (usePointer)
+        {
+            // By-pointer dispatch: conventional user-defined struct operators (T* this).
+            auto* tempAlloca = compiler->CreateAlloca(structTy);
+            compiler->CreateAssignment(lvalue, tempAlloca);
+
+            MyCompilerLLVM::NamedVariable thisNV;
+            thisNV.TypeAndValue.TypeName = typeName;
+            thisNV.TypeAndValue.Pointer  = true;
+            thisNV.Primary = tempAlloca;
+
+            return compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+        }
+        else
+        {
+            // By-value dispatch: built-in value types like string whose operators
+            // are defined as operator+(T a, ...) rather than operator+(T* a, ...).
+            MyCompilerLLVM::NamedVariable thisNV;
+            thisNV.TypeAndValue.TypeName = typeName;
+            thisNV.TypeAndValue.Pointer  = false;
+            thisNV.Primary  = lvalue;
+            thisNV.BaseType = structTy;
+
+            return compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+        }
+
+        return nullptr;
     }
 
     llvm::Value* ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
@@ -2650,9 +2714,9 @@ public:
 
         MyCompilerLLVM::NamedVariable ret;
         ret.Primary = result;
-        ret.TypeAndValue.TypeName = "IReadOnlyString";
-        ret.TypeAndValue.IsInterface = true;
-        ret.TypeAndValue.Pointer = true;
+        ret.TypeAndValue.TypeName = "string";
+        ret.TypeAndValue.IsInterface = false;
+        ret.TypeAndValue.Pointer = false;
         return ret;
     }
 
@@ -2909,6 +2973,14 @@ public:
                         }
                         else if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                         {
+                            structVar = namedVar;
+                            interfaceVar = {};
+                        }
+                        else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
+                                 && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
+                        {
+                            // Opaque pointer to a known struct (e.g. string* a) — track as structVar
+                            // so member call dispatch can dereference it correctly.
                             structVar = namedVar;
                             interfaceVar = {};
                         }
@@ -3367,7 +3439,7 @@ public:
 
     // Parses a format string literal with {expr} interpolation.
     // Splits the literal into alternating plain-text and expression segments,
-    // coerces each expression segment to IReadOnlyString via operator string,
+    // coerces each expression segment to string via operator string,
     // stacks all (ptr, len) pairs on the stack and calls __strconcat.
     llvm::Value* ParseFormatString(CFlatParser::PrimaryExpressionContext* ctx, const std::string& rawText)
     {
@@ -3446,34 +3518,28 @@ public:
                 llvm::Value* ptr = nullptr;
                 llvm::Value* len = nullptr;
 
-                bool isString = nv.TypeAndValue.TypeName == "IReadOnlyString"
-                             || nv.TypeAndValue.TypeName == "string"
-                             || compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName) == "IReadOnlyString";
+                bool isString = nv.TypeAndValue.TypeName == "string";
 
                 if (isString)
                 {
-                    // Already IReadOnlyString fat ptr — extract data() and length()
-                    auto* fatAlloca = compiler->builder->CreateAlloca(compiler->GetFatPtrType(), nullptr, "fatptr");
-                    llvm::Value* fatVal = nv.Primary ? nv.Primary : compiler->CreateLoad(nv.Storage);
-                    compiler->builder->CreateStore(fatVal, fatAlloca);
-                    ptr = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "data",   {});
-                    len = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "length", {});
+                    // Already a string struct — extract _ptr (field 0) and _len (field 1)
+                    llvm::Value* strVal = nv.Primary ? nv.Primary : compiler->CreateLoad(nv.Storage);
+                    ptr = compiler->builder->CreateExtractValue(strVal, { 0u });
+                    len = compiler->builder->CreateExtractValue(strVal, { 1u });
                 }
                 else
                 {
-                    // Call operator string to convert to IReadOnlyString
+                    // Call operator string to convert to string struct
                     MyCompilerLLVM::NamedVariable arg = nv;
                     arg.TypeAndValue.VariableName = "";
-                    auto* strFat = compiler->CreateOverloadedFunctionCall("operator string", { arg });
-                    if (!strFat)
+                    auto* strVal = compiler->CreateOverloadedFunctionCall("operator string", { arg });
+                    if (!strVal)
                     {
                         compiler->LogError("no operator string for expression in format string: " + exprText);
                         return nullptr;
                     }
-                    auto* fatAlloca = compiler->builder->CreateAlloca(compiler->GetFatPtrType(), nullptr, "fmtfat");
-                    compiler->builder->CreateStore(strFat, fatAlloca);
-                    ptr = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "data",   {});
-                    len = compiler->CallInterfaceMethod(fatAlloca, "IReadOnlyString", "length", {});
+                    ptr = compiler->builder->CreateExtractValue(strVal, { 0u });
+                    len = compiler->builder->CreateExtractValue(strVal, { 1u });
                 }
 
                 segments.push_back({ ptr, len });
@@ -3486,9 +3552,9 @@ public:
 
         if (segments.empty())
         {
-            // Degenerate: no content at all — return empty string
+            // Degenerate: no content at all — return empty string struct
             auto* gv = compiler->CreateGlobalString("fmtempty", "");
-            return compiler->WrapStringLiteralAsIReadOnly(gv);
+            return compiler->WrapStringLiteralAsString(gv);
         }
 
         int count = (int)segments.size();
@@ -3995,6 +4061,10 @@ public:
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
         auto structType = compiler->CreateStructType(structName, declList);
+        // A struct with zero fields still needs a sized (non-opaque) type
+        // so that alloca/sizeof work correctly (e.g. when passed via interface).
+        if (structType->isOpaque())
+            structType->setBody(llvm::ArrayRef<llvm::Type*>());
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
         MyCompilerLLVM::TypeAndValue returnType{
@@ -4186,6 +4256,10 @@ public:
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
         auto structType = compiler->CreateStructType(structName, declList);
+        // A class with zero fields still needs a sized (non-opaque) type
+        // so that alloca/sizeof work correctly (e.g. when passed via interface).
+        if (structType->isOpaque())
+            structType->setBody(llvm::ArrayRef<llvm::Type*>());
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
         MyCompilerLLVM::TypeAndValue returnType{

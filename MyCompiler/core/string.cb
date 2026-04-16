@@ -1,19 +1,11 @@
 // Core string types.
 //
-// IReadOnlyString is the fat-pointer contract for any readable string:
+// `string` is a built-in value type { i8* _ptr, i32 _len } with:
 //   i8* data()   — pointer to the underlying bytes (null-terminated)
 //   i32 length() — number of bytes, not counting the terminator
 //
-// `string` is a type alias for IReadOnlyString, so every struct that
-// implements data()/length() can be passed wherever a `string` is expected.
-
-interface IReadOnlyString
-{
-    i8* data();
-    i32 length();
-};
-
-using string = IReadOnlyString;
+// String literals are automatically wrapped into a `string` by the compiler.
+// Use `operator string` overloads to convert other types to `string`.
 
 interface IString
 {
@@ -26,62 +18,100 @@ string operator string(IString* s)
     return s->ToString();
 }
 
-// ── stringdata ───────────────────────────────────────────────────────────────
-// Heap-owned immutable string value. Copies its input buffer and owns it.
-class stringdata : IReadOnlyString
-{
-    i8* _buf = nullptr;
-    i32 _len = 0;
-
-    i8* data()   { return _buf; }
-    i32 length() { return _len; }
-
-    ~stringdata()
-    {
-        if (_buf != nullptr) delete[] _buf;
-    }
-};
-
-// Copy the first `n` bytes of `s` into a freshly allocated, null-terminated
-// stringdata.  Ownership of the buffer is transferred to the stringdata.
-stringdata* MakeStringData(const char* s, i32 n)
-{
-    stringdata* sd = new stringdata();
-    sd->_len = n;
-    sd->_buf = new i8[n + 1];
-    int i = 0;
-    while (i < n)
-    {
-        sd->_buf[i] = s[i];
-        i++;
-    }
-    sd->_buf[n] = 0;
-    return sd;
-}
-
-// Convert a C string to a `string` by wrapping it in a stringdata.
+// Convert a raw C string (char*) to a string value.
 string operator string(char* s)
 {
-    stringdata* sd = MakeStringData(s, strlen(s));
-    string result = sd;
+    string result;
+    result._ptr = s;
+    result._len = strlen(s);
     return result;
 }
 
-// Convert a 32-bit integer to a `string` using sprintf.
+// Convert a 32-bit integer to a string using sprintf.
 string operator string(i32 n)
 {
     char* buf = malloc(32);
     i32 len = sprintf(buf, "%d", n);
-    stringdata* sd = MakeStringData(buf, len);
-    free(buf);
-    string result = sd;
+    string result;
+    result._ptr = buf;
+    result._len = len;
     return result;
 }
 
+// ── string concatenation (operator+) ─────────────────────────────────────────
+
+// Concatenate two strings: s1 + s2
+// The result owns a freshly allocated buffer; the caller is responsible for
+// freeing it (or letting it live for the program duration).
+string operator+(string a, string b)
+{
+    i32 alen  = a.length();
+    i32 blen  = b.length();
+    i32 total = alen + blen;
+    i8* buf   = new i8[total + 1];
+
+    i8* aptr = a.data();
+    i32 i = 0;
+    while (i < alen)
+    {
+        buf[i] = aptr[i];
+        i++;
+    }
+
+    i8* bptr = b.data();
+    i32 j = 0;
+    while (j < blen)
+    {
+        buf[alen + j] = bptr[j];
+        j++;
+    }
+    buf[total] = 0;
+
+    string result;
+    result._ptr = buf;
+    result._len = total;
+    return result;
+}
+
+// Concatenate a string with a raw C string literal: s + "..."
+string operator+(string a, const char* b)
+{
+    i32 alen  = a.length();
+    i32 blen  = strlen(b);
+    i32 total = alen + blen;
+    i8* buf   = new i8[total + 1];
+
+    i8* aptr = a.data();
+    i32 i = 0;
+    while (i < alen)
+    {
+        buf[i] = aptr[i];
+        i++;
+    }
+
+    i32 j = 0;
+    while (j < blen)
+    {
+        buf[alen + j] = b[j];
+        j++;
+    }
+    buf[total] = 0;
+
+    string result;
+    result._ptr = buf;
+    result._len = total;
+    return result;
+}
+
+// Concatenate a string with any IString: s + istring_value
+string operator+(string a, IString b)
+{
+    return a + b->ToString();
+}
+
 // ── stringbuilder ────────────────────────────────────────────────────────────
-// Mutable, growable string buffer.  Implements IReadOnlyString directly so a
-// stringbuilder can be passed anywhere a `string` is expected.
-class stringbuilder : IReadOnlyString
+// Mutable, growable string buffer.
+struct stringbuilder
 {
     i8* _data     = nullptr;
     i32 _length   = 0;
@@ -105,7 +135,6 @@ class stringbuilder : IReadOnlyString
         _capacity = newCap;
     }
 
-    // IReadOnlyString
     i8* data()   { return _data; }
     i32 length() { return _length; }
 
@@ -157,6 +186,18 @@ class stringbuilder : IReadOnlyString
         _length = 0;
         if (_data != nullptr) _data[0] = 0;
     }
+
+    // Return a string view over the current buffer.
+    // The returned string shares the builder's buffer — do not free the builder
+    // while the string is still in use.
+    string toString()
+    {
+        string result;
+        result._ptr = _data;
+        result._len = _length;
+        return result;
+    }
+
 
     ~stringbuilder()
     {

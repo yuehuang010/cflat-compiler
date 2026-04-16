@@ -1,4 +1,4 @@
-import "list.cb";
+﻿import "list.cb";
 import "hashset.cb";
 import "dictionary.cb";
 
@@ -198,63 +198,21 @@ int testDictionary()
 
     return passed;
 }
+// ── main ─────────────────────────────────────────────────────────────────────
 
-// ── string / stringbuilder ───────────────────────────────────────────────────
-
-int testString()
-{
-    int passed = 0;
-
-    // String literal → `string` fat pointer via built-in __StrLit
-    string s = "hello";
-    passed += TestInt("string literal length", s.length(), 5);
-    passed += TestStr("string literal data",   s.data(),   "hello");
-
-    // stringbuilder starts empty
-    stringbuilder sb;
-    passed += TestInt("sb empty length", sb.length(), 0);
-
-    // append raw C strings via appendCStr
-    sb.appendCStr("hello");
-    passed += TestInt("sb after appendCStr length", sb.length(), 5);
-    passed += TestStr("sb after appendCStr data",   sb.data(),   "hello");
-
-    // append another raw C string and verify concatenation
-    sb.appendCStr(", ");
-    sb.appendCStr("world");
-    passed += TestInt("sb concat length", sb.length(), 12);
-    passed += TestStr("sb concat data",   sb.data(),   "hello, world");
-
-    // appendChar
-    sb.appendChar('!');
-    passed += TestInt("sb appendChar length", sb.length(), 13);
-    passed += TestStr("sb appendChar data",   sb.data(),   "hello, world!");
-
-    // clear resets length but keeps the buffer
-    sb.clear();
-    passed += TestInt("sb clear length", sb.length(), 0);
-
-    // Force growth past initial capacity
-    int i = 0;
-    while (i < 30)
-    {
-        sb.appendCStr("ab");
-        i++;
-    }
-    passed += TestInt("sb growth length", sb.length(), 60);
-
-    return passed;
-}
-
-// ── Entry point ───────────────────────────────────────────────────────────────
+extern void printf(const char* fmt, ...);
 
 extern int main()
 {
     int passed = 0;
-    passed += testList();
-    passed += testHashset();
-    passed += testDictionary();
-    passed += testString();
-    printf("\n%d checks passed.\n", passed);
-    return 0;
+    int total  = 0;
+
+    int r;
+
+    r = testList();         passed += r; total += 15;
+    r = testHashset();      passed += r; total += 19;
+    r = testDictionary();   passed += r; total += 34;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }

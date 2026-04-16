@@ -275,6 +275,9 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
         }
     }
 
+    auto savedSourceFileName = sourceFileName;
+    sourceFileName = std::filesystem::path(canonicalStr).filename().string();
+
     // Forward-ref scan the imported file
     {
         if (verbose) std::cout << "[verbose]   forward-ref scan: " << importFilename << "\n";
@@ -289,5 +292,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     auto myListener = std::make_unique<MyListener>(parserPtr, this);
     antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
+
+    sourceFileName = savedSourceFileName;
     return true;
 }

@@ -6,14 +6,19 @@
 #include <stdlib.h>
 
 #include "MyCompilerLLVM.h"
+#include "CompilerManager.h"
 #include "ArgParser.h"
 
 int main(int argc, char* argv[])
 {
-_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);                                                                    _CrtSetReportMode(_CRT_ERROR,  _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_ERROR,  _CRTDBG_FILE_STDERR);                                                                    _CrtSetReportMode(_CRT_WARN,   _CRTDBG_MODE_FILE);
-  _CrtSetReportFile(_CRT_WARN,   _CRTDBG_FILE_STDERR);
+    CompilerManager::Instance().InstallAssertHook();
+
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
 
     // Disable stdout buffering so verbose/diagnostic output survives a crash.
     setvbuf(stdout, nullptr, _IONBF, 0);
