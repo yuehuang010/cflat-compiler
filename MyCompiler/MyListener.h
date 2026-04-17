@@ -1101,6 +1101,135 @@ public:
 
                 return;
             }
+            else if (iterationStatement->Foreach())
+            {
+                /*
+                iterationStatement
+                    : Foreach '(' declarationSpecifiers Identifier In expression ')' statement
+                    ;
+
+                Lowers to:
+                    init: eval collection, cache count(), alloc element var and index
+                    cond: i < count
+                    inner: element = collection.get(i); body
+                    increment: i++
+                    resume: pop scope
+                */
+
+                auto declSpecCtx = iterationStatement->declarationSpecifiers();
+                auto varNameTok  = iterationStatement->Identifier();
+                auto collExprCtx = iterationStatement->expression();
+                auto bodyStmt    = iterationStatement->statement();
+
+                std::string varName = varNameTok->getText();
+
+                auto blockInit      = compiler->CreateBasicBlock("foreachInit");
+                auto blockCond      = compiler->CreateBasicBlock("foreachCond");
+                auto blockInner     = compiler->CreateBasicBlock("foreachInner");
+                auto blockIncrement = compiler->CreateBasicBlock("foreachIncrement");
+                auto blockResume    = compiler->CreateBasicBlock("foreachResume");
+
+                compiler->CreateBlockBreak(blockInit, false);
+
+                // Push scope; continue → increment, break/else → resume
+                compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
+
+                // Evaluate the collection expression (needs typed NamedVariable for dispatch)
+                auto collNV = ParseAssignmentExpressionNamed(collExprCtx->assignmentExpression());
+
+                // Spill into alloca if the collection was returned by value (no storage)
+                if (collNV.Storage == nullptr && collNV.Primary != nullptr)
+                {
+                    llvm::Type* ty = collNV.BaseType;
+                    if (!ty) ty = compiler->GetType(collNV.TypeAndValue);
+                    auto spill = compiler->CreateAlloca(ty);
+                    compiler->CreateAssignment(collNV.Primary, spill);
+                    collNV.Storage = spill;
+                    collNV.Primary = nullptr;
+                }
+
+                bool isFaceType = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
+
+                // Call count() once and cache it
+                llvm::Value* countVal = nullptr;
+                llvm::Value* ifacePtr = nullptr;
+                if (isFaceType)
+                {
+                    ifacePtr = collNV.Storage;
+                    if (!ifacePtr)
+                    {
+                        auto fatTy = compiler->GetFatPtrType();
+                        ifacePtr = compiler->CreateAlloca(fatTy);
+                        compiler->CreateAssignment(collNV.Primary, ifacePtr);
+                    }
+                    countVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "count", {});
+                }
+                else
+                {
+                    MyCompilerLLVM::NamedVariable selfArg = collNV;
+                    selfArg.TypeAndValue.VariableName = "";
+                    countVal = compiler->CreateOverloadedFunctionCall("count", { selfArg });
+                }
+
+                auto* i32Ty = compiler->builder->getInt32Ty();
+
+                auto countAlloca = compiler->CreateAlloca(i32Ty);
+                compiler->builder->CreateStore(countVal, countAlloca);
+
+                auto indexAlloca = compiler->CreateAlloca(i32Ty);
+                compiler->builder->CreateStore(compiler->builder->getInt32(0), indexAlloca);
+
+                // Pre-allocate the element variable in the init block (one alloca for all iterations)
+                auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
+                elemType.VariableName = varName;
+                auto elemAlloca = compiler->CreateLocalVariable(elemType);
+
+                compiler->CreateBlockBreak(blockCond, false);
+
+                // Condition: i < count
+                compiler->InitializeBlock(blockCond, false);
+                auto iVal   = compiler->CreateLoad(indexAlloca);
+                auto cntVal = compiler->CreateLoad(countAlloca);
+                auto cond   = compiler->builder->CreateICmpSLT(iVal, cntVal);
+                compiler->CreateConditionJump(cond, blockInner, blockResume);
+
+                // Inner block: load element, run body
+                compiler->InitializeBlock(blockInner, false);
+
+                MyCompilerLLVM::NamedVariable indexNV;
+                indexNV.Primary  = compiler->CreateLoad(indexAlloca);
+                indexNV.BaseType = i32Ty;
+                indexNV.TypeAndValue.TypeName = "int";
+
+                llvm::Value* elemVal = nullptr;
+                if (isFaceType)
+                {
+                    elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV });
+                }
+                else
+                {
+                    MyCompilerLLVM::NamedVariable selfArg = collNV;
+                    selfArg.TypeAndValue.VariableName = "";
+                    elemVal = compiler->CreateOverloadedFunctionCall("get", { selfArg, indexNV });
+                }
+
+                if (elemVal)
+                    compiler->CreateAssignment(elemVal, elemAlloca);
+
+                ParseStatement(bodyStmt);
+                compiler->CreateContinueCall();
+
+                // Increment block: i++
+                compiler->InitializeBlock(blockIncrement, false);
+                compiler->CreateIncrement(indexAlloca, 1);
+                compiler->CreateBlockBreak(blockCond, false);
+
+                // Resume
+                compiler->InitializeBlock(blockResume, false);
+                compiler->CreateBlockBreak(nullptr, true);
+
+                return;
+            }
         }
         else if (selectionStatement)
         {

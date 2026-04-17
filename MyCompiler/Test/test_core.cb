@@ -198,6 +198,69 @@ int testDictionary()
 
     return passed;
 }
+// ── foreach ──────────────────────────────────────────────────────────────────
+
+int testForeach()
+{
+    int passed = 0;
+
+    // Basic iteration over list<int>
+    list<int> l;
+    l.add(10);
+    l.add(20);
+    l.add(30);
+
+    int sum = 0;
+    foreach (int x in l)
+        sum += x;
+    passed += TestInt("foreach sum", sum, 60);
+
+    // Correct element values
+    int first = -1;
+    int last  = -1;
+    foreach (int x in l)
+    {
+        if (first == -1) first = x;
+        last = x;
+    }
+    passed += TestInt("foreach first", first, 10);
+    passed += TestInt("foreach last",  last,  30);
+
+    // break exits early
+    int count = 0;
+    foreach (int x in l)
+    {
+        if (x == 20) break;
+        count++;
+    }
+    passed += TestInt("foreach break count", count, 1);
+
+    // continue skips element
+    int skipSum = 0;
+    foreach (int x in l)
+    {
+        if (x == 20) continue;
+        skipSum += x;
+    }
+    passed += TestInt("foreach continue sum", skipSum, 40);
+
+    // Empty list iterates zero times
+    list<int> empty;
+    int visits = 0;
+    foreach (int x in empty)
+        visits++;
+    passed += TestInt("foreach empty", visits, 0);
+
+    // Iterate via IEnumerable<int> interface
+    IEnumerable<int> ie = l;
+    int ieSum = 0;
+    foreach (int x in ie)
+        ieSum += x;
+    passed += TestInt("foreach IEnumerable sum", ieSum, 60);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern void printf(const char* fmt, ...);
@@ -212,6 +275,7 @@ extern int main()
     r = testList();         passed += r; total += 15;
     r = testHashset();      passed += r; total += 19;
     r = testDictionary();   passed += r; total += 34;
+    r = testForeach();      passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

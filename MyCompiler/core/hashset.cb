@@ -2,11 +2,6 @@
 // T must support == for equality and must be usable as an integer for hashing
 // (i.e., integer primitive types: int, i32, i64, char, u8, u32, etc.).
 
-interface IHashable
-{
-    int hash();
-};
-
 struct hashset<T>
 {
     T*    _keys   = nullptr;

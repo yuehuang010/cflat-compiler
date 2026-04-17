@@ -1,0 +1,39 @@
+// Core interfaces — auto-imported before string.cb so all modules can depend
+// on these contracts without importing separately.
+
+interface IString
+{
+    string ToString();
+};
+
+interface IEnumerable<T>
+{
+    int count();
+    T   get(int index);
+};
+
+interface IList<T>
+{
+    int  count();
+    T    get(int index);
+    T    operator[](int index);
+    void set(int index, T value);
+    void add(T value);
+    void removeAt(int index);
+    void clear();
+};
+
+interface IHashable
+{
+    int hash();
+};
+
+interface IDictionary<K, V>
+{
+    int  count();
+    bool contains(K key);
+    V    get(K key);
+    void set(K key, V value);
+    bool add(K key, V value);
+    bool remove(K key);
+};

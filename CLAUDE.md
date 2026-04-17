@@ -14,6 +14,12 @@ Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM):
 msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
 ```
 
+**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_core_string.cb`, producing `myapp.exe` and `out.ll`:
+
+```bash
+buildAndRun.bat
+```
+
 ## Running
 
 ```bash
@@ -31,7 +37,7 @@ x64/Debug/MyCompiler.exe input.cb --out-lli out.ll
 lli.exe out.ll
 ```
 
-The compiler automatically locates `runtime.cb` in the same directory as the executable. Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
+The compiler automatically locates `runtime.cb` next to the executable (built from `MyCompiler/core/runtime.cb`). Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
 
 **CLI flags** (see `ArgParser.h`):
 - `-o / --output`: Output native executable path (.exe)
@@ -48,7 +54,7 @@ The compiler automatically locates `runtime.cb` in the same directory as the exe
 test.bat
 ```
 
-Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` via `--emit-exe` and checks the exit code. Test files include both `.c` (C-compatible) and `.cb` (CFlat) variants.
+Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` and checks the exit code. Current tests: `testfile`, `testfile2`, `test_generics` (C); `testfile_module`, `test_library_string` (C, with `-i` lib); `test_operators`, `test_is_as`, `test_core`, `test_core_string` (CFlat).
 
 To run a single test manually:
 
@@ -80,8 +86,10 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 | `CFlat.g4` | ANTLR4 grammar defining CFlat syntax (~1,200 lines) |
 | `MyCompilerLLVM.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
 | `MyListener.h` | AST visitor implementing both passes (~4,100 lines) |
+| `CompilerManager.h` | Singleton crash handler — installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
 | `ArgParser.h` | CLI argument parsing |
 | `MyCompiler.cpp` | Entry point |
+| `core/` | Standard library source: `runtime.cb`, `interfaces.cb`, `string.cb`, `list.cb`, `hashset.cb`, `dictionary.cb` — compiled alongside every program; `interfaces.cb` is auto-imported between runtime and string |
 
 ### Key Internal State (in `MyCompilerLLVM`)
 
@@ -111,6 +119,11 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 - **Named parameters**: `func(x: 1, y: 2)` — args matched by name, any order
 - **Return-block functions**: `return { ... }` — body inlined at call site (stored in `returnBlockTable`)
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
+- **Range-based for**: `foreach (T x in collection) { ... }` — calls `count()` / `get(int)` on the collection; works with structs and `IEnumerable<T>` interface values
+
+### VS Code Extension
+
+`vscode-extension/` contains a language server extension for CFlat syntax highlighting and tooling. Build with `build.bat` and install with `install.bat` inside that directory.
 
 ### Adding New Language Features
 

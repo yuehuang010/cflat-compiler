@@ -453,6 +453,7 @@ iterationStatement
     : While '(' expression ')' statement
     | Do statement While '(' expression ')' ';'
     | For '(' forCondition ')' statement
+    | Foreach '(' declarationSpecifiers Identifier In expression ')' statement
     ;
 
 //    |   'for' '(' expression? ';' expression?  ';' forUpdate? ')' statement
@@ -613,6 +614,10 @@ For
     : 'for'
     ;
 
+Foreach
+    : 'foreach'
+    ;
+
 Goto
     : 'goto'
     ;
@@ -699,6 +704,10 @@ Using
 
 Import
     : 'import'
+    ;
+
+In
+    : 'in'
     ;
 
 Switch

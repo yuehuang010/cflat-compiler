@@ -1,24 +1,7 @@
 // list<T> — mutable growable array (similar to vector<T>).
 // Supports any value type T.
 
-interface IEnumerable<T>
-{
-    int count();
-    T   get(int index);
-};
-
-interface IList<T>
-{
-    int  count();
-    T    get(int index);
-    T    operator[](int index);
-    void set(int index, T value);
-    void add(T value);
-    void removeAt(int index);
-    void clear();
-};
-
-struct list<T>
+class list<T> : IEnumerable<T>, IList<T>
 {
     T*  _data     = nullptr;
     int _size     = 0;

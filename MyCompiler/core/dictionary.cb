@@ -5,16 +5,6 @@
 
 import "hashset.cb";
 
-interface IDictionary<K, V>
-{
-    int  count();
-    bool contains(K key);
-    V    get(K key);
-    void set(K key, V value);
-    bool add(K key, V value);
-    bool remove(K key);
-};
-
 struct dictionary<K, V>
 {
     K*    _keys     = nullptr;

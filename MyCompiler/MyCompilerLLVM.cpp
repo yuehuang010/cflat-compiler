@@ -69,7 +69,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     }
 
     // Auto-import the CFlat runtime (provides printf and other builtins).
-    // runtime.cb must be loaded first because string.cb uses new/delete.
+    // Order matters: runtime first (new/delete), then interfaces, then string.
     if (!runtimeDir.empty())
     {
         auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
@@ -78,6 +78,13 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
             CompileImportedFile(runtimePath.string(), "runtime.cb");
         else if (verbose)
             std::cout << "[verbose]   runtime.cb not found, skipping\n";
+
+        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
+        if (verbose) std::cout << "[verbose] auto-importing interfaces: " << interfacesPath.string() << "\n";
+        if (std::filesystem::exists(interfacesPath))
+            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
+        else if (verbose)
+            std::cout << "[verbose]   interfaces.cb not found, skipping\n";
 
         auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
         if (verbose) std::cout << "[verbose] auto-importing string: " << stringPath.string() << "\n";

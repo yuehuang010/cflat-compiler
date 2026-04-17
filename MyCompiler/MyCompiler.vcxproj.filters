@@ -38,6 +38,7 @@
     <None Include="core\list.cb" />
     <None Include="core\hashset.cb" />
     <None Include="core\dictionary.cb" />
+    <None Include="core\interfaces.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />

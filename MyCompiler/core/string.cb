@@ -7,10 +7,7 @@
 // String literals are automatically wrapped into a `string` by the compiler.
 // Use `operator string` overloads to convert other types to `string`.
 
-interface IString
-{
-    string ToString();
-};
+import "interfaces.cb";
 
 // Any IString value becomes a string by calling ToString().
 string operator string(IString* s)
