@@ -1,4 +1,3 @@
-extern void printf(const char* argv, ...);
 
 int Test(const char* testName, i64 actual, i64 expected)
 {

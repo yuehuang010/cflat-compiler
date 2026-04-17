@@ -16,8 +16,6 @@ int TestInt(const char* name, int actual, int expected)
     return 0;
 }
 
-extern int strcmp(const char* a, const char* b);
-
 int TestStr(const char* name, const char* actual, const char* expected)
 {
     if (strcmp(actual, expected) == 0) { printf("%s passed.\n", name); return 1; }
@@ -262,8 +260,6 @@ int testForeach()
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
-
-extern void printf(const char* fmt, ...);
 
 extern int main()
 {
