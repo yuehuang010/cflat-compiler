@@ -147,6 +147,15 @@ private:
         return directDecl->getText();
     }
 
+    bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
+    {
+        if (!func->declarationSpecifiers()) return false;
+        for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
+            if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
+                return true;
+        return false;
+    }
+
     void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(func);
@@ -167,11 +176,12 @@ private:
         auto params = ParseParameterTypeList(paramTypeList);
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
-        // Operator new/delete/string are static (no 'this' param), but scoped to struct
+        // Operator new/delete/string and static methods are scoped to struct but have no 'this' param
         bool isOperatorFunc = (getFunctionName(func) == "operator new"
                             || getFunctionName(func) == "operator delete"
                             || getFunctionName(func) == "operator string");
-        if (!structName.empty() && isOperatorFunc)
+        bool isStaticFunc = isFunctionStatic(func);
+        if (!structName.empty() && (isOperatorFunc || isStaticFunc))
         {
             name = structName + "." + getFunctionName(func);
         }
@@ -541,6 +551,15 @@ private:
             return ::getOperatorName(opId);
         auto directDecl = ctx->directDeclarator();
         return directDecl->getText();
+    }
+
+    bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
+    {
+        if (!func->declarationSpecifiers()) return false;
+        for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
+            if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
+                return true;
+        return false;
     }
 
     // Returns the default value for a type:
@@ -3096,23 +3115,37 @@ public:
 
                         primaryIdentifier = prevPrimary->getText();
 
-                        if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr && Compiler(ctx)->IsNamespace(prevPrimary->genericIdentifier()->Identifier()->getText()))
+                        if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
-                            namespaceContext = Compiler(ctx)->ResolveNamespace(prevPrimary->genericIdentifier()->Identifier()->getText());
-                            namedVar = {};
-                            structVar = {};
+                            std::string idName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            if (Compiler(ctx)->IsNamespace(idName))
+                            {
+                                namespaceContext = Compiler(ctx)->ResolveNamespace(idName);
+                                namedVar = {};
+                                structVar = {};
+                            }
+                            else if (Compiler(ctx)->IsDataStructure(idName)
+                                     && Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
+                                     && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr)
+                            {
+                                // Type name used as qualifier for static method access: ClassName.Method()
+                                // Constructor calls (ClassName()) still work because functionName = "ClassName".
+                                namespaceContext = idName;
+                                namedVar = {};
+                                structVar = {};
+                            }
+                            else
+                            {
+                                namedVar.Primary = ParsePrimaryExpression(prevPrimary);
+                                namedVar.Storage = nullptr;
+                                if (namedVar.Primary == nullptr)
+                                    namedVar = ParseIdentifier(prevPrimary->genericIdentifier()->Identifier());
+                            }
                         }
                         else
                         {
                             namedVar.Primary = ParsePrimaryExpression(prevPrimary);
                             namedVar.Storage = nullptr;
-
-                            if (namedVar.Primary == nullptr)
-                            {
-                                // Try identifier (now wrapped in genericIdentifier in the grammar)
-                                if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
-                                    namedVar = ParseIdentifier(prevPrimary->genericIdentifier()->Identifier());
-                            }
                         }
 
                         if (namedVar.TypeAndValue.IsInterface)
@@ -4308,14 +4341,16 @@ public:
                 bool isOperatorFunc = (funcName == "operator new"
                                     || funcName == "operator delete"
                                     || funcName == "operator string");
-                std::string declName = isOperatorFunc ? (structName + "." + funcName) : funcName;
+                bool isStaticFunc = isFunctionStatic(func);
+                bool isStaticLike = isOperatorFunc || isStaticFunc;
+                std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
 
                 auto declReturnType = this->getFunctionReturnType(func);
                 auto* declParamList = func->parameterTypeList();
                 auto declParams = this->ParseParameterTypeList(declParamList);
                 bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
 
-                if (!isOperatorFunc)
+                if (!isStaticLike)
                 {
                     MyCompilerLLVM::DeclTypeAndValue thisParam;
                     thisParam.TypeName = structName;
@@ -4329,6 +4364,13 @@ public:
             }
         }
 
+        // Pre-register destructor so 'delete' inside static methods can call it.
+        if (!ctx->destructorDefinition().empty())
+        {
+            if (auto* dtorFn = compiler->GetFunction("~" + structName))
+                compiler->RegisterDestructor(structName, dtorFn);
+        }
+
         {
             bool savedScope = global_scope;
             for (auto func : functionList)
@@ -4337,7 +4379,7 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                if (funcName == "operator new" || funcName == "operator delete")
+                if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 else
                     ParseFunctionDefinition(func, structName);
@@ -4496,14 +4538,16 @@ public:
                 bool isOperatorFunc = (funcName == "operator new"
                                     || funcName == "operator delete"
                                     || funcName == "operator string");
-                std::string declName = isOperatorFunc ? (structName + "." + funcName) : funcName;
+                bool isStaticFunc = isFunctionStatic(func);
+                bool isStaticLike = isOperatorFunc || isStaticFunc;
+                std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
 
                 auto declReturnType = this->getFunctionReturnType(func);
                 auto* declParamList = func->parameterTypeList();
                 auto declParams = this->ParseParameterTypeList(declParamList);
                 bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
 
-                if (!isOperatorFunc)
+                if (!isStaticLike)
                 {
                     MyCompilerLLVM::DeclTypeAndValue thisParam;
                     thisParam.TypeName = structName;
@@ -4517,6 +4561,13 @@ public:
             }
         }
 
+        // Pre-register destructor so 'delete' inside static methods can call it.
+        if (!ctx->destructorDefinition().empty())
+        {
+            if (auto* dtorFn = compiler->GetFunction("~" + structName))
+                compiler->RegisterDestructor(structName, dtorFn);
+        }
+
         {
             bool savedScope = global_scope;
             for (auto func : functionList)
@@ -4525,7 +4576,7 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                if (funcName == "operator new" || funcName == "operator delete")
+                if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 else
                     ParseFunctionDefinition(func, structName);

@@ -23,7 +23,7 @@ int TestStr(const char* name, const char* actual, const char* expected)
     return 0;
 }
 
-// ── free functions: read/write/exists/delete ──────────────────────────────────
+// ── File static methods: read/write/exists/remove ─────────────────────────────
 
 int testFileReadWrite()
 {
@@ -32,22 +32,22 @@ int testFileReadWrite()
     string hw   = "hello world";
     string again = " again";
 
-    fileDelete(path);
-    passed += TestBool("file not exists before write", fileExists(path), false);
+    File.remove(path);
+    passed += TestBool("file not exists before write", File.exists(path), false);
 
-    passed += TestBool("writeAllText",            writeAllText(path, hw), true);
-    passed += TestBool("file exists after write", fileExists(path),       true);
+    passed += TestBool("writeAllText",            File.writeAllText(path, hw), true);
+    passed += TestBool("file exists after write", File.exists(path),           true);
 
-    string content = readAllText(path);
+    string content = File.readAllText(path);
     passed += TestStr("readAllText content", content.data(), "hello world");
     passed += TestInt("readAllText length",  content.length(), 11);
 
-    passed += TestBool("appendAllText", appendAllText(path, again), true);
-    string content2 = readAllText(path);
+    passed += TestBool("appendAllText", File.appendAllText(path, again), true);
+    string content2 = File.readAllText(path);
     passed += TestStr("after append", content2.data(), "hello world again");
 
-    passed += TestBool("fileDelete",               fileDelete(path), true);
-    passed += TestBool("file not exists after del", fileExists(path), false);
+    passed += TestBool("File.remove",               File.remove(path), true);
+    passed += TestBool("file not exists after del", File.exists(path), false);
 
     return passed;
 }
@@ -60,7 +60,7 @@ int testFileClass()
     string path  = "test_fs_class.txt";
     string hello = "hello";
     string world = "world";
-    fileDelete(path);
+    File.remove(path);
 
     File* w = new File;
     passed += TestBool("openWrite",       w->openWrite(path), true);
@@ -88,11 +88,11 @@ int testFileClass()
     passed += TestBool("file size 12", sz == 12, true);
     delete s;
 
-    fileDelete(path);
+    File.remove(path);
     return passed;
 }
 
-// ── fileMove ─────────────────────────────────────────────────────────────────
+// ── File.move ─────────────────────────────────────────────────────────────────
 
 int testFileMove()
 {
@@ -100,42 +100,42 @@ int testFileMove()
     string src     = "test_fs_move_src.txt";
     string dst     = "test_fs_move_dst.txt";
     string moveme  = "move me";
-    fileDelete(src);
-    fileDelete(dst);
+    File.remove(src);
+    File.remove(dst);
 
-    writeAllText(src, moveme);
-    passed += TestBool("fileMove ok",           fileMove(src, dst),  true);
-    passed += TestBool("src gone after move",   fileExists(src),     false);
-    passed += TestBool("dst exists after move", fileExists(dst),     true);
+    File.writeAllText(src, moveme);
+    passed += TestBool("File.move ok",           File.move(src, dst),  true);
+    passed += TestBool("src gone after move",    File.exists(src),     false);
+    passed += TestBool("dst exists after move",  File.exists(dst),     true);
 
-    string content = readAllText(dst);
+    string content = File.readAllText(dst);
     passed += TestStr("moved content", content.data(), "move me");
 
-    fileDelete(dst);
+    File.remove(dst);
     return passed;
 }
 
-// ── Directory free functions ──────────────────────────────────────────────────
+// ── Directory static methods ──────────────────────────────────────────────────
 
 int testDirectoryFunctions()
 {
     int passed = 0;
     string testDir = "test_fs_dir";
 
-    dirDelete(testDir);
-    passed += TestBool("dir not exists before create", dirExists(testDir), false);
-    passed += TestBool("dirCreate",                    dirCreate(testDir), true);
-    passed += TestBool("dir exists after create",      dirExists(testDir), true);
-    passed += TestBool("dirDelete",                    dirDelete(testDir), true);
-    passed += TestBool("dir not exists after delete",  dirExists(testDir), false);
+    Directory.remove(testDir);
+    passed += TestBool("dir not exists before create", Directory.exists(testDir), false);
+    passed += TestBool("Directory.create",             Directory.create(testDir), true);
+    passed += TestBool("dir exists after create",      Directory.exists(testDir), true);
+    passed += TestBool("Directory.remove",             Directory.remove(testDir), true);
+    passed += TestBool("dir not exists after delete",  Directory.exists(testDir), false);
 
-    string cwd = getCurrentDir();
-    passed += TestBool("getCurrentDir not empty", cwd.length() > 0, true);
+    string cwd = Directory.getCurrent();
+    passed += TestBool("getCurrent not empty", cwd.length() > 0, true);
 
     return passed;
 }
 
-// ── Directory class ───────────────────────────────────────────────────────────
+// ── Directory class (instance methods) ───────────────────────────────────────
 
 int testDirectoryClass()
 {
@@ -144,9 +144,9 @@ int testDirectoryClass()
     string atxt    = "test_fs_dir2\\a.txt";
     string btxt    = "test_fs_dir2\\b.txt";
 
-    fileDelete(atxt);
-    fileDelete(btxt);
-    dirDelete(testDir);
+    File.remove(atxt);
+    File.remove(btxt);
+    Directory.remove(testDir);
 
     Directory* d = new Directory;
     d->init(testDir);
@@ -155,8 +155,8 @@ int testDirectoryClass()
     passed += TestBool("Directory.create",        d->create(), true);
     passed += TestBool("Directory.exists true",   d->exists(), true);
 
-    fileDelete(atxt);
-    fileDelete(btxt);
+    File.remove(atxt);
+    File.remove(btxt);
     passed += TestBool("Directory.remove", d->remove(), true);
     delete d;
 

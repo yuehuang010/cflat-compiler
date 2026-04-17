@@ -22,6 +22,7 @@ call :RunTestCb test_is_as
 call :RunTestCb test_core
 call :RunTestCb test_core_string
 call :RunTestCb test_filesystem
+call :RunTestCb test_static
 
 echo.
 if %ERRORS% EQU 0 (

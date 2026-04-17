@@ -3109,6 +3109,7 @@ public:
             if (frame.namespaceAliases.count(name)) return true;
         return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0;
     }
+    bool IsDataStructure(const std::string& name) const { return dataStructures.count(name) > 0; }
     std::string ResolveNamespace(const std::string& name) const
     {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))

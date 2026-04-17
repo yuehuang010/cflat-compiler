@@ -152,87 +152,85 @@ class File
         return sz;
     }
 
+    static bool exists(string path)
+    {
+        return _access(path.data(), 0) == 0;
+    }
+
+    static bool remove(string path)
+    {
+        return _unlink(path.data()) == 0;
+    }
+
+    static bool move(string src, string dst)
+    {
+        // MOVEFILE_REPLACE_EXISTING = 1
+        return MoveFileExA(src.data(), dst.data(), 1) != 0;
+    }
+
+    // Read the entire file at path in one call.
+    static string readAllText(string path)
+    {
+        File* f = new File;
+        if (!f->openRead(path))
+        {
+            delete f;
+            return "";
+        }
+        string result = f->readAll();
+        delete f;
+        return result;
+    }
+
+    // Write content to path, overwriting any existing file.
+    static bool writeAllText(string path, string content)
+    {
+        File* f = new File;
+        if (!f->openWrite(path))
+        {
+            delete f;
+            return false;
+        }
+        bool ok = f->write(content);
+        delete f;
+        return ok;
+    }
+
+    static bool writeAllText(string path, const char* content)
+    {
+        string s;
+        s._ptr = content;
+        s._len = strlen(content);
+        return File.writeAllText(path, s);
+    }
+
+    // Append content to path (creates the file if it does not exist).
+    static bool appendAllText(string path, string content)
+    {
+        File* f = new File;
+        if (!f->openAppend(path))
+        {
+            delete f;
+            return false;
+        }
+        bool ok = f->write(content);
+        delete f;
+        return ok;
+    }
+
+    static bool appendAllText(string path, const char* content)
+    {
+        string s;
+        s._ptr = content;
+        s._len = strlen(content);
+        return File.appendAllText(path, s);
+    }
+
     ~File()
     {
         if (_handle != nullptr) fclose(_handle);
     }
 };
-
-// ── File free functions ──────────────────────────────────────────────────────
-
-bool fileExists(string path)
-{
-    return _access(path.data(), 0) == 0;
-}
-
-bool fileDelete(string path)
-{
-    return _unlink(path.data()) == 0;
-}
-
-bool fileMove(string src, string dst)
-{
-    // MOVEFILE_REPLACE_EXISTING = 1
-    return MoveFileExA(src.data(), dst.data(), 1) != 0;
-}
-
-// Read the entire file at path in one call.
-string readAllText(string path)
-{
-    File* f = new File;
-    if (!f->openRead(path))
-    {
-        delete f;
-        return "";
-    }
-    string result = f->readAll();
-    delete f;
-    return result;
-}
-
-// Write content to path, overwriting any existing file.
-bool writeAllText(string path, string content)
-{
-    File* f = new File;
-    if (!f->openWrite(path))
-    {
-        delete f;
-        return false;
-    }
-    bool ok = f->write(content);
-    delete f;
-    return ok;
-}
-
-bool writeAllText(string path, const char* content)
-{
-    string s;
-    s._ptr = content;
-    s._len = strlen(content);
-    return writeAllText(path, s);
-}
-
-// Append content to path (creates the file if it does not exist).
-bool appendAllText(string path, string content)
-{
-    File* f = new File;
-    if (!f->openAppend(path))
-    {
-        delete f;
-        return false;
-    }
-    bool ok = f->write(content);
-    delete f;
-    return ok;
-}
-
-bool appendAllText(string path, const char* content)
-{
-    string s;
-    s._ptr = content;
-    s._len = strlen(content);
-    return appendAllText(path, s);
-}
 
 // ── Directory ─────────────────────────────────────────────────────────────────
 
@@ -263,76 +261,74 @@ class Directory
 
     bool create() { return _mkdir(_pathPtr) == 0; }
     bool remove() { return _rmdir(_pathPtr) == 0; }
-};
 
-// ── Directory free functions ──────────────────────────────────────────────────
-
-bool dirExists(string path)
-{
-    return _access(path.data(), 0) == 0;
-}
-
-bool dirCreate(string path) { return _mkdir(path.data()) == 0; }
-bool dirDelete(string path) { return _rmdir(path.data()) == 0; }
-
-// Return the process current working directory.
-string getCurrentDir()
-{
-    i8* buf = new i8[4096];
-    i8* result = _getcwd(buf, 4096);
-    if (result == nullptr)
+    static bool exists(string path)
     {
-        delete[] buf;
-        return "";
+        return _access(path.data(), 0) == 0;
     }
-    string s;
-    s._ptr = buf;
-    s._len = strlen(buf);
-    return s;
-}
 
-bool setCurrentDir(string path)
-{
-    return _chdir(path.data()) == 0;
-}
+    static bool create(string path) { return _mkdir(path.data()) == 0; }
+    static bool remove(string path) { return _rmdir(path.data()) == 0; }
 
-// List all entries (files and subdirs) in a directory.
-// WIN32_FIND_DATAA: 600 bytes; cFileName[260] is at byte offset 44.
-// Caller is responsible for deleting the returned list.
-list<string>* listDir(string path)
-{
-    list<string>* result = new list<string>;
-    string pattern = path + "\\*";
-    i8* findData = new i8[600];
-    i64 handle = FindFirstFileA(pattern.data(), findData);
-    if (handle < 0)
+    // Return the process current working directory.
+    static string getCurrent()
     {
+        i8* buf = new i8[4096];
+        i8* result = _getcwd(buf, 4096);
+        if (result == nullptr)
+        {
+            delete[] buf;
+            return "";
+        }
+        string s;
+        s._ptr = buf;
+        s._len = strlen(buf);
+        return s;
+    }
+
+    static bool setCurrent(string path)
+    {
+        return _chdir(path.data()) == 0;
+    }
+
+    // List all entries (files and subdirs) in a directory.
+    // WIN32_FIND_DATAA: 600 bytes; cFileName[260] is at byte offset 44.
+    // Caller is responsible for deleting the returned list.
+    static list<string>* list(string path)
+    {
+        list<string>* result = new list<string>;
+        string pattern = path + "\\*";
+        i8* findData = new i8[600];
+        i64 handle = FindFirstFileA(pattern.data(), findData);
+        if (handle < 0)
+        {
+            delete[] findData;
+            return result;
+        }
+        do {
+            i8* nameBuf = new i8[260];
+            int k = 0;
+            while (k < 260)
+            {
+                i8 c = findData[44 + k];
+                nameBuf[k] = c;
+                k++;
+                if (c == 0) break;
+            }
+            if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
+            {
+                string entry;
+                entry._ptr = nameBuf;
+                entry._len = strlen(nameBuf);
+                result->add(entry);
+            }
+            else
+            {
+                delete[] nameBuf;
+            }
+        } while (FindNextFileA(handle, findData) != 0);
+        FindClose(handle);
         delete[] findData;
         return result;
     }
-    do {
-        i8* nameBuf = new i8[260];
-        int k = 0;
-        while (k < 260)
-        {
-            i8 c = findData[44 + k];
-            nameBuf[k] = c;
-            k++;
-            if (c == 0) break;
-        }
-        if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
-        {
-            string entry;
-            entry._ptr = nameBuf;
-            entry._len = strlen(nameBuf);
-            result->add(entry);
-        }
-        else
-        {
-            delete[] nameBuf;
-        }
-    } while (FindNextFileA(handle, findData) != 0);
-    FindClose(handle);
-    delete[] findData;
-    return result;
-}
+};
