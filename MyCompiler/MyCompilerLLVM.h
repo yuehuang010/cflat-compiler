@@ -2079,6 +2079,16 @@ public:
         return llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(switchType), val->getSExtValue(), true);
     }
 
+    llvm::Function* GetOrDeclareStrcmp()
+    {
+        if (auto* fn = module->getFunction("strcmp"))
+            return fn;
+        auto* i32Ty = builder->getInt32Ty();
+        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false);
+        return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strcmp", module.get());
+    }
+
     llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
     {
         if (cond->getType()->isPointerTy())

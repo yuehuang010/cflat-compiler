@@ -14,7 +14,7 @@ Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM):
 msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
 ```
 
-**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_core_string.cb`, producing `myapp.exe` and `out.ll`:
+**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_filesystem.cb`, producing `myapp.exe` and `out.ll`:
 
 ```bash
 buildAndRun.bat
@@ -54,7 +54,7 @@ The compiler automatically locates `runtime.cb` next to the executable (built fr
 test.bat
 ```
 
-Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` and checks the exit code. Current tests: `testfile`, `testfile2`, `test_generics` (C); `testfile_module`, `test_library_string` (C, with `-i` lib); `test_operators`, `test_is_as`, `test_core`, `test_core_string` (CFlat).
+Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` and checks the exit code. Current tests: `testfile` (C); `testfile2`, `test_generics` (CFlat); `testfile_module`, `test_library_string` (CFlat, with `-i` lib); `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static` (CFlat).
 
 To run a single test manually:
 

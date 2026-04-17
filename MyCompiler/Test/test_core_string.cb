@@ -21,6 +21,16 @@ int TestStr(const char* name, const char* actual, const char* expected)
     return 0;
 }
 
+int TestStr(const char* name, string actual, const char* expected)
+{
+    return TestStr(name, actual.data(), expected);
+}
+
+int TestStr(const char* name, string actual, string expected)
+{
+    return TestStr(name, actual.data(), expected.data());
+}
+
 // ── string / stringbuilder ────────────────────────────────────────────────────
 
 int testString()
@@ -126,6 +136,114 @@ int testStringIString()
     return passed;
 }
 
+// ── string interpolation ─────────────────────────────────────────────────────
+
+class Color : IString
+{
+    i32 r = 0;
+    i32 g = 0;
+    i32 b = 0;
+
+    string ToString()
+    {
+        return "rgb({r},{g},{b})";
+    }
+};
+
+int testInterpolation()
+{
+    int passed = 0;
+
+    // Simple string variable
+    string name = "World";
+    passed += TestStr("interp_simple",    "Hello {name}!",  "Hello World!");
+
+    // Multiple string variables
+    string a = "foo";
+    string b = "bar";
+    passed += TestStr("interp_two_vars",  "{a} and {b}",    "foo and bar");
+
+    // Adjacent placeholders
+    string x = "AB";
+    string y = "CD";
+    passed += TestStr("interp_adjacent",  "{x}{y}",         "ABCD");
+
+    // Placeholder surrounded by literals
+    string mid = "mid";
+    passed += TestStr("interp_sandwich",  "pre-{mid}-suf",  "pre-mid-suf");
+
+    // Integer interpolation via operator string(i32)
+    i32 n = 42;
+    passed += TestStr("interp_int",       "n={n}",          "n=42");
+
+    i32 big = 1000;
+    passed += TestStr("interp_int_big",   "big={big}",      "big=1000");
+
+    // IString object — ToString() is itself an interpolated string
+    Color c;
+    c.r = 255;
+    c.g = 128;
+    c.b = 0;
+    passed += TestStr("interp_istring",   "color={c}",      "color=rgb(255,128,0)");
+
+    // Mixed string + int in one literal
+    string label = "score";
+    i32 value = 99;
+    passed += TestStr("interp_mixed",     "{label}={value}", "score=99");
+
+    return passed;
+}
+
+// ── string switch/case ───────────────────────────────────────────────────────
+
+int testStringSwitch()
+{
+    int passed = 0;
+
+    string fruit = "Apple";
+    int result = -1;
+    switch (fruit)
+    {
+        case "Apple":  result = 1; break;
+        case "Banana": result = 2; break;
+        case "Cherry": result = 3; break;
+        default:       result = 0; break;
+    }
+    passed += TestInt("switch_match_apple", result, 1);
+
+    fruit = "Banana";
+    result = -1;
+    switch (fruit)
+    {
+        case "Apple":  result = 1; break;
+        case "Banana": result = 2; break;
+        case "Cherry": result = 3; break;
+        default:       result = 0; break;
+    }
+    passed += TestInt("switch_match_banana", result, 2);
+
+    fruit = "Mango";
+    result = -1;
+    switch (fruit)
+    {
+        case "Apple":  result = 1; break;
+        case "Banana": result = 2; break;
+        case "Cherry": result = 3; break;
+        default:       result = 0; break;
+    }
+    passed += TestInt("switch_default", result, 0);
+
+    // operator== test
+    string a = "hello";
+    string b = "hello";
+    string c = "world";
+    passed += TestBool("str_eq_same",  a == b, true);
+    passed += TestBool("str_eq_diff",  a == c, false);
+    passed += TestBool("str_neq_diff", a != c, true);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -138,6 +256,8 @@ extern int main()
     r = testString();        passed += r; total += 11;
     r = testStringConcat();  passed += r; total += 10;
     r = testStringIString(); passed += r; total += 4;
+    r = testInterpolation(); passed += r; total += 8;
+    r = testStringSwitch();  passed += r; total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

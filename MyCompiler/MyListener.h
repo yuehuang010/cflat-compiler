@@ -467,7 +467,8 @@ private:
 
     struct SwitchCaseEntry
     {
-        llvm::ConstantInt* value;
+        llvm::ConstantInt* value = nullptr;       // non-null for integer cases
+        llvm::Constant* strLiteral = nullptr;     // non-null for string cases (i8* global)
         llvm::BasicBlock* block;
     };
 
@@ -476,6 +477,7 @@ private:
         std::unordered_map<CFlatParser::LabeledStatementContext*, SwitchCaseEntry> caseMap;
         llvm::BasicBlock* defaultBlock = nullptr;
         llvm::BasicBlock* resumeBlock = nullptr;
+        bool isStringSwitch = false;
     };
 
     std::vector<SwitchContext> switchStack;
@@ -893,11 +895,18 @@ public:
 
         if (labeled->Case())
         {
-            auto val = llvm::dyn_cast<llvm::ConstantInt>(
-                ParseConditionalExpression(labeled->constantExpression()->conditionalExpression()));
+            auto* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
+            auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
+            llvm::Constant* strLit = nullptr;
             if (!val)
-                LogErrorContext(labeled, "case value must be a constant integer expression");
-            ctx.caseMap[labeled] = { val, compiler->CreateBasicBlock("switchCase") };
+            {
+                strLit = llvm::dyn_cast<llvm::Constant>(rawVal);
+                if (strLit && compiler->IsStringLiteralConstant(strLit))
+                    ctx.isStringSwitch = true;
+                else
+                    LogErrorContext(labeled, "case value must be a constant integer or string literal");
+            }
+            ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase") };
             CollectCasesFromStatement(labeled->statement(), ctx);
         }
         else if (labeled->Default())
@@ -1313,11 +1322,32 @@ public:
 
                 auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
 
-                // Emit switch instruction
                 auto condVal = ParseExpression(expression);
-                auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
-                for (auto& [labeledCtx, entry] : switchCtx.caseMap)
-                    switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+
+                if (switchCtx.isStringSwitch)
+                {
+                    // String switch: emit if-else chain using strcmp on _ptr (field 0)
+                    auto* strPtr = compiler->builder->CreateExtractValue(condVal, { 0u });
+                    auto* strcmpFn = compiler->GetOrDeclareStrcmp();
+                    auto* i32Zero = compiler->builder->getInt32(0);
+
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    {
+                        if (!entry.strLiteral) continue;
+                        auto* nextBlock = compiler->CreateBasicBlock("switchCmp");
+                        auto* cmpResult = compiler->builder->CreateCall(strcmpFn, { strPtr, entry.strLiteral });
+                        auto* isEqual = compiler->builder->CreateICmpEQ(cmpResult, i32Zero);
+                        compiler->builder->CreateCondBr(isEqual, entry.block, nextBlock);
+                        compiler->SwitchToBlock(nextBlock);
+                    }
+                    compiler->CreateJump(switchDefault);
+                }
+                else
+                {
+                    auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                        switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                }
 
                 // Push scope: break → resumeBlock, no continue (propagates to outer loop)
                 compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);

@@ -35,6 +35,19 @@ string operator string(i32 n)
     return result;
 }
 
+// ── string equality ──────────────────────────────────────────────────────────
+
+bool operator==(string a, string b)
+{
+    if (a._len != b._len) return false;
+    return strcmp(a._ptr, b._ptr) == 0;
+}
+
+bool operator!=(string a, string b)
+{
+    return !(a == b);
+}
+
 // ── string concatenation (operator+) ─────────────────────────────────────────
 
 // Concatenate two strings: s1 + s2
