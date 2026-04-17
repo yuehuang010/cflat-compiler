@@ -1849,6 +1849,27 @@ public:
 
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
+
+            if (operatorText == "??=")
+            {
+                // Null-coalescing assignment: x ??= rhs  →  if (x == 0/null) x = rhs
+                auto* lhs = compiler->CreateLoad(destination);
+
+                auto* assignBlock  = compiler->CreateBasicBlock("nullcoalasgn_assign");
+                auto* resumeBlock  = compiler->CreateBasicBlock("nullcoalasgn_resume");
+
+                // Jump to assign block only when lhs is null/zero
+                compiler->CreateConditionJump(lhs, resumeBlock, assignBlock);
+
+                compiler->SwitchToBlock(assignBlock);
+                auto* rhs = ParseAssignmentExpression(assignCtx);
+                compiler->CreateAssignment(rhs, destination);
+                compiler->CreateJump(resumeBlock);
+
+                compiler->SwitchToBlock(resumeBlock);
+                return compiler->CreateLoad(destination);
+            }
+
             auto right = ParseAssignmentExpression(assignCtx);
 
             if (operatorText != "=")
@@ -2889,30 +2910,30 @@ public:
                     case CFlatParser::RightParen: { prevToken = tokenType; break; }
                     case CFlatParser::Dot:
                     case CFlatParser::Arrow:
+                    case CFlatParser::QuestionDot:
                     {
                         prevToken = tokenType;
-                        nullConditionalPending = false;
-                        // For '->', load the struct pointer so subsequent field/method lookups work.
-                        if (tokenType == CFlatParser::Arrow
-                            && namedVar.TypeAndValue.Pointer
+                        nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        // For any member access on a pointer to a known struct, load the pointer
+                        // so subsequent field/method lookups work. '.' auto-deduces the dereference
+                        // just like '->'; '?.' does the same but also arms the null-conditional check.
+                        if (namedVar.TypeAndValue.Pointer
                             && !namedVar.TypeAndValue.TypeName.empty()
                             && !namedVar.TypeAndValue.IsInterface)
                         {
                             auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
                             if (sd.StructType)
                             {
-                                // Load the pointer value (handles both local var allocas and direct args)
                                 llvm::Value* ptrVal = LoadNamedVariable(namedVar);
-                                structVar.Storage  = ptrVal;
-                                structVar.Primary  = nullptr;
-                                structVar.BaseType = sd.StructType;
+                                structVar.Storage      = ptrVal;
+                                structVar.Primary      = nullptr;
+                                structVar.BaseType     = sd.StructType;
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
                                 structVar.TypeAndValue.Pointer = false;
                             }
                         }
                         break;
                     }
-                    case CFlatParser::QuestionDot: { prevToken = tokenType; nullConditionalPending = true; break; }
                     case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
                     case CFlatParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
                     case CFlatParser::Identifier:

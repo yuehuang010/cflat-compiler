@@ -613,13 +613,20 @@ bool testNullConditional()
     NullableNode* np = nullptr;
 
     // null-conditional field access + coalescing via helper
-    // (helpers take NullableNode* as a function arg, which correctly sets up struct access)
     result &= Test("nc_coalesce_nonnull", readNodeValueNC(p),  99);
     result &= Test("nc_coalesce_null",    readNodeValueNC(np), -1);
 
     // null-conditional method call via helper
     result &= Test("nc_method_nonnull",   callNodeRead(p),  99);
     result &= Test("nc_method_null",      callNodeRead(np), -1);
+
+    // null-conditional method call directly on a local pointer (no helper)
+    result &= Test("nc_direct_nonnull", p?.Read()  ?? -1, 99);
+    result &= Test("nc_direct_null",    np?.Read() ?? -1, -1);
+
+    // null-conditional field access directly on a local pointer (no helper)
+    result &= Test("nc_direct_field_nonnull", p?.value  ?? -1, 99);
+    result &= Test("nc_direct_field_null",    np?.value ?? -1, -1);
 
     return result;
 }
@@ -645,6 +652,58 @@ bool testNullCoalescing()
     int five = 5;
     result &= Test("nullcoal_zero",    zero ?? 42, 42);
     result &= Test("nullcoal_nonzero", five ?? 42, 5);
+
+    return result;
+}
+
+// =============================================================
+// Null-coalescing assignment (??=) tests
+// =============================================================
+
+bool testNullCoalescingAssignment()
+{
+    bool result = true;
+
+    // zero int: should be assigned the rhs value
+    int x = 0;
+    x ??= 42;
+    result &= Test("nullcoalasgn_zero_becomes_rhs", x, 42);
+
+    // nonzero int: should keep its original value
+    int y = 7;
+    y ??= 99;
+    result &= Test("nullcoalasgn_nonzero_unchanged", y, 7);
+
+    // repeated application: once set, a second ??= should not overwrite
+    int z = 0;
+    z ??= 10;
+    z ??= 20;
+    result &= Test("nullcoalasgn_already_set", z, 10);
+
+    // null pointer: should be assigned the rhs
+    const char* p = nullptr;
+    p ??= "hello";
+    result &= TestStr("nullcoalasgn_null_ptr", p, "hello");
+
+    // non-null pointer: should keep its original value
+    const char* q = "world";
+    q ??= "other";
+    result &= TestStr("nullcoalasgn_nonnull_ptr", q, "world");
+
+    // null struct pointer: should be assigned the rhs
+    NullableNode* node = nullptr;
+    node ??= new NullableNode();
+    result &= Test("nullcoalasgn_null_struct_ptr", node?.Read() ?? -1, 99);
+    delete node;
+
+    // non-null struct pointer: should keep its original value and not be replaced
+    NullableNode* nonNullNode = new NullableNode();
+    NullableNode* replacementNode = new NullableNode();
+    NullableNode* before = nonNullNode;
+    nonNullNode ??= replacementNode;
+    result &= TestBool("nullcoalasgn_nonnull_struct_ptr", nonNullNode == before);
+    delete nonNullNode;
+    delete replacementNode;
 
     return result;
 }
@@ -857,6 +916,7 @@ extern int main()
     result &= testExplicitIntTypes();
     result &= testNullConditional();
     result &= testNullCoalescing();
+    result &= testNullCoalescingAssignment();
     result &= testDefault();
     result &= Test("testNewDelete", testNewDelete(), 42);
     result &= Test("testNewArray", testNewArray(), 99);

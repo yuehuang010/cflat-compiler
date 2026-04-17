@@ -174,6 +174,7 @@ assignmentOperator
     | '&='
     | '^='
     | '|='
+    | '??='
     ;
 
 expression
@@ -900,6 +901,10 @@ Tilde
 
 QuestionDot
     : '?.'
+    ;
+
+QuestionQuestionAssign
+    : '??='
     ;
 
 QuestionQuestion
