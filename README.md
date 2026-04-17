@@ -55,6 +55,40 @@ i64 bigNum = 200000;
 
 `i32` and `int` are the same type and are freely interchangeable.
 
+#### `string`
+
+`string` is a built-in value type with layout `{ i8* _ptr, i32 _len }`. String literals are automatically wrapped into a `string` when assigned to a `string` variable or passed to a `string` parameter.
+
+```c
+string s = "hello";
+s.length();   // 5
+s.data();     // i8* — null-terminated bytes
+```
+
+Concatenation with `operator+` — produces a freshly allocated buffer:
+
+```c
+string a = "hello";
+string b = a + " world";          // string + const char*
+string c = a + b;                 // string + string
+```
+
+Any type implementing the `IString` interface participates in concatenation via its `ToString()` method:
+
+```c
+class Greeting : IString
+{
+    string ToString() { return "world"; }
+};
+
+Greeting g;
+string result = "hello " + g;     // "hello world"
+```
+
+For incremental building, use `stringbuilder` — a mutable, growable buffer with `append`, `appendCStr`, `appendChar`, `clear`, and `toString`.
+
+Define `operator string(T)` to convert arbitrary types to `string`; the core library provides conversions from `char*`, `i32`, and any `IString`.
+
 #### Structs
 
 Structs support field defaults, member functions, constructors, and destructors:
