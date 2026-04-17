@@ -84,15 +84,14 @@ private:
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                     {
                         // Generic type instantiation: Box<MyType> → Box__MyType
-                        std::string mangledName = typeSpec->genericIdentifier()->Identifier()->getText();
+                        std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                        std::vector<std::string> typeArgs;
                     for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
                     {
-                        // Type arguments must be identifiers (user-defined types), not built-in types
-                        if (typeParamSpec->genericIdentifier() != nullptr && typeParamSpec->genericIdentifier()->Identifier() != nullptr)
-                        {
-                            mangledName += "__" + typeParamSpec->genericIdentifier()->Identifier()->getText();
-                        }
+                        typeArgs.push_back(typeParamSpec->getText());
                     }
+                    std::string mangledName = baseName;
+                    for (const auto& arg : typeArgs) mangledName += "__" + arg;
                     // Pre-declare opaque struct type and default constructor so that
                     // uses inside function bodies are resolvable before the full
                     // definition is emitted by ProcessPendingInstantiations().

@@ -1,0 +1,183 @@
+import "filesystem.cb";
+
+extern int strcmp(const char* a, const char* b);
+
+int TestBool(const char* name, bool actual, bool expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+int TestInt(const char* name, int actual, int expected)
+{
+    if (actual == expected) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+int TestStr(const char* name, const char* actual, const char* expected)
+{
+    if (strcmp(actual, expected) == 0) { printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected '%s' got '%s').\n", name, expected, actual);
+    return 0;
+}
+
+// ── free functions: read/write/exists/delete ──────────────────────────────────
+
+int testFileReadWrite()
+{
+    int passed = 0;
+    string path = "test_fs_tmp.txt";
+    string hw   = "hello world";
+    string again = " again";
+
+    fileDelete(path);
+    passed += TestBool("file not exists before write", fileExists(path), false);
+
+    passed += TestBool("writeAllText",            writeAllText(path, hw), true);
+    passed += TestBool("file exists after write", fileExists(path),       true);
+
+    string content = readAllText(path);
+    passed += TestStr("readAllText content", content.data(), "hello world");
+    passed += TestInt("readAllText length",  content.length(), 11);
+
+    passed += TestBool("appendAllText", appendAllText(path, again), true);
+    string content2 = readAllText(path);
+    passed += TestStr("after append", content2.data(), "hello world again");
+
+    passed += TestBool("fileDelete",               fileDelete(path), true);
+    passed += TestBool("file not exists after del", fileExists(path), false);
+
+    return passed;
+}
+
+// ── File class: open / writeLine / readLine / size ────────────────────────────
+
+int testFileClass()
+{
+    int passed = 0;
+    string path  = "test_fs_class.txt";
+    string hello = "hello";
+    string world = "world";
+    fileDelete(path);
+
+    File* w = new File;
+    passed += TestBool("openWrite",       w->openWrite(path), true);
+    passed += TestBool("isOpen",          w->isOpen(),        true);
+    passed += TestBool("writeLine hello", w->writeLine(hello), true);
+    passed += TestBool("writeLine world", w->writeLine(world), true);
+    w->close();
+    passed += TestBool("isOpen after close", w->isOpen(), false);
+    delete w;
+
+    File* r = new File;
+    passed += TestBool("openRead", r->openRead(path), true);
+    string line1 = r->readLine();
+    string line2 = r->readLine();
+    passed += TestStr("readLine 1", line1.data(), "hello");
+    passed += TestStr("readLine 2", line2.data(), "world");
+    r->readLine();
+    passed += TestBool("atEnd", r->atEnd(), true);
+    delete r;
+
+    // "hello\n" + "world\n" = 12 bytes
+    File* s = new File;
+    s->openRead(path);
+    int sz = s->size();
+    passed += TestBool("file size 12", sz == 12, true);
+    delete s;
+
+    fileDelete(path);
+    return passed;
+}
+
+// ── fileMove ─────────────────────────────────────────────────────────────────
+
+int testFileMove()
+{
+    int passed = 0;
+    string src     = "test_fs_move_src.txt";
+    string dst     = "test_fs_move_dst.txt";
+    string moveme  = "move me";
+    fileDelete(src);
+    fileDelete(dst);
+
+    writeAllText(src, moveme);
+    passed += TestBool("fileMove ok",           fileMove(src, dst),  true);
+    passed += TestBool("src gone after move",   fileExists(src),     false);
+    passed += TestBool("dst exists after move", fileExists(dst),     true);
+
+    string content = readAllText(dst);
+    passed += TestStr("moved content", content.data(), "move me");
+
+    fileDelete(dst);
+    return passed;
+}
+
+// ── Directory free functions ──────────────────────────────────────────────────
+
+int testDirectoryFunctions()
+{
+    int passed = 0;
+    string testDir = "test_fs_dir";
+
+    dirDelete(testDir);
+    passed += TestBool("dir not exists before create", dirExists(testDir), false);
+    passed += TestBool("dirCreate",                    dirCreate(testDir), true);
+    passed += TestBool("dir exists after create",      dirExists(testDir), true);
+    passed += TestBool("dirDelete",                    dirDelete(testDir), true);
+    passed += TestBool("dir not exists after delete",  dirExists(testDir), false);
+
+    string cwd = getCurrentDir();
+    passed += TestBool("getCurrentDir not empty", cwd.length() > 0, true);
+
+    return passed;
+}
+
+// ── Directory class ───────────────────────────────────────────────────────────
+
+int testDirectoryClass()
+{
+    int passed = 0;
+    string testDir = "test_fs_dir2";
+    string atxt    = "test_fs_dir2\\a.txt";
+    string btxt    = "test_fs_dir2\\b.txt";
+
+    fileDelete(atxt);
+    fileDelete(btxt);
+    dirDelete(testDir);
+
+    Directory* d = new Directory;
+    d->init(testDir);
+
+    passed += TestBool("Directory.exists false",  d->exists(), false);
+    passed += TestBool("Directory.create",        d->create(), true);
+    passed += TestBool("Directory.exists true",   d->exists(), true);
+
+    fileDelete(atxt);
+    fileDelete(btxt);
+    passed += TestBool("Directory.remove", d->remove(), true);
+    delete d;
+
+    return passed;
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    int r;
+
+    r = testFileReadWrite();      passed += r; total += 9;
+    r = testFileClass();          passed += r; total += 10;
+    r = testFileMove();           passed += r; total += 4;
+    r = testDirectoryFunctions(); passed += r; total += 6;
+    r = testDirectoryClass();     passed += r; total += 4;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

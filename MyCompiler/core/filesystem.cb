@@ -1,0 +1,338 @@
+// core/filesystem.cb — File and Directory classes for CFlat
+//
+// Wraps UCRT file I/O (fopen/fread/fwrite/…) and Win32 directory APIs.
+// Paths are null-terminated via string.data().
+
+import "string.cb";
+import "list.cb";
+
+// ── C runtime / Win32 declarations ───────────────────────────────────────────
+
+extern void* fopen(const char* path, const char* mode);
+extern int   fclose(void* stream);
+extern int   fread(i8* buf, int size, int count, void* stream);
+extern int   fwrite(i8* buf, int size, int count, void* stream);
+extern i8*   fgets(i8* buf, int size, void* stream);
+extern int   feof(void* stream);
+extern int   fseek(void* stream, int offset, int origin);
+extern int   ftell(void* stream);
+
+extern int   _unlink(const char* path);
+extern int   MoveFileExA(const char* existing, const char* newPath, int flags);
+extern int   _access(const char* path, int mode);
+extern int   _mkdir(const char* path);
+extern int   _rmdir(const char* path);
+extern i8*   _getcwd(i8* buf, int size);
+extern int   _chdir(const char* path);
+extern int   strcmp(const char* a, const char* b);
+
+// Win32 FindFirstFile/FindNextFile — handle returned/accepted as i64 so we can
+// compare against INVALID_HANDLE_VALUE (-1) without a void* cast.
+extern i64   FindFirstFileA(const char* pattern, i8* findData);
+extern int   FindNextFileA(i64 handle, i8* findData);
+extern int   FindClose(i64 handle);
+extern int   GetFileAttributesA(const char* path);
+
+// ── File ─────────────────────────────────────────────────────────────────────
+
+class File
+{
+    void* _handle = nullptr;
+
+    bool openRead(string path)
+    {
+        if (_handle != nullptr) fclose(_handle);
+        _handle = fopen(path.data(), "rb");
+        return _handle != nullptr;
+    }
+
+    bool openWrite(string path)
+    {
+        if (_handle != nullptr) fclose(_handle);
+        _handle = fopen(path.data(), "wb");
+        return _handle != nullptr;
+    }
+
+    bool openAppend(string path)
+    {
+        if (_handle != nullptr) fclose(_handle);
+        _handle = fopen(path.data(), "ab");
+        return _handle != nullptr;
+    }
+
+    bool open(string path, string mode)
+    {
+        if (_handle != nullptr) fclose(_handle);
+        _handle = fopen(path.data(), mode.data());
+        return _handle != nullptr;
+    }
+
+    void close()
+    {
+        if (_handle != nullptr)
+        {
+            fclose(_handle);
+            _handle = nullptr;
+        }
+    }
+
+    bool isOpen() { return _handle != nullptr; }
+    bool atEnd()  { return _handle != nullptr && feof(_handle) != 0; }
+
+    // Read one line (strips trailing \r and \n). Returns empty string at EOF.
+    string readLine()
+    {
+        if (_handle == nullptr) return "";
+        i8* buf = new i8[4096];
+        i8* result = fgets(buf, 4096, _handle);
+        if (result == nullptr)
+        {
+            delete[] buf;
+            return "";
+        }
+        i32 len = strlen(buf);
+        if (len > 0 && buf[len - 1] == '\n')
+        {
+            buf[len - 1] = 0;
+            len--;
+        }
+        if (len > 0 && buf[len - 1] == '\r')
+        {
+            buf[len - 1] = 0;
+            len--;
+        }
+        string s;
+        s._ptr = buf;
+        s._len = len;
+        return s;
+    }
+
+    // Read the entire file and return its contents as a string.
+    string readAll()
+    {
+        if (_handle == nullptr) return "";
+        fseek(_handle, 0, 2);
+        int isz = ftell(_handle);
+        fseek(_handle, 0, 0);
+        i8* buf = new i8[isz + 1];
+        fread(buf, 1, isz, _handle);
+        buf[isz] = 0;
+        string s;
+        s._ptr = buf;
+        s._len = isz;
+        return s;
+    }
+
+    // Write a string to the file. Returns true if all bytes were written.
+    bool write(string text)
+    {
+        if (_handle == nullptr) return false;
+        int len = text.length();
+        if (len == 0) return true;
+        int written = fwrite(text.data(), 1, len, _handle);
+        return written == len;
+    }
+
+    // Write a string followed by a newline character.
+    bool writeLine(string text)
+    {
+        if (!write(text)) return false;
+        string nl = "\n";
+        return write(nl);
+    }
+
+    // Return the total file size in bytes without changing the read position.
+    int size()
+    {
+        if (_handle == nullptr) return -1;
+        int cur = ftell(_handle);
+        fseek(_handle, 0, 2);
+        int sz = ftell(_handle);
+        fseek(_handle, cur, 0);
+        return sz;
+    }
+
+    ~File()
+    {
+        if (_handle != nullptr) fclose(_handle);
+    }
+};
+
+// ── File free functions ──────────────────────────────────────────────────────
+
+bool fileExists(string path)
+{
+    return _access(path.data(), 0) == 0;
+}
+
+bool fileDelete(string path)
+{
+    return _unlink(path.data()) == 0;
+}
+
+bool fileMove(string src, string dst)
+{
+    // MOVEFILE_REPLACE_EXISTING = 1
+    return MoveFileExA(src.data(), dst.data(), 1) != 0;
+}
+
+// Read the entire file at path in one call.
+string readAllText(string path)
+{
+    File* f = new File;
+    if (!f->openRead(path))
+    {
+        delete f;
+        return "";
+    }
+    string result = f->readAll();
+    delete f;
+    return result;
+}
+
+// Write content to path, overwriting any existing file.
+bool writeAllText(string path, string content)
+{
+    File* f = new File;
+    if (!f->openWrite(path))
+    {
+        delete f;
+        return false;
+    }
+    bool ok = f->write(content);
+    delete f;
+    return ok;
+}
+
+bool writeAllText(string path, const char* content)
+{
+    string s;
+    s._ptr = content;
+    s._len = strlen(content);
+    return writeAllText(path, s);
+}
+
+// Append content to path (creates the file if it does not exist).
+bool appendAllText(string path, string content)
+{
+    File* f = new File;
+    if (!f->openAppend(path))
+    {
+        delete f;
+        return false;
+    }
+    bool ok = f->write(content);
+    delete f;
+    return ok;
+}
+
+bool appendAllText(string path, const char* content)
+{
+    string s;
+    s._ptr = content;
+    s._len = strlen(content);
+    return appendAllText(path, s);
+}
+
+// ── Directory ─────────────────────────────────────────────────────────────────
+
+class Directory
+{
+    i8* _pathPtr = nullptr;
+    i32 _pathLen = 0;
+
+    // Set the directory path this instance operates on.
+    void init(string path)
+    {
+        _pathPtr = path.data();
+        _pathLen = path.length();
+    }
+
+    string path()
+    {
+        string s;
+        s._ptr = _pathPtr;
+        s._len = _pathLen;
+        return s;
+    }
+
+    bool exists()
+    {
+        return _access(_pathPtr, 0) == 0;
+    }
+
+    bool create() { return _mkdir(_pathPtr) == 0; }
+    bool remove() { return _rmdir(_pathPtr) == 0; }
+};
+
+// ── Directory free functions ──────────────────────────────────────────────────
+
+bool dirExists(string path)
+{
+    return _access(path.data(), 0) == 0;
+}
+
+bool dirCreate(string path) { return _mkdir(path.data()) == 0; }
+bool dirDelete(string path) { return _rmdir(path.data()) == 0; }
+
+// Return the process current working directory.
+string getCurrentDir()
+{
+    i8* buf = new i8[4096];
+    i8* result = _getcwd(buf, 4096);
+    if (result == nullptr)
+    {
+        delete[] buf;
+        return "";
+    }
+    string s;
+    s._ptr = buf;
+    s._len = strlen(buf);
+    return s;
+}
+
+bool setCurrentDir(string path)
+{
+    return _chdir(path.data()) == 0;
+}
+
+// List all entries (files and subdirs) in a directory.
+// WIN32_FIND_DATAA: 600 bytes; cFileName[260] is at byte offset 44.
+// Caller is responsible for deleting the returned list.
+list<string>* listDir(string path)
+{
+    list<string>* result = new list<string>;
+    string pattern = path + "\\*";
+    i8* findData = new i8[600];
+    i64 handle = FindFirstFileA(pattern.data(), findData);
+    if (handle < 0)
+    {
+        delete[] findData;
+        return result;
+    }
+    do {
+        i8* nameBuf = new i8[260];
+        int k = 0;
+        while (k < 260)
+        {
+            i8 c = findData[44 + k];
+            nameBuf[k] = c;
+            k++;
+            if (c == 0) break;
+        }
+        if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
+        {
+            string entry;
+            entry._ptr = nameBuf;
+            entry._len = strlen(nameBuf);
+            result->add(entry);
+        }
+        else
+        {
+            delete[] nameBuf;
+        }
+    } while (FindNextFileA(handle, findData) != 0);
+    FindClose(handle);
+    delete[] findData;
+    return result;
+}

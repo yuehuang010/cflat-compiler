@@ -38,7 +38,7 @@ bool TestBool(const char* testName, bool actual)
 bool testBuiltinIdentifiers()
 {
     bool result = true;
-    result &= TestStr("__FILE__", __FILE__, "testfile2.c");
+    result &= TestStr("__FILE__", __FILE__, "testfile2.cb");
     result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
     result &= Test("__LINE__", __LINE__, 43); // Remember to adjust if shifted.
     return result;

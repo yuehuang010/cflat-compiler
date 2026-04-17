@@ -282,12 +282,64 @@ bool testGenericInterface()
     return result;
 }
 
+// =============================================================
+// Returning list<T>* from functions
+// =============================================================
+
+import "list.cb";
+
+list<int>* makeIntList()
+{
+    list<int>* l = new list<int>;
+    l->add(10);
+    l->add(20);
+    l->add(30);
+    return l;
+}
+
+class ListFactory
+{
+    list<int>* create()
+    {
+        list<int>* l = new list<int>;
+        l->add(1);
+        l->add(2);
+        return l;
+    }
+};
+
+bool testReturnListFreeFunc()
+{
+    bool result = true;
+    list<int>* l = makeIntList();
+    result &= Test("return_list_count",  l->count(), 3);
+    result &= Test("return_list_get_0",  l->get(0),  10);
+    result &= Test("return_list_get_1",  l->get(1),  20);
+    result &= Test("return_list_get_2",  l->get(2),  30);
+    delete l;
+    return result;
+}
+
+bool testReturnListMethod()
+{
+    bool result = true;
+    ListFactory f;
+    list<int>* l = f.create();
+    result &= Test("return_list_method_count", l->count(), 2);
+    result &= Test("return_list_method_get_0", l->get(0),  1);
+    result &= Test("return_list_method_get_1", l->get(1),  2);
+    delete l;
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
     result &= testGenericStructs();
     result &= testInterface();
     result &= testGenericInterface();
+    result &= testReturnListFreeFunc();
+    result &= testReturnListMethod();
     if (result)
     {
         printf("All Test Passed.\n");

@@ -13,14 +13,15 @@ set ERRORS=0
 if not exist "%OUT%" mkdir "%OUT%"
 
 call :RunTest testfile
-call :RunTest testfile2
-call :RunTest test_generics
-call :RunTest testfile_module -i %LIB%
-call :RunTest test_library_string -i %LIB%
+call :RunTestCb testfile2
+call :RunTestCb test_generics
+call :RunTestCb testfile_module -i %LIB%
+call :RunTestCb test_library_string -i %LIB%
 call :RunTestCb test_operators
 call :RunTestCb test_is_as
 call :RunTestCb test_core
 call :RunTestCb test_core_string
+call :RunTestCb test_filesystem
 
 echo.
 if %ERRORS% EQU 0 (
