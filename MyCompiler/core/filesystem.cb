@@ -8,30 +8,35 @@ import "list.cb";
 
 // ── C runtime / Win32 declarations ───────────────────────────────────────────
 
-extern void* fopen(const char* path, const char* mode);
-extern int   fclose(void* stream);
-extern int   fread(i8* buf, int size, int count, void* stream);
-extern int   fwrite(i8* buf, int size, int count, void* stream);
-extern i8*   fgets(i8* buf, int size, void* stream);
-extern int   feof(void* stream);
-extern int   fseek(void* stream, int offset, int origin);
-extern int   ftell(void* stream);
+if const (__PLATFORM__ >= 32)
+{
+    // Windows/UCRT C runtime functions (available on all Windows platforms)
+    extern void* fopen(const char* path, const char* mode);
+    extern int   fclose(void* stream);
+    extern int   fread(i8* buf, int size, int count, void* stream);
+    extern int   fwrite(i8* buf, int size, int count, void* stream);
+    extern i8*   fgets(i8* buf, int size, void* stream);
+    extern int   feof(void* stream);
+    extern int   fseek(void* stream, int offset, int origin);
+    extern int   ftell(void* stream);
 
-extern int   _unlink(const char* path);
-extern int   MoveFileExA(const char* existing, const char* newPath, int flags);
-extern int   _access(const char* path, int mode);
-extern int   _mkdir(const char* path);
-extern int   _rmdir(const char* path);
-extern i8*   _getcwd(i8* buf, int size);
-extern int   _chdir(const char* path);
-extern int   strcmp(const char* a, const char* b);
+    extern int   _unlink(const char* path);
+    extern int   MoveFileExA(const char* existing, const char* newPath, int flags);
+    extern int   _access(const char* path, int mode);
+    extern int   _mkdir(const char* path);
+    extern int   _rmdir(const char* path);
+    extern i8*   _getcwd(i8* buf, int size);
+    extern int   _chdir(const char* path);
+    extern int   strcmp(const char* a, const char* b);
 
-// Win32 FindFirstFile/FindNextFile — handle returned/accepted as i64 so we can
-// compare against INVALID_HANDLE_VALUE (-1) without a void* cast.
-extern i64   FindFirstFileA(const char* pattern, i8* findData);
-extern int   FindNextFileA(i64 handle, i8* findData);
-extern int   FindClose(i64 handle);
-extern int   GetFileAttributesA(const char* path);
+    // Win32 FindFirstFile/FindNextFile — handle returned/accepted as i64 so we can
+    // compare against INVALID_HANDLE_VALUE (-1) without a void* cast.
+    // (Available on all Windows platforms: win32 and win64)
+    extern i64   FindFirstFileA(const char* pattern, i8* findData);
+    extern int   FindNextFileA(i64 handle, i8* findData);
+    extern int   FindClose(i64 handle);
+    extern int   GetFileAttributesA(const char* path);
+}
 
 // ── File ─────────────────────────────────────────────────────────────────────
 
@@ -292,43 +297,50 @@ class Directory
     }
 
     // List all entries (files and subdirs) in a directory.
+    // Win32 implementation: uses FindFirstFileA/FindNextFileA.
     // WIN32_FIND_DATAA: 600 bytes; cFileName[260] is at byte offset 44.
     // Caller is responsible for deleting the returned list.
     static list<string>* list(string path)
     {
         list<string>* result = new list<string>;
-        string pattern = path + "\\*";
-        i8* findData = new i8[600];
-        i64 handle = FindFirstFileA(pattern.data(), findData);
-        if (handle < 0)
+
+        if const (__PLATFORM__ >= 32)
         {
+            // Windows implementation
+            string pattern = path + "\\*";
+            i8* findData = new i8[600];
+            i64 handle = FindFirstFileA(pattern.data(), findData);
+            if (handle < 0)
+            {
+                delete[] findData;
+                return result;
+            }
+            do {
+                i8* nameBuf = new i8[260];
+                int k = 0;
+                while (k < 260)
+                {
+                    i8 c = findData[44 + k];
+                    nameBuf[k] = c;
+                    k++;
+                    if (c == 0) break;
+                }
+                if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
+                {
+                    string entry;
+                    entry._ptr = nameBuf;
+                    entry._len = strlen(nameBuf);
+                    result->add(entry);
+                }
+                else
+                {
+                    delete[] nameBuf;
+                }
+            } while (FindNextFileA(handle, findData) != 0);
+            FindClose(handle);
             delete[] findData;
-            return result;
         }
-        do {
-            i8* nameBuf = new i8[260];
-            int k = 0;
-            while (k < 260)
-            {
-                i8 c = findData[44 + k];
-                nameBuf[k] = c;
-                k++;
-                if (c == 0) break;
-            }
-            if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
-            {
-                string entry;
-                entry._ptr = nameBuf;
-                entry._len = strlen(nameBuf);
-                result->add(entry);
-            }
-            else
-            {
-                delete[] nameBuf;
-            }
-        } while (FindNextFileA(handle, findData) != 0);
-        FindClose(handle);
-        delete[] findData;
+
         return result;
     }
 };

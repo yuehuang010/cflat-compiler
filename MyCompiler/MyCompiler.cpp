@@ -31,7 +31,7 @@ int main(int argc, char* argv[])
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
-    args.addOption("platform", 'p', "Target platform: x64 (default) or x86", "x64");
+    args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
 
     if (!args.parse(argc, argv))

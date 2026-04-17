@@ -310,6 +310,16 @@ public:
     std::string importSearchDir;
     std::string runtimeDir;
     bool verbose = false;
+    int platformValue = 64;  // 64 for win64, 32 for win32
+
+    // Compile-time macros (constant throughout compilation, set early)
+    struct CompileTimeMacro
+    {
+        std::string name;
+        llvm::Constant* value;
+        std::string type;  // "int", "string", etc.
+    };
+    std::unordered_map<std::string, CompileTimeMacro> compileTimeMacros;
     // Keep imported parse state alive: generic template ctx pointers point into
     // these ANTLR parse trees and are accessed later during main-file instantiation.
     struct ImportedParseState
@@ -731,14 +741,14 @@ private:
         std::string clangTarget;
         std::string cpu;
         std::string clangBits;
-        if (platform == "x86")
+        if (platform == "win32")
         {
             triple = "i686-pc-windows-msvc";
             clangTarget = "--target=i686-pc-windows-msvc";
             clangBits = "-m32";
             cpu = "i686";
         }
-        else // x64 (default)
+        else // win64 (default)
         {
             triple = "x86_64-pc-windows-msvc";
             clangTarget = "--target=x86_64-pc-windows-msvc";
@@ -808,7 +818,7 @@ private:
             return false;
         }
 
-        const std::string arch = (platform == "x86") ? "x86" : "x64";
+        const std::string arch = (platform == "win32") ? "x86" : "x64";
 
         // ---- Find VS install path via vswhere ----
         std::string vsPath;
@@ -2879,6 +2889,24 @@ public:
         }
 
         return nullptr;
+    }
+
+    llvm::Constant* GetPlatformConstant()
+    {
+        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
+    }
+
+    void SetCompileTimeMacro(const std::string& name, llvm::Constant* value, const std::string& type)
+    {
+        compileTimeMacros[name] = {name, value, type};
+    }
+
+    CompileTimeMacro GetCompileTimeMacro(const std::string& name)
+    {
+        auto it = compileTimeMacros.find(name);
+        if (it != compileTimeMacros.end())
+            return it->second;
+        return {"", nullptr, ""};
     }
 
     StructData GetDataStructure(std::string structName)

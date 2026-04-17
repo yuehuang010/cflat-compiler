@@ -25,6 +25,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     auto bitcodePath = args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
     importSearchDir = args.getOption("import-dir").value_or("");
+    auto platformOption = args.getOption("platform").value_or("win64");
 
     if (verbose)
     {
@@ -66,6 +67,31 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     {
         std::filesystem::path filePath = std::filesystem::absolute(filename);
         InitDebugInfo(filePath.filename().string(), filePath.parent_path().string());
+    }
+
+    // Set the platform constant (__PLATFORM__) based on the target platform.
+    // This is a compile-time constant available in all compiled files.
+    platformValue = (platformOption == "win32") ? 32 : 64;
+    if (verbose) std::cout << "[verbose] __PLATFORM__ = " << platformValue << "\n";
+
+    // Pre-populate compile-time macros (constants throughout compilation)
+    {
+        // __FILE__: source filename (create global string directly without BasicBlock)
+        auto* fileGlobalStr = module->getOrInsertGlobal("__FILE__",
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), sourceFileName.size() + 1));
+        auto* fileConst = llvm::ConstantDataArray::getString(*context, sourceFileName, true);
+        if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(fileGlobalStr))
+        {
+            gv->setInitializer(fileConst);
+            gv->setConstant(true);
+            SetCompileTimeMacro("__FILE__", gv, "string");
+        }
+
+        // __PLATFORM__: target platform (64 or 32)
+        auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
+        SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
+
+        if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
 
     // Auto-import the CFlat runtime (provides printf and other builtins).
@@ -198,7 +224,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     if (exePath)
     {
         if (verbose) std::cout << "[verbose] emitting executable to " << *exePath << "\n";
-        if (!EmitExecutable(*exePath, args.getOption("platform").value_or("x64")))
+        if (!EmitExecutable(*exePath, platformOption))
         {
             std::cerr << "Error: failed to emit executable '" << *exePath << "'.\n";
             return false;

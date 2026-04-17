@@ -447,6 +447,7 @@ expressionStatement
 
 selectionStatement
     : 'if' '(' expression ')' statement ('else' statement)?
+    | 'if' 'const' '(' expression ')' statement ('else' statement)?
     | 'switch' '(' expression ')' statement
     ;
 
@@ -498,7 +499,16 @@ externalDeclaration
     | namespaceDefinition
     | usingDeclaration
     | importDeclaration
+    | ifConstDeclaration
     | ';' // stray ;
+    ;
+
+ifConstDeclaration
+    : 'if' 'const' '(' expression ')' '{' ifConstBlock '}' ('else' '{' ifConstBlock '}')?
+    ;
+
+ifConstBlock
+    : externalDeclaration*
     ;
 
 usingDeclaration

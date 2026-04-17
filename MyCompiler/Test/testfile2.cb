@@ -880,6 +880,181 @@ bool testFormatString()
     return result;
 }
 
+// =============================================================
+// if const compile-time conditional tests
+// =============================================================
+
+bool testIfConst()
+{
+    bool result = true;
+
+    // Test 1: if const with true literal — should enter true branch
+    if const (true)
+    {
+        result &= Test("if_const_true", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_true", 0, 1);  // should not execute
+    }
+
+    // Test 2: if const with false literal — should skip body entirely
+    if const (false)
+    {
+        result &= Test("if_const_false", 0, 1);  // should not execute
+    }
+
+    // Test 3: if const with comparison (1 == 1) — should enter true branch
+    if const (1 == 1)
+    {
+        result &= Test("if_const_eq_true", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_eq_true", 0, 1);  // should not execute
+    }
+
+    // Test 4: if const with false comparison (1 == 2) — should enter else branch
+    if const (1 == 2)
+    {
+        result &= Test("if_const_eq_false", 0, 1);  // should not execute
+    }
+    else
+    {
+        result &= Test("if_const_eq_false", 1, 1);
+    }
+
+    // Test 5: if const with inequality (5 != 3) — should enter true branch
+    if const (5 != 3)
+    {
+        result &= Test("if_const_neq_true", 1, 1);
+    }
+    else
+    {
+        result &= Test("if_const_neq_true", 0, 1);  // should not execute
+    }
+
+    return result;
+}
+
+// =============================================================
+// Platform constant tests (__PLATFORM__)
+// =============================================================
+
+bool testPlatformConstant()
+{
+    bool result = true;
+
+    // The __PLATFORM__ constant is set at compile-time based on -p flag:
+    // 64 for win64 (default), 32 for win32
+    // This test verifies that if const works with __PLATFORM__
+
+    if const (__PLATFORM__ == 64)
+    {
+        result &= Test("__PLATFORM__==64", 1, 1);
+    }
+    else if const (__PLATFORM__ == 32)
+    {
+        result &= Test("__PLATFORM__==32", 1, 1);
+    }
+
+    // Verify that exactly one of the above branches executed
+    // (the other branch should be completely eliminated from IR)
+    return result;
+}
+
+// =============================================================
+// Global-scope if const tests (compile-time conditional declarations)
+// =============================================================
+
+// Test 1: Simple true/false branches at global scope
+if const (true)
+{
+    class GlobalTrueClass
+    {
+        int value = 42;
+    };
+}
+else
+{
+    class GlobalFalseClass
+    {
+        int value = 0;
+    };
+}
+
+// Test 2: Platform-specific declarations
+if const (__PLATFORM__ >= 32)
+{
+    class PlatformSpecificClass
+    {
+        int platformValue = 64;
+    };
+
+    void platformSpecificFunc()
+    {
+        printf("Compiled for win64\n");
+    }
+}
+else
+{
+    class PlatformSpecificClass
+    {
+        int platformValue = 32;
+    };
+
+    void platformSpecificFunc()
+    {
+        printf("Compiled for other platform\n");
+    }
+}
+
+// Test 3: Nested if const at global scope
+if const (false)
+{
+    class NeverDeclared
+    {
+        int x = 99;
+    };
+}
+
+if const (true)
+{
+    class AlwaysDeclared
+    {
+        int y = 123;
+    };
+}
+
+bool testGlobalIfConst()
+{
+    bool result = true;
+
+    // Test that GlobalTrueClass from true branch is available
+    GlobalTrueClass gtc = GlobalTrueClass();
+    result &= Test("global_if_const_true_branch", gtc.value, 42);
+
+    // Test that PlatformSpecificClass is declared correctly
+    PlatformSpecificClass psc = PlatformSpecificClass();
+    if const (__PLATFORM__ >= 32)
+    {
+        result &= Test("global_if_const_platform_win64", psc.platformValue, 64);
+    }
+    else
+    {
+        result &= Test("global_if_const_platform_other", psc.platformValue, 32);
+    }
+
+    // Test that AlwaysDeclared from always-true branch is available
+    AlwaysDeclared ad = AlwaysDeclared();
+    result &= Test("global_if_const_always_declared", ad.y, 123);
+
+    // Call platform-specific function
+    platformSpecificFunc();
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -924,6 +1099,9 @@ extern int main()
     result &= testStringType();
     result &= testStringLiteral();
     result &= testFormatString();
+    result &= testIfConst();
+    result &= testPlatformConstant();
+    result &= testGlobalIfConst();
 
     if (result)
     {

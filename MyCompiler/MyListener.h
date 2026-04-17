@@ -405,6 +405,8 @@ public:
             ScanInterfaceDefinition(iface);
         else if (auto usingDecl = ctx->usingDeclaration())
             ScanUsingDeclaration(usingDecl);
+        // if const declarations are skipped here; they are handled in MyListener
+        // which has access to expression evaluation and can determine the taken branch
     }
 
     void ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
@@ -800,6 +802,7 @@ public:
         auto iface = ctx->interfaceDefinition();
         auto ns = ctx->namespaceDefinition();
         auto usingDecl = ctx->usingDeclaration();
+        auto ifConst = ctx->ifConstDeclaration();
 
         if (iface != nullptr)
         {
@@ -812,6 +815,10 @@ public:
         else if (usingDecl != nullptr)
         {
             ParseUsingDeclaration(usingDecl);
+        }
+        else if (ifConst != nullptr)
+        {
+            ParseIfConstDeclaration(ifConst, namespaceName);
         }
         else if (decl != nullptr)
         {
@@ -837,6 +844,48 @@ public:
         ProcessPendingInstantiations();
     }
 
+    void ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContext* ctx, const std::string& namespaceName = {})
+    {
+        auto expression = ctx->expression();
+        auto condition = ParseExpression(expression);
+        auto constInt = llvm::dyn_cast<llvm::ConstantInt>(condition);
+        if (!constInt)
+        {
+            LogErrorContext(ctx, "'if const' condition must be a compile-time constant expression");
+            return;
+        }
+
+        bool taken = constInt->getZExtValue() != 0;
+        auto ifBlocks = ctx->ifConstBlock();
+
+        if (ifBlocks.empty())
+            return;
+
+        CFlatParser::IfConstBlockContext* branchBlock = nullptr;
+        if (taken)
+        {
+            branchBlock = ifBlocks[0];
+        }
+        else if (ifBlocks.size() > 1)
+        {
+            branchBlock = ifBlocks[1];
+        }
+
+        if (!branchBlock)
+            return;
+
+        auto branchDecls = branchBlock->externalDeclaration();
+
+        // First pass: forward ref scan the taken branch to register symbols
+        ForwardRefScanner scanner(Compiler());
+        for (auto* extDecl : branchDecls)
+            scanner.ScanExternalDeclaration(extDecl, namespaceName);
+
+        // Second pass: generate code for the taken branch
+        for (auto* extDecl : branchDecls)
+            ParseExternalDeclaration(extDecl, namespaceName);
+    }
+
     void ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
     {
         std::string namespaceName = ctx->Identifier()->getText();
@@ -855,6 +904,10 @@ public:
 
         // Skip nodes nested inside a namespace — they are handled by ParseNamespaceDefinition.
         if (dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(ctx->parent))
+            return;
+
+        // Skip nodes nested inside an if const block — they are handled by ParseIfConstDeclaration.
+        if (dynamic_cast<CFlatParser::IfConstBlockContext*>(ctx->parent))
             return;
 
         ParseExternalDeclaration(ctx);
@@ -1263,11 +1316,33 @@ public:
             /*
             selectionStatement
                 : 'if' '(' expression ')' statement ('else' statement)?
+                | 'if' 'const' '(' expression ')' statement ('else' statement)?
                 | 'switch' '(' expression ')' statement
                 ;
             */
 
-            if (selectionStatement->If())
+            if (selectionStatement->If() && selectionStatement->Const())
+            {
+                // if const (...) - compile-time conditional
+                auto expression = selectionStatement->expression();
+                auto innerStatement = selectionStatement->statement();
+
+                auto condition = ParseExpression(expression);
+                auto constInt = llvm::dyn_cast<llvm::ConstantInt>(condition);
+                if (!constInt)
+                {
+                    LogErrorContext(selectionStatement, "'if const' condition must be a compile-time constant expression");
+                    return;
+                }
+
+                bool taken = constInt->getZExtValue() != 0;
+                if (taken)
+                    ParseStatement(innerStatement[0]);
+                else if (innerStatement.size() > 1)
+                    ParseStatement(innerStatement[1]);
+                return;
+            }
+            else if (selectionStatement->If())
             {
                 auto expression = selectionStatement->expression();
                 auto innerStatement = selectionStatement->statement();
@@ -3898,14 +3973,16 @@ public:
         std::string name = node->getText();
         MyCompilerLLVM::NamedVariable namedVar = {};
 
-        if (name == "__FILE__")
+        // Check compile-time macros (constant throughout compilation)
+        auto macro = compiler->GetCompileTimeMacro(name);
+        if (macro.value != nullptr)
         {
-            auto str = compiler->CreateGlobalString("__FILE__", compiler->GetSourceFileName());
-            namedVar.Primary = str;
-            namedVar.BaseType = str->getType();
+            namedVar.Primary = macro.value;
+            namedVar.BaseType = macro.value->getType();
             return namedVar;
         }
 
+        // Special case: __FUNCTION__ is context-dependent (changes per function)
         if (name == "__FUNCTION__")
         {
             auto str = compiler->CreateGlobalString("__FUNCTION__", compiler->GetCurrentFunctionName());
@@ -3914,6 +3991,7 @@ public:
             return namedVar;
         }
 
+        // Special case: __LINE__ is location-dependent (changes per location)
         if (name == "__LINE__")
         {
             int line = (int)node->getSymbol()->getLine();
