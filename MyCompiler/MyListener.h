@@ -80,6 +80,12 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
+                    // 'move' is a soft keyword — recognized as a parameter ownership qualifier
+                    if (typeSpec->getText() == "move")
+                    {
+                        declType.IsMove = true;
+                        continue;  // not a type; look for the actual type in next specifier
+                    }
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                     {
@@ -533,6 +539,12 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
+                // 'move' is a soft keyword — recognized as a parameter ownership qualifier
+                if (typeSpec->getText() == "move")
+                {
+                    declType.IsMove = true;
+                    continue;  // not a type; look for the actual type in next specifier
+                }
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                 {
                     // Generic type instantiation: Box<MyType> -> Box__MyType

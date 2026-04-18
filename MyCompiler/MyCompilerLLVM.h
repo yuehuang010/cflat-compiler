@@ -73,6 +73,7 @@ public:
         bool Pointer = false;
         bool IsInterface = false;
         bool IsNullable = false;
+        bool IsMove = false;     // parameter declared with 'move' — function takes ownership
 
         bool IsPrimitive() const
         {
@@ -208,6 +209,7 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        bool IsOwning = false;           // true for move parameters and owning local pointers — freed on scope exit
 
         llvm::Value* GetValue() const
         {
@@ -364,6 +366,39 @@ private:
         return fn;
     }
 
+    void EmitOwningPtrCleanup(const NamedVariable& namedVar)
+    {
+        // Load the current pointer value from the alloca
+        auto* ptrVal = builder->CreateLoad(namedVar.BaseType, namedVar.Storage);
+
+        // Skip if null (pointer may have been moved out)
+        auto* isNull = builder->CreateICmpEQ(
+            ptrVal,
+            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(namedVar.BaseType)));
+        auto* cleanupBB = llvm::BasicBlock::Create(*context, "move.cleanup", builder->GetInsertBlock()->getParent());
+        auto* afterBB   = llvm::BasicBlock::Create(*context, "move.after",   builder->GetInsertBlock()->getParent());
+        builder->CreateCondBr(isNull, afterBB, cleanupBB);
+
+        builder->SetInsertPoint(cleanupBB);
+
+        // Call destructor if the type has one
+        auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
+        if (it != dataStructures.end() && it->second.Destructor != nullptr)
+            builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { ptrVal });
+
+        // Call operator delete (global)
+        auto* opDel = module->getFunction("operator delete");
+        if (opDel)
+        {
+            auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
+            auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
+            builder->CreateCall(opDel->getFunctionType(), opDel, { voidPtr });
+        }
+
+        builder->CreateBr(afterBB);
+        builder->SetInsertPoint(afterBB);
+    }
+
     void EmitDestructorsForScope(const StackState& frame)
     {
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
@@ -378,6 +413,13 @@ private:
                 auto* fn = it->second.Destructor;
                 builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
             }
+        }
+
+        // Clean up owning function parameters (move params)
+        for (const auto& [varName, namedVar] : frame.functionArgument)
+        {
+            if (namedVar.IsOwning && namedVar.Storage != nullptr)
+                EmitOwningPtrCleanup(namedVar);
         }
     }
 
@@ -411,6 +453,21 @@ private:
                     .BaseType = fatTy,
                     .Primary = nullptr,
                     .Storage = tmp,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
+            else if (itr_nameArg->IsMove && itr_nameArg->Pointer)
+            {
+                // move parameter: alloca a slot so we can null it out on scope exit
+                auto* ptrTy = GetType(*itr_nameArg, nullptr, true);
+                auto* alloc = builder->CreateAlloca(ptrTy, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, alloc);
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = ptrTy,
+                    .Primary = nullptr,
+                    .Storage = alloc,
+                    .IsOwning = true,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
@@ -2766,7 +2823,20 @@ public:
                 ++candParamItr;
         }
 
-        return CreateFunctionCall(candidate.Function, argList);
+        auto* result = CreateFunctionCall(candidate.Function, argList);
+
+        // Null out caller's storage for move parameters
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+        {
+            if (candidate.Parameters[i].IsMove && matched[i].Storage != nullptr)
+            {
+                auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType);
+                if (ptrTy)
+                    builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), matched[i].Storage);
+            }
+        }
+
+        return result;
     }
 
     llvm::Function* GetFunction(std::string functionName)

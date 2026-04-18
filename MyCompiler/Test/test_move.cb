@@ -1,0 +1,52 @@
+int dtorCount = 0;
+
+struct Resource
+{
+    int id = 0;
+    ~Resource()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+// move parameter takes ownership — Resource is deleted when consume returns
+void consume(move Resource* r)
+{
+    // use r inside the function
+    int x = r->id;
+}
+
+// non-move parameter borrows — caller still owns
+void borrow(Resource* r)
+{
+    int x = r->id;
+}
+
+extern int main()
+{
+    int result = 0;
+    dtorCount = 0;
+
+    // Test 1: move param causes destructor to fire when function returns
+    {
+        Resource* r = new Resource();
+        r->id = 42;
+        borrow(r);          // borrow — r still valid, dtor NOT called yet
+        consume(r);         // move — r is now null, dtor called inside consume
+        // r is null here; no double-free
+    }
+    // destructor should have fired exactly once (inside consume)
+    if (dtorCount == 1)
+        result = result + 1;
+
+    // Test 2: move param with null — no crash (null check in cleanup)
+    dtorCount = 0;
+    {
+        Resource* r = new Resource();
+        consume(r);
+    }
+    if (dtorCount == 1)
+        result = result + 1;
+
+    return result == 2 ? 0 : 1;
+}

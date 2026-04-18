@@ -22,27 +22,32 @@ class list<T> : IEnumerable<T>, IList<T>
         _capacity = newCap;
     }
 
-    // Append a value to the end.
-    void add(T value)
+    // Append a value to the end.  When T is a pointer type, the list takes
+    // ownership — the caller's pointer is nulled and the list frees it on clear
+    // or destruction (element-level cleanup requires removeAt to be called
+    // explicitly for early removal of owned pointers).
+    void add(move T value)
     {
         if (_size >= _capacity) _grow();
         _data[_size] = value;
         _size++;
     }
 
-    // Read the element at index.
+    // Read the element at index (borrow — caller does not receive ownership).
     T get(int index)
     {
         return _data[index];
     }
 
-    // Overwrite the element at index.
-    void set(int index, T value)
+    // Overwrite the element at index.  Takes ownership when T is a pointer type.
+    void set(int index, move T value)
     {
         _data[index] = value;
     }
 
     // Remove the element at index, shifting subsequent elements left.
+    // NOTE: If T is a pointer type, the caller is responsible for freeing
+    // the removed element (use get() before removeAt() to capture it).
     void removeAt(int index)
     {
         int i = index;

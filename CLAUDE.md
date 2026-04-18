@@ -4,17 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-MyCompiler is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, and null-safe access — to LLVM Intermediate Representation for JIT execution.
+MyCompiler is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
 
 ## Building
 
-Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM):
+Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM). Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
-msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
+msbuild MyCompiler.slnx /p:Configuration=Debug /p:Platform=x64
 ```
 
-**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_filesystem.cb`, producing `myapp.exe` and `out.ll`:
+Full msbuild path (if not on PATH): `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe`
+
+**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_filesystem.cb`:
 
 ```bash
 buildAndRun.bat
@@ -26,18 +28,14 @@ buildAndRun.bat
 # Compile to native executable
 x64/Debug/MyCompiler.exe input.cb -o out.exe
 
-# Also dump LLVM IR alongside the exe
+# Also dump LLVM IR
 x64/Debug/MyCompiler.exe input.cb -o out.exe --out-lli out.ll
 
-# With options
-MyCompiler.exe input.cb -o out.exe -b out.bc -g -i import-dir/
-
-# Execute IR directly (skip -o, dump IR with --out-lli, run via lli)
-x64/Debug/MyCompiler.exe input.cb --out-lli out.ll
-lli.exe out.ll
+# Execute IR directly via lli
+x64/Debug/MyCompiler.exe input.cb --out-lli out.ll && lli.exe out.ll
 ```
 
-The compiler automatically locates `runtime.cb` next to the executable (built from `MyCompiler/core/runtime.cb`). Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
+The compiler automatically locates `runtime.cb` next to the executable. Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
 
 **CLI flags** (see `ArgParser.h`):
 - `-o / --output`: Output native executable path (.exe)
@@ -54,14 +52,14 @@ The compiler automatically locates `runtime.cb` next to the executable (built fr
 test.bat
 ```
 
-Runs the compiler against test files in `MyCompiler/Test/` — compiles each to a native `.exe` and checks the exit code. Current tests: `testfile` (C); `testfile2`, `test_generics` (CFlat); `testfile_module`, `test_library_string` (CFlat, with `-i` lib); `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static` (CFlat).
-
 To run a single test manually:
 
 ```bash
 x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out/test_operators.exe --out-lli out/test_operators.ll
 out\test_operators.exe
 ```
+
+Current tests (all in `MyCompiler/Test/`): `testfile` (C); `testfile2`, `test_generics`, `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static`, `test_nullable`, `test_move` (CFlat); `testfile_module`, `test_library_string`, `test_overload` (CFlat with `-i lib`).
 
 ## Architecture
 
@@ -71,13 +69,15 @@ out\test_operators.exe
 Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
     → ForwardRefScanner (pre-pass)
     → MyListener (code generation)
-    → LLVM Module → .ll / .bc
+    → LLVM Module → .ll / .bc → native .exe
 ```
 
 ### Two-Pass Compilation
 
-1. **ForwardRefScanner** (`MyListener.h`): Pre-registers struct shells, function signatures, and generic instantiations. This enables forward references and monomorphizes generics (e.g., `Box<int>` → symbol `Box__int`) before code generation begins.
+1. **ForwardRefScanner** (`MyListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` → symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
 2. **MyListener** (`MyListener.h`): Walks the AST and emits LLVM IR using `MyCompilerLLVM` as the backend.
+
+Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MyListener` copy.
 
 ### Core Components
 
@@ -89,7 +89,7 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 | `CompilerManager.h` | Singleton crash handler — installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
 | `ArgParser.h` | CLI argument parsing |
 | `MyCompiler.cpp` | Entry point |
-| `core/` | Standard library source: `runtime.cb`, `interfaces.cb`, `string.cb`, `list.cb`, `hashset.cb`, `dictionary.cb` — compiled alongside every program; `interfaces.cb` is auto-imported between runtime and string |
+| `core/` | Standard library — compiled alongside every program |
 
 ### Key Internal State (in `MyCompilerLLVM`)
 
@@ -103,47 +103,54 @@ Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
 - `builder / module / context`: LLVM IR generation state
 - `diBuilder`: DWARF debug info builder (active with `-g`)
 
-### Language Features Supported
+`NamedVariable` has an `IsOwning` flag; `TypeAndValue` has an `IsMove` flag — both drive the ownership/lifetime system.
 
-- **Generics**: `struct Box<T> { T value = default; }` — monomorphized to `Box__int` (double-underscore mangling)
+### Language Features
+
+- **Generics**: `struct Box<T> { T value = default; }` — monomorphized at compile time
 - **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
 - **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`
-- **Type aliases**: `using M = Math` — expands at reference time (stored in `namespaceAliasTable`)
+- **Type aliases**: `using M = Math` — expands at reference time
 - **Module system**: `import "file.cb"` for multi-file compilation
-- **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases: `char=i8`, `short=i16`, `int=i32`, `long=i64`
-- **Null-safe access**: `ptr?.field` (only via function arg pointers)
+- **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
+- **Null-safe access**: `ptr?.field` (only via function arg pointers, not locals)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
-- **Default initialization**: `= default` in generic structs
 - **Operator overloading**: `operator+`, `operator==`, `operator new`, `operator delete`
 - **Function overloads** with type-based resolution and default parameters
 - **Named parameters**: `func(x: 1, y: 2)` — args matched by name, any order
-- **Return-block functions**: `return { ... }` — body inlined at call site (stored in `returnBlockTable`)
+- **Return-block functions**: `return { ... }` — body inlined at call site
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
-- **Range-based for**: `foreach (T x in collection) { ... }` — calls `count()` / `get(int)` on the collection; works with structs and `IEnumerable<T>` interface values
+- **Range-based for**: `foreach (T x in collection)` — calls `count()` / `get(int)` on the collection
+
+### Ownership / Lifetime (`move` keyword)
+
+CFlat uses **context-based ownership**: local variables and struct fields own their pointers; function parameters borrow by default.
+
+The `move` keyword on a **parameter definition** transfers ownership into the callee:
+
+```cflat
+void consume(move Resource* r) { ... }  // r is freed when consume() returns
+void borrow(Resource* r)        { ... }  // caller still owns r
+```
+
+- **Call site is silent** — no annotation needed; the caller's pointer is automatically nulled after a `move` call.
+- `move` is a **soft keyword** — detected via text matching in `ParseDeclarationSpecifiers()`, not as an ANTLR lexer token (avoids breaking identifiers/methods named `move`).
+- For value types (int, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true`.
+- `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; element destructors are not auto-called on `removeAt()` — caller must retrieve and free manually.
+
+Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.
 
 ### Compile-Time Features
 
-- **`if const`**: Condition evaluated at compile-time; dead branches eliminated from IR. Syntax: `if const (expr) { ... }` 
-- **Compile-time macros**: `__FILE__`, `__FUNCTION__`, `__LINE__`, `__PLATFORM__` (64 or 32 based on `-p` flag). Pre-populated before compilation; available in all contexts including global scope.
-- **Platform support**: `-p win64` (default, maps to 64) or `-p win32` (maps to 32). Enables platform-specific code via `if const (__PLATFORM__ == 64) { ... }`
+- **`if const`**: Condition evaluated at compile-time; dead branches eliminated from IR. Works at both function and file scope.
+- **Compile-time macros**: `__FILE__`, `__FUNCTION__`, `__LINE__`, `__PLATFORM__` (64 or 32). Available globally.
+- **Platform support**: `-p win64` (default) or `-p win32`; guard with `if const (__PLATFORM__ == 64) { ... }`
 
 ### Known Limitations
 
-- **Null-conditional operator (`?.`)**: Only works with pointers passed as function arguments; not available for local variables or struct members
-- **Generic struct defaults**: Field-level `= default` works; nested generics and `V x = default` in function locals may not codegen correctly
-- **Sized integers**: C-style aliases (`char`, `short`, `int`, `long`) map to fixed widths (`i8`, `i16`, `i32`, `i64`) — mixing styles can be confusing but is valid
-
-### VS Code Extension
-
-`vscode-extension/` contains a language server extension for CFlat syntax highlighting and tooling:
-
-```bash
-cd vscode-extension
-build.bat        # compiles the extension
-install.bat      # installs into VS Code
-```
-
-Reload VS Code to activate. The extension provides syntax highlighting for `.cb` files and integrates with the compiler for diagnostics.
+- **Null-conditional (`?.`)**: Only for pointers passed as function arguments — not local variables or struct members
+- **Generic struct defaults**: `V x = default` in function locals and nested generic fields may not codegen correctly; field-level `= default` works
+- **`move` on `removeAt`**: Owned pointer elements are not auto-freed on removal from a collection
 
 ### Adding New Language Features
 
@@ -151,30 +158,17 @@ Reload VS Code to activate. The extension provides syntax highlighting for `.cb`
 |------|----------------|
 | New syntax | Edit `CFlat.g4`; rebuild triggers ANTLR regeneration |
 | New type or IR operation | Add methods to `MyCompilerLLVM.h` |
-| New statement or expression | Add `Parse*()` handler in `MyListener.h` |
+| New statement or expression | Add `Parse*()` / `exit*()` handler in `MyListener.h` |
 | Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MyListener.h` |
 | New binary operator | `TryBinaryOperatorOverload()` in `MyListener.h` + `Operation` enum in `MyCompilerLLVM.h` |
+| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MyListener.h` — do NOT add to the ANTLR lexer |
 
-### Common Development Workflows
+### Debugging Compiler Crashes
 
-**Adding a new statement type** (e.g., a `do-while` loop):
-1. Add grammar rule to `CFlat.g4`
-2. Rebuild to regenerate `CFlatParser.h` / `CFlatLexer.h`
-3. Add handler in `MyListener.h` (e.g., `exitDoWhile()`)
-4. Emit LLVM IR via `builder` in the handler
-5. Write a test in `MyCompiler/Test/` and run `test.bat`
-
-**Adding a new built-in function** (e.g., a math intrinsic):
-1. Decide: intrinsic (compile-time, in `MyCompilerLLVM.h`) or library function (in `core/runtime.cb`)
-2. Add to symbol table in `MyCompilerLLVM.h` (if compiler-special) or define in `core/runtime.cb`
-3. In `MyListener.h`, add code generation (or forward to LLVM intrinsic)
-4. Test with a simple `.cb` file
-
-**Debugging compiler crashes**:
 - `CompilerManager.h` installs crash handlers that dump compiler state on assert/abort
-- Rerun with `-v / --verbose` to see detailed diagnostics
-- Add `printf` statements in `MyListener.h` or `MyCompilerLLVM.h` to trace code generation
-- Check `.ll` output (via `--out-lli`) to inspect LLVM IR before execution
+- Rerun with `-v` to see detailed diagnostics
+- Check `.ll` output (`--out-lli`) to inspect LLVM IR
+- LLVM assertion `"Ptr must have pointer type"` usually means `GetType()` was called without `allowPointer=true` for a pointer parameter
 
 ### Standard Library
 
@@ -183,11 +177,25 @@ Core library files in `core/` are automatically compiled alongside every program
 | File | Exports |
 |------|---------|
 | `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort |
-| `interfaces.cb` | Core interfaces: `IString`, `IEnumerable<T>`, `IComparable<T>` |
-| `string.cb` | `string` value type, manipulation, and `IString` implementation |
-| `list.cb` | `List<T>` — dynamic array with `add()`, `get()`, `remove()` |
-| `hashset.cb` | `HashSet<T>` — hash-based set with `add()`, `contains()`, `remove()` |
-| `dictionary.cb` | `Dictionary<K,V>` — key-value map with `set()`, `get()`, `remove()` |
-| `filesystem.cb` | File I/O: `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()` |
+| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` — auto-imported between runtime and string |
+| `string.cb` | `string` value type, manipulation, `IString` implementation |
+| `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
+| `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |
+| `dictionary.cb` | `dictionary<K,V>` — hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
+| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |
+| `stack.cb` | `stack<T>` — LIFO; `push()`, `pop()`, `peek()` |
+| `queue.cb` | `queue<T>` — FIFO; `enqueue()`, `dequeue()`, `peek()` |
+| `pair.cb` | `pair<A,B>` — two-field generic struct |
+| `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
 
-Extend the standard library by adding new `.cb` files to `core/` and modifying `MyListener.h` to auto-import them if needed.
+To add a new core library: add the `.cb` file to `core/` and add an auto-import in `MyListener.h` (search for where `interfaces.cb` is imported for the pattern).
+
+### VS Code Extension
+
+```bash
+cd vscode-extension
+build.bat    # compile
+install.bat  # install into VS Code
+```
+
+Reload VS Code to activate syntax highlighting for `.cb` files.
