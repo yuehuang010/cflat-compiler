@@ -1427,6 +1427,33 @@ public:
         return builder->CreateAlloca(type, nullptr);
     }
 
+    // Register an alloca of struct type as the implicit 'this' pointer in the current scope.
+    // Used by parameterized constructors: the alloca IS the pointer (same layout as a method's
+    // incoming this* argument), so GetMemberVariable can GEP through it.
+    void RegisterThisPointer(const TypeAndValue& tv, llvm::Value* storage, llvm::Type* baseType)
+    {
+        NamedVariable namedVar{
+            .TypeAndValue = tv,
+            .BaseType = baseType,
+            .Primary = nullptr,
+            .Storage = storage,
+        };
+        stackNamedVariable.back().functionArgument[tv.VariableName] = namedVar;
+
+        // Also register under "this" so explicit `this->field` resolves correctly.
+        // Primary = storage (the alloca) so LoadNamedVariable returns it directly as a pointer
+        // rather than loading through it (which would yield the struct by value, not a pointer).
+        TypeAndValue thisTv = tv;
+        thisTv.VariableName = "this";
+        NamedVariable thisVar{
+            .TypeAndValue = thisTv,
+            .BaseType = baseType,
+            .Primary = storage,
+            .Storage = nullptr,
+        };
+        stackNamedVariable.back().functionArgument["this"] = thisVar;
+    }
+
     llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
     {
         llvm::LoadInst* loadInst = CreateLoad(destination);

@@ -333,6 +333,167 @@ bool testReturnListMethod()
     return result;
 }
 
+// =============================================================
+// Nested generic struct default initialization
+// =============================================================
+
+struct NestedBox<T>
+{
+    Box<T> inner = default;
+};
+
+bool testNestedGenericDefault()
+{
+    bool result = true;
+    NestedBox<int> nb = default;
+    nb.inner.value = 77;
+    result &= Test("nested_generic_default", nb.inner.value, 77);
+    NestedBox<i32> nb2 = default;
+    nb2.inner.value = 55;
+    result &= Test("nested_generic_default_i32", nb2.inner.value, 55);
+    return result;
+}
+
+// =============================================================
+// Generic local variable with = default (via method)
+// =============================================================
+
+struct LocalDefaultBox<T>
+{
+    T stored = default;
+
+    // Uses a local variable of generic type T initialized to default
+    T GetWithLocal()
+    {
+        T local = default;
+        local = stored;
+        return local;
+    }
+};
+
+bool testGenericLocalDefault()
+{
+    bool result = true;
+
+    LocalDefaultBox<int> b = default;
+    b.stored = 99;
+    result &= Test("generic_local_default_int", b.GetWithLocal(), 99);
+
+    LocalDefaultBox<i32> b2 = default;
+    b2.stored = 77;
+    result &= Test("generic_local_default_i32", b2.GetWithLocal(), 77);
+
+    return result;
+}
+
+// =============================================================
+// Overloaded constructors
+// =============================================================
+
+struct Point
+{
+    int x = 0;
+    int y = 0;
+
+    Point(int px, int py)
+    {
+        this->x = px;
+        this->y = py;
+    }
+};
+
+struct Rect
+{
+    int left = 0;
+    int top = 0;
+    int width = 10;
+    int height = 10;
+
+    Rect(int l, int t, int w, int h)
+    {
+        this->left   = l;
+        this->top    = t;
+        this->width  = w;
+        this->height = h;
+    }
+
+    Rect(int w, int h)
+    {
+        this->width  = w;
+        this->height = h;
+    }
+};
+
+bool testOverloadedConstructors()
+{
+    bool result = true;
+
+    Point p = Point(3, 4);
+    result &= Test("ctor_point_x", p.x, 3);
+    result &= Test("ctor_point_y", p.y, 4);
+
+    Point q = Point();
+    result &= Test("ctor_point_default_x", q.x, 0);
+    result &= Test("ctor_point_default_y", q.y, 0);
+
+    Rect r = Rect(5, 10, 200, 100);
+    result &= Test("ctor_rect_left",   r.left,   5);
+    result &= Test("ctor_rect_top",    r.top,    10);
+    result &= Test("ctor_rect_width",  r.width,  200);
+    result &= Test("ctor_rect_height", r.height, 100);
+
+    Rect r2 = Rect(320, 240);
+    result &= Test("ctor_rect2_left",   r2.left,   0);
+    result &= Test("ctor_rect2_top",    r2.top,    0);
+    result &= Test("ctor_rect2_width",  r2.width,  320);
+    result &= Test("ctor_rect2_height", r2.height, 240);
+
+    return result;
+}
+
+// =============================================================
+// Constructor default arguments
+// =============================================================
+
+struct Vec3
+{
+    int x = 0;
+    int y = 0;
+    int z = 0;
+
+    Vec3(int px, int py = 0, int pz = 0)
+    {
+        this->x = px;
+        this->y = py;
+        this->z = pz;
+    }
+};
+
+bool testConstructorDefaultArgs()
+{
+    bool result = true;
+
+    // All args explicit
+    Vec3 a = Vec3(1, 2, 3);
+    result &= Test("ctor_default_args_all_x", a.x, 1);
+    result &= Test("ctor_default_args_all_y", a.y, 2);
+    result &= Test("ctor_default_args_all_z", a.z, 3);
+
+    // One default (pz = 0)
+    Vec3 b = Vec3(4, 5);
+    result &= Test("ctor_default_args_two_x", b.x, 4);
+    result &= Test("ctor_default_args_two_y", b.y, 5);
+    result &= Test("ctor_default_args_two_z", b.z, 0);
+
+    // Two defaults (py = 0, pz = 0)
+    Vec3 c = Vec3(7);
+    result &= Test("ctor_default_args_one_x", c.x, 7);
+    result &= Test("ctor_default_args_one_y", c.y, 0);
+    result &= Test("ctor_default_args_one_z", c.z, 0);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -341,6 +502,10 @@ extern int main()
     result &= testGenericInterface();
     result &= testReturnListFreeFunc();
     result &= testReturnListMethod();
+    result &= testNestedGenericDefault();
+    result &= testGenericLocalDefault();
+    result &= testOverloadedConstructors();
+    result &= testConstructorDefaultArgs();
     if (result)
     {
         printf("All Test Passed.\n");

@@ -257,9 +257,22 @@ private:
         MyCompilerLLVM::TypeAndValue returnType{ .TypeName = structName };
         compiler->CreateFunctionDeclaration(structName, returnType, {});
 
-        // Pre-declare member functions
+        // Pre-declare member functions (and detect constructor overloads)
         for (auto func : ctx->functionDefinition())
-            ScanFunctionDefinition(func, structName);
+        {
+            if (getFunctionName(func) == structName)
+            {
+                // Constructor overload — no implicit this* parameter, returns the struct type
+                if (!func->parameterTypeList()) continue; // no-arg already declared above
+                auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
+                std::vector<MyCompilerLLVM::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
+                compiler->CreateFunctionDeclaration(structName, returnType, allCtorParams);
+            }
+            else
+            {
+                ScanFunctionDefinition(func, structName);
+            }
+        }
 
         // Pre-declare destructor
         for (auto dtor : ctx->destructorDefinition())
@@ -291,9 +304,22 @@ private:
         MyCompilerLLVM::TypeAndValue returnType{ .TypeName = className };
         compiler->CreateFunctionDeclaration(className, returnType, {});
 
-        // Pre-declare member functions
+        // Pre-declare member functions (and detect constructor overloads)
         for (auto func : ctx->functionDefinition())
-            ScanFunctionDefinition(func, className);
+        {
+            if (getFunctionName(func) == className)
+            {
+                // Constructor overload — no implicit this* parameter, returns the class type
+                if (!func->parameterTypeList()) continue; // no-arg already declared above
+                auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
+                std::vector<MyCompilerLLVM::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
+                compiler->CreateFunctionDeclaration(className, returnType, allCtorParams);
+            }
+            else
+            {
+                ScanFunctionDefinition(func, className);
+            }
+        }
 
         // Pre-declare destructor
         for (auto dtor : ctx->destructorDefinition())
@@ -512,8 +538,28 @@ private:
                         typeArgs.push_back(arg);
                     }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
-                    // Just store the mangled name; instantiation is done separately at declaration time
                     declType.TypeName = mangledName;
+                    // Queue instantiation of nested generic types discovered during field/param parsing.
+                    // Only do this when inside an active instantiation context (substitutions are set),
+                    // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
+                    // Top-level explicit uses (e.g. hashset<int> in user code) are handled by
+                    // ForwardRefScanner::ScanGenericTypeUses and ScanAndQueueGenericTypeUses.
+                    if (!activeTypeSubstitutions.empty() && !instantiatedGenerics.count(mangledName))
+                    {
+                        bool isKnownTemplate = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
+                        if (isKnownTemplate)
+                        {
+                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            instantiatedGenerics.insert(mangledName);
+                            auto* c = Compiler();
+                            if (!c->GetDataStructure(mangledName).StructType)
+                            {
+                                c->CreateStructType(mangledName, {});
+                                MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                                c->CreateFunctionDeclaration(mangledName, rt, {});
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -573,14 +619,21 @@ private:
     llvm::Value* GenerateDefaultValue(const MyCompilerLLVM::DeclTypeAndValue& typeValue)
     {
         auto* compiler = Compiler();
-        auto* llvmType = compiler->GetType(typeValue);
+        // Apply active type-parameter substitutions as a fallback in case the caller
+        // hasn't already resolved them (e.g. "V" inside a generic method body).
+        auto resolved = typeValue;
+        auto substIt = activeTypeSubstitutions.find(resolved.TypeName);
+        if (substIt != activeTypeSubstitutions.end())
+            resolved.TypeName = substIt->second;
+
+        auto* llvmType = compiler->GetType(resolved);
         if (!llvmType) return nullptr;
 
-        if (!typeValue.Pointer && llvmType->isStructTy() && !global_scope)
+        if (!resolved.Pointer && llvmType->isStructTy() && !global_scope)
         {
-            auto structData = compiler->GetDataStructure(typeValue.TypeName);
-            if (structData.StructType != nullptr && compiler->GetFunction(typeValue.TypeName))
-                return compiler->CreateOverloadedFunctionCall(typeValue.TypeName, {});
+            auto structData = compiler->GetDataStructure(resolved.TypeName);
+            if (structData.StructType != nullptr && compiler->GetFunction(resolved.TypeName))
+                return compiler->CreateOverloadedFunctionCall(resolved.TypeName, {});
         }
 
         return llvm::Constant::getNullValue(llvmType);
@@ -4362,6 +4415,13 @@ public:
         MyCompilerLLVM::TypeAndValue returnType{
             .TypeName = structName,
         };
+        // Flush any nested generic instantiations queued while parsing field declarations,
+        // so their constructors exist before this struct's default constructor calls them.
+        {
+            auto savedSubst = activeTypeSubstitutions;
+            ProcessPendingInstantiations();
+            activeTypeSubstitutions = savedSubst;
+        }
         // Create default constructor
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
@@ -4448,6 +4508,18 @@ public:
                 if (func->genericTypeParameters() != nullptr) continue;
 
                 std::string funcName = getFunctionName(func);
+
+                // Constructor overload — pre-declare without this* parameter
+                if (funcName == baseName && func->parameterTypeList())
+                {
+                    auto* declParamList = func->parameterTypeList();
+                    auto declParams = this->ParseParameterTypeList(declParamList);
+                    bool declVarargs = declParamList->Ellipsis() != nullptr;
+                    std::vector<MyCompilerLLVM::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                    compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
+                    continue;
+                }
+
                 bool isOperatorFunc = (funcName == "operator new"
                                     || funcName == "operator delete"
                                     || funcName == "operator string");
@@ -4489,6 +4561,12 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
+                // Constructor overload — same name as struct, with parameters
+                if (funcName == baseName && func->parameterTypeList())
+                {
+                    ParseConstructorDefinition(func, structName);
+                    continue;
+                }
                 if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 else
@@ -4566,6 +4644,13 @@ public:
         MyCompilerLLVM::TypeAndValue returnType{
             .TypeName = structName,
         };
+        // Flush any nested generic instantiations queued while parsing field declarations,
+        // so their constructors exist before this class's default constructor calls them.
+        {
+            auto savedSubst = activeTypeSubstitutions;
+            ProcessPendingInstantiations();
+            activeTypeSubstitutions = savedSubst;
+        }
         // Create default constructor
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
@@ -4645,6 +4730,18 @@ public:
                 if (func->genericTypeParameters() != nullptr) continue;
 
                 std::string funcName = getFunctionName(func);
+
+                // Constructor overload — pre-declare without this* parameter
+                if (funcName == baseName && func->parameterTypeList())
+                {
+                    auto* declParamList = func->parameterTypeList();
+                    auto declParams = this->ParseParameterTypeList(declParamList);
+                    bool declVarargs = declParamList->Ellipsis() != nullptr;
+                    std::vector<MyCompilerLLVM::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                    compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
+                    continue;
+                }
+
                 bool isOperatorFunc = (funcName == "operator new"
                                     || funcName == "operator delete"
                                     || funcName == "operator string");
@@ -4686,6 +4783,12 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
+                // Constructor overload — same name as class, with parameters
+                if (funcName == baseName && func->parameterTypeList())
+                {
+                    ParseConstructorDefinition(func, structName);
+                    continue;
+                }
                 if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
                     ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
                 else
@@ -4769,6 +4872,59 @@ public:
         }
 
         return typeParams;
+    }
+
+    void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName)
+    {
+        auto* compiler = Compiler(func);
+        auto params = ParseParameterTypeList(func->parameterTypeList());
+        size_t line = func->getStart()->getLine();
+        bool varargs = func->parameterTypeList() && func->parameterTypeList()->Ellipsis() != nullptr;
+
+        // Pre-scan body for generic instantiations (same as ParseFunctionDefinition)
+        if (auto* blockItemList = func->compoundStatement()->blockItemList())
+        {
+            ScanAndQueueGenericTypeUses(blockItemList);
+            ProcessPendingInstantiations();
+        }
+
+        MyCompilerLLVM::DeclTypeAndValue returnType;
+        returnType.TypeName = structName;
+        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+
+        // Open constructor function — no this* parameter; returns the struct by value
+        auto fn = compiler->CreateFunctionDefinition(structName, returnType, allParams, false, varargs, line);
+        compiler->InitializeBlock(&fn->front(), false);
+
+        // Get the struct's LLVM type (without pointer)
+        auto* structLLVMType = compiler->GetType(returnType, nullptr, false);
+
+        // Call the default constructor to get a fully default-initialized instance
+        auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {});
+
+        // Alloca the struct so we can GEP into fields via 'this'
+        auto* thisAlloca = compiler->builder->CreateAlloca(structLLVMType, nullptr, structName + "__");
+        if (defaultVal)
+            compiler->builder->CreateStore(defaultVal, thisAlloca);
+
+        // Register the alloca as the implicit 'this' pointer so member field access works
+        MyCompilerLLVM::TypeAndValue thisTv;
+        thisTv.TypeName = structName;
+        thisTv.VariableName = structName + "__";
+        thisTv.Pointer = true;
+        compiler->RegisterThisPointer(thisTv, thisAlloca, structLLVMType);
+
+        // Parse user-written constructor body
+        if (auto* blockItemList = func->compoundStatement()->blockItemList())
+            ParseBlockItemList(blockItemList);
+
+        // Load and return the (possibly mutated) struct by value
+        auto* resultVal = compiler->CreateLoad(structLLVMType, thisAlloca);
+        compiler->CreateReturnCall(resultVal);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+
+        GenerateDefaultParamOverloads(structName, returnType, params, varargs, line);
     }
 
     void ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName)
