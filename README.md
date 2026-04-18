@@ -512,7 +512,27 @@ static_assert(sizeof(i32) == 4, "i32 must be 4 bytes");
 printf("file: %s\n",     __FILE__);
 printf("function: %s\n", __FUNCTION__);
 printf("line: %d\n",     __LINE__);
+printf("platform: %d\n", __PLATFORM__);  // 64 or 32, set by -p flag
 ```
+
+#### Compile-Time Conditionals (`if const`)
+
+The `if const` statement evaluates its condition at compile time, eliminating dead branches from the generated code:
+
+```c
+if const (__PLATFORM__ == 64)
+{
+    // Only compiled on 64-bit platforms
+    i64 bigNum = 0x123456789ABCDEF0;
+}
+else
+{
+    // Only compiled on 32-bit platforms
+    i32 num = 0x12345678;
+}
+```
+
+This is useful for platform-specific code, feature gates, and performance-critical conditionals.
 
 #### Debug Info
 
@@ -532,10 +552,13 @@ MyCompiler.exe <input.cb> [options]
 
 | Flag | Description |
 |------|-------------|
-| `-o / --output <file>`  | Output LLVM IR file (default: `.\out.ll`) |
+| `-o / --output <file>`  | Output native executable path (`.exe`) |
+| `-l / --out-lli <file>` | Output LLVM IR file (`.ll`) |
 | `-b / --bitcode <file>` | Output LLVM bitcode file (`.bc`) |
 | `-g / --debug-info`     | Emit DWARF debug information |
 | `-i / --import-dir <dir>` | Directory to search for imported modules |
+| `-p / --platform <target>` | Target platform: `x64` (default) or `x86`; sets `__PLATFORM__` to 64 or 32 |
+| `-v / --verbose`        | Print detailed diagnostic messages during compilation |
 
 ---
 

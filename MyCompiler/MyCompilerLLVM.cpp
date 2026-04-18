@@ -167,7 +167,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         }
 
         if (verbose) std::cout << "[verbose] code-gen walk (" << sourceFileName << ")\n";
-        auto myListener = std::make_unique<MyListener>(&parser, this);
+        auto myListener = std::make_unique<MyListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
         stream.close();
@@ -322,7 +322,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
 
     // Code-gen walk the imported file
     if (verbose) std::cout << "[verbose]   code-gen walk: " << importFilename << "\n";
-    auto myListener = std::make_unique<MyListener>(parserPtr, this);
+    auto myListener = std::make_unique<MyListener>(parserPtr, this, sourceFileName);
     antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
 

@@ -1,4 +1,3 @@
-extern void printf(const char* fmt, ...);
 
 // ── Vec2: 2D vector with full arithmetic ────────────────────────────────────
 
@@ -67,26 +66,7 @@ struct Counter
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-int TestBool(const char* name, bool actual, bool expected)
-{
-    if (actual == expected) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
-    return 0;
-}
-
-int TestInt(const char* name, int actual, int expected)
-{
-    if (actual == expected) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
-    return 0;
-}
-
-int TestFloat(const char* name, float actual, float expected)
-{
-    if (actual == expected) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected %f got %f).\n", name, expected, actual);
-    return 0;
-}
+import "test_helper.cb";
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -97,26 +77,26 @@ extern int main()
     Vec2 b; b.x = 3.0f; b.y = 4.0f;
 
     Vec2 sum = a + b;
-    TestFloat("Vec2 + x", sum.x, 4.0f);
-    TestFloat("Vec2 + y", sum.y, 6.0f);
+    Test("Vec2 + x", sum.x, 4.0f);
+    Test("Vec2 + y", sum.y, 6.0f);
 
     Vec2 diff = b - a;
-    TestFloat("Vec2 - x", diff.x, 2.0f);
-    TestFloat("Vec2 - y", diff.y, 2.0f);
+    Test("Vec2 - x", diff.x, 2.0f);
+    Test("Vec2 - y", diff.y, 2.0f);
 
     Vec2 scaled = a * 3.0f;
-    TestFloat("Vec2 * x", scaled.x, 3.0f);
-    TestFloat("Vec2 * y", scaled.y, 6.0f);
+    Test("Vec2 * x", scaled.x, 3.0f);
+    Test("Vec2 * y", scaled.y, 6.0f);
 
     Vec2 divided = b / 2.0f;
-    TestFloat("Vec2 / x", divided.x, 1.5f);
-    TestFloat("Vec2 / y", divided.y, 2.0f);
+    Test("Vec2 / x", divided.x, 1.5f);
+    Test("Vec2 / y", divided.y, 2.0f);
 
     Vec2 c; c.x = 1.0f; c.y = 2.0f;
-    TestBool("Vec2 == (equal)",     a == c,  true);
-    TestBool("Vec2 == (not equal)", a == b,  false);
-    TestBool("Vec2 != (not equal)", a != b,  true);
-    TestBool("Vec2 != (equal)",     a != c,  false);
+    Test("Vec2 == (equal)",     a == c,  true);
+    Test("Vec2 == (not equal)", a == b,  false);
+    Test("Vec2 != (not equal)", a != b,  true);
+    Test("Vec2 != (equal)",     a != c,  false);
 
     // Fraction tests:  1/2 + 1/3 = 5/6,  1/2 * 2/3 = 2/6 = 1/3
     Fraction half;  half.num  = 1; half.den  = 2;
@@ -124,21 +104,21 @@ extern int main()
     Fraction twothirds; twothirds.num = 2; twothirds.den = 3;
 
     Fraction fsum = half + third;          // 5/6
-    TestInt("Frac + num", fsum.num, 5);
-    TestInt("Frac + den", fsum.den, 6);
+    Test("Frac + num", fsum.num, 5);
+    Test("Frac + den", fsum.den, 6);
 
     Fraction fdiff = half - third;         // 1/6
-    TestInt("Frac - num", fdiff.num, 1);
-    TestInt("Frac - den", fdiff.den, 6);
+    Test("Frac - num", fdiff.num, 1);
+    Test("Frac - den", fdiff.den, 6);
 
     Fraction fprod = half * twothirds;     // 2/6
     Fraction oneThird; oneThird.num = 1; oneThird.den = 3;
-    TestBool("Frac * ==",  fprod == oneThird, true);
+    Test("Frac * ==",  fprod == oneThird, true);
 
-    TestBool("Frac ==",    half == half,   true);
-    TestBool("Frac !=",    half != third,  true);
-    TestBool("Frac < ",    third < half,   true);
-    TestBool("Frac > ",    half > third,   true);
+    Test("Frac ==",    half == half,   true);
+    Test("Frac !=",    half != third,  true);
+    Test("Frac < ",    third < half,   true);
+    Test("Frac > ",    half > third,   true);
 
     // Counter tests
     Counter p; p.value = 10;
@@ -148,16 +128,16 @@ extern int main()
     Counter cdiff = p - q;
     Counter cmul  = q * 4;
 
-    TestInt("Counter + value",  csum.value,  15);
-    TestInt("Counter - value",  cdiff.value,  5);
-    TestInt("Counter * value",  cmul.value,  20);
-    TestBool("Counter == (eq)",  p == p,  true);
-    TestBool("Counter == (ne)",  p == q,  false);
-    TestBool("Counter <  ",      q < p,   true);
+    Test("Counter + value",  csum.value,  15);
+    Test("Counter - value",  cdiff.value,  5);
+    Test("Counter * value",  cmul.value,  20);
+    Test("Counter == (eq)",  p == p,  true);
+    Test("Counter == (ne)",  p == q,  false);
+    Test("Counter <  ",      q < p,   true);
 
     // Chained: (a + b) + c  ==  a + (1,2) + (3,4)+(1,2) = (5,8)+(1,2) but let's just check addition chaining
     Vec2 chain = a + b + c;    // (1+3+1, 2+4+2) = (5, 8)
-    TestFloat("Vec2 chain + x", chain.x, 5.0f);
-    TestFloat("Vec2 chain + y", chain.y, 8.0f);
+    Test("Vec2 chain + x", chain.x, 5.0f);
+    Test("Vec2 chain + y", chain.y, 8.0f);
     return 0;
 }

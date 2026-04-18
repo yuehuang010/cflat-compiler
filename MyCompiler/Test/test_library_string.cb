@@ -1,29 +1,5 @@
 import "string.c";
-
-extern void printf(const char* fmt, ...);
-extern int strcmp(const char* a, const char* b);
-
-int Test(const char* testName, int actual, int expected)
-{
-    if (expected == actual)
-    {
-        printf("%s passed.\n", testName);
-        return 1;
-    }
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-    return 0;
-}
-
-bool TestStr(const char* testName, const char* actual, const char* expected)
-{
-    if (strcmp(actual, expected) == 0)
-    {
-        printf("%s passed.\n", testName);
-        return true;
-    }
-    printf("%s failed: expected '%s' but got '%s'.\n", testName, expected, actual);
-    return false;
-}
+import "test_helper.cb";
 
 bool testLength()
 {
@@ -43,7 +19,7 @@ bool testData()
     StringView s = StringView();
     s.Init("world");
     bool result = true;
-    result &= TestStr("data_world", s.Data(), "world");
+    result &= Test("data_world", s.Data(), "world");
     return result;
 }
 
@@ -102,10 +78,10 @@ bool testStringSet()
     bool result = true;
     s.Set("hello");
     result &= Test("string_set_length", s.Length(), 5);
-    result &= TestStr("string_set_data", s.Data(), "hello");
+    result &= Test("string_set_data", s.Data(), "hello");
     s.Set("hi");
     result &= Test("string_set_overwrite_length", s.Length(), 2);
-    result &= TestStr("string_set_overwrite_data", s.Data(), "hi");
+    result &= Test("string_set_overwrite_data", s.Data(), "hi");
     s.Set("");
     result &= Test("string_set_empty_length", s.Length(), 0);
     s.Free();
@@ -119,10 +95,10 @@ bool testStringAppend()
     s.Set("hello");
     s.Append(" world");
     result &= Test("string_append_length", s.Length(), 11);
-    result &= TestStr("string_append_data", s.Data(), "hello world");
+    result &= Test("string_append_data", s.Data(), "hello world");
     s.Append("!");
     result &= Test("string_append_again_length", s.Length(), 12);
-    result &= TestStr("string_append_again_data", s.Data(), "hello world!");
+    result &= Test("string_append_again_data", s.Data(), "hello world!");
     s.Free();
     return result;
 }
@@ -136,7 +112,7 @@ bool testStringClear()
     result &= Test("string_clear_length", s.Length(), 0);
     s.Set("after_clear");
     result &= Test("string_after_clear_length", s.Length(), 11);
-    result &= TestStr("string_after_clear_data", s.Data(), "after_clear");
+    result &= Test("string_after_clear_data", s.Data(), "after_clear");
     s.Free();
     return result;
 }

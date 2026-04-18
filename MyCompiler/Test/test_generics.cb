@@ -1,13 +1,15 @@
 
+extern bool printOnPass;
+
 int Test(const char* testName, i64 actual, i64 expected)
 {
     if (expected == actual)
     {
-        printf("%s passed.\n", testName);
+        if (printOnPass) printf("%s passed.\n", testName);
         return 1;
     }
 
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    printf("%s mismatch: expected '%d' but got '%d'.\n", testName, expected, actual);
     return 0;
 }
 
@@ -15,11 +17,11 @@ int Test(const char* testName, int actual, int expected)
 {
     if (expected == actual)
     {
-        printf("%s passed.\n", testName);
+        if (printOnPass) printf("%s passed.\n", testName);
         return 1;
     }
 
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    printf("%s mismatch: expected '%d' but got '%d'.\n", testName, expected, actual);
     return 0;
 }
 

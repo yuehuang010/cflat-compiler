@@ -1,0 +1,104 @@
+// Reproducer for overload resolution bug with float and string types.
+// int/bool overloads work; float overload incorrectly selects const char* overload
+// because CompareUpconvert returns 0 for any argument when the other side is a pointer.
+
+import "string.cb";
+
+extern int strcmp(const char* a, const char* b);
+extern bool printOnPass;
+
+int Test(const char* name, bool actual, bool expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH.\n", name);
+    return 0;
+}
+
+int Test(const char* name, int actual, int expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, const char* actual, const char* expected)
+{
+    if (strcmp(actual, expected) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected '%s' got '%s').\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, float actual, float expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected %f got %f).\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, string actual, string expected)
+{
+    if (strcmp(actual.data(), expected.data()) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected '%s' got '%s').\n", name, expected.data(), actual.data());
+    return 0;
+}
+
+int Test(const char* name, string actual, const char* expected)
+{
+    if (strcmp(actual.data(), expected) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected '%s' got '%s').\n", name, expected, actual.data());
+    return 0;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    // int overload — baseline, expected to work
+    total++;
+    passed += Test("int overload", 42, 42);
+
+    // bool overload — baseline, expected to work
+    total++;
+    passed += Test("bool overload", true, true);
+
+    // const char* overload — baseline
+    total++;
+    passed += Test("const char* overload", "hello", "hello");
+
+    // float overload — was broken: const char* overload picked instead
+    float f = 1.5f;
+    total++;
+    passed += Test("float overload exact", f, 1.5f);
+
+    total++;
+    passed += Test("float overload literal", 3.14f, 3.14f);
+
+    // Negative float case: different values should fail
+    total++;
+    int negative = Test("float overload mismatch", 1.0f, 2.0f);
+    if (negative == 0) { printf("float overload mismatch correctly detected.\n"); passed++; }
+    else { printf("float overload mismatch FAILED to detect.\n"); }
+
+    // string overload: string variable vs string variable
+    string s1 = "hello";
+    string s2 = "hello";
+    string s3 = "world";
+    total++;
+    passed += Test("string overload (str==str)", s1, s2);
+    total++;
+    int negStr = Test("string overload (str!=str)", s1, s3);
+    if (negStr == 0) { printf("string overload mismatch correctly detected.\n"); passed++; }
+    else { printf("string overload mismatch FAILED to detect.\n"); }
+
+    // string vs const char* literal overload
+    total++;
+    passed += Test("string vs literal overload", s1, "hello");
+    total++;
+    int negStrLit = Test("string vs literal mismatch", s1, "world");
+    if (negStrLit == 0) { printf("string vs literal mismatch correctly detected.\n"); passed++; }
+    else { printf("string vs literal mismatch FAILED to detect.\n"); }
+
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

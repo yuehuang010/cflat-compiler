@@ -285,7 +285,7 @@ public:
 
     void LogError(std::string message) const
     {
-        std::cout << std::format("[{}:{}] : {}\n", currentLine, currentColumn, message);
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
         exit(1);
     }
 
@@ -1557,9 +1557,13 @@ public:
     /// <returns>Returns -1 for in compatible type, 0 for same, positive number for possible Upconvert.</returns>
     int CompareUpconvert(llvm::Type* srcType, llvm::Type* destType) const
     {
-        if (srcType->isPointerTy() || destType->isPointerTy())
+        if (srcType->isPointerTy() && destType->isPointerTy())
         {
             return 0;
+        }
+        if (srcType->isPointerTy() || destType->isPointerTy())
+        {
+            return -1;  // pointer vs non-pointer: incompatible
         }
 
         // auto srcType = value->getType();

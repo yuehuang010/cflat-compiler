@@ -1,27 +1,5 @@
 import "filesystem.cb";
-
-extern int strcmp(const char* a, const char* b);
-
-int TestBool(const char* name, bool actual, bool expected)
-{
-    if (actual == expected) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
-    return 0;
-}
-
-int TestInt(const char* name, int actual, int expected)
-{
-    if (actual == expected) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
-    return 0;
-}
-
-int TestStr(const char* name, const char* actual, const char* expected)
-{
-    if (strcmp(actual, expected) == 0) { printf("%s passed.\n", name); return 1; }
-    printf("%s FAILED (expected '%s' got '%s').\n", name, expected, actual);
-    return 0;
-}
+import "test_helper.cb";
 
 // ── File static methods: read/write/exists/remove ─────────────────────────────
 
@@ -33,21 +11,21 @@ int testFileReadWrite()
     string again = " again";
 
     File.remove(path);
-    passed += TestBool("file not exists before write", File.exists(path), false);
+    passed += Test("file not exists before write", File.exists(path), false);
 
-    passed += TestBool("writeAllText",            File.writeAllText(path, hw), true);
-    passed += TestBool("file exists after write", File.exists(path),           true);
+    passed += Test("writeAllText",            File.writeAllText(path, hw), true);
+    passed += Test("file exists after write", File.exists(path),           true);
 
     string content = File.readAllText(path);
-    passed += TestStr("readAllText content", content.data(), "hello world");
-    passed += TestInt("readAllText length",  content.length(), 11);
+    passed += Test("readAllText content", content.data(), "hello world");
+    passed += Test("readAllText length",  content.length(), 11);
 
-    passed += TestBool("appendAllText", File.appendAllText(path, again), true);
+    passed += Test("appendAllText", File.appendAllText(path, again), true);
     string content2 = File.readAllText(path);
-    passed += TestStr("after append", content2.data(), "hello world again");
+    passed += Test("after append", content2.data(), "hello world again");
 
-    passed += TestBool("File.remove",               File.remove(path), true);
-    passed += TestBool("file not exists after del", File.exists(path), false);
+    passed += Test("File.remove",               File.remove(path), true);
+    passed += Test("file not exists after del", File.exists(path), false);
 
     return passed;
 }
@@ -63,29 +41,29 @@ int testFileClass()
     File.remove(path);
 
     File* w = new File;
-    passed += TestBool("openWrite",       w->openWrite(path), true);
-    passed += TestBool("isOpen",          w->isOpen(),        true);
-    passed += TestBool("writeLine hello", w->writeLine(hello), true);
-    passed += TestBool("writeLine world", w->writeLine(world), true);
+    passed += Test("openWrite",       w->openWrite(path), true);
+    passed += Test("isOpen",          w->isOpen(),        true);
+    passed += Test("writeLine hello", w->writeLine(hello), true);
+    passed += Test("writeLine world", w->writeLine(world), true);
     w->close();
-    passed += TestBool("isOpen after close", w->isOpen(), false);
+    passed += Test("isOpen after close", w->isOpen(), false);
     delete w;
 
     File* r = new File;
-    passed += TestBool("openRead", r->openRead(path), true);
+    passed += Test("openRead", r->openRead(path), true);
     string line1 = r->readLine();
     string line2 = r->readLine();
-    passed += TestStr("readLine 1", line1.data(), "hello");
-    passed += TestStr("readLine 2", line2.data(), "world");
+    passed += Test("readLine 1", line1.data(), "hello");
+    passed += Test("readLine 2", line2.data(), "world");
     r->readLine();
-    passed += TestBool("atEnd", r->atEnd(), true);
+    passed += Test("atEnd", r->atEnd(), true);
     delete r;
 
     // "hello\n" + "world\n" = 12 bytes
     File* s = new File;
     s->openRead(path);
     int sz = s->size();
-    passed += TestBool("file size 12", sz == 12, true);
+    passed += Test("file size 12", sz == 12, true);
     delete s;
 
     File.remove(path);
@@ -104,12 +82,12 @@ int testFileMove()
     File.remove(dst);
 
     File.writeAllText(src, moveme);
-    passed += TestBool("File.move ok",           File.move(src, dst),  true);
-    passed += TestBool("src gone after move",    File.exists(src),     false);
-    passed += TestBool("dst exists after move",  File.exists(dst),     true);
+    passed += Test("File.move ok",           File.move(src, dst),  true);
+    passed += Test("src gone after move",    File.exists(src),     false);
+    passed += Test("dst exists after move",  File.exists(dst),     true);
 
     string content = File.readAllText(dst);
-    passed += TestStr("moved content", content.data(), "move me");
+    passed += Test("moved content", content.data(), "move me");
 
     File.remove(dst);
     return passed;
@@ -123,14 +101,14 @@ int testDirectoryFunctions()
     string testDir = "test_fs_dir";
 
     Directory.remove(testDir);
-    passed += TestBool("dir not exists before create", Directory.exists(testDir), false);
-    passed += TestBool("Directory.create",             Directory.create(testDir), true);
-    passed += TestBool("dir exists after create",      Directory.exists(testDir), true);
-    passed += TestBool("Directory.remove",             Directory.remove(testDir), true);
-    passed += TestBool("dir not exists after delete",  Directory.exists(testDir), false);
+    passed += Test("dir not exists before create", Directory.exists(testDir), false);
+    passed += Test("Directory.create",             Directory.create(testDir), true);
+    passed += Test("dir exists after create",      Directory.exists(testDir), true);
+    passed += Test("Directory.remove",             Directory.remove(testDir), true);
+    passed += Test("dir not exists after delete",  Directory.exists(testDir), false);
 
     string cwd = Directory.getCurrent();
-    passed += TestBool("getCurrent not empty", cwd.length() > 0, true);
+    passed += Test("getCurrent not empty", cwd.length() > 0, true);
 
     return passed;
 }
@@ -151,13 +129,13 @@ int testDirectoryClass()
     Directory* d = new Directory;
     d->init(testDir);
 
-    passed += TestBool("Directory.exists false",  d->exists(), false);
-    passed += TestBool("Directory.create",        d->create(), true);
-    passed += TestBool("Directory.exists true",   d->exists(), true);
+    passed += Test("Directory.exists false",  d->exists(), false);
+    passed += Test("Directory.create",        d->create(), true);
+    passed += Test("Directory.exists true",   d->exists(), true);
 
     File.remove(atxt);
     File.remove(btxt);
-    passed += TestBool("Directory.remove", d->remove(), true);
+    passed += Test("Directory.remove", d->remove(), true);
     delete d;
 
     return passed;

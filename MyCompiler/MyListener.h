@@ -426,6 +426,7 @@ class MyListener : public CFlatBaseListener
 private:
     CFlatParser* parser;
     MyCompilerLLVM* compilerLLVM;
+    std::string sourceFileName;
 
     MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
     {
@@ -586,10 +587,11 @@ private:
     }
 
 public:
-    MyListener(CFlatParser* parser, MyCompilerLLVM* compilerLLVM)
+    MyListener(CFlatParser* parser, MyCompilerLLVM* compilerLLVM, const std::string& filename)
     {
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
+        this->sourceFileName = filename;
     }
 
     void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
@@ -4954,7 +4956,7 @@ public:
         auto symbol = ctx->getSymbol();
         int line = static_cast<int>(symbol->getLine());
         int column = static_cast<int>(symbol->getCharPositionInLine());
-        std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, line, column, errorMessage);
         exit(1);
     }
 
@@ -4962,7 +4964,7 @@ public:
     {
         int line = static_cast<int>(ctx->getStart()->getLine());
         int column = static_cast<int>(ctx->getStart()->getCharPositionInLine());
-        std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), errorMessage);
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, line, column, errorMessage);
         exit(1);
     }
 
@@ -4970,14 +4972,14 @@ public:
     {
         size_t line = ctx->getStart()->getLine();
         size_t column = ctx->getStart()->getCharPositionInLine();
-        std::cout << std::format("[{}:{}] {} : {}\n", line, column, ctx->getText(), warningMessage);
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, line, column, warningMessage);
     }
 
     void PrintContext(antlr4::ParserRuleContext* ctx, std::string suffix = "")
     {
         size_t line = ctx->getStart()->getLine();
         size_t column = ctx->getStart()->getCharPositionInLine();
-        std::cout << std::format("[{}:{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
+        std::cout << std::format("[{},{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
     }
 
     void enterEveryRule(antlr4::ParserRuleContext* ctx) override

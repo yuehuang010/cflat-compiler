@@ -1,46 +1,11 @@
-int Test(const char* testName, i64 actual, i64 expected)
-{
-    if (expected == actual)
-    {
-        printf("%s passed.\n", testName);
-        return 1;
-    }
-
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-    return 0;
-}
-
-int Test(const char* testName, int actual, int expected)
-{
-    if (expected == actual)
-    {
-        printf("%s passed.\n", testName);
-        return 1;
-    }
-
-    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
-    return 0;
-}
-
-bool TestBool(const char* testName, bool actual)
-{
-    bool expected = true;
-    if (expected == actual)
-    {
-        printf("%s passed.\n", testName);
-        return true;
-    }
-
-    printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
-    return false;
-}
+import "test_helper.cb";
 
 bool testBuiltinIdentifiers()
 {
     bool result = true;
-    result &= TestStr("__FILE__", __FILE__, "testfile2.cb");
-    result &= TestStr("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 43); // Remember to adjust if shifted.
+    result &= Test("__FILE__", __FILE__, "testfile2.cb");
+    result &= Test("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
+    result &= Test("__LINE__", __LINE__, 8); // Remember to adjust if shifted.
     return result;
 }
 
@@ -212,7 +177,7 @@ bool testDefaultExpression()
 
 extern int strcmp(const char* a, const char* b);
 
-bool TestStr(const char* testName, const char* actual, const char* expected)
+bool Test(const char* testName, const char* actual, const char* expected)
 {
     if (strcmp(actual, expected) == 0)
     {
@@ -242,13 +207,13 @@ bool testTypeof()
     bool b = false;
     TypedThing t = TypedThing();
 
-    result &= TestStr("typeof_int", typeof(i), "int");
-    result &= TestStr("typeof_bool", typeof(b), "bool");
-    result &= TestStr("typeof_struct", typeof(t), "TypedThing");
-    result &= TestStr("typeof_field_int", typeof(t.count), "int");
-    result &= TestStr("typeof_field_bool", typeof(t.flag), "bool");
-    result &= TestStr("typeof_type_int", typeof(int), "int");
-    result &= TestStr("typeof_type_name", typeof(TypedThing), "TypedThing");
+    result &= Test("typeof_int", typeof(i), "int");
+    result &= Test("typeof_bool", typeof(b), "bool");
+    result &= Test("typeof_struct", typeof(t), "TypedThing");
+    result &= Test("typeof_field_int", typeof(t.count), "int");
+    result &= Test("typeof_field_bool", typeof(t.flag), "bool");
+    result &= Test("typeof_type_int", typeof(int), "int");
+    result &= Test("typeof_type_name", typeof(TypedThing), "TypedThing");
     return result;
 }
 
@@ -258,10 +223,10 @@ bool testNameof()
     int myVar = 0;
     NamedThing thing = NamedThing();
 
-    result &= TestStr("nameof_var", nameof(myVar), "myVar");
-    result &= TestStr("nameof_struct", nameof(thing), "thing");
-    result &= TestStr("nameof_field", nameof(thing.value), "value");
-    result &= TestStr("nameof_type", nameof(NamedThing), "NamedThing");
+    result &= Test("nameof_var", nameof(myVar), "myVar");
+    result &= Test("nameof_struct", nameof(thing), "thing");
+    result &= Test("nameof_field", nameof(thing.value), "value");
+    result &= Test("nameof_type", nameof(NamedThing), "NamedThing");
     return result;
 }
 
@@ -515,7 +480,7 @@ bool testAssertFail()
 bool testAssertReturnBlock()
 {
     bool result = true;
-    result &= TestBool("assert_all_pass", testAssertPass());
+    result &= Test("assert_all_pass", testAssertPass(), true);
     result &= Test("assert_early_exit", testAssertFail(), false);
     return result;
 }
@@ -644,8 +609,8 @@ bool testNullCoalescing()
     // pointer coalescing: null -> fallback string
     const char* name1 = tryGetName(true)  ?? "Unknown";
     const char* name2 = tryGetName(false) ?? "Unknown";
-    result &= TestStr("nullcoal_nonnull_ptr", name1, "Alice");
-    result &= TestStr("nullcoal_null_ptr",    name2, "Unknown");
+    result &= Test("nullcoal_nonnull_ptr", name1, "Alice");
+    result &= Test("nullcoal_null_ptr",    name2, "Unknown");
 
     // integer coalescing: 0 -> default, nonzero -> self
     int zero = 0;
@@ -683,12 +648,12 @@ bool testNullCoalescingAssignment()
     // null pointer: should be assigned the rhs
     const char* p = nullptr;
     p ??= "hello";
-    result &= TestStr("nullcoalasgn_null_ptr", p, "hello");
+    result &= Test("nullcoalasgn_null_ptr", p, "hello");
 
     // non-null pointer: should keep its original value
     const char* q = "world";
     q ??= "other";
-    result &= TestStr("nullcoalasgn_nonnull_ptr", q, "world");
+    result &= Test("nullcoalasgn_nonnull_ptr", q, "world");
 
     // null struct pointer: should be assigned the rhs
     NullableNode* node = nullptr;
@@ -701,7 +666,7 @@ bool testNullCoalescingAssignment()
     NullableNode* replacementNode = new NullableNode();
     NullableNode* before = nonNullNode;
     nonNullNode ??= replacementNode;
-    result &= TestBool("nullcoalasgn_nonnull_struct_ptr", nonNullNode == before);
+    result &= Test("nullcoalasgn_nonnull_struct_ptr", nonNullNode == before, true);
     delete nonNullNode;
     delete replacementNode;
 
@@ -751,11 +716,11 @@ bool testStringType()
     string s = "hello";
 
     result &= Test("string_length", s.length(), 5);
-    result &= TestStr("string_data", s.data(), "hello");
+    result &= Test("string_data", s.data(), "hello");
 
     string s2 = "world!!";
     result &= Test("string2_length", s2.length(), 7);
-    result &= TestStr("string2_data", s2.data(), "world!!");
+    result &= Test("string2_data", s2.data(), "world!!");
 
     return result;
 }
@@ -769,17 +734,17 @@ bool testStringLiteral()
     // Basic assignment from a string literal
     string s = "hello";
     result &= Test("str_lit_length",      s.length(), 5);
-    result &= TestStr("str_lit_data",     s.data(),  "hello");
+    result &= Test("str_lit_data",     s.data(),  "hello");
 
     // Longer literal — the canonical use case: string s = "My test string";
     string s2 = "My test string";
     result &= Test("str_lit_long_length", s2.length(), 14);
-    result &= TestStr("str_lit_long_data", s2.data(), "My test string");
+    result &= Test("str_lit_long_data", s2.data(), "My test string");
 
     // Empty string literal
     string s3 = "";
     result &= Test("str_lit_empty_length", s3.length(), 0);
-    result &= TestStr("str_lit_empty_data", s3.data(), "");
+    result &= Test("str_lit_empty_data", s3.data(), "");
 
     // String with escape sequences — \n counts as one character
     string s4 = "line1\nline2";
@@ -790,8 +755,8 @@ bool testStringLiteral()
     string sb = "beta!";
     result &= Test("str_lit_multi_a_length",  sa.length(), 5);
     result &= Test("str_lit_multi_b_length",  sb.length(), 5);
-    result &= TestStr("str_lit_multi_a_data", sa.data(), "alpha");
-    result &= TestStr("str_lit_multi_b_data", sb.data(), "beta!");
+    result &= Test("str_lit_multi_a_data", sa.data(), "alpha");
+    result &= Test("str_lit_multi_b_data", sb.data(), "beta!");
 
     return result;
 }
@@ -859,23 +824,23 @@ bool testFormatString()
 
     string name = "World";
     string greeting = "Hello {name}!";
-    result &= TestStr("fmt_simple", greeting.data(), "Hello World!");
+    result &= Test("fmt_simple", greeting.data(), "Hello World!");
 
     string a = "foo";
     string b = "bar";
     string combined = "{a} and {b}";
-    result &= TestStr("fmt_two", combined.data(), "foo and bar");
+    result &= Test("fmt_two", combined.data(), "foo and bar");
 
     string prefix = "pre";
     string suffix = "suf";
     string three = "{prefix}-mid-{suffix}";
-    result &= TestStr("fmt_three", three.data(), "pre-mid-suf");
+    result &= Test("fmt_three", three.data(), "pre-mid-suf");
 
     Point p = Point();
 	p.x = 10;
 	p.y = 20;
 	string pointStr = "Point is {p}.";
-	result &= TestStr("fmt_object", pointStr.data(), "Point is 10, 20.");
+	result &= Test("fmt_object", pointStr.data(), "Point is 10, 20.");
 
     return result;
 }

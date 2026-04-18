@@ -1,0 +1,56 @@
+// Test helper functions for unit tests
+
+import "string.cb";
+
+extern int strcmp(const char* a, const char* b);
+
+bool printOnPass = false;
+
+int Test(const char* name, bool actual, bool expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+int Test(const char* name, int actual, int expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, const char* actual, const char* expected)
+{
+    if (strcmp(actual, expected) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected '%s' got '%s').\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, i64 actual, i64 expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, float actual, float expected)
+{
+    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s MISMATCH (expected %f got %f).\n", name, expected, actual);
+    return 0;
+}
+
+int Test(const char* name, string actual, const char* expected)
+{
+    if (strcmp(actual.data(), expected) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected '%s' got '%s').\n", name, expected, actual.data());
+    return 0;
+}
+
+int Test(const char* name, string actual, string expected)
+{
+    if (strcmp(actual.data(), expected.data()) == 0) { if (printOnPass) printf("%s passed.\n", name); return 1; }
+    printf("%s FAILED (expected '%s' got '%s').\n", name, expected.data(), actual.data());
+    return 0;
+}

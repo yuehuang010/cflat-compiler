@@ -1,4 +1,5 @@
-extern void printf(const char* fmt, ...);
+
+import "test_helper.cb";
 
 interface IShape
 {
@@ -16,17 +17,6 @@ class Square : IShape
     int side = 0;
     int Area() { return side * side; }
 };
-
-bool Test(const char* name, bool actual, bool expected)
-{
-    if (actual == expected)
-    {
-        printf("%s passed.\n", name);
-        return true;
-    }
-    printf("%s failed: expected %d but got %d.\n", name, expected, actual);
-    return false;
-}
 
 extern int main()
 {
