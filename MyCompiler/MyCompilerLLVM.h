@@ -72,6 +72,13 @@ public:
         std::string VariableName;
         bool Pointer = false;
         bool IsInterface = false;
+        bool IsNullable = false;
+
+        bool IsPrimitive() const
+        {
+            return IsInteger() != -1 || IsUnsignedInteger() != -1 || IsFloatingPoint() != -1
+                || TypeName == "bool" || TypeName == "void";
+        }
 
         bool IsTypeMatch(const TypeAndValue& other) const
         {

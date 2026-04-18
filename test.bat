@@ -24,6 +24,7 @@ call :RunTestCb test_core_string
 call :RunTestCb test_filesystem
 call :RunTestCb test_static
 call :RunTestCb test_overload -i %LIB%
+call :RunTestCb test_nullable
 
 echo.
 if %ERRORS% EQU 0 (

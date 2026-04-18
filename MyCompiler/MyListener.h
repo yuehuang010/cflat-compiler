@@ -110,6 +110,16 @@ private:
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
+                if (declSpec->Question())
+                {
+                    if (declType.IsPrimitive())
+                        std::cerr << std::format("error: nullable '?' is not allowed on primitive type '{}'\n", declType.TypeName);
+                    else
+                    {
+                        declType.IsNullable = true;
+                        declType.Pointer = true;
+                    }
+                }
                 break;
             }
             else if (storageSpec)
@@ -578,6 +588,16 @@ private:
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
+                if (declSpec->Question())
+                {
+                    if (declType.IsPrimitive())
+                        LogErrorContext(declSpec, std::format("nullable '?' is not allowed on primitive type '{}'", declType.TypeName));
+                    else
+                    {
+                        declType.IsNullable = true;
+                        declType.Pointer = true;
+                    }
+                }
                 break;
             }
             else if (storageSpec)
@@ -1911,6 +1931,13 @@ public:
                     {
                         right = GenerateDefaultValue(typeAndValue);
                     }
+                }
+
+                if (right == nullptr && typeAndValue.IsNullable)
+                {
+                    // Nullable pointer defaults to null when no initializer is provided.
+                    llvm::Type* ptrTy = compiler->GetType(typeAndValue);
+                    right = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
                 }
 
                 if (right == nullptr && !typeAndValue.Pointer)

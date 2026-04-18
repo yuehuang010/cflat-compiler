@@ -197,7 +197,7 @@ declarationSpecifiers
 
 declarationSpecifier
     : storageClassSpecifier
-    | typeSpecifier (pointer | '[' assignmentExpression ']')?
+    | typeSpecifier '?'? (pointer | '[' assignmentExpression ']')?
     | typeQualifier
     | functionSpecifier
     | alignmentSpecifier

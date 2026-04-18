@@ -1,0 +1,38 @@
+struct Point
+{
+    int x = 0;
+    int y = 0;
+};
+
+extern int main()
+{
+    // Nullable defaults to nullptr
+    Point? p;
+
+    int result = 0;
+
+    // Should be nullptr initially
+    if (p == nullptr)
+        result = result + 1;
+
+    // Assign a real value
+    Point pt = Point();
+    pt.x = 10;
+    pt.y = 20;
+    p = &pt;
+
+    // Should no longer be nullptr
+    if (p != nullptr)
+        result = result + 1;
+
+    // Access via ?.
+    if (p?.x == 10)
+        result = result + 1;
+
+    // Reset to nullptr
+    p = nullptr;
+    if (p == nullptr)
+        result = result + 1;
+
+    return result == 4 ? 0 : 1;
+}
