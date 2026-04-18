@@ -1,0 +1,30 @@
+// Test stack data structure
+import "stack.cb";
+
+extern int main()
+{
+    stack<i32> s;
+
+    // Test empty check
+    if (!s.isEmpty()) return 1;
+
+    // Push values
+    s.push(10);
+    s.push(20);
+    s.push(30);
+
+    if (s.count() != 3) return 1;
+    if (!(!s.isEmpty())) return 1;
+
+    // Peek top
+    if (s.peek() != 30) return 1;
+
+    // Pop should be LIFO
+    if (s.pop() != 30) return 1;
+    if (s.pop() != 20) return 1;
+    if (s.pop() != 10) return 1;
+
+    if (!s.isEmpty()) return 1;
+
+    return 0;
+}

@@ -1,0 +1,46 @@
+// stack<T> — LIFO (Last In First Out) data structure backed by list<T>.
+
+class stack<T>
+{
+    list<T> _items = default;
+
+    // Push a value onto the stack.
+    void push(T value)
+    {
+        _items.add(value);
+    }
+
+    // Remove and return the top value.
+    // Undefined behavior if stack is empty.
+    T pop()
+    {
+        int idx = _items.count() - 1;
+        T value = _items.get(idx);
+        _items.removeAt(idx);
+        return value;
+    }
+
+    // View the top value without removing it.
+    // Undefined behavior if stack is empty.
+    T peek()
+    {
+        return _items.get(_items.count() - 1);
+    }
+
+    // Check if the stack is empty.
+    bool isEmpty()
+    {
+        return _items.count() == 0;
+    }
+
+    // Return the number of elements in the stack.
+    int count()
+    {
+        return _items.count();
+    }
+
+    ~stack()
+    {
+        if (_items._data != nullptr) delete[] _items._data;
+    }
+}

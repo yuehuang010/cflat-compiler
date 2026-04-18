@@ -1,0 +1,45 @@
+// queue<T> — FIFO (First In First Out) data structure backed by list<T>.
+
+class queue<T>
+{
+    list<T> _items = default;
+
+    // Add a value to the back of the queue.
+    void enqueue(T value)
+    {
+        _items.add(value);
+    }
+
+    // Remove and return the front value.
+    // Undefined behavior if queue is empty.
+    T dequeue()
+    {
+        T value = _items.get(0);
+        _items.removeAt(0);
+        return value;
+    }
+
+    // View the front value without removing it.
+    // Undefined behavior if queue is empty.
+    T peek()
+    {
+        return _items.get(0);
+    }
+
+    // Check if the queue is empty.
+    bool isEmpty()
+    {
+        return _items.count() == 0;
+    }
+
+    // Return the number of elements in the queue.
+    int count()
+    {
+        return _items.count();
+    }
+
+    ~queue()
+    {
+        if (_items._data != nullptr) delete[] _items._data;
+    }
+}

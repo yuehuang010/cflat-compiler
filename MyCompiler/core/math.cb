@@ -1,0 +1,53 @@
+// math.cb — common mathematical utilities.
+// Provides abs, min, max, clamp for integers and floats.
+
+namespace Math
+{
+    // Absolute value for i32.
+    i32 abs(i32 x)
+    {
+        return x < 0 ? -x : x;
+    }
+
+    // Absolute value for i64.
+    i64 abs(i64 x)
+    {
+        return x < 0 ? -x : x;
+    }
+
+    // Minimum of two i32 values.
+    i32 min(i32 a, i32 b)
+    {
+        return a < b ? a : b;
+    }
+
+    // Minimum of two i64 values.
+    i64 min(i64 a, i64 b)
+    {
+        return a < b ? a : b;
+    }
+
+    // Maximum of two i32 values.
+    i32 max(i32 a, i32 b)
+    {
+        return a > b ? a : b;
+    }
+
+    // Maximum of two i64 values.
+    i64 max(i64 a, i64 b)
+    {
+        return a > b ? a : b;
+    }
+
+    // Clamp x to [min, max] for i32.
+    i32 clamp(i32 x, i32 minVal, i32 maxVal)
+    {
+        return x < minVal ? minVal : (x > maxVal ? maxVal : x);
+    }
+
+    // Clamp x to [min, max] for i64.
+    i64 clamp(i64 x, i64 minVal, i64 maxVal)
+    {
+        return x < minVal ? minVal : (x > maxVal ? maxVal : x);
+    }
+}
