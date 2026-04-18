@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
+REM set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
 set COMPILER=x64\Debug\MyCompiler.exe
 set SRC=MyCompiler\Test
 set LIB=MyCompiler\Test\library

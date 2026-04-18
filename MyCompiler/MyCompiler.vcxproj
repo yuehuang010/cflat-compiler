@@ -236,4 +236,14 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
+  <Target Name="CopyLldDependencies" AfterTargets="Build" Condition="'$(Platform)'=='x64'">
+    <PropertyGroup>
+      <_VcpkgBinDir Condition="'$(Configuration)'=='Debug'">$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\debug\bin</_VcpkgBinDir>
+      <_VcpkgBinDir Condition="'$(Configuration)'=='Release'">$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\bin</_VcpkgBinDir>
+      <_VcpkgToolsDir>$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\tools\llvm</_VcpkgToolsDir>
+    </PropertyGroup>
+    <Copy SourceFiles="$(_VcpkgBinDir)\LTO.dll;$(_VcpkgBinDir)\Remarks.dll;$(_VcpkgToolsDir)\lld-link.exe"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
 </Project>
