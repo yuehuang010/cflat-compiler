@@ -1,6 +1,7 @@
 ﻿import "list.cb";
 import "hashset.cb";
 import "dictionary.cb";
+import "pair.cb";
 
 int TestBool(const char* name, bool actual, bool expected)
 {
@@ -196,6 +197,30 @@ int testDictionary()
 
     return passed;
 }
+
+// ── Pair<T,U> ────────────────────────────────────────────────────────────────
+
+int testPair()
+{
+    int passed = 0;
+
+    // Test Pair<int, int>
+    Pair<int, int> p1 = default;
+    p1.first = 10;
+    p1.second = 20;
+    passed += TestInt("pair int int first", p1.first, 10);
+    passed += TestInt("pair int int second", p1.second, 20);
+
+    // Test Pair<int, int> with different values
+    Pair<int, int> p2 = default;
+    p2.first = 42;
+    p2.second = 99;
+    passed += TestInt("pair int int first 2", p2.first, 42);
+    passed += TestInt("pair int int second 2", p2.second, 99);
+
+    return passed;
+}
+
 // ── foreach ──────────────────────────────────────────────────────────────────
 
 int testForeach()
@@ -271,6 +296,7 @@ extern int main()
     r = testList();         passed += r; total += 15;
     r = testHashset();      passed += r; total += 19;
     r = testDictionary();   passed += r; total += 34;
+    r = testPair();         passed += r; total += 4;
     r = testForeach();      passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
