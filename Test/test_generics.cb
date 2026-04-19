@@ -172,13 +172,11 @@ bool testGenericStack()
 int testGenericStructs()
 {
     bool result = true;
-    printf("=== Generic Struct Tests ===\n");
     result &= testGenericBox();
     result &= testGenericPair();
     result &= testGenericMultipleInstantiations();
     result &= testGenericContainer();
     result &= testGenericStack();
-    printf("=== Generic Tests Completed ===\n");
     return result;
 }
 

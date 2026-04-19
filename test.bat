@@ -3,29 +3,26 @@ setlocal
 
 REM set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
 set COMPILER=x64\Debug\MyCompiler.exe
-set SRC=MyCompiler\Test
-set LIB=MyCompiler\Test\library
+set SRC=Test
+set LIB=Test\library
 set OUT=out
-
 
 set ERRORS=0
 
+REM Tests excluded from the run (space-separated, no extensions)
+set EXCLUDE=test_helper test_queue test_stack
+
 if not exist "%OUT%" mkdir "%OUT%"
 
-call :RunTest test_c
-call :RunTestCb test_basic
-call :RunTestCb test_generics
-call :RunTestCb test_module -i %LIB%
-call :RunTestCb test_library_string -i %LIB%
-call :RunTestCb test_operators
-call :RunTestCb test_is_as
-call :RunTestCb test_core
-call :RunTestCb test_core_string
-call :RunTestCb test_filesystem
-call :RunTestCb test_static
-call :RunTestCb test_overload -i %LIB%
-call :RunTestCb test_nullable
-call :RunTestCb test_move
+for %%F in (%SRC%\test_*.c) do (
+    call :IsExcluded %%~nF
+    if not errorlevel 1 call :RunTest %%~nF
+)
+
+for %%F in (%SRC%\test_*.cb) do (
+    call :IsExcluded %%~nF
+    if not errorlevel 1 call :RunTestCb %%~nF
+)
 
 echo.
 if %ERRORS% EQU 0 (
@@ -36,12 +33,17 @@ if %ERRORS% EQU 0 (
 )
 exit /b 0
 
+:IsExcluded
+for %%E in (%EXCLUDE%) do (
+    if /I "%~1"=="%%E" exit /b 1
+)
+exit /b 0
+
 :RunTest
 set NAME=%~1
-set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.c %EXTRA% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.c -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
     set /a ERRORS+=1
@@ -60,10 +62,9 @@ exit /b
 
 :RunTestCb
 set NAME=%~1
-set EXTRA=%~2 %~3
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.cb %EXTRA% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.cb -i %LIB% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
     set /a ERRORS+=1
