@@ -45,7 +45,7 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('mycompiler.runDiagnostics', () => {
             const editor = vscode.window.activeTextEditor;
-            if (editor && editor.document.languageId === 'myc') {
+            if (editor && editor.document.languageId === 'cflat') {
                 client.sendNotification('mycompiler/runDiagnostics', {
                     uri: editor.document.uri.toString()
                 });
