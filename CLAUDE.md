@@ -11,15 +11,21 @@ MyCompiler is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb fil
 Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM). Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
-msbuild MyCompiler.slnx /p:Configuration=Debug /p:Platform=x64
+msbuild MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
 ```
 
-Full msbuild path (if not on PATH): `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe`
+> **Bash / Git Bash note**: Use **`-p:`** (dash), not `/p:` (slash). Git Bash path-converts arguments that start with `/letter:`, stripping the leading slash, which causes MSBuild to misparse the flags. Dashes are safe.
 
-**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_filesystem.cb`:
+Full msbuild path (if not on PATH):
 
 ```bash
-buildAndRun.bat
+"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
+```
+
+**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_generics.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
+
+```bash
+./buildAndRun.bat
 ```
 
 ## Running
