@@ -779,6 +779,8 @@ private:
         return true;
     }
 
+    void OptimizeModule(int optimizationLevel);
+
     bool SaveToFile(std::string filename)
     {
         std::error_code errorCode;

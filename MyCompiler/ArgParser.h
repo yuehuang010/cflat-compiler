@@ -117,6 +117,13 @@ public:
 
 	size_t positionalCount() const { return m_positionalValues.size(); }
 
+	int getOptimizationLevel() const
+	{
+		if (hasFlag("O2")) return 2;
+		if (hasFlag("O1")) return 1;
+		return 0;
+	}
+
 	void printUsage() const
 	{
 		std::cout << "Usage: " << m_program;

@@ -5,6 +5,7 @@
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
+#include <llvm\Passes\PassBuilder.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -211,6 +212,13 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         return false;
     }
 
+    int optLevel = args.getOptimizationLevel();
+    if (optLevel > 0)
+    {
+        if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel << ")\n";
+        OptimizeModule(optLevel);
+    }
+
     if (!bitcodePath.empty())
     {
         if (verbose) std::cout << "[verbose] writing bitcode to " << bitcodePath << "\n";
@@ -328,4 +336,30 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
 
     sourceFileName = savedSourceFileName;
     return true;
+}
+
+void MyCompilerLLVM::OptimizeModule(int optimizationLevel)
+{
+    if (optimizationLevel == 0)
+        return;
+
+    llvm::PassBuilder PB;
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::ModulePassManager MPM;
+    if (optimizationLevel == 1)
+        MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
+    else if (optimizationLevel == 2)
+        MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+
+    MPM.run(*module, MAM);
 }

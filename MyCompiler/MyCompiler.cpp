@@ -34,6 +34,9 @@ int main(int argc, char* argv[])
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
     args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
+    args.addFlag("O0", '0', "No optimization (default)");
+    args.addFlag("O1", '1', "Optimize for speed (level 1)");
+    args.addFlag("O2", '2', "Optimize for speed (level 2)");
 
     if (!args.parse(argc, argv))
         return 1;
