@@ -39,6 +39,8 @@
     <None Include="core\hashset.cb" />
     <None Include="core\dictionary.cb" />
     <None Include="core\interfaces.cb" />
+    <None Include="core\pair.cb" />
+    <None Include="core\filesystem.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />
@@ -48,6 +50,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CompilerManager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Version.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

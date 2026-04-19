@@ -1,6 +1,9 @@
 
 extern bool printOnPass;
 
+import "list.cb";
+import "dictionary.cb";
+
 int Test(const char* testName, i64 actual, i64 expected)
 {
     if (expected == actual)
@@ -287,8 +290,6 @@ bool testGenericInterface()
 // Returning list<T>* from functions
 // =============================================================
 
-import "list.cb";
-
 list<int>* makeIntList()
 {
     list<int>* l = new list<int>;
@@ -494,6 +495,197 @@ bool testConstructorDefaultArgs()
     return result;
 }
 
+// =============================================================
+// Collections with struct and class types
+// =============================================================
+
+struct Person
+{
+    int age = 0;
+    int id = 0;
+};
+
+bool testListStruct()
+{
+    bool result = true;
+
+    list<Person> people;
+
+    Person p1 = default;
+    p1.age = 25;
+    p1.id = 101;
+
+    Person p2 = default;
+    p2.age = 30;
+    p2.id = 102;
+
+    Person p3 = default;
+    p3.age = 35;
+    p3.id = 103;
+
+    people.add(p1);
+    people.add(p2);
+    people.add(p3);
+
+    result &= Test("list<struct> count", people.count(), 3);
+    result &= Test("list<struct> get[0].age", people.get(0).age, 25);
+    result &= Test("list<struct> get[0].id",  people.get(0).id,  101);
+    result &= Test("list<struct> get[1].age", people.get(1).age, 30);
+    result &= Test("list<struct> get[2].id",  people.get(2).id,  103);
+
+    // operator[]
+    result &= Test("list<struct> op[] get", people[1].age, 30);
+
+    // set
+    Person p4 = default;
+    p4.age = 40;
+    p4.id = 104;
+    people.set(1, p4);
+    result &= Test("list<struct> after set", people.get(1).age, 40);
+
+    // removeAt
+    people.removeAt(1);
+    result &= Test("list<struct> count after remove", people.count(), 2);
+    result &= Test("list<struct> after remove[1]", people.get(1).id, 103);
+
+    // clear
+    people.clear();
+    result &= Test("list<struct> after clear", people.count(), 0);
+
+    return result;
+}
+
+
+bool testDictionaryStruct()
+{
+    bool result = true;
+
+    dictionary<int, Person> personMap;
+
+    Person p1 = default;
+    p1.age = 25;
+    p1.id = 101;
+
+    Person p2 = default;
+    p2.age = 30;
+    p2.id = 102;
+
+    Person p3 = default;
+    p3.age = 35;
+    p3.id = 103;
+
+    // Add entries
+    result &= Test("dict<int,struct> add 1", personMap.add(1, p1), true);
+    result &= Test("dict<int,struct> add 2", personMap.add(2, p2), true);
+    result &= Test("dict<int,struct> add 3", personMap.add(3, p3), true);
+
+    result &= Test("dict<int,struct> count", personMap.count(), 3);
+
+    // Get and check fields
+    result &= Test("dict<int,struct> get 1 age",  personMap.get(1).age, 25);
+    result &= Test("dict<int,struct> get 1 id",   personMap.get(1).id,  101);
+    result &= Test("dict<int,struct> get 2 age",  personMap.get(2).age, 30);
+    result &= Test("dict<int,struct> op[] get",   personMap[3].id,      103);
+
+    // set
+    Person p4 = default;
+    p4.age = 40;
+    p4.id = 104;
+    personMap.set(2, p4);
+    result &= Test("dict<int,struct> after set", personMap.get(2).age, 40);
+
+    // remove
+    result &= Test("dict<int,struct> remove", personMap.remove(2), true);
+    result &= Test("dict<int,struct> count after remove", personMap.count(), 2);
+    result &= Test("dict<int,struct> get after remove", personMap.get(3).age, 35);
+
+    return result;
+}
+
+
+bool testForeachStruct()
+{
+    bool result = true;
+
+    list<Person> people;
+
+    Person p1 = default;
+    p1.age = 20;
+
+    Person p2 = default;
+    p2.age = 30;
+
+    Person p3 = default;
+    p3.age = 40;
+
+    people.add(p1);
+    people.add(p2);
+    people.add(p3);
+
+    int sumAge = 0;
+    foreach (Person p in people)
+        sumAge += p.age;
+
+    result &= Test("foreach struct sum", sumAge, 90);
+
+    return result;
+}
+
+// =============================================================
+// Pointer types inside generic parameters (list<Employee*>)
+// =============================================================
+
+struct Employee
+{
+    int id = 0;
+    int salary = 0;
+};
+
+bool testListPointer()
+{
+    bool result = true;
+
+    list<Employee*> employees;
+
+    Employee* e1 = new Employee;
+    e1->id = 1;
+    e1->salary = 50000;
+
+    Employee* e2 = new Employee;
+    e2->id = 2;
+    e2->salary = 60000;
+
+    Employee* e3 = new Employee;
+    e3->id = 3;
+    e3->salary = 70000;
+
+    employees.add(e1);
+    employees.add(e2);
+    employees.add(e3);
+
+    result &= Test("list<ptr> count",        employees.count(),          3);
+    result &= Test("list<ptr> get[0].id",    employees.get(0)->id,       1);
+    result &= Test("list<ptr> get[0].salary",employees.get(0)->salary,   50000);
+    result &= Test("list<ptr> get[1].id",    employees.get(1)->id,       2);
+    result &= Test("list<ptr> get[2].salary",employees.get(2)->salary,   70000);
+
+    // operator[]
+    result &= Test("list<ptr> op[]",         employees[1]->id,           2);
+
+    // removeAt (caller must free)
+    Employee* removed = employees.get(1);
+    employees.removeAt(1);
+    delete removed;
+    result &= Test("list<ptr> count after remove", employees.count(),    2);
+    result &= Test("list<ptr> after remove[1].id", employees.get(1)->id, 3);
+
+    // cleanup
+    delete employees.get(0);
+    delete employees.get(1);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -506,6 +698,10 @@ extern int main()
     result &= testGenericLocalDefault();
     result &= testOverloadedConstructors();
     result &= testConstructorDefaultArgs();
+    result &= testListStruct();
+    result &= testDictionaryStruct();
+    result &= testForeachStruct();
+    result &= testListPointer();
     if (result)
     {
         printf("All Test Passed.\n");

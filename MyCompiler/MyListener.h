@@ -56,6 +56,16 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     return m->directDeclarator()->getText();
 }
 
+// Normalize a generic type argument for use in mangled names (e.g. "Employee*" → "Employeeptr").
+static std::string MangleTypeArg(const std::string& typeName)
+{
+    std::string result;
+    for (char c : typeName)
+        if (c == '*') result += "ptr";
+        else result += c;
+    return result;
+}
+
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
 // all function signatures and struct type shells before the main code-gen walk.
 // This allows functions and types to be used before their definition in source.
@@ -92,12 +102,10 @@ private:
                         // Generic type instantiation: Box<MyType> → Box__MyType
                         std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
-                    for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                    {
-                        typeArgs.push_back(typeParamSpec->getText());
-                    }
+                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(entry->getText());
                     std::string mangledName = baseName;
-                    for (const auto& arg : typeArgs) mangledName += "__" + arg;
+                    for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
                     // Pre-declare opaque struct type and default constructor so that
                     // uses inside function bodies are resolvable before the full
                     // definition is emitted by ProcessPendingInstantiations().
@@ -387,8 +395,8 @@ public:
             {
         auto* compiler = Compiler(genericParams);
                 std::string mangledName = baseName;
-                for (auto* typeParamSpec : genericParams->typeParameterList()->typeSpecifier())
-                    mangledName += "__" + typeParamSpec->getText();
+                for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
+                    mangledName += "__" + MangleTypeArg(entry->getText());
                 compiler->CreateStructType(mangledName, {});
                 MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
@@ -550,9 +558,9 @@ private:
                     // Generic type instantiation: Box<MyType> -> Box__MyType
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                     {
-                        std::string arg = typeParamSpec->getText();
+                        std::string arg = entry->getText();
                         // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                         auto substIt = activeTypeSubstitutions.find(arg);
                         if (substIt != activeTypeSubstitutions.end())
@@ -587,16 +595,31 @@ private:
                 {
                     typeName = typeSpec->getText();
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
+                    bool substPointer = false;
                     auto substIt = activeTypeSubstitutions.find(typeName);
                     if (substIt != activeTypeSubstitutions.end())
+                    {
                         typeName = substIt->second;
+                        // If substituted type includes pointer suffix (e.g. "Employee*"), extract it
+                        while (!typeName.empty() && typeName.back() == '*')
+                        {
+                            typeName.pop_back();
+                            substPointer = true;
+                        }
+                    }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
                     // Resolve type aliases (e.g. user-defined aliases)
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     declType.TypeName = typeName;
+                    if (substPointer) declType.Pointer = true;
                 }
-                declType.Pointer = declSpec->pointer() != nullptr;
+                bool hasExplicitPointer = declSpec->pointer() != nullptr;
+                // When the substituted type is already a pointer AND there is an explicit '*',
+                // the result is pointer-to-pointer (e.g. T* where T=Employee* → Employee**).
+                if (declType.Pointer && hasExplicitPointer)
+                    declType.ElemPointer = true;
+                declType.Pointer = hasExplicitPointer || declType.Pointer;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
@@ -656,7 +679,14 @@ private:
         auto resolved = typeValue;
         auto substIt = activeTypeSubstitutions.find(resolved.TypeName);
         if (substIt != activeTypeSubstitutions.end())
+        {
             resolved.TypeName = substIt->second;
+            while (!resolved.TypeName.empty() && resolved.TypeName.back() == '*')
+            {
+                resolved.TypeName.pop_back();
+                resolved.Pointer = true;
+            }
+        }
 
         auto* llvmType = compiler->GetType(resolved);
         if (!llvmType) return nullptr;
@@ -2088,7 +2118,8 @@ public:
                 return compiler->CreateLoad(destination);
             }
 
-            auto right = ParseAssignmentExpression(assignCtx);
+            auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            auto right = LoadNamedVariable(rightNV);
 
             if (operatorText != "=")
             {
@@ -2096,7 +2127,17 @@ public:
                 right = compiler->CreateOperation(operatorText, left, right);
             }
 
-            return compiler->CreateAssignment(right, destination);
+            auto* assignResult = compiler->CreateAssignment(right, destination);
+            // Transfer ownership: if RHS was an owning move param, null its alloca so
+            // EmitDestructorsForScope won't free the pointer we just stored elsewhere.
+            if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
+                && rightNV.TypeAndValue.Pointer)
+            {
+                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
+            }
+            return assignResult;
         }
         else if (unaryCtx)
         {
@@ -2588,7 +2629,8 @@ public:
                 // Local variables and globals store the pointer value inside an alloca/global.
                 // Function arguments have the pointer value as the argument itself — return directly.
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
-                    llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+                    llvm::isa<llvm::GlobalVariable>(namedVar.Storage) ||
+                    llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
                     return compiler->CreateLoad(namedVar.Storage);
                 return namedVar.Storage;
             }
@@ -2913,8 +2955,8 @@ public:
             // Generic type: Box<int> → Box__int
             std::string base = ctx->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> args;
-            for (auto* tp : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                args.push_back(tp->getText());
+            for (auto* entry : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                args.push_back(entry->getText());
             return MangledGenericName(base, args);
         }
         std::string name = ctx->getText();
@@ -2930,7 +2972,16 @@ public:
         std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
         bool isArray = ctx->assignmentExpression() != nullptr;
 
-        MyCompilerLLVM::TypeAndValue typeInfo{ .TypeName = typeName };
+        // If type substitution produced a pointer type (e.g. T=Employee*), strip the '*'
+        // and treat as pointer-to-element so GetType resolves the base type correctly.
+        bool typeIsPtr = false;
+        while (!typeName.empty() && typeName.back() == '*')
+        {
+            typeName.pop_back();
+            typeIsPtr = true;
+        }
+
+        MyCompilerLLVM::TypeAndValue typeInfo{ .TypeName = typeName, .Pointer = typeIsPtr };
         llvm::Type* elemType = compiler->GetType(typeInfo);
 
         // Compute allocation size
@@ -3305,8 +3356,8 @@ public:
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
                             std::string mangledName = prevPrimary->genericIdentifier()->Identifier()->getText();
-                            for (auto* typeParamSpec : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                                mangledName += "__" + typeParamSpec->getText();
+                            for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                                mangledName += "__" + MangleTypeArg(entry->getText());
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -3405,12 +3456,17 @@ public:
                                 namedVar.Primary  = result;
                                 namedVar.Storage  = nullptr;
                                 namedVar.BaseType = result->getType();
-                                namedVar.TypeAndValue = {};
+                                namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 if (result->getType()->isStructTy())
                                 {
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(result->getType()))
                                         if (!st->isLiteral() && st->hasName())
                                             namedVar.TypeAndValue.TypeName = st->getName().str();
+                                    structVar = namedVar;
+                                }
+                                else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
+                                         && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
+                                {
                                     structVar = namedVar;
                                 }
                                 else
@@ -3429,15 +3485,22 @@ public:
                         if (namedVar.TypeAndValue.Pointer)
                         {
                             // Indexing through a pointer (e.g. char* p; p[i]).
-                            // Use the loaded pointer as the GEP base and the
-                            // element type (TypeName without the pointer flag) as element type.
                             auto elementTypeAndValue = namedVar.TypeAndValue;
-                            elementTypeAndValue.Pointer = false;
+                            if (elementTypeAndValue.ElemPointer)
+                            {
+                                // Double-pointer (e.g. T* where T=Employee*): element type is T* (Employee*).
+                                // Keep Pointer=true, clear ElemPointer — element is a pointer value.
+                                elementTypeAndValue.ElemPointer = false;
+                            }
+                            else
+                            {
+                                elementTypeAndValue.Pointer = false;
+                            }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             auto ptrValue = LoadNamedVariable(namedVar);
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
-                            namedVar.TypeAndValue.Pointer = false;
+                            namedVar.TypeAndValue = elementTypeAndValue;
                         }
                         else
                         {
@@ -3760,10 +3823,17 @@ public:
                                 }
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
-                                namedVar.BaseType = namedVar.Primary->getType();
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                // Populate TypeAndValue from the resolved overload's return type
+                                // so that subsequent member access (->field) can resolve the struct.
+                                if (namedVar.Primary)
+                                    namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
                             }
 
                             if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                                structVar = namedVar;
+                            else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
+                                     && Compiler(primaryCtx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
                                 structVar = namedVar;
                         }
 
@@ -4291,8 +4361,8 @@ public:
                 {
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto* p : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                        typeArgs.push_back(p->getText());
+                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(entry->getText());
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
                     {
@@ -4309,8 +4379,8 @@ public:
                 {
                     std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
-                    for (auto* p : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                        typeArgs.push_back(p->getText());
+                    for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(entry->getText());
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
                     {
@@ -4337,8 +4407,8 @@ public:
             // This is a generic type instantiation
             std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> typeArgs;
-            for (auto typeParamSpec : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeSpecifier())
-                typeArgs.push_back(typeParamSpec->getText());
+            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                typeArgs.push_back(entry->getText());
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 
@@ -4357,7 +4427,7 @@ public:
     {
         std::string name = baseName;
         for (const auto& arg : typeArgs)
-            name += "__" + arg;
+            name += "__" + MangleTypeArg(arg);
         return name;
     }
 
@@ -4859,9 +4929,9 @@ public:
             {
                 // Compute concrete type args by applying active substitutions
                 std::vector<std::string> concreteTypeArgs;
-                for (auto* typeSpec : genId->genericTypeParameters()->typeParameterList()->typeSpecifier())
+                for (auto* entry : genId->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 {
-                    std::string typeArg = typeSpec->getText();
+                    std::string typeArg = entry->getText();
                     auto substIt = activeTypeSubstitutions.find(typeArg);
                     if (substIt != activeTypeSubstitutions.end())
                         typeArg = substIt->second;
@@ -4899,12 +4969,13 @@ public:
         if (!typeParamList)
             return typeParams;
 
-        for (auto typeSpec : typeParamList->typeSpecifier())
+        for (auto* entry : typeParamList->typeParameterEntry())
         {
+            auto* typeSpec = entry->typeSpecifier();
             // Generic type parameters must be simple identifiers, not built-in types
-            if (!typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->Identifier())
+            if (!typeSpec || !typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->Identifier())
             {
-                LogErrorContext(typeSpec, "Generic type parameter must be an identifier, not a built-in type");
+                LogErrorContext(entry, "Generic type parameter must be an identifier, not a built-in type");
                 continue;
             }
             typeParams.push_back(typeSpec->genericIdentifier()->Identifier()->getText());

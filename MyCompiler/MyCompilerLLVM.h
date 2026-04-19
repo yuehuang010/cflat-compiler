@@ -71,6 +71,7 @@ public:
         std::string TypeName;
         std::string VariableName;
         bool Pointer = false;
+        bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
         bool IsInterface = false;
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
@@ -179,8 +180,8 @@ public:
             {
                 // Note: LLVM doesn't have void ptr, instead use i8 ptr.
                 if (TypeName == "void")
-                    return "U8Ptr";
-                return type + "Ptr";
+                    return ElemPointer ? "U8PtrPtr" : "U8Ptr";
+                return ElemPointer ? type + "PtrPtr" : type + "Ptr";
             }
 
             return type;
@@ -285,6 +286,11 @@ public:
     private:
     size_t currentLine = 0;
     size_t currentColumn = 0;
+
+    public:
+    TypeAndValue lastCallReturnType; // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+
+    private:
 
     void SetSourceLocation(size_t line, size_t column)
     {
@@ -2172,6 +2178,14 @@ public:
         return GetType(it->second.front().ReturnType);
     }
 
+    TypeAndValue GetFunctionReturnTypeInfo(const std::string& functionName) const
+    {
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end() || it->second.empty())
+            return {};
+        return it->second.front().ReturnType;
+    }
+
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases)
     {
         if (!cond->getType()->isIntegerTy())
@@ -2441,8 +2455,12 @@ public:
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
             if (type->isVoidTy())
-                return builder->getInt8Ty()->getPointerTo();
-            return type->getPointerTo();
+            {
+                auto p = builder->getInt8Ty()->getPointerTo();
+                return typeAndValue.ElemPointer ? p->getPointerTo() : p;
+            }
+            auto p = type->getPointerTo();
+            return typeAndValue.ElemPointer ? p->getPointerTo() : p;
         }
 
         return type;
@@ -2824,6 +2842,9 @@ public:
         }
 
         auto* result = CreateFunctionCall(candidate.Function, argList);
+
+        // Cache the resolved return type so callers can populate TypeAndValue after the call.
+        lastCallReturnType = candidate.ReturnType;
 
         // Null out caller's storage for move parameters
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)

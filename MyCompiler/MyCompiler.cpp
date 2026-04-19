@@ -8,6 +8,7 @@
 #include "MyCompilerLLVM.h"
 #include "CompilerManager.h"
 #include "ArgParser.h"
+#include "Version.h"
 
 int main(int argc, char* argv[])
 {
@@ -45,7 +46,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::cout << "MyCompilerLLVM\n";
+    std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
 
     // Locate runtime.cb next to this executable.
     char* pgmptr = nullptr;

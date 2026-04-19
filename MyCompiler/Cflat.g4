@@ -251,7 +251,11 @@ genericTypeParameters
     ;
 
 typeParameterList
-    : typeSpecifier (',' typeSpecifier)*
+    : typeParameterEntry (',' typeParameterEntry)*
+    ;
+
+typeParameterEntry
+    : typeSpecifier pointer?
     ;
 
 // typeParameter
