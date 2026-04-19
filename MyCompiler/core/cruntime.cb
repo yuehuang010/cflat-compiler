@@ -1,0 +1,77 @@
+// C runtime bindings — extern declarations and wrappers for standard C library functions
+
+// === I/O Functions ===
+extern void* __acrt_iob_func(int fd);
+extern int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+extern int __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
+
+extern void printf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    void* stdout_stream = __acrt_iob_func(1);
+    __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+    va_end(ap);
+}
+
+extern i32 sprintf(char* buf, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    i32 result = __stdio_common_vsprintf(0, buf, 2147483647, fmt, nullptr, ap);
+    va_end(ap);
+    return result;
+}
+
+extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    int result = __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
+    va_end(ap);
+    return result;
+}
+
+// === Memory Functions ===
+extern void* malloc(i64 size);
+extern void  free(void* ptr);
+extern void* calloc(i64 count, i64 size);
+extern void* realloc(void* ptr, i64 size);
+
+// === String Functions ===
+extern i32 strlen(const char* s);
+extern int strcmp(const char* a, const char* b);
+extern int strncmp(const char* a, const char* b, i64 n);
+extern char* strcpy(char* dest, const char* src);
+extern char* strncpy(char* dest, const char* src, i64 n);
+extern char* strcat(char* dest, const char* src);
+extern char* strncat(char* dest, const char* src, i64 n);
+extern const char* strchr(const char* s, int c);
+extern const char* strrchr(const char* s, int c);
+extern const char* strstr(const char* haystack, const char* needle);
+extern char* strtok(char* str, const char* delim);
+extern void* memcpy(void* dest, const void* src, i64 n);
+extern void* memmove(void* dest, const void* src, i64 n);
+extern void* memset(void* s, int c, i64 n);
+extern int memcmp(const void* a, const void* b, i64 n);
+
+// === Character Classification ===
+extern int isalpha(int c);
+extern int isdigit(int c);
+extern int isalnum(int c);
+extern int isspace(int c);
+extern int isupper(int c);
+extern int islower(int c);
+extern int toupper(int c);
+extern int tolower(int c);
+
+// === Math Functions (basic) ===
+extern i64 abs(i64 n);
+extern double fabs(double x);
+extern i64 imaxabs(i64 n);
+
+// === Process Control ===
+extern void exit(int status);
+extern void abort();
+extern int atexit(void* func);
+
+// === Other Utilities ===
+extern int rand();
+extern void srand(u32 seed);

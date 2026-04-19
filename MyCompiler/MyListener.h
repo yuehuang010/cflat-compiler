@@ -1861,14 +1861,17 @@ public:
             auto declarator = initDecl->declarator();
             auto direct = declarator->directDeclarator();
             auto paramTypeList = declarator->parameterTypeList();
+            // A declarator with parens but no paramTypeList is a zero-parameter function:
+            // matches grammar alternative `directDeclarator '(' identifierList? ')'`
+            bool hasParens = declarator->children.size() > 1;
 
-            if (paramTypeList != nullptr)
+            if (paramTypeList != nullptr || hasParens)
             {
-                // If there is parameter list, then it is a function.
-                auto declParams = ParseParameterTypeList(paramTypeList);
+                // If there is parameter list (or empty parens), then it is a function.
+                auto declParams = paramTypeList ? ParseParameterTypeList(paramTypeList) : std::vector<MyCompilerLLVM::DeclTypeAndValue>{};
                 std::vector<MyCompilerLLVM::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
-                bool ellipsis = paramTypeList->Ellipsis() != nullptr;
+                bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
                 compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
 
                 // Declare overloads for each suffix of omitted default parameters

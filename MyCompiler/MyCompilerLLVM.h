@@ -300,7 +300,7 @@ public:
 
     void LogError(std::string message) const
     {
-        std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
+        std::cerr << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
         exit(1);
     }
 
@@ -1110,7 +1110,7 @@ public:
             auto it = interfaceTable.find(parentName);
             if (it == interfaceTable.end())
             {
-                std::cout << std::format("Unknown parent interface: '{}'\n", parentName);
+                LogError(std::format("unknown parent interface: '{}'", parentName));
                 continue;
             }
             for (const auto& m : it->second)
@@ -1188,7 +1188,7 @@ public:
         auto ifaceIt = interfaceTable.find(ifaceName);
         if (ifaceIt == interfaceTable.end())
         {
-            std::cout << std::format("GetOrCreateVTable: unknown interface '{}'\n", ifaceName);
+            LogError(std::format("GetOrCreateVTable: unknown interface '{}'", ifaceName));
             return nullptr;
         }
 
@@ -1225,7 +1225,7 @@ public:
             }
             if (fn == nullptr)
             {
-                std::cout << std::format("GetOrCreateVTable: '{}' does not implement '{}::{}'\n", structName, ifaceName, method.Name);
+                LogError(std::format("GetOrCreateVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
             }
             else
@@ -1382,7 +1382,7 @@ public:
         auto ifaceIt = interfaceTable.find(interfaceName);
         if (ifaceIt == interfaceTable.end())
         {
-            std::cout << std::format("Unknown interface: '{}'\n", interfaceName);
+            LogError(std::format("unknown interface: '{}'", interfaceName));
             return;
         }
 
@@ -1417,7 +1417,7 @@ public:
 
             if (!found)
             {
-                std::cout << std::format("Class '{}' does not implement '{}::{}'\n", structName, interfaceName, method.Name);
+                LogError(std::format("class '{}' does not implement '{}::{}'", structName, interfaceName, method.Name));
             }
         }
     }
@@ -1973,7 +1973,7 @@ public:
         }
         else
         {
-            std::cout << std::format("Unknown value: {}\n", typeName);
+            LogError(std::format("unknown type '{}'", typeName));
             return nullptr;
         }
 
@@ -2447,7 +2447,7 @@ public:
                 }
                 else
                 {
-                    std::cout << std::format("Unknown value: {}\n", resolvedTypeName);
+                    LogError(std::format("unknown type '{}'", resolvedTypeName));
                     type = builder->getVoidTy();
                 }
             }
@@ -2725,10 +2725,10 @@ public:
 
         if (candidate.Function == nullptr)
         {
-            std::cout << std::format("[{}:{}] : no overload of '{}' matches the given arguments.\n", currentLine, currentColumn, functionName);
+            std::string msg = std::format("no overload of '{}' matches the given arguments.\n", functionName);
 
-            // Print the input arguments
-            std::cout << std::format("  Call arguments ({}):\n", arguments.size());
+            // Call arguments
+            msg += std::format("  Call arguments ({}):\n", arguments.size());
             for (size_t i = 0; i < arguments.size(); i++)
             {
                 const auto& arg = arguments[i];
@@ -2741,11 +2741,11 @@ public:
                     typeName = typeStr;
                 }
                 std::string name = arg.TypeAndValue.VariableName.empty() ? "<unnamed>" : arg.TypeAndValue.VariableName;
-                std::cout << std::format("    [{}] {}{} {}\n", i, typeName, arg.TypeAndValue.Pointer ? "*" : "", name);
+                msg += std::format("    [{}] {}{} {}\n", i, typeName, arg.TypeAndValue.Pointer ? "*" : "", name);
             }
 
-            // Print all candidates so the user can see what was available
-            std::cout << std::format("  Candidates ({}):\n", candidates.size());
+            // Candidates
+            msg += std::format("  Candidates ({}):\n", candidates.size());
             for (const auto& c : candidates)
             {
                 std::string paramList;
@@ -2755,14 +2755,14 @@ public:
                     const auto& p = c.Parameters[i];
                     paramList += std::format("{}{} {}", p.TypeName, p.Pointer ? "*" : "", p.VariableName);
                 }
-                std::cout << std::format("    {}({})\n", c.UniqueName, paramList);
+                msg += std::format("    {}({})\n", c.UniqueName, paramList);
             }
 
             // If exactly one resolved candidate passed MatchFunction, show per-argument type comparison
             if (resolvedCandidate.size() == 1)
             {
                 const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
-                std::cout << std::format("  Argument mismatch detail (single resolved candidate: {}):\n", resolvedSym.UniqueName);
+                msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n", resolvedSym.UniqueName);
                 size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
                 for (size_t i = 0; i < count; i++)
                 {
@@ -2777,11 +2777,11 @@ public:
                     bool argPtr = i < resolvedArgs.size() && resolvedArgs[i].TypeAndValue.Pointer;
                     std::string paramDesc = i < resolvedSym.Parameters.size() ? resolvedSym.Parameters[i].TypeName : "<missing>";
                     bool paramPtr = i < resolvedSym.Parameters.size() && resolvedSym.Parameters[i].Pointer;
-                    std::cout << std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr ? "*" : "", paramDesc, paramPtr ? "*" : "");
+                    msg += std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr ? "*" : "", paramDesc, paramPtr ? "*" : "");
                 }
             }
 
-            exit(1);
+            LogError(msg);
             return nullptr;
         }
 

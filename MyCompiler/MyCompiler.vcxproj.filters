@@ -18,12 +18,6 @@
     <ClCompile Include="MyCompiler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="MyCompilerLLVM.h">
-      <Filter>Header Files</Filter>
-    </ClCompile>
-    <ClCompile Include="MyListener.h">
-      <Filter>Header Files</Filter>
-    </ClCompile>
     <ClCompile Include="MyCompilerLLVM.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -44,6 +38,7 @@
     <None Include="core\math.cb" />
     <None Include="core\queue.cb" />
     <None Include="core\stack.cb" />
+    <None Include="core\cruntime.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />
@@ -56,6 +51,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Version.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MyCompilerLLVM.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MyListener.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

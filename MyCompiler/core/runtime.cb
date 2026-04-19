@@ -1,34 +1,5 @@
-// CFlat runtime — provides printf by calling directly into UCRT without
-// requiring legacy_stdio_definitions.lib.
-//
-// __stdio_common_vfprintf is the underlying UCRT function that the modern
-// Windows SDK routes printf through internally.  __acrt_iob_func(1) returns
-// the FILE* for stdout.
-
-extern void* __acrt_iob_func(int fd);
-extern int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern i32 strlen(const char* s);
-extern int __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
-extern int strcmp(const char* a, const char* b);
-
-extern i32 sprintf(char* buf, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap);
-    i32 result = __stdio_common_vsprintf(0, buf, 2147483647, fmt, nullptr, ap);
-    va_end(ap);
-    return result;
-}
-
-extern void printf(const char* fmt, ...) {
-    va_list ap;
-    va_start(ap);
-    void* stdout_stream = __acrt_iob_func(1);
-    __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
-    va_end(ap);
-}
-
-extern void* malloc(i64 size);
-extern void  free(void* ptr);
+// CFlat runtime — allocator interface
+import "cruntime.cb";
 
 void* operator new(i64 size)
 {
