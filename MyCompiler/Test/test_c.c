@@ -3,17 +3,17 @@ extern void printf(const char* argv, ...);
 extern void* malloc(i64 size);
 extern void free(void* ptr);
 
-bool TestVerbose = true;
+bool printOnPass = false;
 
 bool Test(const char* testName, long long actual, long long expected)
 {
     if (expected == actual)
     {
-        if (TestVerbose) printf("%s passed.\n", testName);
+        if (printOnPass) printf("%s passed.\n", testName);
         return true;
     }
 
-    if (TestVerbose) printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
     return false;
 }
 
@@ -21,11 +21,11 @@ bool Test(const char* testName, int actual, int expected)
 {
     if (expected == actual)
     {
-        if (TestVerbose) printf("%s passed.\n", testName);
+        if (printOnPass) printf("%s passed.\n", testName);
         return true;
     }
 
-    if (TestVerbose) printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
+    printf("%s failed expecting '%d' but got '%d'.\n", testName, expected, actual);
     return false;
 }
 
@@ -33,11 +33,11 @@ bool Test(const char* testName, float actual, float expected)
 {
     if (expected == actual)
     {
-        if (TestVerbose) printf("%s passed (float).\n", testName);
+        if (printOnPass) printf("%s passed (float).\n", testName);
         return true;
     }
 
-    if (TestVerbose) printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
+    printf("%s failed expecting '%f' but got '%f'.\n", testName, expected, actual);
     return false;
 }
 
@@ -45,11 +45,11 @@ bool Test(const char* testName, double actual, double expected)
 {
     if (expected == actual)
     {
-        if (TestVerbose) printf("%s passed (double).\n", testName);
+        if (printOnPass) printf("%s passed (double).\n", testName);
         return true;
     }
 
-    if (TestVerbose) printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
+    printf("%s failed expecting '%lf' but got '%lf'.\n", testName, expected, actual);
     return false;
 }
 
@@ -57,11 +57,11 @@ bool Test(const char* testName, bool actual, bool expected)
 {
     if (expected == actual)
     {
-        if (TestVerbose) printf("%s passed.\n", testName);
+        if (printOnPass) printf("%s passed.\n", testName);
         return true;
     }
 
-    if (TestVerbose) printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
+    printf("%s failed expecting '%s' but got '%s'.\n", testName, expected ? "false" : "true", actual ? "false" : "true");
     return false;
 }
 
@@ -110,7 +110,6 @@ bool testLogicalOr()
 
 bool testShortCircuit()
 {
-    TestVerbose = false;
     bool result = true;
     shortCircuitCounter = 0;
     result &= Test("FuncTrue() || FuncTrue() || FuncTrue()", FuncTrue() || FuncTrue() || FuncTrue(), true);
@@ -135,8 +134,6 @@ bool testShortCircuit()
     shortCircuitCounter = 0;
     result &= Test("FuncTrue() && FuncTrue() && FuncTrue()", FuncTrue() && FuncTrue() && FuncTrue(), true);
     result &= Test("shortCircuitCounter", shortCircuitCounter, 3);
-
-    TestVerbose = true;
 
     return result;
 }

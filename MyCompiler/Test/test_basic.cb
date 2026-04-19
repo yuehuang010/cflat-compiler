@@ -3,7 +3,7 @@ import "test_helper.cb";
 bool testBuiltinIdentifiers()
 {
     bool result = true;
-    result &= Test("__FILE__", __FILE__, "testfile2.cb");
+    result &= Test("__FILE__", __FILE__, "test_basic.cb");
     result &= Test("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
     result &= Test("__LINE__", __LINE__, 8); // Remember to adjust if shifted.
     return result;

@@ -12,10 +12,10 @@ set ERRORS=0
 
 if not exist "%OUT%" mkdir "%OUT%"
 
-call :RunTest testfile
-call :RunTestCb testfile2
+call :RunTest test_c
+call :RunTestCb test_basic
 call :RunTestCb test_generics
-call :RunTestCb testfile_module -i %LIB%
+call :RunTestCb test_module -i %LIB%
 call :RunTestCb test_library_string -i %LIB%
 call :RunTestCb test_operators
 call :RunTestCb test_is_as

@@ -41,6 +41,9 @@
     <None Include="core\interfaces.cb" />
     <None Include="core\pair.cb" />
     <None Include="core\filesystem.cb" />
+    <None Include="core\math.cb" />
+    <None Include="core\queue.cb" />
+    <None Include="core\stack.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />

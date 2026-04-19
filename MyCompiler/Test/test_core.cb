@@ -198,6 +198,19 @@ int testPair()
     passed += Test("pair int int first 2", p2.first, 42);
     passed += Test("pair int int second 2", p2.second, 99);
 
+    // Test Pair<string, string>
+    Pair<string, string> ps = default;
+    ps.first = "hello";
+    ps.second = "world";
+    passed += Test("pair string string first",  ps.first,  "hello");
+    passed += Test("pair string string second", ps.second, "world");
+
+    // Reassign fields
+    ps.first = "foo";
+    ps.second = "bar";
+    passed += Test("pair string string reassign first",  ps.first,  "foo");
+    passed += Test("pair string string reassign second", ps.second, "bar");
+
     return passed;
 }
 
@@ -276,7 +289,7 @@ extern int main()
     r = testList();         passed += r; total += 15;
     r = testHashset();      passed += r; total += 19;
     r = testDictionary();   passed += r; total += 34;
-    r = testPair();         passed += r; total += 4;
+    r = testPair();         passed += r; total += 8;
     r = testForeach();      passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
