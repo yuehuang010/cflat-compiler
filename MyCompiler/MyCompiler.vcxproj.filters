@@ -26,7 +26,6 @@
     <None Include="antlr4.bat">
       <Filter>Source Files</Filter>
     </None>
-    <None Include="testfile3.c" />
     <None Include="core\runtime.cb" />
     <None Include="core\string.cb" />
     <None Include="core\list.cb" />

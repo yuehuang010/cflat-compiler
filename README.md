@@ -6,29 +6,29 @@ CFlat (`.cb`) extends C with generics, interfaces, namespaces, operator overload
 
 ---
 
+
 ## Quick Start
 
 ```bash
-# Compile a source file
-MyCompiler.exe hello.cb -o hello.ll
-
-# Run the compiled IR
-lli.exe hello.ll
+# Compile a source file to native executable
+MyCompiler.exe hello.cb -o hello.exe
 ```
 
 ```c
-extern void printf(const char* fmt, ...);
+import "core/list.cb";
 
-extern int main()
-{
-    printf("Hello, CFlat!\n");
+extern int main() {
+    list<int> nums;
+    nums.add(42);
+    printf("First: %d\n", nums.get(0));
     return 0;
 }
 ```
 
 ---
 
-## Language Features
+
+## Language & Core Library Features
 
 ### Types
 
@@ -115,13 +115,13 @@ s.num1 = 10;
 int t = s.Total();   // 12
 ```
 
+
 #### Enums
 
 Enums have an explicit backing type and their members are accessed with dot notation:
 
 ```c
 enum Color : u8 { Red = 1, Green, Blue = 5 };
-
 u8 c = Color.Red;    // 1
 u8 b = Color.Blue;   // 5
 ```
@@ -138,42 +138,35 @@ MyStruct s = default;   // fields get their declared initial values
 
 ---
 
-### Functions
+
+### Functions & Core Collections
 
 #### Overloading
 
-Multiple functions can share a name and are resolved by argument types:
-
-```c
-bool Test(const char* name, int actual,   int expected)   { ... }
+Multiple functions can share a name and are resolved by argument types.
+```cpp
 bool Test(const char* name, float actual, float expected) { ... }
 bool Test(const char* name, bool actual,  bool expected)  { ... }
 ```
 
 #### Default Parameters
 
-Parameters can have default values; the compiler generates the matching overloads automatically:
-
-```c
-int add(int x, int y = 5)              { return x + y; }
-int sum(int x, int y = 10, int z = 20) { return x + y + z; }
-
-add(3);     // 8   (y defaults to 5)
-add(3, 4);  // 7
-sum(1);     // 31  (y=10, z=20)
+Parameters can have default values; the compiler generates the matching overloads automatically.
+```
 sum(1, 2);  // 23  (z=20)
 ```
+
 
 #### Named Parameters
 
 Arguments can be passed by name, in any order:
 
 ```c
-int myFunction(int x, int y, int z) { ... }
+int sum(int x, int y, int z) { return x + y + z; }
 
-myFunction(x:1, y:2, z:3);   // in order
-myFunction(z:3, x:1, y:2);   // out of order
-myFunction(x:1, y:2, 3);     // mixed with positional
+int a = sum(x: 1, y: 2, z: 3);         // in order
+int b = sum(z: 3, x: 1, y: 2);         // out of order
+int c = sum(x: 1, y: 2, 3);            // mixed with positional
 ```
 
 #### Forward References
@@ -194,7 +187,7 @@ bool isOdd(int n)
 }
 ```
 
-#### Inline Return-Block Functions
+#### Inline Return-Block Functions (Experimental)
 
 A function whose body is a single `return { ... };` is inlined at every call site. The `return` statement inside the block exits the **caller**, not the function. This enables assert-style helpers:
 
@@ -220,7 +213,8 @@ bool runTest()
 
 ---
 
-### Generics
+
+### Generics/Templates & Ownership
 
 Generics are resolved at compile time (monomorphization — no runtime overhead).
 
@@ -257,7 +251,8 @@ T ExtGet<T>(Container<T> container)
 
 ---
 
-### Interfaces & Polymorphism
+
+### Interfaces & Polymorphism (core/interfaces.cb)
 
 #### Defining and Implementing Interfaces
 
@@ -333,6 +328,7 @@ interface IString : IReadonlyString
 
 ---
 
+
 ### Namespaces & Modules
 
 #### Namespaces
@@ -383,7 +379,8 @@ Imported functions, structs, and namespaces are available immediately after the 
 
 ---
 
-### Memory Management
+
+### Memory Management & Filesystem (core/filesystem.cb)
 
 #### `new` and `delete`
 
@@ -396,6 +393,7 @@ delete n;
 int* arr  = new int[5];
 delete[] arr;
 ```
+
 
 #### Custom Allocators (`operator new` / `operator delete`)
 
@@ -500,12 +498,6 @@ float  f   = 1.5f;
 double d   = 1e3;    // 1000.0
 ```
 
-#### `static_assert`
-
-```c
-static_assert(sizeof(i32) == 4, "i32 must be 4 bytes");
-```
-
 #### Built-in Identifiers
 
 ```c
@@ -534,7 +526,7 @@ else
 
 This is useful for platform-specific code, feature gates, and performance-critical conditionals.
 
-#### Debug Info
+#### Debug Info (Work in Progress)
 
 Pass `-g` to emit DWARF debug information for use with debuggers:
 
@@ -543,6 +535,7 @@ MyCompiler.exe app.cb -o app.ll -g
 ```
 
 ---
+
 
 ## Compiler CLI
 
@@ -559,8 +552,10 @@ MyCompiler.exe <input.cb> [options]
 | `-i / --import-dir <dir>` | Directory to search for imported modules |
 | `-p / --platform <target>` | Target platform: `x64` (default) or `x86`; sets `__PLATFORM__` to 64 or 32 |
 | `-v / --verbose`        | Print detailed diagnostic messages during compilation |
+| `-O1`, `-O2`            | Set optimization level |
+| `--help`                | Show usage and available options |
 
----
+See `core/` for standard library modules and more usage examples.
 
 ## Building the Compiler
 

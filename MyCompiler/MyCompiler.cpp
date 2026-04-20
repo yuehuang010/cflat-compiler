@@ -21,10 +21,6 @@ int main(int argc, char* argv[])
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
 
-    // Disable stdout buffering so verbose/diagnostic output survives a crash.
-    setvbuf(stdout, nullptr, _IONBF, 0);
-    setvbuf(stderr, nullptr, _IONBF, 0);
-
     ArgParser args;
     args.addPositional("filename", "Source file to compile");
     args.addOption("output", 'o', "Output native executable path (.exe)");
@@ -65,6 +61,4 @@ int main(int argc, char* argv[])
         return 1;
     }
     std::cout << "Done.\n";
-
-    // Run vcpkg_installed\x64-windows\x64-windows\tools\llvm\lli.exe MyCompiler\out.ll
 }
