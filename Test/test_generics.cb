@@ -601,7 +601,7 @@ bool testDictionaryStruct()
 }
 
 
-bool testForeachStruct()
+bool testForStruct()
 {
     bool result = true;
 
@@ -621,10 +621,10 @@ bool testForeachStruct()
     people.add(p3);
 
     int sumAge = 0;
-    foreach (Person p in people)
+    for (Person p in people)
         sumAge += p.age;
 
-    result &= Test("foreach struct sum", sumAge, 90);
+    result &= Test("for struct sum", sumAge, 90);
 
     return result;
 }
@@ -698,7 +698,7 @@ extern int main()
     result &= testConstructorDefaultArgs();
     result &= testListStruct();
     result &= testDictionaryStruct();
-    result &= testForeachStruct();
+    result &= testForStruct();
     result &= testListPointer();
     if (result)
     {
