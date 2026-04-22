@@ -276,7 +276,6 @@ structDeclarationList
 structDeclaration // The first two rules have priority order and cannot be simplified to one expression.
     : specifierQualifierList structDeclaratorList ';'
     | specifierQualifierList ';'
-    | staticAssertDeclaration
     ;
 
 specifierQualifierList
@@ -365,22 +364,7 @@ typeName
 
 abstractDeclarator
     : pointer
-//    | pointer? directAbstractDeclarator
     ;
-
-// directAbstractDeclarator
-//     : '(' abstractDeclarator ')'
-//     | '[' typeQualifierList? assignmentExpression? ']'
-//     | '[' 'static' typeQualifierList? assignmentExpression ']'
-//     | '[' typeQualifierList 'static' assignmentExpression ']'
-//     | '[' '*' ']'
-//     | '(' parameterTypeList? ')'
-//     | directAbstractDeclarator '[' typeQualifierList? assignmentExpression? ']'
-//     | directAbstractDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-//     | directAbstractDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-//     | directAbstractDeclarator '[' '*' ']'
-//     | directAbstractDeclarator '(' parameterTypeList? ')'
-//     ;
 
 typedefName
     : Identifier
@@ -407,10 +391,6 @@ designatorList
 designator
     : '[' constantExpression ']'
     | '.' Identifier
-    ;
-
-staticAssertDeclaration
-    : 'static_assert' '(' constantExpression ',' StringLiteral+ ')' ';'
     ;
 
 statement
@@ -783,10 +763,6 @@ Imaginary
 
 Noreturn
     : '_Noreturn'
-    ;
-
-StaticAssert
-    : '_Static_assert'
     ;
 
 ThreadLocal
