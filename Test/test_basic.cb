@@ -455,7 +455,7 @@ inline bool Assert(const char* testName, int actual, int expected)
     return {
         if (actual != expected)
         {
-            printf("%s failed: expected '%d' but got '%d'.\n", testName, expected, actual);
+            printf("%s negative: expected '%d' but got '%d'.\n", testName, expected, actual);
             return false;
         }
     };

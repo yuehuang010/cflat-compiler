@@ -1,46 +1,55 @@
-// stack<T> — LIFO (Last In First Out) data structure backed by list<T>.
-
+// stack<T> — LIFO (Last In First Out) using simple array.
 class stack<T>
 {
-    list<T> _items = default;
+    T*  _data     = nullptr;
+    int _size     = 0;
+    int _capacity = 0;
 
-    // Push a value onto the stack.
+    void _grow()
+    {
+        int newCap = _capacity == 0 ? 4 : _capacity * 2;
+        T* newData = new T[newCap];
+        int i = 0;
+        while (i < _size)
+        {
+            newData[i] = _data[i];
+            i++;
+        }
+        if (_data != nullptr) delete[] _data;
+        _data = newData;
+        _capacity = newCap;
+    }
+
     void push(T value)
     {
-        _items.add(value);
+        if (_size >= _capacity) _grow();
+        _data[_size] = value;
+        _size++;
     }
 
-    // Remove and return the top value.
-    // Undefined behavior if stack is empty.
     T pop()
     {
-        int idx = _items.count() - 1;
-        T value = _items.get(idx);
-        _items.removeAt(idx);
-        return value;
+        _size--;
+        return _data[_size];
     }
 
-    // View the top value without removing it.
-    // Undefined behavior if stack is empty.
     T peek()
     {
-        return _items.get(_items.count() - 1);
+        return _data[_size - 1];
     }
 
-    // Check if the stack is empty.
     bool isEmpty()
     {
-        return _items.count() == 0;
+        return _size == 0;
     }
 
-    // Return the number of elements in the stack.
     int count()
     {
-        return _items.count();
+        return _size;
     }
 
     ~stack()
     {
-        if (_items._data != nullptr) delete[] _items._data;
+        if (_data != nullptr) delete[] _data;
     }
-}
+};

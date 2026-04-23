@@ -535,6 +535,44 @@ private:
 
     std::vector<SwitchContext> switchStack;
 
+    // Recursively resolve a typeParameterEntry to its mangled string,
+    // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
+    std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry)
+    {
+        auto* typeSpec = entry->typeSpecifier();
+        bool hasPointer = entry->pointer() != nullptr;
+        std::string resolved;
+
+        if (typeSpec && typeSpec->genericIdentifier() && typeSpec->genericIdentifier()->genericTypeParameters())
+        {
+            // Nested generic (e.g., Box<T>): recurse into each type argument
+            std::string innerBase = typeSpec->genericIdentifier()->Identifier()->getText();
+            std::vector<std::string> innerArgs;
+            for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
+            resolved = MangledGenericName(innerBase, innerArgs);
+        }
+        else
+        {
+            // Simple type or type parameter: look up in activeTypeSubstitutions
+            resolved = typeSpec ? typeSpec->getText() : entry->getText();
+            auto substIt = activeTypeSubstitutions.find(resolved);
+            if (substIt != activeTypeSubstitutions.end())
+            {
+                resolved = substIt->second;
+                while (!resolved.empty() && resolved.back() == '*')
+                {
+                    resolved.pop_back();
+                    hasPointer = true;
+                }
+            }
+        }
+
+        if (hasPointer)
+            resolved += "*";
+        return resolved;
+    }
+
     MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
         MyCompilerLLVM::DeclTypeAndValue declType;
@@ -559,14 +597,7 @@ private:
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                    {
-                        std::string arg = entry->getText();
-                        // Apply active type parameter substitutions (e.g. T -> int inside a template body)
-                        auto substIt = activeTypeSubstitutions.find(arg);
-                        if (substIt != activeTypeSubstitutions.end())
-                            arg = substIt->second;
-                        typeArgs.push_back(arg);
-                    }
+                        typeArgs.push_back(ResolveTypeArgEntry(entry));
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     declType.TypeName = mangledName;
                     // Queue instantiation of nested generic types discovered during field/param parsing.
@@ -2943,10 +2974,18 @@ public:
         if (ctx->genericIdentifier() && ctx->genericIdentifier()->genericTypeParameters())
         {
             // Generic type: Box<int> → Box__int
+            // Also apply type substitutions to arguments (e.g. Box<T> with T=int → Box__int)
             std::string base = ctx->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> args;
             for (auto* entry : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                args.push_back(entry->getText());
+            {
+                std::string arg = entry->getText();
+                // Apply active type substitutions to each type argument
+                auto it = activeTypeSubstitutions.find(arg);
+                if (it != activeTypeSubstitutions.end())
+                    arg = it->second;
+                args.push_back(arg);
+            }
             return MangledGenericName(base, args);
         }
         std::string name = ctx->getText();
@@ -3343,11 +3382,19 @@ public:
 
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
                         // map it to its mangled constructor name (e.g. Box__MyInt).
+                        // Apply type substitutions for generic parameters.
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
                             std::string mangledName = prevPrimary->genericIdentifier()->Identifier()->getText();
                             for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                                mangledName += "__" + MangleTypeArg(entry->getText());
+                            {
+                                std::string arg = entry->getText();
+                                // Apply active type substitutions to each type argument
+                                auto it = activeTypeSubstitutions.find(arg);
+                                if (it != activeTypeSubstitutions.end())
+                                    arg = it->second;
+                                mangledName += "__" + MangleTypeArg(arg);
+                            }
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -4345,6 +4392,7 @@ public:
             }
 
             // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
+            // Apply type substitutions for generic parameters.
             if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx))
             {
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
@@ -4352,7 +4400,14 @@ public:
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(entry->getText());
+                    {
+                        std::string arg = entry->getText();
+                        // Apply active type substitutions to each type argument
+                        auto it = activeTypeSubstitutions.find(arg);
+                        if (it != activeTypeSubstitutions.end())
+                            arg = it->second;
+                        typeArgs.push_back(arg);
+                    }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
                     {
@@ -4363,6 +4418,7 @@ public:
             }
 
             // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
+            // Apply type substitutions for generic parameters.
             if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
             {
                 if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
@@ -4370,7 +4426,14 @@ public:
                     std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
                     for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                        typeArgs.push_back(entry->getText());
+                    {
+                        std::string arg = entry->getText();
+                        // Apply active type substitutions to each type argument
+                        auto it = activeTypeSubstitutions.find(arg);
+                        if (it != activeTypeSubstitutions.end())
+                            arg = it->second;
+                        typeArgs.push_back(arg);
+                    }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (!instantiatedGenerics.count(mangledName))
                     {

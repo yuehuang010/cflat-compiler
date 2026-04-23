@@ -684,6 +684,227 @@ bool testListPointer()
     return result;
 }
 
+// =============================================================
+// Nested generic structures (generic fields with generic types)
+// =============================================================
+
+struct DoubleNested<T>
+{
+    Box<Box<T>> innerBox = default;
+};
+
+struct TripleNested<T>
+{
+    Box<Box<Box<T>>> tripleBox = default;
+};
+
+struct PairOfBoxes<K, V>
+{
+    Box<K> left = default;
+    Box<V> right = default;
+};
+
+struct ContainerOfPairs<A, B>
+{
+    Pair<A, B> data = default;
+    int dataCount = 0;
+};
+
+bool testDoubleNestedGeneric()
+{
+    bool result = true;
+
+    // Test DoubleNested<int>
+    DoubleNested<int> dn = default;
+    dn.innerBox.value.value = 123;
+    result &= Test("double_nested_int", dn.innerBox.value.value, 123);
+
+    // Test DoubleNested<i32>
+    DoubleNested<i32> dn2 = default;
+    dn2.innerBox.value.value = 456;
+    result &= Test("double_nested_i32", dn2.innerBox.value.value, 456);
+
+    return result;
+}
+
+bool testTripleNestedGeneric()
+{
+    bool result = true;
+
+    // Test TripleNested<int>
+    TripleNested<int> tn = default;
+    tn.tripleBox.value.value.value = 789;
+    result &= Test("triple_nested_int", tn.tripleBox.value.value.value, 789);
+
+    // Test TripleNested<i32>
+    TripleNested<i32> tn2 = default;
+    tn2.tripleBox.value.value.value = 999;
+    result &= Test("triple_nested_i32", tn2.tripleBox.value.value.value, 999);
+
+    return result;
+}
+
+bool testPairOfBoxes()
+{
+    bool result = true;
+
+    // Test PairOfBoxes<int, int>
+    PairOfBoxes<int, int> pob = default;
+    pob.left.value = 10;
+    pob.right.value = 20;
+    result &= Test("pair_of_boxes_int_int_left", pob.left.value, 10);
+    result &= Test("pair_of_boxes_int_int_right", pob.right.value, 20);
+
+    // Test PairOfBoxes<i32, i64>
+    PairOfBoxes<i32, i64> pob2 = default;
+    pob2.left.value = 100;
+    pob2.right.value = 1000;
+    result &= Test("pair_of_boxes_i32_i64_left", pob2.left.value, 100);
+    result &= Test("pair_of_boxes_i32_i64_right", pob2.right.value, 1000);
+
+    // Test PairOfBoxes<u32, u16>
+    PairOfBoxes<u32, u16> pob3 = default;
+    pob3.left.value = 50000;
+    pob3.right.value = 5000;
+    result &= Test("pair_of_boxes_u32_u16_left", pob3.left.value, 50000);
+    result &= Test("pair_of_boxes_u32_u16_right", pob3.right.value, 5000);
+
+    return result;
+}
+
+bool testContainerOfPairs()
+{
+    bool result = true;
+
+    // Test ContainerOfPairs<int, int>
+    ContainerOfPairs<int, int> cop = default;
+    cop.data.first = 5;
+    cop.data.second = 10;
+    cop.dataCount = 1;
+    result &= Test("container_of_pairs_int_int_first", cop.data.first, 5);
+    result &= Test("container_of_pairs_int_int_second", cop.data.second, 10);
+    result &= Test("container_of_pairs_int_int_count", cop.dataCount, 1);
+
+    // Test ContainerOfPairs<i32, i64>
+    ContainerOfPairs<i32, i64> cop2 = default;
+    cop2.data.first = 777;
+    cop2.data.second = 888;
+    cop2.dataCount = 2;
+    result &= Test("container_of_pairs_i32_i64_first", cop2.data.first, 777);
+    result &= Test("container_of_pairs_i32_i64_second", cop2.data.second, 888);
+    result &= Test("container_of_pairs_i32_i64_count", cop2.dataCount, 2);
+
+    return result;
+}
+
+// Generic struct with generic method returning nested generic
+struct GenericWrapper<T>
+{
+    Box<T> wrapped = default;
+
+    Box<T> GetWrapped()
+    {
+        return wrapped;
+    }
+
+    T GetValue()
+    {
+        return wrapped.value;
+    }
+};
+
+bool testGenericWrapperMethods()
+{
+    bool result = true;
+
+    // Test GenericWrapper<int> GetValue
+    GenericWrapper<int> gw = default;
+    gw.wrapped.value = 42;
+    result &= Test("generic_wrapper_int_get_value", gw.GetValue(), 42);
+
+    // Test GenericWrapper<i32> GetValue
+    GenericWrapper<i32> gw2 = default;
+    gw2.wrapped.value = 100;
+    result &= Test("generic_wrapper_i32_get_value", gw2.GetValue(), 100);
+
+    // Test GenericWrapper<int> GetWrapped
+    Box<int> b = gw.GetWrapped();
+    result &= Test("generic_wrapper_int_get_wrapped", b.value, 42);
+
+    return result;
+}
+
+// Multiple levels of generic composition
+struct Layer1<T>
+{
+    T data = default;
+};
+
+struct Layer2<T>
+{
+    Layer1<T> inner = default;
+};
+
+struct Layer3<T>
+{
+    Layer2<T> inner = default;
+};
+
+bool testMultiLayerGeneric()
+{
+    bool result = true;
+
+    // Test Layer3<int>
+    Layer3<int> l3 = default;
+    l3.inner.inner.data = 111;
+    result &= Test("multi_layer_int", l3.inner.inner.data, 111);
+
+    // Test Layer3<i32>
+    Layer3<i32> l3_i32 = default;
+    l3_i32.inner.inner.data = 222;
+    result &= Test("multi_layer_i32", l3_i32.inner.inner.data, 222);
+
+    return result;
+}
+
+// Generic struct with mixed generic and non-generic fields
+struct MixedGeneric<T>
+{
+    Box<T> genericBox = default;
+    int regularInt = 0;
+    T genericValue = default;
+    i64 regularLong = 0;
+};
+
+bool testMixedGenericFields()
+{
+    bool result = true;
+
+    // Test MixedGeneric<int>
+    MixedGeneric<int> mg = default;
+    mg.genericBox.value = 50;
+    mg.regularInt = 100;
+    mg.genericValue = 25;
+    mg.regularLong = 9999;
+    result &= Test("mixed_generic_int_box", mg.genericBox.value, 50);
+    result &= Test("mixed_generic_int_regular", mg.regularInt, 100);
+    result &= Test("mixed_generic_int_value", mg.genericValue, 25);
+    result &= Test("mixed_generic_int_long", mg.regularLong, 9999);
+
+    // Test MixedGeneric<i32>
+    MixedGeneric<i32> mg2 = default;
+    mg2.genericBox.value = 200;
+    mg2.regularInt = 300;
+    mg2.genericValue = 400;
+    mg2.regularLong = 5555;
+    result &= Test("mixed_generic_i32_box", mg2.genericBox.value, 200);
+    result &= Test("mixed_generic_i32_regular", mg2.regularInt, 300);
+    result &= Test("mixed_generic_i32_value", mg2.genericValue, 400);
+    result &= Test("mixed_generic_i32_long", mg2.regularLong, 5555);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -700,6 +921,13 @@ extern int main()
     result &= testDictionaryStruct();
     result &= testForStruct();
     result &= testListPointer();
+    result &= testDoubleNestedGeneric();
+    result &= testTripleNestedGeneric();
+    result &= testPairOfBoxes();
+    result &= testContainerOfPairs();
+    result &= testGenericWrapperMethods();
+    result &= testMultiLayerGeneric();
+    result &= testMixedGenericFields();
     if (result)
     {
         printf("All Test Passed.\n");

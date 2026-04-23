@@ -1,45 +1,60 @@
-// queue<T> — FIFO (First In First Out) data structure backed by list<T>.
-
+// queue<T> — FIFO (First In First Out) using simple array.
 class queue<T>
 {
-    list<T> _items = default;
+    T*  _data     = nullptr;
+    int _size     = 0;
+    int _capacity = 0;
+    int _front    = 0;
 
-    // Add a value to the back of the queue.
-    void enqueue(T value)
+    void _grow()
     {
-        _items.add(value);
+        int newCap = _capacity == 0 ? 4 : _capacity * 2;
+        T* newData = new T[newCap];
+        int i = 0;
+        while (i < _size)
+        {
+            newData[i] = _data[_front + i];
+            i++;
+        }
+        if (_data != nullptr) delete[] _data;
+        _data = newData;
+        _capacity = newCap;
+        _front = 0;
     }
 
-    // Remove and return the front value.
-    // Undefined behavior if queue is empty.
+    void enqueue(T value)
+    {
+        if (_size >= _capacity) _grow();
+        _data[_front + _size] = value;
+        _size++;
+    }
+
     T dequeue()
     {
-        T value = _items.get(0);
-        _items.removeAt(0);
+        T value = _data[_front];
+        _front++;
+        _size--;
+        if (_size == 0) _front = 0;
         return value;
     }
 
-    // View the front value without removing it.
-    // Undefined behavior if queue is empty.
     T peek()
     {
-        return _items.get(0);
+        return _data[_front];
     }
 
-    // Check if the queue is empty.
     bool isEmpty()
     {
-        return _items.count() == 0;
+        return _size == 0;
     }
 
-    // Return the number of elements in the queue.
     int count()
     {
-        return _items.count();
+        return _size;
     }
 
     ~queue()
     {
-        if (_items._data != nullptr) delete[] _items._data;
+        if (_data != nullptr) delete[] _data;
     }
-}
+};

@@ -108,7 +108,7 @@ additiveExpression
     ;
 
 shiftExpression
-    : additiveExpression (('<<' | '>>') additiveExpression)?
+    : additiveExpression (('<<' | ('>' '>')) additiveExpression)?
     ;
 
 relationalExpression
@@ -823,10 +823,6 @@ GreaterEqual
 
 LeftShift
     : '<<'
-    ;
-
-RightShift
-    : '>>'
     ;
 
 Plus
