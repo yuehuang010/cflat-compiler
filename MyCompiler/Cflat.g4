@@ -37,6 +37,7 @@ primaryExpression
     : Constant
     | genericIdentifier
     | StringLiteral+
+    | lambdaExpression
     | '(' expression ')'
     | NameOf '(' expression ')'
     | TypeOf '(' expression ')'
@@ -244,6 +245,37 @@ typeSpecifier
     | 'auto'
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
     | genericIdentifier
+    | functionPointerSpecifier
+    ;
+
+functionPointerSpecifier
+    : Function '<' typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    | Function
+    ;
+
+functionPointerParamList
+    : functionPointerParam (',' functionPointerParam)*
+    ;
+
+functionPointerParam
+    : typeSpecifier pointer?
+    ;
+
+lambdaExpression
+    : '(' lambdaParamList? ')' FatArrow lambdaBody
+    ;
+
+lambdaParamList
+    : lambdaParam (',' lambdaParam)*
+    ;
+
+lambdaParam
+    : typeSpecifier pointer? Identifier
+    ;
+
+lambdaBody
+    : compoundStatement
+    | assignmentExpression
     ;
 
 genericTypeParameters
@@ -609,6 +641,10 @@ For
     : 'for'
     ;
 
+Function
+    : 'function'
+    ;
+
 Goto
     : 'goto'
     ;
@@ -964,6 +1000,10 @@ NotEqual
 
 Arrow
     : '->'
+    ;
+
+FatArrow
+    : '=>'
     ;
 
 Dot

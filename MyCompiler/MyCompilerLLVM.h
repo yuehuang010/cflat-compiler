@@ -76,6 +76,13 @@ public:
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
 
+        // Function pointer fields (IsFunctionPointer == true)
+        bool IsFunctionPointer = false;
+        std::string FuncPtrReturnTypeName;
+        bool FuncPtrReturnPointer = false;
+        struct FuncPtrParam { std::string TypeName; bool Pointer = false; };
+        std::vector<FuncPtrParam> FuncPtrParams;
+
         bool IsPrimitive() const
         {
             return IsInteger() != -1 || IsUnsignedInteger() != -1 || IsFloatingPoint() != -1
@@ -174,6 +181,14 @@ public:
 
         std::string ToUniqueString() const
         {
+            if (IsFunctionPointer)
+            {
+                std::string s = "funcptr_" + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
+                for (const auto& p : FuncPtrParams)
+                    s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "");
+                return s;
+            }
+
             std::string type = TypeName;
 
             if (Pointer)
@@ -326,6 +341,7 @@ public:
     std::string runtimeDir;
     bool verbose = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
+    int lambdaCounter = 0;
 
     // Compile-time macros (constant throughout compilation, set early)
     struct CompileTimeMacro
@@ -995,6 +1011,7 @@ private:
         else if (operationText == ">") { return Operation::Greater; }
         else if (operationText == ">=") { return Operation::GreaterEqual; }
         else if (operationText == "<") { return Operation::Less; }
+        else if (operationText == "<=") { return Operation::LessEqual; }
         else if (operationText == "*=") { return Operation::MultiplyAssignment; }
         else if (operationText == "/=") { return Operation::DivideAssignment; }
         else if (operationText == "%=") { return Operation::ModAssignment; }
@@ -2188,6 +2205,56 @@ public:
         return it->second.front().ReturnType;
     }
 
+    std::string CreateAnonFunctionName()
+    {
+        return "__lambda_" + std::to_string(lambdaCounter++);
+    }
+
+    // Returns a TypeAndValue describing the function pointer type for the named function.
+    TypeAndValue MakeFuncPtrTypeAndValue(const std::string& functionName) const
+    {
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end() || it->second.empty())
+            return {};
+        const auto& sym = it->second.front();
+        TypeAndValue tv;
+        tv.IsFunctionPointer = true;
+        tv.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
+        tv.FuncPtrReturnPointer = sym.ReturnType.Pointer;
+        for (const auto& p : sym.Parameters)
+        {
+            TypeAndValue::FuncPtrParam fp;
+            fp.TypeName = p.TypeName;
+            fp.Pointer = p.Pointer;
+            tv.FuncPtrParams.push_back(fp);
+        }
+        return tv;
+    }
+
+    // Emits an indirect call through a function pointer value.
+    llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr, std::vector<llvm::Value*> args)
+    {
+        std::vector<llvm::Type*> paramTypes;
+        for (const auto& p : funcPtrType.FuncPtrParams)
+        {
+            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            paramTypes.push_back(GetType(pTV));
+        }
+        TypeAndValue retTV;
+        retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
+        retTV.Pointer = funcPtrType.FuncPtrReturnPointer;
+        auto* retTy = GetType(retTV);
+        auto* funcTy = llvm::FunctionType::get(retTy, paramTypes, false);
+
+        // Upconvert args to match param types
+        for (size_t i = 0; i < args.size() && i < paramTypes.size(); i++)
+            args[i] = Upconvert(args[i], paramTypes[i]);
+
+        lastCallReturnType = retTV;
+        auto* result = builder->CreateCall(funcTy, funcPtr, args);
+        return retTy->isVoidTy() ? nullptr : result;
+    }
+
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases)
     {
         if (!cond->getType()->isIntegerTy())
@@ -2400,6 +2467,23 @@ public:
 
     llvm::Type* GetType(const MyCompilerLLVM::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
     {
+        if (typeAndValue.IsFunctionPointer)
+        {
+            std::vector<llvm::Type*> paramTypes;
+            for (const auto& p : typeAndValue.FuncPtrParams)
+            {
+                TypeAndValue pTV;
+                pTV.TypeName = p.TypeName;
+                pTV.Pointer = p.Pointer;
+                paramTypes.push_back(GetType(pTV));
+            }
+            TypeAndValue retTV;
+            retTV.TypeName = typeAndValue.FuncPtrReturnTypeName;
+            retTV.Pointer = typeAndValue.FuncPtrReturnPointer;
+            auto* retTy = GetType(retTV);
+            return llvm::FunctionType::get(retTy, paramTypes, false)->getPointerTo();
+        }
+
         llvm::Type* type = nullptr;
         const auto& typeName = typeAndValue.TypeName;
 

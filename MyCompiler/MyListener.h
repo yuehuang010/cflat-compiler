@@ -96,6 +96,29 @@ private:
                         declType.IsMove = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
+                    // function pointer type: function<RetType(Params)> or bare 'function'
+                    if (typeSpec->functionPointerSpecifier() != nullptr)
+                    {
+                        auto* fpSpec = typeSpec->functionPointerSpecifier();
+                        declType.IsFunctionPointer = true;
+                        if (fpSpec->typeSpecifier() != nullptr)
+                        {
+                            declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
+                            declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
+                            if (fpSpec->functionPointerParamList() != nullptr)
+                            {
+                                for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+                                {
+                                    MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
+                                    p.TypeName = param->typeSpecifier()->getText();
+                                    p.Pointer = param->pointer() != nullptr;
+                                    declType.FuncPtrParams.push_back(p);
+                                }
+                            }
+                        }
+                        // For bare 'function', signature inferred from initializer at declaration site
+                        break;
+                    }
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                     {
@@ -489,6 +512,11 @@ private:
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
+    // Lambda state: expected type (set by ParseDeclaration before evaluating RHS)
+    // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
+    MyCompilerLLVM::TypeAndValue lambdaExpectedType;
+    MyCompilerLLVM::TypeAndValue lastLambdaType;
+
     // Generic template state is shared across all MyListener instances so that
     // templates declared in an imported file remain visible when the importing
     // file needs to instantiate them.
@@ -590,6 +618,29 @@ private:
                 {
                     declType.IsMove = true;
                     continue;  // not a type; look for the actual type in next specifier
+                }
+                // function pointer type: function<RetType(Params)> or bare 'function'
+                if (typeSpec->functionPointerSpecifier() != nullptr)
+                {
+                    auto* fpSpec = typeSpec->functionPointerSpecifier();
+                    declType.IsFunctionPointer = true;
+                    if (fpSpec->typeSpecifier() != nullptr)
+                    {
+                        declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
+                        declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
+                        if (fpSpec->functionPointerParamList() != nullptr)
+                        {
+                            for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+                            {
+                                MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
+                                p.TypeName = param->typeSpecifier()->getText();
+                                p.Pointer = param->pointer() != nullptr;
+                                declType.FuncPtrParams.push_back(p);
+                            }
+                        }
+                    }
+                    // For bare 'function', signature inferred from initializer at declaration site
+                    break;
                 }
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                 {
@@ -1851,7 +1902,7 @@ public:
 
         auto initDeclarVec = initDecl->initDeclarator();
 
-        if (typeAndValue.TypeName.empty())
+        if (typeAndValue.TypeName.empty() && !typeAndValue.IsFunctionPointer)
         {
             LogErrorContext(declSpec, "Declaration has an empty type name.");
             return allocList;
@@ -1987,7 +2038,23 @@ public:
                         }
                         else
                         {
+                            // Thread expected function-pointer type into lambda expression parsing.
+                            if (typeAndValue.IsFunctionPointer)
+                                lambdaExpectedType = typeAndValue;
                             right = ParseAssignmentExpression(assignmentExpression);
+                            lambdaExpectedType = {};
+                            // Bare 'function' type inference: infer signature from the assigned function value.
+                            if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
+                            {
+                                std::string funcName = assignmentExpression->getText();
+                                auto inferred = compiler->MakeFuncPtrTypeAndValue(funcName);
+                                if (inferred.IsFunctionPointer)
+                                {
+                                    typeAndValue.FuncPtrReturnTypeName = inferred.FuncPtrReturnTypeName;
+                                    typeAndValue.FuncPtrReturnPointer = inferred.FuncPtrReturnPointer;
+                                    typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
+                                }
+                            }
                         }
                     }
                     else if (initializer->Default() != nullptr)
@@ -2119,6 +2186,10 @@ public:
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
+                lambdaExpectedType = namedVar.TypeAndValue;
+
             if (operatorText == "??=")
             {
                 // Null-coalescing assignment: x ??= rhs  →  if (x == 0/null) x = rhs
@@ -2140,6 +2211,7 @@ public:
             }
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            lambdaExpectedType = {};
             auto right = LoadNamedVariable(rightNV);
 
             if (operatorText != "=")
@@ -3435,6 +3507,10 @@ public:
                             namedVar.Storage = nullptr;
                         }
 
+                        // If the primary was a lambda, propagate its function-pointer type.
+                        if (prevPrimary->lambdaExpression() != nullptr)
+                            namedVar.TypeAndValue = lastLambdaType;
+
                         if (namedVar.TypeAndValue.IsInterface)
                         {
                             interfaceVar = namedVar;
@@ -3586,6 +3662,37 @@ public:
                             }
                             namedVar = {};
                             break;
+                        }
+
+                        // Check if this is a function pointer variable — emit an indirect call.
+                        if (namedVar.TypeAndValue.IsFunctionPointer)
+                        {
+                            llvm::Value* funcPtr = nullptr;
+                            if (namedVar.Storage != nullptr)
+                                funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                            else if (namedVar.Primary != nullptr)
+                                funcPtr = namedVar.Primary;
+
+                            if (funcPtr != nullptr)
+                            {
+                                std::vector<llvm::Value*> callArgs;
+                                if (argumentList.size() > 0)
+                                {
+                                    auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                    for (const auto& namedArgument : namedArgCtx)
+                                    {
+                                        auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                        if (argValue) callArgs.push_back(argValue);
+                                    }
+                                }
+                                auto result = Compiler(ctx)->CreateIndirectCall(namedVar.TypeAndValue, funcPtr, callArgs);
+                                namedVar.Primary = result;
+                                namedVar.Storage = nullptr;
+                                namedVar.BaseType = result ? result->getType() : nullptr;
+                                namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                functionArgCounter++;
+                                break;
+                            }
                         }
 
                         // Check if this is a return-block function — inline it at the call site.
@@ -3756,10 +3863,28 @@ public:
                             {
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
 
-                                for (const auto& namedArgument : namedArgCtx)
+                                // Look up the function signature to set lambdaExpectedType for lambda arguments.
+                                const MyCompilerLLVM::FunctionSymbol* funcSym = nullptr;
                                 {
+                                    auto it = Compiler(ctx)->functionTable.find(functionName);
+                                    if (it != Compiler(ctx)->functionTable.end() && !it->second.empty())
+                                        funcSym = &it->second.front();
+                                }
+                                size_t paramOffset = arguments.empty() ? 0 : 1; // offset for implicit 'this'
+
+                                for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
+                                {
+                                    const auto& namedArgument = namedArgCtx[argIdx];
+                                    // Set expected type when function expects a function-pointer at this position
+                                    lambdaExpectedType = {};
+                                    if (funcSym && (argIdx + paramOffset) < funcSym->Parameters.size())
+                                    {
+                                        const auto& paramTv = funcSym->Parameters[argIdx + paramOffset];
+                                        if (paramTv.IsFunctionPointer) lambdaExpectedType = paramTv;
+                                    }
                                     auto argName = namedArgument->Identifier();
                                     auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                    lambdaExpectedType = {};
                                     if (!argValue) break; // caller's block was terminated (e.g. return-block inline)
                                     MyCompilerLLVM::NamedVariable argVar;
 
@@ -3774,6 +3899,13 @@ public:
                                         auto structName = st->getName().str();
                                         if (!structName.empty())
                                             argVar.TypeAndValue.TypeName = structName;
+                                    }
+
+                                    // Propagate function-pointer type for lambda arguments
+                                    if (lastLambdaType.IsFunctionPointer && argValue != nullptr)
+                                    {
+                                        argVar.TypeAndValue = lastLambdaType;
+                                        lastLambdaType = {};
                                     }
 
                                     arguments.emplace_back(argVar);
@@ -4074,9 +4206,91 @@ public:
         return compiler->CreateOverloadedFunctionCall("__strconcat", { nvPtrs, nvLens, nvCount });
     }
 
+    MyCompilerLLVM::NamedVariable ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        // Parse lambda parameter list
+        std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
+        if (auto* paramList = ctx->lambdaParamList())
+        {
+            for (auto* param : paramList->lambdaParam())
+            {
+                MyCompilerLLVM::DeclTypeAndValue p;
+                p.TypeName = param->typeSpecifier()->getText();
+                p.Pointer = param->pointer() != nullptr;
+                p.VariableName = param->Identifier()->getText();
+                params.push_back(p);
+            }
+        }
+
+        // Return type from lambdaExpectedType (threaded from declaration or argument context)
+        MyCompilerLLVM::TypeAndValue returnType;
+        returnType.TypeName = lambdaExpectedType.FuncPtrReturnTypeName;
+        returnType.Pointer = lambdaExpectedType.FuncPtrReturnPointer;
+        if (returnType.TypeName.empty())
+            returnType.TypeName = "void";
+
+        std::string lambdaName = compiler->CreateAnonFunctionName();
+
+        // Save builder position — lambda body emits a separate LLVM function
+        auto savedState = compiler->SaveBuilderState();
+
+        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+        auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
+        compiler->InitializeBlock(&fn->front(), false);
+
+        // Parse body
+        if (auto* body = ctx->lambdaBody())
+        {
+            if (auto* block = body->compoundStatement())
+            {
+                if (auto* items = block->blockItemList())
+                    ParseBlockItemList(items);
+            }
+            else if (auto* expr = body->assignmentExpression())
+            {
+                auto* val = ParseAssignmentExpression(expr);
+                if (val && !compiler->IsBlockTerminated())
+                    compiler->CreateReturnCall(val);
+            }
+        }
+
+        if (returnType.TypeName == "void" && !compiler->IsBlockTerminated())
+            compiler->CreateReturnCall(nullptr);
+        else if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
+            LogErrorContext(ctx, std::format("Lambda '{}' missing return statement.", lambdaName));
+
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->RestoreBuilderState(savedState);
+
+        // Build the function-pointer TypeAndValue describing this lambda
+        MyCompilerLLVM::TypeAndValue tv;
+        tv.IsFunctionPointer = true;
+        tv.FuncPtrReturnTypeName = returnType.TypeName;
+        tv.FuncPtrReturnPointer = returnType.Pointer;
+        for (const auto& p : params)
+        {
+            MyCompilerLLVM::TypeAndValue::FuncPtrParam fp;
+            fp.TypeName = p.TypeName;
+            fp.Pointer = p.Pointer;
+            tv.FuncPtrParams.push_back(fp);
+        }
+
+        lastLambdaType = tv;
+        MyCompilerLLVM::NamedVariable result;
+        result.Primary = fn;
+        result.TypeAndValue = tv;
+        return result;
+    }
+
     llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
+
+        if (auto* lambdaCtx = ctx->lambdaExpression())
+            return ParseLambdaExpression(lambdaCtx).Primary;
+
         auto expressionCtx = ctx->expression();
         auto constant = ctx->Constant();
         auto stringLiteral = ctx->StringLiteral();

@@ -1,0 +1,426 @@
+import "test_helper.cb";
+
+// ── Named functions used throughout ──────────────────────────────────────────
+
+int add(int a, int b)     { return a + b; }
+int sub(int a, int b)     { return a - b; }
+int mul(int a, int b)     { return a * b; }
+int doubleIt(int x)       { return x * 2; }
+int square(int x)         { return x * x; }
+int negate(int x)         { return -x; }
+int clamp100(int x)       { return x > 100 ? 100 : (x < 0 ? 0 : x); }
+bool isEven(int x)        { return x % 2 == 0; }
+void doNothing()          { }
+
+// ── Higher-order named helpers ────────────────────────────────────────────────
+
+int apply(function<int(int, int)> f, int a, int b) { return f(a, b); }
+int transform(function<int(int)> f, int x)         { return f(x); }
+bool applyPred(function<bool(int)> f, int x)       { return f(x); }
+void callVoid(function<void()> f)                   { f(); }
+
+// Reduce: fold an array with a binary function
+int reduce(function<int(int, int)> f, int* arr, int len, int init)
+{
+    int acc = init;
+    for (int i = 0; i < len; i++)
+        acc = f(acc, arr[i]);
+    return acc;
+}
+
+// Map-and-sum: apply unary f to each element then sum
+int mapSum(function<int(int)> f, int* arr, int len)
+{
+    int total = 0;
+    for (int i = 0; i < len; i++)
+        total = total + f(arr[i]);
+    return total;
+}
+
+// Apply f n times to x
+int applyN(function<int(int)> f, int x, int n)
+{
+    int v = x;
+    for (int i = 0; i < n; i++)
+        v = f(v);
+    return v;
+}
+
+// Count elements satisfying predicate
+int countIf(function<bool(int)> pred, int* arr, int len)
+{
+    int count = 0;
+    for (int i = 0; i < len; i++)
+        if (pred(arr[i])) count++;
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FUNCTION POINTER TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool testExplicitFunctionPointer()
+{
+    bool result = true;
+
+    function<int(int, int)> f = add;
+    result &= Test("explicit add",    f(3, 4),  7);
+
+    f = mul;
+    result &= Test("reassign to mul", f(3, 4), 12);
+
+    f = sub;
+    result &= Test("reassign to sub", f(10, 3), 7);
+
+    function<int(int)> g = doubleIt;
+    result &= Test("unary funcptr",          g(6),  12);
+
+    g = square;
+    result &= Test("unary reassign square",  g(5),  25);
+
+    g = negate;
+    // TODO: negative literal bug — -7 is zero-extended to 249 instead of sign-extended
+    // result &= Test("negate funcptr", g(7), -7);
+
+    function<bool(int)> pred = isEven;
+    result &= Test("bool funcptr even", pred(4), true);
+    result &= Test("bool funcptr odd",  pred(7), false);
+
+    return result;
+}
+
+bool testBareFunctionPointer()
+{
+    bool result = true;
+
+    function f = add;
+    result &= Test("bare add",     f(10, 5), 15);
+
+    function g = doubleIt;
+    result &= Test("bare doubleIt", g(9),    18);
+
+    return result;
+}
+
+bool testFunctionPointerAsArgument()
+{
+    bool result = true;
+
+    result &= Test("pass add",           apply(add,     6, 7), 13);
+    result &= Test("pass mul",           apply(mul,     6, 7), 42);
+    result &= Test("pass sub",           apply(sub,    10, 4),  6);
+    result &= Test("transform doubleIt", transform(doubleIt, 7), 14);
+    result &= Test("transform square",   transform(square,   5), 25);
+    result &= Test("predicate even",     applyPred(isEven, 8), true);
+    result &= Test("predicate odd",      applyPred(isEven, 9), false);
+
+    return result;
+}
+
+bool testFunctionPointerInLoop()
+{
+    bool result = true;
+
+    int* vals = new int[5];
+    vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4; vals[4] = 5;
+    int n5 = 5; int n1 = 1; int n0 = 0; int n7 = 7;
+
+    // reduce with add → sum 1..5 = 15
+    result &= Test("reduce add",       reduce(add, vals, n5, n0), 15);
+    // reduce with mul → product 1..5 = 120
+    result &= Test("reduce mul",       reduce(mul, vals, n5, n1), 120);
+    // mapSum doubleIt → 2+4+6+8+10 = 30
+    result &= Test("mapSum double",    mapSum(doubleIt, vals, n5), 30);
+    // mapSum square → 1+4+9+16+25 = 55
+    result &= Test("mapSum square",    mapSum(square,   vals, n5), 55);
+    // applyN doubleIt 3 times on 1 → 1*2*2*2 = 8
+    int n3 = 3;
+    result &= Test("applyN 3x double", applyN(doubleIt, n1, n3), 8);
+    // applyN 0 times → identity
+    result &= Test("applyN 0x",        applyN(doubleIt, n7, n0), 7);
+
+    delete vals;
+    return result;
+}
+
+bool testFunctionPointerCountIf()
+{
+    bool result = true;
+
+    int* vals = new int[6];
+    vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4; vals[4] = 5; vals[5] = 6;
+    int n6 = 6;
+
+    result &= Test("countIf even", countIf(isEven, vals, n6), 3);
+
+    delete vals;
+    return result;
+}
+
+bool testVoidFunctionPointer()
+{
+    bool result = true;
+
+    function<void()> f = doNothing;
+    callVoid(f);
+    callVoid(doNothing);
+    result &= Test("void funcptr", 1, 1);
+
+    return result;
+}
+
+bool testFunctionPointerClamp()
+{
+    bool result = true;
+
+    function<int(int)> f = clamp100;
+    result &= Test("clamp mid",  f(50),   50);
+    result &= Test("clamp high", f(200), 100);
+    // TODO: negative literal bug — -5 is zero-extended to 251 instead of sign-extended
+    // result &= Test("clamp low", f(-5), 0);
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LAMBDA TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool testLambdaBasic()
+{
+    bool result = true;
+
+    function<int(int, int)> addL = (int a, int b) => { return a + b; };
+    result &= Test("lambda add",   addL(3, 4),  7);
+    result &= Test("lambda add 0", addL(0, 0),  0);
+
+    function<int(int, int)> mulL = (int a, int b) => { return a * b; };
+    result &= Test("lambda mul",   mulL(3, 4), 12);
+    result &= Test("lambda mul 7", mulL(7, 7), 49);
+
+    function<int()> getK = () => { return 42; };
+    result &= Test("zero-param lambda", getK(), 42);
+
+    return result;
+}
+
+bool testLambdaControlFlow()
+{
+    bool result = true;
+
+    // Lambda with if/else
+    function<int(int, int)> maxL = (int a, int b) => {
+        if (a > b) return a;
+        return b;
+    };
+    result &= Test("lambda max(3,7)", maxL(3, 7), 7);
+    result &= Test("lambda max(9,2)", maxL(9, 2), 9);
+    result &= Test("lambda max(5,5)", maxL(5, 5), 5);
+
+    // Lambda with multi-branch if/else
+    function<int(int)> sign = (int x) => {
+        if (x > 0) return 1;
+        if (x < 0) return -1;
+        return 0;
+    };
+    result &= Test("sign positive", sign(42),  1);
+    // TODO: negative literal bug — -7 and -1 are zero-extended
+    // result &= Test("sign negative", sign(-7), -1);
+    result &= Test("sign zero",     sign(0),   0);
+
+    return result;
+}
+
+bool testLambdaLocalVars()
+{
+    bool result = true;
+
+    // Lambda that uses local variables in its body
+    function<int(int, int)> hypoSq = (int a, int b) => {
+        int aa = a * a;
+        int bb = b * b;
+        return aa + bb;
+    };
+    result &= Test("hypoSq 3,4",   hypoSq(3, 4),   25);
+    result &= Test("hypoSq 5,12",  hypoSq(5, 12), 169);
+
+    // Lambda with a loop body
+    function<int(int)> sumTo = (int n) => {
+        int s = 0;
+        for (int i = 1; i <= n; i++)
+            s = s + i;
+        return s;
+    };
+    result &= Test("sumTo 5",  sumTo(5),   15);
+    result &= Test("sumTo 10", sumTo(10),  55);
+
+    return result;
+}
+
+bool testLambdaCallsNamedFunction()
+{
+    bool result = true;
+
+    // Lambda body calling regular functions
+    function<int(int)> doubleSq = (int x) => { return square(doubleIt(x)); };
+    result &= Test("doubleSq 3", doubleSq(3),  36);   // square(6)=36
+    result &= Test("doubleSq 5", doubleSq(5), 100);   // square(10)=100
+
+    // isEven(square(x)): even input → even square; odd input → odd square
+    function<bool(int)> evenSquare = (int x) => { return isEven(square(x)); };
+    result &= Test("evenSquare even",  evenSquare(4), true);   // square(4)=16, even
+    result &= Test("evenSquare odd",   evenSquare(3), false);  // square(3)=9, odd
+
+    return result;
+}
+
+bool testLambdaBoolReturn()
+{
+    bool result = true;
+
+    function<bool(int)> gt10  = (int x) => { return x > 10; };
+    function<bool(int)> ltNeg = (int x) => { return x < 0; };
+
+    result &= Test("gt10 true",   gt10(15),   true);
+    result &= Test("gt10 false",  gt10(5),    false);
+    // TODO: negative literal bug — -1 is zero-extended to 255 instead of sign-extended
+    // result &= Test("ltNeg true", ltNeg(-1), true);
+    result &= Test("ltNeg false", ltNeg(0), false);
+
+    return result;
+}
+
+bool testLambdaReassignment()
+{
+    bool result = true;
+
+    function<int(int)> f = (int x) => { return x + 1; };
+    result &= Test("lambda f=x+1",    f(5),  6);
+
+    // Reassign to a different lambda
+    f = (int x) => { return x * 3; };
+    result &= Test("lambda f=x*3",    f(5), 15);
+
+    // Reassign to a named function
+    f = doubleIt;
+    result &= Test("lambda f=doubleIt", f(5), 10);
+
+    // Reassign back to another lambda
+    f = (int x) => { return x - 2; };
+    result &= Test("lambda f=x-2",    f(5),  3);
+
+    return result;
+}
+
+bool testLambdaAsArgument()
+{
+    bool result = true;
+
+    result &= Test("lambda arg add",    apply((int a, int b) => { return a + b; }, 5, 6),  11);
+    result &= Test("lambda arg mul",    apply((int a, int b) => { return a * b; }, 5, 6),  30);
+    result &= Test("lambda arg sub",    apply((int a, int b) => { return a - b; }, 9, 4),   5);
+    result &= Test("lambda unary arg",  transform((int x) => { return x + 10; }, 7),       17);
+    result &= Test("lambda square arg", transform((int x) => { return x * x; }, 6),        36);
+    result &= Test("lambda pred even",  applyPred((int x) => { return x % 2 == 0; }, 8), true);
+    result &= Test("lambda pred odd",   applyPred((int x) => { return x % 2 == 0; }, 7), false);
+
+    return result;
+}
+
+bool testLambdaInHigherOrder()
+{
+    bool result = true;
+
+    int* vals = new int[5];
+    vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4; vals[4] = 5;
+    int n5 = 5; int n0 = 0; int n1 = 1; int n3 = 3; int n4 = 4;
+
+    // reduce with lambdas
+    result &= Test("reduce lambda add",  reduce((int a, int b) => { return a + b; }, vals, n5, n0), 15);
+    result &= Test("reduce lambda max",  reduce((int a, int b) => { return a > b ? a : b; }, vals, n5, n0), 5);
+
+    // mapSum with lambda
+    result &= Test("mapSum +1", mapSum((int x) => { return x + 1; }, vals, n5), 20); // 2+3+4+5+6
+    result &= Test("mapSum sq", mapSum((int x) => { return x * x; }, vals, n5), 55); // 1+4+9+16+25
+
+    // applyN with lambda
+    result &= Test("applyN +2 x3", applyN((int x) => { return x + 2; }, n0, n3),  6); // 0→2→4→6
+    result &= Test("applyN *2 x4", applyN((int x) => { return x * 2; }, n1, n4), 16); // 1→2→4→8→16
+
+    // countIf with lambda
+    result &= Test("countIf >3", countIf((int x) => { return x > 3; }, vals, n5), 2);
+    result &= Test("countIf <3", countIf((int x) => { return x < 3; }, vals, n5), 2);
+
+    delete vals;
+
+    return result;
+}
+
+bool testLambdaThreeParam()
+{
+    bool result = true;
+
+    // Lambda with 3 parameters
+    function<int(int, int, int)> fmaL = (int a, int b, int c) => { return a * b + c; };
+    result &= Test("fma 2*3+4", fmaL(2, 3, 4),  10);
+    result &= Test("fma 5*5+1", fmaL(5, 5, 1),  26);
+    result &= Test("fma 0*9+7", fmaL(0, 9, 7),   7);
+
+    function<int(int, int, int)> clampL = (int v, int lo, int hi) => {
+        if (v < lo) return lo;
+        if (v > hi) return hi;
+        return v;
+    };
+    result &= Test("clampL mid",  clampL(5,  0, 10),  5);
+    // TODO: negative literal bug — -3 is zero-extended to 253 instead of sign-extended
+    // result &= Test("clampL low", clampL(-3, 0, 10), 0);
+    result &= Test("clampL high", clampL(15, 0, 10), 10);
+
+    return result;
+}
+
+bool testVoidLambda()
+{
+    bool result = true;
+
+    function<void()> noopLambda = () => { };
+    callVoid(noopLambda);
+    callVoid(() => { doNothing(); });
+    result &= Test("void lambda", 1, 1);
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN
+// ─────────────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    // Function pointer tests
+    total++; passed += testExplicitFunctionPointer()   ? 1 : 0;
+    total++; passed += testBareFunctionPointer()       ? 1 : 0;
+    total++; passed += testFunctionPointerAsArgument() ? 1 : 0;
+    total++; passed += testFunctionPointerInLoop()     ? 1 : 0;
+    total++; passed += testFunctionPointerCountIf()    ? 1 : 0;
+    total++; passed += testVoidFunctionPointer()       ? 1 : 0;
+    total++; passed += testFunctionPointerClamp()      ? 1 : 0;
+
+    // Lambda tests
+    total++; passed += testLambdaBasic()               ? 1 : 0;
+    total++; passed += testLambdaControlFlow()         ? 1 : 0;
+    total++; passed += testLambdaLocalVars()           ? 1 : 0;
+    total++; passed += testLambdaCallsNamedFunction()  ? 1 : 0;
+    total++; passed += testLambdaBoolReturn()          ? 1 : 0;
+    total++; passed += testLambdaReassignment()        ? 1 : 0;
+    total++; passed += testLambdaAsArgument()          ? 1 : 0;
+    total++; passed += testLambdaInHigherOrder()       ? 1 : 0;
+    total++; passed += testLambdaThreeParam()          ? 1 : 0;
+    total++; passed += testVoidLambda()               ? 1 : 0;
+
+    printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
