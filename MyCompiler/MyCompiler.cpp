@@ -33,6 +33,7 @@ int main(int argc, char* argv[])
     args.addFlag("O0", '0', "No optimization (default)");
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
+    args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
 
     if (!args.parse(argc, argv))
         return 1;
@@ -55,6 +56,7 @@ int main(int argc, char* argv[])
     MyCompilerLLVM compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
+    compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
     if (!compiler.Compile(args))
     {
         std::cerr << "Compilation failed.\n";

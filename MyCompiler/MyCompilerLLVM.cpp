@@ -99,12 +99,14 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     // Order matters: runtime first (new/delete), then interfaces, then string.
     if (!runtimeDir.empty())
     {
-        auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
-        if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
-        if (std::filesystem::exists(runtimePath))
-            CompileImportedFile(runtimePath.string(), "runtime.cb");
-        else if (verbose)
-            std::cout << "[verbose]   runtime.cb not found, skipping\n";
+        if (!skipRuntimeImport) {
+            auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+            if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
+            if (std::filesystem::exists(runtimePath))
+                CompileImportedFile(runtimePath.string(), "runtime.cb");
+            else if (verbose)
+                std::cout << "[verbose]   runtime.cb not found, skipping\n";
+        }
 
         auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
         if (verbose) std::cout << "[verbose] auto-importing interfaces: " << interfacesPath.string() << "\n";

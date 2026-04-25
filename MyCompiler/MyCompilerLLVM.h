@@ -367,6 +367,9 @@ public:
     std::unordered_set<std::string> importedFiles;
     std::string importSearchDir;
     std::string runtimeDir;
+private:
+    // When true, disables auto-import of core/runtime.cb
+    bool skipRuntimeImport = false;
     bool verbose = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
     int lambdaCounter = 0;
@@ -3631,6 +3634,8 @@ public:
         llvm::outs() << prefix << "Current insertion block: " << currentBlock->getParent()->getName() << "::" << currentBlock->getName() << "\n";
     }
 
+    // If set, disables auto-import of core/runtime.cb
+    void SetSkipRuntimeImport(bool v) { skipRuntimeImport = v; }
     void SetRuntimeDir(const std::string& dir) { runtimeDir = dir; }
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
