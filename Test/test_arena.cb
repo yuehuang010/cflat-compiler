@@ -1,0 +1,62 @@
+// Test arena bump allocator
+import "arena.cb";
+
+extern int main()
+{
+    // ── basic alloc ──────────────────────────────────────────────────────────
+    Arena arena;
+
+    void* p1 = arena.alloc(16);
+    void* p2 = arena.alloc(32);
+    if (p1 == nullptr) return 1;
+    if (p2 == nullptr) return 2;
+    if (p1 == p2)      return 3;   // must be distinct allocations
+
+    // used() should reflect 16 + 32 = 48 (both already 8-byte aligned)
+    if (arena.used() != 48) return 4;
+    if (arena.allocated() < 48) return 5;
+
+    // ── write and read back ──────────────────────────────────────────────────
+    i32* nums = (i32*)arena.alloc(16);   // 4 × i32 = 16 bytes
+    if (nums == nullptr) return 6;
+    nums[0] = 10;
+    nums[1] = 20;
+    nums[2] = 30;
+    nums[3] = 40;
+    if (nums[0] != 10) return 7;
+    if (nums[1] != 20) return 8;
+    if (nums[2] != 30) return 9;
+    if (nums[3] != 40) return 10;
+
+    // ── zalloc returns zeroed memory ─────────────────────────────────────────
+    i32* zeroed = (i32*)arena.zalloc(16);   // 4 × i32 = 16 bytes
+    if (zeroed == nullptr) return 11;
+    if (zeroed[0] != 0) return 12;
+    if (zeroed[3] != 0) return 13;
+
+    // ── reset reuses memory ──────────────────────────────────────────────────
+    i64 allocBefore = arena.allocated();
+    arena.reset();
+    if (arena.used() != 0) return 14;
+    if (arena.allocated() != allocBefore) return 15;  // blocks still held
+
+    void* p3 = arena.alloc(16);
+    if (p3 == nullptr) return 16;
+    if (p3 != p1) return 17;   // same block reused from offset 0
+
+    // ── oversized alloc triggers a new block ─────────────────────────────────
+    arena.reset();
+    void* big = arena.alloc(131072);   // 128 KiB > default 64 KiB block
+    if (big == nullptr) return 18;
+    if (arena.allocated() < 131072) return 19;
+
+    // ── multiple blocks accumulate used() correctly ──────────────────────────
+    arena.reset();
+    arena.setBlockSize(64);   // tiny blocks to force multiple allocations
+    arena.alloc(64);
+    arena.alloc(64);
+    arena.alloc(64);
+    if (arena.used() != 192) return 20;
+
+    return 0;
+}

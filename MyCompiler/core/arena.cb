@@ -1,0 +1,120 @@
+// arena.cb — bump allocator (memory arena / region allocator)
+//
+// Allocates memory from large contiguous blocks; dispenses sub-allocations
+// by bumping a pointer.  All memory is freed at once on reset() or destruction.
+//
+// Usage:
+//   Arena arena;
+//   int* buf = (int*)arena.alloc(sizeof(int) * 100);
+//   ...
+//   arena.reset();   // reuse all memory without freeing blocks
+//   // destructor frees everything on scope exit
+
+struct _ArenaBlock
+{
+    i8*          _data = nullptr;
+    i64          _size = 0;
+    i64          _used = 0;
+    _ArenaBlock* _next = nullptr;
+};
+
+class Arena
+{
+    _ArenaBlock* _head      = nullptr;
+    i64          _blockSize = 65536;   // 64 KiB default block size
+
+    void _newBlock(i64 minSize)
+    {
+        i64 size = _blockSize;
+        if (minSize > size) size = minSize;
+        _ArenaBlock* blk = new _ArenaBlock[1];
+        blk->_data = (i8*)malloc(size);
+        blk->_size = size;
+        blk->_used = 0;
+        blk->_next = _head;
+        _head = blk;
+    }
+
+    i64 _align8(i64 n)
+    {
+        i64 rem = n % 8;
+        if (rem == 0) return n;
+        return n + (8 - rem);
+    }
+
+    // Allocate `size` bytes; returns a pointer valid until reset() or destruction.
+    void* alloc(i64 size)
+    {
+        i64 aligned = _align8(size);
+        if (_head == nullptr) _newBlock(aligned);
+        if (_head->_used + aligned > _head->_size) _newBlock(aligned);
+        void* ptr = (void*)&_head->_data[_head->_used];
+        _head->_used = _head->_used + aligned;
+        return ptr;
+    }
+
+    // Zero-initialize and return `size` bytes.
+    void* zalloc(i64 size)
+    {
+        void* ptr = alloc(size);
+        memset(ptr, 0, size);
+        return ptr;
+    }
+
+    // Reset all blocks to empty so their memory can be reused without
+    // additional malloc calls.  Does not free any blocks.
+    void reset()
+    {
+        _ArenaBlock* blk = _head;
+        while (blk != nullptr)
+        {
+            blk->_used = 0;
+            blk = blk->_next;
+        }
+    }
+
+    // Change the default block size for future block allocations.
+    void setBlockSize(i64 size)
+    {
+        _blockSize = size;
+    }
+
+    // Total bytes currently dispensed across all blocks.
+    i64 used()
+    {
+        i64 total = 0;
+        _ArenaBlock* blk = _head;
+        while (blk != nullptr)
+        {
+            total = total + blk->_used;
+            blk = blk->_next;
+        }
+        return total;
+    }
+
+    // Total bytes reserved across all blocks (>= used()).
+    i64 allocated()
+    {
+        i64 total = 0;
+        _ArenaBlock* blk = _head;
+        while (blk != nullptr)
+        {
+            total = total + blk->_size;
+            blk = blk->_next;
+        }
+        return total;
+    }
+
+    ~Arena()
+    {
+        _ArenaBlock* blk = _head;
+        while (blk != nullptr)
+        {
+            _ArenaBlock* next = blk->_next;
+            free(blk->_data);
+            delete[] blk;
+            blk = next;
+        }
+        _head = nullptr;
+    }
+};
