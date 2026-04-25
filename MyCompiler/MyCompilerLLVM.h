@@ -226,6 +226,7 @@ public:
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         bool IsOwning = false;           // true for move parameters and owning local pointers — freed on scope exit
+        bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
 
         llvm::Value* GetValue() const
         {
@@ -289,6 +290,7 @@ public:
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
+        bool ReturnsOwnedString = false; // true when the function returns a heap-allocated string the caller must free
     };
 
     struct InterfaceMethod
@@ -318,7 +320,8 @@ public:
     size_t currentColumn = 0;
 
     public:
-    TypeAndValue lastCallReturnType; // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
+    bool lastCallReturnsOwnedString = false; // set when the last call returned an owned heap string
 
     private:
 
@@ -382,6 +385,7 @@ public:
     std::optional<ReturnCaptureContext> returnCapture;
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
+    bool stringDtorRegistered = false;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
@@ -445,8 +449,15 @@ private:
         {
             if (namedVar.TypeAndValue.Pointer) continue;
             auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
-            if (it != dataStructures.end() && it->second.Destructor != nullptr)
+            if (it != dataStructures.end())
             {
+                // String destructor is only called when the local owns its buffer.
+                if (namedVar.TypeAndValue.TypeName == "string")
+                {
+                    if (!namedVar.IsOwningString) continue;
+                    EnsureStringDtorRegistered();
+                }
+                if (it->second.Destructor == nullptr) continue;
                 auto* fn = it->second.Destructor;
                 builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
             }
@@ -457,6 +468,15 @@ private:
         {
             if (namedVar.IsOwning && namedVar.Storage != nullptr)
                 EmitOwningPtrCleanup(namedVar);
+
+            // Clean up move string parameters (move string param — non-pointer ownership)
+            if (namedVar.IsOwningString && namedVar.Storage != nullptr)
+            {
+                EnsureStringDtorRegistered();
+                auto it = dataStructures.find("string");
+                if (it != dataStructures.end() && it->second.Destructor != nullptr)
+                    builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { namedVar.Storage });
+            }
         }
     }
 
@@ -505,6 +525,21 @@ private:
                     .Primary = nullptr,
                     .Storage = alloc,
                     .IsOwning = true,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
+            else if (itr_nameArg->IsMove && itr_nameArg->TypeName == "string")
+            {
+                // move string parameter: alloca a slot so the destructor can free the buffer on scope exit
+                auto* strTy = GetType(*itr_nameArg, nullptr, false);
+                auto* alloc = builder->CreateAlloca(strTy, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, alloc);
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = strTy,
+                    .Primary = nullptr,
+                    .Storage = alloc,
+                    .IsOwningString = true,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
@@ -643,6 +678,9 @@ private:
             sym.Parameters = { selfParam };
             functionTable["length"].push_back(sym);
         }
+
+        // String destructor is registered lazily via EnsureStringDtorRegistered()
+        // so that the C `free` function is available in the function table first.
     }
 
     void RegisterBuiltinStrConcat()
@@ -776,6 +814,41 @@ private:
 
         // Pre-register the built-in `string` value type { i8* _ptr, i32 _len }.
         RegisterBuiltinString();
+    }
+
+    // Called lazily the first time a string local's destructor needs to fire.
+    // Must run after cruntime.cb is compiled so `free` is in the LLVM module.
+    void EnsureStringDtorRegistered()
+    {
+        if (stringDtorRegistered) return;
+        stringDtorRegistered = true;
+
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (!strTy) return;
+
+        // Look up free() — compiled from cruntime.cb, must already be in the module.
+        auto* freeFn = module->getFunction("free");
+        if (!freeFn) return;   // free not yet available; destructor cannot be created yet
+
+        auto* voidTy   = llvm::Type::getVoidTy(*context);
+        auto* ptrTy    = builder->getInt8Ty()->getPointerTo();
+        auto* strPtrTy = strTy->getPointerTo();
+
+        auto* dtorFnTy = llvm::FunctionType::get(voidTy, { strPtrTy }, false);
+        auto* dtorFn   = llvm::Function::Create(dtorFnTy, llvm::Function::InternalLinkage, "string.dtor", *module);
+        dtorFn->arg_begin()->setName("self");
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", dtorFn);
+        llvm::IRBuilder<> b(entry);
+
+        auto* self   = &*dtorFn->arg_begin();
+        auto* ptrPtr = b.CreateStructGEP(strTy, self, 0, "ptrfield");
+        auto* ptr    = b.CreateLoad(ptrTy, ptrPtr, "ptr");
+        b.CreateCall(freeFn->getFunctionType(), freeFn, { ptr });
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy), ptrPtr);
+        b.CreateRetVoid();
+
+        RegisterDestructor("string", dtorFn);
     }
 
     // Called lazily from ParseFormatString after string concat is first needed.
@@ -2400,7 +2473,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false)
+    void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwnedString = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -2419,6 +2492,7 @@ public:
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
+                .ReturnsOwnedString = returnsOwnedString,
             };
 
             for (const auto& arg : arguments)
@@ -2996,15 +3070,32 @@ public:
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
+        lastCallReturnsOwnedString = candidate.ReturnsOwnedString;
 
         // Null out caller's storage for move parameters
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
             if (candidate.Parameters[i].IsMove && matched[i].Storage != nullptr)
             {
-                auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType);
-                if (ptrTy)
+                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType))
+                {
+                    // Pointer move param: null the caller's storage.
                     builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), matched[i].Storage);
+                }
+                else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
+                {
+                    // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
+                    auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+                    if (strTy)
+                    {
+                        auto* ptrField = builder->CreateStructGEP(strTy, matched[i].Storage, 0);
+                        auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
+                        builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                    }
+                    // Mark the caller's NV as no longer owning (will be cleared by namedVariable cleanup).
+                    // We can't modify matched[i] here directly since it's a copy, but the alloca is zeroed.
+                    // The caller's IsOwningString flag will cause the destructor to run on the null ptr (free(null) is safe).
+                }
             }
         }
 
@@ -3275,12 +3366,41 @@ public:
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
+        // If returning an owned string loaded from a local alloca, suppress its destructor
+        // so we don't free the buffer before the caller receives the struct.
+        // The loaded snapshot in `value` already captures the pointer; the caller takes ownership.
+        NamedVariable* ownedReturnVar = nullptr;
+        if (value)
+        {
+            if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value))
+            {
+                auto* srcAlloca = loadInst->getPointerOperand();
+                [&]() {
+                    for (auto& frame : stackNamedVariable)
+                    {
+                        for (auto& [varName, nv] : frame.namedVariable)
+                        {
+                            if (nv.Storage == srcAlloca && nv.IsOwningString)
+                            {
+                                ownedReturnVar = &nv;
+                                nv.IsOwningString = false;  // suppress destructor
+                                return;
+                            }
+                        }
+                    }
+                }();
+            }
+        }
+
         // Emit destructors for all scopes from innermost out to the function boundary
         for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
         {
             EmitDestructorsForScope(*it);
             if (it->isFunction) break;
         }
+
+        // Restore flag (clean state, though the scope is about to be popped anyway)
+        if (ownedReturnVar) ownedReturnVar->IsOwningString = true;
 
         // If we are inlining a return-block, capture the value and branch to continuation.
         if (returnCapture)

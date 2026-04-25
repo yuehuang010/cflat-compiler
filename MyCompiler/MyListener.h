@@ -242,7 +242,22 @@ private:
         }
 
         std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs);
+
+        // Detect functions that heap-allocate and return a new string buffer.
+        // operator+ always allocates; operator string(i32) uses malloc; user functions can
+        // opt in by declaring 'move string' as their return type.
+        bool returnsOwnedString = false;
+        if (returnType.TypeName == "string")
+        {
+            if (name == "operator+")
+                returnsOwnedString = true;
+            else if (name == "operator string" && allParams.size() == 1 && allParams[0].TypeName == "i32")
+                returnsOwnedString = true;
+            else if (returnType.IsMove)
+                returnsOwnedString = true;
+        }
+
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwnedString);
 
         // Pre-declare overloads for default parameters
         int firstDefault = -1;
@@ -2130,6 +2145,15 @@ public:
                     if (right != nullptr)
                     {
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+
+                        // Propagate ownership: if the RHS was a heap-allocating string call,
+                        // mark this local as owning so the destructor frees the buffer on scope exit.
+                        if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwnedString)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.IsOwningString = true;
+                            compiler->lastCallReturnsOwnedString = false;
+                        }
                     }
                 }
             }
