@@ -627,6 +627,12 @@ private:
                     if (fpSpec->typeSpecifier() != nullptr)
                     {
                         declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
+                        // Apply active generic type substitutions (e.g. T → int inside list<int>)
+                        {
+                            auto substIt = activeTypeSubstitutions.find(declType.FuncPtrReturnTypeName);
+                            if (substIt != activeTypeSubstitutions.end())
+                                declType.FuncPtrReturnTypeName = substIt->second;
+                        }
                         declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
                         if (fpSpec->functionPointerParamList() != nullptr)
                         {
@@ -634,6 +640,12 @@ private:
                             {
                                 MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
                                 p.TypeName = param->typeSpecifier()->getText();
+                                // Apply active generic type substitutions
+                                {
+                                    auto substIt = activeTypeSubstitutions.find(p.TypeName);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                        p.TypeName = substIt->second;
+                                }
                                 p.Pointer = param->pointer() != nullptr;
                                 declType.FuncPtrParams.push_back(p);
                             }
@@ -4787,10 +4799,10 @@ public:
             auto classIt = genericClassTemplates.find(pending.templateName);
             if (structIt == genericStructTemplates.end() && classIt == genericClassTemplates.end())
             {
-                if (Compiler()->IsVerbose())
-                    std::cout << "[verbose]   skip instantiation '" << pending.mangledName
-                              << "': template '" << pending.templateName << "' not found\n";
-                continue; // not a generic template
+                Compiler()->LogError(std::format(
+                    "unknown generic type '{}': definition not found. Did you forget to import the file?",
+                    pending.templateName));
+                continue;
             }
 
             if (Compiler()->IsVerbose())

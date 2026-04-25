@@ -1,4 +1,5 @@
 import "test_helper.cb";
+import "list.cb";
 
 // ── Named functions used throughout ──────────────────────────────────────────
 
@@ -79,8 +80,7 @@ bool testExplicitFunctionPointer()
     result &= Test("unary reassign square",  g(5),  25);
 
     g = negate;
-    // TODO: negative literal bug — -7 is zero-extended to 249 instead of sign-extended
-    // result &= Test("negate funcptr", g(7), -7);
+    result &= Test("negate funcptr", g(7), -7);
 
     function<bool(int)> pred = isEven;
     result &= Test("bool funcptr even", pred(4), true);
@@ -176,8 +176,7 @@ bool testFunctionPointerClamp()
     function<int(int)> f = clamp100;
     result &= Test("clamp mid",  f(50),   50);
     result &= Test("clamp high", f(200), 100);
-    // TODO: negative literal bug — -5 is zero-extended to 251 instead of sign-extended
-    // result &= Test("clamp low", f(-5), 0);
+    result &= Test("clamp low", f(-5), 0);
 
     return result;
 }
@@ -224,8 +223,7 @@ bool testLambdaControlFlow()
         return 0;
     };
     result &= Test("sign positive", sign(42),  1);
-    // TODO: negative literal bug — -7 and -1 are zero-extended
-    // result &= Test("sign negative", sign(-7), -1);
+    result &= Test("sign negative", sign(-7), -1);
     result &= Test("sign zero",     sign(0),   0);
 
     return result;
@@ -283,8 +281,7 @@ bool testLambdaBoolReturn()
 
     result &= Test("gt10 true",   gt10(15),   true);
     result &= Test("gt10 false",  gt10(5),    false);
-    // TODO: negative literal bug — -1 is zero-extended to 255 instead of sign-extended
-    // result &= Test("ltNeg true", ltNeg(-1), true);
+    result &= Test("ltNeg true", ltNeg(-1), true);
     result &= Test("ltNeg false", ltNeg(0), false);
 
     return result;
@@ -372,8 +369,7 @@ bool testLambdaThreeParam()
         return v;
     };
     result &= Test("clampL mid",  clampL(5,  0, 10),  5);
-    // TODO: negative literal bug — -3 is zero-extended to 253 instead of sign-extended
-    // result &= Test("clampL low", clampL(-3, 0, 10), 0);
+    result &= Test("clampL low", clampL(-3, 0, 10), 0);
     result &= Test("clampL high", clampL(15, 0, 10), 10);
 
     return result;
@@ -387,6 +383,90 @@ bool testVoidLambda()
     callVoid(noopLambda);
     callVoid(() => { doNothing(); });
     result &= Test("void lambda", 1, 1);
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LIST SORT TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool testListSortAscending()
+{
+    bool result = true;
+
+    list<int> nums;
+    nums.add(5); nums.add(2); nums.add(8); nums.add(1); nums.add(9); nums.add(3);
+    nums.sort((int a, int b) => { return a < b; });
+
+    result &= Test("sort[0]==1", nums.get(0), 1);
+    result &= Test("sort[1]==2", nums.get(1), 2);
+    result &= Test("sort[2]==3", nums.get(2), 3);
+    result &= Test("sort[3]==5", nums.get(3), 5);
+    result &= Test("sort[4]==8", nums.get(4), 8);
+    result &= Test("sort[5]==9", nums.get(5), 9);
+
+    return result;
+}
+
+bool testListSortDescending()
+{
+    bool result = true;
+
+    list<int> nums;
+    nums.add(5); nums.add(2); nums.add(8); nums.add(1); nums.add(9); nums.add(3);
+    nums.sort((int a, int b) => { return a > b; });
+
+    result &= Test("desc[0]==9", nums.get(0), 9);
+    result &= Test("desc[1]==8", nums.get(1), 8);
+    result &= Test("desc[2]==5", nums.get(2), 5);
+    result &= Test("desc[3]==3", nums.get(3), 3);
+    result &= Test("desc[4]==2", nums.get(4), 2);
+    result &= Test("desc[5]==1", nums.get(5), 1);
+
+    return result;
+}
+
+bool testListSortEdgeCases()
+{
+    bool result = true;
+
+    // Single element
+    list<int> one;
+    one.add(42);
+    one.sort((int a, int b) => { return a < b; });
+    result &= Test("single elem", one.get(0), 42);
+
+    // Already sorted
+    list<int> sorted;
+    sorted.add(1); sorted.add(2); sorted.add(3);
+    sorted.sort((int a, int b) => { return a < b; });
+    result &= Test("already sorted[0]", sorted.get(0), 1);
+    result &= Test("already sorted[2]", sorted.get(2), 3);
+
+    // Reverse sorted
+    list<int> rev;
+    rev.add(3); rev.add(2); rev.add(1);
+    rev.sort((int a, int b) => { return a < b; });
+    result &= Test("reverse sorted[0]", rev.get(0), 1);
+    result &= Test("reverse sorted[2]", rev.get(2), 3);
+
+    return result;
+}
+
+bool testListSortNamedComparator()
+{
+    bool result = true;
+
+    list<int> nums;
+    nums.add(7); nums.add(3); nums.add(5);
+
+    function<bool(int, int)> asc = (int a, int b) => { return a < b; };
+    nums.sort(asc);
+
+    result &= Test("named cmp[0]", nums.get(0), 3);
+    result &= Test("named cmp[1]", nums.get(1), 5);
+    result &= Test("named cmp[2]", nums.get(2), 7);
 
     return result;
 }
@@ -420,6 +500,12 @@ extern int main()
     total++; passed += testLambdaInHigherOrder()       ? 1 : 0;
     total++; passed += testLambdaThreeParam()          ? 1 : 0;
     total++; passed += testVoidLambda()               ? 1 : 0;
+
+    // List sort tests
+    total++; passed += testListSortAscending()         ? 1 : 0;
+    total++; passed += testListSortDescending()        ? 1 : 0;
+    total++; passed += testListSortEdgeCases()         ? 1 : 0;
+    total++; passed += testListSortNamedComparator()   ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

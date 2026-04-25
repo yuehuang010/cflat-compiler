@@ -71,6 +71,25 @@ class list<T> : IEnumerable<T>, IList<T>
         _size = 0;
     }
 
+    // Sort in-place using a comparator: compare(a, b) returns true if a should
+    // come before b.  Uses insertion sort (stable, O(n²) worst case).
+    void sort(function<bool(T, T)> compare)
+    {
+        int i = 1;
+        while (i < _size)
+        {
+            int j = i;
+            while (j > 0 && compare(_data[j], _data[j - 1]))
+            {
+                T tmp = _data[j];
+                _data[j] = _data[j - 1];
+                _data[j - 1] = tmp;
+                j--;
+            }
+            i++;
+        }
+    }
+
     // l[index] — same semantics as get(index).
     T operator[](int index)
     {
