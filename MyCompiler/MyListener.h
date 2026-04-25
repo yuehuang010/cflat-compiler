@@ -1147,7 +1147,7 @@ public:
 
         if (labeled->Case())
         {
-            auto* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
+            llvm::Value* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
             auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
             llvm::Constant* strLit = nullptr;
             if (!val)
@@ -1861,7 +1861,8 @@ public:
             if (auto cexpr = enumerator->constantExpression())
             {
                 auto cond = cexpr->conditionalExpression();
-                auto valLLVM = llvm::dyn_cast<llvm::ConstantInt>(ParseConditionalExpression(cond));
+                llvm::Value* condVal = ParseConditionalExpression(cond);
+                auto valLLVM = llvm::dyn_cast<llvm::ConstantInt>(condVal);
                 if (!valLLVM)
                     LogErrorContext(enumerator, "enum value must be a constant integer expression");
                 value = valLLVM->getSExtValue();
@@ -1968,6 +1969,7 @@ public:
                 }
 
                 llvm::Value* right = nullptr;
+                bool srcIsUnsigned = false;
                 auto initializer = initDecl->initializer();
                 if (initializer != nullptr)
                 {
@@ -2041,7 +2043,11 @@ public:
                             // Thread expected function-pointer type into lambda expression parsing.
                             if (typeAndValue.IsFunctionPointer)
                                 lambdaExpectedType = typeAndValue;
-                            right = ParseAssignmentExpression(assignmentExpression);
+                            {
+                                auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                right = LoadNamedVariable(rightNV);
+                                srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
+                            }
                             lambdaExpectedType = {};
                             // Bare 'function' type inference: infer signature from the assigned function value.
                             if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
@@ -2095,7 +2101,7 @@ public:
 
                     if (right != nullptr)
                     {
-                        compiler->CreateAssignment(right, alloc);
+                        compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                     }
                 }
             }
@@ -2132,7 +2138,9 @@ public:
                                 if (eqs.size() == 1)
                                 {
                                     auto tcs = eqs[0]->typeCheckExpression();
-                                    if (tcs.size() == 1)
+                                    // Guard: skip the fast path if the typeCheckExpression has 'is'/'as'
+                                    // operators — those must be handled by ParseConditionalExpression.
+                                    if (tcs.size() == 1 && tcs[0]->typeSpecifier().empty())
                                     {
                                         auto* relCtx = tcs[0]->relationalExpression();
                                         auto rels = relCtx ? relCtx->shiftExpression() : std::vector<CFlatParser::ShiftExpressionContext*>{};
@@ -2160,11 +2168,35 @@ public:
                 }
             }
         }
-        // Fall back: no TypeName info available
-        MyCompilerLLVM::NamedVariable result;
-        result.Primary = ParseAssignmentExpression(ctx);
-        if (result.Primary) result.BaseType = result.Primary->getType();
-        return result;
+        // Fall back: call ParseConditionalExpression directly (when no assignment) so we can
+        // recover the isUnsigned flag from TypedValue and synthesize the TypeName for Upconvert.
+        {
+            MyCompilerLLVM::NamedVariable result;
+            auto* condCtx = ctx->conditionalExpression();
+            if (condCtx && !ctx->assignmentOperator())
+            {
+                auto tv = ParseConditionalExpression(condCtx);
+                result.Primary = tv.value;
+                if (result.Primary)
+                {
+                    result.BaseType = result.Primary->getType();
+                    if (tv.isUnsigned && result.Primary->getType()->isIntegerTy())
+                    {
+                        unsigned bits = result.Primary->getType()->getIntegerBitWidth();
+                        if      (bits == 8)  result.TypeAndValue.TypeName = "u8";
+                        else if (bits == 16) result.TypeAndValue.TypeName = "u16";
+                        else if (bits == 32) result.TypeAndValue.TypeName = "u32";
+                        else if (bits == 64) result.TypeAndValue.TypeName = "u64";
+                    }
+                }
+            }
+            else
+            {
+                result.Primary = ParseAssignmentExpression(ctx);
+                if (result.Primary) result.BaseType = result.Primary->getType();
+            }
+            return result;
+        }
     }
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx)
@@ -2214,13 +2246,15 @@ public:
             lambdaExpectedType = {};
             auto right = LoadNamedVariable(rightNV);
 
+            bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
             if (operatorText != "=")
             {
                 auto left = compiler->CreateLoad(destination);
-                right = compiler->CreateOperation(operatorText, left, right);
+                bool lhsUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
+                right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
             }
 
-            auto* assignResult = compiler->CreateAssignment(right, destination);
+            auto* assignResult = compiler->CreateAssignment(right, destination, rhsUnsigned);
             // Transfer ownership: if RHS was an owning move param, null its alloca so
             // EmitDestructorsForScope won't free the pointer we just stored elsewhere.
             if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
@@ -2243,7 +2277,7 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
@@ -2251,8 +2285,8 @@ public:
         if (ctx->QuestionQuestion())
         {
             // Null-coalescing: lhs ?? rhs  →  (lhs != null) ? lhs : rhs
-            auto* lhs = ParseLogicalOrExpression(logicCtx);
-            if (!lhs) return nullptr;
+            llvm::Value* lhs = ParseLogicalOrExpression(logicCtx);
+            if (!lhs) return {};
 
             auto* resultAlloca = compiler->CreateAlloca(lhs->getType());
 
@@ -2266,12 +2300,12 @@ public:
             compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(nullBlock);
-            auto* rhs = ParseConditionalExpression(ctx->conditionalExpression());
+            llvm::Value* rhs = ParseConditionalExpression(ctx->conditionalExpression());
             compiler->CreateAssignment(rhs, resultAlloca);
             compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(resumeBlock);
-            return compiler->CreateLoad(resultAlloca);
+            return { compiler->CreateLoad(resultAlloca), false };
         }
 
         // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
@@ -2281,18 +2315,18 @@ public:
 
         if (logicCtx != nullptr)
         {
-            auto expression = ParseLogicalOrExpression(logicCtx);
+            auto condTv = ParseLogicalOrExpression(logicCtx);
 
             // Both expression should exist or not exist.
             if ((expressionFalseCtx != nullptr) != (expressionTrueCtx != nullptr))
             {
                 LogErrorContext(ctx, "Conditional expression requires both true and false branches.");
-                return nullptr;
+                return {};
             }
             else if (expressionFalseCtx != nullptr && (expressionTrueCtx != nullptr))
             {
-                auto trueValue = ParseExpression(expressionTrueCtx);
-                auto falseValue = ParseConditionalExpression(expressionFalseCtx);
+                auto trueValue  = ParseExpression(expressionTrueCtx);
+                llvm::Value* falseValue = ParseConditionalExpression(expressionFalseCtx);
 
                 // Align branch types so LLVM select has matching operand types.
                 if (falseValue && trueValue && falseValue->getType() != trueValue->getType())
@@ -2308,18 +2342,18 @@ public:
                     }
                 }
 
-                auto selectValue = compiler->CreateSelect(expression, falseValue, trueValue);
-                return selectValue;
+                auto* selectValue = compiler->CreateSelect(condTv.value, falseValue, trueValue);
+                return { selectValue, false };
             }
 
-            return expression;
+            return condTv;
         }
 
         LogErrorContext(ctx, "Conditional expression has no logical-or sub-expression.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
@@ -2380,17 +2414,17 @@ public:
                 compiler->CreateBlockBreak(resumeBlock, false);
 
                 compiler->InitializeBlock(resumeBlock, false);
-                return compiler->CreateLoad(resultStorage);
+                return { compiler->CreateLoad(resultStorage), false };
             }
 
-            return left;
+            return { left, false };  // || produces bool
         }
 
         LogErrorContext(ctx, "Logical-OR expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
@@ -2451,16 +2485,16 @@ public:
                 compiler->CreateBlockBreak(resumeBlock, false);
 
                 compiler->InitializeBlock(resumeBlock, false);
-                return compiler->CreateLoad(resultStorage);
+                return { compiler->CreateLoad(resultStorage), false };
             }
-            return left;
+            return { left, false };  // && produces bool
         }
 
         LogErrorContext(ctx, "Logical-AND expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
     {
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size())
@@ -2472,10 +2506,10 @@ public:
         }
 
         LogErrorContext(ctx, "Inclusive-OR expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
     {
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size())
@@ -2487,10 +2521,10 @@ public:
         }
 
         LogErrorContext(ctx, "Exclusive-OR expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
     {
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size())
@@ -2502,10 +2536,10 @@ public:
         }
 
         LogErrorContext(ctx, "Bitwise-AND expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
     {
         auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
@@ -2514,28 +2548,31 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            auto left  = ParseTypeCheckExpression(nextCtxs[0]);
-            auto right = ParseTypeCheckExpression(nextCtxs[1]);
+            auto lv = ParseTypeCheckExpression(nextCtxs[0]);
+            auto rv = ParseTypeCheckExpression(nextCtxs[1]);
             std::string op = ctx->children[1]->getText();
 
-            auto* overload = TryBinaryOperatorOverload(left, op, right, ctx);
-            return overload ? overload : Compiler(ctx)->CreateOperation(op, left, right);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
+            llvm::Value* result = overload ? overload
+                                           : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
+            return { result, false };  // == != result is bool, not unsigned
         }
 
         LogErrorContext(ctx, "Equality expression has unexpected operand count.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
     {
         auto relCtx = ctx->relationalExpression();
         if (!relCtx)
         {
             LogErrorContext(ctx, "Type check expression has no operand.");
-            return nullptr;
+            return {};
         }
 
-        auto result = ParseRelationalExpression(relCtx);
+        auto tv = ParseRelationalExpression(relCtx);
+        llvm::Value* result = tv.value;
 
         // Handle 'is' and 'as' operators
         auto typeSpecs = ctx->typeSpecifier();
@@ -2555,9 +2592,10 @@ public:
                     result = GenerateSafeCast(result, targetTypeName, ctx);
                 }
             }
+            return { result, false };  // is/as result is bool or pointer, not unsigned
         }
 
-        return result;
+        return tv;
     }
 
     // Returns the type descriptor pointer loaded from vtable[0].
@@ -2646,7 +2684,7 @@ public:
         return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
 
-    llvm::Value* ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)
     {
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
@@ -2655,19 +2693,21 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            auto left  = ParseShiftExpression(nextCtxs[0]);
-            auto right = ParseShiftExpression(nextCtxs[1]);
+            auto lv = ParseShiftExpression(nextCtxs[0]);
+            auto rv = ParseShiftExpression(nextCtxs[1]);
             std::string op = ctx->children[1]->getText();
 
-            auto* overload = TryBinaryOperatorOverload(left, op, right, ctx);
-            return overload ? overload : Compiler(ctx)->CreateOperation(op, left, right);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
+            llvm::Value* result = overload ? overload
+                                           : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
+            return { result, false };  // comparison result is bool, not unsigned
         }
 
         LogErrorContext(ctx, "Relational expression has unexpected operand count.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.size())
@@ -2679,10 +2719,10 @@ public:
         }
 
         LogErrorContext(ctx, "Shift expression has no operands.");
-        return nullptr;
+        return {};
     }
 
-    llvm::Value* ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx)
     {
         auto nextCtxs = ctx->multiplicativeExpression();
 
@@ -2692,22 +2732,27 @@ public:
         }
         else if (nextCtxs.size() > 1)
         {
-            llvm::Value* lvalue = ParseMultiplicativeExpression(nextCtxs[0]);
+            auto lv = ParseMultiplicativeExpression(nextCtxs[0]);
+            llvm::Value* lvalue = lv.value;
+            bool lu = lv.isUnsigned;
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                llvm::Value* rvalue = ParseMultiplicativeExpression(nextCtxs[i]);
+                auto rv = ParseMultiplicativeExpression(nextCtxs[i]);
+                llvm::Value* rvalue = rv.value;
+                bool ru = rv.isUnsigned;
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
-                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue);
+                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                lu = lu || ru;
             }
 
-            return lvalue;
+            return { lvalue, lu };
         }
 
         LogErrorContext(ctx, "Additive expression has no operands.");
-        return nullptr;
+        return {};
     }
 
     llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
@@ -2850,35 +2895,39 @@ public:
         return nullptr;
     }
 
-    llvm::Value* ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
+    MyCompilerLLVM::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
     {
         auto nextCtxs = ctx->castExpression();
 
         if (nextCtxs.size() == 1)
         {
             auto namedVar = ParseCastExpression(nextCtxs[0]);
-            return LoadNamedVariable(namedVar);
+            bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
+            return { LoadNamedVariable(namedVar), isUnsigned };
         }
         else if (nextCtxs.size() > 1)
         {
             auto firstNV = ParseCastExpression(nextCtxs[0]);
+            bool lu = firstNV.TypeAndValue.IsUnsignedInteger() != -1;
             llvm::Value* lvalue = LoadNamedVariable(firstNV);
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 auto rightNV = ParseCastExpression(nextCtxs[i]);
+                bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
-                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue);
+                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                lu = lu || ru;
             }
 
-            return lvalue;
+            return { lvalue, lu };
         }
 
         LogErrorContext(ctx, "Multiplicative expression has no operands.");
-        return nullptr;
+        return {};
     }
 
     MyCompilerLLVM::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false)
@@ -3012,7 +3061,24 @@ public:
             else if (opText == "-")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compiler->CreateNeg(newValue);
+                // Fold negation of integer constants into the smallest fitting type.
+                // e.g. 32768 is i32, but -32768 fits in i16 (INT16_MIN).
+                if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
+                {
+                    int64_t neg = -(int64_t)ci->getSExtValue();
+                    if (neg >= std::numeric_limits<int8_t>::min() && neg <= std::numeric_limits<int8_t>::max())
+                        namedVar.Primary = compiler->builder->getInt8((int8_t)neg);
+                    else if (neg >= std::numeric_limits<int16_t>::min() && neg <= std::numeric_limits<int16_t>::max())
+                        namedVar.Primary = compiler->builder->getInt16((int16_t)neg);
+                    else if (neg >= (int64_t)std::numeric_limits<int32_t>::min() && neg <= (int64_t)std::numeric_limits<int32_t>::max())
+                        namedVar.Primary = compiler->builder->getInt32((int32_t)neg);
+                    else
+                        namedVar.Primary = compiler->builder->getInt64(neg);
+                }
+                else
+                {
+                    namedVar.Primary = compiler->CreateNeg(newValue);
+                }
                 namedVar.Storage = nullptr;
             }
             else if (opText == "+")
@@ -3883,7 +3949,9 @@ public:
                                         if (paramTv.IsFunctionPointer) lambdaExpectedType = paramTv;
                                     }
                                     auto argName = namedArgument->Identifier();
-                                    auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                    auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    // Load from storage if Primary isn't populated (simple variable reference)
+                                    auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     lambdaExpectedType = {};
                                     if (!argValue) break; // caller's block was terminated (e.g. return-block inline)
                                     MyCompilerLLVM::NamedVariable argVar;
@@ -3893,12 +3961,19 @@ public:
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
 
+                                    // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
+                                    if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+
                                     // Extract struct name if this is a struct type
-                                    if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
+                                    if (argVar.TypeAndValue.TypeName.empty())
                                     {
-                                        auto structName = st->getName().str();
-                                        if (!structName.empty())
-                                            argVar.TypeAndValue.TypeName = structName;
+                                        if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
+                                        {
+                                            auto structName = st->getName().str();
+                                            if (!structName.empty())
+                                                argVar.TypeAndValue.TypeName = structName;
+                                        }
                                     }
 
                                     // Propagate function-pointer type for lambda arguments
@@ -5463,6 +5538,10 @@ public:
         if (negative)
         {
             long long sval = -static_cast<long long>(uval);
+            if (sval >= std::numeric_limits<int8_t>::min() && sval <= std::numeric_limits<int8_t>::max())
+                return static_cast<char>(sval);
+            if (sval >= std::numeric_limits<int16_t>::min() && sval <= std::numeric_limits<int16_t>::max())
+                return static_cast<short>(sval);
             if (sval >= std::numeric_limits<int>::min() && sval <= std::numeric_limits<int>::max())
                 return static_cast<int>(sval);
             return static_cast<int64_t>(sval);

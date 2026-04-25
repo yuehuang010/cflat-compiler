@@ -236,6 +236,21 @@ public:
         }
     };
 
+    // Lightweight expression result: pairs an LLVM value with its signedness.
+    // operator llvm::Value*() lets it substitute for Value* transparently at call sites.
+    struct TypedValue
+    {
+        llvm::Value* value     = nullptr;
+        bool         isUnsigned = false;
+
+        TypedValue() = default;
+        TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
+
+        operator llvm::Value*()   const { return value; }
+        llvm::Value* operator->() const { return value; }
+        explicit operator bool()  const { return value != nullptr; }
+    };
+
     struct StructData
     {
         llvm::StructType* StructType;
@@ -1361,7 +1376,7 @@ public:
             else
             {
                 auto val = nv.Primary != nullptr ? nv.Primary : CreateLoad(nv.Storage);
-                val = Upconvert(val, GetType(param));
+                val = Upconvert(val, GetType(param), nv.TypeAndValue.IsUnsignedInteger() != -1);
                 callArgs.push_back(val);
             }
         }
@@ -1578,7 +1593,7 @@ public:
         return builder->CreateExtractValue(structInstance, index);
     }
 
-    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination)
+    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false)
     {
         auto destType = GetTypeFromStorage(destination);
         if (destType == builder->getInt1Ty())
@@ -1596,7 +1611,11 @@ public:
             }
             else
             {
-                value = CreateCast(value, destType);
+                // Upconvert handles integer widening with correct sign semantics (SExt for signed, ZExt for unsigned).
+                // CreateCast handles all other conversions (truncation, int<->float, ptr<->int, etc.).
+                value = Upconvert(value, destType, srcIsUnsigned);
+                if (value->getType() != destType)
+                    value = CreateCast(value, destType);
             }
         }
         return builder->CreateStore(value, destination);
@@ -1613,13 +1632,13 @@ public:
         return builder->CreateLoad(type, value);
     }
 
-    llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination) const
+    llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false) const
     {
         auto destType = GetTypeFromStorage(destination);
-        return Upconvert(value, destType);
+        return Upconvert(value, destType, srcIsUnsigned);
     }
 
-    llvm::Value* Upconvert(llvm::Value* value, llvm::Type* destType) const
+    llvm::Value* Upconvert(llvm::Value* value, llvm::Type* destType, bool srcIsUnsigned = false) const
     {
         auto srcType = value->getType();
         if (srcType->isIntegerTy() && destType->isIntegerTy())
@@ -1627,10 +1646,12 @@ public:
             auto targetSize = destType->getIntegerBitWidth();
             auto srcSize = srcType->getIntegerBitWidth();
 
-            // upconvert is needed
             if (srcSize < targetSize)
             {
-                return builder->CreateZExt(value, destType);
+                // i1 (bool) and unsigned types zero-extend; signed types sign-extend
+                if (srcSize == 1 || srcIsUnsigned)
+                    return builder->CreateZExt(value, destType);
+                return builder->CreateSExt(value, destType);
             }
         }
         else if (srcType->isFloatingPointTy() && destType->isFloatingPointTy())
@@ -1760,10 +1781,10 @@ public:
             unsigned dstBits = destType->getIntegerBitWidth();
             if (dstBits < srcBits)
                 return builder->CreateTrunc(value, destType);
-            else if (isSigned)
-                return builder->CreateSExt(value, destType);
-            else
+            // i1 (bool) and unsigned types zero-extend; signed types sign-extend
+            if (srcBits == 1 || !isSigned)
                 return builder->CreateZExt(value, destType);
+            return builder->CreateSExt(value, destType);
         }
 
         // Float <-> Float
@@ -1778,19 +1799,13 @@ public:
         // Integer -> Float
         if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {
-            if (isSigned)
-                return builder->CreateSIToFP(value, destType);
-            else
-                return builder->CreateUIToFP(value, destType);
+            return builder->CreateSIToFP(value, destType);
         }
 
         // Float -> Integer
         if (srcType->isFloatingPointTy() && destType->isIntegerTy())
         {
-            if (isSigned)
-                return builder->CreateFPToSI(value, destType);
-            else
-                return builder->CreateFPToUI(value, destType);
+            return builder->CreateFPToSI(value, destType);
         }
 
         // Pointer -> Integer
@@ -2154,6 +2169,50 @@ public:
 
         LogError(std::format("unhandled operation {}", static_cast<int>(op)));
         return right;
+    }
+
+    // Signedness-aware: chooses ZExt vs SExt, UDiv vs SDiv, ICMP_UGT vs ICMP_SGT, etc.
+    llvm::Value* CreateOperation(Operation op, llvm::Value* left, llvm::Value* right,
+                                  bool leftIsUnsigned, bool rightIsUnsigned)
+    {
+        if (left == nullptr)
+            return right;
+
+        left  = Upconvert(left,  right, leftIsUnsigned);
+        right = Upconvert(right, left,  rightIsUnsigned);
+
+        bool anyUnsigned = leftIsUnsigned || rightIsUnsigned;
+
+        if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
+            return CreateOperation(op, left, right);
+
+        switch (op)
+        {
+        case Operation::DivideAssignment:
+        case Operation::Divide:
+            return anyUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+        case Operation::Modulo:
+            return anyUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
+        case Operation::Greater:
+            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_UGT : llvm::ICmpInst::ICMP_SGT, left, right);
+        case Operation::GreaterEqual:
+            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_UGE : llvm::ICmpInst::ICMP_SGE, left, right);
+        case Operation::Less:
+            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
+        case Operation::LessEqual:
+            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
+        default:
+            return CreateOperation(op, left, right);
+        }
+    }
+
+    llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right,
+                                  bool leftIsUnsigned, bool rightIsUnsigned)
+    {
+        if (left == nullptr)
+            return right;
+        Operation op = ParseOperation(oper);
+        return CreateOperation(op, left, right, leftIsUnsigned, rightIsUnsigned);
     }
 
     llvm::Value* CreateNot(llvm::Value* value)
@@ -2607,6 +2666,11 @@ public:
                         if (myBits != -1 && otherBits != -1 && myUnsigned == otherUnsigned)
                             result = (myBits == otherBits) ? 0 : 1;
 
+                        // Unsigned source into a signed param at equal or greater width is a safe
+                        // implicit conversion (e.g. u8 -> int, u64 -> i64); Upconvert zero-extends.
+                        if (result < 0 && myBits != -1 && otherBits != -1 && myUnsigned && !otherUnsigned && myBits <= otherBits)
+                            result = (myBits == otherBits) ? 1 : 1;
+
                         if (result < 0)
                         {
                             int myFP = tmpArg.IsFloatingPoint();
@@ -2920,7 +2984,8 @@ public:
                 }
 
                 // Upconvert to match the declared parameter type (e.g. i16 -> i32).
-                value = Upconvert(value, GetType(*candParamItr));
+                bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
+                value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
                 argList.push_back(value);
             }
             if (candParamItr != candidate.Parameters.end() - 1)

@@ -389,6 +389,85 @@ bool testNumericLiterals()
     return result;
 }
 
+// ── Upconvert helpers ────────────────────────────────────────────────────────
+// Each function performs a single widening conversion so the compiler must
+// emit the appropriate sext / zext / sitofp / fpext instruction.
+
+int          conv_short_to_int   (short x)    { int r    = x; return r; }
+long long    conv_short_to_ll    (short x)    { long long r = x; return r; }
+long long    conv_int_to_ll      (int x)      { long long r = x; return r; }
+float        conv_short_to_float (short x)    { float r  = x; return r; }
+float        conv_int_to_float   (int x)      { float r  = x; return r; }
+float        conv_ll_to_float    (long long x){ float r  = x; return r; }
+double       conv_short_to_double(short x)    { double r = x; return r; }
+double       conv_int_to_double  (int x)      { double r = x; return r; }
+double       conv_ll_to_double   (long long x){ double r = x; return r; }
+double       conv_float_to_double(float x)    { double r = x; return r; }
+
+bool testUpconvert()
+{
+    bool result = true;
+
+    // ── short → int ──────────────────────────────────────────────────────────
+    result &= Test("short_to_int_pos",      conv_short_to_int(200),    200);
+    result &= Test("short_to_int_neg",      conv_short_to_int(-200),  -200);
+    result &= Test("short_to_int_zero",     conv_short_to_int(0),        0);
+    result &= Test("short_to_int_min",      conv_short_to_int(-32768), -32768);
+    result &= Test("short_to_int_max",      conv_short_to_int(32767),  32767);
+
+    // ── short → long long ────────────────────────────────────────────────────
+    result &= Test("short_to_ll_pos",       conv_short_to_ll(1000),    1000LL);
+    result &= Test("short_to_ll_neg",       conv_short_to_ll(-1000),  -1000LL);
+    result &= Test("short_to_ll_min",       conv_short_to_ll(-32768), -32768LL);
+    result &= Test("short_to_ll_max",       conv_short_to_ll(32767),  32767LL);
+
+    // ── int → long long ──────────────────────────────────────────────────────
+    result &= Test("int_to_ll_pos",         conv_int_to_ll(100000),    100000LL);
+    result &= Test("int_to_ll_neg",         conv_int_to_ll(-100000),  -100000LL);
+    result &= Test("int_to_ll_zero",        conv_int_to_ll(0),              0LL);
+    result &= Test("int_to_ll_int_min",     conv_int_to_ll(-2147483648), -2147483648LL);
+    result &= Test("int_to_ll_int_max",     conv_int_to_ll(2147483647),  2147483647LL);
+
+    // ── short → float ────────────────────────────────────────────────────────
+    result &= Test("short_to_float_pos",    conv_short_to_float(100),   100.0f);
+    result &= Test("short_to_float_neg",    conv_short_to_float(-100), -100.0f);
+    result &= Test("short_to_float_zero",   conv_short_to_float(0),      0.0f);
+
+    // ── int → float ──────────────────────────────────────────────────────────
+    result &= Test("int_to_float_pos",      conv_int_to_float(42),     42.0f);
+    result &= Test("int_to_float_neg",      conv_int_to_float(-42),   -42.0f);
+    result &= Test("int_to_float_zero",     conv_int_to_float(0),       0.0f);
+    result &= Test("int_to_float_large",    conv_int_to_float(1000000), 1000000.0f);
+    result &= Test("int_to_float_large_neg",conv_int_to_float(-1000000),-1000000.0f);
+
+    // ── long long → float ────────────────────────────────────────────────────
+    result &= Test("ll_to_float_pos",       conv_ll_to_float(1000LL),   1000.0f);
+    result &= Test("ll_to_float_neg",       conv_ll_to_float(-1000LL), -1000.0f);
+
+    // ── short → double ───────────────────────────────────────────────────────
+    result &= Test("short_to_double_pos",   conv_short_to_double(200),   200.0);
+    result &= Test("short_to_double_neg",   conv_short_to_double(-200), -200.0);
+
+    // ── int → double ─────────────────────────────────────────────────────────
+    result &= Test("int_to_double_pos",     conv_int_to_double(1000),   1000.0);
+    result &= Test("int_to_double_neg",     conv_int_to_double(-1000), -1000.0);
+    result &= Test("int_to_double_zero",    conv_int_to_double(0),         0.0);
+    result &= Test("int_to_double_large",   conv_int_to_double(1000000), 1000000.0);
+    result &= Test("int_to_double_large_neg",conv_int_to_double(-1000000),-1000000.0);
+
+    // ── long long → double ───────────────────────────────────────────────────
+    result &= Test("ll_to_double_pos",      conv_ll_to_double(100000LL),   100000.0);
+    result &= Test("ll_to_double_neg",      conv_ll_to_double(-100000LL), -100000.0);
+
+    // ── float → double ───────────────────────────────────────────────────────
+    result &= Test("float_to_double_pos",   conv_float_to_double(3.14f),  (double)3.14f);
+    result &= Test("float_to_double_neg",   conv_float_to_double(-3.14f), (double)-3.14f);
+    result &= Test("float_to_double_zero",  conv_float_to_double(0.0f),   0.0);
+    result &= Test("float_to_double_large", conv_float_to_double(1e10f),  (double)1e10f);
+
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -439,6 +518,7 @@ extern int main(int argc, char** argv)
     result &= Test("switch_fall1",     switchFallthrough(1), 12);
     result &= Test("switch_fall2",     switchFallthrough(2), 12);
     result &= Test("switch_fall3",     switchFallthrough(3),  3);
+    result &= Test("testUpconvert",     testUpconvert(), true);
 
     if (result)
     {
