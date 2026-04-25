@@ -2417,59 +2417,37 @@ public:
         else if (logicCtxs.size() > 1)
         {
             llvm::Value* left = nullptr;
-            auto elseBlock = compiler->GetElseBlock();
 
-            if (elseBlock)
+            // Always use resultStorage path. The elseBlock optimization was broken:
+            // when the first || operand is true it jumped to blockFalse instead of blockTrue,
+            // because only the false-destination is stored in the block context.
+            MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+            auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+            auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
+
+            for (const auto& logicCtx : logicCtxs)
             {
-                for (const auto& logicCtx : logicCtxs)
+                if (left == nullptr)
                 {
-                    if (left == nullptr)
-                    {
-                        left = ParseLogicalAndExpression(logicCtx);
-                    }
-                    else
-                    {
-                        auto falseBlock = compiler->CreateBasicBlock("falseOR");
-                        auto branch = compiler->CreateConditionJump(left, elseBlock, falseBlock);
+                    left = ParseLogicalAndExpression(logicCtx);
+                    compiler->CreateAssignment(left, resultStorage);
+                }
+                else
+                {
+                    auto falseBlock = compiler->CreateBasicBlock("falseOR");
+                    auto branch = compiler->CreateConditionJump(left, resumeBlock, falseBlock);
 
-                        compiler->InitializeBlock(falseBlock, false);
-                        llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
-                    }
+                    compiler->InitializeBlock(falseBlock, false);
+                    llvm::Value* right = ParseLogicalAndExpression(logicCtx);
+                    left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+                    compiler->CreateAssignment(left, resultStorage);
                 }
             }
-            else
-            {
-                MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
-                auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
-                auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
 
-                for (const auto& logicCtx : logicCtxs)
-                {
-                    if (left == nullptr)
-                    {
-                        left = ParseLogicalAndExpression(logicCtx);
-                        compiler->CreateAssignment(left, resultStorage);
-                    }
-                    else
-                    {
-                        auto falseBlock = compiler->CreateBasicBlock("falseOR");
-                        auto branch = compiler->CreateConditionJump(left, resumeBlock, falseBlock);
+            compiler->CreateBlockBreak(resumeBlock, false);
 
-                        compiler->InitializeBlock(falseBlock, false);
-                        llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
-                        compiler->CreateAssignment(left, resultStorage);
-                    }
-                }
-
-                compiler->CreateBlockBreak(resumeBlock, false);
-
-                compiler->InitializeBlock(resumeBlock, false);
-                return { compiler->CreateLoad(resultStorage), false };
-            }
-
-            return { left, false };  // || produces bool
+            compiler->InitializeBlock(resumeBlock, false);
+            return { compiler->CreateLoad(resultStorage), false };
         }
 
         LogErrorContext(ctx, "Logical-OR expression has no operands.");

@@ -468,6 +468,55 @@ bool testUpconvert()
     return result;
 }
 
+bool testShortCircuitIf()
+{
+    bool result = true;
+    int x;
+
+    // || in if condition: first operand true — body must execute
+    x = 0;
+    if (FuncTrue() || FuncFalse()) x = 1;
+    result &= Test("if(T||F) body", x, 1);
+
+    // || in if condition: second operand true — body must execute
+    x = 0;
+    if (FuncFalse() || FuncTrue()) x = 1;
+    result &= Test("if(F||T) body", x, 1);
+
+    // || in if condition: both false — else must execute
+    x = 0;
+    if (FuncFalse() || FuncFalse()) x = 1; else x = 2;
+    result &= Test("if(F||F) else", x, 2);
+
+    // || in if condition: both true — body must execute
+    x = 0;
+    if (FuncTrue() || FuncTrue()) x = 1; else x = 2;
+    result &= Test("if(T||T) body", x, 1);
+
+    // Three-way ||: first true — short-circuit, body executes
+    shortCircuitCounter = 0;
+    x = 0;
+    if (FuncTrue() || FuncTrue() || FuncTrue()) x = 1;
+    result &= Test("if(T||T||T) body", x, 1);
+    result &= Test("if(T||T||T) count", shortCircuitCounter, 1);
+
+    // Three-way ||: first two false, last true
+    shortCircuitCounter = 0;
+    x = 0;
+    if (FuncFalse() || FuncFalse() || FuncTrue()) x = 1;
+    result &= Test("if(F||F||T) body", x, 1);
+    result &= Test("if(F||F||T) count", shortCircuitCounter, 3);
+
+    // Three-way ||: all false — else executes
+    shortCircuitCounter = 0;
+    x = 0;
+    if (FuncFalse() || FuncFalse() || FuncFalse()) x = 1; else x = 2;
+    result &= Test("if(F||F||F) else", x, 2);
+    result &= Test("if(F||F||F) count", shortCircuitCounter, 3);
+
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -518,7 +567,8 @@ extern int main(int argc, char** argv)
     result &= Test("switch_fall1",     switchFallthrough(1), 12);
     result &= Test("switch_fall2",     switchFallthrough(2), 12);
     result &= Test("switch_fall3",     switchFallthrough(3),  3);
-    result &= Test("testUpconvert",     testUpconvert(), true);
+    result &= Test("testUpconvert",          testUpconvert(), true);
+    result &= Test("testShortCircuitIf",     testShortCircuitIf(), true);
 
     if (result)
     {
