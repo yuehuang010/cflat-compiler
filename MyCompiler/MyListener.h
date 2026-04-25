@@ -631,22 +631,38 @@ private:
                         {
                             auto substIt = activeTypeSubstitutions.find(declType.FuncPtrReturnTypeName);
                             if (substIt != activeTypeSubstitutions.end())
+                            {
                                 declType.FuncPtrReturnTypeName = substIt->second;
+                                while (!declType.FuncPtrReturnTypeName.empty() && declType.FuncPtrReturnTypeName.back() == '*')
+                                {
+                                    declType.FuncPtrReturnTypeName.pop_back();
+                                    declType.FuncPtrReturnPointer = true;
+                                }
+                            }
                         }
-                        declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
+                        if (!declType.FuncPtrReturnPointer)
+                            declType.FuncPtrReturnPointer = fpSpec->pointer() != nullptr;
                         if (fpSpec->functionPointerParamList() != nullptr)
                         {
                             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                             {
                                 MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
                                 p.TypeName = param->typeSpecifier()->getText();
-                                // Apply active generic type substitutions
+                                // Apply active generic type substitutions; strip trailing * into Pointer flag
                                 {
                                     auto substIt = activeTypeSubstitutions.find(p.TypeName);
                                     if (substIt != activeTypeSubstitutions.end())
+                                    {
                                         p.TypeName = substIt->second;
+                                        while (!p.TypeName.empty() && p.TypeName.back() == '*')
+                                        {
+                                            p.TypeName.pop_back();
+                                            p.Pointer = true;
+                                        }
+                                    }
                                 }
-                                p.Pointer = param->pointer() != nullptr;
+                                if (!p.Pointer)
+                                    p.Pointer = param->pointer() != nullptr;
                                 declType.FuncPtrParams.push_back(p);
                             }
                         }
@@ -4797,11 +4813,23 @@ public:
             // Now safe to instantiate
             auto structIt = genericStructTemplates.find(pending.templateName);
             auto classIt = genericClassTemplates.find(pending.templateName);
+            auto ifaceIt = genericInterfaceTemplates.find(pending.templateName);
             if (structIt == genericStructTemplates.end() && classIt == genericClassTemplates.end())
             {
-                Compiler()->LogError(std::format(
-                    "unknown generic type '{}': definition not found. Did you forget to import the file?",
-                    pending.templateName));
+                if (ifaceIt != genericInterfaceTemplates.end())
+                {
+                    // It's a generic interface — instantiate it
+                    std::unordered_map<std::string, std::string> ifaceSubst;
+                    const auto& ifaceTypeParams = genericInterfaceTypeParams[pending.templateName];
+                    for (size_t i = 0; i < ifaceTypeParams.size() && i < pending.typeArgs.size(); i++)
+                        ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                    InstantiateGenericInterface(pending.templateName, pending.mangledName, ifaceSubst);
+                }
+                else if (Compiler()->IsVerbose())
+                {
+                    std::cout << "[verbose]   skip instantiation '" << pending.mangledName
+                              << "': template '" << pending.templateName << "' not found\n";
+                }
                 continue;
             }
 
