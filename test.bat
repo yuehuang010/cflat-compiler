@@ -24,6 +24,10 @@ for %%F in (%SRC%\test_*.cb) do (
     if not errorlevel 1 call :RunTestCb %%~nF
 )
 
+for %%F in (%SRC%\errors\err_*.cb) do (
+    call :RunErrorTest %%~nxF
+)
+
 echo.
 if %ERRORS% EQU 0 (
     echo All tests passed.
@@ -58,6 +62,16 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo PASSED: %NAME%
+exit /b
+
+:RunErrorTest
+set ERRFILE=%~1
+echo === %ERRFILE% ===
+%COMPILER% %SRC%\errors\%ERRFILE% -i %LIB%
+if %ERRORLEVEL% neq 0 (
+    echo FAILED: %ERRFILE%
+    set /a ERRORS+=1
+)
 exit /b
 
 :RunTestCb

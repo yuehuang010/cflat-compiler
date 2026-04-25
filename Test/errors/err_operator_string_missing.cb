@@ -1,0 +1,15 @@
+struct Point
+{
+    int x = 0;
+    int y = 0;
+};
+
+extern int main()
+{
+    Point p;
+    p.x = 1;
+    p.y = 2;
+    expect_error("no overload of 'operator string'");
+    string s = operator string(p);
+    return 0;
+}

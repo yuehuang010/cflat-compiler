@@ -67,6 +67,41 @@ out\test_operators.exe
 
 Current tests (all in `MyCompiler/Test/`): `testfile` (C); `testfile2`, `test_generics`, `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static`, `test_nullable`, `test_move` (CFlat); `testfile_module`, `test_library_string`, `test_overload` (CFlat with `-i lib`).
 
+### Error tests
+
+Negative tests live in `Test/errors/` and use the `expect_error` compiler built-in. `test.bat` compiles each `err_*.cb` and expects exit code 0. To run one individually:
+
+```bash
+x64/Debug/MyCompiler.exe Test/errors/err_missing_return.cb -i Test/library
+# prints: PASS: expected error received
+# exit code: 0
+```
+
+Two forms are supported:
+
+```cflat
+// Bare-semicolon form — error must occur before the enclosing scope closes
+extern int main()
+{
+    expect_error("Undefined variable foo.");
+    int x = foo + 1;
+}
+
+// Scoped block form (statement scope) — error must occur inside the braces
+expect_error("nullable '?' is not allowed on primitive type 'int'") {
+    int? x = 0;
+}
+
+// Scoped block form (file scope) — for testing function/struct definitions
+expect_error("missing a return statement") {
+    int compute(int x) { int y = x * 2; }
+}
+```
+
+The substring in `expect_error` is matched against the error message text (not the `file(line,col):` prefix). The compiler exits 0 on match, 1 with a diagnostic on mismatch or if the block compiles without error.
+
+To add a new error test: create `Test/errors/err_<description>.cb`. No script changes needed.
+
 ## Architecture
 
 ### Compilation Pipeline
@@ -168,6 +203,7 @@ Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructors
 | Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MyListener.h` |
 | New binary operator | `TryBinaryOperatorOverload()` in `MyListener.h` + `Operation` enum in `MyCompilerLLVM.h` |
 | New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MyListener.h` — do NOT add to the ANTLR lexer |
+| New grammar keyword statement | Add rule to `CFlat.g4`; add `ctx->newRule()` retrieval in `ParseStatement`; add no-op overrides in `ForwardRefScanner` if the rule can appear at file scope |
 
 ### Debugging Compiler Crashes
 

@@ -333,7 +333,17 @@ public:
 
     void LogError(std::string message) const
     {
-        std::cerr << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
+        if (!expectedError.empty())
+        {
+            if (message.find(expectedError) != std::string::npos)
+            {
+                std::cout << "PASS: expected error received\n";
+                exit(0);
+            }
+            std::cout << std::format("FAIL: expected error '{}' but got '{}'\n", expectedError, message);
+            exit(1);
+        }
         exit(1);
     }
 
@@ -360,6 +370,8 @@ public:
     bool verbose = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
     int lambdaCounter = 0;
+    std::string expectedError;
+    size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
 
     // Compile-time macros (constant throughout compilation, set early)
     struct CompileTimeMacro
@@ -2443,6 +2455,14 @@ public:
     {
         if (exitBlackStack)
         {
+            // Bare-semicolon form: expect_error("msg"); — if the expected error never fired before this scope exits, report failure.
+            if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size())
+            {
+                std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectedError);
+                expectedError.clear();
+                expectedErrorScopeDepth = SIZE_MAX;
+                exit(1);
+            }
             EmitDestructorsForScope(stackNamedVariable.back());
             stackNamedVariable.pop_back();
         }

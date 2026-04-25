@@ -428,6 +428,7 @@ designator
 statement
     : labeledStatement
     | compoundStatement
+    | expectErrorStatement
     | expressionStatement
     | selectionStatement
     | iterationStatement
@@ -498,6 +499,14 @@ jumpStatement
     ) ';'
     ;
 
+expectErrorStatement
+    : 'expect_error' '(' StringLiteral ')' (compoundStatement | ';')
+    ;
+
+expectErrorDeclaration
+    : 'expect_error' '(' StringLiteral ')' '{' externalDeclaration+ '}'
+    ;
+
 compilationUnit
     : translationUnit? EOF
     ;
@@ -516,6 +525,7 @@ externalDeclaration
     | usingDeclaration
     | importDeclaration
     | ifConstDeclaration
+    | expectErrorDeclaration
     | ';' // stray ;
     ;
 

@@ -1,0 +1,8 @@
+expect_error("enum value must be a constant integer expression") {
+    enum BadEnum : int { A = 1, B = "hello" };
+}
+
+extern int main()
+{
+    return 0;
+}

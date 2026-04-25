@@ -1,0 +1,6 @@
+extern int main()
+{
+    expect_error("nullable '?' is not allowed on primitive type 'int'");
+    int? x = 0;
+    return 0;
+}

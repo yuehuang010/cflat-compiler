@@ -1,0 +1,6 @@
+extern int main()
+{
+    expect_error("Undefined variable foo.");
+    int x = foo + 1;
+    return x;
+}

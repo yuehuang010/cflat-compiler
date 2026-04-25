@@ -493,6 +493,12 @@ public:
             ScanInterfaceDefinition(iface);
         else if (auto usingDecl = ctx->usingDeclaration())
             ScanUsingDeclaration(usingDecl);
+        else if (auto expectErrDecl = ctx->expectErrorDeclaration())
+        {
+            // Scan function/struct definitions inside the expect_error block so forward refs work.
+            for (auto* extDecl : expectErrDecl->externalDeclaration())
+                ScanExternalDeclaration(extDecl, namespaceName);
+        }
         // if const declarations are skipped here; they are handled in MyListener
         // which has access to expression evaluation and can determine the taken branch
     }
@@ -1080,6 +1086,24 @@ public:
         {
             ParseClassDefinition(classDef, {}, namespaceName);
         }
+        else if (auto expectErrDecl = ctx->expectErrorDeclaration())
+        {
+            // Scoped block form at file scope: expect_error("msg") { functionDef / structDef / ... }
+            std::string rawText = expectErrDecl->StringLiteral()->getText();
+            compilerLLVM->expectedError = ProcessRawText(rawText);
+            compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+
+            for (auto* extDecl : expectErrDecl->externalDeclaration())
+                ParseExternalDeclaration(extDecl, namespaceName);
+
+            if (!compilerLLVM->expectedError.empty())
+            {
+                std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                          compilerLLVM->expectedError);
+                compilerLLVM->expectedError.clear();
+                exit(1);
+            }
+        }
 
         // Process any generic instantiations queued while parsing the above item.
         // This is the only safe point: the IRBuilder has no active function/block.
@@ -1222,6 +1246,7 @@ public:
         auto selectionStatement = statement->selectionStatement();
         auto compoundStatement = statement->compoundStatement();
         auto labeledStatement = statement->labeledStatement();
+        auto expectErrorStmt = statement->expectErrorStatement();
 
         if (labeledStatement != nullptr && !switchStack.empty())
         {
@@ -1677,6 +1702,35 @@ public:
             if (blockList)
                 ParseBlockItemList(blockList);
             compiler->CreateBlockBreak(nullptr, true);
+            return;
+        }
+        else if (expectErrorStmt)
+        {
+            std::string rawText = expectErrorStmt->StringLiteral()->getText();
+            compilerLLVM->expectedError = ProcessRawText(rawText);
+
+            if (auto* cs = expectErrorStmt->compoundStatement())
+            {
+                // Scoped block form: expect_error("msg") { ... } — error must occur inside the braces.
+                compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
+                compiler->InitializeBlock(nullptr, true);
+                if (auto* blockList = cs->blockItemList())
+                    ParseBlockItemList(blockList);
+                compiler->CreateBlockBreak(nullptr, true);
+
+                if (!compilerLLVM->expectedError.empty())
+                {
+                    std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                              compilerLLVM->expectedError);
+                    compilerLLVM->expectedError.clear();
+                    exit(1);
+                }
+            }
+            else
+            {
+                // Bare-semicolon form: expect_error("msg"); — error must occur before the enclosing scope exits.
+                compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
+            }
             return;
         }
 
@@ -5608,18 +5662,16 @@ public:
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage)
     {
         auto symbol = ctx->getSymbol();
-        int line = static_cast<int>(symbol->getLine());
-        int column = static_cast<int>(symbol->getCharPositionInLine());
-        std::cout << std::format("{}({},{}): {}\n", sourceFileName, line, column, errorMessage);
-        exit(1);
+        compilerLLVM->currentLine = static_cast<int>(symbol->getLine());
+        compilerLLVM->currentColumn = static_cast<int>(symbol->getCharPositionInLine());
+        compilerLLVM->LogError(std::move(errorMessage));
     }
 
     void LogErrorContext(antlr4::ParserRuleContext* ctx, std::string errorMessage)
     {
-        int line = static_cast<int>(ctx->getStart()->getLine());
-        int column = static_cast<int>(ctx->getStart()->getCharPositionInLine());
-        std::cout << std::format("{}({},{}): {}\n", sourceFileName, line, column, errorMessage);
-        exit(1);
+        compilerLLVM->currentLine = static_cast<int>(ctx->getStart()->getLine());
+        compilerLLVM->currentColumn = static_cast<int>(ctx->getStart()->getCharPositionInLine());
+        compilerLLVM->LogError(std::move(errorMessage));
     }
 
     void LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage)

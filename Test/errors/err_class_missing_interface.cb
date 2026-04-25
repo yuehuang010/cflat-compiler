@@ -1,0 +1,16 @@
+interface IGreet
+{
+    int greet();
+};
+
+expect_error("does not implement") {
+    class Foo : IGreet
+    {
+        int x = 0;
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -1,0 +1,16 @@
+interface IShape { int Area(); };
+class Circle : IShape
+{
+    int radius = 0;
+    int Area() { return radius * radius; }
+};
+
+extern int main()
+{
+    Circle c;
+    c.radius = 5;
+    IShape shape = c;
+    expect_error("is not a known struct type for 'is' check");
+    bool b = shape is GhostType;
+    return 0;
+}

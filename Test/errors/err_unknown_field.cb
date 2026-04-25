@@ -1,0 +1,12 @@
+struct Foo
+{
+    int x = 0;
+};
+
+extern int main()
+{
+    Foo f;
+    expect_error("Unknown identifier");
+    int y = f.bogusField;
+    return 0;
+}

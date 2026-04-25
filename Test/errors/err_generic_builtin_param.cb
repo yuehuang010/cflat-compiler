@@ -1,0 +1,8 @@
+expect_error("Generic type parameter must be an identifier, not a built-in type") {
+    struct Box<int> { int value = 0; }
+}
+
+extern int main()
+{
+    return 0;
+}
