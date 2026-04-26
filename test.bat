@@ -47,7 +47,7 @@ exit /b 0
 set NAME=%~1
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.c -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.c -o %OUT%\%NAME%.exe --nologo --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
     set /a ERRORS+=1
@@ -67,7 +67,7 @@ exit /b
 :RunErrorTest
 set ERRFILE=%~1
 echo === %ERRFILE% ===
-%COMPILER% %SRC%\errors\%ERRFILE% -i %LIB%
+%COMPILER% %SRC%\errors\%ERRFILE% -i %LIB% --nologo
 if %ERRORLEVEL% neq 0 (
     echo FAILED: %ERRFILE%
     set /a ERRORS+=1
@@ -78,7 +78,7 @@ exit /b
 set NAME=%~1
 echo === %NAME% ===
 
-%COMPILER% %SRC%\%NAME%.cb -i %LIB% -o %OUT%\%NAME%.exe --out-lli %OUT%\%NAME%.ll
+%COMPILER% %SRC%\%NAME%.cb -i %LIB% -o %OUT%\%NAME%.exe --nologo --out-lli %OUT%\%NAME%.ll
 if %ERRORLEVEL% neq 0 (
     echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
     set /a ERRORS+=1

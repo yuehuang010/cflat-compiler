@@ -41,6 +41,12 @@ public:
 				return false;
 			}
 
+			if (arg == "--version")
+			{
+				m_showVersion = true;
+				return true;
+			}
+
 			if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-')
 			{
 				std::string name = arg.substr(2);
@@ -63,27 +69,35 @@ public:
 					return false;
 				}
 			}
-			else if (arg.size() == 2 && arg[0] == '-')
+			else if (arg.size() >= 2 && arg[0] == '-')
 			{
-				char s = arg[1];
-				std::string name = resolveShort(s);
-				if (name.empty())
+				if (arg.size() == 2)
 				{
-					std::cerr << "Error: unknown argument '-" << s << "'.\n";
-					return false;
-				}
-				if (isFlag(name))
-				{
-					m_flagValues[name] = true;
-				}
-				else if (isOption(name))
-				{
-					if (i + 1 >= argc)
+					char s = arg[1];
+					std::string name = resolveShort(s);
+					if (name.empty())
 					{
-						std::cerr << "Error: -" << s << " requires a value.\n";
+						std::cerr << "Error: unknown argument '-" << s << "'.\n";
 						return false;
 					}
-					m_optionValues[name] = argv[++i];
+					if (isFlag(name))
+					{
+						m_flagValues[name] = true;
+					}
+					else if (isOption(name))
+					{
+						if (i + 1 >= argc)
+						{
+							std::cerr << "Error: -" << s << " requires a value.\n";
+							return false;
+						}
+						m_optionValues[name] = argv[++i];
+					}
+				}
+				else
+				{
+					std::cerr << "Error: unknown argument '" << arg << "'.\n";
+					return false;
 				}
 			}
 			else
@@ -93,6 +107,8 @@ public:
 		}
 		return true;
 	}
+
+	bool showVersion() const { return m_showVersion; }
 
 	bool hasFlag(const std::string& name) const
 	{
@@ -169,6 +185,7 @@ private:
 	std::unordered_map<std::string, std::string> m_optionValues;
 	std::vector<std::string>                     m_positionalValues;
 	std::string                                  m_program;
+	bool                                         m_showVersion = false;
 
 	bool isFlag(const std::string& name) const
 	{

@@ -34,9 +34,16 @@ int main(int argc, char* argv[])
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
+    args.addFlag("nologo", 0, "Hide compiler version and completion messages");
 
     if (!args.parse(argc, argv))
         return 1;
+
+    if (args.showVersion())
+    {
+        std::cout << std::format("{}.{}\n", MAJOR_VERSION, MINOR_VERSION);
+        return 0;
+    }
 
     auto filename = args.getPositional(0);
     if (!filename)
@@ -46,7 +53,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
+    bool showLogo = !args.hasFlag("nologo");
+    if (showLogo)
+        std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
 
     // Locate runtime.cb next to this executable.
     char* pgmptr = nullptr;
@@ -62,5 +71,6 @@ int main(int argc, char* argv[])
         std::cerr << "Compilation failed.\n";
         return 1;
     }
-    std::cout << "Done.\n";
+    if (showLogo)
+        std::cout << "Done.\n";
 }
