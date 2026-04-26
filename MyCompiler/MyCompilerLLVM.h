@@ -1,5 +1,24 @@
 #pragma once
 
+// ============================================================
+// MyCompilerLLVM.h — LLVM IR backend, type system, symbol tables
+// ============================================================
+// SECTION      LINE     DESCRIPTION
+// ───────────────────────────────────────────────────────────
+// §1           40-370   Public enums/structs (Operation, TypeAndValue, ...)
+// §2           372-414  Private member data
+// §3           416-1134 Private methods
+// §4           1136+    Public methods (~160+ methods)
+//   §4.1               Debug info
+//   §4.2               Block control
+//   §4.3               Interface system
+//   §4.4               Variable management
+//   §4.5               IR emission
+//   §4.6               Control flow
+//   §4.7               Function system
+//   §4.8               Lookup / name resolution
+// ============================================================
+
 #include <deque>
 #include <ranges>
 #include <variant>
@@ -2485,9 +2504,9 @@ public:
     /// <summary>
     /// Exit the current BasicBlock and then jump to resumeBlock.
     /// </summary>
-    llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlackStack)
+    llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlockStack)
     {
-        if (exitBlackStack)
+        if (exitBlockStack)
         {
             // Bare-semicolon form: expect_error("msg"); — if the expected error never fired before this scope exits, report failure.
             if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size())

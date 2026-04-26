@@ -6,6 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MyCompiler is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
 
+## Plan
+
+Provide an Architecture overview before analyzing code changes.  Verify with the user first before continuing with the Phases.
+
+## Logging Conventions
+
+- Use `LogError` or `LogErrorContext` for all error reporting in the compiler. Do not introduce `LogWarning` or leave `std::cout`.
+
+## Debugging Workflow
+
+- Before editing, state the hypothesized root cause and verify against the codebase. Avoid speculative edits based on a single guess (e.g., do not assume lexer token conflicts before checking parser/grammar paths).
+
 ## Building
 
 Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM). Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
@@ -51,6 +63,11 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 - `-i / --import-dir`: Directory to search for imported modules
 - `-p / --platform`: Target platform — `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
+
+## Testing
+- Always run `test.bat` after compiler changes to verify all tests pass before declaring work complete.
+- Do NOT create separate compiler integration tests - test.bat already validates the compiler end-to-end.
+- When tests fail after a fix, investigate root causes; do not weaken/dilute test assertions to make them pass. Ask before disabling tests.
 
 ## Running Tests
 

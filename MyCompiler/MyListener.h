@@ -1,4 +1,25 @@
-﻿#pragma once
+﻿// ============================================================
+// MyListener.h — CFlat front-end: ForwardRefScanner + MyListener
+// ============================================================
+// SECTION         LINE     DESCRIPTION
+// ───────────────────────────────────────────────────────────
+// §1              15-67    File-level helpers
+// §2              72-195   ForwardRefScanner class (pre-pass)
+// §3              200-517  MyListener class (code generation)
+//   §3.1  591             ParseDeclarationSpecifiers (codegen)
+//   §3.2  847             Interface/generic instantiation
+//   §3.3 1020             Top-level declarations
+//   §3.4 1206             Statement parsing
+//   §3.5 1858             Function/parameter declarations
+//   §3.6 2017             Expression parsing
+//   §3.7 3476             ParsePostfixExpression (~797 lines)
+//   §3.8 4838             Generic instantiation queue
+//   §3.9 5011             Struct/Class definitions
+//   §3.10 5571            Constructor/Destructor
+//   §3.11 5686            Utilities
+// ============================================================
+
+#pragma once
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -10,7 +31,6 @@
 #include "CFlatLexer.h"
 #include "CFlatBaseListener.h"
 #include "MyCompilerLLVM.h"
-
 
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
@@ -64,6 +84,25 @@ static std::string MangleTypeArg(const std::string& typeName)
         if (c == '*') result += "ptr";
         else result += c;
     return result;
+}
+
+// Extract function name from FunctionDefinitionContext (handles operator overloads).
+static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
+{
+    if (auto* opId = ctx->operatorFunctionId())
+        return ::getOperatorName(opId);
+    auto directDecl = ctx->directDeclarator();
+    return directDecl->getText();
+}
+
+// Check if a function definition has the 'static' storage class.
+static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
+{
+    if (!func->declarationSpecifiers()) return false;
+    for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
+        if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
+            return true;
+    return false;
 }
 
 // ForwardRefScanner performs a lightweight pre-pass over the AST to register
@@ -186,23 +225,6 @@ private:
         return params;
     }
 
-    std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
-    {
-        if (auto* opId = ctx->operatorFunctionId())
-            return ::getOperatorName(opId);
-        auto directDecl = ctx->directDeclarator();
-        return directDecl->getText();
-    }
-
-    bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
-    {
-        if (!func->declarationSpecifiers()) return false;
-        for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
-            if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
-                return true;
-        return false;
-    }
-
     void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(func);
@@ -301,38 +323,41 @@ private:
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
     }
 
-    void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
+    // Pre-declare a struct or class type shell, member functions, and destructor.
+    // Templated to handle both StructDefinitionContext and ClassDefinitionContext.
+    template<typename TCtx>
+    void ScanStructOrClassDefinition(TCtx* ctx, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
         if (ctx->genericTypeParameters() != nullptr)
             return;
 
-        std::string structName = ctx->directDeclarator()->getText();
+        std::string typeName = ctx->directDeclarator()->getText();
         if (!namespaceName.empty())
-            structName = namespaceName + "." + structName;
+            typeName = namespaceName + "." + typeName;
 
         // Register opaque struct so the type is known for pointer/field use
-        compiler->CreateStructType(structName, {});
+        compiler->CreateStructType(typeName, {});
 
         // Pre-declare default constructor
-        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = structName };
-        compiler->CreateFunctionDeclaration(structName, returnType, {});
+        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = typeName };
+        compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
         // Pre-declare member functions (and detect constructor overloads)
         for (auto func : ctx->functionDefinition())
         {
-            if (getFunctionName(func) == structName)
+            if (getFunctionName(func) == typeName)
             {
-                // Constructor overload — no implicit this* parameter, returns the struct type
+                // Constructor overload — no implicit this* parameter, returns the type
                 if (!func->parameterTypeList()) continue; // no-arg already declared above
                 auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
                 std::vector<MyCompilerLLVM::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
-                compiler->CreateFunctionDeclaration(structName, returnType, allCtorParams);
+                compiler->CreateFunctionDeclaration(typeName, returnType, allCtorParams);
             }
             else
             {
-                ScanFunctionDefinition(func, structName);
+                ScanFunctionDefinition(func, typeName);
             }
         }
 
@@ -340,59 +365,22 @@ private:
         for (auto dtor : ctx->destructorDefinition())
         {
             MyCompilerLLVM::DeclTypeAndValue thisParam;
-            thisParam.TypeName = structName;
-            thisParam.VariableName = structName + "__";
+            thisParam.TypeName = typeName;
+            thisParam.VariableName = typeName + "__";
             thisParam.Pointer = true;
             MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
-            compiler->CreateFunctionDeclaration("~" + structName, voidReturn, { thisParam });
+            compiler->CreateFunctionDeclaration("~" + typeName, voidReturn, { thisParam });
         }
+    }
+
+    void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
+    {
+        ScanStructOrClassDefinition(ctx, namespaceName);
     }
 
     void ScanClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& namespaceName = {})
     {
-        auto* compiler = Compiler(ctx);
-        // Generic template definitions are not pre-declared; they are instantiated on demand.
-        if (ctx->genericTypeParameters() != nullptr)
-            return;
-
-        std::string className = ctx->directDeclarator()->getText();
-        if (!namespaceName.empty())
-            className = namespaceName + "." + className;
-
-        // Register opaque struct so the type is known for pointer/field use
-        compiler->CreateStructType(className, {});
-
-        // Pre-declare default constructor
-        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = className };
-        compiler->CreateFunctionDeclaration(className, returnType, {});
-
-        // Pre-declare member functions (and detect constructor overloads)
-        for (auto func : ctx->functionDefinition())
-        {
-            if (getFunctionName(func) == className)
-            {
-                // Constructor overload — no implicit this* parameter, returns the class type
-                if (!func->parameterTypeList()) continue; // no-arg already declared above
-                auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
-                std::vector<MyCompilerLLVM::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
-                compiler->CreateFunctionDeclaration(className, returnType, allCtorParams);
-            }
-            else
-            {
-                ScanFunctionDefinition(func, className);
-            }
-        }
-
-        // Pre-declare destructor
-        for (auto dtor : ctx->destructorDefinition())
-        {
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
-            thisParam.TypeName = className;
-            thisParam.VariableName = className + "__";
-            thisParam.Pointer = true;
-            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
-            compiler->CreateFunctionDeclaration("~" + className, voidReturn, { thisParam });
-        }
+        ScanStructOrClassDefinition(ctx, namespaceName);
     }
 
 public:
@@ -784,23 +772,6 @@ private:
         auto declSpecs = ctx->declarationSpecifiers();
 
         return ParseDeclarationSpecifiers(declSpecs);
-    }
-
-    std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
-    {
-        if (auto* opId = ctx->operatorFunctionId())
-            return ::getOperatorName(opId);
-        auto directDecl = ctx->directDeclarator();
-        return directDecl->getText();
-    }
-
-    bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
-    {
-        if (!func->declarationSpecifiers()) return false;
-        for (auto* ds : func->declarationSpecifiers()->declarationSpecifier())
-            if (ds->storageClassSpecifier() && ds->storageClassSpecifier()->Static() != nullptr)
-                return true;
-        return false;
     }
 
     // Returns the default value for a type:
@@ -1859,7 +1830,7 @@ public:
     {
         auto* compiler = Compiler(func);
         // Create Function Definition
-        auto name = nameOverride.empty() ? this->getFunctionName(func) : nameOverride;
+        auto name = nameOverride.empty() ? ::getFunctionName(func) : nameOverride;
         if (!namespaceName.empty())
             name = namespaceName + "." + name;
         auto returnType = this->getFunctionReturnType(func);
@@ -5074,14 +5045,14 @@ public:
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
-            std::vector<llvm::Value*> initilizers;
+            std::vector<llvm::Value*> initializers;
             for (auto& typeValue : declList)
             {
-                auto initilizer = typeValue.Initializer;
+                auto initializer = typeValue.Initializer;
                 llvm::Value* rvalue = nullptr;
-                if (initilizer != nullptr)
+                if (initializer != nullptr)
                 {
-                    auto assignmentExpression = initilizer->assignmentExpression();
+                    auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                     {
                         rvalue = ParseAssignmentExpression(assignmentExpression);
@@ -5092,7 +5063,7 @@ public:
                             structType = compiler->CreateStructType(structName, declList);
                         }
                     }
-                    else if (initilizer->Default() != nullptr)
+                    else if (initializer->Default() != nullptr)
                     {
                         rvalue = GenerateDefaultValue(typeValue);
                     }
@@ -5102,7 +5073,7 @@ public:
                     std::cout << "Uninitialize field \"" << structName << "::" << typeValue.VariableName << "\".\n";
                 }
 
-                initilizers.push_back(rvalue);
+                initializers.push_back(rvalue);
             }
 
             llvm::Value* structVal = llvm::UndefValue::get(structType);
@@ -5113,7 +5084,7 @@ public:
 
             unsigned int structIndex = 0;
 
-            for (auto rvalue : initilizers)
+            for (auto rvalue : initializers)
             {
                 if (rvalue != nullptr)
                 {
@@ -5304,14 +5275,14 @@ public:
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
-            std::vector<llvm::Value*> initilizers;
+            std::vector<llvm::Value*> initializers;
             for (auto& typeValue : declList)
             {
-                auto initilizer = typeValue.Initializer;
+                auto initializer = typeValue.Initializer;
                 llvm::Value* rvalue = nullptr;
-                if (initilizer != nullptr)
+                if (initializer != nullptr)
                 {
-                    auto assignmentExpression = initilizer->assignmentExpression();
+                    auto assignmentExpression = initializer->assignmentExpression();
                     if (assignmentExpression != nullptr)
                     {
                         rvalue = ParseAssignmentExpression(assignmentExpression);
@@ -5321,17 +5292,17 @@ public:
                             structType = compiler->CreateStructType(structName, declList);
                         }
                     }
-                    else if (initilizer->Default() != nullptr)
+                    else if (initializer->Default() != nullptr)
                     {
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
                 else
                 {
-                    std::cout << "Uninitialize field \"" << structName << "::" << typeValue.VariableName << "\".\n";
+                    std::cout << "Uninitialized field \"" << structName << "::" << typeValue.VariableName << "\".\n";
                 }
 
-                initilizers.push_back(rvalue);
+                initializers.push_back(rvalue);
             }
 
             llvm::Value* structVal = llvm::UndefValue::get(structType);
@@ -5342,7 +5313,7 @@ public:
 
             unsigned int structIndex = 0;
 
-            for (auto rvalue : initilizers)
+            for (auto rvalue : initializers)
             {
                 if (rvalue != nullptr)
                 {
