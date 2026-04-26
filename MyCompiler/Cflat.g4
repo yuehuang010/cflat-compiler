@@ -290,10 +290,13 @@ typeParameterEntry
     : typeSpecifier pointer?
     ;
 
-// typeParameter
-//     : Identifier
-//     | Identifier ':' typeName
-//     ;
+whereClause
+    : Where typeParameterConstraint (',' typeParameterConstraint)*
+    ;
+
+typeParameterConstraint
+    : Identifier ':' Identifier
+    ;
 
 structClassUnion
     : 'struct'
@@ -550,16 +553,16 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' whereClause? compoundStatement
     ;
 
 structDefinition
-    : 'struct' directDeclarator genericTypeParameters? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
-    | 'union' directDeclarator genericTypeParameters? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 classDefinition
-    : Class directDeclarator genericTypeParameters? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 genericIdentifier
@@ -729,6 +732,10 @@ As
 
 Interface
     : 'interface'
+    ;
+
+Where
+    : 'where'
     ;
 
 Namespace

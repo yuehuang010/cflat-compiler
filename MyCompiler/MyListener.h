@@ -545,6 +545,9 @@ private:
     static inline std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*> genericClassTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
     static inline std::unordered_set<std::string> instantiatedGenerics;
+    // Constraints: templateName → { typeParamName → [requiredInterface, …] }
+    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
+    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
 
@@ -555,6 +558,7 @@ private:
     static inline std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*> genericFunctionTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
     static inline std::unordered_set<std::string> instantiatedGenericFunctions;
+    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
 
     // Queue for pending generic instantiations (delayed until safe to emit code)
     struct PendingInstantiation
@@ -933,6 +937,9 @@ public:
         const auto& typeParams = genericFunctionTypeParams[baseName];
         if (typeParams.size() != typeArgs.size()) return {};
 
+        if (!CheckConstraints(baseName, typeParams, typeArgs, genericFunctionConstraints, templateIt->second))
+            return {};
+
         auto savedSubst = activeTypeSubstitutions;
         for (size_t i = 0; i < typeParams.size(); i++)
             activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
@@ -1093,10 +1100,22 @@ public:
             compilerLLVM->expectedError = ProcessRawText(rawText);
             compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
 
-            for (auto* extDecl : expectErrDecl->externalDeclaration())
-                ParseExternalDeclaration(extDecl, namespaceName);
+            bool errorReceived = false;
+            try
+            {
+                for (auto* extDecl : expectErrDecl->externalDeclaration())
+                    ParseExternalDeclaration(extDecl, namespaceName);
+            }
+            catch (const ExpectedErrorReceived&)
+            {
+                errorReceived = true;
+                compilerLLVM->AbortFunctionBlocks(0);
+                compilerLLVM->ClearCurrentSubprogram();
+                compilerLLVM->expectedError.clear();
+                compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+            }
 
-            if (!compilerLLVM->expectedError.empty())
+            if (!errorReceived && !compilerLLVM->expectedError.empty())
             {
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                           compilerLLVM->expectedError);
@@ -1174,6 +1193,11 @@ public:
 
         // Skip nodes nested inside an if const block — they are handled by ParseIfConstDeclaration.
         if (dynamic_cast<CFlatParser::IfConstBlockContext*>(ctx->parent))
+            return;
+
+        // Skip nodes nested inside an expect_error block — handled by ParseExternalDeclaration's
+        // expectErrorDeclaration branch, which processes them manually after setting expectedError.
+        if (dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(ctx->parent))
             return;
 
         ParseExternalDeclaration(ctx);
@@ -1713,17 +1737,44 @@ public:
             {
                 // Scoped block form: expect_error("msg") { ... } — error must occur inside the braces.
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
+                size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 compiler->InitializeBlock(nullptr, true);
-                if (auto* blockList = cs->blockItemList())
-                    ParseBlockItemList(blockList);
-                compiler->CreateBlockBreak(nullptr, true);
-
-                if (!compilerLLVM->expectedError.empty())
+                bool errorReceived = false;
+                try
                 {
-                    std::cout << std::format("FAIL: expected error '{}' did not occur\n",
-                                              compilerLLVM->expectedError);
+                    if (auto* blockList = cs->blockItemList())
+                        ParseBlockItemList(blockList);
+                }
+                catch (const ExpectedErrorReceived&)
+                {
+                    errorReceived = true;
+                    // Pop any extra nested frames without destructors (error path).
+                    while (compilerLLVM->stackNamedVariable.size() > savedDepth)
+                        compilerLLVM->stackNamedVariable.pop_back();
+                    // Terminate the current block and create a new one so the outer
+                    // function's subsequent statements have a valid insertion point.
+                    if (auto* bb = compilerLLVM->builder->GetInsertBlock())
+                    {
+                        if (!compiler->IsBlockTerminated())
+                            compilerLLVM->builder->CreateUnreachable();
+                        auto* resume = llvm::BasicBlock::Create(
+                            *compilerLLVM->context, "after_expect_error", bb->getParent());
+                        compilerLLVM->builder->SetInsertPoint(resume);
+                    }
                     compilerLLVM->expectedError.clear();
-                    exit(1);
+                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                }
+
+                if (!errorReceived)
+                {
+                    compiler->CreateBlockBreak(nullptr, true);
+                    if (!compilerLLVM->expectedError.empty())
+                    {
+                        std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                                  compilerLLVM->expectedError);
+                        compilerLLVM->expectedError.clear();
+                        exit(1);
+                    }
                 }
             }
             else
@@ -1823,6 +1874,7 @@ public:
             auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
             genericFunctionTemplates[name] = func;
             genericFunctionTypeParams[name] = typeParams;
+            genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
             return;
         }
 
@@ -1859,23 +1911,55 @@ public:
 
         compiler->InitializeBlock(&fn->front(), false);
 
+        // Record stack depth after createFunctionBlock pushed the function's frame.
+        // Used to identify bare-semicolon expect_error that was set inside this function.
+        size_t funcDepth = compilerLLVM->stackNamedVariable.size();
+
         auto blockItemList = func->compoundStatement()->blockItemList();
 
+        bool expectErrorHandled = false;
         if (blockItemList)
-            ParseBlockItemList(blockItemList);
-
-        if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
-            LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
-
-        // if return is void, then this might need a implicit return;
-        if (returnType.TypeName == "void")
         {
-            compiler->CreateReturnCall(nullptr);
+            try
+            {
+                ParseBlockItemList(blockItemList);
+            }
+            catch (const ExpectedErrorReceived&)
+            {
+                // Handle only if the expect_error was set at this function's entry depth
+                // (bare-semicolon form inside this function body).
+                // File-scope scoped-block form sets expectedErrorScopeDepth = SIZE_MAX — re-throw.
+                if (!compilerLLVM->expectedError.empty() &&
+                    compilerLLVM->expectedErrorScopeDepth == funcDepth)
+                {
+                    compilerLLVM->AbortFunctionBlocks(funcDepth - 1);
+                    compilerLLVM->expectedError.clear();
+                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                    compiler->ClearCurrentSubprogram();
+                    expectErrorHandled = true;
+                }
+                else
+                {
+                    throw;
+                }
+            }
         }
 
-        // Pop the stack
-        compiler->CreateBlockBreak(nullptr, true);
-        compiler->ClearCurrentSubprogram();
+        if (!expectErrorHandled)
+        {
+            if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
+                LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
+
+            // if return is void, then this might need a implicit return;
+            if (returnType.TypeName == "void")
+            {
+                compiler->CreateReturnCall(nullptr);
+            }
+
+            // Pop the stack
+            compiler->CreateBlockBreak(nullptr, true);
+            compiler->ClearCurrentSubprogram();
+        }
 
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
@@ -3607,7 +3691,9 @@ public:
                         // Apply type substitutions for generic parameters.
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
-                            std::string mangledName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            std::string baseName = prevPrimary->genericIdentifier()->Identifier()->getText();
+                            std::string mangledName = baseName;
+                            std::vector<std::string> typeArgs;
                             for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             {
                                 std::string arg = entry->getText();
@@ -3615,8 +3701,13 @@ public:
                                 auto it = activeTypeSubstitutions.find(arg);
                                 if (it != activeTypeSubstitutions.end())
                                     arg = it->second;
+                                typeArgs.push_back(arg);
                                 mangledName += "__" + MangleTypeArg(arg);
                             }
+                            // If this is a generic function template call (e.g. MaxScore<Player>(...)),
+                            // instantiate the template now with the explicit type arguments.
+                            if (genericFunctionTemplates.count(baseName))
+                                InstantiateGenericFunction(baseName, typeArgs);
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -4894,6 +4985,15 @@ public:
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
 
+            // Verify where-clause constraints before instantiating
+            auto* ctxForError = structIt != genericStructTemplates.end()
+                ? (antlr4::ParserRuleContext*)structIt->second
+                : (antlr4::ParserRuleContext*)classIt->second;
+            const auto& constraintMap = structIt != genericStructTemplates.end()
+                ? genericStructConstraints : genericClassConstraints;
+            if (!CheckConstraints(pending.templateName, typeParams, pending.typeArgs, constraintMap, ctxForError))
+                continue;
+
             // Set up type substitutions for this instantiation
             auto savedSubst = activeTypeSubstitutions;
             for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
@@ -4935,6 +5035,7 @@ public:
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericStructTemplates[structName] = ctx;
             genericStructTypeParams[structName] = typeParams;
+            genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
             return;
         }
 
@@ -5167,6 +5268,7 @@ public:
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericClassTemplates[structName] = ctx;
             genericStructTypeParams[structName] = typeParams;
+            genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
             return;
         }
 
@@ -5420,6 +5522,50 @@ public:
         }
 
         return typeParams;
+    }
+
+    // Returns { typeParamName → [requiredInterface, …] } from a whereClause context.
+    std::unordered_map<std::string, std::vector<std::string>>
+    ParseWhereClause(CFlatParser::WhereClauseContext* wc)
+    {
+        std::unordered_map<std::string, std::vector<std::string>> result;
+        if (!wc) return result;
+        for (auto* constraint : wc->typeParameterConstraint())
+        {
+            auto ids = constraint->Identifier();
+            if (ids.size() < 2) continue;
+            result[ids[0]->getText()].push_back(ids[1]->getText());
+        }
+        return result;
+    }
+
+    // Checks that each concrete type argument satisfies its where-clause constraints.
+    // Logs an error and returns false on the first violation.
+    bool CheckConstraints(
+        const std::string& templateName,
+        const std::vector<std::string>& typeParams,
+        const std::vector<std::string>& typeArgs,
+        const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& constraintMap,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto cit = constraintMap.find(templateName);
+        if (cit == constraintMap.end()) return true;
+        for (size_t i = 0; i < typeParams.size() && i < typeArgs.size(); i++)
+        {
+            auto pit = cit->second.find(typeParams[i]);
+            if (pit == cit->second.end()) continue;
+            for (const auto& iface : pit->second)
+            {
+                if (!Compiler(ctx)->TypeImplementsInterface(typeArgs[i], iface))
+                {
+                    Compiler(ctx)->LogError(std::format(
+                        "type '{}' does not implement '{}', required by constraint 'where {} : {}'",
+                        typeArgs[i], iface, typeParams[i], iface));
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName)

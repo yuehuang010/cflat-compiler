@@ -1,0 +1,250 @@
+
+import "test_helper.cb";
+
+// ===========================================================
+// Generic type constraint tests (where T : IInterface)
+// ===========================================================
+
+// --- Interfaces ---
+
+interface IScorer
+{
+    int Score();
+};
+
+interface ILabeled
+{
+    int Label();
+};
+
+// --- Concrete types ---
+
+class Player : IScorer
+{
+    int points = 0;
+    int Score() { return points; }
+};
+
+// Second type satisfying IScorer — exercises a different monomorphization
+class Robot : IScorer
+{
+    int power = 0;
+    int Score() { return power * 2; }
+};
+
+// Type satisfying both IScorer and ILabeled — exercises multi-constraint
+class Medal : IScorer, ILabeled
+{
+    int value = 0;
+    int rank  = 0;
+    int Score() { return value; }
+    int Label() { return rank;  }
+};
+
+// --- Constrained generic structs ---
+
+// Single constraint, one type param
+struct BestOf<T> where T : IScorer
+{
+    T first  = default;
+    T second = default;
+
+    int best()
+    {
+        int a = first.Score();
+        int b = second.Score();
+        return a > b ? a : b;
+    }
+};
+
+// Single constraint, two type params (each independently constrained)
+struct Duel<T, U> where T : IScorer, U : IScorer
+{
+    T challenger = default;
+    U defender   = default;
+
+    bool challengerWins()
+    {
+        return challenger.Score() > defender.Score();
+    }
+};
+
+// Two constraints on the same type param
+struct TaggedBest<T> where T : IScorer, T : ILabeled
+{
+    T first  = default;
+    T second = default;
+
+    int bestScore()
+    {
+        int a = first.Score();
+        int b = second.Score();
+        return a > b ? a : b;
+    }
+
+    int bestLabel()
+    {
+        int la = first.Label();
+        int lb = second.Label();
+        return la > lb ? la : lb;
+    }
+};
+
+// --- Constrained generic class ---
+
+class ScoreAccumulator<T> where T : IScorer
+{
+    T item  = default;
+    int bonus = 0;
+
+    int total()
+    {
+        return item.Score() + bonus;
+    }
+};
+
+// --- Constrained generic functions ---
+
+int MaxScore<T>(T* a, T* b) where T : IScorer
+{
+    int sa = a.Score();
+    int sb = b.Score();
+    return sa > sb ? sa : sb;
+}
+
+int SumScores<T>(T* a, T* b) where T : IScorer
+{
+    return a.Score() + b.Score();
+}
+
+// ===========================================================
+// Tests
+// ===========================================================
+
+// 1. Basic struct constraint with Player
+bool testBasicStructConstraint()
+{
+    bool result = true;
+
+    BestOf<Player> bo;
+    bo.first.points  = 10;
+    bo.second.points = 20;
+    result &= Test("constraint_best_of_20", bo.best(), 20);
+
+    BestOf<Player> bo2;
+    bo2.first.points  = 99;
+    bo2.second.points = 7;
+    result &= Test("constraint_best_of_99", bo2.best(), 99);
+
+    return result;
+}
+
+// 2. Same constrained struct instantiated with a second satisfying type
+bool testAlternativeConcreteType()
+{
+    bool result = true;
+
+    BestOf<Robot> br;
+    br.first.power  = 5;   // Score() = 10
+    br.second.power = 8;   // Score() = 16
+    result &= Test("constraint_robot_best_16", br.best(), 16);
+
+    BestOf<Robot> br2;
+    br2.first.power  = 9;  // Score() = 18
+    br2.second.power = 3;  // Score() = 6
+    result &= Test("constraint_robot_best_18", br2.best(), 18);
+
+    return result;
+}
+
+// 3. Two separately-constrained type params
+bool testTwoConstrainedParams()
+{
+    bool result = true;
+
+    Duel<Player, Robot> d;
+    d.challenger.points = 25;   // Score() = 25
+    d.defender.power    = 10;   // Score() = 20
+    result &= Test("constraint_duel_challenger_wins", d.challengerWins(), true);
+
+    Duel<Robot, Player> d2;
+    d2.challenger.power  = 3;   // Score() = 6
+    d2.defender.points   = 50;  // Score() = 50
+    result &= Test("constraint_duel_defender_wins", d2.challengerWins(), false);
+
+    return result;
+}
+
+// 4. Multiple constraints on the same type param
+bool testMultipleConstraintsSameParam()
+{
+    bool result = true;
+
+    TaggedBest<Medal> tb;
+    tb.first.value  = 10;
+    tb.first.rank   = 3;
+    tb.second.value = 7;
+    tb.second.rank  = 5;
+    result &= Test("constraint_tagged_best_score", tb.bestScore(), 10);
+    result &= Test("constraint_tagged_best_label", tb.bestLabel(), 5);
+
+    return result;
+}
+
+// 5. Constrained class template
+bool testConstrainedClass()
+{
+    bool result = true;
+
+    ScoreAccumulator<Player> sa;
+    sa.item.points = 30;
+    sa.bonus       = 5;
+    result &= Test("constraint_class_player_total", sa.total(), 35);
+
+    ScoreAccumulator<Robot> sar;
+    sar.item.power = 4;   // Score() = 8
+    sar.bonus      = 2;
+    result &= Test("constraint_class_robot_total", sar.total(), 10);
+
+    return result;
+}
+
+// 6. Constrained generic functions, multiple types and functions
+bool testConstrainedFunction()
+{
+    bool result = true;
+
+    Player p1;
+    p1.points = 15;
+    Player p2;
+    p2.points = 30;
+    result &= Test("constraint_func_max_player", MaxScore<Player>(&p1, &p2), 30);
+    result &= Test("constraint_func_sum_player", SumScores<Player>(&p1, &p2), 45);
+
+    Robot r1;
+    r1.power = 6;  // Score() = 12
+    Robot r2;
+    r2.power = 4;  // Score() = 8
+    result &= Test("constraint_func_max_robot", MaxScore<Robot>(&r1, &r2), 12);
+    result &= Test("constraint_func_sum_robot", SumScores<Robot>(&r1, &r2), 20);
+
+    return result;
+}
+
+extern int main()
+{
+    bool result = true;
+    result &= testBasicStructConstraint();
+    result &= testAlternativeConcreteType();
+    result &= testTwoConstrainedParams();
+    result &= testMultipleConstraintsSameParam();
+    result &= testConstrainedClass();
+    result &= testConstrainedFunction();
+
+    if (result)
+    {
+        printf("All tests passed.\n");
+        return 0;
+    }
+    return 1;
+}

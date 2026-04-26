@@ -1,0 +1,31 @@
+
+interface IScorer
+{
+    int Score();
+};
+
+interface ILabeled
+{
+    int Label();
+};
+
+struct TaggedBest<T> where T : IScorer, T : ILabeled
+{
+    T first = default;
+};
+
+// PartialType satisfies IScorer but NOT ILabeled.
+class PartialType : IScorer
+{
+    int x = 0;
+    int Score() { return x; }
+};
+
+// Instantiating TaggedBest<PartialType> must error on the missing ILabeled.
+expect_error("does not implement 'ILabeled'") {
+    int trigger()
+    {
+        TaggedBest<PartialType> tb;
+        return 0;
+    }
+}

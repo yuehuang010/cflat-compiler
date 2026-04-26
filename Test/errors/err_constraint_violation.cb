@@ -1,0 +1,24 @@
+
+interface IScorer
+{
+    int Score();
+};
+
+struct BestOf<T> where T : IScorer
+{
+    T first = default;
+};
+
+struct Plain
+{
+    int x = 0;
+};
+
+// Plain does not implement IScorer — instantiating BestOf<Plain> must error.
+expect_error("does not implement 'IScorer'") {
+    int triggerInstantiation()
+    {
+        BestOf<Plain> f;
+        return 0;
+    }
+}

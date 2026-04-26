@@ -33,6 +33,8 @@
 #include "ArgParser.h"
 #include "CompilerManager.h"
 
+struct ExpectedErrorReceived {};
+
 class MyCompilerLLVM
 {
 public:
@@ -339,7 +341,7 @@ public:
             if (message.find(expectedError) != std::string::npos)
             {
                 std::cout << "PASS: expected error received\n";
-                exit(0);
+                throw ExpectedErrorReceived{};
             }
             std::cout << std::format("FAIL: expected error '{}' but got '{}'\n", expectedError, message);
             exit(1);
@@ -1198,6 +1200,27 @@ public:
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
     }
 
+    // Terminate all unterminated basic blocks in every function in the module, then pop stack
+    // frames back down to targetDepth (without running destructors — used in error-skip paths).
+    // Iterates the whole module because lambdas save/restore builder state: when an exception
+    // fires inside a lambda the outer function's blocks may also be unterminated.
+    void AbortFunctionBlocks(size_t targetDepth)
+    {
+        for (auto& fn : *module)
+        {
+            for (auto& bb : fn)
+            {
+                if (!bb.getTerminator())
+                {
+                    builder->SetInsertPoint(&bb);
+                    builder->CreateUnreachable();
+                }
+            }
+        }
+        while (stackNamedVariable.size() > targetDepth)
+            stackNamedVariable.pop_back();
+    }
+
     struct BuilderState
     {
         llvm::IRBuilder<>::InsertPoint ip;
@@ -1495,6 +1518,14 @@ public:
         auto it = dataStructures.find(structName);
         if (it == dataStructures.end()) return {};
         return it->second.Interfaces;
+    }
+
+    bool TypeImplementsInterface(const std::string& typeName, const std::string& ifaceName) const
+    {
+        auto it = dataStructures.find(typeName);
+        if (it == dataStructures.end()) return false;
+        const auto& ifaces = it->second.Interfaces;
+        return std::find(ifaces.begin(), ifaces.end(), ifaceName) != ifaces.end();
     }
 
     void VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
@@ -3066,7 +3097,14 @@ public:
             }
             else if (candParamItr->Pointer)
             {
-                argList.push_back(arg.GetValue());
+                // For a non-pointer value passed to a pointer parameter (e.g. a field access
+                // used as the 'this' receiver), prefer Storage (the GEP address) over Primary
+                // (the pre-loaded value). Primary holds the struct value itself, which would
+                // be the wrong type for a pointer parameter.
+                if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr)
+                    argList.push_back(arg.Storage);
+                else
+                    argList.push_back(arg.GetValue());
             }
             else
             {

@@ -1,0 +1,27 @@
+
+interface IScorer
+{
+    int Score();
+};
+
+int MaxScore<T>(T* a, T* b) where T : IScorer
+{
+    int sa = a.Score();
+    int sb = b.Score();
+    return sa > sb ? sa : sb;
+}
+
+struct Plain
+{
+    int x = 0;
+};
+
+// Plain does not implement IScorer — calling MaxScore<Plain> must error.
+expect_error("does not implement 'IScorer'") {
+    int trigger()
+    {
+        Plain p1;
+        Plain p2;
+        return MaxScore<Plain>(&p1, &p2);
+    }
+}
