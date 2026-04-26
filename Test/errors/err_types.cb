@@ -48,7 +48,7 @@ expect_error("is not a known struct type for 'is' check") {
     }
 }
 
-expect_error("is not a known struct type for 'as' cast") {
+expect_error("is not a known struct or interface type for 'as' cast") {
     int test_as_unknown_type()
     {
         Circle c;

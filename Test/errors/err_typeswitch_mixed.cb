@@ -1,0 +1,30 @@
+// Test error: cannot mix type cases with constant cases
+
+interface IShape
+{
+    int area();
+};
+
+class Circle : IShape
+{
+    int r = 0;
+    int area() { return r * r; }
+};
+
+expect_error("cannot mix constant cases with type cases") {
+    int test_mixed_cases()
+    {
+        IShape c = new Circle();
+        switch(c)
+        {
+            case Circle: printf("circle\n"); break;
+            case 42: printf("42\n"); break;  // Error: cannot mix constant case with type case
+        }
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

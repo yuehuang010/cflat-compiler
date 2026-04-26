@@ -1,4 +1,5 @@
-﻿// ============================================================
+﻿#pragma once
+// ============================================================
 // MyListener.h — CFlat front-end: ForwardRefScanner + MyListener
 // ============================================================
 // SECTION         LINE     DESCRIPTION
@@ -19,7 +20,6 @@
 //   §3.11 5686            Utilities
 // ============================================================
 
-#pragma once
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -564,6 +564,8 @@ private:
         llvm::ConstantInt* value = nullptr;       // non-null for integer cases
         llvm::Constant* strLiteral = nullptr;     // non-null for string cases (i8* global)
         llvm::BasicBlock* block;
+        bool isTypeCase = false;                  // non-null for type cases (struct or interface)
+        std::string typeCaseName;                 // struct or interface name for type cases
     };
 
     struct SwitchContext
@@ -572,6 +574,7 @@ private:
         llvm::BasicBlock* defaultBlock = nullptr;
         llvm::BasicBlock* resumeBlock = nullptr;
         bool isStringSwitch = false;
+        bool isTypeSwitch = false;                // true if this switch contains type cases
     };
 
     std::vector<SwitchContext> switchStack;
@@ -1209,19 +1212,47 @@ public:
 
         if (labeled->Case())
         {
-            llvm::Value* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
-            auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
-            llvm::Constant* strLit = nullptr;
-            if (!val)
+            // Check if this is a type case (struct or interface name) before evaluating as constant
+            auto constExpr = labeled->constantExpression();
+            if (!constExpr)
             {
-                strLit = llvm::dyn_cast<llvm::Constant>(rawVal);
-                if (strLit && compiler->IsStringLiteralConstant(strLit))
-                    ctx.isStringSwitch = true;
-                else
-                    LogErrorContext(labeled, "case value must be a constant integer or string literal");
+                LogErrorContext(labeled, "case must have an expression");
+                return;
             }
-            ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase") };
-            CollectCasesFromStatement(labeled->statement(), ctx);
+
+            std::string exprText = constExpr->getText();
+            bool isStruct = compiler->dataStructures.count(exprText) > 0;
+            bool isInterface = compiler->interfaceTable.count(exprText) > 0;
+
+            if (isStruct || isInterface)
+            {
+                // Type case detected
+                if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
+                    LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
+                ctx.isTypeSwitch = true;
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, exprText };
+                CollectCasesFromStatement(labeled->statement(), ctx);
+            }
+            else
+            {
+                // Constant case (integer or string)
+                if (ctx.isTypeSwitch)
+                    LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
+
+                llvm::Value* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
+                auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
+                llvm::Constant* strLit = nullptr;
+                if (!val)
+                {
+                    strLit = llvm::dyn_cast<llvm::Constant>(rawVal);
+                    if (strLit && compiler->IsStringLiteralConstant(strLit))
+                        ctx.isStringSwitch = true;
+                    else
+                        LogErrorContext(labeled, "case value must be a constant integer or string literal");
+                }
+                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "" };
+                CollectCasesFromStatement(labeled->statement(), ctx);
+            }
         }
         else if (labeled->Default())
         {
@@ -1648,7 +1679,89 @@ public:
 
                 auto condVal = ParseExpression(expression);
 
-                if (switchCtx.isStringSwitch)
+                if (switchCtx.isTypeSwitch)
+                {
+                    // Type switch: dispatch on the concrete type behind an interface fat pointer
+                    auto fatTy = compiler->GetFatPtrType();
+                    auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+
+                    // Validate: switch expression must be an interface-typed value (fat pointer)
+                    if (condVal->getType() != fatTy && condVal->getType() != fatTy->getPointerTo())
+                        LogErrorContext(expression, "type switch expression must be interface-typed (fat pointer)");
+
+                    // Extract dataPtr (field 1 of fat pointer)
+                    llvm::Value* dataPtr;
+                    if (condVal->getType()->isStructTy())
+                    {
+                        dataPtr = compiler->builder->CreateExtractValue(condVal, {1u});
+                    }
+                    else
+                    {
+                        auto dpField = compiler->builder->CreateStructGEP(fatTy, condVal, 1);
+                        dataPtr = compiler->builder->CreateLoad(ptrTy, dpField);
+                    }
+
+                    // Load type descriptor from vtable[0]
+                    llvm::Value* loadedDesc = LoadTypeDescFromInterface(condVal, expression);
+
+                    // Emit linear dispatch chain: for each type case, check if it matches
+                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    {
+                        if (!entry.isTypeCase) continue;  // skip non-type cases (shouldn't happen)
+
+                        auto* nextCheck = compiler->CreateBasicBlock("typeswitch_next");
+
+                        if (compiler->dataStructures.count(entry.typeCaseName))
+                        {
+                            // Concrete struct case: single type descriptor comparison
+                            auto& sd = compiler->dataStructures[entry.typeCaseName];
+                            if (!sd.typeDescriptor)
+                            {
+                                LogErrorContext(expression, std::format("struct '{}' has no type descriptor", entry.typeCaseName));
+                                continue;
+                            }
+                            auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                            compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
+                        }
+                        else if (compiler->interfaceTable.count(entry.typeCaseName))
+                        {
+                            // Interface case: match if the concrete type implements this interface
+                            // Emit: if (typedesc == any_implementing_struct_typedesc) goto case block
+                            llvm::BasicBlock* anyMatchedBlock = entry.block;
+                            auto* nextStruct = nextCheck;
+
+                            // Enumerate all concrete structs that implement this interface
+                            for (auto& [sName, sd] : compiler->dataStructures)
+                            {
+                                if (!compiler->StructImplementsInterface(sName, entry.typeCaseName)) continue;
+                                if (!sd.typeDescriptor) continue;
+
+                                auto* matchBlock = compiler->CreateBasicBlock("typeswitch_match");
+                                auto* cmpNextStruct = compiler->CreateBasicBlock("typeswitch_cmp_next");
+
+                                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                                compiler->builder->CreateCondBr(cmp, matchBlock, cmpNextStruct);
+
+                                compiler->SwitchToBlock(matchBlock);
+                                compiler->builder->CreateBr(anyMatchedBlock);
+
+                                compiler->SwitchToBlock(cmpNextStruct);
+                                nextStruct = cmpNextStruct;
+                            }
+                            // Fall through nextStruct to nextCheck
+                            compiler->builder->CreateBr(nextCheck);
+                        }
+                        else
+                        {
+                            LogErrorContext(expression, std::format("'{}' is not a known struct or interface type", entry.typeCaseName));
+                        }
+
+                        compiler->SwitchToBlock(nextCheck);
+                    }
+                    // Fall through to default case
+                    compiler->CreateJump(switchDefault);
+                }
+                else if (switchCtx.isStringSwitch)
                 {
                     // String switch: emit if-else chain using strcmp on _ptr (field 0)
                     auto* strPtr = compiler->builder->CreateExtractValue(condVal, { 0u });
@@ -2790,10 +2903,65 @@ public:
         auto* compiler = Compiler(ctx);
         auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
 
+        // Check if target is an interface (interface-to-interface cast)
+        if (compiler->interfaceTable.count(targetTypeName))
+        {
+            auto fatTy = compiler->GetFatPtrType();
+
+            // Extract dataPtr from source fat pointer
+            llvm::Value* dataPtr;
+            if (interfaceValue->getType()->isStructTy())
+                dataPtr = compiler->builder->CreateExtractValue(interfaceValue, {1u});
+            else
+            {
+                auto dp = compiler->builder->CreateStructGEP(fatTy, interfaceValue, 1);
+                dataPtr = compiler->builder->CreateLoad(ptrTy, dp);
+            }
+
+            // Load type descriptor from source
+            llvm::Value* loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
+
+            // Alloca for result: defaults to null fat ptr (aggregate zero)
+            auto* resultAlloca = compiler->CreateAlloca(fatTy);
+            compiler->builder->CreateStore(llvm::ConstantAggregateZero::get(fatTy), resultAlloca);
+
+            auto* afterBlock = compiler->CreateBasicBlock("as_iface_after");
+
+            // For each concrete struct that implements the target interface,
+            // check if the concrete type matches and build the appropriate fat pointer
+            for (auto& [sName, sd] : compiler->dataStructures)
+            {
+                if (!compiler->StructImplementsInterface(sName, targetTypeName)) continue;
+                if (!sd.typeDescriptor) continue;
+
+                auto* matchBlock = compiler->CreateBasicBlock("as_iface_match");
+                auto* nextBlock = compiler->CreateBasicBlock("as_iface_next");
+
+                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                compiler->builder->CreateCondBr(cmp, matchBlock, nextBlock);
+
+                compiler->SwitchToBlock(matchBlock);
+                auto* vtable = compiler->GetOrCreateVTable(sName, targetTypeName);
+                auto fatVal = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                compiler->builder->CreateStore(fatVal, resultAlloca);
+                compiler->builder->CreateBr(afterBlock);
+
+                compiler->SwitchToBlock(nextBlock);
+            }
+
+            // No match: fall through (result stays null fat ptr)
+            compiler->builder->CreateBr(afterBlock);
+            compiler->SwitchToBlock(afterBlock);
+
+            // Return the fat pointer value (aggregate)
+            return compiler->builder->CreateLoad(fatTy, resultAlloca);
+        }
+
+        // Concrete struct cast (existing logic)
         auto targetIt = compiler->dataStructures.find(targetTypeName);
         if (targetIt == compiler->dataStructures.end())
         {
-            LogErrorContext(ctx, std::format("'{}' is not a known struct type for 'as' cast", targetTypeName));
+            LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'as' cast", targetTypeName));
             return nullptr;
         }
 
