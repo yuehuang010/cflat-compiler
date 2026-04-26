@@ -1,3 +1,5 @@
+// DEPRECATED: replaced by MyCompiler.exe lsp (stdio transport in extension.ts).
+// Remove once the native LSP server is stable.
 import {
     createConnection,
     TextDocuments,

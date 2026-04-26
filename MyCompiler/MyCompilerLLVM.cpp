@@ -300,6 +300,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     auto computeUnit = state.parser->compilationUnit();
     if (verbose) std::cout << "[verbose]   parse complete (" << state.tokens->getTokens().size() << " tokens)\n";
     auto* parserPtr = state.parser.get();
+    state.canonicalPath = canonicalStr;
     importedParseStates.push_back(std::move(state));
 
     // Recursively process nested imports before scanning this file's declarations
@@ -364,4 +365,147 @@ void MyCompilerLLVM::OptimizeModule(int optimizationLevel)
         MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
 
     MPM.run(*module, MAM);
+}
+
+bool MyCompilerLLVM::Analyze(const std::string& filePath,
+                              const std::string& importDir,
+                              const std::string& runtimeDirPath)
+{
+    MyListener::ClearGenericCaches();
+
+    sourceFileName = std::filesystem::path(filePath).filename().string();
+    importedFiles.insert(std::filesystem::weakly_canonical(filePath).string());
+    importSearchDir = importDir;
+    runtimeDir = runtimeDirPath;
+    verbose = false;
+    bool debugInfo = false;
+
+    platformValue = 64;
+
+    // Pre-populate compile-time macros
+    {
+        auto* fileGlobalStr = module->getOrInsertGlobal("__FILE__",
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), sourceFileName.size() + 1));
+        auto* fileConst = llvm::ConstantDataArray::getString(*context, sourceFileName, true);
+        if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(fileGlobalStr))
+        {
+            gv->setInitializer(fileConst);
+            gv->setConstant(true);
+            SetCompileTimeMacro("__FILE__", gv, "string");
+        }
+        auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
+        SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
+    }
+
+    // Auto-import core files (skipped on subsequent analyses — already in importedParseStates)
+    if (!runtimeDir.empty())
+    {
+        if (!skipRuntimeImport) {
+            auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+            if (std::filesystem::exists(runtimePath))
+                CompileImportedFile(runtimePath.string(), "runtime.cb");
+        }
+        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
+        if (std::filesystem::exists(interfacesPath))
+            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
+
+        auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
+        if (std::filesystem::exists(stringPath))
+            CompileImportedFile(stringPath.string(), "string.cb");
+    }
+
+    // Snapshot core files after first analysis so ResetForReanalysis() knows which entries to keep.
+    if (coreImportedFiles_.empty())
+        coreImportedFiles_ = importedFiles;
+
+    if (!std::filesystem::exists(filePath))
+    {
+        std::cerr << "Error: input file '" << filePath << "' does not exist.\n";
+        return false;
+    }
+
+    try
+    {
+        std::ifstream stream;
+        stream.open(filePath);
+        antlr4::ANTLRInputStream input(stream);
+        CFlatLexer lexer(&input);
+        antlr4::CommonTokenStream tokens(&lexer);
+        CFlatParser parser(&tokens);
+        tokens.fill();
+
+        auto computeUnit = parser.compilationUnit();
+
+        // Process top-level imports before scanning
+        if (auto* tu = computeUnit->translationUnit()) {
+            for (auto* decl : tu->externalDeclaration()) {
+                if (auto* imp = decl->importDeclaration()) {
+                    std::string raw = imp->StringLiteral()->getText();
+                    std::string importFilename = raw.substr(1, raw.size() - 2);
+                    if (!CompileImportedFile(filePath, importFilename))
+                        return false;
+                }
+            }
+        }
+
+        // Forward-ref scan
+        {
+            ForwardRefScanner scanner(this);
+            if (auto* tu = computeUnit->translationUnit())
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.ScanGenericTypeUses(decl);
+            if (auto* tu = computeUnit->translationUnit())
+                for (auto* decl : tu->externalDeclaration())
+                    scanner.ScanExternalDeclaration(decl);
+        }
+
+        // Code-gen walk
+        auto myListener = std::make_unique<MyListener>(&parser, this, sourceFileName);
+        auto walker = antlr4::tree::ParseTreeWalker();
+        walker.walk(myListener.get(), computeUnit);
+        stream.close();
+    }
+    catch (CompilerAbortException&) { return false; }
+    catch (ExpectedErrorReceived&)  { return false; }
+
+    return true;
+}
+
+void MyCompilerLLVM::ResetForReanalysis()
+{
+    module = std::make_unique<llvm::Module>("cflat", *context);
+    builder = std::make_unique<llvm::IRBuilder<>>(*context);
+
+    functionTable.clear();
+    dataStructures.clear();
+    enumBackingTypes.clear();
+    typeAliases.clear();
+    interfaceTable.clear();
+    interfaceParents.clear();
+    globalNamedVariable.clear();
+    namespaceTable.clear();
+    stringPool.clear();
+    stackNamedVariable.clear();
+    namespaceAliasTable.clear();
+    returnBlockTable.clear();
+    compileTimeMacros.clear();
+    stringLiteralLenByPtr.clear();
+    strConcatRegistered = false;
+    stringDtorRegistered = false;
+    lambdaCounter = 0;
+    expectedError.clear();
+    expectedErrorScopeDepth = SIZE_MAX;
+    currentFunction = nullptr;
+    returnCapture = std::nullopt;
+
+    // Restore importedFiles to just the core set; remove non-core parse states.
+    importedFiles = coreImportedFiles_;
+    auto it = importedParseStates.begin();
+    while (it != importedParseStates.end())
+    {
+        if (coreImportedFiles_.count(it->canonicalPath) == 0)
+            it = importedParseStates.erase(it);
+        else
+            ++it;
+    }
 }

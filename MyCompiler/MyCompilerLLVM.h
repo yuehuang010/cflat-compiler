@@ -19,6 +19,7 @@
 // ============================================================
 
 #include <deque>
+#include <functional>
 #include <ranges>
 #include <variant>
 #include <format>
@@ -51,7 +52,16 @@
 #include "ArgParser.h"
 #include "CompilerManager.h"
 
+class LspSymbolIndex;  // forward declaration for symbol sink
+
 struct ExpectedErrorReceived {};
+
+struct CompilerAbortException {
+    std::string message;
+    std::string file;
+    size_t line;
+    size_t column;
+};
 
 class MyCompilerLLVM
 {
@@ -354,6 +364,11 @@ public:
     void LogError(std::string message) const
     {
         std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
+        if (diagnosticSink_)
+        {
+            diagnosticSink_(sourceFileName, currentLine, currentColumn, message);
+            throw CompilerAbortException{ message, sourceFileName, currentLine, currentColumn };
+        }
         if (!expectedError.empty())
         {
             if (message.find(expectedError) != std::string::npos)
@@ -408,6 +423,7 @@ private:
     // these ANTLR parse trees and are accessed later during main-file instantiation.
     struct ImportedParseState
     {
+        std::string canonicalPath;   // absolute canonical path, used to identify core vs user imports
         std::unique_ptr<std::ifstream> stream;
         std::unique_ptr<antlr4::ANTLRInputStream> input;
         std::unique_ptr<CFlatLexer> lexer;
@@ -421,6 +437,9 @@ private:
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
+    std::function<void(const std::string&, size_t, size_t, const std::string&)> diagnosticSink_;
+    LspSymbolIndex* symbolSink_ = nullptr;
+    std::unordered_set<std::string> coreImportedFiles_;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
@@ -3696,8 +3715,16 @@ public:
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
 
+    using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg)>;
+    void SetDiagnosticSink(DiagnosticSink sink) { diagnosticSink_ = std::move(sink); }
+
+    void SetSymbolSink(LspSymbolIndex* sink) { symbolSink_ = sink; }
+    LspSymbolIndex* GetSymbolSink() const { return symbolSink_; }
+
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);
+    bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
+    void ResetForReanalysis();
 };
 
 // Defined here so MyCompilerLLVM is fully declared before DumpState() is called.

@@ -9,9 +9,13 @@
 #include "CompilerManager.h"
 #include "ArgParser.h"
 #include "Version.h"
+#include "LspServer.h"
 
 int main(int argc, char* argv[])
 {
+    if (argc >= 2 && std::string_view(argv[1]) == "lsp")
+        return RunLspServer(argc - 2, argv + 2);
+
     CompilerManager::Instance().InstallAssertHook();
 
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);

@@ -31,6 +31,7 @@
 #include "CFlatLexer.h"
 #include "CFlatBaseListener.h"
 #include "MyCompilerLLVM.h"
+#include "LspSymbolIndex.h"
 
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
@@ -281,6 +282,26 @@ private:
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwnedString);
 
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            std::string sig = returnType.TypeName + " " + name + "(";
+            bool first = true;
+            for (const auto& p : params)
+            {
+                // Skip implicit 'this' pointer (name convention: TypeName__)
+                if (p.VariableName.size() >= 2 && p.VariableName.compare(p.VariableName.size() - 2, 2, "__") == 0)
+                    continue;
+                if (!first) sig += ", ";
+                first = false;
+                sig += p.TypeName;
+                if (p.Pointer) sig += "*";
+                if (!p.VariableName.empty()) sig += " " + p.VariableName;
+            }
+            sig += ")";
+            s->Register(SymbolKind::Function, name, compiler->GetSourceFileName(),
+                        (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
+        }
+
         // Pre-declare overloads for default parameters
         int firstDefault = -1;
         for (int i = 0; i < (int)params.size(); i++)
@@ -321,6 +342,26 @@ private:
         }
 
         Compiler(ctx)->CreateInterfaceDefinition(name, parentNames, methods);
+
+        if (auto* s = Compiler(ctx)->GetSymbolSink())
+        {
+            std::string sig = "interface " + name;
+            if (!parentNames.empty())
+            {
+                sig += " : ";
+                for (size_t i = 0; i < parentNames.size(); ++i)
+                {
+                    if (i > 0) sig += ", ";
+                    sig += parentNames[i];
+                }
+            }
+            std::vector<std::string> memberNames;
+            for (const auto& m : methods)
+                memberNames.push_back(m.Name);
+            s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFileName(),
+                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                        sig, memberNames);
+        }
     }
 
     // Pre-declare a struct or class type shell, member functions, and destructor.
@@ -339,6 +380,11 @@ private:
 
         // Register opaque struct so the type is known for pointer/field use
         compiler->CreateStructType(typeName, {});
+
+        if (auto* s = compiler->GetSymbolSink())
+            s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFileName(),
+                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                        "struct " + typeName);
 
         // Pre-declare default constructor
         MyCompilerLLVM::TypeAndValue returnType{ .TypeName = typeName };
@@ -818,6 +864,24 @@ public:
         this->sourceFileName = filename;
     }
 
+    static void ClearGenericCaches()
+    {
+        genericStructTemplates.clear();
+        genericClassTemplates.clear();
+        genericStructTypeParams.clear();
+        instantiatedGenerics.clear();
+        genericStructConstraints.clear();
+        genericClassConstraints.clear();
+        genericInterfaceTemplates.clear();
+        genericInterfaceTypeParams.clear();
+        instantiatedInterfaces.clear();
+        genericFunctionTemplates.clear();
+        genericFunctionTypeParams.clear();
+        genericFunctionConstraints.clear();
+        instantiatedGenericFunctions.clear();
+        pendingInstantiations.clear();
+    }
+
     void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
     {
         auto* nameGid = ctx->genericIdentifier();
@@ -1015,7 +1079,13 @@ public:
         // If the target names a known type (interface or struct), register a type alias.
         // Otherwise treat it as a namespace alias.
         if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr)
+        {
             compiler->RegisterTypeAlias(alias, target);
+            if (auto* s = compiler->GetSymbolSink())
+                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFileName(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "using " + alias + " = " + target);
+        }
         else if (global_scope)
             compiler->RegisterNamespaceAlias(alias, target);
         else
@@ -1094,7 +1164,10 @@ public:
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                           compilerLLVM->expectedError);
                 compilerLLVM->expectedError.clear();
-                exit(1);
+                if (compilerLLVM->diagnosticSink_)
+                    throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
+                else
+                    exit(1);
             }
         }
 
@@ -1857,7 +1930,10 @@ public:
                         std::cout << std::format("FAIL: expected error '{}' did not occur\n",
                                                   compilerLLVM->expectedError);
                         compilerLLVM->expectedError.clear();
-                        exit(1);
+                        if (compilerLLVM->diagnosticSink_)
+                            throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
+                        else
+                            exit(1);
                     }
                 }
             }

@@ -159,6 +159,13 @@
     <ClInclude Include="MyCompilerLLVM.h" />
     <ClInclude Include="MyListener.h" />
     <ClCompile Include="MyCompiler.cpp" />
+    <ClCompile Include="JsonRpcLoop.cpp" />
+    <ClInclude Include="JsonRpcLoop.h" />
+    <ClCompile Include="LspServer.cpp" />
+    <ClInclude Include="LspServer.h" />
+    <ClCompile Include="LspSymbolIndex.cpp" />
+    <ClInclude Include="LspSymbolIndex.h" />
+    <ClInclude Include="LspTypes.h" />
     <None Include="core\cruntime.cb">
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</DeploymentContent>
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</DeploymentContent>
