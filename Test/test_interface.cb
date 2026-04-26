@@ -1,6 +1,7 @@
 import "test_helper.cb";
 
-// Interfaces
+// === Interfaces ===
+
 interface IShape
 {
     int area();
@@ -21,18 +22,13 @@ interface IWriter
     void write(string text);
 };
 
-interface ISeekable
-{
-    void seek(int pos);
-};
+// === Concrete classes ===
 
-// Concrete classes
 class Circle : IDrawable
 {
     int r = 0;
-
     int area() { return r * r * 3; }
-    void draw() { printf("Circle\n"); }
+    void draw() { printf("Circle r=%d\n", r); }
 };
 
 class Square : IShape
@@ -45,113 +41,312 @@ class Triangle : IDrawable
 {
     int b = 0;
     int area() { return b / 2; }
-    void draw() { printf("Triangle\n"); }
+    void draw() { printf("Triangle b=%d\n", b); }
 };
 
 class FileStream : IReader, IWriter
 {
     int id = 0;
 
-    string read()
-    {
-        printf("reading from stream %d\n", id);
-        return "data";
-    }
-
-    void write(string text)
-    {
-        printf("writing to stream %d\n", id);
-    }
+    string read()  { return "data"; }
+    void write(string text) { }
 };
 
-// Test 1: Type switch with concrete struct cases
-bool testConcreteStructDispatch()
+// ── Test 1: VTable dispatch ──────────────────────────────────────────────────
+// Interface method calls route to the correct concrete implementation.
+
+bool testVTableDispatch()
 {
     bool result = true;
 
-    IShape c = new Circle();
-    IShape sq = new Square();
+    Circle c;
+    c.r = 5;
+    IShape sc = c;
+    result &= Test("vtable_circle_area",   sc.area(), 75);   // 5*5*3
 
-    // Verify concrete struct case matching
-    // This tests that 'case StructName:' matches the correct type
-    // We verify this through the dispatch logic (switch takes correct path)
+    Square sq;
+    sq.s = 4;
+    IShape ss = sq;
+    result &= Test("vtable_square_area",   ss.area(), 16);   // 4*4
 
-    result &= Test("concrete struct dispatch works", true, true);
+    Triangle t;
+    t.b = 10;
+    IShape st = t;
+    result &= Test("vtable_triangle_area", st.area(), 5);    // 10/2
+
+    // Heap-allocated — interface holds pointer to heap object
+    Circle* hc = new Circle();
+    hc.r = 6;
+    IShape shc = hc;
+    result &= Test("vtable_heap_circle_area", shc.area(), 108);  // 6*6*3
+    delete hc;
 
     return result;
 }
 
-// Test 2: Type switch with interface cases
-bool testInterfaceDispatch()
+// ── Test 2: is operator ──────────────────────────────────────────────────────
+// Reports the concrete type behind an interface value.
+
+bool testIsOperator()
 {
     bool result = true;
 
-    IShape sq = new Square();
-    IShape c = new Circle();
+    Circle c;
+    c.r = 3;
+    IShape sc = c;
 
-    // Square doesn't implement IDrawable, so dispatch to default
-    // Circle does implement IDrawable, so dispatch to case
+    Square sq;
+    sq.s = 2;
+    IShape ss = sq;
 
-    result &= Test("interface dispatch works", true, true);
+    Triangle t;
+    t.b = 4;
+    IShape st = t;
+
+    result &= Test("is_circle_true",     sc is Circle,   true);
+    result &= Test("is_circle_false_sq", ss is Circle,   false);
+    result &= Test("is_square_true",     ss is Square,   true);
+    result &= Test("is_square_false_c",  sc is Square,   false);
+    result &= Test("is_triangle_true",   st is Triangle, true);
+    result &= Test("is_triangle_false",  sc is Triangle, false);
 
     return result;
 }
 
-// Test 3: Interface inheritance through switch
-bool testInterfaceInheritance()
+// ── Test 3: as operator — downcast to concrete struct ────────────────────────
+// Returns a non-null pointer on match, null on mismatch.
+
+bool testAsToStruct()
 {
     bool result = true;
 
-    IShape c = new Circle();
+    Circle c;
+    c.r = 7;
+    IShape sc = c;
 
-    // Circle implements IDrawable, which inherits from IShape
-    // So Circle should match both case IDrawable and case IShape
-    result &= Test("interface inheritance dispatch", true, true);
+    Circle* cp = sc as Circle;
+    result &= Test("as_circle_nonnull",      cp != nullptr, true);
+    if (cp != nullptr)
+        result &= Test("as_circle_area_via_ptr", cp.r * cp.r * 3, 147);  // 7*7*3
+
+    Square* sp = sc as Square;
+    result &= Test("as_circle_as_square_null", sp == nullptr, true);
+
+    Square sq;
+    sq.s = 6;
+    IShape ss = sq;
+
+    Square* sp2 = ss as Square;
+    result &= Test("as_square_nonnull",        sp2 != nullptr, true);
+    if (sp2 != nullptr)
+        result &= Test("as_square_s_via_ptr",  sp2.s * sp2.s, 36);
+
+    Circle* cp2 = ss as Circle;
+    result &= Test("as_square_as_circle_null", cp2 == nullptr, true);
 
     return result;
 }
 
-// Test 4: Multiple interface implementations
+// ── Test 4: as operator — interface-to-interface cast ────────────────────────
+// Casting IShape (Circle) to IDrawable should succeed; calling the inherited
+// area() and own draw() on the result should dispatch correctly.
+
+bool testAsToInterface()
+{
+    bool result = true;
+
+    Circle c;
+    c.r = 4;
+    IShape sc = c;
+
+    // Circle implements IDrawable — cast must succeed
+    IDrawable d = sc as IDrawable;
+    result &= Test("as_iface_is_circle",     d is Circle, true);
+    result &= Test("as_iface_area_inherited", d.area(),   48);   // 4*4*3
+
+    // Direct assignment from Circle to IDrawable (no intermediate IShape)
+    Circle c2;
+    c2.r = 3;
+    IDrawable d2 = c2;
+    result &= Test("direct_assign_to_idrawable", d2.area(), 27);  // 3*3*3
+    result &= Test("direct_idrawable_is_circle", d2 is Circle, true);
+
+    // Triangle also implements IDrawable
+    Triangle t;
+    t.b = 8;
+    IDrawable dt = t;
+    result &= Test("triangle_as_idrawable_area", dt.area(), 4);   // 8/2
+    result &= Test("triangle_idrawable_is_triangle", dt is Triangle, true);
+
+    return result;
+}
+
+// ── Test 5: switch on concrete type ─────────────────────────────────────────
+// Dispatches to the matching case by runtime concrete type.
+
+bool testSwitchConcreteType()
+{
+    bool result = true;
+
+    Circle c;
+    c.r = 2;
+    IShape sc = c;
+
+    Square sq;
+    sq.s = 3;
+    IShape ss = sq;
+
+    Triangle t;
+    t.b = 6;
+    IShape st = t;
+
+    int kind = 0;
+
+    switch (sc)
+    {
+        case Circle:   kind = 1; break;
+        case Square:   kind = 2; break;
+        case Triangle: kind = 3; break;
+        default:       kind = 0; break;
+    }
+    result &= Test("switch_circle",   kind, 1);
+
+    switch (ss)
+    {
+        case Circle:   kind = 1; break;
+        case Square:   kind = 2; break;
+        case Triangle: kind = 3; break;
+        default:       kind = 0; break;
+    }
+    result &= Test("switch_square",   kind, 2);
+
+    switch (st)
+    {
+        case Circle:   kind = 1; break;
+        case Square:   kind = 2; break;
+        case Triangle: kind = 3; break;
+        default:       kind = 0; break;
+    }
+    result &= Test("switch_triangle", kind, 3);
+
+    return result;
+}
+
+// ── Test 6: switch on interface case ────────────────────────────────────────
+// A case can name an interface; any concrete type implementing it matches.
+
+bool testSwitchInterfaceCase()
+{
+    bool result = true;
+
+    Circle c;
+    c.r = 1;
+    IShape sc = c;       // Circle implements IDrawable
+
+    Square sq;
+    sq.s = 1;
+    IShape ss = sq;      // Square does NOT implement IDrawable
+
+    Triangle t;
+    t.b = 2;
+    IShape st = t;       // Triangle implements IDrawable
+
+    int hit = 0;
+
+    switch (sc)
+    {
+        case IDrawable: hit = 1; break;
+        default:        hit = 0; break;
+    }
+    result &= Test("switch_iface_circle_matches",   hit, 1);
+
+    switch (ss)
+    {
+        case IDrawable: hit = 1; break;
+        default:        hit = 0; break;
+    }
+    result &= Test("switch_iface_square_no_match",  hit, 0);
+
+    switch (st)
+    {
+        case IDrawable: hit = 1; break;
+        default:        hit = 0; break;
+    }
+    result &= Test("switch_iface_triangle_matches", hit, 1);
+
+    return result;
+}
+
+// ── Test 7: switch default case ─────────────────────────────────────────────
+// When no type case matches, execution goes to default.
+
+bool testSwitchDefault()
+{
+    bool result = true;
+
+    Square sq;
+    sq.s = 5;
+    IShape ss = sq;
+
+    int hit = 0;
+    switch (ss)
+    {
+        case Circle:   hit = 1; break;
+        case Triangle: hit = 2; break;
+        default:       hit = 3; break;
+    }
+    result &= Test("switch_default_hit", hit, 3);
+
+    // No default: execution falls through to resume block
+    hit = 0;
+    switch (ss)
+    {
+        case Circle:   hit = 1; break;
+        case Triangle: hit = 2; break;
+    }
+    result &= Test("switch_no_default_no_match", hit, 0);
+
+    return result;
+}
+
+// ── Test 8: multiple interface implementations ───────────────────────────────
+// FileStream implements both IReader and IWriter; each interface dispatches
+// correctly and `is` works through either interface fat pointer.
+
 bool testMultipleInterfaces()
 {
     bool result = true;
 
-    IReader reader = new FileStream();
+    FileStream fs;
+    fs.id = 42;
 
-    // FileStream implements both IReader and IWriter
-    // Dispatch should work for both interfaces
+    IReader reader = fs;
+    IWriter writer = fs;
 
-    result &= Test("multiple interface dispatch", true, true);
+    string s = reader.read();
+    result &= Test("multi_iface_read",                  s, "data");
 
-    return result;
-}
+    result &= Test("multi_iface_is_filestream_reader",  reader is FileStream, true);
+    result &= Test("multi_iface_is_filestream_writer",  writer is FileStream, true);
 
-// Test 5: Type switch with default case
-bool testDefaultCase()
-{
-    bool result = true;
+    // Downcast via as from each interface view
+    FileStream* rfp = reader as FileStream;
+    FileStream* wfp = writer as FileStream;
+    result &= Test("multi_iface_as_from_reader_nonnull", rfp != nullptr, true);
+    result &= Test("multi_iface_as_from_writer_nonnull", wfp != nullptr, true);
+    if (rfp != nullptr)
+        result &= Test("multi_iface_field_via_reader_ptr", rfp.id, 42);
+    if (wfp != nullptr)
+        result &= Test("multi_iface_field_via_writer_ptr", wfp.id, 42);
 
-    IShape sq = new Square();
-
-    // When no case matches, default case is taken
-    result &= Test("default case in type switch", true, true);
-
-    return result;
-}
-
-// Test 6: Mixed struct type dispatch
-bool testMixedStructTypes()
-{
-    bool result = true;
-
-    IShape c = new Circle();
-    IShape t = new Triangle();
-    IShape sq = new Square();
-
-    // All three classes implement different subsets of interfaces
-    // Verify dispatch works for all of them
-
-    result &= Test("mixed struct type dispatch", true, true);
+    // Switch via IReader view
+    int kind = 0;
+    switch (reader)
+    {
+        case FileStream: kind = 1; break;
+        default:         kind = 0; break;
+    }
+    result &= Test("multi_iface_switch_reader", kind, 1);
 
     return result;
 }
@@ -160,16 +355,18 @@ extern int main()
 {
     bool allPassed = true;
 
-    allPassed &= testConcreteStructDispatch();
-    allPassed &= testInterfaceDispatch();
-    allPassed &= testInterfaceInheritance();
+    allPassed &= testVTableDispatch();
+    allPassed &= testIsOperator();
+    allPassed &= testAsToStruct();
+    allPassed &= testAsToInterface();
+    allPassed &= testSwitchConcreteType();
+    allPassed &= testSwitchInterfaceCase();
+    allPassed &= testSwitchDefault();
     allPassed &= testMultipleInterfaces();
-    allPassed &= testDefaultCase();
-    allPassed &= testMixedStructTypes();
 
     if (allPassed)
     {
-        printf("All interface switch tests passed.\n");
+        printf("All interface tests passed.\n");
         return 0;
     }
     return 1;
