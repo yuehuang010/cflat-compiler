@@ -3,6 +3,7 @@
   "version": "1.0",
   "dependencies": [
     "antlr4",
-    "llvm"
+    "llvm",
+    "nlohmann-json"
   ]
 }
