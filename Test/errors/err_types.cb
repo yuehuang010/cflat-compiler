@@ -1,0 +1,65 @@
+// Type errors: unknown types, identifiers, fields, is/as casts
+
+interface IShape { int Area(); };
+class Circle : IShape
+{
+    int radius = 0;
+    int Area() { return radius * radius; }
+};
+
+struct Foo
+{
+    int x = 0;
+};
+
+expect_error("unknown type") {
+    int test_unknown_type()
+    {
+        Blorf x;
+        return 0;
+    }
+}
+
+expect_error("Undefined variable foo.") {
+    int test_unknown_identifier()
+    {
+        int x = foo + 1;
+        return x;
+    }
+}
+
+expect_error("Unknown identifier") {
+    int test_unknown_field()
+    {
+        Foo f;
+        int y = f.bogusField;
+        return 0;
+    }
+}
+
+expect_error("is not a known struct type for 'is' check") {
+    int test_is_unknown_type()
+    {
+        Circle c;
+        c.radius = 5;
+        IShape shape = c;
+        bool b = shape is GhostType;
+        return 0;
+    }
+}
+
+expect_error("is not a known struct type for 'as' cast") {
+    int test_as_unknown_type()
+    {
+        Circle c;
+        c.radius = 5;
+        IShape shape = c;
+        Circle* gp = shape as GhostType;
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

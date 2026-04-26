@@ -1,0 +1,50 @@
+// Statement errors: switch, case, if const, nullable
+
+expect_error("case value must be a constant integer or string literal") {
+    int test_case_not_constant()
+    {
+        int y = 5;
+        int z = 1;
+        switch (y) {
+            case z:
+                return 1;
+            default:
+                break;
+        }
+        return 0;
+    }
+}
+
+expect_error("switch expression must be an integer type") {
+    int test_switch_non_integer()
+    {
+        float f = 1.5f;
+        switch (f) {
+            default:
+                break;
+        }
+        return 0;
+    }
+}
+
+expect_error("compile-time constant expression") {
+    int test_if_const_not_constant()
+    {
+        int x = 1;
+        if const (x) { }
+        return 0;
+    }
+}
+
+expect_error("nullable '?' is not allowed on primitive type 'int'") {
+    int test_nullable_primitive()
+    {
+        int? x = 0;
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

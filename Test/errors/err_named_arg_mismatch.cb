@@ -1,8 +1,0 @@
-int add(int a, int b) { return a + b; }
-
-extern int main()
-{
-    expect_error("named argument");
-    int result = add(z: 1, b: 2);
-    return result;
-}

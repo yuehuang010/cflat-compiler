@@ -1,0 +1,69 @@
+// Generic constraint violations: struct, function, and multi-constraint
+
+interface IScorer
+{
+    int Score();
+};
+
+interface ILabeled
+{
+    int Label();
+};
+
+struct BestOf<T> where T : IScorer
+{
+    T first = default;
+};
+
+int MaxScore<T>(T* a, T* b) where T : IScorer
+{
+    int sa = a.Score();
+    int sb = b.Score();
+    return sa > sb ? sa : sb;
+}
+
+struct TaggedBest<T> where T : IScorer, T : ILabeled
+{
+    T first = default;
+};
+
+class PartialType : IScorer
+{
+    int x = 0;
+    int Score() { return x; }
+};
+
+struct Plain
+{
+    int x = 0;
+};
+
+expect_error("does not implement 'IScorer'") {
+    int test_constraint_struct()
+    {
+        BestOf<Plain> f;
+        return 0;
+    }
+}
+
+expect_error("does not implement 'IScorer'") {
+    int test_constraint_func()
+    {
+        Plain p1;
+        Plain p2;
+        return MaxScore<Plain>(&p1, &p2);
+    }
+}
+
+expect_error("does not implement 'ILabeled'") {
+    int test_constraint_multi()
+    {
+        TaggedBest<PartialType> tb;
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

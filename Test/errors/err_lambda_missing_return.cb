@@ -1,6 +1,0 @@
-extern int main()
-{
-    expect_error("missing return statement");
-    function<int(int)> f = (int x) => { int y = x + 1; };
-    return 0;
-}

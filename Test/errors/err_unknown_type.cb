@@ -1,6 +1,0 @@
-extern int main()
-{
-    expect_error("unknown type");
-    Blorf x;
-    return 0;
-}
