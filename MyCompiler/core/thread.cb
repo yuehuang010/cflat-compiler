@@ -4,15 +4,11 @@ extern void  CloseHandle(void* handle);
 
 // Args packet allocated with malloc so thread infrastructure bypasses any
 // per-program tracked allocator.
-// sizeof(__ThreadArgs) == 16: function pointer (8) + void* (8) on x64.
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
 };
 
-// CreateThread's fn parameter uses function<int(__ThreadArgs*)> so the
-// trampoline receives the args packet as a struct pointer, avoiding CFlat's
-// extra load that applies to void* parameters.
 extern void* CreateThread(void* attr, i64 stackSize, function<int(__ThreadArgs*)> fn, void* param, i32 flags, i32* id);
 
 // Win32 LPTHREAD_START_ROUTINE. Receives __ThreadArgs* directly from Win32,
@@ -22,15 +18,15 @@ int __thread_trampoline(__ThreadArgs* args) {
 }
 
 struct Thread {
-    void* _handle = nullptr;
-    void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()
+    void* _handle        = nullptr;
+    __ThreadArgs* _args  = nullptr;  // owns the __ThreadArgs packet; freed in join()
     i32   _exitCode = 0;
 
     void start(function<int(void*)> fn, void* ctx) {
-        __ThreadArgs* args = (__ThreadArgs*)malloc(16);  // function ptr (8) + void* (8)
+        __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
         args->fn  = fn;
         args->ctx = ctx;
-        _args = args;  // save for freeing in join()
+        _args = args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
     }
@@ -41,7 +37,7 @@ struct Thread {
         i32 code = 0;
         GetExitCodeThread(_handle, &code);
         CloseHandle(_handle);
-        free(_args);
+        free((void*)_args);
         _handle   = nullptr;
         _args     = nullptr;
         _exitCode = code;

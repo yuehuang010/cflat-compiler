@@ -3435,7 +3435,7 @@ public:
                 }
 
                 // Check if this looks like a type name (alphanumeric, dots, underscores, generics)
-                bool likelyType = !postfixText.empty() && std::isalpha(postfixText[0]);
+                bool likelyType = !postfixText.empty() && (std::isalpha(postfixText[0]) || postfixText[0] == '_');
                 for (char c : postfixText)
                 {
                     if (!std::isalnum(c) && c != '_' && c != '.' && c != '<' && c != '>' && c != '*')

@@ -1,5 +1,20 @@
 // Comprehensive test for sizeof() and alignof()
 
+struct _UnderscoreStruct {
+    int x;
+    int y;
+};
+
+struct __DoubleUnderscoreStruct {
+    void* a = nullptr;
+    void* b = nullptr;
+};
+
+struct FuncPtrFieldStruct {
+    function<int(void*)> fn = nullptr;
+    void* ctx = nullptr;
+};
+
 struct Point {
     int x;
     int y;
@@ -156,6 +171,17 @@ extern int main() {
     } else {
         return 10;
     }
+
+    // Underscore-prefixed struct names — sizeof must handle identifiers starting with '_'
+    i64 sizeof_underscore = sizeof(_UnderscoreStruct);
+    if (sizeof_underscore != 8) return 11;
+
+    i64 sizeof_dunder = sizeof(__DoubleUnderscoreStruct);
+    if (sizeof_dunder != 16) return 11;
+
+    // Struct with function<T> pointer field — sizeof must return correct size
+    i64 sizeof_funcptr_field = sizeof(FuncPtrFieldStruct);
+    if (sizeof_funcptr_field != 16) return 12;
 
     return 0;
 }
