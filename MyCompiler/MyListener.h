@@ -3400,9 +3400,77 @@ public:
         auto postFixCtx = ctx->postfixExpression();
         auto castExpCtx = ctx->castExpression();
         auto unaryOperator = ctx->unaryOperator();
+        auto typeNameCtx = ctx->typeName();
 
+        // Handle sizeof/alignof as prefix: the parser may match "sizeof" and "(TypeName)"
+        // separately, where the "(TypeName)" becomes a postfixExpression (function call syntax)
         if (postFixCtx != nullptr)
         {
+            std::string text = ctx->getText();
+            bool prefixSizeof = text.find("sizeof(") == 0;
+            bool prefixAlignof = text.find("alignof(") == 0;
+
+            if ((prefixSizeof || prefixAlignof) && typeNameCtx == nullptr)
+            {
+                // The parser matched sizeof/alignof as a prefix on a postfixExpression.
+                // Extract the type name from the text (e.g., "sizeof(Point)" -> "Point")
+                std::string postfixText = postFixCtx->getText();
+
+                // Remove outer parentheses if present
+                if (!postfixText.empty() && postfixText[0] == '(' && postfixText.back() == ')')
+                {
+                    postfixText = postfixText.substr(1, postfixText.length() - 2);
+                }
+
+                // Check if this looks like a type name (alphanumeric, dots, underscores, generics)
+                bool likelyType = !postfixText.empty() && std::isalpha(postfixText[0]);
+                for (char c : postfixText)
+                {
+                    if (!std::isalnum(c) && c != '_' && c != '.' && c != '<' && c != '>' && c != '*')
+                    {
+                        likelyType = false;
+                        break;
+                    }
+                }
+
+                if (likelyType)
+                {
+                    // Try to parse as a type
+                    MyCompilerLLVM::TypeAndValue typeValue;
+                    typeValue.TypeName = postfixText;
+
+                    // Check for trailing * (pointer)
+                    if (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
+                    {
+                        typeValue.Pointer = true;
+                        typeValue.TypeName.pop_back();
+                    }
+
+                    auto* llvmType = compiler->GetType(typeValue, nullptr, true);
+                    if (llvmType && !llvmType->isVoidTy())  // Void is a valid type but let's use basic validity check
+                    {
+                        llvm::Value* result;
+                        if (prefixSizeof)
+                        {
+                            result = compiler->GetTypeSizeBytes(llvmType);
+                        }
+                        else
+                        {
+                            result = compiler->GetTypeAlignBytes(llvmType);
+                        }
+
+                        if (result)
+                        {
+                            MyCompilerLLVM::NamedVariable namedVar;
+                            namedVar.Primary = result;
+                            namedVar.TypeAndValue.TypeName = "i64";
+                            namedVar.Storage = nullptr;
+                            return namedVar;
+                        }
+                    }
+                }
+            }
+
             return ParsePostfixExpression(postFixCtx);
         }
         else if (auto* newCtx = ctx->newExpression())
@@ -3497,6 +3565,51 @@ public:
 
             // TODO, unaryOperator
             return namedVar;
+        }
+        else if (auto* typeNameCtx = ctx->typeName())
+        {
+            // Handle sizeof(typeName) or alignof(typeName)
+            std::string text = ctx->getText();
+
+            // Check if this is a sizeof or alignof expression
+            bool isSizeof = text.find("sizeof(") != std::string::npos;
+            bool isAlignof = text.find("alignof(") != std::string::npos;
+
+            if (isSizeof || isAlignof)
+            {
+                // Parse the type name to get its LLVM type
+                auto typeValue = ParseTypeName(typeNameCtx);
+                if (typeValue.TypeName.empty())
+                {
+                    LogErrorContext(ctx, "sizeof/alignof: could not determine type");
+                    return {};
+                }
+
+                auto* llvmType = compiler->GetType(typeValue, nullptr, true);
+                if (!llvmType)
+                {
+                    LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");
+                    return {};
+                }
+
+                // Get the size or alignment value
+                llvm::Value* result;
+                if (isSizeof)
+                {
+                    result = compiler->GetTypeSizeBytes(llvmType);
+                }
+                else
+                {
+                    result = compiler->GetTypeAlignBytes(llvmType);
+                }
+
+                // Return as a named variable with i64 type
+                MyCompilerLLVM::NamedVariable namedVar;
+                namedVar.Primary = result;
+                namedVar.TypeAndValue.TypeName = "i64";
+                namedVar.Storage = nullptr;
+                return namedVar;
+            }
         }
 
         LogErrorContext(ctx, "Unary expression has no recognized form.");

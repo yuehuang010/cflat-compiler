@@ -1,0 +1,161 @@
+// Comprehensive test for sizeof() and alignof()
+
+struct Point {
+    int x;
+    int y;
+};
+
+struct ComplexStruct {
+    char a;
+    int b;
+    double c;
+    Point p;
+};
+
+struct EmptyStruct {
+};
+
+struct SingleFieldStruct {
+    i64 value;
+};
+
+struct PointerFieldStruct {
+    int* ptr;
+    char* str_ptr;
+};
+
+struct NestedStruct {
+    Point outer;
+    ComplexStruct inner;
+};
+
+struct GenericContainer {
+    i32 count;
+    i64 data;
+};
+
+interface IReadable {
+    int Read();
+};
+
+struct Reader {
+    int value;
+};
+
+// Helper to print values
+void PrintSize(string name, i64 size) {
+    // Test output - can be verified manually
+}
+
+extern int main() {
+    // Primitive types
+    i64 sizeof_int = sizeof(int);
+    i64 sizeof_char = sizeof(char);
+    i64 sizeof_double = sizeof(double);
+    i64 sizeof_bool = sizeof(bool);
+    i64 sizeof_i8 = sizeof(i8);
+    i64 sizeof_i16 = sizeof(i16);
+    i64 sizeof_i32 = sizeof(i32);
+    i64 sizeof_i64 = sizeof(i64);
+    i64 sizeof_u8 = sizeof(u8);
+    i64 sizeof_u16 = sizeof(u16);
+    i64 sizeof_u32 = sizeof(u32);
+    i64 sizeof_u64 = sizeof(u64);
+    i64 sizeof_float = sizeof(float);
+
+    // Verify expected sizes for common types
+    // On x64: char/i8/u8 = 1, i16/u16 = 2, int/i32/u32/float = 4, i64/u64/double = 8
+    if (sizeof_int != 4) return 1;
+    if (sizeof_char != 1) return 1;
+    if (sizeof_double != 8) return 1;
+    if (sizeof_bool != 1) return 1;
+    if (sizeof_i8 != 1) return 1;
+    if (sizeof_i16 != 2) return 1;
+    if (sizeof_i32 != 4) return 1;
+    if (sizeof_i64 != 8) return 1;
+    if (sizeof_u8 != 1) return 1;
+    if (sizeof_u16 != 2) return 1;
+    if (sizeof_u32 != 4) return 1;
+    if (sizeof_u64 != 8) return 1;
+    if (sizeof_float != 4) return 1;
+
+    // Pointer types - all same size on x64 (8 bytes)
+    i64 sizeof_int_ptr = sizeof(int*);
+    i64 sizeof_char_ptr = sizeof(char*);
+    i64 sizeof_double_ptr = sizeof(double*);
+    if (sizeof_int_ptr != 8) return 2;
+    if (sizeof_char_ptr != 8) return 2;
+    if (sizeof_double_ptr != 8) return 2;
+
+    // Struct types
+    i64 sizeof_point = sizeof(Point);
+    i64 sizeof_complex = sizeof(ComplexStruct);
+    i64 sizeof_empty = sizeof(EmptyStruct);
+    i64 sizeof_single = sizeof(SingleFieldStruct);
+    i64 sizeof_pointer_field = sizeof(PointerFieldStruct);
+    i64 sizeof_nested = sizeof(NestedStruct);
+
+    // Point: int(4) + int(4) = 8 bytes
+    if (sizeof_point != 8) return 3;
+
+    // SingleFieldStruct: i64 = 8 bytes
+    if (sizeof_single != 8) return 3;
+
+    // PointerFieldStruct: ptr(8) + ptr(8) = 16 bytes
+    if (sizeof_pointer_field != 16) return 3;
+
+    // EmptyStruct: LLVM gives empty structs a size of 0, which is valid
+    if (sizeof_empty < 0) return 3;  // Just check it's non-negative
+
+    // alignof() tests - verify they return positive values
+    i64 align_int = alignof(int);
+    i64 align_char = alignof(char);
+    i64 align_double = alignof(double);
+    i64 align_i64 = alignof(i64);
+
+    // Alignments should be positive and reasonable (1, 2, 4, 8, etc.)
+    if (align_int <= 0) return 4;
+    if (align_char <= 0) return 4;
+    if (align_double <= 0) return 4;
+    if (align_i64 <= 0) return 4;
+
+    // Alignment of struct types
+    i64 align_point = alignof(Point);
+    i64 align_pointer_field = alignof(PointerFieldStruct);
+
+    // Struct alignments should be positive
+    if (align_point <= 0) return 4;
+    if (align_pointer_field <= 0) return 4;
+
+    // Pointer type sizes and alignment
+    i64 sizeof_point_ptr = sizeof(Point*);
+    i64 align_point_ptr = alignof(Point*);
+    if (sizeof_point_ptr != 8) return 5;
+    if (align_point_ptr != 8) return 5;
+
+    // Complex types with nesting
+    i64 sizeof_nested_struct = sizeof(NestedStruct);
+    if (sizeof_nested_struct < sizeof(Point)) return 6;
+
+    // Test with multiple calls to ensure consistency
+    i64 size1 = sizeof(ComplexStruct);
+    i64 size2 = sizeof(ComplexStruct);
+    if (size1 != size2) return 7;
+
+    // Test with casts and combinations
+    i64 total = sizeof(int) + sizeof(char) + sizeof(double);
+    if (total != (4 + 1 + 8)) return 8;
+
+    // Test alignment in expressions - just verify we can do arithmetic on alignof results
+    i64 align_sum = alignof(int) + alignof(double);
+    if (align_sum <= 0) return 9;
+
+    // Test in comparison expressions
+    if (sizeof(i64) >= sizeof(int)) {
+        // Expected: true (8 >= 4)
+    } else {
+        return 10;
+    }
+
+    return 0;
+}

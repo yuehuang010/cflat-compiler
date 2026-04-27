@@ -1546,9 +1546,27 @@ public:
     /// Returns i64 sizeof(type) as a compile-time constant.
     llvm::Value* GetTypeSizeBytes(llvm::Type* type)
     {
+        if (!type)
+        {
+            LogError("GetTypeSizeBytes: null type pointer");
+            return nullptr;
+        }
         const llvm::DataLayout& dl = module->getDataLayout();
         uint64_t size = dl.getTypeAllocSize(type);
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), size);
+    }
+
+    /// Returns i64 alignof(type) as a compile-time constant.
+    llvm::Value* GetTypeAlignBytes(llvm::Type* type)
+    {
+        if (!type)
+        {
+            LogError("GetTypeAlignBytes: null type pointer");
+            return nullptr;
+        }
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t align = dl.getABITypeAlign(type).value();
+        return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), align);
     }
 
     void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
