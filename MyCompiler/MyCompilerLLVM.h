@@ -246,6 +246,7 @@ public:
         CFlatParser::AssignmentExpressionContext* DefaultValue = nullptr;
 
         bool external = false;
+        bool threadLocal = false;
     };
 
     struct NamedVariable
@@ -1615,7 +1616,7 @@ public:
         }
     }
 
-    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue)
+    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false)
     {
         llvm::Type* destinationType = GetType(typeValue);
         if (initValue)
@@ -1649,6 +1650,9 @@ public:
             initValue, // Initial value
             typeValue.VariableName // Name
         );
+
+        if (threadLocal)
+            gVar->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
 
         globalNamedVariable[typeValue.VariableName] = gVar;
 

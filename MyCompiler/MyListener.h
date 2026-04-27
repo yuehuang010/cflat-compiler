@@ -202,6 +202,7 @@ private:
             else if (storageSpec)
             {
                 declType.external = storageSpec->Extern() != nullptr;
+                declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
             }
         }
         return declType;
@@ -810,6 +811,7 @@ private:
             else if (storageSpec)
             {
                 declType.external = storageSpec->Extern() != nullptr;
+                declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
             }
         }
 
@@ -2433,10 +2435,12 @@ public:
                 if (global_scope)
                 {
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
-                    compiler->CreateGlobalVariable(typeAndValue, constant);
+                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal);
                 }
                 else
                 {
+                    if (typeAndValue.threadLocal)
+                        LogErrorContext(direct, "thread_local is only allowed on global variables.");
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line);
                     allocList.push_back(std::pair(name, alloc));
 

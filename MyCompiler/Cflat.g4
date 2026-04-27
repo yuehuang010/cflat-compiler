@@ -216,7 +216,7 @@ storageClassSpecifier
     : 'typedef'
     | 'extern'
     | 'static'
-    | 'thread_local'
+    | ThreadLocal
     | 'register'
     ;
 
@@ -815,7 +815,7 @@ Noreturn
     ;
 
 ThreadLocal
-    : '_Thread_local'
+    : 'thread_local'
     ;
 
 New
