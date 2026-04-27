@@ -1,12 +1,4 @@
-
-extern bool printOnPass;
-
-int Test(const char* name, int actual, int expected)
-{
-    if (actual == expected) { if (printOnPass) printf("%s passed.\n", name); return 1; }
-    printf("%s MISMATCH (expected %d got %d).\n", name, expected, actual);
-    return 0;
-}
+import "test_helper.cb";
 
 // ── Basic static method on a struct ──────────────────────────────────────────
 

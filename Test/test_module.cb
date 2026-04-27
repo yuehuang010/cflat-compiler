@@ -1,17 +1,5 @@
 import "testmodule.c";
-
-extern bool printOnPass;
-
-int Test(const char* testName, int actual, int expected)
-{
-    if (expected == actual)
-    {
-        if (printOnPass) printf("%s passed.\n", testName);
-        return 1;
-    }
-    printf("%s mismatch: expected '%d' but got '%d'.\n", testName, expected, actual);
-    return 0;
-}
+import "test_helper.cb";
 
 bool testImportedFunctions()
 {

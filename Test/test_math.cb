@@ -1,29 +1,19 @@
-// Test math utilities
+import "test_helper.cb";
 import "math.cb";
 
 extern int main()
 {
+    int passed = 0;
+    int total = 0;
     i32 a = 5;
     i32 b = 3;
     i32 c = 7;
 
-    // Test that basic comparisons work
-    printf("Testing a < b: 5 < 3\n");
-    if (a < b) { printf("FAIL: 5 < 3\n"); return 1; }
-    printf("Testing !(b < c): !(3 < 7)\n");
-    if (!(b < c)) { printf("FAIL: !(3 < 7)\n"); return 1; }
+    total++; passed += Test("a_not_less_than_b", a < b, false);
+    total++; passed += Test("b_less_than_c",     b < c, true);
+    total++; passed += Test("min(3,7)=3",        Math.min(b, c), (i32)b);
+    total++; passed += Test("max(3,7)=7",        Math.max(b, c), (i32)c);
 
-    // Test min/max
-    printf("Testing min(3, 7) = 3\n");
-    i32 minRes = Math.min(b, c);
-    printf("min result: %d\n", minRes);
-    if (minRes != b) { printf("FAIL: min(3, 7) != 3\n"); return 1; }
-
-    printf("Testing max(3, 7) = 7\n");
-    i32 maxRes = Math.max(b, c);
-    printf("max result: %d\n", maxRes);
-    if (maxRes != c) { printf("FAIL: max(3, 7) != 7\n"); return 1; }
-
-    printf("All math tests passed!\n");
-    return 0;
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
