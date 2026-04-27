@@ -3344,17 +3344,28 @@ public:
             auto destTypeName = ParseTypeName(typeName);
             auto type = compiler->GetType(destTypeName);
 
-            if (namedVar.Storage)
+            // Load with the source type first so we read the correct number of bytes,
+            // then cast to the destination type. The old code loaded directly with the
+            // destination type, which reads too many bytes from narrower fields
+            // (e.g., i64 load from a u32 field corrupts the adjacent field).
+            if (namedVar.Primary == nullptr && namedVar.Storage != nullptr)
             {
-                // If storage is available, then load it with new type.
-                namedVar.Primary = compiler->CreateLoad(type, namedVar.Storage);
-            }
-            else
-            {
-                // Otherwise cast it.
-                namedVar.Primary = compiler->CreateCast(namedVar.Primary, type);
+                // Pointer parameters use Storage = &arg (the parameter register value),
+                // not an alloca. Loading from the parameter register would dereference
+                // the pointer, not read the pointer itself. Use the register value directly.
+                if (llvm::isa<llvm::Argument>(namedVar.Storage))
+                    namedVar.Primary = namedVar.Storage;
+                else
+                {
+                    auto srcType = compiler->GetType(namedVar.TypeAndValue);
+                    namedVar.Primary = compiler->CreateLoad(srcType, namedVar.Storage);
+                }
+                namedVar.Storage = nullptr;
             }
 
+            bool srcIsSigned = namedVar.TypeAndValue.IsUnsignedInteger() == -1;
+            namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned);
+            namedVar.TypeAndValue = destTypeName;
             return namedVar;
         }
 
@@ -5392,6 +5403,17 @@ public:
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
 
+        // Queue and instantiate generic types used in field declarations before
+        // ParseDeclarationList resolves them to LLVM types. Only needed at top-level
+        // (non-template) scope; template instantiations already have activeTypeSubstitutions
+        // set and their generics are queued via ParseDeclarationSpecifiers.
+        if (activeTypeSubstitutions.empty())
+        {
+            for (auto decl : declarationList)
+                ScanAndQueueGenericTypeUses(decl);
+            ProcessPendingInstantiations();
+        }
+
         auto declList = ParseDeclarationList(declarationList);
         if (compiler->IsVerbose())
             std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
@@ -5621,6 +5643,17 @@ public:
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
+
+        // Queue and instantiate generic types used in field declarations before
+        // ParseDeclarationList resolves them to LLVM types. Only needed at top-level
+        // (non-template) scope; template instantiations already have activeTypeSubstitutions
+        // set and their generics are queued via ParseDeclarationSpecifiers.
+        if (activeTypeSubstitutions.empty())
+        {
+            for (auto decl : declarationList)
+                ScanAndQueueGenericTypeUses(decl);
+            ProcessPendingInstantiations();
+        }
 
         auto declList = ParseDeclarationList(declarationList);
         if (compiler->IsVerbose())

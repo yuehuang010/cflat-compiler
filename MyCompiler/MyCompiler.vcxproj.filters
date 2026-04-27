@@ -48,6 +48,7 @@
     <None Include="core\stack.cb" />
     <None Include="core\cruntime.cb" />
     <None Include="core\thread.cb" />
+    <None Include="core\block_allocator.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />

@@ -37,3 +37,9 @@ interface IDictionary<K, V>
     bool add(K key, V value);
     bool remove(K key);
 };
+
+interface IAllocator
+{
+    void* alloc(i64 size);
+    void  dealloc(void* ptr);
+};

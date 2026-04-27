@@ -1,0 +1,191 @@
+// block_allocator.cb — fixed-block-size page allocator.
+//
+// Each page is a malloc'd buffer. The first blockCount bytes are a
+// per-block allocation bitmap (0 = free, 1 = used), followed by
+// blockCount fixed-size blocks. All tracking lives inside the page buffer.
+//
+// Page size is read once from the OS via GetSystemInfo (dwAllocationGranularity,
+// typically 65536 bytes). Block size is fixed at 64 bytes (cache line).
+//
+// Usage:
+//   BlockAllocator ba;
+//   void* p = ba.alloc(32);   // any size <= 64
+//   ba.dealloc(p);
+//   ba.PrintUsage();
+
+// Win32 SYSTEM_INFO — matches the x64 struct layout exactly (48 bytes).
+struct _SystemInfo
+{
+    u32 _oemId;            //  0 — dwOemId union
+    u32 _pageSize;         //  4 — dwPageSize
+    i8* _minAddr;          //  8 — lpMinimumApplicationAddress
+    i8* _maxAddr;          // 16 — lpMaximumApplicationAddress
+    i64 _procMask;         // 24 — dwActiveProcessorMask
+    u32 _numProc;          // 32 — dwNumberOfProcessors
+    u32 _procType;         // 36 — dwProcessorType
+    u32 _allocGranularity; // 40 — dwAllocationGranularity (VirtualAlloc page size)
+    u16 _procLevel;        // 44
+    u16 _procRevision;     // 46
+};
+
+extern void GetSystemInfo(void* lpSystemInfo);
+
+// Per-page bookkeeping stored alongside the page's raw buffer pointer.
+struct _BlockPage
+{
+    i8*  _data       = nullptr;
+    i64  _blockCount = 0;
+    i64  _usedCount  = 0;
+};
+
+class BlockAllocator : IAllocator
+{
+    _BlockPage* _pages        = nullptr;
+    int         _pageCount    = 0;
+    int         _pageCapacity = 0;
+    i64         _pageSize     = 0;   // 0 until first allocation; filled from GetSystemInfo
+    i64         _blockSize    = 64;  // cache-line-sized blocks
+
+    void _initPageSize()
+    {
+        _SystemInfo* info = new _SystemInfo[1];
+        GetSystemInfo((void*)info);
+        _pageSize = info->_allocGranularity;
+        delete[] info;
+    }
+
+    void _growPages()
+    {
+        int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
+        _BlockPage* newPages = new _BlockPage[newCap];
+        int i = 0;
+        while (i < _pageCount)
+        {
+            newPages[i] = _pages[i];
+            i = i + 1;
+        }
+        if (_pages != nullptr) delete[] _pages;
+        _pages    = newPages;
+        _pageCapacity = newCap;
+    }
+
+    // Allocates and appends a fresh, fully-free page.
+    void _newPage()
+    {
+        if (_pageSize == 0) _initPageSize();
+
+        i64 blockCount = _pageSize / (_blockSize + 1);
+        i8* data = (i8*)malloc(_pageSize);
+        memset((void*)data, 0, blockCount);   // zero bitmap; block data is left uninit
+
+        if (_pageCount == _pageCapacity) _growPages();
+
+        _pages[_pageCount]._data       = data;
+        _pages[_pageCount]._blockCount = blockCount;
+        _pages[_pageCount]._usedCount  = 0;
+        _pageCount = _pageCount + 1;
+    }
+
+    // Returns a pointer to a free block, or nullptr if size exceeds blockSize.
+    // Creates a new page automatically when all existing pages are full.
+    void* alloc(i64 size)
+    {
+        if (size > _blockSize) return nullptr;
+
+        int pi = 0;
+        while (pi < _pageCount)
+        {
+            if (_pages[pi]._usedCount < _pages[pi]._blockCount)
+            {
+                i8* bitmap = _pages[pi]._data;
+                int bi = 0;
+                while (bi < (int)_pages[pi]._blockCount)
+                {
+                    if (bitmap[bi] == 0)
+                    {
+                        bitmap[bi] = 1;
+                        _pages[pi]._usedCount = _pages[pi]._usedCount + 1;
+                        return (void*)&_pages[pi]._data[_pages[pi]._blockCount + (i64)bi * _blockSize];
+                    }
+                    bi = bi + 1;
+                }
+            }
+            pi = pi + 1;
+        }
+
+        // No free slot found — add a new page and allocate block 0.
+        _newPage();
+        int last = _pageCount - 1;
+        _pages[last]._data[0]  = 1;
+        _pages[last]._usedCount = 1;
+        return (void*)&_pages[last]._data[_pages[last]._blockCount];
+    }
+
+    // Marks the block containing ptr as free.
+    void dealloc(void* ptr)
+    {
+        i64 ptrAddr = (i64)ptr;
+        int pi = 0;
+        while (pi < _pageCount)
+        {
+            i64 blocksAddr = (i64)&_pages[pi]._data[_pages[pi]._blockCount];
+            i64 blocksEnd  = blocksAddr + _pages[pi]._blockCount * _blockSize;
+
+            if (ptrAddr >= blocksAddr && ptrAddr < blocksEnd)
+            {
+                i64 idx = (ptrAddr - blocksAddr) / _blockSize;
+                _pages[pi]._data[idx] = 0;
+                _pages[pi]._usedCount = _pages[pi]._usedCount - 1;
+                return;
+            }
+            pi = pi + 1;
+        }
+    }
+
+    // Total blocks currently allocated across all pages.
+    i64 usedBlocks()
+    {
+        i64 total = 0;
+        int i = 0;
+        while (i < _pageCount)
+        {
+            total = total + _pages[i]._usedCount;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    // Total block capacity across all pages.
+    i64 totalBlocks()
+    {
+        i64 total = 0;
+        int i = 0;
+        while (i < _pageCount)
+        {
+            total = total + _pages[i]._blockCount;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    void PrintUsage()
+    {
+        i64 used  = usedBlocks();
+        i64 total = totalBlocks();
+        printf("BlockAllocator: %d pages, %lld/%lld blocks used, %lld/%lld bytes used\n",
+            _pageCount,
+            used, total,
+            used * _blockSize, total * _blockSize);
+    }
+
+    ~BlockAllocator()
+    {
+        int i = 0;
+        while (i < _pageCount)
+        {
+            free(_pages[i]._data);
+            i = i + 1;
+        }
+        if (_pages != nullptr) delete[] _pages;
+    }
+};
