@@ -1805,7 +1805,7 @@ public:
                             llvm::BasicBlock* anyMatchedBlock = entry.block;
                             auto* nextStruct = nextCheck;
 
-                            // Enumerate all concrete structs that implement this interface
+                            // Enumerate all classes that implement this interface
                             for (auto& [sName, sd] : compiler->dataStructures)
                             {
                                 if (!compiler->StructImplementsInterface(sName, entry.typeCaseName)) continue;
@@ -2325,12 +2325,13 @@ public:
                             // so we can do the struct→interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
-                            // If RHS is a struct (not already a fat struct), upcast it to the interface.
+                            // Classes that implement interfaces can be upcast. Structs cannot.
                             if (right && right->getType() != compiler->GetFatPtrType())
                             {
                                 std::string structName = rightNV.TypeAndValue.TypeName;
-                                if (!structName.empty())
+                                if (!structName.empty() && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
+                                    // Only classes (not structs) can implement interfaces, so this is a class
                                     auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
                                     // BuildInterfaceFatValue needs a *pointer* to the struct data,
                                     // not the loaded struct value.
@@ -2339,7 +2340,7 @@ public:
                                     llvm::Value* dataPtr;
                                     if (rightNV.TypeAndValue.Pointer)
                                     {
-                                        // RHS is already a pointer to the struct (e.g. StringData* sd)
+                                        // RHS is already a pointer to the class (e.g. Circle* c)
                                         dataPtr = right;
                                     }
                                     else
@@ -3010,7 +3011,7 @@ public:
 
             auto* afterBlock = compiler->CreateBasicBlock("as_iface_after");
 
-            // For each concrete struct that implements the target interface,
+            // For each class that implements the target interface,
             // check if the concrete type matches and build the appropriate fat pointer
             for (auto& [sName, sd] : compiler->dataStructures)
             {
@@ -5580,9 +5581,6 @@ public:
             }
             global_scope = savedScope;
         }
-
-        // Structs cannot implement interfaces — only classes can.
-        compiler->RegisterStructInterfaces(structName, {});
 
         // Process any generic instantiations that were queued during this struct definition
         // ProcessPendingInstantiations();

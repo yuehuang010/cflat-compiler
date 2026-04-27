@@ -292,8 +292,8 @@ public:
         llvm::StructType* StructType;
         std::vector<DeclTypeAndValue> StructFields;
         llvm::Function* Destructor = nullptr;
-        std::vector<std::string> Interfaces;
-        std::unordered_map<std::string, llvm::GlobalVariable*> VTables;
+        std::vector<std::string> Interfaces;      // Only used by classes (structs have empty list)
+        std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
     };
 
