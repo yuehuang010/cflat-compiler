@@ -2614,6 +2614,9 @@ public:
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
             }
+            // Reassignment to a moved variable makes it live again.
+            if (operatorText == "=" && !namedVar.CallerName.empty())
+                compiler->MarkVariableUnmoved(namedVar.CallerName);
             return assignResult;
         }
         else if (unaryCtx)
@@ -3141,6 +3144,12 @@ public:
     llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
+        if (namedVar.IsMoved && namedVar.IdentifierLine > 0)
+        {
+            compiler->currentLine = namedVar.IdentifierLine;
+            compiler->currentColumn = namedVar.IdentifierColumn;
+            compiler->LogError(std::format("use of moved variable '{}'", namedVar.CallerName));
+        }
         if (namedVar.TypeAndValue.Pointer)
         {
             if (namedVar.Primary != nullptr)
@@ -4350,6 +4359,8 @@ public:
                                         argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    // Propagate caller variable name for compile-time move tracking.
+                                    argVar.CallerName = argNV.CallerName;
 
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
@@ -4884,12 +4895,16 @@ public:
         namedVar = compiler->GetLocalVariable(name);
         if (namedVar.Storage != nullptr || namedVar.Primary != nullptr)
         {
+            namedVar.IdentifierLine = (int)node->getSymbol()->getLine();
+            namedVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
             return namedVar;
         }
 
         auto funcArgument = compiler->GetFunctionArgument(name);
         if (funcArgument.GetValue() != nullptr)
         {
+            funcArgument.IdentifierLine = (int)node->getSymbol()->getLine();
+            funcArgument.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
             return funcArgument;
         }
 

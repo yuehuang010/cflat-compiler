@@ -251,6 +251,12 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
 
     std::error_code ec;
     auto canonical = std::filesystem::canonical(importPath, ec);
+    // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
+    if (ec && !sourceFileDir_.empty())
+    {
+        auto sourcePath = (std::filesystem::path(sourceFileDir_) / importFilename).lexically_normal();
+        canonical = std::filesystem::canonical(sourcePath, ec);
+    }
     if (ec && !importSearchDir.empty())
     {
         auto searchPath = (std::filesystem::path(importSearchDir) / importFilename).lexically_normal();
@@ -266,6 +272,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     {
         std::cerr << "Error: imported file not found: " << importFilename
                   << " (searched relative to '" << importingDir.string() << "'"
+                  << (sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'")
                   << (importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'")
                   << (runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'")
                   << ").\n";

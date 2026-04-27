@@ -257,6 +257,10 @@ public:
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         bool IsOwning = false;           // true for move parameters and owning local pointers — freed on scope exit
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
+        bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        std::string CallerName;          // the variable's name at the call site, for move tracking
+        int IdentifierLine = 0;          // source location for use-after-move error reporting
+        int IdentifierColumn = 0;
 
         llvm::Value* GetValue() const
         {
@@ -402,6 +406,7 @@ public:
     std::unordered_set<std::string> importedFiles;
     std::string importSearchDir;
     std::string runtimeDir;
+    std::string sourceFileDir_;  // original source dir for LSP temp-file analysis
 private:
     // When true, disables auto-import of core/runtime.cb
     bool skipRuntimeImport = false;
@@ -3170,30 +3175,36 @@ public:
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnsOwnedString = candidate.ReturnsOwnedString;
 
-        // Null out caller's storage for move parameters
+        // Null out caller's storage for move parameters; mark variable as moved for compile-time checking.
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
-            if (candidate.Parameters[i].IsMove && matched[i].Storage != nullptr)
+            if (candidate.Parameters[i].IsMove)
             {
-                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType))
+                if (matched[i].Storage != nullptr)
                 {
-                    // Pointer move param: null the caller's storage.
-                    builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), matched[i].Storage);
-                }
-                else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
-                {
-                    // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
-                    auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-                    if (strTy)
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType))
                     {
-                        auto* ptrField = builder->CreateStructGEP(strTy, matched[i].Storage, 0);
-                        auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
-                        builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                        // Pointer move param: null the caller's storage.
+                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), matched[i].Storage);
                     }
-                    // Mark the caller's NV as no longer owning (will be cleared by namedVariable cleanup).
-                    // We can't modify matched[i] here directly since it's a copy, but the alloca is zeroed.
-                    // The caller's IsOwningString flag will cause the destructor to run on the null ptr (free(null) is safe).
+                    else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
+                    {
+                        // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
+                        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+                        if (strTy)
+                        {
+                            auto* ptrField = builder->CreateStructGEP(strTy, matched[i].Storage, 0);
+                            auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
+                            builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                        }
+                    }
                 }
+                // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
+                // Only applies to pointer types — move is a no-op for value types (int, etc.).
+                if (!matched[i].CallerName.empty() &&
+                    matched[i].BaseType != nullptr &&
+                    llvm::isa<llvm::PointerType>(matched[i].BaseType))
+                    MarkVariableMoved(matched[i].CallerName);
             }
         }
 
@@ -3221,7 +3232,9 @@ public:
 
             if (result != nameVal.end())
             {
-                return result->second;
+                auto nv = result->second;
+                nv.CallerName = name;
+                return nv;
             }
         }
 
@@ -3342,11 +3355,37 @@ public:
 
             if (result != nameVal.end())
             {
-                return result->second;
+                auto nv = result->second;
+                nv.CallerName = name;
+                return nv;
             }
         }
 
         return {};
+    }
+
+    void MarkVariableMoved(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.IsMoved = true; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.IsMoved = true; return; }
+        }
+    }
+
+    void MarkVariableUnmoved(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.IsMoved = false; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.IsMoved = false; return; }
+        }
     }
 
     llvm::GlobalVariable* GetGlobalVariable(std::string name)
@@ -3712,6 +3751,7 @@ public:
     // If set, disables auto-import of core/runtime.cb
     void SetSkipRuntimeImport(bool v) { skipRuntimeImport = v; }
     void SetRuntimeDir(const std::string& dir) { runtimeDir = dir; }
+    void SetSourceFileDir(const std::string& dir) { sourceFileDir_ = dir; }
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
 

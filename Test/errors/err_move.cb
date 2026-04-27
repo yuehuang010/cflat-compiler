@@ -1,0 +1,24 @@
+// Tests that using a variable after it has been moved is a compile-time error.
+
+struct MoveResource { int id = 0; }
+void MoveResource(MoveResource* self) { self->id = 0; }
+void consume(move MoveResource* r) { delete r; }
+
+extern int main()
+{
+    // use after move — pass to another call
+    expect_error("use of moved variable 'r'") {
+        MoveResource* r = new MoveResource();
+        consume(r);
+        consume(r);
+    }
+
+    // use after move — field read
+    expect_error("use of moved variable 'r2'") {
+        MoveResource* r2 = new MoveResource();
+        consume(r2);
+        int x = r2->id;
+    }
+
+    return 0;
+}
