@@ -1,34 +1,57 @@
 // block_allocator.cb — fixed-block-size page allocator.
 //
-// Each page is a malloc'd buffer. The first blockCount bytes are a
-// per-block allocation bitmap (0 = free, 1 = used), followed by
-// blockCount fixed-size blocks. All tracking lives inside the page buffer.
+// Each page is a VirtualAlloc'd buffer (MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE).
+// VirtualAlloc guarantees OS-aligned, zero-initialized pages — no memset needed.
 //
-// Page size is read once from the OS via GetSystemInfo (dwAllocationGranularity,
-// typically 65536 bytes). Block size is fixed at 64 bytes (cache line).
+// Page layout: [bitmap | padding | data blocks]
+//   bitmap    — one byte per block (0 = free, 1 = used)
+//   padding   — zeros, rounds bitmap up to the next cache-line boundary
+//   data      — blockCount fixed-size blocks, each _blockSize bytes
+//
+// Block size is read once from GetLogicalProcessorInformation (L3 cache line size,
+// typically 64 bytes). Page size is read from GetSystemInfo (dwAllocationGranularity,
+// typically 65536 bytes). Both are queried lazily on first allocation.
 //
 // Usage:
 //   BlockAllocator ba;
-//   void* p = ba.alloc(32);   // any size <= 64
+//   void* p = ba.alloc(32);   // any size <= blockSize
 //   ba.dealloc(p);
 //   ba.PrintUsage();
 
 // Win32 SYSTEM_INFO — matches the x64 struct layout exactly (48 bytes).
 struct _SystemInfo
 {
-    u32 _oemId;            //  0 — dwOemId union
-    u32 _pageSize;         //  4 — dwPageSize
-    i8* _minAddr;          //  8 — lpMinimumApplicationAddress
-    i8* _maxAddr;          // 16 — lpMaximumApplicationAddress
-    i64 _procMask;         // 24 — dwActiveProcessorMask
-    u32 _numProc;          // 32 — dwNumberOfProcessors
-    u32 _procType;         // 36 — dwProcessorType
-    u32 _allocGranularity; // 40 — dwAllocationGranularity (VirtualAlloc page size)
-    u16 _procLevel;        // 44
-    u16 _procRevision;     // 46
+    u32 _oemId            = default;  //  0 — dwOemId union
+    u32 _pageSize         = default;  //  4 — dwPageSize
+    i8* _minAddr          = default;  //  8 — lpMinimumApplicationAddress
+    i8* _maxAddr          = default;  // 16 — lpMaximumApplicationAddress
+    i64 _procMask         = default;  // 24 — dwActiveProcessorMask
+    u32 _numProc          = default;  // 32 — dwNumberOfProcessors
+    u32 _procType         = default;  // 36 — dwProcessorType
+    u32 _allocGranularity = default;  // 40 — dwAllocationGranularity (VirtualAlloc page size)
+    u16 _procLevel        = default;  // 44
+    u16 _procRevision     = default;  // 46
 };
 
-extern void GetSystemInfo(void* lpSystemInfo);
+// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION — 32 bytes on x64.
+// The union at offset 16 is interpreted as CACHE_DESCRIPTOR when _relationship == 2.
+struct _SysLogicalProcInfo
+{
+    i64 _processorMask = default;  //  0 — ULONG_PTR ProcessorMask
+    u32 _relationship  = default;  //  8 — LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
+    u32 _pad           = default;  // 12 — padding before union
+    u8  _cacheLevel    = default;  // 16 — CACHE_DESCRIPTOR.Level
+    u8  _cacheAssoc    = default;  // 17 — CACHE_DESCRIPTOR.Associativity
+    u16 _cacheLineSize = default;  // 18 — CACHE_DESCRIPTOR.LineSize
+    u32 _cacheSize     = default;  // 20 — CACHE_DESCRIPTOR.Size
+    u32 _cacheType     = default;  // 24 — PROCESSOR_CACHE_TYPE
+    u32 _pad2          = default;  // 28 — trailing pad to reach 32 bytes
+};
+
+extern void  GetSystemInfo(void* lpSystemInfo);
+extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
+extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
+extern int   GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
 
 // Per-page bookkeeping stored alongside the page's raw buffer pointer.
 struct _BlockPage
@@ -44,20 +67,42 @@ class BlockAllocator : IAllocator
     int         _pageCount    = 0;
     int         _pageCapacity = 0;
     i64         _pageSize     = 0;   // 0 until first allocation; filled from GetSystemInfo
-    i64         _blockSize    = 64;  // cache-line-sized blocks
+    i64         _blockSize    = 64;  // overridden at init from L3 cache line; 64 is the fallback
 
-    void _initPageSize()
+    void _init()
     {
-        _SystemInfo* info = (_SystemInfo*)malloc(48);   // sizeof(_SystemInfo) == 48 bytes
-        GetSystemInfo((void*)info);
-        _pageSize = info->_allocGranularity;
-        free((void*)info);
+        // --- page size from GetSystemInfo ---
+        _SystemInfo* sysInfo = (_SystemInfo*)malloc(sizeof(_SystemInfo));
+        GetSystemInfo((void*)sysInfo);
+        _pageSize = sysInfo->_allocGranularity;
+        free((void*)sysInfo);
+
+        // --- L3 cache line size from GetLogicalProcessorInformation ---
+        u32 len = 0;
+        GetLogicalProcessorInformation(nullptr, &len);   // first call: query required buffer size
+        i8* buf = (i8*)malloc((i64)len);
+        GetLogicalProcessorInformation((void*)buf, &len);
+
+        i64 entrySize = (i64)sizeof(_SysLogicalProcInfo);  // 32 bytes
+        i64 count = (i64)len / entrySize;
+        int i = 0;
+        while (i < (int)count)
+        {
+            _SysLogicalProcInfo* e = (_SysLogicalProcInfo*)&buf[(i64)i * entrySize];
+            if (e->_relationship == 2 && e->_cacheLevel == 3)  // RelationCache, Level 3
+            {
+                _blockSize = (i64)e->_cacheLineSize;
+                break;
+            }
+            i = i + 1;
+        }
+        free((void*)buf);
     }
 
     void _growPages()
     {
         int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
-        _BlockPage* newPages = (_BlockPage*)malloc((i64)newCap * 24);  // sizeof(_BlockPage) == 24 bytes
+        _BlockPage* newPages = (_BlockPage*)malloc((i64)newCap * (i64)sizeof(_BlockPage));
         int i = 0;
         while (i < _pageCount)
         {
@@ -65,18 +110,22 @@ class BlockAllocator : IAllocator
             i = i + 1;
         }
         if (_pages != nullptr) free((void*)_pages);
-        _pages    = newPages;
+        _pages        = newPages;
         _pageCapacity = newCap;
     }
 
     // Allocates and appends a fresh, fully-free page.
     void _newPage()
     {
-        if (_pageSize == 0) _initPageSize();
+        if (_pageSize == 0) _init();
 
-        i64 blockCount = _pageSize / (_blockSize + 1);
-        i8* data = (i8*)malloc(_pageSize);
-        memset((void*)data, 0, blockCount);   // zero bitmap; block data is left uninit
+        i64 rawCount   = _pageSize / (_blockSize + 1);
+        i64 bitmapSize = (rawCount + _blockSize - 1) / _blockSize * _blockSize;  // round up to cache line
+        i64 blockCount = (_pageSize - bitmapSize) / _blockSize;
+
+        // MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_READWRITE = 0x04
+        // VirtualAlloc zero-initializes committed pages — bitmap is already cleared.
+        i8* data = (i8*)VirtualAlloc(nullptr, _pageSize, 0x3000u, 0x04u);
 
         if (_pageCount == _pageCapacity) _growPages();
 
@@ -97,7 +146,8 @@ class BlockAllocator : IAllocator
         {
             if (_pages[pi]._usedCount < _pages[pi]._blockCount)
             {
-                i8* bitmap = _pages[pi]._data;
+                i8* bitmap    = _pages[pi]._data;
+                i64 bitmapSize = (_pages[pi]._blockCount + _blockSize - 1) / _blockSize * _blockSize;
                 int bi = 0;
                 while (bi < (int)_pages[pi]._blockCount)
                 {
@@ -105,7 +155,7 @@ class BlockAllocator : IAllocator
                     {
                         bitmap[bi] = 1;
                         _pages[pi]._usedCount = _pages[pi]._usedCount + 1;
-                        return (void*)&_pages[pi]._data[_pages[pi]._blockCount + (i64)bi * _blockSize];
+                        return (void*)&_pages[pi]._data[bitmapSize + (i64)bi * _blockSize];
                     }
                     bi = bi + 1;
                 }
@@ -116,9 +166,10 @@ class BlockAllocator : IAllocator
         // No free slot found — add a new page and allocate block 0.
         _newPage();
         int last = _pageCount - 1;
-        _pages[last]._data[0]  = 1;
+        i64 bitmapSize = (_pages[last]._blockCount + _blockSize - 1) / _blockSize * _blockSize;
+        _pages[last]._data[0]   = 1;
         _pages[last]._usedCount = 1;
-        return (void*)&_pages[last]._data[_pages[last]._blockCount];
+        return (void*)&_pages[last]._data[bitmapSize];
     }
 
     // Marks the block containing ptr as free.
@@ -128,7 +179,8 @@ class BlockAllocator : IAllocator
         int pi = 0;
         while (pi < _pageCount)
         {
-            i64 blocksAddr = (i64)&_pages[pi]._data[_pages[pi]._blockCount];
+            i64 bitmapSize = (_pages[pi]._blockCount + _blockSize - 1) / _blockSize * _blockSize;
+            i64 blocksAddr = (i64)&_pages[pi]._data[bitmapSize];
             i64 blocksEnd  = blocksAddr + _pages[pi]._blockCount * _blockSize;
 
             if (ptrAddr >= blocksAddr && ptrAddr < blocksEnd)
@@ -184,7 +236,7 @@ class BlockAllocator : IAllocator
         int i = 0;
         while (i < _pageCount)
         {
-            free(_pages[i]._data);
+            VirtualFree(_pages[i]._data, 0, 0x8000u);  // MEM_RELEASE; dwSize must be 0
             i = i + 1;
         }
         if (_pages != nullptr) free((void*)_pages);
@@ -199,7 +251,7 @@ class BlockAllocator : IAllocator
         int i = 0;
         while (i < _pageCount)
         {
-            free(_pages[i]._data);
+            VirtualFree(_pages[i]._data, 0, 0x8000u);  // MEM_RELEASE; dwSize must be 0
             i = i + 1;
         }
         if (_pages != nullptr) free((void*)_pages);

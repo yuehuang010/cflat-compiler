@@ -1,9 +1,2 @@
 import "cruntime.cb";
 import "block_allocator.cb";
-
-thread_local BlockAllocator* __active_allocator = nullptr;
-
-void __register_handle(void* handle, void* closeFn)
-{
-    // stub — handle tracking is future work
-}

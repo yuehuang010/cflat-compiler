@@ -1,8 +1,8 @@
 // Comprehensive test for sizeof() and alignof()
 
 struct _UnderscoreStruct {
-    int x;
-    int y;
+    int x = default;
+    int y = default;
 };
 
 struct __DoubleUnderscoreStruct {
@@ -16,37 +16,37 @@ struct FuncPtrFieldStruct {
 };
 
 struct Point {
-    int x;
-    int y;
+    int x = default;
+    int y = default;
 };
 
 struct ComplexStruct {
-    char a;
-    int b;
-    double c;
-    Point p;
+    char a   = default;
+    int b    = default;
+    double c = default;
+    Point p  = default;
 };
 
 struct EmptyStruct {
 };
 
 struct SingleFieldStruct {
-    i64 value;
+    i64 value = default;
 };
 
 struct PointerFieldStruct {
-    int* ptr;
-    char* str_ptr;
+    int*  ptr     = nullptr;
+    char* str_ptr = nullptr;
 };
 
 struct NestedStruct {
-    Point outer;
-    ComplexStruct inner;
+    Point outer        = default;
+    ComplexStruct inner = default;
 };
 
 struct GenericContainer {
-    i32 count;
-    i64 data;
+    i32 count = default;
+    i64 data  = default;
 };
 
 interface IReadable {
@@ -54,7 +54,7 @@ interface IReadable {
 };
 
 struct Reader {
-    int value;
+    int value = default;
 };
 
 // Helper to print values

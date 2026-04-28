@@ -1,6 +1,13 @@
 // CFlat runtime — allocator interface
 import "cruntime.cb";
 
+thread_local BlockAllocator* __active_allocator = nullptr;
+
+void __register_handle(void* handle, void* closeFn)
+{
+    // stub — handle tracking is future work
+}
+
 void* __runtime_alloc(BlockAllocator* a, i64 size)
 {
     return a.alloc(size);
