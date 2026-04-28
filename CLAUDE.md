@@ -83,7 +83,7 @@ x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out/test_operators
 out\test_operators.exe
 ```
 
-Current tests (all in `MyCompiler/Test/`): `testfile` (C); `testfile2`, `test_generics`, `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static`, `test_nullable`, `test_move` (CFlat); `testfile_module`, `test_library_string`, `test_overload` (CFlat with `-i lib`).
+Current tests (all in `MyCompiler/Test/`): `testfile` (C); `testfile2`, `test_generics`, `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static`, `test_nullable`, `test_move`, `test_program` (CFlat); `testfile_module`, `test_library_string`, `test_overload` (CFlat with `-i lib`).
 
 ### Error tests
 
@@ -180,6 +180,7 @@ Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing 
 - **Return-block functions**: `return { ... }` — body inlined at call site
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
 - **Range-based for**: `foreach (T x in collection)` — calls `count()` / `get(int)` on the collection
+- **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` — struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `BlockAllocator` (heap allocations in `main` are freed automatically on return), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
 
 ### Ownership / Lifetime (`move` keyword)
 

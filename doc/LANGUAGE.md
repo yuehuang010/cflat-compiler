@@ -496,6 +496,49 @@ else
 
 This is useful for platform-specific code, feature gates, and performance-critical conditionals.
 
+### Program (`program` keyword)
+
+`program` defines a struct-like construct with a managed entry point. It is useful for structured programs that need isolated heap allocation and a clean exit code.
+
+```c
+import "list.cb";
+import "thread.cb";
+
+program MyApp {
+    int startFrom = 0;   // configurable field
+
+    int main(move list<string> args)
+    {
+        // all heap allocations here are freed automatically when main returns
+        return startFrom + args.count();
+    }
+};
+
+extern int main()
+{
+    MyApp app;
+    app.startFrom = 10;
+
+    list<string> args;
+    args.add("" + "a");
+    args.add("" + "b");
+
+    int code = app.run(args);   // returns exit code from main()
+    return code;                // 12
+}
+```
+
+The compiler auto-generates a `run(list<string> args)` method on the struct. Calling `run()`:
+
+1. Spawns a dedicated thread.
+2. Installs a per-thread `BlockAllocator` — heap allocations inside `main` are freed automatically when it returns.
+3. Calls the `main` method with the provided args.
+4. Joins the thread and returns the `int` exit code.
+
+**Requirements**: `import "list.cb"` and `import "thread.cb"` must appear before the `program` definition.
+
+---
+
 ### Debug Info (Work in Progress)
 
 Pass `-g` to emit DWARF debug information for use with debuggers:
