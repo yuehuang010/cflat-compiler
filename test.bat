@@ -1,39 +1,156 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
 REM set PATH=%CD%\vcpkg_installed\x64-windows-static\x64-windows-static\tools\llvm;%PATH%
+
+REM ===========================================================================
+REM Worker mode: compile and run a single .c test, write result file
+REM All compiler/exe output goes to a log file; nothing printed to console.
+REM ===========================================================================
+if "%~1"=="--worker-c" (
+    set NAME=%~2
+    set COMPILER=x64\Debug\MyCompiler.exe
+    set SRC=Test
+    set OUT=out
+    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll > "!OUT!\results\!NAME!.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
+        exit /b
+    )
+    !OUT!\!NAME!.exe >> "!OUT!\results\!NAME!.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
+        exit /b
+    )
+    echo PASS>"!OUT!\results\!NAME!.result"
+    exit /b
+)
+
+REM ===========================================================================
+REM Worker mode: compile and run a single .cb test, write result file
+REM ===========================================================================
+if "%~1"=="--worker-cb" (
+    set NAME=%~2
+    set COMPILER=x64\Debug\MyCompiler.exe
+    set SRC=Test
+    set LIB=Test\library
+    set OUT=out
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll > "!OUT!\results\!NAME!.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
+        exit /b
+    )
+    !OUT!\!NAME!.exe >> "!OUT!\results\!NAME!.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
+        exit /b
+    )
+    echo PASS>"!OUT!\results\!NAME!.result"
+    exit /b
+)
+
+REM ===========================================================================
+REM Worker mode: run test_err.bat, capture output to log file
+REM ===========================================================================
+if "%~1"=="--worker-err" (
+    set OUT=out
+    call "%~dp0test_err.bat" > "!OUT!\results\test_err.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: test_err>"!OUT!\results\test_err.result"
+    ) else (
+        echo PASS>"!OUT!\results\test_err.result"
+    )
+    exit /b
+)
+
+REM ===========================================================================
+REM Main: launch all tests in parallel, wait, collect results
+REM ===========================================================================
 set COMPILER=x64\Debug\MyCompiler.exe
 set SRC=Test
 set LIB=Test\library
 set OUT=out
-
-set ERRORS=0
-
-REM Tests excluded from the run (space-separated, no extensions)
 set EXCLUDE=test_helper
+set SCRIPT=%~f0
+set START_TIME=%TIME%
 
 if not exist "%OUT%" mkdir "%OUT%"
+if not exist "%OUT%\results" mkdir "%OUT%\results"
+del /q "%OUT%\results\*.result" 2>nul
+del /q "%OUT%\results\*.log" 2>nul
+
+set /a LAUNCHED=0
+
+REM Launch error tests first — they're slower and benefit most from early start
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-err"
 
 for %%F in (%SRC%\test_*.c) do (
     call :IsExcluded %%~nF
-    if not errorlevel 1 call :RunTest %%~nF
+    if not errorlevel 1 (
+        set /a LAUNCHED+=1
+        start "" /b cmd /c "%SCRIPT% --worker-c %%~nF"
+    )
 )
 
 for %%F in (%SRC%\test_*.cb) do (
     call :IsExcluded %%~nF
-    if not errorlevel 1 call :RunTestCb %%~nF
+    if not errorlevel 1 (
+        set /a LAUNCHED+=1
+        start "" /b cmd /c "%SCRIPT% --worker-cb %%~nF"
+    )
 )
 
-call "%~dp0test_err.bat"
-if %ERRORLEVEL% neq 0 set /a ERRORS+=1
+REM Wait for all workers to finish (up to 120 seconds)
+set /a WAITED=0
+:WaitLoop
+set /a DONE=0
+for %%R in (%OUT%\results\*.result) do set /a DONE+=1
+if !DONE! lss !LAUNCHED! (
+    if !WAITED! geq 120 (
+        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after 120s
+        goto :Collect
+    )
+    ping -n 2 127.0.0.1 >nul 2>&1
+    set /a WAITED+=1
+    goto WaitLoop
+)
+
+:Collect
+set /a ERRORS=0
+for %%R in (%OUT%\results\*.result) do (
+    set /p RESULT=<"%%R"
+    if /I "!RESULT!" neq "PASS" (
+        echo.
+        echo === %%~nR ===
+        type "%%~dpnR.log"
+        echo !RESULT!
+        set /a ERRORS+=1
+    ) else (
+        echo PASSED: %%~nR
+    )
+)
 
 echo.
+call :ElapsedTime "%START_TIME%" "%TIME%"
 if %ERRORS% EQU 0 (
     echo All tests passed.
+    exit /b 0
 ) else (
     echo %ERRORS% tests failed.
     exit /b 1
 )
+
+:ElapsedTime
+setlocal
+set T0=%~1
+set T1=%~2
+for /f "tokens=1-4 delims=:." %%a in ("%T0: =0%") do set /a S0=%%a*3600+%%b*60+%%c
+for /f "tokens=1-4 delims=:." %%a in ("%T1: =0%") do set /a S1=%%a*3600+%%b*60+%%c
+set /a SECS=S1-S0
+if !SECS! lss 0 set /a SECS+=86400
+echo Elapsed: !SECS!s
+endlocal
 exit /b 0
 
 :IsExcluded
@@ -41,45 +158,3 @@ for %%E in (%EXCLUDE%) do (
     if /I "%~1"=="%%E" exit /b 1
 )
 exit /b 0
-
-:RunTest
-set NAME=%~1
-echo === %NAME% ===
-
-%COMPILER% %SRC%\%NAME%.c -o %OUT%\%NAME%.exe --nologo --out-lli %OUT%\%NAME%.ll
-if %ERRORLEVEL% neq 0 (
-    echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.c
-    set /a ERRORS+=1
-    exit /b
-)
-
-%OUT%\%NAME%.exe
-if %ERRORLEVEL% neq 0 (
-    echo FAILED: %NAME%.exe returned error %ERRORLEVEL%
-    set /a ERRORS+=1
-    exit /b
-)
-
-echo PASSED: %NAME%
-exit /b
-
-:RunTestCb
-set NAME=%~1
-echo === %NAME% ===
-
-%COMPILER% %SRC%\%NAME%.cb -i %LIB% -o %OUT%\%NAME%.exe --nologo --out-lli %OUT%\%NAME%.ll
-if %ERRORLEVEL% neq 0 (
-    echo FAILED: compiler returned error %ERRORLEVEL% for %NAME%.cb
-    set /a ERRORS+=1
-    exit /b
-)
-
-%OUT%\%NAME%.exe
-if %ERRORLEVEL% neq 0 (
-    echo FAILED: %NAME%.exe returned error %ERRORLEVEL%
-    set /a ERRORS+=1
-    exit /b
-)
-
-echo PASSED: %NAME%
-exit /b

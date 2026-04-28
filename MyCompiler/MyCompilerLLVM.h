@@ -25,6 +25,7 @@
 #include <format>
 #include <unordered_set>
 #include <cstdlib>
+#include <io.h>
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
@@ -1127,16 +1128,20 @@ private:
             {
                 llvm::SmallString<256> outFile;
                 llvm::sys::path::system_temp_directory(true, outFile);
-                llvm::sys::path::append(outFile, "mycompiler_vswhere.txt");
-                std::string outFileStr = outFile.str().str();
+                int outFD;
+                if (!llvm::sys::fs::createTemporaryFile("mycompiler_vswhere", "txt", outFD, outFile))
+                {
+                    _close(outFD);
+                    std::string outFileStr = outFile.str().str();
 
-                std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
-                std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
+                    std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
+                    std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
+                    llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
 
-                if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
-                    vsPath = buf.get()->getBuffer().trim().str();
-                llvm::sys::fs::remove(outFile);
+                    if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
+                        vsPath = buf.get()->getBuffer().trim().str();
+                    llvm::sys::fs::remove(outFile);
+                }
             }
         }
 
