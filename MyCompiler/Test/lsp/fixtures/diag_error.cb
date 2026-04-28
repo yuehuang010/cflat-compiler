@@ -1,0 +1,2 @@
+// $expect diagnostic message="Undefined"
+extern int main() { return unknownVar; }

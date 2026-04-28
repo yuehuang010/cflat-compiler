@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""
+Fixture-driven LSP tests for MyCompiler.exe lsp.
+
+Each .cb file in Test/lsp/fixtures/ may contain directive comments:
+    // $cursor line=N col=N        -- LSP position for hover/definition/completion
+    // $expect hover contains="X"  -- hover markdown contains substring X
+    // $expect hover null           -- hover returns null (nothing at cursor)
+    // $expect definition line=N   -- definition result is at line N (0-based)
+    // $expect completion includes="X" -- completion list contains label X
+    // $expect diagnostic message="X"  -- at least one diagnostic message contains X
+    // $expect no_diagnostic           -- publishDiagnostics has empty list
+
+Directives are stripped before sending source to the LSP server, so the
+line/col in $cursor refers to positions in the stripped source.
+
+Usage:
+    python vscode-extension/test/lsp_fixture_test.py [path/to/MyCompiler.exe]
+
+Exit code: 0 = all passed, 1 = one or more failures.
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from lsp_client import LspClient, find_exe, initialize, wait_diagnostics_for
+
+REPO_ROOT = Path(__file__).parent.parent.parent
+FIXTURE_DIR = REPO_ROOT / "MyCompiler" / "Test" / "lsp" / "fixtures"
+
+# Virtual URI prefix — server analyzes via temp files internally, so these
+# paths don't need to exist on disk.
+_URI_BASE = "file:///C%3A/lsp_fixture_"
+
+
+def _uri_for(name: str) -> str:
+    return _URI_BASE + name + ".cb"
+
+
+# ---------------------------------------------------------------------------
+# Directive parser
+# ---------------------------------------------------------------------------
+
+_CURSOR_RE  = re.compile(r"//\s+\$cursor\s+line=(\d+)\s+col=(\d+)")
+_EXPECT_RE  = re.compile(r"//\s+\$expect\s+(.*)")
+
+
+def _parse_kv(text: str) -> dict:
+    """Extract key="value" and key=N pairs from a string."""
+    result = {}
+    for m in re.finditer(r'(\w+)="([^"]*)"', text):
+        result[m.group(1)] = m.group(2)
+    for m in re.finditer(r'(\w+)=(\d+)', text):
+        if m.group(1) not in result:
+            result[m.group(1)] = int(m.group(2))
+    return result
+
+
+def parse_fixture(content: str) -> tuple[dict, str]:
+    """Return (directives, stripped_source).
+
+    directives keys:
+      'cursor'  -> (line, col) tuple
+      'expect'  -> (kind, kv_dict) tuple
+    """
+    directives: dict = {}
+    source_lines: list[str] = []
+
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        m = _CURSOR_RE.match(stripped)
+        if m:
+            directives["cursor"] = (int(m.group(1)), int(m.group(2)))
+            continue
+        m = _EXPECT_RE.match(stripped)
+        if m:
+            rest = m.group(1).strip()
+            parts = rest.split(None, 1)
+            kind = parts[0]
+            kv = _parse_kv(parts[1]) if len(parts) > 1 else {}
+            directives["expect"] = (kind, kv)
+            continue
+        source_lines.append(line)
+
+    return directives, "".join(source_lines)
+
+
+# ---------------------------------------------------------------------------
+# Fixture runner
+# ---------------------------------------------------------------------------
+
+def _open_doc(client: LspClient, uri: str, source: str, version: int = 1):
+    client.notify("textDocument/didOpen", {
+        "textDocument": {
+            "uri": uri,
+            "languageId": "cflat",
+            "version": version,
+            "text": source,
+        }
+    })
+
+
+def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
+    """Return None on pass, error description on failure."""
+    content = fixture_path.read_text(encoding="utf-8")
+    directives, source = parse_fixture(content)
+
+    name = fixture_path.stem
+    uri = _uri_for(name)
+
+    expect_kind, expect_kv = directives.get("expect", (None, {}))
+    cursor = directives.get("cursor", (0, 0))
+
+    # Open document — triggers immediate analysis.
+    _open_doc(client, uri, source)
+
+    # For diagnostic expectations we need the publishDiagnostics notification.
+    if expect_kind in ("diagnostic", "no_diagnostic"):
+        diags = wait_diagnostics_for(client, uri)
+        if expect_kind == "no_diagnostic":
+            if diags:
+                return f"expected no diagnostics, got: {diags}"
+            return None
+        # diagnostic message="X"
+        needle = expect_kv.get("message", "")
+        messages = [d.get("message", "") for d in diags]
+        if not any(needle in msg for msg in messages):
+            return f"expected diagnostic containing {needle!r}, got: {messages}"
+        return None
+
+    # Wait for analysis to finish so the symbol index is populated.
+    wait_diagnostics_for(client, uri)
+
+    line, col = cursor
+    position = {"line": line, "character": col}
+
+    if expect_kind == "hover_null":
+        # $expect hover_null — cursor is on non-symbol text; hover must return null.
+        resp = client.request("textDocument/hover", {
+            "textDocument": {"uri": uri},
+            "position": position,
+        })
+        if "result" not in resp:
+            return f"hover_null: no result in response: {resp}"
+        if resp["result"] is not None:
+            return f"hover_null: expected null, got: {resp['result']}"
+        return None
+
+    if expect_kind == "hover":
+        resp = client.request("textDocument/hover", {
+            "textDocument": {"uri": uri},
+            "position": position,
+        })
+        if "result" not in resp:
+            return f"hover: no result in response: {resp}"
+        result = resp["result"]
+        if result is None:
+            return f"hover: got null — symbol not found at ({line},{col})"
+        value = result.get("contents", {}).get("value", "")
+        needle = expect_kv.get("contains", "")
+        if needle and needle not in value:
+            return f"hover: expected {needle!r} in markdown, got: {value!r}"
+        return None
+
+    if expect_kind == "definition":
+        resp = client.request("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position": position,
+        })
+        if "result" not in resp:
+            return f"definition: no result in response: {resp}"
+        results = resp["result"]
+        if not results:
+            return f"definition: empty result — symbol not found at ({line},{col})"
+        target_line = results[0].get("range", {}).get("start", {}).get("line")
+        expected_line = expect_kv.get("line")
+        if expected_line is not None and target_line != expected_line:
+            return f"definition: expected line {expected_line}, got line {target_line}"
+        return None
+
+    if expect_kind == "completion":
+        resp = client.request("textDocument/completion", {
+            "textDocument": {"uri": uri},
+            "position": position,
+        })
+        if "result" not in resp:
+            return f"completion: no result in response: {resp}"
+        result = resp["result"]
+        items = result if isinstance(result, list) else result.get("items", [])
+        labels = [item.get("label", "") for item in items]
+        needle = expect_kv.get("includes", "")
+        if needle and not any(needle in label for label in labels):
+            return f"completion: expected label containing {needle!r}, got: {labels[:10]}"
+        return None
+
+    return f"unknown expect kind: {expect_kind!r}"
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded scenario tests
+# ---------------------------------------------------------------------------
+
+def test_diagnostic_lifecycle(client: LspClient) -> str | None:
+    """Error appears on open, then clears after fixing the source."""
+    error_source = "extern int main() { return unknownVar; }"
+    fixed_source = "extern int main() { return 0; }"
+    uri = _uri_for("lifecycle")
+
+    _open_doc(client, uri, error_source)
+    diags = wait_diagnostics_for(client, uri)
+    if not diags:
+        return "lifecycle: expected diagnostic for error source, got none"
+
+    # Fix via didChange + didSave (didSave triggers immediate re-analysis).
+    client.notify("textDocument/didChange", {
+        "textDocument": {"uri": uri, "version": 2},
+        "contentChanges": [{"text": fixed_source}],
+    })
+    client.notify("textDocument/didSave", {
+        "textDocument": {"uri": uri},
+        "text": fixed_source,
+    })
+    diags = wait_diagnostics_for(client, uri)
+    if diags:
+        return f"lifecycle: expected diagnostics to clear after fix, got: {diags}"
+    return None
+
+
+def test_negative_hover_before_initialize(exe: str) -> str | None:
+    """Hover before initialize should return an error response, not crash."""
+    client = LspClient(exe)
+    try:
+        resp = client.request("textDocument/hover", {
+            "textDocument": {"uri": _uri_for("preinit")},
+            "position": {"line": 0, "character": 0},
+        }, timeout=5.0)
+        # Server should respond with an error or null result — not crash.
+        if "error" not in resp and resp.get("result") is None:
+            return None  # null result is acceptable
+        if "error" in resp:
+            return None  # error response is correct
+        return f"negative: unexpected response to pre-init hover: {resp}"
+    except TimeoutError:
+        return "negative: server timed out on pre-init hover"
+    finally:
+        client.close()
+
+
+def test_server_resilience(client: LspClient) -> str | None:
+    """Server stays alive after receiving a document that triggers an analysis error."""
+    # A file with a crash-prone pattern: deep nesting / invalid construct.
+    # Even if the compiler errors out, the server should keep responding.
+    bad_source = "extern int main() { int x = ((((((((((0)))))))))))))))); }"
+    uri = _uri_for("resilience")
+
+    _open_doc(client, uri, bad_source)
+    # Don't care about diagnostics content — just drain the notification.
+    try:
+        wait_diagnostics_for(client, uri, timeout=10.0)
+    except TimeoutError:
+        pass  # server may not publish diagnostics for a crash — that's OK
+
+    # Verify server still responds to a subsequent hover request.
+    try:
+        resp = client.request("textDocument/hover", {
+            "textDocument": {"uri": _uri_for("hover_function")},
+            "position": {"line": 0, "character": 11},
+        }, timeout=10.0)
+        if "result" not in resp and "error" not in resp:
+            return "resilience: server stopped responding after bad input"
+    except (TimeoutError, RuntimeError) as e:
+        return f"resilience: server died after bad input: {e}"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Test runner
+# ---------------------------------------------------------------------------
+
+def run_all(exe: str) -> bool:
+    if not FIXTURE_DIR.exists():
+        print(f"error: fixture directory not found: {FIXTURE_DIR}", file=sys.stderr)
+        return False
+
+    fixtures = sorted(FIXTURE_DIR.glob("*.cb"))
+    print(f"Server:   {exe}")
+    print(f"Fixtures: {FIXTURE_DIR} ({len(fixtures)} files)\n")
+
+    client = LspClient(exe)
+    initialize(client)
+
+    passed = 0
+    failed = 0
+
+    def record(name: str, error: str | None):
+        nonlocal passed, failed
+        if error is None:
+            print(f"  PASS  {name}")
+            passed += 1
+        else:
+            print(f"  FAIL  {name}")
+            print(f"        {error}")
+            failed += 1
+
+    # --- fixture-driven tests ---
+    for fixture_path in fixtures:
+        name = fixture_path.name
+        try:
+            err = run_fixture(client, fixture_path)
+        except TimeoutError as e:
+            err = f"TIMEOUT: {e}"
+        except Exception as e:
+            err = f"EXCEPTION: {e}"
+        record(name, err)
+
+    # --- hardcoded scenario tests ---
+    try:
+        record("diagnostic lifecycle", test_diagnostic_lifecycle(client))
+    except Exception as e:
+        record("diagnostic lifecycle", f"EXCEPTION: {e}")
+
+    try:
+        record("server resilience", test_server_resilience(client))
+    except Exception as e:
+        record("server resilience", f"EXCEPTION: {e}")
+
+    # Shutdown main client.
+    try:
+        client.request("shutdown")
+        client.notify("exit")
+    except Exception:
+        pass
+    stderr = client.close()
+
+    print(f"\n{passed} passed, {failed} failed")
+    if stderr.strip():
+        print("\n--- server stderr ---")
+        print(stderr.strip())
+
+    # --- out-of-process test (needs its own client) ---
+    try:
+        err = test_negative_hover_before_initialize(exe)
+        record("negative: hover before initialize", err)
+    except Exception as e:
+        record("negative: hover before initialize", f"EXCEPTION: {e}")
+
+    return failed == 0
+
+
+def main():
+    if len(sys.argv) >= 2:
+        exe = sys.argv[1]
+        if not Path(exe).exists():
+            print(f"error: not found: {exe}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        exe = find_exe()
+        if exe is None:
+            print(
+                "error: MyCompiler.exe not found. Build first, or pass the path as an argument.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    ok = run_all(exe)
+    sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    main()

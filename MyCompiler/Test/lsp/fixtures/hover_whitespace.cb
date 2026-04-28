@@ -1,0 +1,3 @@
+// $cursor line=0 col=6
+// $expect hover_null
+extern int main() { return 0; }

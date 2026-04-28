@@ -1,0 +1,4 @@
+// $cursor line=0 col=11
+// $expect completion includes="add"
+extern int add(int a, int b) { return a + b; }
+extern int main() { return add(1, 2); }

@@ -1,0 +1,4 @@
+// $cursor line=1 col=27
+// $expect definition line=0
+extern int add(int a, int b) { return a + b; }
+extern int main() { return add(1, 2); }
