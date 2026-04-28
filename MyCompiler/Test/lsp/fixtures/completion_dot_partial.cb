@@ -1,0 +1,4 @@
+// $cursor line=1 col=39
+// $expect completion includes="y"
+struct Point { int x = 0; int y = 0; };
+extern int main() { Point p; return p.y; }

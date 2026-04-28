@@ -3,7 +3,7 @@
 #include <vector>
 #include <unordered_map>
 
-enum class SymbolKind { Function, Struct, Interface, Namespace, TypeAlias };
+enum class SymbolKind { Function, Struct, Interface, Namespace, TypeAlias, Field };
 
 struct SymbolDef
 {
@@ -28,6 +28,10 @@ public:
     // Replace all occurrences of fromFile with toFile in registered symbol locations.
     void RemapFile(const std::string& fromFile, const std::string& toFile);
 
+    void RegisterVariable(const std::string& varName, const std::string& typeName);
+    const std::string* LookupVariableType(const std::string& varName) const;
+
 private:
     std::unordered_map<std::string, SymbolDef> symbols_;
+    std::unordered_map<std::string, std::string> variableTypes_;
 };

@@ -53,7 +53,7 @@
 #include "ArgParser.h"
 #include "CompilerManager.h"
 
-class LspSymbolIndex;  // forward declaration for symbol sink
+#include "LspSymbolIndex.h"
 
 struct ExpectedErrorReceived {};
 
@@ -669,6 +669,9 @@ private:
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
+            if (symbolSink_ && !itr_nameArg->VariableName.empty())
+                symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName);
+
             itr_nameArg++;
         }
 
@@ -1744,6 +1747,9 @@ public:
 
         globalNamedVariable[typeValue.VariableName] = gVar;
 
+        if (symbolSink_ && !typeValue.VariableName.empty())
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
+
         return gVar;
     }
 
@@ -1755,6 +1761,9 @@ public:
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
+
+        if (symbolSink_ && !typeValue.VariableName.empty())
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
 
         if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {
@@ -1777,6 +1786,9 @@ public:
         namedVariable.Storage = nullptr;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = value->getType();
+
+        if (symbolSink_ && !typeValue.VariableName.empty())
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
     }
 
     llvm::AllocaInst* CreateAlloca(llvm::Type* type)

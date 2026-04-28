@@ -36,6 +36,19 @@ std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& pr
 void LspSymbolIndex::Clear()
 {
     symbols_.clear();
+    variableTypes_.clear();
+}
+
+void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::string& typeName)
+{
+    if (!varName.empty() && !typeName.empty())
+        variableTypes_[varName] = typeName;
+}
+
+const std::string* LspSymbolIndex::LookupVariableType(const std::string& varName) const
+{
+    auto it = variableTypes_.find(varName);
+    return (it != variableTypes_.end()) ? &it->second : nullptr;
 }
 
 void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& toFile)

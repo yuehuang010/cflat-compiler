@@ -153,6 +153,49 @@ std::string extractWordAt(const std::string& text, int line, int character)
     return lineText.substr(start, end - start);
 }
 
+// Extract the identifier before a '.' at the given position, plus any partial identifier after it.
+// Returns {"", ""} if the character before the cursor (or before any partial word) is not '.'.
+std::pair<std::string, std::string> extractReceiverAt(const std::string& text, int line, int character)
+{
+    int currentLine = 0;
+    size_t lineStart = 0;
+    for (size_t i = 0; i < text.size(); ++i)
+    {
+        if (text[i] == '\n')
+        {
+            if (currentLine == line) break;
+            currentLine++;
+            lineStart = i + 1;
+        }
+    }
+    size_t lineEnd = text.find('\n', lineStart);
+    if (lineEnd == std::string::npos) lineEnd = text.size();
+    std::string lineText = text.substr(lineStart, lineEnd - lineStart);
+
+    size_t col = static_cast<size_t>(character) < lineText.size() ? static_cast<size_t>(character) : lineText.size();
+    auto isWord = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+
+    // Scan backward over any partial identifier typed after the dot
+    size_t partialStart = col;
+    while (partialStart > 0 && isWord(lineText[partialStart - 1]))
+        partialStart--;
+    std::string partial = lineText.substr(partialStart, col - partialStart);
+
+    // Expect a '.' immediately before the partial
+    if (partialStart == 0 || lineText[partialStart - 1] != '.')
+        return {"", ""};
+
+    // Scan backward over the receiver identifier
+    size_t dotPos = partialStart - 1;
+    size_t recvEnd = dotPos;
+    size_t recvStart = dotPos;
+    while (recvStart > 0 && isWord(lineText[recvStart - 1]))
+        recvStart--;
+    if (recvStart == recvEnd) return {"", ""};
+
+    return {lineText.substr(recvStart, recvEnd - recvStart), partial};
+}
+
 struct OpenDocument
 {
     std::string uri;
@@ -440,46 +483,75 @@ private:
 
     void HandleCompletion(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
-        std::string prefix;
+        int line = 0, character = 0;
+        std::string uri, text;
         if (msg.contains("params") && msg["params"].is_object())
         {
             const auto& params = msg["params"];
             if (params.contains("position") && params["position"].is_object())
             {
-                int line      = params["position"].value("line",      0);
-                int character = params["position"].value("character", 0);
-                std::string uri;
-                if (params.contains("textDocument") && params["textDocument"].is_object())
-                    uri = params["textDocument"].value("uri", "");
-                std::string text;
-                {
-                    std::lock_guard<std::mutex> lock(docsMutex_);
-                    if (auto it = docs_.find(uri); it != docs_.end())
-                        text = it->second.text;
-                }
-                prefix = extractWordAt(text, line, character);
+                line      = params["position"].value("line",      0);
+                character = params["position"].value("character", 0);
             }
+            if (params.contains("textDocument") && params["textDocument"].is_object())
+                uri = params["textDocument"].value("uri", "");
+        }
+        {
+            std::lock_guard<std::mutex> lock(docsMutex_);
+            if (auto it = docs_.find(uri); it != docs_.end())
+                text = it->second.text;
         }
 
         auto index = GetCurrentIndex();
-        auto defs = index->LookupPrefix(prefix);
-
         nlohmann::json items = nlohmann::json::array();
-        for (const SymbolDef* def : defs)
+
+        auto [receiver, partial] = extractReceiverAt(text, line, character);
+        if (!receiver.empty())
         {
-            nlohmann::json item = {
-                {"label",  def->name},
-                {"detail", def->signatureMarkdown}
-            };
-            switch (def->kind)
+            // Resolve variable name to its type; fall back to treating receiver as type/namespace name.
+            std::string typeName = receiver;
+            if (auto* vt = index->LookupVariableType(receiver))
+                typeName = *vt;
+
+            // LookupPrefix("TypeName.partial") returns matching fields and methods.
+            auto members = index->LookupPrefix(typeName + "." + partial);
+            for (const SymbolDef* def : members)
             {
-                case SymbolKind::Function:  item["kind"] = 3;  break;  // Function
-                case SymbolKind::Struct:    item["kind"] = 22; break;  // Struct
-                case SymbolKind::Interface: item["kind"] = 8;  break;  // Interface
-                case SymbolKind::Namespace: item["kind"] = 9;  break;  // Module
-                case SymbolKind::TypeAlias: item["kind"] = 25; break;  // TypeParameter
+                std::string label = def->name.size() > typeName.size() + 1
+                    ? def->name.substr(typeName.size() + 1)
+                    : def->name;
+                nlohmann::json item = {{"label", label}, {"detail", def->signatureMarkdown}};
+                switch (def->kind)
+                {
+                    case SymbolKind::Function: item["kind"] = 3; break;  // Function
+                    case SymbolKind::Field:    item["kind"] = 5; break;  // Field
+                    default: break;
+                }
+                items.push_back(std::move(item));
             }
-            items.push_back(std::move(item));
+        }
+        else
+        {
+            // Global prefix completion.
+            std::string prefix = extractWordAt(text, line, character);
+            auto defs = index->LookupPrefix(prefix);
+            for (const SymbolDef* def : defs)
+            {
+                nlohmann::json item = {
+                    {"label",  def->name},
+                    {"detail", def->signatureMarkdown}
+                };
+                switch (def->kind)
+                {
+                    case SymbolKind::Function:  item["kind"] = 3;  break;  // Function
+                    case SymbolKind::Struct:    item["kind"] = 22; break;  // Struct
+                    case SymbolKind::Interface: item["kind"] = 8;  break;  // Interface
+                    case SymbolKind::Namespace: item["kind"] = 9;  break;  // Module
+                    case SymbolKind::TypeAlias: item["kind"] = 25; break;  // TypeParameter
+                    case SymbolKind::Field:     item["kind"] = 5;  break;  // Field
+                }
+                items.push_back(std::move(item));
+            }
         }
         SendResponse(id, { {"isIncomplete", false}, {"items", std::move(items)} });
     }

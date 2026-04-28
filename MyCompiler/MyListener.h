@@ -303,6 +303,15 @@ private:
             sig += ")";
             s->Register(SymbolKind::Function, name, compiler->GetSourceFileName(),
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
+
+            // Also register under "TypeName.method" for dot-completion prefix lookup.
+            // Operators and statics already have the qualified name; only instance methods need this.
+            if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
+            {
+                std::string qualName = structName + "." + getFunctionName(func);
+                s->Register(SymbolKind::Function, qualName, compiler->GetSourceFileName(),
+                            (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
+            }
         }
 
         // Pre-declare overloads for default parameters
@@ -5739,6 +5748,24 @@ public:
             compiler->CreateBlockBreak(nullptr, true);
         }
 
+        // Register struct fields in LSP index for dot-completion
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            auto sd = compiler->GetDataStructure(structName);
+            for (const auto& field : sd.StructFields)
+            {
+                if (field.VariableName.empty()) continue;
+                std::string typeSig = field.TypeName;
+                if (field.Pointer) typeSig += "*";
+                if (field.ElemPointer) typeSig += "*";
+                s->Register(SymbolKind::Field, structName + "." + field.VariableName,
+                            compiler->GetSourceFileName(),
+                            (int)ctx->getStart()->getLine(),
+                            (int)ctx->getStart()->getCharPositionInLine(),
+                            typeSig + " " + field.VariableName);
+            }
+        }
+
         // Parse member functions
         auto functionList = ctx->functionDefinition();
 
@@ -6169,6 +6196,24 @@ public:
 
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // Register class fields in LSP index for dot-completion
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            auto sd = compiler->GetDataStructure(name);
+            for (const auto& field : sd.StructFields)
+            {
+                if (field.VariableName.empty()) continue;
+                std::string typeSig = field.TypeName;
+                if (field.Pointer) typeSig += "*";
+                if (field.ElemPointer) typeSig += "*";
+                s->Register(SymbolKind::Field, name + "." + field.VariableName,
+                            compiler->GetSourceFileName(),
+                            (int)ctx->getStart()->getLine(),
+                            (int)ctx->getStart()->getCharPositionInLine(),
+                            typeSig + " " + field.VariableName);
+            }
         }
 
         // Parse member functions (includes user's main)
