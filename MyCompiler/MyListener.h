@@ -2610,6 +2610,13 @@ public:
                             nv.IsOwningString = true;
                             compiler->lastCallReturnsOwnedString = false;
                         }
+
+                        // Propagate new-allocation: mark local as owning its heap pointer.
+                        if (compiler->lastNewAllocated)
+                        {
+                            compiler->stackNamedVariable.back().namedVariable[name].IsNewAllocated = true;
+                            compiler->lastNewAllocated = false;
+                        }
                     }
                 }
             }
@@ -2782,6 +2789,34 @@ public:
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
+            // Lazy refcount: if a new-allocated local is assigned to a non-local destination
+            // (struct field, heap object), create a refcount on first escape and increment it.
+            if (operatorText == "=" && rightNV.IsNewAllocated && rightNV.TypeAndValue.Pointer
+                && !rightNV.CallerName.empty()
+                && destination != nullptr
+                && !llvm::isa<llvm::AllocaInst>(destination)
+                && !llvm::isa<llvm::GlobalVariable>(destination))
+            {
+                // Fetch the live RefCountStorage (rightNV is a copy; look up the actual NV).
+                llvm::Value* refAlloca = rightNV.RefCountStorage;
+                if (refAlloca == nullptr)
+                {
+                    // First escape: emit the refcount alloca at function entry (initialized to 1).
+                    auto savedIP = compiler->builder->saveIP();
+                    auto* fn = compiler->builder->GetInsertBlock()->getParent();
+                    auto* entryBB = &fn->getEntryBlock();
+                    compiler->builder->SetInsertPoint(entryBB, entryBB->begin());
+                    refAlloca = compiler->builder->CreateAlloca(compiler->builder->getInt32Ty(), nullptr, "refcount");
+                    compiler->builder->CreateStore(compiler->builder->getInt32(1), refAlloca);
+                    compiler->builder->restoreIP(savedIP);
+                    compiler->SetVariableRefCountStorage(rightNV.CallerName, refAlloca);
+                }
+                // Increment for this escape.
+                auto* cur = compiler->builder->CreateLoad(compiler->builder->getInt32Ty(), refAlloca);
+                compiler->builder->CreateStore(
+                    compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
+                    refAlloca);
+            }
             // Transfer ownership: if RHS was an owning move param, null its alloca so
             // EmitDestructorsForScope won't free the pointer we just stored elsewhere.
             if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
@@ -3955,6 +3990,7 @@ public:
         result.TypeAndValue.Pointer = true;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
+        compiler->lastNewAllocated = true;
         return result;
     }
 
@@ -3968,11 +4004,25 @@ public:
         // AST-level type information from the unary expression instead.
         std::string typeName;
         llvm::Value* ptrVal = nullptr;
+        llvm::Value* srcAlloca = nullptr;
+        llvm::Type* srcAllocaElemType = nullptr;
         if (auto* ue = tryGetUnaryExpression(ctx->expression()))
         {
             auto namedVar = ParseUnaryExpression(ue);
             typeName = namedVar.TypeAndValue.TypeName;
-            ptrVal = namedVar.Storage ? compiler->CreateLoad(namedVar.Storage) : namedVar.Primary;
+            if (namedVar.Storage)
+            {
+                ptrVal = compiler->CreateLoad(namedVar.Storage);
+                if (llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                {
+                    srcAlloca = namedVar.Storage;
+                    srcAllocaElemType = namedVar.BaseType;
+                }
+            }
+            else
+            {
+                ptrVal = namedVar.Primary;
+            }
         }
         else
         {
@@ -4008,6 +4058,14 @@ public:
         else
         {
             LogErrorContext(ctx, "'delete' requires 'operator delete' to be defined");
+        }
+
+        // 4. Null the source alloca so scope-exit cleanup (IsNewAllocated) doesn't double-free.
+        if (srcAlloca && srcAllocaElemType)
+        {
+            if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcAllocaElemType))
+                compiler->builder->CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy), srcAlloca);
         }
 
         return {};

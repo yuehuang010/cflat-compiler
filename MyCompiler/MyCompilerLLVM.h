@@ -261,6 +261,8 @@ public:
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors — destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        bool IsNewAllocated = false;     // true when local was initialized with 'new' — freed at scope exit unless escaped
+        llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         int IdentifierLine = 0;          // source location for use-after-move error reporting
         int IdentifierColumn = 0;
@@ -381,6 +383,7 @@ public:
     public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
     bool lastCallReturnsOwnedString = false; // set when the last call returned an owned heap string
+    bool lastNewAllocated = false;           // set by ParseNewExpression; consumed by ParseDeclaration
 
     private:
 
@@ -492,6 +495,31 @@ private:
         return fn;
     }
 
+    void SetVariableRefCountStorage(const std::string& varName, llvm::Value* refStorage)
+    {
+        for (auto& frame : stackNamedVariable)
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it != frame.namedVariable.end())
+            {
+                it->second.RefCountStorage = refStorage;
+                return;
+            }
+        }
+    }
+
+    void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount)
+    {
+        auto* zeroCond = builder->CreateICmpEQ(refCount, builder->getInt32(0), "refiszero");
+        auto* freeBB = llvm::BasicBlock::Create(*context, "refcount.free", builder->GetInsertBlock()->getParent());
+        auto* skipBB = llvm::BasicBlock::Create(*context, "refcount.skip", builder->GetInsertBlock()->getParent());
+        builder->CreateCondBr(zeroCond, freeBB, skipBB);
+        builder->SetInsertPoint(freeBB);
+        EmitOwningPtrCleanup(namedVar);
+        builder->CreateBr(skipBB);
+        builder->SetInsertPoint(skipBB);
+    }
+
     void EmitOwningPtrCleanup(const NamedVariable& namedVar)
     {
         // Load the current pointer value from the alloca
@@ -532,6 +560,21 @@ private:
 
         for (const auto& [varName, namedVar] : frame.namedVariable)
         {
+            if (namedVar.TypeAndValue.Pointer && namedVar.IsNewAllocated)
+            {
+                if (namedVar.RefCountStorage == nullptr)
+                {
+                    EmitOwningPtrCleanup(namedVar);
+                }
+                else
+                {
+                    auto* cur = builder->CreateLoad(builder->getInt32Ty(), namedVar.RefCountStorage);
+                    auto* dec = builder->CreateSub(cur, builder->getInt32(1), "refdec");
+                    builder->CreateStore(dec, namedVar.RefCountStorage);
+                    EmitConditionalOwningPtrCleanup(namedVar, dec);
+                }
+                continue;
+            }
             if (namedVar.TypeAndValue.Pointer) continue;
             auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
             if (it != dataStructures.end())
@@ -3734,10 +3777,11 @@ public:
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
-        // If returning an owned string loaded from a local alloca, suppress its destructor
-        // so we don't free the buffer before the caller receives the struct.
+        // If returning an owned variable loaded from a local alloca, suppress its cleanup
+        // so we don't free the value before the caller receives it.
         // The loaded snapshot in `value` already captures the pointer; the caller takes ownership.
-        NamedVariable* ownedReturnVar = nullptr;
+        NamedVariable* ownedStringReturnVar    = nullptr;
+        NamedVariable* ownedNewAllocReturnVar  = nullptr;
         if (value)
         {
             if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value))
@@ -3750,8 +3794,14 @@ public:
                         {
                             if (nv.Storage == srcAlloca && nv.IsOwningString)
                             {
-                                ownedReturnVar = &nv;
+                                ownedStringReturnVar = &nv;
                                 nv.IsOwningString = false;  // suppress destructor
+                                return;
+                            }
+                            if (nv.Storage == srcAlloca && nv.IsNewAllocated)
+                            {
+                                ownedNewAllocReturnVar = &nv;
+                                nv.IsNewAllocated = false;  // suppress cleanup on return path
                                 return;
                             }
                         }
@@ -3767,8 +3817,9 @@ public:
             if (it->isFunction) break;
         }
 
-        // Restore flag (clean state, though the scope is about to be popped anyway)
-        if (ownedReturnVar) ownedReturnVar->IsOwningString = true;
+        // Restore flags (clean state, though the scope is about to be popped anyway)
+        if (ownedStringReturnVar)   ownedStringReturnVar->IsOwningString = true;
+        if (ownedNewAllocReturnVar) ownedNewAllocReturnVar->IsNewAllocated = true;
 
         // If we are inlining a return-block, capture the value and branch to continuation.
         if (returnCapture)
