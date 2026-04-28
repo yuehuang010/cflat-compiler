@@ -521,6 +521,7 @@ translationUnit
 externalDeclaration
     : classDefinition
     | structDefinition
+    | programDefinition
     | functionDefinition
     | interfaceDefinition
     | declaration
@@ -563,6 +564,10 @@ structDefinition
 
 classDefinition
     : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    ;
+
+programDefinition
+    : 'program' directDeclarator '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 genericIdentifier

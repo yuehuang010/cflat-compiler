@@ -514,6 +514,38 @@ public:
             compiler->RegisterTypeAlias(alias, target);
     }
 
+    void ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string name = ctx->directDeclarator()->getText();
+
+        // Register opaque struct shell and default constructor
+        compiler->CreateStructType(name, {});
+        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = name };
+        compiler->CreateFunctionDeclaration(name, returnType, {});
+
+        // Pre-declare trampoline: int __program_run_Name(void*)
+        MyCompilerLLVM::TypeAndValue intReturn{ .TypeName = "int" };
+        MyCompilerLLVM::DeclTypeAndValue ctxParam;
+        ctxParam.TypeName = "void";
+        ctxParam.VariableName = "ctx";
+        ctxParam.Pointer = true;
+        compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam });
+
+        // Pre-declare member functions (including user's main) and destructor
+        for (auto func : ctx->functionDefinition())
+            ScanFunctionDefinition(func, name);
+        for (auto dtor : ctx->destructorDefinition())
+        {
+            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer = true;
+            compiler->CreateFunctionDeclaration("~" + name, voidReturn, { thisParam });
+        }
+    }
+
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         if (auto ns = ctx->namespaceDefinition())
@@ -528,6 +560,8 @@ public:
             ScanInterfaceDefinition(iface);
         else if (auto usingDecl = ctx->usingDeclaration())
             ScanUsingDeclaration(usingDecl);
+        else if (auto progDef = ctx->programDefinition())
+            ScanProgramDefinition(progDef);
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
             // Scan function/struct definitions inside the expect_error block so forward refs work.
@@ -1138,6 +1172,10 @@ public:
         else if (classDef != nullptr)
         {
             ParseClassDefinition(classDef, {}, namespaceName);
+        }
+        else if (auto progDef = ctx->programDefinition())
+        {
+            ParseProgramDefinition(progDef);
         }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
@@ -5606,6 +5644,288 @@ public:
 
         // Process any generic instantiations that were queued during this struct definition
         // ProcessPendingInstantiations();
+    }
+
+    // Find the first registered overload of `methodName` whose first parameter type is `firstParamType`.
+    llvm::Function* FindMethodOf(const std::string& methodName, const std::string& firstParamType)
+    {
+        auto it = compilerLLVM->functionTable.find(methodName);
+        if (it == compilerLLVM->functionTable.end()) return nullptr;
+        for (const auto& sym : it->second)
+        {
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == firstParamType)
+                return sym.Function;
+        }
+        return nullptr;
+    }
+
+    void EmitProgramRunWrapper(const std::string& name)
+    {
+        auto* compiler = compilerLLVM;
+
+        // Resolve types — all must be concrete by this point (ProcessPendingInstantiations ran)
+        auto* progType       = compiler->dataStructures[name].StructType;
+        auto* blockAllocType = compiler->dataStructures.count("BlockAllocator")
+                               ? compiler->dataStructures["BlockAllocator"].StructType : nullptr;
+        auto* listStringType = compiler->dataStructures.count("list__string")
+                               ? compiler->dataStructures["list__string"].StructType : nullptr;
+        auto* threadType     = compiler->dataStructures.count("Thread")
+                               ? compiler->dataStructures["Thread"].StructType : nullptr;
+
+        if (!progType || !blockAllocType || !listStringType || !threadType)
+        {
+            compiler->LogError(std::format(
+                "program '{}': missing required type (BlockAllocator={}, list__string={}, Thread={})",
+                name,
+                blockAllocType ? "ok" : "missing",
+                listStringType ? "ok" : "missing",
+                threadType     ? "ok" : "missing"));
+            return;
+        }
+
+        auto* progPtrType       = progType->getPointerTo();
+        auto* blockAllocPtrType = blockAllocType->getPointerTo();
+        auto* voidPtrType       = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* i32Type           = llvm::Type::getInt32Ty(*compiler->context);
+        auto* i64Type           = llvm::Type::getInt64Ty(*compiler->context);
+
+        // __RunArgs_Name = { Name*, list__string }
+        auto* runArgsType = llvm::StructType::create(
+            *compiler->context, {progPtrType, listStringType}, "__RunArgs_" + name);
+        compiler->programTable[name].RunArgsType = runArgsType;
+
+        // Look up helper functions
+        auto* mallocFn           = compiler->GetFunction("malloc");
+        auto* freeFn             = compiler->GetFunction("free");
+        auto* blockAllocCtorFn   = compiler->GetFunction("BlockAllocator");
+        auto* blockAllocCleanupFn = FindMethodOf("cleanup", "BlockAllocator");
+        auto* threadCtorFn       = compiler->GetFunction("Thread");
+        auto* threadStartFn      = FindMethodOf("start", "Thread");
+        auto* threadJoinFn       = FindMethodOf("join", "Thread");
+        auto* mainFn             = FindMethodOf("main", name);
+
+        if (!mallocFn || !freeFn || !blockAllocCtorFn || !blockAllocCleanupFn
+            || !threadCtorFn || !threadStartFn || !threadJoinFn || !mainFn)
+        {
+            compiler->LogError(std::format("program '{}': missing helper function for run() generation", name));
+            return;
+        }
+
+        // ======================================================================
+        // EMIT TRAMPOLINE: int __program_run_Name(void* ctx)
+        // Runs on the spawned thread. Sets up allocator, calls main, cleans up.
+        // ======================================================================
+        {
+            MyCompilerLLVM::TypeAndValue intReturn;   intReturn.TypeName = "int";
+            MyCompilerLLVM::DeclTypeAndValue ctxParam;
+            ctxParam.TypeName = "void";  ctxParam.VariableName = "ctx";  ctxParam.Pointer = true;
+            auto* trampolineFn = compiler->CreateFunctionDefinition(
+                "__program_run_" + name, intReturn, {ctxParam});
+            compiler->programTable[name].TrampolineFunction = trampolineFn;
+
+            auto* ctxArg = trampolineFn->getArg(0);
+
+            // Cast void* ctx to __RunArgs_Name*
+            auto* argsPacket = compiler->builder->CreateBitCast(
+                ctxArg, runArgsType->getPointerTo(), "args_packet");
+
+            // Load self (Name*) from field 0
+            auto* selfGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 0, "self_gep");
+            auto* self     = compiler->builder->CreateLoad(progPtrType, selfGEP, "self");
+
+            // Pointer to list__string (field 1) — passed by value to main
+            auto* argsGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 1, "args_gep");
+
+            // Allocate BlockAllocator on heap using raw malloc (tracked alloc not active yet)
+            auto* blockAllocSize = compiler->GetTypeSizeBytes(blockAllocType);
+            auto* allocRaw = compiler->builder->CreateCall(
+                mallocFn->getFunctionType(), mallocFn, {blockAllocSize}, "alloc_raw");
+            auto* allocPtr = compiler->builder->CreateBitCast(allocRaw, blockAllocPtrType, "alloc_ptr");
+
+            // Initialize BlockAllocator via its default constructor (returns struct by value)
+            auto* allocInitVal = compiler->builder->CreateCall(
+                blockAllocCtorFn->getFunctionType(), blockAllocCtorFn, {}, "alloc_init");
+            compiler->builder->CreateStore(allocInitVal, allocPtr);
+
+            // Set thread-local __active_allocator = allocPtr
+            auto* activeAllocGlobal = compiler->globalNamedVariable["__active_allocator"];
+            compiler->builder->CreateStore(allocPtr, activeAllocGlobal);
+
+            // Load list__string args by value from the packet
+            auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
+
+            // Call Name.main(self, args)
+            auto* mainResult = compiler->builder->CreateCall(
+                mainFn->getFunctionType(), mainFn, {self, argsVal}, "main_result");
+
+            // Cleanup: call BlockAllocator.cleanup(allocPtr)
+            compiler->builder->CreateCall(
+                blockAllocCleanupFn->getFunctionType(), blockAllocCleanupFn, {allocPtr});
+
+            // Free the BlockAllocator
+            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocRaw});
+
+            // Clear __active_allocator
+            compiler->builder->CreateStore(
+                llvm::ConstantPointerNull::get(blockAllocPtrType), activeAllocGlobal);
+
+            compiler->CreateReturnCall(mainResult);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // ======================================================================
+        // EMIT run(): int run(Name* this, list__string args)
+        // Called by the user. Allocates args packet, spawns thread, joins.
+        // ======================================================================
+        {
+            MyCompilerLLVM::TypeAndValue intReturn;  intReturn.TypeName = "int";
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+            MyCompilerLLVM::DeclTypeAndValue argsParam;
+            argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
+
+            auto* runFn = compiler->CreateFunctionDefinition("run", intReturn, {thisParam, argsParam});
+            compiler->programTable[name].RunFunction = runFn;
+
+            auto* thisArg = runFn->getArg(0);   // Name*
+            auto* argsArg = runFn->getArg(1);   // list__string by value
+
+            // Malloc the args packet (raw malloc — tracked alloc is per-thread)
+            auto* pkgSize = compiler->GetTypeSizeBytes(runArgsType);
+            auto* pkgRaw  = compiler->builder->CreateCall(
+                mallocFn->getFunctionType(), mallocFn, {pkgSize}, "pkg_raw");
+            auto* pkg = compiler->builder->CreateBitCast(pkgRaw, runArgsType->getPointerTo(), "pkg");
+
+            // Store this → pkg->self (field 0)
+            auto* selfGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 0, "pkg_self_gep");
+            compiler->builder->CreateStore(thisArg, selfGEP);
+
+            // Store args → pkg->args (field 1) by value
+            auto* argsGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 1, "pkg_args_gep");
+            compiler->builder->CreateStore(argsArg, argsGEP);
+
+            // Create Thread on stack and initialize via default ctor
+            auto* threadAlloca  = compiler->builder->CreateAlloca(threadType, nullptr, "thread");
+            auto* threadInitVal = compiler->builder->CreateCall(
+                threadCtorFn->getFunctionType(), threadCtorFn, {}, "thread_init");
+            compiler->builder->CreateStore(threadInitVal, threadAlloca);
+
+            // Thread.start(thread*, function<int(void*)> trampoline, void* ctx)
+            auto* trampolineFn  = compiler->programTable[name].TrampolineFunction;
+            auto* trampolinePtrAsVoid = compiler->builder->CreateBitCast(trampolineFn, voidPtrType);
+            // Cast trampoline to the expected function pointer type: int(*)(void*)
+            auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
+            auto* trampolineFnPtr = compiler->builder->CreateBitCast(
+                trampolineFn, trampolineFnTy->getPointerTo());
+            compiler->builder->CreateCall(
+                threadStartFn->getFunctionType(), threadStartFn,
+                {threadAlloca, trampolineFnPtr, pkgRaw});
+
+            // Thread.join(thread*) → i32 exit code
+            auto* exitCode = compiler->builder->CreateCall(
+                threadJoinFn->getFunctionType(), threadJoinFn, {threadAlloca}, "exit_code");
+
+            // Free the args packet (thread has finished)
+            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {pkgRaw});
+
+            compiler->CreateReturnCall(exitCode);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+    }
+
+    void ParseProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string name = ctx->directDeclarator()->getText();
+
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     parse program: " << name << "\n";
+
+        // Queue generic types used in field declarations and function parameters
+        if (activeTypeSubstitutions.empty())
+        {
+            for (auto decl : ctx->declaration())
+                ScanAndQueueGenericTypeUses(decl);
+            for (auto func : ctx->functionDefinition())
+                ScanAndQueueGenericTypeUses(func);
+            ProcessPendingInstantiations();
+        }
+
+        auto declList = ParseDeclarationList(ctx->declaration());
+
+        // Build struct type (config fields only — no allocator field)
+        auto* structType = compiler->CreateStructType(name, declList);
+        if (structType->isOpaque())
+            structType->setBody(llvm::ArrayRef<llvm::Type*>());
+
+        // Create default constructor (same pattern as ParseStructDefinition)
+        {
+            MyCompilerLLVM::TypeAndValue returnType;
+            returnType.TypeName = name;
+            compiler->CreateFunctionDefinition(name, returnType, {});
+
+            std::vector<llvm::Value*> initializers;
+            for (auto& typeValue : declList)
+            {
+                llvm::Value* rvalue = nullptr;
+                auto* initializer = typeValue.Initializer;
+                if (initializer)
+                {
+                    if (auto* ae = initializer->assignmentExpression())
+                        rvalue = ParseAssignmentExpression(ae);
+                    else if (initializer->Default())
+                        rvalue = GenerateDefaultValue(typeValue);
+                }
+                initializers.push_back(rvalue);
+            }
+
+            llvm::Value* structVal = llvm::UndefValue::get(structType);
+            unsigned int idx = 0;
+            for (auto* rvalue : initializers)
+            {
+                if (rvalue)
+                {
+                    auto* destType = structType->getTypeAtIndex(idx);
+                    rvalue = compiler->Upconvert(rvalue, destType);
+                    structVal = compiler->CreateInsertValue(structVal, rvalue, idx);
+                }
+                idx++;
+            }
+
+            compiler->CreateReturnCall(structVal);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // Parse member functions (includes user's main)
+        {
+            bool savedScope = global_scope;
+            for (auto func : ctx->functionDefinition())
+            {
+                global_scope = false;
+                ParseFunctionDefinition(func, name);
+            }
+            global_scope = savedScope;
+        }
+
+        // Parse destructor if present
+        {
+            bool savedScope = global_scope;
+            for (auto dtor : ctx->destructorDefinition())
+            {
+                global_scope = false;
+                ParseDestructorDefinition(dtor, name);
+            }
+            global_scope = savedScope;
+        }
+
+        // Flush instantiations (e.g. list__string from main's params) before emitting run()
+        ProcessPendingInstantiations();
+
+        // Emit auto-generated run() method and __program_run_Name trampoline
+        EmitProgramRunWrapper(name);
+
+        compiler->programTable[name].StructType = structType;
+        compiler->programTable[name].ConfigFields = declList;
     }
 
     void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})

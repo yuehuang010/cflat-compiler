@@ -48,23 +48,23 @@ class BlockAllocator : IAllocator
 
     void _initPageSize()
     {
-        _SystemInfo* info = new _SystemInfo[1];
+        _SystemInfo* info = (_SystemInfo*)malloc(48);   // sizeof(_SystemInfo) == 48 bytes
         GetSystemInfo((void*)info);
         _pageSize = info->_allocGranularity;
-        delete[] info;
+        free((void*)info);
     }
 
     void _growPages()
     {
         int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
-        _BlockPage* newPages = new _BlockPage[newCap];
+        _BlockPage* newPages = (_BlockPage*)malloc((i64)newCap * 24);  // sizeof(_BlockPage) == 24 bytes
         int i = 0;
         while (i < _pageCount)
         {
             newPages[i] = _pages[i];
             i = i + 1;
         }
-        if (_pages != nullptr) delete[] _pages;
+        if (_pages != nullptr) free((void*)_pages);
         _pages    = newPages;
         _pageCapacity = newCap;
     }
@@ -178,6 +178,22 @@ class BlockAllocator : IAllocator
             used * _blockSize, total * _blockSize);
     }
 
+    // Free all pages and reset state. Safe to call before freeing the struct itself.
+    void cleanup()
+    {
+        int i = 0;
+        while (i < _pageCount)
+        {
+            free(_pages[i]._data);
+            i = i + 1;
+        }
+        if (_pages != nullptr) free((void*)_pages);
+        _pages        = nullptr;
+        _pageCount    = 0;
+        _pageCapacity = 0;
+        _pageSize     = 0;
+    }
+
     ~BlockAllocator()
     {
         int i = 0;
@@ -186,6 +202,6 @@ class BlockAllocator : IAllocator
             free(_pages[i]._data);
             i = i + 1;
         }
-        if (_pages != nullptr) delete[] _pages;
+        if (_pages != nullptr) free((void*)_pages);
     }
 };

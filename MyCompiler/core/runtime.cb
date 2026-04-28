@@ -1,13 +1,30 @@
 // CFlat runtime — allocator interface
 import "cruntime.cb";
 
+void* __runtime_alloc(BlockAllocator* a, i64 size)
+{
+    return a.alloc(size);
+}
+
+void __runtime_dealloc(BlockAllocator* a, void* ptr)
+{
+    a.dealloc(ptr);
+}
+
 void* operator new(i64 size)
 {
+    if (__active_allocator != nullptr)
+        return __runtime_alloc(__active_allocator, size);
     return malloc(size);
 }
 
 void operator delete(void* ptr)
 {
+    if (__active_allocator != nullptr)
+    {
+        __runtime_dealloc(__active_allocator, ptr);
+        return;
+    }
     free(ptr);
 }
 

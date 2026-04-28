@@ -297,6 +297,17 @@ public:
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
     };
 
+    struct ProgramData
+    {
+        llvm::StructType* StructType = nullptr;
+        std::vector<DeclTypeAndValue> ConfigFields;
+        llvm::Function* Destructor = nullptr;
+        llvm::Function* MainFunction = nullptr;
+        llvm::Function* RunFunction = nullptr;
+        llvm::Function* TrampolineFunction = nullptr;  // __program_run_Name
+        llvm::StructType* RunArgsType = nullptr;       // { Name*, list__string }
+    };
+
     class StackState
     {
     public:
@@ -397,6 +408,7 @@ public:
     std::vector<StackState> stackNamedVariable;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, StructData> dataStructures;
+    std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
@@ -3167,6 +3179,15 @@ public:
                 // be the wrong type for a pointer parameter.
                 if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr)
                     argList.push_back(arg.Storage);
+                else if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
+                         && arg.Primary != nullptr && arg.Primary->getType()->isStructTy())
+                {
+                    // By-value struct parameter passed to a pointer parameter (e.g. args.count()
+                    // where args is a list<T> value param). Materialize on the stack first.
+                    auto* tempAlloca = builder->CreateAlloca(arg.Primary->getType());
+                    builder->CreateStore(arg.Primary, tempAlloca);
+                    argList.push_back(tempAlloca);
+                }
                 else
                     argList.push_back(arg.GetValue());
             }

@@ -95,10 +95,24 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
 
-    // Auto-import the CFlat runtime (provides printf and other builtins).
-    // Order matters: runtime first (new/delete), then interfaces, then string.
+    // Auto-import order: interfaces → program → runtime → string.
+    // program.cb declares __active_allocator; runtime.cb references it, so program must come first.
     if (!runtimeDir.empty())
     {
+        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
+        if (verbose) std::cout << "[verbose] auto-importing interfaces: " << interfacesPath.string() << "\n";
+        if (std::filesystem::exists(interfacesPath))
+            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
+        else if (verbose)
+            std::cout << "[verbose]   interfaces.cb not found, skipping\n";
+
+        auto programPath = std::filesystem::path(runtimeDir) / "core" / "program.cb";
+        if (verbose) std::cout << "[verbose] auto-importing program: " << programPath.string() << "\n";
+        if (std::filesystem::exists(programPath))
+            CompileImportedFile(programPath.string(), "program.cb");
+        else if (verbose)
+            std::cout << "[verbose]   program.cb not found, skipping\n";
+
         if (!skipRuntimeImport) {
             auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
             if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
@@ -107,13 +121,6 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
             else if (verbose)
                 std::cout << "[verbose]   runtime.cb not found, skipping\n";
         }
-
-        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
-        if (verbose) std::cout << "[verbose] auto-importing interfaces: " << interfacesPath.string() << "\n";
-        if (std::filesystem::exists(interfacesPath))
-            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
-        else if (verbose)
-            std::cout << "[verbose]   interfaces.cb not found, skipping\n";
 
         auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
         if (verbose) std::cout << "[verbose] auto-importing string: " << stringPath.string() << "\n";
