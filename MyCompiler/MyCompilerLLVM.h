@@ -458,7 +458,6 @@ private:
     bool stringDtorRegistered = false;
     std::function<void(const std::string&, size_t, size_t, const std::string&)> diagnosticSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
-    std::unordered_set<std::string> coreImportedFiles_;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
@@ -711,7 +710,9 @@ private:
         auto* ptrTy = builder->getInt8Ty()->getPointerTo();
         auto* i32Ty = builder->getInt32Ty();
 
-        auto* strTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "string");
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (!strTy)
+            strTy = llvm::StructType::create(*context, { ptrTy, i32Ty }, "string");
 
         DeclTypeAndValue ptrField;
         ptrField.TypeName = "i8";

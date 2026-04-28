@@ -435,10 +435,6 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
             CompileImportedFile(stringPath.string(), "string.cb");
     }
 
-    // Snapshot core files after first analysis so ResetForReanalysis() knows which entries to keep.
-    if (coreImportedFiles_.empty())
-        coreImportedFiles_ = importedFiles;
-
     if (!std::filesystem::exists(filePath))
     {
         std::cerr << "Error: input file '" << filePath << "' does not exist.\n";
@@ -499,6 +495,7 @@ void MyCompilerLLVM::ResetForReanalysis()
 
     functionTable.clear();
     dataStructures.clear();
+    programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
     interfaceTable.clear();
@@ -517,16 +514,16 @@ void MyCompilerLLVM::ResetForReanalysis()
     expectedError.clear();
     expectedErrorScopeDepth = SIZE_MAX;
     currentFunction = nullptr;
+    autoVaListAlloca = nullptr;
     returnCapture = std::nullopt;
 
-    // Restore importedFiles to just the core set; remove non-core parse states.
-    importedFiles = coreImportedFiles_;
-    auto it = importedParseStates.begin();
-    while (it != importedParseStates.end())
-    {
-        if (coreImportedFiles_.count(it->canonicalPath) == 0)
-            it = importedParseStates.erase(it);
-        else
-            ++it;
-    }
+    // Clear all import state so core files (string, runtime, etc.) are fully re-imported
+    // on the next Analyze() call.
+    importedFiles.clear();
+    importedParseStates.clear();
+
+    // Re-register the built-in string type that was wiped by the clears above.
+    // string.cb references 'string' as a return type before the struct is parsed,
+    // so it must exist before any core file is compiled.
+    RegisterBuiltinString();
 }

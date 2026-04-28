@@ -37,14 +37,40 @@ function findCompilerExecutable(): string | undefined {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+    const outputChannel = vscode.window.createOutputChannel('MyCompiler Language Server');
+    context.subscriptions.push(outputChannel);
+
+    outputChannel.appendLine('=== MyCompiler Extension Activating ===');
+    outputChannel.appendLine(`Extension path : ${context.extensionPath}`);
+    outputChannel.appendLine(`Log directory  : ${context.logUri.fsPath}`);
+
+    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+    if (workspaceFolders.length === 0) {
+        outputChannel.appendLine('Workspace folders: (none)');
+    } else {
+        workspaceFolders.forEach(f => outputChannel.appendLine(`Workspace folder: ${f.uri.fsPath}`));
+    }
+
+    const configured = vscode.workspace.getConfiguration('mycompiler').get<string>('executablePath');
+    outputChannel.appendLine(`mycompiler.executablePath setting: "${configured ?? ''}"`);
+
     const exePath = findCompilerExecutable();
     if (!exePath) {
+        outputChannel.appendLine('ERROR: MyCompiler.exe not found — checked x64/Debug, x64/Release, x86/Debug, x86/Release relative to each workspace folder.');
+        outputChannel.show(true);
         vscode.window.showWarningMessage(
             'MyCompiler: could not find MyCompiler.exe. ' +
             'Set mycompiler.executablePath in settings or build the project first.'
         );
         return;
     }
+
+    outputChannel.appendLine(`Compiler exe   : ${exePath}`);
+
+    const coreDir = path.join(path.dirname(exePath), 'core');
+    const runtimeCb = path.join(coreDir, 'runtime.cb');
+    outputChannel.appendLine(`Core directory : ${coreDir} (${fs.existsSync(coreDir) ? 'exists' : 'MISSING'})`);
+    outputChannel.appendLine(`runtime.cb     : ${runtimeCb} (${fs.existsSync(runtimeCb) ? 'exists' : 'MISSING'})`);
 
     const logPath = path.join(context.logUri.fsPath, 'lsp.log');
 
@@ -58,7 +84,7 @@ export function activate(context: vscode.ExtensionContext): void {
         synchronize: {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{cb,c}')
         },
-        outputChannelName: 'MyCompiler Language Server'
+        outputChannel
     };
 
     client = new LanguageClient(
@@ -68,7 +94,9 @@ export function activate(context: vscode.ExtensionContext): void {
         clientOptions
     );
 
+    outputChannel.appendLine('Starting LSP client...');
     client.start();
+    outputChannel.appendLine('LSP client started.');
 
     // Command: manually trigger diagnostics on current file
     context.subscriptions.push(

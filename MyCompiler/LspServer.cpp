@@ -634,8 +634,13 @@ private:
 
         // Symbols were registered under the temp path; remap to the real source path
         // so that GoToDefinition jumps to the actual file, not the temp file.
+        // The compiler stores only the filename component in def.file (e.g. "cflat_lsp_42.cb"),
+        // not the full temp path, so we remap both forms.
         if (!filePath.empty())
+        {
             newIndex->RemapFile(tempPath, filePath);
+            newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
+        }
 
         {
             std::lock_guard<std::mutex> lock(indexMutex_);
