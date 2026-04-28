@@ -10,7 +10,7 @@ set OUT=out
 set ERRORS=0
 
 REM Tests excluded from the run (space-separated, no extensions)
-set EXCLUDE=test_helper test_program
+set EXCLUDE=test_helper
 
 if not exist "%OUT%" mkdir "%OUT%"
 

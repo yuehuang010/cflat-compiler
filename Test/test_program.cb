@@ -5,8 +5,12 @@ import "test_helper.cb";
 program Counter {
     int startFrom = 0;
 
-    int main(list<string> args) {
-        return 42;
+    int main(move list<string> args) {
+        int* heap = new int;
+        *heap = startFrom + args.count();
+        int result = *heap;
+        // heap is freed by the BlockAllocator on run() exit
+        return result;
     }
 };
 
@@ -14,8 +18,8 @@ extern int main() {
     Counter c;
     c.startFrom = 10;
     list<string> args;
-    string sa = "a";
-    string sb = "b";
+    string sa = "" + "a";
+    string sb = "" + "b";
     args.add(sa);
     args.add(sb);
     int code = c.run(args);

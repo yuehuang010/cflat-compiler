@@ -4602,6 +4602,11 @@ public:
                                     argVar.BaseType = argValue->getType();
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
+                                    // Propagate storage and ownership so move-param zeroing works at the call site.
+                                    argVar.Storage = argNV.Storage;
+                                    argVar.IsOwning = argNV.IsOwning;
+                                    argVar.IsOwningString = argNV.IsOwningString;
+                                    argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
 
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
@@ -5857,12 +5862,13 @@ public:
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
             MyCompilerLLVM::DeclTypeAndValue argsParam;
             argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
+            argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
 
             auto* runFn = compiler->CreateFunctionDefinition("run", intReturn, {thisParam, argsParam});
             compiler->programTable[name].RunFunction = runFn;
 
             auto* thisArg = runFn->getArg(0);   // Name*
-            auto* argsArg = runFn->getArg(1);   // list__string by value
+            auto* argsArg = runFn->getArg(1);   // list__string by value (move)
 
             // Malloc the args packet (raw malloc — tracked alloc is per-thread)
             auto* pkgSize = compiler->GetTypeSizeBytes(runArgsType);
@@ -5874,9 +5880,18 @@ public:
             auto* selfGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 0, "pkg_self_gep");
             compiler->builder->CreateStore(thisArg, selfGEP);
 
-            // Store args → pkg->args (field 1) by value
+            // Store args → pkg->args (field 1): use the original argument value (pre-alloca copy)
             auto* argsGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 1, "pkg_args_gep");
             compiler->builder->CreateStore(argsArg, argsGEP);
+
+            // Zero run()'s args alloca so ~list__string is a no-op at scope exit.
+            // Ownership of _data transfers to the packet/spawned thread; Counter.main frees it.
+            {
+                auto& runArgNV = compiler->stackNamedVariable.back().functionArgument["args"];
+                if (runArgNV.Storage != nullptr)
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(listStringType), runArgNV.Storage);
+            }
 
             // Create Thread on stack and initialize via default ctor
             auto* threadAlloca  = compiler->builder->CreateAlloca(threadType, nullptr, "thread");

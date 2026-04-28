@@ -258,6 +258,7 @@ public:
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         bool IsOwning = false;           // true for move parameters and owning local pointers — freed on scope exit
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
+        bool IsOwningStruct = false;     // true for move parameters of struct types with destructors — destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         std::string CallerName;          // the variable's name at the call site, for move tracking
         int IdentifierLine = 0;          // source location for use-after-move error reporting
@@ -550,6 +551,14 @@ private:
                 if (it != dataStructures.end() && it->second.Destructor != nullptr)
                     builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { namedVar.Storage });
             }
+
+            // Clean up move struct parameters
+            if (namedVar.IsOwningStruct && namedVar.Storage != nullptr)
+            {
+                auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
+                if (it != dataStructures.end() && it->second.Destructor != nullptr)
+                    builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { namedVar.Storage });
+            }
         }
     }
 
@@ -613,6 +622,21 @@ private:
                     .Primary = nullptr,
                     .Storage = alloc,
                     .IsOwningString = true,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
+            else if (itr_nameArg->IsMove && !itr_nameArg->Pointer)
+            {
+                // move struct parameter: alloca a slot so the destructor runs on scope exit
+                auto* structTy = GetType(*itr_nameArg, nullptr, false);
+                auto* alloc = builder->CreateAlloca(structTy, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, alloc);
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = structTy,
+                    .Primary = nullptr,
+                    .Storage = alloc,
+                    .IsOwningStruct = true,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
@@ -915,11 +939,19 @@ private:
         auto* entry = llvm::BasicBlock::Create(*context, "entry", dtorFn);
         llvm::IRBuilder<> b(entry);
 
-        auto* self   = &*dtorFn->arg_begin();
-        auto* ptrPtr = b.CreateStructGEP(strTy, self, 0, "ptrfield");
-        auto* ptr    = b.CreateLoad(ptrTy, ptrPtr, "ptr");
+        auto* self    = &*dtorFn->arg_begin();
+        auto* ptrPtr  = b.CreateStructGEP(strTy, self, 0, "ptrfield");
+        auto* ptr     = b.CreateLoad(ptrTy, ptrPtr, "ptr");
+        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        auto* isNotNull = b.CreateICmpNE(ptr, nullPtr, "is_not_null");
+        auto* freeBlock = llvm::BasicBlock::Create(*context, "free", dtorFn);
+        auto* doneBlock = llvm::BasicBlock::Create(*context, "done", dtorFn);
+        b.CreateCondBr(isNotNull, freeBlock, doneBlock);
+        b.SetInsertPoint(freeBlock);
         b.CreateCall(freeFn->getFunctionType(), freeFn, { ptr });
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy), ptrPtr);
+        b.CreateBr(doneBlock);
+        b.SetInsertPoint(doneBlock);
+        b.CreateStore(nullPtr, ptrPtr);
         b.CreateRetVoid();
 
         RegisterDestructor("string", dtorFn);
@@ -3142,9 +3174,16 @@ public:
         // convert parameter to vector of llvm::value*
         std::vector<llvm::Value*> argList;
         auto candParamItr = candidate.Parameters.begin();
+        size_t argIndex = 0;
         for (const auto& arg : matched)
         {
-            if (candParamItr->IsInterface && candParamItr->Pointer && !arg.TypeAndValue.IsInterface)
+            // Variadic arguments past the declared parameter list must not be dispatched
+            // through pointer-parameter logic (candParamItr points at the last declared
+            // param, which for printf is 'ptr %fmt' — causing all variadic args to be
+            // pushed as storage/GEP addresses instead of loaded values).
+            bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
+
+            if (!inVariadicRange && candParamItr->IsInterface && candParamItr->Pointer && !arg.TypeAndValue.IsInterface)
             {
                 // Derive struct name from TypeName if available, else from BaseType
                 std::string structName = arg.TypeAndValue.TypeName;
@@ -3167,19 +3206,22 @@ public:
                 }
                 argList.push_back(BuildInterfaceFatValue(vtable, dataPtr));
             }
-            else if (candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
+            else if (!inVariadicRange && candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
             {
                 // Interface → interface: pass fat struct by value
                 llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
                 argList.push_back(val);
             }
-            else if (candParamItr->Pointer)
+            else if (!inVariadicRange && candParamItr->Pointer)
             {
                 // For a non-pointer value passed to a pointer parameter (e.g. a field access
                 // used as the 'this' receiver), prefer Storage (the GEP address) over Primary
                 // (the pre-loaded value). Primary holds the struct value itself, which would
                 // be the wrong type for a pointer parameter.
-                if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr)
+                // Guard: if Primary is already a pointer value (e.g. loaded from a global ptr),
+                // use Primary directly — Storage would be the wrong level of indirection.
+                if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
+                    && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
                     argList.push_back(arg.Storage);
                 else if (!arg.TypeAndValue.Pointer && arg.Storage == nullptr
                          && arg.Primary != nullptr && arg.Primary->getType()->isStructTy())
@@ -3205,13 +3247,17 @@ public:
                     value = arg.Primary;
                 }
 
-                // Upconvert to match the declared parameter type (e.g. i16 -> i32).
-                bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
-                value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
+                if (!inVariadicRange)
+                {
+                    // Upconvert to match the declared parameter type (e.g. i16 -> i32).
+                    bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
+                    value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
+                }
                 argList.push_back(value);
             }
-            if (candParamItr != candidate.Parameters.end() - 1)
+            if (!inVariadicRange && candParamItr != candidate.Parameters.end() - 1)
                 ++candParamItr;
+            argIndex++;
         }
 
         auto* result = CreateFunctionCall(candidate.Function, argList);
@@ -3242,6 +3288,11 @@ public:
                             auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
                             builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
                         }
+                    }
+                    else if (auto* stTy = llvm::dyn_cast<llvm::StructType>(matched[i].BaseType))
+                    {
+                        // Struct move param: zero the caller's entire struct so its destructor is a no-op.
+                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), matched[i].Storage);
                     }
                 }
                 // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
