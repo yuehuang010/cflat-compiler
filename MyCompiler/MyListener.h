@@ -607,6 +607,9 @@ private:
     MyCompilerLLVM::TypeAndValue lambdaExpectedType;
     MyCompilerLLVM::TypeAndValue lastLambdaType;
 
+    // Variadic forwarding: true when the current function being codegen'd accepts '...'
+    bool currentFunctionIsVariadic = false;
+
     // Generic template state is shared across all MyListener instances so that
     // templates declared in an imported file remain visible when the importing
     // file needs to instantiate them.
@@ -2110,6 +2113,8 @@ public:
         auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
 
         compiler->InitializeBlock(&fn->front(), false);
+
+        currentFunctionIsVariadic = varargs;
 
         // Record stack depth after createFunctionBlock pushed the function's frame.
         // Used to identify bare-semicolon expect_error that was set inside this function.
@@ -4507,6 +4512,32 @@ public:
                                 for (size_t argIdx = 0; argIdx < namedArgCtx.size(); ++argIdx)
                                 {
                                     const auto& namedArgument = namedArgCtx[argIdx];
+
+                                    // '...' in call position: forward this function's variadic args as a va_list.
+                                    if (namedArgument->Ellipsis())
+                                    {
+                                        if (!currentFunctionIsVariadic)
+                                        {
+                                            LogErrorContext(ctx, "'...' forwarding can only be used inside a variadic function");
+                                            break;
+                                        }
+                                        if (!Compiler(ctx)->autoVaListAlloca)
+                                        {
+                                            MyCompilerLLVM::TypeAndValue vaTv;
+                                            vaTv.TypeName = "va_list";
+                                            vaTv.VariableName = "__va_forward";
+                                            Compiler(ctx)->autoVaListAlloca = Compiler(ctx)->CreateLocalVariable(vaTv);
+                                            Compiler(ctx)->CreateVaStart(Compiler(ctx)->autoVaListAlloca);
+                                        }
+                                        llvm::Value* vaValue = Compiler(ctx)->CreateLoad(Compiler(ctx)->autoVaListAlloca);
+                                        MyCompilerLLVM::NamedVariable argVar;
+                                        argVar.Primary = vaValue;
+                                        argVar.BaseType = vaValue->getType();
+                                        argVar.TypeAndValue.TypeName = "va_list";
+                                        arguments.emplace_back(argVar);
+                                        continue;
+                                    }
+
                                     // Set expected type when function expects a function-pointer at this position
                                     lambdaExpectedType = {};
                                     if (funcSym && (argIdx + paramOffset) < funcSym->Parameters.size())

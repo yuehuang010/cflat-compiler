@@ -1,0 +1,6 @@
+// Verify that '...' forwarding is rejected in a non-variadic function.
+expect_error("'...' forwarding can only be used inside a variadic function") {
+    void nonVariadic(const char* fmt) { vprintf(fmt, ...); }
+}
+
+extern int main() { return 0; }

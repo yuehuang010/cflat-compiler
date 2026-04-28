@@ -67,7 +67,8 @@ argumentExpressionList
     ;
 
 argumentNamedExpression
-    : (Identifier ':')? assignmentExpression 
+    : (Identifier ':')? assignmentExpression
+    | '...'
     ;
 
 unaryExpression

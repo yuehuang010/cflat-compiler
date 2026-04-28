@@ -29,6 +29,19 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
     return result;
 }
 
+extern int vprintf(const char* fmt, va_list ap) {
+    void* stdout_stream = __acrt_iob_func(1);
+    return __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+}
+
+extern int vsprintf(char* buf, const char* fmt, va_list ap) {
+    return __stdio_common_vsprintf(0, buf, 2147483647, fmt, nullptr, ap);
+}
+
+extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
+    return __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
+}
+
 // === Memory Functions ===
 extern void* malloc(i64 size);
 extern void  free(void* ptr);

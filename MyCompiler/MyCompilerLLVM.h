@@ -461,6 +461,7 @@ private:
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
+    llvm::AllocaInst* autoVaListAlloca = nullptr;
 
     std::unique_ptr<llvm::DIBuilder> diBuilder;
     llvm::DIFile* diFile = nullptr;
@@ -630,6 +631,7 @@ private:
         }
 
         currentFunction = fn;
+        autoVaListAlloca = nullptr;
     }
 
     llvm::DIType* GetDIType(const TypeAndValue& typeValue)
@@ -3590,6 +3592,9 @@ public:
             builder->CreateBr(returnCapture->ContinuationBlock);
             return;
         }
+
+        if (autoVaListAlloca)
+            CreateVaEnd(autoVaListAlloca);
 
         if (value == nullptr)
             builder->CreateRetVoid();
