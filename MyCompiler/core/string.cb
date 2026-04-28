@@ -10,7 +10,7 @@
 import "interfaces.cb";
 
 // Any IString value becomes a string by calling ToString().
-string operator string(IString* s)
+string operator string(IString s)
 {
     return s->ToString();
 }

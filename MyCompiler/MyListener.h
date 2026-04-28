@@ -186,6 +186,8 @@ private:
                 declType.Pointer = declSpec->pointer() != nullptr;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
+                if (declType.IsInterface && declSpec->pointer() != nullptr)
+                    std::cerr << std::format("error: pointer '*' is not allowed on interface type '{}'\n", declType.TypeName);
                 if (declType.IsInterface) declType.Pointer = true;
                 if (declSpec->Question())
                 {
@@ -697,7 +699,11 @@ private:
         }
 
         if (hasPointer)
+        {
+            if (Compiler(entry)->IsInterfaceType(resolved))
+                LogErrorContext(entry, std::format("pointer '*' is not allowed on interface type '{}'", resolved));
             resolved += "*";
+        }
         return resolved;
     }
 
@@ -832,6 +838,8 @@ private:
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
+                if (declType.IsInterface && hasExplicitPointer)
+                    LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
                 if (declType.IsInterface) declType.Pointer = true;
                 if (declSpec->Question())
                 {
