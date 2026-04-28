@@ -9,17 +9,18 @@ struct __ThreadArgs {
     void* ctx = nullptr;
 };
 
-extern void* CreateThread(void* attr, i64 stackSize, function<int(__ThreadArgs*)> fn, void* param, i32 flags, i32* id);
+extern void* CreateThread(void* attr, i64 stackSize, function<int(void*)> fn, void* param, i32 flags, i32* id);
 
-// Win32 LPTHREAD_START_ROUTINE. Receives __ThreadArgs* directly from Win32,
+// Win32 LPTHREAD_START_ROUTINE. Receives void* from Win32, casts to __ThreadArgs*,
 // calls fn(ctx), and returns the result.  join() frees the args packet.
-int __thread_trampoline(__ThreadArgs* args) {
+int __thread_trampoline(void* param) {
+    __ThreadArgs* args = (__ThreadArgs*)param;
     return args->fn(args->ctx);
 }
 
 struct Thread {
-    void* _handle        = nullptr;
-    __ThreadArgs* _args  = nullptr;  // owns the __ThreadArgs packet; freed in join()
+    void* _handle = nullptr;
+    void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()
     i32   _exitCode = 0;
 
     void start(function<int(void*)> fn, void* ctx) {
