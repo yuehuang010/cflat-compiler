@@ -24,7 +24,7 @@ for %%F in (%SRC%\test_*.cb) do (
     if not errorlevel 1 call :RunTestCb %%~nF
 )
 
-call test_err.bat
+call "%~dp0test_err.bat"
 if %ERRORLEVEL% neq 0 set /a ERRORS+=1
 
 echo.

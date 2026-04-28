@@ -2,6 +2,18 @@ import "list.cb";
 import "thread.cb";
 import "test_helper.cb";
 
+// ---------------------------------------------------------------------------
+// Program definitions
+// ---------------------------------------------------------------------------
+
+// Minimal program: no config fields, always returns 0
+program Minimal {
+    int main(move list<string> args) {
+        return 0;
+    }
+};
+
+// Counter: int field + args.count() (baseline test)
 program Counter {
     int startFrom = 0;
 
@@ -9,12 +21,64 @@ program Counter {
         int* heap = new int;
         *heap = startFrom + args.count();
         int result = *heap;
-        // heap is freed by the BlockAllocator on run() exit
+        // heap is freed by BlockAllocator on run() exit
         return result;
     }
 };
 
-extern int main() {
+// FixedExit: returns whatever code is set in the config field
+program FixedExit {
+    int code = 0;
+
+    int main(move list<string> args) {
+        return code;
+    }
+};
+
+// MultiField: three independent int fields summed in main
+program MultiField {
+    int a = 0;
+    int b = 0;
+    int c = 0;
+
+    int main(move list<string> args) {
+        return a + b + c;
+    }
+};
+
+// HeapStress: allocates `count` ints on the heap, returns their sum;
+// BlockAllocator is responsible for cleanup
+program HeapStress {
+    int count = 0;
+
+    int main(move list<string> args) {
+        int sum = 0;
+        int i = 0;
+        while (i < count) {
+            int* p = new int;
+            *p = i + 1;
+            sum = sum + *p;
+            i++;
+        }
+        return sum;
+    }
+};
+
+// ArgsSum: returns startFrom + args.count(), testing both sources
+program ArgsSum {
+    int startFrom = 0;
+
+    int main(move list<string> args) {
+        return startFrom + args.count();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Test functions
+// ---------------------------------------------------------------------------
+
+bool testProgramBasicArgsAndField() {
+    bool result = true;
     Counter c;
     c.startFrom = 10;
     list<string> args;
@@ -23,7 +87,186 @@ extern int main() {
     args.add(sa);
     args.add(sb);
     int code = c.run(args);
-    if (code != 12) { printf("FAILED: expected 12, got %d\n", code); return 1; }
-    printf("program test passed\n");
-    return 0;
+    result &= Test("basic counter", code, 12);
+    return result;
+}
+
+bool testProgramMinimalNoFields() {
+    bool result = true;
+    Minimal m;
+    list<string> args;
+    int code = m.run(args);
+    result &= Test("minimal no fields", code, 0);
+    return result;
+}
+
+bool testProgramEmptyArgs() {
+    bool result = true;
+    Counter c;
+    c.startFrom = 5;
+    list<string> args;
+    int code = c.run(args);
+    result &= Test("empty args", code, 5);
+    return result;
+}
+
+bool testProgramExitCodeZero() {
+    bool result = true;
+    FixedExit f;
+    f.code = 0;
+    list<string> args;
+    int code = f.run(args);
+    result &= Test("exit code 0", code, 0);
+    return result;
+}
+
+bool testProgramExitCodeNonZero() {
+    bool result = true;
+    FixedExit f;
+    f.code = 42;
+    list<string> args;
+    int code = f.run(args);
+    result &= Test("exit code 42", code, 42);
+    return result;
+}
+
+bool testProgramMultipleFields() {
+    bool result = true;
+    MultiField m;
+    m.a = 3;
+    m.b = 7;
+    m.c = 5;
+    list<string> args;
+    int code = m.run(args);
+    result &= Test("multiple fields sum", code, 15);
+    return result;
+}
+
+bool testProgramFieldDefaultValues() {
+    bool result = true;
+    // No fields set — all default to 0, so a+b+c = 0
+    MultiField m;
+    list<string> args;
+    int code = m.run(args);
+    result &= Test("field defaults zero", code, 0);
+    return result;
+}
+
+bool testProgramHeapAllocationsFreed() {
+    bool result = true;
+    HeapStress h;
+    h.count = 10;
+    list<string> args;
+    int code = h.run(args);
+    // sum of 1+2+...+10 = 55
+    result &= Test("heap stress sum 10", code, 55);
+    return result;
+}
+
+bool testProgramMultipleRuns() {
+    bool result = true;
+    FixedExit f;
+
+    f.code = 7;
+    list<string> args1;
+    int code1 = f.run(args1);
+    result &= Test("multiple runs first", code1, 7);
+
+    f.code = 13;
+    list<string> args2;
+    int code2 = f.run(args2);
+    result &= Test("multiple runs second", code2, 13);
+
+    return result;
+}
+
+bool testProgramArgsManyItems() {
+    bool result = true;
+    Counter c;
+    c.startFrom = 0;
+    list<string> args;
+    string s1 = "" + "one";
+    string s2 = "" + "two";
+    string s3 = "" + "three";
+    string s4 = "" + "four";
+    string s5 = "" + "five";
+    args.add(s1);
+    args.add(s2);
+    args.add(s3);
+    args.add(s4);
+    args.add(s5);
+    int code = c.run(args);
+    result &= Test("args count 5", code, 5);
+    return result;
+}
+
+bool testProgramArgsAndFieldCombined() {
+    bool result = true;
+    ArgsSum p;
+    p.startFrom = 100;
+    list<string> args;
+    string s1 = "" + "x";
+    string s2 = "" + "y";
+    string s3 = "" + "z";
+    args.add(s1);
+    args.add(s2);
+    args.add(s3);
+    int code = p.run(args);
+    result &= Test("field + args combined", code, 103);
+    return result;
+}
+
+bool testTwoDifferentPrograms() {
+    bool result = true;
+
+    Counter c;
+    c.startFrom = 20;
+    list<string> cargs;
+    int code1 = c.run(cargs);
+    result &= Test("two programs - counter", code1, 20);
+
+    FixedExit f;
+    f.code = 99;
+    list<string> fargs;
+    int code2 = f.run(fargs);
+    result &= Test("two programs - fixed", code2, 99);
+
+    return result;
+}
+
+bool testProgramHeapStressLarge() {
+    bool result = true;
+    HeapStress h;
+    h.count = 50;
+    list<string> args;
+    int code = h.run(args);
+    // sum of 1+2+...+50 = 1275
+    result &= Test("heap stress sum 50", code, 1275);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+extern int main() {
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testProgramBasicArgsAndField()    ? 1 : 0;
+    total++; passed += testProgramMinimalNoFields()      ? 1 : 0;
+    total++; passed += testProgramEmptyArgs()            ? 1 : 0;
+    total++; passed += testProgramExitCodeZero()         ? 1 : 0;
+    total++; passed += testProgramExitCodeNonZero()      ? 1 : 0;
+    total++; passed += testProgramMultipleFields()       ? 1 : 0;
+    total++; passed += testProgramFieldDefaultValues()   ? 1 : 0;
+    total++; passed += testProgramHeapAllocationsFreed() ? 1 : 0;
+    total++; passed += testProgramMultipleRuns()         ? 1 : 0;
+    total++; passed += testProgramArgsManyItems()        ? 1 : 0;
+    total++; passed += testProgramArgsAndFieldCombined() ? 1 : 0;
+    total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
+    total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
+
+    printf("Program tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
