@@ -261,6 +261,48 @@ bool testProgramHeapStressLarge() {
 }
 
 // ---------------------------------------------------------------------------
+// stop_token tests
+// ---------------------------------------------------------------------------
+
+bool testWaitForExitWithToken() {
+    bool result = true;
+
+    // Thread completes naturally → WaitForExit(token) returns true
+    stop_source src;
+    src.init();
+    stop_token token = src.get_token();
+
+    Minimal prog;
+    list<string> args;
+    prog.run(args);
+    bool done = prog.WaitForExit(token);
+    result &= Test("WaitForExit(token) completes", done, true);
+    result &= Test("WaitForExit(token) exitCode", prog.exitCode, 0);
+    src.dispose();
+
+    return result;
+}
+
+bool testWaitForExitCancelled() {
+    bool result = true;
+
+    // Pre-cancelled token → WaitForExit returns false immediately
+    stop_source src;
+    src.init();
+    src.request_stop();
+    stop_token token = src.get_token();
+
+    Minimal prog;
+    list<string> args;
+    prog.run(args);
+    bool done = prog.WaitForExit(token);
+    result &= Test("WaitForExit(cancelled token) returns false", done, false);
+    src.dispose();
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -281,6 +323,8 @@ extern int main() {
     total++; passed += testProgramArgsAndFieldCombined() ? 1 : 0;
     total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
     total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
+    total++; passed += testWaitForExitWithToken()        ? 1 : 0;
+    total++; passed += testWaitForExitCancelled()        ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

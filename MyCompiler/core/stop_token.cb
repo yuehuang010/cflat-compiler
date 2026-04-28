@@ -1,0 +1,53 @@
+import "thread.cb";
+
+struct stop_token {
+    i32* _state = nullptr;
+
+    bool stop_requested() {
+        if (_state == nullptr) return false;
+        return *_state != 0;
+    }
+};
+
+struct stop_source {
+    i32* _state = nullptr;
+
+    void init() {
+        _state = (i32*)malloc(sizeof(i32));
+        *_state = 0;
+    }
+
+    stop_token get_token() {
+        stop_token t;
+        t._state = _state;
+        return t;
+    }
+
+    void request_stop() {
+        if (_state != nullptr)
+            *_state = 1;
+    }
+
+    bool stop_requested() {
+        if (_state == nullptr) return false;
+        return *_state != 0;
+    }
+
+    void dispose() {
+        if (_state != nullptr) {
+            free((void*)_state);
+            _state = nullptr;
+        }
+    }
+};
+
+// Polls t->try_join(50ms) until the thread exits or the token is cancelled.
+// Returns true if the thread exited cleanly; false if cancellation was requested.
+// When false, the thread is NOT joined — caller is responsible for cleanup.
+bool __wait_thread_or_stop(Thread* t, stop_token token) {
+    while (!token.stop_requested()) {
+        if (t->try_join(50))
+            return true;
+    }
+    return false;
+}

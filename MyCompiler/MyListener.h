@@ -568,6 +568,19 @@ public:
             compiler->CreateFunctionDeclaration("WaitForExit", voidReturn, { thisParam });
         }
 
+        // Pre-declare WaitForExit(Name* this, stop_token token) -> bool
+        {
+            MyCompilerLLVM::TypeAndValue boolReturn{ .TypeName = "bool" };
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            MyCompilerLLVM::DeclTypeAndValue tokenParam;
+            tokenParam.TypeName     = "stop_token";
+            tokenParam.VariableName = "token";
+            compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, tokenParam });
+        }
+
         // Pre-declare member functions (including user's main) and destructor
         for (auto func : ctx->functionDefinition())
             ScanFunctionDefinition(func, name);
@@ -6094,6 +6107,42 @@ public:
 
             compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // ======================================================================
+        // EMIT WaitForExit(stop_token): bool WaitForExit(Name* this, stop_token token)
+        // Polls until the thread exits or the token is cancelled.
+        // Returns true if thread exited; false if cancelled (thread NOT joined).
+        // ======================================================================
+        {
+            auto* stopTokenType = compiler->dataStructures.count("stop_token")
+                                  ? compiler->dataStructures["stop_token"].StructType : nullptr;
+            auto* waitOrStopFn  = stopTokenType
+                                  ? FindMethodOf("__wait_thread_or_stop", "Thread") : nullptr;
+
+            if (stopTokenType && waitOrStopFn)
+            {
+                MyCompilerLLVM::TypeAndValue boolReturn;   boolReturn.TypeName = "bool";
+                MyCompilerLLVM::DeclTypeAndValue thisParam;
+                thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+                MyCompilerLLVM::DeclTypeAndValue tokenParam;
+                tokenParam.TypeName = "stop_token";  tokenParam.VariableName = "token";
+
+                auto* waitFn = compiler->CreateFunctionDefinition("WaitForExit", boolReturn, {thisParam, tokenParam});
+
+                auto* thisArg  = waitFn->getArg(0);
+                auto* tokenArg = waitFn->getArg(1);
+
+                auto* threadFieldGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, threadIdx, "thread_field");
+
+                auto* result = compiler->builder->CreateCall(
+                    waitOrStopFn->getFunctionType(), waitOrStopFn,
+                    {threadFieldGEP, tokenArg}, "wait_result");
+
+                compiler->builder->CreateRet(result);
+                compiler->CreateBlockBreak(nullptr, true);
+            }
         }
     }
 

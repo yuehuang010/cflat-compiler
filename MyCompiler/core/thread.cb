@@ -50,4 +50,21 @@ struct Thread {
         _exitCode = code;
         return code;
     }
+
+    // Returns true if the thread exited within timeout_ms; does full cleanup and
+    // sets _exitCode. Returns false on timeout; all handles remain intact.
+    bool try_join(i32 timeout_ms) {
+        i32 result = WaitForSingleObject(_handle, timeout_ms);
+        if (result == 0) {
+            i32 code = 0;
+            GetExitCodeThread(_handle, &code);
+            CloseHandle(_handle);
+            free((void*)_args);
+            _handle   = nullptr;
+            _args     = nullptr;
+            _exitCode = code;
+            return true;
+        }
+        return false;
+    }
 };
