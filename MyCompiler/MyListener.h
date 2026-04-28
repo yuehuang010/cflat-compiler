@@ -2624,6 +2624,25 @@ public:
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)
+            // and BaseType holds the pointee type. All loads/stores through `destination` must use it.
+            auto isDerefStorage = [&]() {
+                return namedVar.BaseType
+                    && !llvm::isa<llvm::AllocaInst>(destination)
+                    && !llvm::isa<llvm::GlobalVariable>(destination)
+                    && !llvm::isa<llvm::GetElementPtrInst>(destination);
+            };
+            auto derefLoad = [&]() -> llvm::Value* {
+                return isDerefStorage()
+                    ? compiler->CreateLoad(namedVar.BaseType, destination)
+                    : compiler->CreateLoad(destination);
+            };
+            auto derefAssign = [&](llvm::Value* val, bool isUnsigned) {
+                return isDerefStorage()
+                    ? compiler->CreateAssignment(val, destination, isUnsigned, namedVar.BaseType)
+                    : compiler->CreateAssignment(val, destination, isUnsigned);
+            };
+
             // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
                 lambdaExpectedType = namedVar.TypeAndValue;
@@ -2631,7 +2650,7 @@ public:
             if (operatorText == "??=")
             {
                 // Null-coalescing assignment: x ??= rhs  →  if (x == 0/null) x = rhs
-                auto* lhs = compiler->CreateLoad(destination);
+                auto* lhs = derefLoad();
 
                 auto* assignBlock  = compiler->CreateBasicBlock("nullcoalasgn_assign");
                 auto* resumeBlock  = compiler->CreateBasicBlock("nullcoalasgn_resume");
@@ -2641,11 +2660,11 @@ public:
 
                 compiler->SwitchToBlock(assignBlock);
                 auto* rhs = ParseAssignmentExpression(assignCtx);
-                compiler->CreateAssignment(rhs, destination);
+                derefAssign(rhs, false);
                 compiler->CreateJump(resumeBlock);
 
                 compiler->SwitchToBlock(resumeBlock);
-                return compiler->CreateLoad(destination);
+                return derefLoad();
             }
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
@@ -2655,12 +2674,12 @@ public:
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
             if (operatorText != "=")
             {
-                auto left = compiler->CreateLoad(destination);
+                auto left = derefLoad();
                 bool lhsUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
                 right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
             }
 
-            auto* assignResult = compiler->CreateAssignment(right, destination, rhsUnsigned);
+            auto* assignResult = derefAssign(right, rhsUnsigned);
             // Transfer ownership: if RHS was an owning move param, null its alloca so
             // EmitDestructorsForScope won't free the pointer we just stored elsewhere.
             if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
@@ -3229,6 +3248,13 @@ public:
 
             if (namedVar.Storage != nullptr)
             {
+                // For through-pointer dereferences (Storage is a raw loaded ptr, not an alloca/gep/global),
+                // use BaseType to emit the correctly-typed load (opaque pointers carry no type info).
+                if (namedVar.BaseType
+                    && !llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                    && !llvm::isa<llvm::GlobalVariable>(namedVar.Storage)
+                    && !llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
+                    return compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
                 return compiler->CreateLoad(namedVar.Storage);
             }
         }
@@ -3577,7 +3603,16 @@ public:
                     LogErrorContext(ctx, "Unable to dereference a non-Pointer.");
                 }
 
-                namedVar.Primary = compiler->CreateLoad(namedVar.Storage);
+                // Strip one pointer level from the CFlat type to get the pointee type.
+                namedVar.TypeAndValue.Pointer = false;
+                auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
+                // Load the pointer value out of its alloca/storage.
+                auto* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                // The deref'd location: loadedPtr is the address; pointeeType is what it holds.
+                // Storing it in Storage (not Primary) makes it usable as both lvalue and rvalue.
+                namedVar.Storage  = loadedPtr;
+                namedVar.Primary  = nullptr;
+                namedVar.BaseType = pointeeType;
             }
             else if (opText == "!")
             {

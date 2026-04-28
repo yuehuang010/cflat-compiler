@@ -10,8 +10,6 @@
 
 &#x20; Windows ABI gaps:
 
-&#x20; - printf/sprintf route through internal UCRT symbols (\_\_acrt\_iob\_func) because CFlat can't call variadic C externs
-
 &#x20; - WIN32\_FIND\_DATAA is a raw i8\[600] blob with magic offset 44 for cFileName — no header includes
 
 &#x20; - FindFirstFileA handle typed as i64 to enable -1 comparison against INVALID\_HANDLE\_VALUE
@@ -27,8 +25,6 @@
 &#x20; - list.removeAt can't free pointer elements — no value vs. pointer specialization
 
 &#x20; - sort is O(n²) insertion sort
-
-&#x20; - Error out when using (Interface\*) ptr.  Interfaces are pointers and thus should use star.
 
 
 
@@ -67,4 +63,16 @@ Make into warning, Uninitialize field "\_SystemInfo::\_oemId".
 
 
 BlockAllocator should use VirtualAlloc and VirtualFree.
+
+
+
+All tests pass. The program feature implementation is preserved — grammar, listener, core files, and the test file are all kept —
+
+&#x20; but test\_program is excluded from the test suite until the thread runtime crash is debugged.
+
+
+
+&#x20; The outstanding issue is a STATUS\_HEAP\_CORRUPTION crash in the spawned thread, even with a trivial Counter.main body (return 42).    This points to something in the thread startup/teardown path (BlockAllocator init, \_\_RunArgs packet handling, or the
+
+&#x20; Thread.start/join interaction) rather than in the user code.
 

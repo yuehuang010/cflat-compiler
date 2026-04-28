@@ -1790,9 +1790,9 @@ public:
         return builder->CreateExtractValue(structInstance, index);
     }
 
-    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false)
+    llvm::StoreInst* CreateAssignment(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false, llvm::Type* explicitDestType = nullptr)
     {
-        auto destType = GetTypeFromStorage(destination);
+        auto destType = explicitDestType ? explicitDestType : GetTypeFromStorage(destination);
         if (destType == builder->getInt1Ty())
         {
             value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");

@@ -1,20 +1,59 @@
 import "test_helper.cb";
 import "thread.cb";
 
-int g_threadResult = 0;
+// ---------------------------------------------------------------------------
+// Shared thread functions (named, for non-lambda tests)
+// ---------------------------------------------------------------------------
 
-int writeThread(void* ctx) {
-    g_threadResult = 99;
+// Write 99 into the int pointed to by ctx.
+int writeToPtr(void* ctx) {
+    int* p = (int*)ctx;
+    *p = 99;
     return 0;
 }
 
-bool testThreadWritesGlobal() {
+// Read the int pointed to by ctx and return it as the exit code.
+int readFromPtr(void* ctx) {
+    int* p = (int*)ctx;
+    return *p;
+}
+
+// ---------------------------------------------------------------------------
+// Context struct for computation tests
+// ---------------------------------------------------------------------------
+
+struct ComputeCtx {
+    int input  = 0;
+    int output = 0;
+};
+
+int computeSquare(void* ctx) {
+    ComputeCtx* c = (ComputeCtx*)ctx;
+    c->output = c->input * c->input;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+bool testThreadWritesThroughPointer() {
     bool result = true;
-    g_threadResult = 0;
+    int value = 0;
     Thread t;
-    t.start(writeThread, nullptr);
+    t.start(writeToPtr, &value);
     t.join();
-    result &= Test("thread writes global", g_threadResult, 99);
+    result &= Test("write through ptr", value, 99);
+    return result;
+}
+
+bool testThreadReadsThroughPointer() {
+    bool result = true;
+    int value = 42;
+    Thread t;
+    t.start(readFromPtr, &value);
+    i32 code = t.join();
+    result &= Test("read through ptr", (int)code, 42);
     return result;
 }
 
@@ -27,12 +66,150 @@ bool testThreadExitCode() {
     return result;
 }
 
+// Spawn three threads concurrently; each writes to its own int via void* ctx.
+bool testMultipleThreadsConcurrent() {
+    bool result = true;
+    int a = 0;
+    int b = 0;
+    int c = 0;
+    Thread t1;
+    Thread t2;
+    Thread t3;
+    t1.start(writeToPtr, &a);
+    t2.start(writeToPtr, &b);
+    t3.start(writeToPtr, &c);
+    t1.join();
+    t2.join();
+    t3.join();
+    result &= Test("concurrent thread 1", a, 99);
+    result &= Test("concurrent thread 2", b, 99);
+    result &= Test("concurrent thread 3", c, 99);
+    return result;
+}
+
+// Inline lambda that writes through a void* ctx pointer.
+bool testLambdaWritesViaCtx() {
+    bool result = true;
+    int value = 0;
+    Thread t;
+    t.start((void* ctx) => {
+        int* p = (int*)ctx;
+        *p = 123;
+        return 0;
+    }, &value);
+    t.join();
+    result &= Test("lambda writes via ctx", value, 123);
+    return result;
+}
+
+// Inline lambda that reads ctx, performs arithmetic, and returns a value.
+bool testLambdaExitCodeFromCtx() {
+    bool result = true;
+    int value = 10;
+    Thread t;
+    t.start((void* ctx) => {
+        int* p = (int*)ctx;
+        return *p * 3;
+    }, &value);
+    i32 code = t.join();
+    result &= Test("lambda exit code from ctx", (int)code, 30);
+    return result;
+}
+
+// Named function: thread reads input field, writes computed result to output field.
+bool testThreadComputationViaStruct() {
+    bool result = true;
+    ComputeCtx ctx;
+    ctx.input  = 7;
+    ctx.output = 0;
+    Thread t;
+    t.start(computeSquare, &ctx);
+    t.join();
+    result &= Test("named fn computes square", ctx.output, 49);
+    return result;
+}
+
+// Inline lambda: same computation through a ComputeCtx pointer.
+bool testLambdaComputationViaStruct() {
+    bool result = true;
+    ComputeCtx ctx;
+    ctx.input  = 5;
+    ctx.output = 0;
+    Thread t;
+    t.start((void* vctx) => {
+        ComputeCtx* c = (ComputeCtx*)vctx;
+        c->output = c->input * c->input;
+        return 0;
+    }, &ctx);
+    t.join();
+    result &= Test("lambda computes square", ctx.output, 25);
+    return result;
+}
+
+// Two threads run sequentially (start/join, then start/join) on separate objects.
+bool testSequentialThreads() {
+    bool result = true;
+    int a = 0;
+    int b = 0;
+    Thread t1;
+    t1.start(writeToPtr, &a);
+    t1.join();
+    Thread t2;
+    t2.start(writeToPtr, &b);
+    t2.join();
+    result &= Test("sequential thread 1", a, 99);
+    result &= Test("sequential thread 2", b, 99);
+    return result;
+}
+
+// Thread returns exit code 0 (the success case).
+bool testThreadExitCodeZero() {
+    bool result = true;
+    Thread t;
+    t.start((void* ctx) => { return 0; }, nullptr);
+    i32 code = t.join();
+    result &= Test("exit code 0", (int)code, 0);
+    return result;
+}
+
+// Five threads concurrently compute squares into separate ComputeCtx slots.
+bool testMultipleThreadsCompute() {
+    bool result = true;
+    ComputeCtx c0; c0.input = 1; c0.output = 0;
+    ComputeCtx c1; c1.input = 2; c1.output = 0;
+    ComputeCtx c2; c2.input = 3; c2.output = 0;
+    ComputeCtx c3; c3.input = 4; c3.output = 0;
+    ComputeCtx c4; c4.input = 5; c4.output = 0;
+    Thread t0; Thread t1; Thread t2; Thread t3; Thread t4;
+    t0.start(computeSquare, &c0);
+    t1.start(computeSquare, &c1);
+    t2.start(computeSquare, &c2);
+    t3.start(computeSquare, &c3);
+    t4.start(computeSquare, &c4);
+    t0.join(); t1.join(); t2.join(); t3.join(); t4.join();
+    result &= Test("parallel compute 1^2", c0.output,  1);
+    result &= Test("parallel compute 2^2", c1.output,  4);
+    result &= Test("parallel compute 3^2", c2.output,  9);
+    result &= Test("parallel compute 4^2", c3.output, 16);
+    result &= Test("parallel compute 5^2", c4.output, 25);
+    return result;
+}
+
 extern int main() {
     int passed = 0;
     int total  = 0;
 
-    total++; passed += testThreadWritesGlobal() ? 1 : 0;
-    total++; passed += testThreadExitCode()     ? 1 : 0;
+    total++; passed += testThreadWritesThroughPointer()  ? 1 : 0;
+    total++; passed += testThreadReadsThroughPointer()   ? 1 : 0;
+    total++; passed += testThreadExitCode()              ? 1 : 0;
+    total++; passed += testMultipleThreadsConcurrent()   ? 1 : 0;
+    total++; passed += testLambdaWritesViaCtx()          ? 1 : 0;
+    total++; passed += testLambdaExitCodeFromCtx()       ? 1 : 0;
+    total++; passed += testThreadComputationViaStruct()  ? 1 : 0;
+    total++; passed += testLambdaComputationViaStruct()  ? 1 : 0;
+    total++; passed += testSequentialThreads()           ? 1 : 0;
+    total++; passed += testThreadExitCodeZero()          ? 1 : 0;
+    total++; passed += testMultipleThreadsCompute()      ? 1 : 0;
 
     printf("Thread tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
