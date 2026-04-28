@@ -419,7 +419,7 @@ private:
             if (!resolved.empty())
             {
                 lsp::Range range{ {0, 0}, {0, 0} };
-                SendResponse(id, lsp::locationToJson(lsp::Location{ filePathToUri(resolved), range }));
+                SendResponse(id, nlohmann::json::array({ lsp::locationToJson(lsp::Location{ filePathToUri(resolved), range }) }));
                 return;
             }
         }
@@ -435,7 +435,7 @@ private:
             { def->line - 1, def->column + (int)def->name.size() }
         };
         lsp::Location loc{ filePathToUri(def->file), range };
-        SendResponse(id, lsp::locationToJson(loc));
+        SendResponse(id, nlohmann::json::array({ lsp::locationToJson(loc) }));
     }
 
     void HandleCompletion(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)

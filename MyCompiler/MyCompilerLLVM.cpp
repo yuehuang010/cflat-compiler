@@ -411,17 +411,24 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
         SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
     }
 
-    // Auto-import core files (skipped on subsequent analyses — already in importedParseStates)
+    // Auto-import core files in the same order as Compile():
+    // interfaces → program (pulls in block_allocator) → runtime → string.
+    // runtime.cb references BlockAllocator, which program.cb imports, so program must come first.
     if (!runtimeDir.empty())
     {
+        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
+        if (std::filesystem::exists(interfacesPath))
+            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
+
+        auto programPath = std::filesystem::path(runtimeDir) / "core" / "program.cb";
+        if (std::filesystem::exists(programPath))
+            CompileImportedFile(programPath.string(), "program.cb");
+
         if (!skipRuntimeImport) {
             auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
             if (std::filesystem::exists(runtimePath))
                 CompileImportedFile(runtimePath.string(), "runtime.cb");
         }
-        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
-        if (std::filesystem::exists(interfacesPath))
-            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
 
         auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
         if (std::filesystem::exists(stringPath))

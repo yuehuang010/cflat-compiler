@@ -1888,11 +1888,11 @@ public:
             auto targetSize = destType->getScalarSizeInBits();
             auto srcSize = srcType->getScalarSizeInBits();
 
-            // upconvert is needed
+            // Widening only (e.g. float → double). Narrowing (double → float) is
+            // not handled here — use a typed literal (0.0f) or an explicit cast at
+            // the source level so types match before reaching this path.
             if (srcSize < targetSize)
-            {
                 return builder->CreateFPExt(value, destType);
-            }
         }
         else if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {

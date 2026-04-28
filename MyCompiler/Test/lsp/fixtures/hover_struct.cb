@@ -1,4 +1,4 @@
 // $cursor line=0 col=7
 // $expect hover contains="Point"
-struct Point { float x = 0.0; float y = 0.0; };
+struct Point { float x = 0.0f; float y = 0.0f; };
 extern int main() { Point p; return 0; }
