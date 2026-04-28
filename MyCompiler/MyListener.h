@@ -1996,6 +1996,61 @@ public:
             return;
         }
 
+        else if (auto* lockStmt = statement->lockStatement())
+        {
+            // lock (expr) { body }
+            // 1. Evaluate the mutex expression — get the NamedVariable so we have its Storage.
+            auto* exprCtx = lockStmt->expression();
+            auto mutexNV = ParseAssignmentExpressionNamed(exprCtx->assignmentExpression());
+
+            // Spill into alloca if returned by value (no storage pointer).
+            if (mutexNV.Storage == nullptr && mutexNV.Primary != nullptr)
+            {
+                llvm::Type* ty = mutexNV.BaseType ? mutexNV.BaseType : compiler->GetType(mutexNV.TypeAndValue);
+                auto* spill = compiler->CreateAlloca(ty);
+                compiler->CreateAssignment(mutexNV.Primary, spill);
+                mutexNV.Storage = spill;
+                mutexNV.Primary = nullptr;
+            }
+
+            if (!mutexNV.Storage)
+            {
+                LogErrorContext(lockStmt, "lock: expression must be a mutex variable.");
+                return;
+            }
+
+            // 2. Call mutex.acquire().
+            MyCompilerLLVM::NamedVariable selfArg = mutexNV;
+            selfArg.TypeAndValue.VariableName = "";
+            compiler->CreateOverloadedFunctionCall("acquire", { selfArg });
+
+            // 3. Find the release function for cleanup on scope exit.
+            std::string mutexTypeName = mutexNV.TypeAndValue.TypeName;
+            llvm::Function* unlockFn = FindMethodOf("release", mutexTypeName);
+            if (!unlockFn)
+            {
+                LogErrorContext(lockStmt, std::format("lock: type '{}' has no 'release' method.", mutexTypeName));
+                return;
+            }
+
+            // 4. Push a new scope with lockCleanup set so any exit (return, scope-close)
+            //    automatically calls unlock().
+            compiler->InitializeBlock(nullptr, true);
+            compiler->stackNamedVariable.back().lockCleanup = MyCompilerLLVM::StackState::LockCleanup{
+                .UnlockFn  = unlockFn,
+                .MutexPtr  = mutexNV.Storage,
+            };
+
+            // 5. Parse the body.
+            auto* blockList = lockStmt->compoundStatement()->blockItemList();
+            if (blockList)
+                ParseBlockItemList(blockList);
+
+            // 6. Close the scope — EmitDestructorsForScope will call unlock().
+            compiler->CreateBlockBreak(nullptr, true);
+            return;
+        }
+
         LogErrorContext(statement, "Unhandled statement type.");
         return;
     }
@@ -3477,7 +3532,20 @@ public:
             if (typeSpecs.size() > 0)
             {
                 // TODO Collect all of them.
-                typeValue.TypeName = typeSpecs[0]->getText();
+                auto* typeSpec = typeSpecs[0];
+                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                {
+                    // Generic cast: (channel<int>*) → mangle to channel__int
+                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                    std::vector<std::string> typeArgs;
+                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(ResolveTypeArgEntry(entry));
+                    typeValue.TypeName = MangledGenericName(baseName, typeArgs);
+                }
+                else
+                {
+                    typeValue.TypeName = typeSpec->getText();
+                }
             }
         }
         else
@@ -3618,8 +3686,13 @@ public:
                 // Strip one pointer level from the CFlat type to get the pointee type.
                 namedVar.TypeAndValue.Pointer = false;
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
-                // Load the pointer value out of its alloca/storage.
-                auto* loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                // Pointer parameters use Storage = argument register (not an alloca), so the
+                // register IS the pointer value — loading from it would add an extra indirection.
+                llvm::Value* loadedPtr;
+                if (llvm::isa<llvm::Argument>(namedVar.Storage))
+                    loadedPtr = namedVar.Storage;
+                else
+                    loadedPtr = compiler->CreateLoad(namedVar.Storage);
                 // The deref'd location: loadedPtr is the address; pointeeType is what it holds.
                 // Storing it in Storage (not Primary) makes it usable as both lvalue and rvalue.
                 namedVar.Storage  = loadedPtr;

@@ -1,0 +1,57 @@
+// latch.cb — one-shot countdown latch.
+//
+// Usage:
+//   latch l;
+//   l.init(3);              // 3 threads must count down before waiters unblock
+//   l.count_down();         // decrement the count; signals when it reaches 0
+//   l.wait();               // block until count reaches 0
+//   l.destroy();            // release OS resources
+//
+// Once the count reaches 0 all past and future wait() calls return immediately.
+// The latch is NOT reusable after the count reaches 0.
+
+extern void* CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
+extern i32   SetEvent(void* handle);
+extern i32   WaitForSingleObject(void* handle, i32 ms);
+extern void  CloseHandle(void* handle);
+
+// Atomic stubs — intercepted by the compiler; emit LLVM atomic IR.
+extern i64 __atomic_counter_decrement(i64* ptr);
+extern i64 __atomic_counter_read(i64* ptr);
+
+struct latch {
+    void* _event = nullptr;  // manual-reset Win32 event (signaled when count hits 0)
+    i64   _count = 0;        // remaining count (atomically decremented)
+
+    // Initialize the latch with a countdown of n.
+    // Must be called before count_down() or wait().
+    void init(int n) {
+        // manual_reset=1, initial_state=0 (not yet signaled)
+        _event = CreateEventA(nullptr, 1, 0, nullptr);
+        _count = n;
+    }
+
+    // Decrement the countdown.  When it reaches 0 all wait() callers unblock.
+    void count_down() {
+        i64 remaining = __atomic_counter_decrement(&_count);
+        if (remaining == 0) {
+            SetEvent(_event);
+        }
+    }
+
+    // Block until the countdown reaches 0.
+    // Returns immediately if already at 0.
+    void wait() {
+        if (__atomic_counter_read(&_count) > 0) {
+            WaitForSingleObject(_event, -1);
+        }
+    }
+
+    // Release OS resources.
+    void destroy() {
+        if (_event != nullptr) {
+            CloseHandle(_event);
+            _event = nullptr;
+        }
+    }
+};

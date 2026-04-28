@@ -437,9 +437,14 @@ statement
     | selectionStatement
     | iterationStatement
     | jumpStatement
+    | lockStatement
     | ('volatile') '(' (
         logicalOrExpression (',' logicalOrExpression)*
     )? (':' (logicalOrExpression (',' logicalOrExpression)*)?)* ')' ';'
+    ;
+
+lockStatement
+    : 'lock' '(' expression ')' compoundStatement
     ;
 
 labeledStatement

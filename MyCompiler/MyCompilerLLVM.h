@@ -321,6 +321,15 @@ public:
         bool isFunction = false;
         std::string functionName;
 
+        // Set when this scope was entered via a `lock` statement.
+        // unlock() is called on scope exit (return, or normal block close).
+        struct LockCleanup
+        {
+            llvm::Function* UnlockFn = nullptr;
+            llvm::Value*    MutexPtr = nullptr; // pointer to the mutex struct
+        };
+        std::optional<LockCleanup> lockCleanup;
+
         void ClearBlock()
         {
             continueBlock = nullptr;
@@ -558,6 +567,13 @@ private:
                 if (it != dataStructures.end() && it->second.Destructor != nullptr)
                     builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { namedVar.Storage });
             }
+        }
+
+        // Release lock held by this scope (lock statement).
+        if (frame.lockCleanup.has_value())
+        {
+            auto& lc = frame.lockCleanup.value();
+            builder->CreateCall(lc.UnlockFn->getFunctionType(), lc.UnlockFn, { lc.MutexPtr });
         }
     }
 
@@ -3076,6 +3092,93 @@ public:
         return result;
     }
 
+    // Emit LLVM atomic IR for __atomic_* builtins called from atomic.cb.
+    // Returns nullptr when name is not an atomic builtin (caller falls through to normal call).
+    llvm::Value* TryEmitAtomicBuiltin(const std::string& name, const std::vector<llvm::Value*>& args)
+    {
+        using namespace llvm;
+        auto& ctx = *context;
+
+        // arg[0] is always the pointer to the _value field (i64* or i32*)
+        if (name == "__atomic_counter_increment" || name == "__atomic_counter_decrement" ||
+            name == "__atomic_counter_add")
+        {
+            // atomicrmw add/sub relaxed ptr, delta -> returns old value; we return old+delta
+            Value* ptr   = args[0];
+            Value* delta = (name == "__atomic_counter_decrement")
+                ? ConstantInt::get(Type::getInt64Ty(ctx), -1)
+                : (args.size() > 1 ? args[1] : ConstantInt::get(Type::getInt64Ty(ctx), 1));
+            auto op = (name == "__atomic_counter_decrement")
+                ? AtomicRMWInst::Add  // add(-1) == sub
+                : AtomicRMWInst::Add;
+            auto* old = builder->CreateAtomicRMW(op, ptr, delta,
+                MaybeAlign(), AtomicOrdering::Monotonic);
+            // return old + delta (new value)
+            return builder->CreateAdd(old, delta, "atomic_new");
+        }
+        if (name == "__atomic_counter_read")
+        {
+            Value* ptr = args[0];
+            auto* li = builder->CreateLoad(Type::getInt64Ty(ctx), ptr, "atomic_load");
+            li->setAtomic(AtomicOrdering::SequentiallyConsistent);
+            li->setAlignment(Align(8));
+            return li;
+        }
+        if (name == "__atomic_flag_test_and_set")
+        {
+            Value* ptr = args[0];
+            auto* one = ConstantInt::get(Type::getInt32Ty(ctx), 1);
+            // xchg acquire: returns old value; 0 means we acquired the flag
+            auto* old = builder->CreateAtomicRMW(AtomicRMWInst::Xchg, ptr, one,
+                MaybeAlign(), AtomicOrdering::Acquire);
+            // return true if old was 1 (flag was already set = contention)
+            return builder->CreateICmpNE(old, ConstantInt::get(Type::getInt32Ty(ctx), 0), "was_set");
+        }
+        if (name == "__atomic_flag_clear")
+        {
+            Value* ptr = args[0];
+            auto* zero = ConstantInt::get(Type::getInt32Ty(ctx), 0);
+            auto* si = builder->CreateStore(zero, ptr);
+            si->setAtomic(AtomicOrdering::Release);
+            si->setAlignment(Align(4));
+            return ConstantInt::get(Type::getInt32Ty(ctx), 0); // void: unused
+        }
+        if (name == "__atomic_i32_load" || name == "__atomic_i64_load")
+        {
+            bool is64 = (name == "__atomic_i64_load");
+            Value* ptr = args[0];
+            auto* ty = is64 ? Type::getInt64Ty(ctx) : Type::getInt32Ty(ctx);
+            auto* li = builder->CreateLoad(ty, ptr, "atomic_load");
+            li->setAtomic(AtomicOrdering::SequentiallyConsistent);
+            li->setAlignment(is64 ? Align(8) : Align(4));
+            return li;
+        }
+        if (name == "__atomic_i32_store" || name == "__atomic_i64_store")
+        {
+            bool is64 = (name == "__atomic_i64_store");
+            Value* ptr = args[0];
+            Value* val = args[1];
+            auto* si = builder->CreateStore(val, ptr);
+            si->setAtomic(AtomicOrdering::SequentiallyConsistent);
+            si->setAlignment(is64 ? Align(8) : Align(4));
+            return ConstantInt::get(Type::getInt32Ty(ctx), 0); // void: unused
+        }
+        if (name == "__atomic_i32_cas" || name == "__atomic_i64_cas")
+        {
+            bool is64 = (name == "__atomic_i64_cas");
+            Value* ptr      = args[0];
+            Value* expected = args[1];
+            Value* desired  = args[2];
+            auto* result = builder->CreateAtomicCmpXchg(ptr, expected, desired,
+                MaybeAlign(),
+                AtomicOrdering::AcquireRelease,
+                AtomicOrdering::Monotonic);
+            // extract the success bit (second element of {T, i1})
+            return builder->CreateExtractValue(result, 1, "cas_ok");
+        }
+        return nullptr; // not an atomic builtin
+    }
+
     llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
     {
         functionName = ResolveQualifiedName(functionName);
@@ -3259,6 +3362,18 @@ public:
             if (!inVariadicRange && candParamItr != candidate.Parameters.end() - 1)
                 ++candParamItr;
             argIndex++;
+        }
+
+        // Intercept __atomic_* stubs: emit LLVM atomic IR directly.
+        if (candidate.Function->getName().starts_with("__atomic_"))
+        {
+            auto* atomicResult = TryEmitAtomicBuiltin(candidate.Function->getName().str(), argList);
+            if (atomicResult != nullptr)
+            {
+                lastCallReturnType = candidate.ReturnType;
+                lastCallReturnsOwnedString = false;
+                return atomicResult;
+            }
         }
 
         auto* result = CreateFunctionCall(candidate.Function, argList);

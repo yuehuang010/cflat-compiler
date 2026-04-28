@@ -1,0 +1,255 @@
+import "test_helper.cb";
+import "thread.cb";
+import "semaphore.cb";
+import "latch.cb";
+import "rwlock.cb";
+
+// ---------------------------------------------------------------------------
+// semaphore tests
+// ---------------------------------------------------------------------------
+
+bool testSemaphoreBasic() {
+    bool result = true;
+    semaphore s;
+    s.init(3, 10);   // start with 3 available slots
+
+    // acquire three times — should not block
+    s.acquire();
+    s.acquire();
+    s.acquire();
+
+    // release back
+    s.release();
+    s.release();
+    s.release();
+
+    result &= Test("semaphore basic acquire/release", 1, 1);
+    s.destroy();
+    return result;
+}
+
+// Two threads signal a semaphore; main waits twice.
+struct SemCtx {
+    void* sem = nullptr;  // semaphore*
+};
+
+int semSignalWorker(void* ctx) {
+    SemCtx* sc = (SemCtx*)ctx;
+    semaphore* sp = (semaphore*)sc->sem;
+    sp->release();
+    return 0;
+}
+
+bool testSemaphoreWithThreads() {
+    bool result = true;
+    semaphore s;
+    s.init(0, 10);
+
+    SemCtx ctx;
+    ctx.sem = (void*)&s;
+
+    Thread t1;
+    Thread t2;
+    t1.start(semSignalWorker, &ctx);
+    t2.start(semSignalWorker, &ctx);
+
+    // Wait for both signals — will block until both workers call release()
+    s.acquire();
+    s.acquire();
+
+    t1.join();
+    t2.join();
+
+    result &= Test("semaphore threaded signal", 1, 1);
+    s.destroy();
+    return result;
+}
+
+// lock statement works with semaphore (acts as binary semaphore / mutex)
+bool testSemaphoreLockStatement() {
+    bool result = true;
+    semaphore s;
+    s.init(1, 1);  // binary semaphore — 1 slot available
+
+    int counter = 0;
+    lock (s) {
+        counter = counter + 1;
+    }
+    result &= Test("semaphore lock statement", counter, 1);
+    s.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// latch tests
+// ---------------------------------------------------------------------------
+
+bool testLatchBasic() {
+    bool result = true;
+    latch l;
+    l.init(1);
+    l.count_down();
+    l.wait();   // should return immediately
+    result &= Test("latch count_down once then wait", 1, 1);
+    l.destroy();
+    return result;
+}
+
+// Three threads count down; main waits until all three are done.
+struct LatchCtx {
+    void* lch = nullptr;   // latch*
+    int*  steps = nullptr;
+};
+
+int latchWorker(void* ctx) {
+    LatchCtx* lc = (LatchCtx*)ctx;
+    latch* lp = (latch*)lc->lch;
+    *lc->steps = *lc->steps + 1;
+    lp->count_down();
+    return 0;
+}
+
+bool testLatchWithThreads() {
+    bool result = true;
+    latch l;
+    l.init(3);
+    int steps = 0;
+
+    LatchCtx ctx;
+    ctx.lch   = (void*)&l;
+    ctx.steps = &steps;
+
+    Thread t1;
+    Thread t2;
+    Thread t3;
+    t1.start(latchWorker, &ctx);
+    t2.start(latchWorker, &ctx);
+    t3.start(latchWorker, &ctx);
+
+    l.wait();   // blocks until all three count down
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    result &= Test("latch 3 threads", steps, 3);
+    l.destroy();
+    return result;
+}
+
+bool testLatchAlreadyZero() {
+    bool result = true;
+    latch l;
+    l.init(1);
+    l.count_down();
+    l.wait();
+    l.wait();   // second wait should return immediately (event stays signaled)
+    result &= Test("latch wait idempotent", 1, 1);
+    l.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// rwlock tests
+// ---------------------------------------------------------------------------
+
+bool testRwlockExclusive() {
+    bool result = true;
+    rwlock rw;
+    int shared = 0;
+
+    rw.acquire_write();
+    shared = 42;
+    rw.release_write();
+
+    result &= Test("rwlock exclusive write", shared, 42);
+    return result;
+}
+
+bool testRwlockShared() {
+    bool result = true;
+    rwlock rw;
+    int shared = 99;
+
+    // Multiple readers can coexist
+    rw.acquire_read();
+    rw.acquire_read();
+    int val1 = shared;
+    int val2 = shared;
+    rw.release_read();
+    rw.release_read();
+
+    result &= Test("rwlock shared read", val1, 99);
+    result &= Test("rwlock shared read 2", val2, 99);
+    return result;
+}
+
+bool testRwlockLockStatement() {
+    bool result = true;
+    rwlock rw;
+    int shared = 0;
+
+    lock (rw) {
+        shared = 77;
+    }
+    result &= Test("rwlock lock statement (write)", shared, 77);
+    return result;
+}
+
+// Two writer threads update a shared value under exclusive lock.
+struct RwCtx {
+    void* rw  = nullptr;  // rwlock*
+    int*  val = nullptr;
+    int   add = 0;
+};
+
+int rwWriterWorker(void* ctx) {
+    RwCtx* rc = (RwCtx*)ctx;
+    rwlock* rp = (rwlock*)rc->rw;
+    rp->acquire_write();
+    *rc->val = *rc->val + rc->add;
+    rp->release_write();
+    return 0;
+}
+
+bool testRwlockWithThreads() {
+    bool result = true;
+    rwlock rw;
+    int value = 0;
+
+    RwCtx ctx1; ctx1.rw = (void*)&rw; ctx1.val = &value; ctx1.add = 10;
+    RwCtx ctx2; ctx2.rw = (void*)&rw; ctx2.val = &value; ctx2.add = 5;
+
+    Thread t1;
+    Thread t2;
+    t1.start(rwWriterWorker, &ctx1);
+    t2.start(rwWriterWorker, &ctx2);
+    t1.join();
+    t2.join();
+
+    result &= Test("rwlock two writer threads", value, 15);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+extern int main() {
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testSemaphoreBasic()         ? 1 : 0;
+    total++; passed += testSemaphoreWithThreads()   ? 1 : 0;
+    total++; passed += testSemaphoreLockStatement() ? 1 : 0;
+    total++; passed += testLatchBasic()             ? 1 : 0;
+    total++; passed += testLatchWithThreads()       ? 1 : 0;
+    total++; passed += testLatchAlreadyZero()       ? 1 : 0;
+    total++; passed += testRwlockExclusive()        ? 1 : 0;
+    total++; passed += testRwlockShared()           ? 1 : 0;
+    total++; passed += testRwlockLockStatement()    ? 1 : 0;
+    total++; passed += testRwlockWithThreads()      ? 1 : 0;
+
+    printf("Sync2 tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

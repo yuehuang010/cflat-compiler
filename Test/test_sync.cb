@@ -1,0 +1,226 @@
+import "test_helper.cb";
+import "thread.cb";
+import "mutex.cb";
+import "atomic.cb";
+
+// ---------------------------------------------------------------------------
+// mutex + lock statement tests
+// ---------------------------------------------------------------------------
+
+bool testMutexManual() {
+    bool result = true;
+    mutex m;
+    int counter = 0;
+    m.acquire();
+    counter = counter + 1;
+    m.release();
+    result &= Test("mutex manual acquire/release", counter, 1);
+    m.destroy();
+    return result;
+}
+
+bool testLockStatement() {
+    bool result = true;
+    mutex m;
+    int counter = 0;
+    lock (m) {
+        counter = counter + 1;
+    }
+    result &= Test("lock statement", counter, 1);
+    m.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Threaded mutex test: two threads increment a shared counter under a lock.
+// ---------------------------------------------------------------------------
+
+// Context for threaded mutex test: passes mutex and counter as separate pointers.
+struct MutexIntCtx {
+    void* m = nullptr;  // mutex*
+    int*  v = nullptr;
+};
+
+int incrementShared(void* ctx) {
+    MutexIntCtx* mi = (MutexIntCtx*)ctx;
+    mutex* mp = (mutex*)mi->m;
+    lock (*mp) {
+        *mi->v = *mi->v + 1;
+    }
+    return 0;
+}
+
+bool testMutexWithThreads() {
+    bool result = true;
+    mutex m;
+    int value = 0;
+    MutexIntCtx mi;
+    mi.m = (void*)&m;
+    mi.v = &value;
+
+    Thread t1;
+    Thread t2;
+    t1.start(incrementShared, &mi);
+    t2.start(incrementShared, &mi);
+    t1.join();
+    t2.join();
+
+    result &= Test("mutex with threads", value, 2);
+    m.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// atomic_counter tests
+// ---------------------------------------------------------------------------
+
+bool testAtomicCounterIncrement() {
+    bool result = true;
+    atomic_counter c;
+    c.increment();
+    c.increment();
+    c.increment();
+    result &= Test("atomic increment x3", (int)c.read(), 3);
+    return result;
+}
+
+bool testAtomicCounterDecrement() {
+    bool result = true;
+    atomic_counter c;
+    c.increment();
+    c.increment();
+    c.decrement();
+    result &= Test("atomic decrement", (int)c.read(), 1);
+    return result;
+}
+
+bool testAtomicCounterAdd() {
+    bool result = true;
+    atomic_counter c;
+    c.add(10);
+    c.add(5);
+    result &= Test("atomic add", (int)c.read(), 15);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Threaded atomic_counter test: 5 threads each increment 100 times.
+// ---------------------------------------------------------------------------
+
+struct AtomicCtx {
+    atomic_counter* counter = nullptr;
+    int iterations = 0;
+};
+
+int atomicIncrementWorker(void* ctx) {
+    AtomicCtx* ac = (AtomicCtx*)ctx;
+    int i = 0;
+    while (i < ac->iterations) {
+        ac->counter->increment();
+        i = i + 1;
+    }
+    return 0;
+}
+
+bool testAtomicCounterThreaded() {
+    bool result = true;
+    atomic_counter counter;
+
+    AtomicCtx ctx1; ctx1.counter = &counter; ctx1.iterations = 100;
+    AtomicCtx ctx2; ctx2.counter = &counter; ctx2.iterations = 100;
+    AtomicCtx ctx3; ctx3.counter = &counter; ctx3.iterations = 100;
+    AtomicCtx ctx4; ctx4.counter = &counter; ctx4.iterations = 100;
+    AtomicCtx ctx5; ctx5.counter = &counter; ctx5.iterations = 100;
+
+    Thread t1; Thread t2; Thread t3; Thread t4; Thread t5;
+    t1.start(atomicIncrementWorker, &ctx1);
+    t2.start(atomicIncrementWorker, &ctx2);
+    t3.start(atomicIncrementWorker, &ctx3);
+    t4.start(atomicIncrementWorker, &ctx4);
+    t5.start(atomicIncrementWorker, &ctx5);
+    t1.join(); t2.join(); t3.join(); t4.join(); t5.join();
+
+    result &= Test("atomic counter 5 threads x100", (int)counter.read(), 500);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// atomic_flag spinlock test
+// ---------------------------------------------------------------------------
+
+bool testAtomicFlag() {
+    bool result = true;
+    atomic_flag flag;
+
+    // Initially clear — test_and_set returns false (was 0)
+    bool was_set = flag.test_and_set();
+    result &= Test("flag initially clear", (int)was_set, 0);
+
+    // Now set — test_and_set returns true (was 1)
+    bool still_set = flag.test_and_set();
+    result &= Test("flag was set", (int)still_set, 1);
+
+    // Clear it
+    flag.clear();
+
+    // Now clear again
+    bool after_clear = flag.test_and_set();
+    result &= Test("flag after clear", (int)after_clear, 0);
+    flag.clear();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// atomic<i32> / atomic<i64> tests
+// ---------------------------------------------------------------------------
+
+bool testAtomicI32() {
+    bool result = true;
+    atomic__i32 a;
+    a.store(42);
+    result &= Test("atomic i32 store/load", a.load(), 42);
+
+    bool ok = a.cas(42, 99);
+    result &= Test("atomic i32 cas success", (int)ok, 1);
+    result &= Test("atomic i32 cas result", a.load(), 99);
+
+    bool fail = a.cas(0, 1);
+    result &= Test("atomic i32 cas fail", (int)fail, 0);
+    result &= Test("atomic i32 unchanged", a.load(), 99);
+    return result;
+}
+
+bool testAtomicI64() {
+    bool result = true;
+    atomic__i64 a;
+    a.store(1000000000000);
+    result &= Test("atomic i64 store/load", (int)(a.load() == 1000000000000), 1);
+
+    bool ok = a.cas(1000000000000, 2000000000000);
+    result &= Test("atomic i64 cas success", (int)ok, 1);
+    result &= Test("atomic i64 cas result", (int)(a.load() == 2000000000000), 1);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+extern int main() {
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testMutexManual()              ? 1 : 0;
+    total++; passed += testLockStatement()            ? 1 : 0;
+    total++; passed += testMutexWithThreads()         ? 1 : 0;
+    total++; passed += testAtomicCounterIncrement()   ? 1 : 0;
+    total++; passed += testAtomicCounterDecrement()   ? 1 : 0;
+    total++; passed += testAtomicCounterAdd()         ? 1 : 0;
+    total++; passed += testAtomicCounterThreaded()    ? 1 : 0;
+    total++; passed += testAtomicFlag()               ? 1 : 0;
+    total++; passed += testAtomicI32()                ? 1 : 0;
+    total++; passed += testAtomicI64()                ? 1 : 0;
+
+    printf("Sync tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

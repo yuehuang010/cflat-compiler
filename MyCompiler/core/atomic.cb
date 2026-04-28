@@ -1,0 +1,123 @@
+// atomic.cb — lock-free atomic types.
+//
+// Memory ordering is encoded in each operation and hidden from users.
+// Correct on both x86 and ARM — LLVM handles the platform-specific lowering.
+//
+// Types:
+//   atomic_counter  — shared counter (stats, reference counts)
+//   atomic_flag     — spinlock / one-shot signal
+//   atomic<T>       — generic load/store/CAS (T = i32 or i64)
+//
+// The __atomic_* functions below are stubs: the compiler intercepts every
+// call whose name starts with __atomic_ and emits LLVM atomic IR instead of
+// a real call.  No object file for these functions is ever linked.
+
+// -------------------------------------------------------------------------
+// Stubs — intercepted by the compiler; never actually called.
+// -------------------------------------------------------------------------
+extern i64  __atomic_counter_increment(i64* ptr);
+extern i64  __atomic_counter_decrement(i64* ptr);
+extern i64  __atomic_counter_add(i64* ptr, i64 delta);
+extern i64  __atomic_counter_read(i64* ptr);
+
+extern bool __atomic_flag_test_and_set(i32* ptr);
+extern void __atomic_flag_clear(i32* ptr);
+
+extern i32  __atomic_i32_load(i32* ptr);
+extern void __atomic_i32_store(i32* ptr, i32 val);
+extern bool __atomic_i32_cas(i32* ptr, i32 expected, i32 desired);
+
+extern i64  __atomic_i64_load(i64* ptr);
+extern void __atomic_i64_store(i64* ptr, i64 val);
+extern bool __atomic_i64_cas(i64* ptr, i64 expected, i64 desired);
+
+// -------------------------------------------------------------------------
+// atomic_counter — use for stats, reference counts, sequence numbers.
+// -------------------------------------------------------------------------
+struct atomic_counter {
+    i64 _value = 0;
+
+    // Add 1; return new value.  (atomicrmw add relaxed)
+    i64 increment() {
+        return __atomic_counter_increment(&_value);
+    }
+
+    // Subtract 1; return new value.  (atomicrmw add relaxed)
+    i64 decrement() {
+        return __atomic_counter_decrement(&_value);
+    }
+
+    // Add delta; return new value.  (atomicrmw add relaxed)
+    i64 add(i64 delta) {
+        return __atomic_counter_add(&_value, delta);
+    }
+
+    // Read current value.  (load seq_cst)
+    i64 read() {
+        return __atomic_counter_read(&_value);
+    }
+};
+
+// -------------------------------------------------------------------------
+// atomic_flag — spinlock / one-shot signal.
+// -------------------------------------------------------------------------
+struct atomic_flag {
+    i32 _value = 0;
+
+    // Set the flag; returns true if it was already set (i.e. someone else holds it).
+    // (atomicrmw xchg acquire)
+    bool test_and_set() {
+        return __atomic_flag_test_and_set(&_value);
+    }
+
+    // Clear the flag.  (store release)
+    void clear() {
+        __atomic_flag_clear(&_value);
+    }
+};
+
+// -------------------------------------------------------------------------
+// atomic<i32> — generic atomic for 32-bit integers.
+// -------------------------------------------------------------------------
+struct atomic__i32 {
+    i32 _value = 0;
+
+    // Load current value.  (load seq_cst)
+    i32 load() {
+        return __atomic_i32_load(&_value);
+    }
+
+    // Store a new value.  (store seq_cst)
+    void store(i32 val) {
+        __atomic_i32_store(&_value, val);
+    }
+
+    // Compare-and-swap: if _value == expected, set it to desired; return true on success.
+    // (cmpxchg acquire release)
+    bool cas(i32 expected, i32 desired) {
+        return __atomic_i32_cas(&_value, expected, desired);
+    }
+};
+
+// -------------------------------------------------------------------------
+// atomic<i64> — generic atomic for 64-bit integers.
+// -------------------------------------------------------------------------
+struct atomic__i64 {
+    i64 _value = 0;
+
+    // Load current value.  (load seq_cst)
+    i64 load() {
+        return __atomic_i64_load(&_value);
+    }
+
+    // Store a new value.  (store seq_cst)
+    void store(i64 val) {
+        __atomic_i64_store(&_value, val);
+    }
+
+    // Compare-and-swap: if _value == expected, set it to desired; return true on success.
+    // (cmpxchg acquire release)
+    bool cas(i64 expected, i64 desired) {
+        return __atomic_i64_cas(&_value, expected, desired);
+    }
+};

@@ -1,0 +1,53 @@
+// mutex.cb — mutual-exclusion primitive backed by Win32 CRITICAL_SECTION.
+//
+// Usage:
+//   mutex m;
+//   lock (m) {              // preferred — release is guaranteed on return
+//       shared_value++;
+//   }
+//
+//   m.acquire();            // manual acquire
+//   m.release();            // manual release
+//   m.destroy();            // free OS resources when mutex is no longer needed
+//
+// NOTE: break / continue that escape a lock {} block will NOT call unlock.
+// Avoid breaking out of a lock block.
+
+// Win32 CRITICAL_SECTION is an opaque struct; we hold it behind a void* so
+// CFlat does not need to know its size.  Allocated lazily on first lock().
+extern void* malloc(i64 size);
+extern void  free(void* ptr);
+extern void  InitializeCriticalSection(void* cs);
+extern void  DeleteCriticalSection(void* cs);
+extern void  EnterCriticalSection(void* cs);
+extern void  LeaveCriticalSection(void* cs);
+
+// sizeof(CRITICAL_SECTION) on x64 Windows is 40 bytes.
+i32 __CRITICAL_SECTION_SIZE = 40;
+
+struct mutex {
+    void* _cs = nullptr;
+
+    // Acquire the lock.  Allocates the CRITICAL_SECTION on first call.
+    void acquire() {
+        if (_cs == nullptr) {
+            _cs = malloc(__CRITICAL_SECTION_SIZE);
+            InitializeCriticalSection(_cs);
+        }
+        EnterCriticalSection(_cs);
+    }
+
+    // Release the lock.
+    void release() {
+        LeaveCriticalSection(_cs);
+    }
+
+    // Free OS resources.  Call only when the mutex will never be used again.
+    void destroy() {
+        if (_cs != nullptr) {
+            DeleteCriticalSection(_cs);
+            free(_cs);
+            _cs = nullptr;
+        }
+    }
+};

@@ -1,0 +1,92 @@
+// spsc_queue<T> — wait-free single-producer single-consumer ring queue.
+//
+// IMPORTANT: exactly ONE thread may call try_push, and exactly ONE (different)
+// thread may call try_pop.  Violating this is undefined behaviour.
+//
+// Usage:
+//   spsc_queue<int> q;
+//   q.init(1024);          // allocate 1023 usable slots (one slot is a sentinel)
+//
+//   q.try_push(42);        // producer thread — returns false if full
+//   int v = 0;
+//   q.try_pop(&v);         // consumer thread — returns false if empty
+//
+//   q.destroy();           // free the ring buffer
+//
+// Memory ordering:
+//   Head (write index) is written by the producer and read by the consumer.
+//   Tail (read  index) is written by the consumer and read by the producer.
+//   seq_cst atomic loads/stores are used so the implementation is correct on
+//   both x86 (already strongly ordered) and ARM (needs explicit barriers).
+//   The underlying LLVM atomic IR handles platform-specific fence emission.
+//
+// One slot is intentionally wasted so that head == tail means empty,
+// and (head + 1) % cap == tail means full.
+
+// Atomic stubs — intercepted by compiler; emit LLVM atomic IR.
+extern int  __atomic_i32_load(int* ptr);
+extern void __atomic_i32_store(int* ptr, int val);
+
+class spsc_queue<T>
+{
+    T*  _buf  = nullptr;   // ring buffer (cap slots; cap-1 are usable)
+    int _cap  = 0;         // total allocated slots (not visible to callers)
+    int _head = 0;         // next write position — producer writes, consumer reads
+    int _tail = 0;         // next read  position — consumer writes, producer reads
+
+    // Allocate the ring buffer.  Must be called before try_push/try_pop.
+    // capacity is the number of usable slots; internally cap+1 slots are allocated.
+    void init(int capacity) {
+        _cap  = capacity + 1;   // +1 for the sentinel slot
+        _buf  = new T[_cap];
+        _head = 0;
+        _tail = 0;
+    }
+
+    // Push one item.  Returns true on success; false if the queue is full.
+    // Called by the producer thread only.
+    bool try_push(T item) {
+        int head = __atomic_i32_load(&_head);
+        int next = (head + 1) % _cap;
+        if (next == __atomic_i32_load(&_tail)) return false;   // full
+        _buf[head] = item;
+        __atomic_i32_store(&_head, next);
+        return true;
+    }
+
+    // Pop one item into *out.  Returns true on success; false if empty.
+    // Called by the consumer thread only.
+    bool try_pop(T* out) {
+        int tail = __atomic_i32_load(&_tail);
+        if (tail == __atomic_i32_load(&_head)) return false;   // empty
+        *out = _buf[tail];
+        __atomic_i32_store(&_tail, (tail + 1) % _cap);
+        return true;
+    }
+
+    // True when no items are available.
+    bool is_empty() {
+        return __atomic_i32_load(&_head) == __atomic_i32_load(&_tail);
+    }
+
+    // True when the queue cannot accept more items.
+    bool is_full() {
+        int head = __atomic_i32_load(&_head);
+        int tail = __atomic_i32_load(&_tail);
+        return (head + 1) % _cap == tail;
+    }
+
+    // Number of usable slots (capacity passed to init).
+    int capacity() {
+        return _cap - 1;
+    }
+
+    // Free the ring buffer.
+    void destroy() {
+        if (_buf != nullptr) { delete[] _buf; _buf = nullptr; }
+    }
+
+    ~spsc_queue() {
+        destroy();
+    }
+};

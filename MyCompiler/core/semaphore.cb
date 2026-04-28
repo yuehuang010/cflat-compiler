@@ -1,0 +1,50 @@
+// semaphore.cb — counting semaphore backed by Win32 CreateSemaphoreA.
+//
+// Usage:
+//   semaphore s;
+//   s.init(0, 10);         // initial=0 (blocked), max=10 slots
+//   s.acquire();            // wait (down) — blocks if count is 0
+//   s.release();            // signal (up) by 1
+//   s.release_n(3);         // signal (up) by n
+//   s.destroy();            // close the Win32 handle
+//
+// lock statement works: lock (s) { } acquires and releases one slot.
+
+extern void* CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
+extern i32   WaitForSingleObject(void* handle, i32 ms);
+extern i32   ReleaseSemaphore(void* handle, i32 count, i32* prev);
+extern void  CloseHandle(void* handle);
+
+struct semaphore {
+    void* _handle = nullptr;
+
+    // Create the semaphore.  Must be called before acquire/release.
+    //   initial   — starting signal count (0 = fully blocked)
+    //   max_count — maximum count (typically capacity of the resource pool)
+    void init(int initial, int max_count) {
+        _handle = CreateSemaphoreA(nullptr, initial, max_count, nullptr);
+    }
+
+    // Decrement count; block until count > 0.  (alias: acquire)
+    void acquire() {
+        WaitForSingleObject(_handle, -1);  // -1 == INFINITE
+    }
+
+    // Increment count by 1; wake one blocked acquire() caller.  (alias: release)
+    void release() {
+        ReleaseSemaphore(_handle, 1, nullptr);
+    }
+
+    // Increment count by n; wake up to n blocked acquire() callers.
+    void release_n(int n) {
+        ReleaseSemaphore(_handle, n, nullptr);
+    }
+
+    // Close the Win32 handle.
+    void destroy() {
+        if (_handle != nullptr) {
+            CloseHandle(_handle);
+            _handle = nullptr;
+        }
+    }
+};
