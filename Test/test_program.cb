@@ -86,8 +86,9 @@ bool testProgramBasicArgsAndField() {
     string sb = "" + "b";
     args.add(sa);
     args.add(sb);
-    int code = c.run(args);
-    result &= Test("basic counter", code, 12);
+    c.run(args);
+    c.WaitForExit();
+    result &= Test("basic counter", c.exitCode, 12);
     return result;
 }
 
@@ -95,8 +96,9 @@ bool testProgramMinimalNoFields() {
     bool result = true;
     Minimal m;
     list<string> args;
-    int code = m.run(args);
-    result &= Test("minimal no fields", code, 0);
+    m.run(args);
+    m.WaitForExit();
+    result &= Test("minimal no fields", m.exitCode, 0);
     return result;
 }
 
@@ -105,8 +107,9 @@ bool testProgramEmptyArgs() {
     Counter c;
     c.startFrom = 5;
     list<string> args;
-    int code = c.run(args);
-    result &= Test("empty args", code, 5);
+    c.run(args);
+    c.WaitForExit();
+    result &= Test("empty args", c.exitCode, 5);
     return result;
 }
 
@@ -115,8 +118,9 @@ bool testProgramExitCodeZero() {
     FixedExit f;
     f.code = 0;
     list<string> args;
-    int code = f.run(args);
-    result &= Test("exit code 0", code, 0);
+    f.run(args);
+    f.WaitForExit();
+    result &= Test("exit code 0", f.exitCode, 0);
     return result;
 }
 
@@ -125,8 +129,9 @@ bool testProgramExitCodeNonZero() {
     FixedExit f;
     f.code = 42;
     list<string> args;
-    int code = f.run(args);
-    result &= Test("exit code 42", code, 42);
+    f.run(args);
+    f.WaitForExit();
+    result &= Test("exit code 42", f.exitCode, 42);
     return result;
 }
 
@@ -137,8 +142,9 @@ bool testProgramMultipleFields() {
     m.b = 7;
     m.c = 5;
     list<string> args;
-    int code = m.run(args);
-    result &= Test("multiple fields sum", code, 15);
+    m.run(args);
+    m.WaitForExit();
+    result &= Test("multiple fields sum", m.exitCode, 15);
     return result;
 }
 
@@ -147,8 +153,9 @@ bool testProgramFieldDefaultValues() {
     // No fields set — all default to 0, so a+b+c = 0
     MultiField m;
     list<string> args;
-    int code = m.run(args);
-    result &= Test("field defaults zero", code, 0);
+    m.run(args);
+    m.WaitForExit();
+    result &= Test("field defaults zero", m.exitCode, 0);
     return result;
 }
 
@@ -157,9 +164,10 @@ bool testProgramHeapAllocationsFreed() {
     HeapStress h;
     h.count = 10;
     list<string> args;
-    int code = h.run(args);
+    h.run(args);
+    h.WaitForExit();
     // sum of 1+2+...+10 = 55
-    result &= Test("heap stress sum 10", code, 55);
+    result &= Test("heap stress sum 10", h.exitCode, 55);
     return result;
 }
 
@@ -169,13 +177,15 @@ bool testProgramMultipleRuns() {
 
     f.code = 7;
     list<string> args1;
-    int code1 = f.run(args1);
-    result &= Test("multiple runs first", code1, 7);
+    f.run(args1);
+    f.WaitForExit();
+    result &= Test("multiple runs first", f.exitCode, 7);
 
     f.code = 13;
     list<string> args2;
-    int code2 = f.run(args2);
-    result &= Test("multiple runs second", code2, 13);
+    f.run(args2);
+    f.WaitForExit();
+    result &= Test("multiple runs second", f.exitCode, 13);
 
     return result;
 }
@@ -195,8 +205,9 @@ bool testProgramArgsManyItems() {
     args.add(s3);
     args.add(s4);
     args.add(s5);
-    int code = c.run(args);
-    result &= Test("args count 5", code, 5);
+    c.run(args);
+    c.WaitForExit();
+    result &= Test("args count 5", c.exitCode, 5);
     return result;
 }
 
@@ -211,8 +222,9 @@ bool testProgramArgsAndFieldCombined() {
     args.add(s1);
     args.add(s2);
     args.add(s3);
-    int code = p.run(args);
-    result &= Test("field + args combined", code, 103);
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("field + args combined", p.exitCode, 103);
     return result;
 }
 
@@ -222,14 +234,16 @@ bool testTwoDifferentPrograms() {
     Counter c;
     c.startFrom = 20;
     list<string> cargs;
-    int code1 = c.run(cargs);
-    result &= Test("two programs - counter", code1, 20);
+    c.run(cargs);
+    c.WaitForExit();
+    result &= Test("two programs - counter", c.exitCode, 20);
 
     FixedExit f;
     f.code = 99;
     list<string> fargs;
-    int code2 = f.run(fargs);
-    result &= Test("two programs - fixed", code2, 99);
+    f.run(fargs);
+    f.WaitForExit();
+    result &= Test("two programs - fixed", f.exitCode, 99);
 
     return result;
 }
@@ -239,9 +253,10 @@ bool testProgramHeapStressLarge() {
     HeapStress h;
     h.count = 50;
     list<string> args;
-    int code = h.run(args);
+    h.run(args);
+    h.WaitForExit();
     // sum of 1+2+...+50 = 1275
-    result &= Test("heap stress sum 50", code, 1275);
+    result &= Test("heap stress sum 50", h.exitCode, 1275);
     return result;
 }
 

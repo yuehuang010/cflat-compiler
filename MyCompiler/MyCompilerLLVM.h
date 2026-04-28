@@ -308,6 +308,8 @@ public:
         llvm::Function* RunFunction = nullptr;
         llvm::Function* TrampolineFunction = nullptr;  // __program_run_Name
         llvm::StructType* RunArgsType = nullptr;       // { Name*, list__string }
+        unsigned ExitCodeFieldIndex = 0;               // struct field index of exitCode
+        unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
     };
 
     class StackState

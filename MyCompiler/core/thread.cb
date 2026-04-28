@@ -23,13 +23,19 @@ struct Thread {
     void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()
     i32   _exitCode = 0;
 
-    void start(function<int(void*)> fn, void* ctx) {
+    bool start(function<int(void*)> fn, void* ctx) {
         __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
         args->fn  = fn;
         args->ctx = ctx;
         _args = args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
+        if (_handle == nullptr) {
+            free((void*)_args);
+            _args = nullptr;
+            return false;
+        }
+        return true;
     }
 
     // Blocks until the thread exits. Returns the thread's exit code.

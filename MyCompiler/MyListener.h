@@ -527,12 +527,37 @@ public:
         compiler->CreateFunctionDeclaration(name, returnType, {});
 
         // Pre-declare trampoline: int __program_run_Name(void*)
-        MyCompilerLLVM::TypeAndValue intReturn{ .TypeName = "int" };
-        MyCompilerLLVM::DeclTypeAndValue ctxParam;
-        ctxParam.TypeName = "void";
-        ctxParam.VariableName = "ctx";
-        ctxParam.Pointer = true;
-        compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam });
+        {
+            MyCompilerLLVM::TypeAndValue intReturn{ .TypeName = "int" };
+            MyCompilerLLVM::DeclTypeAndValue ctxParam;
+            ctxParam.TypeName = "void";
+            ctxParam.VariableName = "ctx";
+            ctxParam.Pointer = true;
+            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam });
+        }
+
+        // Pre-declare run(Name* this, list__string args) -> bool
+        {
+            MyCompilerLLVM::TypeAndValue boolReturn{ .TypeName = "bool" };
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer = true;
+            MyCompilerLLVM::DeclTypeAndValue argsParam;
+            argsParam.TypeName = "list__string";
+            argsParam.VariableName = "args";
+            compiler->CreateFunctionDeclaration("run", boolReturn, { thisParam, argsParam });
+        }
+
+        // Pre-declare WaitForExit(Name* this) -> void
+        {
+            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer = true;
+            compiler->CreateFunctionDeclaration("WaitForExit", voidReturn, { thisParam });
+        }
 
         // Pre-declare member functions (including user's main) and destructor
         for (auto func : ctx->functionDefinition())
@@ -5875,9 +5900,16 @@ public:
             return;
         }
 
+        unsigned exitCodeIdx = compiler->programTable[name].ExitCodeFieldIndex;
+        unsigned threadIdx   = compiler->programTable[name].ThreadFieldIndex;
+
+        // Cast trampoline to the expected function pointer type: int(*)(void*)
+        auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
+
         // ======================================================================
         // EMIT TRAMPOLINE: int __program_run_Name(void* ctx)
-        // Runs on the spawned thread. Sets up allocator, calls main, cleans up.
+        // Runs on the spawned thread. Sets up allocator, calls main, stores
+        // exitCode into self, frees the args packet, returns main's result.
         // ======================================================================
         {
             MyCompilerLLVM::TypeAndValue intReturn;   intReturn.TypeName = "int";
@@ -5922,6 +5954,10 @@ public:
             auto* mainResult = compiler->builder->CreateCall(
                 mainFn->getFunctionType(), mainFn, {self, argsVal}, "main_result");
 
+            // Store main's return code into self->exitCode
+            auto* exitCodeGEP = compiler->builder->CreateStructGEP(progType, self, exitCodeIdx, "exit_code_gep");
+            compiler->builder->CreateStore(mainResult, exitCodeGEP);
+
             // Cleanup: call BlockAllocator.cleanup(allocPtr)
             compiler->builder->CreateCall(
                 blockAllocCleanupFn->getFunctionType(), blockAllocCleanupFn, {allocPtr});
@@ -5933,23 +5969,27 @@ public:
             compiler->builder->CreateStore(
                 llvm::ConstantPointerNull::get(blockAllocPtrType), activeAllocGlobal);
 
+            // Free the args packet (trampoline owns it; run() transferred ownership on start success)
+            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
+
             compiler->CreateReturnCall(mainResult);
             compiler->CreateBlockBreak(nullptr, true);
         }
 
         // ======================================================================
-        // EMIT run(): int run(Name* this, list__string args)
-        // Called by the user. Allocates args packet, spawns thread, joins.
+        // EMIT run(): bool run(Name* this, list__string args)
+        // Allocates args packet, spawns thread into self->_thread, returns
+        // whether the thread started. Does NOT join — caller uses WaitForExit().
         // ======================================================================
         {
-            MyCompilerLLVM::TypeAndValue intReturn;  intReturn.TypeName = "int";
+            MyCompilerLLVM::TypeAndValue boolReturn;  boolReturn.TypeName = "bool";
             MyCompilerLLVM::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
             MyCompilerLLVM::DeclTypeAndValue argsParam;
             argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
 
-            auto* runFn = compiler->CreateFunctionDefinition("run", intReturn, {thisParam, argsParam});
+            auto* runFn = compiler->CreateFunctionDefinition("run", boolReturn, {thisParam, argsParam});
             compiler->programTable[name].RunFunction = runFn;
 
             auto* thisArg = runFn->getArg(0);   // Name*
@@ -5970,7 +6010,7 @@ public:
             compiler->builder->CreateStore(argsArg, argsGEP);
 
             // Zero run()'s args alloca so ~list__string is a no-op at scope exit.
-            // Ownership of _data transfers to the packet/spawned thread; Counter.main frees it.
+            // Ownership of _data transfers to the packet; trampoline frees the packet on completion.
             {
                 auto& runArgNV = compiler->stackNamedVariable.back().functionArgument["args"];
                 if (runArgNV.Storage != nullptr)
@@ -5978,31 +6018,54 @@ public:
                         llvm::ConstantAggregateZero::get(listStringType), runArgNV.Storage);
             }
 
-            // Create Thread on stack and initialize via default ctor
-            auto* threadAlloca  = compiler->builder->CreateAlloca(threadType, nullptr, "thread");
-            auto* threadInitVal = compiler->builder->CreateCall(
-                threadCtorFn->getFunctionType(), threadCtorFn, {}, "thread_init");
-            compiler->builder->CreateStore(threadInitVal, threadAlloca);
+            // Get &self->_thread (stored field; initialized by the program ctor)
+            auto* threadFieldGEP = compiler->builder->CreateStructGEP(
+                progType, thisArg, threadIdx, "thread_field");
 
-            // Thread.start(thread*, function<int(void*)> trampoline, void* ctx)
+            // Thread.start(&self->_thread, trampoline, pkg) → bool
             auto* trampolineFn  = compiler->programTable[name].TrampolineFunction;
-            auto* trampolinePtrAsVoid = compiler->builder->CreateBitCast(trampolineFn, voidPtrType);
-            // Cast trampoline to the expected function pointer type: int(*)(void*)
-            auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
             auto* trampolineFnPtr = compiler->builder->CreateBitCast(
                 trampolineFn, trampolineFnTy->getPointerTo());
-            compiler->builder->CreateCall(
+            auto* startResult = compiler->builder->CreateCall(
                 threadStartFn->getFunctionType(), threadStartFn,
-                {threadAlloca, trampolineFnPtr, pkgRaw});
+                {threadFieldGEP, trampolineFnPtr, pkgRaw}, "start_result");
 
-            // Thread.join(thread*) → i32 exit code
-            auto* exitCode = compiler->builder->CreateCall(
-                threadJoinFn->getFunctionType(), threadJoinFn, {threadAlloca}, "exit_code");
+            // On start failure: free pkg, return false
+            auto* successBlock = llvm::BasicBlock::Create(*compiler->context, "start_ok",   runFn);
+            auto* failBlock    = llvm::BasicBlock::Create(*compiler->context, "start_fail", runFn);
+            compiler->builder->CreateCondBr(startResult, successBlock, failBlock);
 
-            // Free the args packet (thread has finished)
+            compiler->builder->SetInsertPoint(failBlock);
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {pkgRaw});
+            compiler->builder->CreateRet(compiler->builder->getFalse());
 
-            compiler->CreateReturnCall(exitCode);
+            // On start success: return true (trampoline owns pkg from here)
+            compiler->builder->SetInsertPoint(successBlock);
+            compiler->builder->CreateRet(compiler->builder->getTrue());
+
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        // ======================================================================
+        // EMIT WaitForExit(): void WaitForExit(Name* this)
+        // Blocks until the program thread exits. exitCode field is readable after.
+        // ======================================================================
+        {
+            MyCompilerLLVM::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+
+            compiler->CreateFunctionDefinition("WaitForExit", voidReturn, {thisParam});
+
+            auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
+
+            // Get &self->_thread and join
+            auto* threadFieldGEP = compiler->builder->CreateStructGEP(
+                progType, thisArg, threadIdx, "thread_field");
+            compiler->builder->CreateCall(
+                threadJoinFn->getFunctionType(), threadJoinFn, {threadFieldGEP});
+
+            compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
         }
     }
@@ -6027,7 +6090,30 @@ public:
 
         auto declList = ParseDeclarationList(ctx->declaration());
 
-        // Build struct type (config fields only — no allocator field)
+        // Guard against user fields clashing with auto-injected synthetic fields
+        for (auto& field : declList)
+        {
+            if (field.VariableName == "exitCode" || field.VariableName == "_thread")
+                compiler->LogError(std::format(
+                    "program '{}': field name '{}' is reserved", name, field.VariableName));
+        }
+
+        // Inject synthetic fields: exitCode (int = -1) and _thread (Thread)
+        unsigned exitCodeFieldIndex = (unsigned)declList.size();
+        unsigned threadFieldIndex   = exitCodeFieldIndex + 1;
+        {
+            MyCompilerLLVM::DeclTypeAndValue exitCodeField;
+            exitCodeField.TypeName     = "int";
+            exitCodeField.VariableName = "exitCode";
+            declList.push_back(exitCodeField);
+
+            MyCompilerLLVM::DeclTypeAndValue threadField;
+            threadField.TypeName     = "Thread";
+            threadField.VariableName = "_thread";
+            declList.push_back(threadField);
+        }
+
+        // Build struct type with user fields + synthetic fields
         auto* structType = compiler->CreateStructType(name, declList);
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
@@ -6066,6 +6152,21 @@ public:
                 idx++;
             }
 
+            // Synthetic field: exitCode = -1
+            {
+                auto* minusOne = llvm::ConstantInt::getSigned(
+                    llvm::Type::getInt32Ty(*compiler->context), -1);
+                structVal = compiler->CreateInsertValue(structVal, minusOne, exitCodeFieldIndex);
+            }
+
+            // Synthetic field: _thread = Thread()
+            if (auto* threadCtorFn = compiler->GetFunction("Thread"))
+            {
+                auto* threadInitVal = compiler->builder->CreateCall(
+                    threadCtorFn->getFunctionType(), threadCtorFn, {}, "thread_init");
+                structVal = compiler->CreateInsertValue(structVal, threadInitVal, threadFieldIndex);
+            }
+
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -6095,11 +6196,14 @@ public:
         // Flush instantiations (e.g. list__string from main's params) before emitting run()
         ProcessPendingInstantiations();
 
-        // Emit auto-generated run() method and __program_run_Name trampoline
-        EmitProgramRunWrapper(name);
+        // Set programTable before EmitProgramRunWrapper so it can read field indices
+        compiler->programTable[name].StructType        = structType;
+        compiler->programTable[name].ConfigFields      = declList;
+        compiler->programTable[name].ExitCodeFieldIndex = exitCodeFieldIndex;
+        compiler->programTable[name].ThreadFieldIndex   = threadFieldIndex;
 
-        compiler->programTable[name].StructType = structType;
-        compiler->programTable[name].ConfigFields = declList;
+        // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
+        EmitProgramRunWrapper(name);
     }
 
     void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
