@@ -2689,6 +2689,18 @@ public:
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
             }
+            // Transfer ownership for move string: null _ptr so string.dtor is a no-op
+            // after the value has been moved to persistent storage (e.g. list::add).
+            if (operatorText == "=" && rightNV.IsOwningString && rightNV.Storage != nullptr
+                && rightNV.TypeAndValue.IsMove)
+            {
+                if (auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string"))
+                {
+                    auto* ptrField = compiler->builder->CreateStructGEP(strTy, rightNV.Storage, 0);
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(compiler->builder->getPtrTy()), ptrField);
+                }
+            }
             // Reassignment to a moved variable makes it live again.
             if (operatorText == "=" && !namedVar.CallerName.empty())
                 compiler->MarkVariableUnmoved(namedVar.CallerName);

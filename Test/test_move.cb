@@ -1,3 +1,6 @@
+import "list.cb";
+import "test_helper.cb";
+
 int dtorCount = 0;
 
 struct Resource
@@ -22,22 +25,96 @@ void borrow(Resource* r)
     int x = r->id;
 }
 
+// ── list<string> helpers ──────────────────────────────────────────────────────
+// Passing list<string> value/pointer as a free-function parameter is a known
+// limitation; these helpers operate on extracted string values instead.
+
+string echoString(string s)
+{
+    return s;
+}
+
+// Two-hop relay: string passes through two function calls
+string relayString(string s)
+{
+    return echoString(s);
+}
+
+// Three-hop relay
+string relayStringDeep(string s)
+{
+    return relayString(s);
+}
+
+int testListStringMove()
+{
+    int passed = 0;
+
+    // Basic list<string> operations: add, count, get
+    {
+        list<string> words;
+        string a = "" + "apple";
+        string b = "" + "banana";
+        string c = "" + "cherry";
+        words.add(a);
+        words.add(b);
+        words.add(c);
+        passed += Test("list_string_count", words.count(), 3);
+        passed += Test("list_string_get0",  words.get(0), "apple");
+        passed += Test("list_string_get1",  words.get(1), "banana");
+        passed += Test("list_string_get2",  words.get(2), "cherry");
+    }
+
+    // removeAt: verify element is removed and count updates
+    {
+        list<string> words;
+        string a = "" + "first";
+        string b = "" + "second";
+        string c = "" + "third";
+        words.add(a);
+        words.add(b);
+        words.add(c);
+        words.removeAt(1);
+        passed += Test("list_string_remove_count", words.count(), 2);
+        passed += Test("list_string_remove_get0",  words.get(0), "first");
+        passed += Test("list_string_remove_get1",  words.get(1), "third");
+    }
+
+    // Strings extracted from list survive passing through function calls
+    // (regression: string values were corrupted when passed across functions)
+    {
+        list<string> words;
+        string w1 = "" + "hello";
+        string w2 = "" + "world";
+        words.add(w1);
+        words.add(w2);
+
+        string r1 = echoString(words.get(0));     // one hop
+        string r2 = relayString(words.get(1));    // two hops
+        string r3 = relayStringDeep(words.get(0)); // three hops
+        passed += Test("list_string_one_hop",   r1, "hello");
+        passed += Test("list_string_two_hop",   r2, "world");
+        passed += Test("list_string_three_hop", r3, "hello");
+    }
+
+    return passed;
+}
+
 extern int main()
 {
-    int result = 0;
-    dtorCount = 0;
+    int passed = 0;
+    int total  = 0;
 
     // Test 1: move param causes destructor to fire when function returns
+    dtorCount = 0;
     {
         Resource* r = new Resource();
         r->id = 42;
-        borrow(r);          // borrow — r still valid, dtor NOT called yet
-        consume(r);         // move — r is now null, dtor called inside consume
-        // r is null here; no double-free
+        borrow(r);
+        consume(r);
     }
-    // destructor should have fired exactly once (inside consume)
-    if (dtorCount == 1)
-        result = result + 1;
+    passed += Test("move_borrow_no_dtor", dtorCount, 1);
+    total++;
 
     // Test 2: move param with null — no crash (null check in cleanup)
     dtorCount = 0;
@@ -45,8 +122,12 @@ extern int main()
         Resource* r = new Resource();
         consume(r);
     }
-    if (dtorCount == 1)
-        result = result + 1;
+    passed += Test("move_null_safe", dtorCount, 1);
+    total++;
 
-    return result == 2 ? 0 : 1;
+    passed += testListStringMove();
+    total += 10;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
