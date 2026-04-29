@@ -4325,6 +4325,27 @@ public:
                                 LogErrorContext(primaryCtx, std::format("Unknown identifier '{}'.", primaryIdentifier));
                             }
                         }
+                        else if (prevToken == CFlatParser::Dot && [&]() -> bool {
+                            // Named variables (alloca-backed): TypeName is reliable.
+                            if (namedVar.TypeAndValue.IsFloatingPoint() >= 0) return true;
+                            // Inline float expressions (e.g. (-2.5f)): TypeName is empty,
+                            // but Primary holds the unloaded LLVM float value.
+                            if (namedVar.Primary != nullptr
+                                && namedVar.Primary->getType()->isFloatingPointTy()) return true;
+                            // Integer conversion methods — matched by name so they work on any
+                            // integer-typed base (named var, inline literal, call result).
+                            static const std::unordered_set<std::string> intConvert = {
+                                "to_i8","to_u8","to_i16","to_u16","to_i32","to_u32","to_i64","to_u64"
+                            };
+                            return intConvert.count(terminal->getText()) > 0;
+                        }())
+                        {
+                            // Method name on a primitive float/double or integer conversion
+                            // (e.g. f.round(), (-2.5f).abs(), x.to_i32(), x.to_u64()).
+                            // Record the method name; the base value stays in namedVar.
+                            // Actual dispatch happens when '()' is processed below.
+                            primaryIdentifier = terminal->getText();
+                        }
                         else
                         {
                             namedVar = ParseIdentifier(terminal);
@@ -4779,6 +4800,44 @@ public:
                         }
                         else
                         {
+                            // Intercept primitive method calls:
+                            //   float/double: f.round(), (-2.5f).abs(), etc.
+                            //   integer:      x.to_i32(), n.to_u64(), etc.
+                            if (!structVar.BaseType && !primaryIdentifier.empty())
+                            {
+                                llvm::Value* primVal = namedVar.Storage
+                                    ? Compiler(ctx)->CreateLoad(namedVar.Storage)
+                                    : namedVar.Primary;
+
+                                if (primVal != nullptr && primVal->getType()->isFloatingPointTy())
+                                {
+                                    auto* result = Compiler(ctx)->CreateFloatIntrinsic(primaryIdentifier, primVal);
+                                    if (result)
+                                    {
+                                        namedVar.Primary  = result;
+                                        namedVar.Storage  = nullptr;
+                                        namedVar.BaseType = result->getType();
+                                        structVar = {};
+                                        break;
+                                    }
+                                }
+                                else if (primVal != nullptr && primVal->getType()->isIntegerTy())
+                                {
+                                    auto* result = Compiler(ctx)->CreateIntegerConvert(primaryIdentifier, primVal);
+                                    if (result)
+                                    {
+                                        namedVar.Primary  = result;
+                                        namedVar.Storage  = nullptr;
+                                        namedVar.BaseType = result->getType();
+                                        // Strip the "to_" prefix to get the CFlat type name (e.g. "i32", "u64").
+                                        namedVar.TypeAndValue = {};
+                                        namedVar.TypeAndValue.TypeName = primaryIdentifier.substr(3);
+                                        structVar = {};
+                                        break;
+                                    }
+                                }
+                            }
+
                             std::vector<MyCompilerLLVM::NamedVariable> arguments;
                             if (structVar.BaseType)
                             {

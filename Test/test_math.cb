@@ -14,6 +14,33 @@ extern int main()
     total++; passed += Test("min(3,7)=3",        Math.min(b, c), (i32)b);
     total++; passed += Test("max(3,7)=7",        Math.max(b, c), (i32)c);
 
+    // float methods
+    float f = 3.7f;
+    total++; passed += Test("float.round(3.7)",  f.round(),       4.0f);
+    total++; passed += Test("float.floor(3.7)",  f.floor(),       3.0f);
+    total++; passed += Test("float.ceil(3.7)",   f.ceil(),        4.0f);
+    total++; passed += Test("float.abs(-2.5)",   (-2.5f).abs(),   2.5f);
+    total++; passed += Test("float.sqrt(4.0)",   (4.0f).sqrt(),   2.0f);
+
+    // integer conversion methods
+    i64 big = 0x100000000;  // 2^32
+    big = big + 0x42;       // 0x1_0000_0042 — high bits above i32 range
+    i32 lo = big.to_i32();
+    total++; passed += Test("i64.to_i32 truncate", lo, (i32)0x42);
+
+    i32 neg = -1;
+    i64 sext = neg.to_i64();
+    total++; passed += Test("i32.to_i64 sign-extend", sext, (i64)-1);
+
+    i32 pos = 0xFF;
+    u64 zext = pos.to_u64();
+    total++; passed += Test("i32.to_u64 zero-extend", (i64)zext, (i64)0xFF);
+
+    i64 big2 = 0x100000000;
+    big2 = big2 + 7;
+    u32 ulo = big2.to_u32();
+    total++; passed += Test("i64.to_u32 truncate", (i32)ulo, (i32)7);
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

@@ -1044,6 +1044,49 @@ private:
         builder->CreateCall(fn, {apAlloca});
     }
 
+    // Emit a single-argument LLVM float intrinsic (round, floor, ceil, fabs, sqrt).
+    // Returns nullptr if methodName is not a recognized float method.
+    // Works for both float (f32) and double (f64) — type is inferred from floatVal.
+    llvm::Value* CreateFloatIntrinsic(const std::string& methodName, llvm::Value* floatVal)
+    {
+        llvm::Intrinsic::ID id;
+        if      (methodName == "round") id = llvm::Intrinsic::round;
+        else if (methodName == "floor") id = llvm::Intrinsic::floor;
+        else if (methodName == "ceil")  id = llvm::Intrinsic::ceil;
+        else if (methodName == "abs")   id = llvm::Intrinsic::fabs;
+        else if (methodName == "sqrt")  id = llvm::Intrinsic::sqrt;
+        else return nullptr;
+
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), id, {floatVal->getType()});
+        return builder->CreateCall(fn, {floatVal});
+    }
+
+    // Emit an integer narrowing/widening conversion (to_i8, to_u8, to_i16, to_u16,
+    // to_i32, to_u32, to_i64, to_u64).  Returns nullptr for unrecognized names.
+    // Narrowing always truncates; widening sign-extends for signed targets, zero-extends for unsigned.
+    llvm::Value* CreateIntegerConvert(const std::string& methodName, llvm::Value* intVal)
+    {
+        struct Target { unsigned bits; bool isSigned; };
+        static const std::unordered_map<std::string, Target> table = {
+            {"to_i8",  {8,  true}},  {"to_u8",  {8,  false}},
+            {"to_i16", {16, true}},  {"to_u16", {16, false}},
+            {"to_i32", {32, true}},  {"to_u32", {32, false}},
+            {"to_i64", {64, true}},  {"to_u64", {64, false}},
+        };
+        auto it = table.find(methodName);
+        if (it == table.end()) return nullptr;
+
+        unsigned srcBits  = intVal->getType()->getIntegerBitWidth();
+        unsigned destBits = it->second.bits;
+        auto* destTy = llvm::Type::getIntNTy(*context, destBits);
+
+        if (srcBits > destBits)  return builder->CreateTrunc(intVal, destTy);
+        if (srcBits < destBits)  return it->second.isSigned
+                                     ? builder->CreateSExt(intVal, destTy)
+                                     : builder->CreateZExt(intVal, destTy);
+        return intVal; // same width — no-op
+    }
+
     bool VerifyModule()
     {
         std::string errors;
