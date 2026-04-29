@@ -3074,12 +3074,19 @@ public:
     MyCompilerLLVM::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
     {
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
-        if (exclusiveCtxs.size())
+        if (exclusiveCtxs.size() == 1)
+            return ParseExclusiveOrExpression(exclusiveCtxs[0]);
+
+        if (exclusiveCtxs.size() > 1)
         {
-            for (const auto& exclusiveCtx : exclusiveCtxs)
+            auto lv = ParseExclusiveOrExpression(exclusiveCtxs[0]);
+            llvm::Value* acc = lv.value;
+            for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
-                return ParseExclusiveOrExpression(exclusiveCtx);
+                auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i]);
+                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseOr, acc, rv.value);
             }
+            return { acc, lv.isUnsigned };
         }
 
         LogErrorContext(ctx, "Inclusive-OR expression has no operands.");
@@ -3089,12 +3096,19 @@ public:
     MyCompilerLLVM::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
     {
         auto andCtxs = ctx->andExpression();
-        if (andCtxs.size())
+        if (andCtxs.size() == 1)
+            return ParseAndExpression(andCtxs[0]);
+
+        if (andCtxs.size() > 1)
         {
-            for (const auto& andCtx : andCtxs)
+            auto lv = ParseAndExpression(andCtxs[0]);
+            llvm::Value* acc = lv.value;
+            for (size_t i = 1; i < andCtxs.size(); i++)
             {
-                return ParseAndExpression(andCtx);
+                auto rv = ParseAndExpression(andCtxs[i]);
+                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseXor, acc, rv.value);
             }
+            return { acc, lv.isUnsigned };
         }
 
         LogErrorContext(ctx, "Exclusive-OR expression has no operands.");
@@ -3104,12 +3118,19 @@ public:
     MyCompilerLLVM::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
     {
         auto nextCtxs = ctx->equalityExpression();
-        if (nextCtxs.size())
+        if (nextCtxs.size() == 1)
+            return ParseEqualityExpression(nextCtxs[0]);
+
+        if (nextCtxs.size() > 1)
         {
-            for (const auto& nextCtx : nextCtxs)
+            auto lv = ParseEqualityExpression(nextCtxs[0]);
+            llvm::Value* acc = lv.value;
+            for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                return ParseEqualityExpression(nextCtx);
+                auto rv = ParseEqualityExpression(nextCtxs[i]);
+                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseAnd, acc, rv.value);
             }
+            return { acc, lv.isUnsigned };
         }
 
         LogErrorContext(ctx, "Bitwise-AND expression has no operands.");
@@ -3342,12 +3363,21 @@ public:
     MyCompilerLLVM::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
-        if (nextCtxs.size())
+        if (nextCtxs.size() == 1)
         {
-            for (const auto& nextCtx : nextCtxs)
-            {
-                return ParseAdditiveExpression(nextCtx);
-            }
+            return ParseAdditiveExpression(nextCtxs[0]);
+        }
+        else if (nextCtxs.size() == 2)
+        {
+            auto lv = ParseAdditiveExpression(nextCtxs[0]);
+            auto rv = ParseAdditiveExpression(nextCtxs[1]);
+            // '>>' is two tokens in the grammar (('>' '>')), so children[1] = '>' and children[2] = '>'.
+            // '<<' is a single token, so children[1] = '<<'.
+            std::string op = ctx->children[1]->getText();
+            if (op == ">" && ctx->children.size() > 2 && ctx->children[2]->getText() == ">")
+                op = ">>";
+            auto result = Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
+            return { result, false };
         }
 
         LogErrorContext(ctx, "Shift expression has no operands.");

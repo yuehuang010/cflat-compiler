@@ -1,0 +1,71 @@
+// random.cb — Pseudo-random number generation using splitmix64.
+//
+// Uses the splitmix64 algorithm: state advances by a fixed golden-ratio-derived
+// increment, then the output is scrambled through three avalanche passes.
+// The constants are written as their signed i64 equivalents (two's-complement
+// multiplication produces the same bit pattern as unsigned multiplication).
+//
+// Usage:
+//   import "random.cb";
+//
+//   Random rng;
+//   rng.seedFromTime();
+//   int x = rng.nextInt(1, 100);
+//   double d = rng.nextDouble();
+
+extern int QueryPerformanceCounter(i64* count);
+
+struct Random
+{
+    i64 _state = 0;
+
+    // Seed from the current high-resolution performance counter.
+    void seedFromTime()
+    {
+        i64 count = 0;
+        QueryPerformanceCounter(&count);
+        seed(count);
+    }
+
+    // Seed with an explicit value.
+    void seed(i64 s)
+    {
+        _state = s;
+    }
+
+    i64 _advance()
+    {
+        // +0x9e3779b97f4a7c15 (golden-ratio derived increment, written as signed i64)
+        _state += -7046029254386353131;
+        i64 z = _state;
+        // *0xbf58476d1ce4e5b9
+        z = (z ^ (z >> 30)) * -4658895347498068487;
+        // *0x94d049bb133111eb
+        z = (z ^ (z >> 27)) * -7769279635992552469;
+        return z ^ (z >> 31);
+    }
+
+    // Non-negative pseudo-random i64 in [0, INT64_MAX].
+    // Uses arithmetic-shift trick: v ^ (v >> 63) clears the sign bit on any value,
+    // including INT64_MIN, without overflow.
+    i64 next()
+    {
+        i64 v = _advance();
+        return v ^ (v >> 63);
+    }
+
+    // Pseudo-random integer in [min, max] inclusive.
+    int nextInt(int min, int max)
+    {
+        i64 range = (i64)(max - min + 1);
+        return min + (int)(next() % range);
+    }
+
+    // Pseudo-random double in [0.0, 1.0).
+    double nextDouble()
+    {
+        i64 v = _advance();
+        v = v ^ (v >> 63);
+        return (double)v * (1.0 / 9223372036854775808.0);
+    }
+};

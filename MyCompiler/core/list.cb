@@ -73,23 +73,56 @@ class list<T> : IEnumerable<T>, IList<T>
         _size = 0;
     }
 
+    // Lomuto partition: pivot at _data[hi], returns final pivot index.
+    int _partition(int lo, int hi, function<bool(T, T)> compare)
+    {
+        int i = lo - 1;
+        int j = lo;
+        while (j < hi)
+        {
+            if (compare(_data[j], _data[hi]))
+            {
+                i++;
+                T tmp = _data[i];
+                _data[i] = _data[j];
+                _data[j] = tmp;
+            }
+            j++;
+        }
+        i++;
+        T tmp = _data[i];
+        _data[i] = _data[hi];
+        _data[hi] = tmp;
+        return i;
+    }
+
+    // Place the median of _data[lo], _data[mid], _data[hi] at position hi.
+    void _medianPivot(int lo, int mid, int hi, function<bool(T, T)> compare)
+    {
+        if (compare(_data[hi], _data[lo])) { T t = _data[lo]; _data[lo] = _data[hi]; _data[hi] = t; }
+        if (compare(_data[mid], _data[lo])) { T t = _data[lo]; _data[lo] = _data[mid]; _data[mid] = t; }
+        if (compare(_data[hi], _data[mid])) { T t = _data[mid]; _data[mid] = _data[hi]; _data[hi] = t; }
+        T tmp = _data[mid];
+        _data[mid] = _data[hi];
+        _data[hi] = tmp;
+    }
+
+    void _qsort(int lo, int hi, function<bool(T, T)> compare)
+    {
+        if (lo >= hi) return;
+        int mid = lo + (hi - lo) / 2;
+        _medianPivot(lo, mid, hi, compare);
+        int p = _partition(lo, hi, compare);
+        _qsort(lo, p - 1, compare);
+        _qsort(p + 1, hi, compare);
+    }
+
     // Sort in-place using a comparator: compare(a, b) returns true if a should
-    // come before b.  Uses insertion sort (stable, O(n²) worst case).
+    // come before b.  Uses quicksort (O(n log n) average).  Not stable.
     void sort(function<bool(T, T)> compare)
     {
-        int i = 1;
-        while (i < _size)
-        {
-            int j = i;
-            while (j > 0 && compare(_data[j], _data[j - 1]))
-            {
-                T tmp = _data[j];
-                _data[j] = _data[j - 1];
-                _data[j - 1] = tmp;
-                j--;
-            }
-            i++;
-        }
+        if (_size > 1)
+            _qsort(0, _size - 1, compare);
     }
 
     // l[index] — same semantics as get(index).

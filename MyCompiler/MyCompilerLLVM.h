@@ -89,6 +89,11 @@ public:
         MinusAssignment, // '-='
         LeftShiftAssignment, // '<<='
         RightShiftAssignment, // '>>='
+        ShiftLeft, // '<<'
+        ShiftRight, // '>>'
+        BitwiseAnd, // '&'
+        BitwiseXor, // '^'
+        BitwiseOr,  // '|'
         LogicalAnd, // '&&'
         AndAssignment, // '&='
         XorAssignment, // '^='
@@ -1330,6 +1335,11 @@ private:
         else if (operationText == "%=") { return Operation::ModAssignment; }
         else if (operationText == "+=") { return Operation::AddAssignment; }
         else if (operationText == "-=") { return Operation::MinusAssignment; }
+        else if (operationText == "<<") { return Operation::ShiftLeft; }
+        else if (operationText == ">>") { return Operation::ShiftRight; }
+        else if (operationText == "&") { return Operation::BitwiseAnd; }
+        else if (operationText == "^") { return Operation::BitwiseXor; }
+        else if (operationText == "|") { return Operation::BitwiseOr; }
         else if (operationText == "<<=") { return Operation::LeftShiftAssignment; }
         else if (operationText == ">>=") { return Operation::RightShiftAssignment; }
         else if (operationText == "&=") { return Operation::AndAssignment; }
@@ -2511,17 +2521,26 @@ public:
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
             }
             case Operation::LogicalAnd:
+            case Operation::BitwiseAnd:
             case Operation::AndAssignment:
             {
                 return builder->CreateAnd(left, right);
             }
             case Operation::LogicalOr:
+            case Operation::BitwiseOr:
             case Operation::OrAssignment:
             {
                 return builder->CreateOr(left, right);
             }
+            case Operation::BitwiseXor:
             case Operation::XorAssignment:
                 return builder->CreateXor(left, right);
+            case Operation::ShiftLeft:
+            case Operation::LeftShiftAssignment:
+                return builder->CreateShl(left, right);
+            case Operation::ShiftRight:
+            case Operation::RightShiftAssignment:
+                return builder->CreateAShr(left, right);
             }
         }
 
@@ -2559,6 +2578,9 @@ public:
             return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
         case Operation::LessEqual:
             return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
+        case Operation::ShiftRight:
+        case Operation::RightShiftAssignment:
+            return anyUnsigned ? builder->CreateLShr(left, right) : builder->CreateAShr(left, right);
         default:
             return CreateOperation(op, left, right);
         }

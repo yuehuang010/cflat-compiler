@@ -1,0 +1,157 @@
+import "test_helper.cb";
+import "list.cb";
+import "random.cb";
+
+// ── Random ────────────────────────────────────────────────────────────────────
+
+int testRandom()
+{
+    int passed = 0;
+
+    Random rng;
+    rng.seed(42);
+
+    // next() always returns non-negative values
+    int neg = 0;
+    int i = 0;
+    while (i < 100)
+    {
+        if (rng.next() < 0) neg++;
+        i++;
+    }
+    passed += Test("random next() non-negative", neg, 0);
+
+    // nextInt(min, max) stays in range
+    rng.seed(1);
+    int outOfRange = 0;
+    i = 0;
+    while (i < 200)
+    {
+        int v = rng.nextInt(5, 10);
+        if (v < 5 || v > 10) outOfRange++;
+        i++;
+    }
+    passed += Test("random nextInt in [5,10]", outOfRange, 0);
+
+    // nextInt covers the full range over enough samples
+    rng.seed(7);
+    bool seen5  = false;
+    bool seen10 = false;
+    i = 0;
+    while (i < 500)
+    {
+        int v = rng.nextInt(5, 10);
+        if (v == 5)  seen5  = true;
+        if (v == 10) seen10 = true;
+        i++;
+    }
+    passed += Test("random nextInt sees min (5)",  seen5,  true);
+    passed += Test("random nextInt sees max (10)", seen10, true);
+
+    // nextDouble() in [0.0, 1.0)
+    rng.seed(99);
+    int outOfRangeD = 0;
+    i = 0;
+    while (i < 200)
+    {
+        double d = rng.nextDouble();
+        if (d < 0.0 || d >= 1.0) outOfRangeD++;
+        i++;
+    }
+    passed += Test("random nextDouble in [0,1)", outOfRangeD, 0);
+
+    // Different seeds produce different sequences
+    Random a;
+    Random b;
+    a.seed(1);
+    b.seed(2);
+    passed += Test("random different seeds differ", a.next() != b.next(), true);
+
+    // Same seed reproduces same sequence
+    Random c;
+    Random d;
+    c.seed(12345);
+    d.seed(12345);
+    bool same = true;
+    i = 0;
+    while (i < 10)
+    {
+        if (c.next() != d.next()) same = false;
+        i++;
+    }
+    passed += Test("random same seed reproduces", same, true);
+
+    return passed;
+}
+
+// ── list.sort (quicksort) ─────────────────────────────────────────────────────
+
+int testSort()
+{
+    int passed = 0;
+
+    // Already sorted input (worst case for naive quicksort without median-of-3)
+    list<int> sorted;
+    sorted.add(1); sorted.add(2); sorted.add(3); sorted.add(4); sorted.add(5);
+    sorted.sort((int a, int b) => { return a < b; });
+    passed += Test("sort already-sorted [0]", sorted.get(0), 1);
+    passed += Test("sort already-sorted [4]", sorted.get(4), 5);
+
+    // Reverse-sorted input
+    list<int> rev;
+    rev.add(5); rev.add(4); rev.add(3); rev.add(2); rev.add(1);
+    rev.sort((int a, int b) => { return a < b; });
+    passed += Test("sort reverse [0]", rev.get(0), 1);
+    passed += Test("sort reverse [4]", rev.get(4), 5);
+
+    // Random-order input
+    list<int> unsorted;
+    unsorted.add(30); unsorted.add(10); unsorted.add(50); unsorted.add(20); unsorted.add(40);
+    unsorted.sort((int a, int b) => { return a < b; });
+    passed += Test("sort random [0]", unsorted.get(0), 10);
+    passed += Test("sort random [1]", unsorted.get(1), 20);
+    passed += Test("sort random [2]", unsorted.get(2), 30);
+    passed += Test("sort random [3]", unsorted.get(3), 40);
+    passed += Test("sort random [4]", unsorted.get(4), 50);
+
+    // Descending comparator
+    list<int> desc;
+    desc.add(3); desc.add(1); desc.add(4); desc.add(1); desc.add(5);
+    desc.sort((int a, int b) => { return a > b; });
+    passed += Test("sort desc [0]", desc.get(0), 5);
+    passed += Test("sort desc [1]", desc.get(1), 4);
+    passed += Test("sort desc [4]", desc.get(4), 1);
+
+    // Single element
+    list<int> one;
+    one.add(42);
+    one.sort((int a, int b) => { return a < b; });
+    passed += Test("sort single element", one.get(0), 42);
+
+    // Large input — 100 elements in reverse order
+    list<int> large;
+    int i = 99;
+    while (i >= 0) { large.add(i); i--; }
+    large.sort((int a, int b) => { return a < b; });
+    passed += Test("sort large [0]",  large.get(0),  0);
+    passed += Test("sort large [50]", large.get(50), 50);
+    passed += Test("sort large [99]", large.get(99), 99);
+
+    return passed;
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    int r;
+
+    r = testRandom();  passed += r; total += 7;
+    r = testSort();    passed += r; total += 16;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
