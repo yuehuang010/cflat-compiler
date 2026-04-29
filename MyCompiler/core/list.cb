@@ -46,10 +46,12 @@ class list<T> : IEnumerable<T>, IList<T>
     }
 
     // Remove the element at index, shifting subsequent elements left.
-    // NOTE: If T is a pointer type, the caller is responsible for freeing
-    // the removed element (use get() before removeAt() to capture it).
+    // When T is a pointer type, the removed element is freed automatically
+    // (destructor called + memory released).  For value types this is a no-op.
     void removeAt(int index)
     {
+        if const (is_pointer(T))
+            delete _data[index];
         int i = index;
         while (i < _size - 1)
         {

@@ -4550,6 +4550,32 @@ public:
 
                         auto argumentList = ctx->argumentExpressionList();
 
+                        // Compile-time intrinsic: is_pointer(T) — returns 1 if the type parameter T
+                        // resolves to a pointer type in the current generic instantiation, 0 otherwise.
+                        // Useful with `if const` to branch on pointer vs value element types.
+                        if (functionName == "is_pointer")
+                        {
+                            bool isPtr = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                    {
+                                        const std::string& resolved = substIt->second;
+                                        isPtr = !resolved.empty() && resolved.back() == '*';
+                                    }
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(*Compiler(ctx)->context), isPtr ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Handle va_start / va_end — pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
@@ -5409,7 +5435,7 @@ public:
             return {};
 
         // Compiler intrinsics handled at the call site — not in the function table.
-        if (name == "va_start" || name == "va_end")
+        if (name == "va_start" || name == "va_end" || name == "is_pointer")
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));

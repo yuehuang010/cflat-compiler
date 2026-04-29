@@ -196,7 +196,7 @@ void borrow(Resource* r)        { ... }  // caller still owns r
 - **Call site is silent** — no annotation needed; the caller's pointer is automatically nulled after a `move` call.
 - `move` is a **soft keyword** — detected via text matching in `ParseDeclarationSpecifiers()`, not as an ANTLR lexer token (avoids breaking identifiers/methods named `move`).
 - For value types (int, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true`.
-- `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; element destructors are not auto-called on `removeAt()` — caller must retrieve and free manually.
+- `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; `list::removeAt()` auto-frees pointer elements (destructor + delete); `dictionary::remove()` does not.
 
 Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.
 
@@ -204,13 +204,13 @@ Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructors
 
 - **`if const`**: Condition evaluated at compile-time; dead branches eliminated from IR. Works at both function and file scope.
 - **Compile-time macros**: `__FILE__`, `__FUNCTION__`, `__LINE__`, `__PLATFORM__` (64 or 32). Available globally.
+- **`is_pointer(T)`**: Compile-time intrinsic that returns 1 if the type parameter T resolves to a pointer type in the current generic instantiation, 0 otherwise. Use with `if const` to branch on element ownership in generic code.
 - **Platform support**: `-p win64` (default) or `-p win32`; guard with `if const (__PLATFORM__ == 64) { ... }`
 
 ### Known Limitations
 
 - **Null-conditional (`?.`)**: Works on any struct pointer — function arguments, local variables, and struct member fields
 - **Generic struct defaults**: `V x = default` in function locals and nested generic fields may not codegen correctly; field-level `= default` works
-- **`move` on `removeAt`**: Owned pointer elements are not auto-freed on removal from a collection
 
 ### Adding New Language Features
 

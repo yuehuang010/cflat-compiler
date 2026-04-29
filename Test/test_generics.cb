@@ -607,10 +607,13 @@ bool testForStruct()
 // Pointer types inside generic parameters (list<Employee*>)
 // =============================================================
 
+int empDtorCount = 0;
+
 struct Employee
 {
     int id = 0;
     int salary = 0;
+    ~Employee() { empDtorCount = empDtorCount + 1; }
 };
 
 bool testListPointer()
@@ -644,16 +647,17 @@ bool testListPointer()
     // operator[]
     result &= Test("list<ptr> op[]",         employees[1]->id,           2);
 
-    // removeAt (caller must free)
-    Employee* removed = employees.get(1);
+    // removeAt auto-frees the element (destructor called + memory released)
+    empDtorCount = 0;
     employees.removeAt(1);
-    delete removed;
-    result &= Test("list<ptr> count after remove", employees.count(),    2);
-    result &= Test("list<ptr> after remove[1].id", employees.get(1)->id, 3);
+    result &= Test("list<ptr> removeAt dtor fired",    empDtorCount,              1);
+    result &= Test("list<ptr> count after remove",     employees.count(),         2);
+    result &= Test("list<ptr> after remove[1].id",     employees.get(1)->id,      3);
 
-    // cleanup
+    // cleanup remaining elements
     delete employees.get(0);
     delete employees.get(1);
+    result &= Test("list<ptr> cleanup dtor count",     empDtorCount,              3);
 
     return result;
 }
@@ -879,6 +883,30 @@ bool testMixedGenericFields()
     return result;
 }
 
+// =============================================================
+// is_pointer(T) compile-time intrinsic
+// =============================================================
+
+struct PointerChecker<T>
+{
+    int check()
+    {
+        return is_pointer(T);
+    }
+};
+
+bool testIsPointerIntrinsic()
+{
+    bool result = true;
+    PointerChecker<int>       ci = default;
+    PointerChecker<bool>      cb = default;
+    PointerChecker<Employee*> cp = default;
+    result &= Test("is_pointer int",       ci.check(), 0);
+    result &= Test("is_pointer bool",      cb.check(), 0);
+    result &= Test("is_pointer Employee*", cp.check(), 1);
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -902,6 +930,7 @@ extern int main()
     result &= testGenericWrapperMethods();
     result &= testMultiLayerGeneric();
     result &= testMixedGenericFields();
+    result &= testIsPointerIntrinsic();
     if (result)
     {
         printf("All Test Passed.\n");
