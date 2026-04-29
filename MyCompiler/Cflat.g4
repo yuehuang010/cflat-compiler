@@ -190,8 +190,21 @@ constantExpression
     ;
 
 declaration
-    : declarationSpecifiers initDeclaratorList ';'
-    | enumSpecifier ';'
+    : annotationList? declarationSpecifiers initDeclaratorList ';'
+    | annotationList? enumSpecifier ';'
+    ;
+
+annotationArg
+    : StringLiteral
+    | Constant
+    ;
+
+annotation
+    : '[' Identifier ('(' annotationArg ')')? ']'
+    ;
+
+annotationList
+    : annotation+
     ;
 
 declarationSpecifiers
@@ -527,7 +540,8 @@ translationUnit
     ;
 
 externalDeclaration
-    : classDefinition
+    : annotationDefinition
+    | classDefinition
     | structDefinition
     | programDefinition
     | functionDefinition
@@ -539,6 +553,10 @@ externalDeclaration
     | ifConstDeclaration
     | expectErrorDeclaration
     | ';' // stray ;
+    ;
+
+annotationDefinition
+    : Annotation Identifier '{' declaration* '}' ';'
     ;
 
 ifConstDeclaration
@@ -765,6 +783,10 @@ Using
 
 Import
     : 'import'
+    ;
+
+Annotation
+    : 'annotation'
     ;
 
 In

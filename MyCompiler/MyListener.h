@@ -610,9 +610,27 @@ public:
         }
     }
 
+    void ScanAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string name = ctx->Identifier()->getText();
+
+        std::vector<std::string> fields;
+        for (auto* decl : ctx->declaration())
+        {
+            if (auto* initList = decl->initDeclaratorList())
+                for (auto* initDecl : initList->initDeclarator())
+                    if (auto* dir = initDecl->declarator())
+                        fields.push_back(dir->directDeclarator()->getText());
+        }
+        compiler->annotationRegistry[name] = fields;
+    }
+
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
-        if (auto ns = ctx->namespaceDefinition())
+        if (auto annDef = ctx->annotationDefinition())
+            ScanAnnotationDefinition(annDef);
+        else if (auto ns = ctx->namespaceDefinition())
             ScanNamespace(ns, namespaceName);
         else if (auto func = ctx->functionDefinition())
             ScanFunctionDefinition(func, {}, namespaceName);
@@ -1208,6 +1226,30 @@ public:
             compiler->RegisterLocalNamespaceAlias(alias, target);
     }
 
+    void ParseAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        std::string name = ctx->Identifier()->getText();
+
+        // Validate: no duplicate declaration
+        if (compiler->annotationRegistry.count(name))
+        {
+            // Already registered by ForwardRefScanner — nothing to emit (no LLVM type).
+            return;
+        }
+
+        // Fallback registration in case ForwardRefScanner missed it (shouldn't happen).
+        std::vector<std::string> fields;
+        for (auto* decl : ctx->declaration())
+        {
+            if (auto* initList = decl->initDeclaratorList())
+                for (auto* initDecl : initList->initDeclarator())
+                    if (auto* dir = initDecl->declarator())
+                        fields.push_back(dir->directDeclarator()->getText());
+        }
+        compiler->annotationRegistry[name] = fields;
+    }
+
     void ParseExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {})
     {
         auto func = ctx->functionDefinition();
@@ -1218,6 +1260,12 @@ public:
         auto ns = ctx->namespaceDefinition();
         auto usingDecl = ctx->usingDeclaration();
         auto ifConst = ctx->ifConstDeclaration();
+
+        if (auto annDef = ctx->annotationDefinition())
+        {
+            ParseAnnotationDefinition(annDef);
+            return;
+        }
 
         if (iface != nullptr)
         {
@@ -2301,6 +2349,54 @@ public:
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
 
+    std::vector<MyCompilerLLVM::AnnotationValue> ParseAnnotationList(CFlatParser::AnnotationListContext* annList)
+    {
+        std::vector<MyCompilerLLVM::AnnotationValue> result;
+        if (!annList) return result;
+
+        auto* compiler = Compiler(annList);
+        for (auto* ann : annList->annotation())
+        {
+            std::string annName = ann->Identifier()->getText();
+
+            // Validate: annotation must be declared
+            auto regIt = compiler->annotationRegistry.find(annName);
+            if (regIt == compiler->annotationRegistry.end())
+            {
+                LogErrorContext(ann, "Unknown annotation '" + annName + "': no annotation declaration found");
+                continue;
+            }
+
+            std::string argValue;
+            bool hasArg = ann->annotationArg() != nullptr;
+            bool expectsArg = !regIt->second.empty();
+
+            if (hasArg && !expectsArg)
+            {
+                LogErrorContext(ann, "Annotation '" + annName + "' does not accept arguments");
+                continue;
+            }
+            if (!hasArg && expectsArg)
+            {
+                LogErrorContext(ann, "Annotation '" + annName + "' requires an argument");
+                continue;
+            }
+
+            if (hasArg)
+            {
+                // Strip surrounding quotes from string literals
+                std::string raw = ann->annotationArg()->getText();
+                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
+                    argValue = raw.substr(1, raw.size() - 2);
+                else
+                    argValue = raw;
+            }
+
+            result.push_back({ annName, argValue });
+        }
+        return result;
+    }
+
     std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CFlatParser::DeclarationContext*> ctx)
     {
         std::vector<MyCompilerLLVM::DeclTypeAndValue> result;
@@ -2312,6 +2408,8 @@ public:
                 auto direct = decl->declarationSpecifiers();
                 auto typeAndValue = ParseDeclarationSpecifiers(direct);
 
+                auto annotations = ParseAnnotationList(decl->annotationList());
+
                 auto initDeclList = decl->initDeclaratorList()->initDeclarator();
                 for (auto initDecl : initDeclList)
                 {
@@ -2321,6 +2419,7 @@ public:
                     std::string name = declarator->directDeclarator()->getText();
                     typeAndValue.VariableName = name;
                     typeAndValue.Initializer = initializer;
+                    typeAndValue.Annotations = annotations;
 
                     result.push_back(typeAndValue);  // Copy
                 }
@@ -4654,6 +4753,54 @@ public:
 
                         auto argumentList = ctx->argumentExpressionList();
 
+                        // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")
+                        // Returns the annotation's argument value as a string constant, or "" if absent.
+                        // For no-arg annotations, returns "1" if present or "" if absent.
+                        // Usable with `if const` to branch on annotation presence.
+                        if (functionName == "annotationof")
+                        {
+                            std::string annValue;
+                            auto* compiler = Compiler(ctx);
+                            if (argumentList.size() > 0)
+                            {
+                                auto allArgs = argumentList[0]->argumentNamedExpression();
+
+                                auto getArgText = [&](int idx) -> std::string {
+                                    if (idx >= (int)allArgs.size()) return {};
+                                    std::string t = allArgs[idx]->assignmentExpression()->getText();
+                                    // Strip surrounding quotes from string literal args
+                                    if (t.size() >= 2 && t.front() == '"' && t.back() == '"')
+                                        return t.substr(1, t.size() - 2);
+                                    return t;
+                                };
+
+                                std::string typeName  = getArgText(0);
+                                std::string fieldName = getArgText(1);
+                                std::string annName   = getArgText(2);
+
+                                // Resolve generic type substitutions
+                                auto substIt = activeTypeSubstitutions.find(typeName);
+                                if (substIt != activeTypeSubstitutions.end())
+                                    typeName = substIt->second;
+
+                                auto structData = compiler->GetDataStructure(typeName);
+                                for (const auto& field : structData.StructFields)
+                                {
+                                    if (field.VariableName != fieldName) continue;
+                                    for (const auto& ann : field.Annotations)
+                                    {
+                                        if (ann.Name != annName) continue;
+                                        annValue = ann.Value.empty() ? "1" : ann.Value;
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+                            namedVar.Primary = compiler->CreateGlobalString("annotationof", annValue);
+                            namedVar.TypeAndValue.TypeName = "string";
+                            break;
+                        }
+
                         // Compile-time intrinsic: is_pointer(T) — returns 1 if the type parameter T
                         // resolves to a pointer type in the current generic instantiation, 0 otherwise.
                         // Useful with `if const` to branch on pointer vs value element types.
@@ -5600,7 +5747,7 @@ public:
             return {};
 
         // Compiler intrinsics handled at the call site — not in the function table.
-        if (name == "va_start" || name == "va_end" || name == "is_pointer")
+        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof")
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));

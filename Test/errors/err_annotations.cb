@@ -1,0 +1,28 @@
+// Annotation error tests
+
+annotation JsonName { string value; };
+annotation Private { };
+
+// Unknown annotation name
+expect_error("Unknown annotation 'Foo'") {
+    struct BadUnknown {
+        [Foo]
+        int x = 0;
+    };
+}
+
+// Annotation with unexpected argument
+expect_error("does not accept arguments") {
+    struct BadExtraArg {
+        [Private("oops")]
+        int x = 0;
+    };
+}
+
+// Annotation missing required argument
+expect_error("requires an argument") {
+    struct BadMissingArg {
+        [JsonName]
+        int x = 0;
+    };
+}

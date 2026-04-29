@@ -241,6 +241,12 @@ public:
 
     };
 
+    struct AnnotationValue
+    {
+        std::string Name;   // e.g. "JsonName"
+        std::string Value;  // raw arg text, empty for no-arg annotations
+    };
+
     struct DeclTypeAndValue : public TypeAndValue
     {
         // Used for delayed Initialization
@@ -254,6 +260,8 @@ public:
 
         bool external = false;
         bool threadLocal = false;
+
+        std::vector<AnnotationValue> Annotations;
     };
 
     struct NamedVariable
@@ -434,6 +442,10 @@ public:
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
     std::unordered_map<std::string, StructData> dataStructures;
+
+    // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).
+    // Field name "" means the annotation accepts a single unnamed positional arg.
+    std::unordered_map<std::string, std::vector<std::string>> annotationRegistry;
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;

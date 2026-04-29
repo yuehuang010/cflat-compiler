@@ -1,0 +1,52 @@
+import "test_helper.cb";
+
+annotation JsonName  { string value; };
+annotation Private   { };
+annotation MaxLength { int value; };
+
+struct Person {
+    [JsonName("first_name")]
+    string firstName = default;
+
+    [Private]
+    string _token = default;
+
+    [JsonName("age_years")]
+    [MaxLength(3)]
+    int age = 0;
+
+    string lastName = default;
+};
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    // String annotation arg
+    string fn = annotationof(Person, "firstName", "JsonName");
+    total++; passed += Test("JsonName on firstName", fn.data(), "first_name");
+
+    // No-arg annotation returns "1"
+    string priv = annotationof(Person, "_token", "Private");
+    total++; passed += Test("Private on _token", priv.data(), "1");
+
+    // Integer annotation arg stored as raw text
+    string maxLen = annotationof(Person, "age", "MaxLength");
+    total++; passed += Test("MaxLength on age", maxLen.data(), "3");
+
+    // Second annotation on same field
+    string ageName = annotationof(Person, "age", "JsonName");
+    total++; passed += Test("JsonName on age", ageName.data(), "age_years");
+
+    // Unannotated field returns empty string
+    string none = annotationof(Person, "lastName", "JsonName");
+    total++; passed += Test("no annotation on lastName", none.length(), 0);
+
+    if (passed == total)
+        printf("All %d annotation tests passed.\n", total);
+    else
+        printf("%d/%d annotation tests failed.\n", total - passed, total);
+
+    return (passed == total) ? 0 : 1;
+}
