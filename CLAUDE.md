@@ -249,7 +249,9 @@ Core library files in `core/` are automatically compiled alongside every program
 | `pair.cb` | `pair<A,B>` — two-field generic struct |
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
 
-To add a new core library: add the `.cb` file to `core/` and add an auto-import in `MyListener.h` (search for where `interfaces.cb` is imported for the pattern).
+To add a new core library: add the `.cb` file to `core/` and add an entry in MyCompiler.vcxproj with DeploymentContent.
+Use nullptr instead of null;
+Always assign "default" to fields.
 
 ### VS Code Extension
 

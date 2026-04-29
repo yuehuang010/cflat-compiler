@@ -56,7 +56,7 @@ postfixExpression
     : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') (
         '[' expression ']'
         | '(' argumentExpressionList ')'
-        | ('.' | '->' | QuestionDot) Identifier genericTypeParameters?
+        | ('.' | '->' | QuestionDot) (Identifier | Move) genericTypeParameters?
         | '++'
         | '--'
     )*
@@ -78,6 +78,7 @@ unaryExpression
         | ('sizeof' | 'alignof') '(' typeName ')'
         | newExpression
         | deleteExpression
+        | moveExpression
         | operatorStringExpression
     )
     ;
@@ -244,6 +245,7 @@ typeSpecifier
     | 'va_list'
     | structClassUnion
     | 'auto'
+    | Move                           // soft keyword — ownership modifier on parameters
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
     | genericIdentifier
     | functionPointerSpecifier
@@ -364,8 +366,8 @@ declarator
     ;
 
 directDeclarator
-    : Identifier
-    | Identifier ':' DigitSequence         // bit field
+    : (Identifier | Move)
+    | (Identifier | Move) ':' DigitSequence  // bit field
     | '(' declarator ')'
     ;
 
@@ -587,6 +589,10 @@ destructorDefinition
 newExpression
     : New typeSpecifier ('(' argumentExpressionList ')')?
     | New typeSpecifier '[' assignmentExpression ']'
+    ;
+
+moveExpression
+    : Move unaryExpression
     ;
 
 deleteExpression
@@ -835,6 +841,10 @@ New
 
 Delete
     : 'delete'
+    ;
+
+Move
+    : 'move'
     ;
 
 Operator

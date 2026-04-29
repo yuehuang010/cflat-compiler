@@ -3732,6 +3732,10 @@ public:
         {
             return ParseDeleteExpression(delCtx);
         }
+        else if (auto* moveCtx = ctx->moveExpression())
+        {
+            return ParseMoveExpression(moveCtx);
+        }
         else if (auto* opStrCtx = ctx->operatorStringExpression())
         {
             return ParseOperatorStringExpression(opStrCtx);
@@ -4071,6 +4075,38 @@ public:
         return {};
     }
 
+    MyCompilerLLVM::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+        llvm::Value* ptrVal = LoadNamedVariable(argNV);
+
+        if (!argNV.TypeAndValue.Pointer)
+        {
+            LogErrorContext(ctx, "'move' expression requires a pointer type.");
+            return {};
+        }
+        if (argNV.Storage == nullptr)
+        {
+            LogErrorContext(ctx, "'move' expression requires an addressable source (field or local).");
+            return {};
+        }
+
+        // Null the source (field GEP or local alloca) to transfer ownership.
+        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
+            compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
+
+        // Signal ParseDeclaration to mark the target local as IsNewAllocated.
+        compiler->lastNewAllocated = true;
+
+        MyCompilerLLVM::NamedVariable result;
+        result.Primary      = ptrVal;
+        result.Storage      = nullptr;
+        result.BaseType     = ptrVal ? ptrVal->getType() : nullptr;
+        result.TypeAndValue = argNV.TypeAndValue;
+        return result;
+    }
+
     MyCompilerLLVM::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -4135,6 +4171,10 @@ public:
                 {
                     auto terminal = dynamic_cast<antlr4::tree::TerminalNode*>(parseTree);
                     auto tokenType = terminal->getSymbol()->getType();
+                    // 'move' is now a keyword token; remap it to Identifier handling
+                    // so it works as a member name (e.g. File.move(...)).
+                    if (tokenType == CFlatParser::Move)
+                        tokenType = CFlatParser::Identifier;
                     switch (tokenType)
                     {
                     case CFlatParser::LeftBracket:

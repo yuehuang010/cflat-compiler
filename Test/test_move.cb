@@ -12,6 +12,16 @@ struct Resource
     }
 };
 
+struct Container
+{
+    Resource* item = nullptr;
+    ~Container()
+    {
+        if (item != nullptr)
+            delete item;
+    }
+};
+
 // move parameter takes ownership — Resource is deleted when consume returns
 void consume(move Resource* r)
 {
@@ -123,6 +133,30 @@ extern int main()
         consume(r);
     }
     passed += Test("move_null_safe", dtorCount, 1);
+    total++;
+
+    // Test 3: new-allocated local auto-freed at scope exit (no escape)
+    dtorCount = 0;
+    {
+        Resource* r = new Resource();
+    }
+    passed += Test("new_local_auto_free", dtorCount, 1);
+    total++;
+
+    // Test 4: new local assigned to struct field — not freed early; freed when owner is destroyed
+    dtorCount = 0;
+    {
+        Container* c = new Container();
+        {
+            Resource* r = new Resource();
+            c->item = r;
+            // r exits scope: refcount 2→1, no free
+        }
+        passed += Test("stack_to_field_no_early_free", dtorCount, 0);
+        total++;
+        // c exits scope: auto-freed, ~Container() frees c->item → dtorCount = 1
+    }
+    passed += Test("stack_to_field_freed_with_owner", dtorCount, 1);
     total++;
 
     passed += testListStringMove();
