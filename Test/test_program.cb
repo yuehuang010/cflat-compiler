@@ -306,6 +306,67 @@ bool testAllocatorUsedBlocksLeaked() {
 }
 
 // ---------------------------------------------------------------------------
+// onStdout tests
+// ---------------------------------------------------------------------------
+
+int g_stdout_count = 0;
+
+void capture_stdout(char* s) {
+    g_stdout_count++;
+}
+
+// Program that calls printf three times
+program StdoutCapture {
+    int main(move list<string> args) {
+        printf("line 1\n");
+        printf("line 2\n");
+        printf("line 3\n");
+        return 0;
+    }
+};
+
+bool testOnStdoutNamedCallback() {
+    bool result = true;
+    g_stdout_count = 0;
+    StdoutCapture p;
+    p.onStdout = capture_stdout;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("onStdout named callback count", g_stdout_count, 3);
+    result &= Test("onStdout exitCode", p.exitCode, 0);
+    return result;
+}
+
+void capture_stdout2(char* s) {
+    g_stdout_count = g_stdout_count + 10;
+}
+
+bool testOnStdoutSecondCallback() {
+    bool result = true;
+    g_stdout_count = 0;
+    StdoutCapture p;
+    p.onStdout = capture_stdout2;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("onStdout second callback count", g_stdout_count, 30);
+    return result;
+}
+
+bool testOnStdoutNullByDefault() {
+    bool result = true;
+    g_stdout_count = 0;
+    StdoutCapture p;
+    // onStdout is null by default — output goes to console (we just verify callback not called)
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("onStdout default null count", g_stdout_count, 0);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // stop_token tests
 // ---------------------------------------------------------------------------
 
@@ -374,6 +435,9 @@ extern int main() {
     total++; passed += testAllocatorNullBeforeRun()        ? 1 : 0;
     total++; passed += testAllocatorUsedBlocksCleanExit()  ? 1 : 0;
     total++; passed += testAllocatorUsedBlocksLeaked()     ? 1 : 0;
+    total++; passed += testOnStdoutNamedCallback()          ? 1 : 0;
+    total++; passed += testOnStdoutSecondCallback()          ? 1 : 0;
+    total++; passed += testOnStdoutNullByDefault()          ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

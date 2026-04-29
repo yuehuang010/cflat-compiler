@@ -5,11 +5,36 @@ extern void* __acrt_iob_func(int fd);
 extern int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 extern int __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
 
+// === Memory Functions ===
+extern void* malloc(i64 size);
+extern void  free(void* ptr);
+extern void* calloc(i64 count, i64 size);
+extern void* realloc(void* ptr, i64 size);
+
+// Per-thread stdout hook set by 'program' constructs. When non-null, printf/vprintf
+// format into a heap buffer and call the hook instead of writing to the console.
+thread_local function<void(char*)> __stdout_hook = default;
+thread_local bool __stdout_in_hook = false;  // re-entrancy guard: callbacks may call printf
+
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    void* stdout_stream = __acrt_iob_func(1);
-    __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+    if (__stdout_hook != nullptr && !__stdout_in_hook) {
+        __stdout_in_hook = true;
+        char* buf = (char*)malloc(4096);
+        int needed = __stdio_common_vsprintf(0, buf, 4096, fmt, nullptr, ap);
+        if (needed >= 4096) {
+            free(buf);
+            buf = (char*)malloc((i64)needed + 1);
+            __stdio_common_vsprintf(0, buf, (i64)needed + 1, fmt, nullptr, ap);
+        }
+        __stdout_hook(buf);
+        free(buf);
+        __stdout_in_hook = false;
+    } else {
+        void* stdout_stream = __acrt_iob_func(1);
+        __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+    }
     va_end(ap);
 }
 
@@ -30,6 +55,20 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
 }
 
 extern int vprintf(const char* fmt, va_list ap) {
+    if (__stdout_hook != nullptr && !__stdout_in_hook) {
+        __stdout_in_hook = true;
+        char* buf = (char*)malloc(4096);
+        int len = __stdio_common_vsprintf(0, buf, 4096, fmt, nullptr, ap);
+        if (len >= 4096) {
+            free(buf);
+            buf = (char*)malloc((i64)len + 1);
+            __stdio_common_vsprintf(0, buf, (i64)len + 1, fmt, nullptr, ap);
+        }
+        __stdout_hook(buf);
+        free(buf);
+        __stdout_in_hook = false;
+        return len;
+    }
     void* stdout_stream = __acrt_iob_func(1);
     return __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
 }
@@ -41,12 +80,6 @@ extern int vsprintf(char* buf, const char* fmt, va_list ap) {
 extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
     return __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
 }
-
-// === Memory Functions ===
-extern void* malloc(i64 size);
-extern void  free(void* ptr);
-extern void* calloc(i64 count, i64 size);
-extern void* realloc(void* ptr, i64 size);
 
 // === String Functions ===
 extern i32 strlen(const char* s);

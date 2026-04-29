@@ -313,6 +313,7 @@ public:
         unsigned ExitCodeFieldIndex = 0;               // struct field index of exitCode
         unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
         unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (BlockAllocator*)
+        unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
     };
 
     class StackState

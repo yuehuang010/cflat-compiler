@@ -6125,6 +6125,21 @@ public:
         unsigned exitCodeIdx    = compiler->programTable[name].ExitCodeFieldIndex;
         unsigned threadIdx      = compiler->programTable[name].ThreadFieldIndex;
         unsigned allocatorIdx   = compiler->programTable[name].AllocatorFieldIndex;
+        unsigned onStdoutIdx    = compiler->programTable[name].OnStdoutFieldIndex;
+
+        // Look up the thread-local stdout hook global (declared in cruntime.cb)
+        llvm::GlobalVariable* stdoutHookGlobal = nullptr;
+        {
+            auto it = compiler->globalNamedVariable.find("__stdout_hook");
+            if (it != compiler->globalNamedVariable.end()) stdoutHookGlobal = it->second;
+        }
+        if (!stdoutHookGlobal)
+        {
+            compiler->LogError(std::format(
+                "program '{}': __stdout_hook not found — cruntime.cb must be imported", name));
+            return;
+        }
+        auto* hookFnPtrType = stdoutHookGlobal->getValueType(); // void(char*)* LLVM type
 
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
@@ -6171,6 +6186,15 @@ public:
             auto* activeAllocGlobal = compiler->globalNamedVariable["__active_allocator"];
             compiler->builder->CreateStore(allocPtr, activeAllocGlobal);
 
+            // Install stdout hook: load self->onStdout and store into __stdout_hook
+            {
+                auto* onStdoutGEP = compiler->builder->CreateStructGEP(
+                    progType, self, onStdoutIdx, "on_stdout_gep");
+                auto* onStdoutVal = compiler->builder->CreateLoad(
+                    hookFnPtrType, onStdoutGEP, "on_stdout_fn");
+                compiler->builder->CreateStore(onStdoutVal, stdoutHookGlobal);
+            }
+
             // Load list__string args by value from the packet
             auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
@@ -6185,6 +6209,11 @@ public:
             // Clear __active_allocator — allocations are no longer tracked after main() returns
             compiler->builder->CreateStore(
                 llvm::ConstantPointerNull::get(blockAllocPtrType), activeAllocGlobal);
+
+            // Clear stdout hook
+            compiler->builder->CreateStore(
+                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(hookFnPtrType)),
+                stdoutHookGlobal);
 
             // Store allocator into self->_allocator so it remains inspectable after WaitForExit().
             // Cleanup and free happen in ~Name() when the program struct is destroyed.
@@ -6394,15 +6423,17 @@ public:
         for (auto& field : declList)
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
-                || field.VariableName == "_allocator")
+                || field.VariableName == "_allocator" || field.VariableName == "onStdout")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
-        // Inject synthetic fields: exitCode (int = -1), _thread (Thread), _allocator (BlockAllocator*)
+        // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (BlockAllocator*),
+        // onStdout (function<void(char*)> — optional stdout capture callback)
         unsigned exitCodeFieldIndex  = (unsigned)declList.size();
         unsigned threadFieldIndex    = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex = threadFieldIndex + 1;
+        unsigned onStdoutFieldIndex  = allocatorFieldIndex + 1;
         {
             MyCompilerLLVM::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -6419,6 +6450,13 @@ public:
             allocatorField.VariableName = "_allocator";
             allocatorField.Pointer      = true;
             declList.push_back(allocatorField);
+
+            MyCompilerLLVM::DeclTypeAndValue onStdoutField;
+            onStdoutField.VariableName          = "onStdout";
+            onStdoutField.IsFunctionPointer     = true;
+            onStdoutField.FuncPtrReturnTypeName = "void";
+            onStdoutField.FuncPtrParams         = {{"char", true}};
+            declList.push_back(onStdoutField);
         }
 
         // Build struct type with user fields + synthetic fields
@@ -6486,6 +6524,14 @@ public:
                 }
             }
 
+            // Synthetic field: onStdout = nullptr
+            {
+                auto& onStdoutDecl = declList[onStdoutFieldIndex];
+                auto* fnPtrType = llvm::cast<llvm::PointerType>(compiler->GetType(onStdoutDecl));
+                auto* nullFnPtr = llvm::ConstantPointerNull::get(fnPtrType);
+                structVal = compiler->CreateInsertValue(structVal, nullFnPtr, onStdoutFieldIndex);
+            }
+
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -6539,6 +6585,7 @@ public:
         compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
+        compiler->programTable[name].OnStdoutFieldIndex  = onStdoutFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);
