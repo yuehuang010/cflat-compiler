@@ -1020,6 +1020,36 @@ bool testGlobalIfConst()
     return result;
 }
 
+// =============================================================
+// Global struct pointer method dispatch
+// Verifies that TypeAndValue is preserved for global variables so
+// direct method calls on globals resolve correctly.
+// =============================================================
+
+struct GlobalCounter
+{
+    int count = 0;
+    int increment() { count = count + 1; return count; }
+    int get() { return count; }
+};
+
+GlobalCounter* g_counter = nullptr;
+
+bool testGlobalStructPtrMethod()
+{
+    bool result = true;
+
+    GlobalCounter c = GlobalCounter();
+    g_counter = &c;
+
+    result &= Test("global_ptr_method_get",      g_counter.get(),       0);
+    result &= Test("global_ptr_method_increment", g_counter.increment(), 1);
+    result &= Test("global_ptr_method_after_inc", g_counter.get(),       1);
+
+    g_counter = nullptr;
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1067,6 +1097,7 @@ extern int main()
     result &= testIfConst();
     result &= testPlatformConstant();
     result &= testGlobalIfConst();
+    result &= testGlobalStructPtrMethod();
 
     if (result)
     {

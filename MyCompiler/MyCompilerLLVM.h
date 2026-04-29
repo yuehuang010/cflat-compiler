@@ -424,6 +424,7 @@ public:
 
     std::vector<StackState> stackNamedVariable;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
+    std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
     std::unordered_map<std::string, StructData> dataStructures;
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
@@ -1834,6 +1835,7 @@ public:
             gVar->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
 
         globalNamedVariable[typeValue.VariableName] = gVar;
+        globalVariableTypes[typeValue.VariableName] = typeValue;
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
@@ -3716,6 +3718,23 @@ public:
         }
 
         return nullptr;
+    }
+
+    NamedVariable GetGlobalVariableNV(const std::string& name)
+    {
+        auto gIt = globalNamedVariable.find(name);
+        if (gIt == globalNamedVariable.end())
+            return {};
+
+        NamedVariable nv;
+        nv.Storage  = gIt->second;
+        nv.BaseType = gIt->second->getValueType();
+
+        auto tvIt = globalVariableTypes.find(name);
+        if (tvIt != globalVariableTypes.end())
+            nv.TypeAndValue = tvIt->second;
+
+        return nv;
     }
 
     llvm::Constant* GetPlatformConstant()

@@ -4228,10 +4228,10 @@ public:
                                 primaryIdentifier = qualifiedName;
                                 namespaceContext.clear();
 
-                                if (auto gVar = Compiler(ctx)->GetGlobalVariable(primaryIdentifier))
+                                auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
+                                if (globalNV.Storage != nullptr)
                                 {
-                                    namedVar.Storage = gVar;
-                                    namedVar.BaseType = gVar->getType();
+                                    namedVar = globalNV;
                                 }
                                 else if (auto func = Compiler(ctx)->GetFunction(primaryIdentifier))
                                 {
@@ -5476,11 +5476,10 @@ public:
         }
 
         // try getting global variable
-        if (auto gVar = compiler->GetGlobalVariable(name))
         {
-            namedVar.Storage = gVar;
-            namedVar.BaseType = gVar->getType();
-            return namedVar;
+            auto globalNV = compiler->GetGlobalVariableNV(name);
+            if (globalNV.Storage != nullptr)
+                return globalNV;
         }
 
         if (auto func = compiler->GetFunction(name))

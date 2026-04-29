@@ -531,6 +531,7 @@ void MyCompilerLLVM::ResetForReanalysis()
     interfaceTable.clear();
     interfaceParents.clear();
     globalNamedVariable.clear();
+    globalVariableTypes.clear();
     namespaceTable.clear();
     stringPool.clear();
     stackNamedVariable.clear();
