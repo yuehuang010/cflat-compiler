@@ -188,7 +188,11 @@ private:
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
                     std::cerr << std::format("error: pointer '*' is not allowed on interface type '{}'\n", declType.TypeName);
-                if (declType.IsInterface) declType.Pointer = true;
+                if (declType.IsInterface)
+                {
+                    declType.IsInterfacePointer = declSpec->pointer() != nullptr;
+                    declType.Pointer = true;
+                }
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -535,6 +539,17 @@ public:
         MyCompilerLLVM::TypeAndValue returnType{ .TypeName = name };
         compiler->CreateFunctionDeclaration(name, returnType, {});
 
+        // Pre-register channel<IMessage> so the synthetic inbox field resolves during the main pass
+        {
+            const std::string channelMangledName = "channel__IMessage";
+            if (!compiler->dataStructures.count(channelMangledName))
+            {
+                compiler->CreateStructType(channelMangledName, {});
+                MyCompilerLLVM::TypeAndValue chReturnType{ .TypeName = channelMangledName };
+                compiler->CreateFunctionDeclaration(channelMangledName, chReturnType, {});
+            }
+        }
+
         // Pre-declare trampoline: int __program_run_Name(void*)
         {
             MyCompilerLLVM::TypeAndValue intReturn{ .TypeName = "int" };
@@ -878,6 +893,7 @@ private:
                     if (substPointer) declType.Pointer = true;
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
+                bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 // When the substituted type is already a pointer AND there is an explicit '*',
                 // the result is pointer-to-pointer (e.g. T* where T=Employee* → Employee**).
                 if (declType.Pointer && hasExplicitPointer)
@@ -885,9 +901,15 @@ private:
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
-                if (declType.IsInterface && hasExplicitPointer)
+                if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
                     LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
-                if (declType.IsInterface) declType.Pointer = true;
+                if (declType.IsInterface)
+                {
+                    // IsInterfacePointer: this represents a pointer TO a fat-ptr, not the fat-ptr itself.
+                    // True when T* where T=IFace (hasExplicitPointer), or T where T=IFace* (substPointer).
+                    declType.IsInterfacePointer = hasExplicitPointer || substPointer;
+                    declType.Pointer = true;
+                }
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -3771,6 +3793,7 @@ public:
 
                 // Strip one pointer level from the CFlat type to get the pointee type.
                 namedVar.TypeAndValue.Pointer = false;
+                namedVar.TypeAndValue.IsInterfacePointer = false; // dereference removes the pointer-to-fat-ptr level
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
                 // Pointer parameters use Storage = argument register (not an alloca), so the
                 // register IS the pointer value — loading from it would add an extra indirection.
@@ -4205,6 +4228,23 @@ public:
                                 structVar.TypeAndValue.Pointer = false;
                             }
                         }
+                        else if (!namedVar.TypeAndValue.Pointer
+                                 && !namedVar.TypeAndValue.TypeName.empty()
+                                 && !namedVar.TypeAndValue.IsInterface
+                                 && namedVar.Storage != nullptr)
+                        {
+                            // Embedded struct field (value, not pointer): namedVar.Storage is the GEP
+                            // address of the embedded field — use it directly as the struct base so
+                            // chained method calls (e.g. w.inbox.send()) pass the correct 'this'.
+                            auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                            if (sd.StructType)
+                            {
+                                structVar.Storage      = namedVar.Storage;
+                                structVar.Primary      = nullptr;
+                                structVar.BaseType     = sd.StructType;
+                                structVar.TypeAndValue = namedVar.TypeAndValue;
+                            }
+                        }
                         break;
                     }
                     case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
@@ -4501,17 +4541,26 @@ public:
                                 namedVar.Storage  = nullptr;
                                 namedVar.BaseType = result->getType();
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
-                                if (result->getType()->isStructTy())
+                                if (namedVar.TypeAndValue.IsInterface)
+                                {
+                                    // operator[] returned an interface fat-ptr — expose as interfaceVar
+                                    // so subsequent member accesses dispatch via vtable.
+                                    interfaceVar = namedVar;
+                                    structVar = {};
+                                }
+                                else if (result->getType()->isStructTy())
                                 {
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(result->getType()))
                                         if (!st->isLiteral() && st->hasName())
                                             namedVar.TypeAndValue.TypeName = st->getName().str();
                                     structVar = namedVar;
+                                    interfaceVar = {};
                                 }
                                 else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
                                          && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
                                 {
                                     structVar = namedVar;
+                                    interfaceVar = {};
                                 }
                                 else
                                 {
@@ -4539,6 +4588,10 @@ public:
                             else
                             {
                                 elementTypeAndValue.Pointer = false;
+                                // For interface arrays (T* where T=IFace), the element is a bare fat-ptr
+                                // {i8*,i8*}, not a pointer-to-fat-ptr. Clear IsInterfacePointer so
+                                // GetType returns {i8*,i8*} instead of {i8*,i8*}*.
+                                elementTypeAndValue.IsInterfacePointer = false;
                             }
                             auto elementType = Compiler(ctx)->GetType(elementTypeAndValue);
                             auto ptrValue = LoadNamedVariable(namedVar);
@@ -4938,6 +4991,17 @@ public:
                                         }
                                     }
 
+                                    // Propagate struct TypeName for pointer args (e.g. move expressions, new)
+                                    // so struct*→interface* upcast matching works in ComputeOverloadFunction.
+                                    // Only propagate for known struct types — primitive TypeNames (char, bool,
+                                    // int, …) must stay empty so LLVM-type comparison handles them correctly.
+                                    if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
+                                        && !argNV.TypeAndValue.TypeName.empty()
+                                        && Compiler(ctx)->IsDataStructure(argNV.TypeAndValue.TypeName))
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    }
+
                                     // Propagate function-pointer type for lambda arguments
                                     if (lastLambdaType.IsFunctionPointer && argValue != nullptr)
                                     {
@@ -5036,11 +5100,22 @@ public:
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
                             }
 
-                            if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                            if (namedVar.TypeAndValue.IsInterface)
+                            {
+                                interfaceVar = namedVar;
+                                structVar = {};
+                            }
+                            else if (namedVar.BaseType && namedVar.BaseType->isStructTy())
+                            {
                                 structVar = namedVar;
+                                interfaceVar = {};
+                            }
                             else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
                                      && Compiler(primaryCtx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
+                            {
                                 structVar = namedVar;
+                                interfaceVar = {};
+                            }
                         }
 
                         functionArgCounter++;
@@ -5254,8 +5329,10 @@ public:
             for (auto* param : paramList->lambdaParam())
             {
                 MyCompilerLLVM::DeclTypeAndValue p;
-                p.TypeName = param->typeSpecifier()->getText();
+                p.TypeName = compiler->ResolveTypeAlias(param->typeSpecifier()->getText());
                 p.Pointer = param->pointer() != nullptr;
+                p.IsInterface = compiler->IsInterfaceType(p.TypeName);
+                if (p.IsInterface) p.Pointer = true;
                 p.VariableName = param->Identifier()->getText();
                 params.push_back(p);
             }
@@ -6419,21 +6496,31 @@ public:
 
         auto declList = ParseDeclarationList(ctx->declaration());
 
+        // Ensure channel<IMessage> is fully instantiated before CreateStructType uses its layout.
+        if (!instantiatedGenerics.count("channel__IMessage"))
+        {
+            pendingInstantiations.push_back({"channel", {"IMessage"}, "channel__IMessage"});
+            instantiatedGenerics.insert("channel__IMessage");
+            ProcessPendingInstantiations();
+        }
+
         // Guard against user fields clashing with auto-injected synthetic fields
         for (auto& field : declList)
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
-                || field.VariableName == "_allocator" || field.VariableName == "onStdout")
+                || field.VariableName == "_allocator" || field.VariableName == "onStdout"
+                || field.VariableName == "inbox")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (BlockAllocator*),
-        // onStdout (function<void(char*)> — optional stdout capture callback)
+        // onStdout (function<void(char*)>), inbox (channel<IMessage>)
         unsigned exitCodeFieldIndex  = (unsigned)declList.size();
         unsigned threadFieldIndex    = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex = threadFieldIndex + 1;
         unsigned onStdoutFieldIndex  = allocatorFieldIndex + 1;
+        unsigned inboxFieldIndex     = onStdoutFieldIndex + 1;
         {
             MyCompilerLLVM::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -6457,6 +6544,11 @@ public:
             onStdoutField.FuncPtrReturnTypeName = "void";
             onStdoutField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdoutField);
+
+            MyCompilerLLVM::DeclTypeAndValue inboxField;
+            inboxField.TypeName     = "channel__IMessage";
+            inboxField.VariableName = "inbox";
+            declList.push_back(inboxField);
         }
 
         // Build struct type with user fields + synthetic fields
@@ -6532,6 +6624,14 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullFnPtr, onStdoutFieldIndex);
             }
 
+            // Synthetic field: inbox = channel__IMessage() (zero-init; caller must call inbox.init(N) before run())
+            if (auto* inboxCtorFn = compiler->GetFunction("channel__IMessage"))
+            {
+                auto* inboxInitVal = compiler->builder->CreateCall(
+                    inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_init");
+                structVal = compiler->CreateInsertValue(structVal, inboxInitVal, inboxFieldIndex);
+            }
+
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -6586,6 +6686,7 @@ public:
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
         compiler->programTable[name].OnStdoutFieldIndex  = onStdoutFieldIndex;
+        compiler->programTable[name].InboxFieldIndex     = inboxFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);

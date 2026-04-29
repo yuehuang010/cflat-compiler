@@ -43,3 +43,5 @@ interface IAllocator
     void* alloc(i64 size);
     void  dealloc(void* ptr);
 };
+
+interface IMessage { };

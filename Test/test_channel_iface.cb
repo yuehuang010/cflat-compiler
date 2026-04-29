@@ -1,0 +1,47 @@
+import "channel.cb";
+import "thread.cb";
+
+interface IShape
+{
+    int area();
+};
+
+class Circle : IShape
+{
+    int r = 0;
+    int area() { return r * r * 3; }
+};
+
+class Square : IShape
+{
+    int s = 0;
+    int area() { return s * s; }
+};
+
+extern int main()
+{
+    channel<IShape> ch;
+    ch.init(4);
+
+    Circle c;
+    c.r = 5;
+    ch.send(c);
+
+    Square sq;
+    sq.s = 4;
+    ch.send(sq);
+
+    IShape s0 = ch.receive();
+    IShape s1 = ch.receive();
+
+    int a0 = s0.area();
+    int a1 = s1.area();
+
+    if (a0 == 75 && a1 == 16)
+        printf("channel<IShape> send/receive: PASS\n");
+    else
+        printf("channel<IShape> send/receive: FAIL (got %d, %d)\n", a0, a1);
+
+    ch.destroy();
+    return (a0 == 75 && a1 == 16) ? 0 : 1;
+}

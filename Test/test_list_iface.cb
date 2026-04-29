@@ -1,0 +1,111 @@
+import "list.cb";
+import "test_helper.cb";
+
+interface IShape
+{
+    int area();
+};
+
+interface IDrawable : IShape
+{
+    void draw();
+};
+
+class Circle : IDrawable
+{
+    int r = 0;
+    int area() { return r * r * 3; }
+    void draw() { printf("Circle r=%d\n", r); }
+};
+
+class Square : IShape
+{
+    int s = 0;
+    int area() { return s * s; }
+};
+
+bool testListInterfaceBasic()
+{
+    bool result = true;
+
+    list<IShape> shapes;
+
+    Circle c;
+    c.r = 5;
+    shapes.add(c);
+
+    Square sq;
+    sq.s = 4;
+    shapes.add(sq);
+
+    result &= Test("count", shapes.count(), 2);
+    result &= Test("operator[0]_area", shapes[0].area(), 75);
+    result &= Test("operator[1]_area", shapes[1].area(), 16);
+    result &= Test("get0_area",        shapes.get(0).area(), 75);
+    result &= Test("get1_area",        shapes.get(1).area(), 16);
+
+    return result;
+}
+
+bool testListInterfaceIsAs()
+{
+    bool result = true;
+
+    list<IShape> shapes;
+
+    Circle c;
+    c.r = 3;
+    shapes.add(c);
+
+    Square sq;
+    sq.s = 2;
+    shapes.add(sq);
+
+    result &= Test("is_circle",  shapes[0] is Circle, true);
+    result &= Test("is_square",  shapes[1] is Square, true);
+    result &= Test("not_square", shapes[0] is Square, false);
+
+    Circle* cp = shapes[0] as Circle;
+    result &= Test("as_circle_nonnull", cp != nullptr, true);
+    if (cp != nullptr)
+        result &= Test("as_circle_r", cp.r, 3);
+
+    Square* sp = shapes[1] as Square;
+    result &= Test("as_square_nonnull", sp != nullptr, true);
+    if (sp != nullptr)
+        result &= Test("as_square_s", sp.s, 2);
+
+    return result;
+}
+
+bool testListInterfaceSort()
+{
+    bool result = true;
+
+    list<IShape> shapes;
+
+    Square sq1; sq1.s = 3; shapes.add(sq1);  // area 9
+    Square sq2; sq2.s = 1; shapes.add(sq2);  // area 1
+    Circle c;   c.r  = 2; shapes.add(c);     // area 12
+
+    shapes.sort((IShape a, IShape b) => { return a.area() < b.area(); });
+
+    result &= Test("sort0_area", shapes[0].area(), 1);
+    result &= Test("sort1_area", shapes[1].area(), 9);
+    result &= Test("sort2_area", shapes[2].area(), 12);
+
+    return result;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testListInterfaceBasic() ? 1 : 0;
+    total++; passed += testListInterfaceIsAs()  ? 1 : 0;
+    total++; passed += testListInterfaceSort()  ? 1 : 0;
+
+    printf("list<IInterface> tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

@@ -104,6 +104,7 @@ public:
         bool Pointer = false;
         bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
         bool IsInterface = false;
+        bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
 
@@ -314,6 +315,7 @@ public:
         unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
         unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (BlockAllocator*)
         unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
+        unsigned InboxFieldIndex = 0;                  // struct field index of inbox (channel<IMessage>)
     };
 
     class StackState
@@ -645,7 +647,7 @@ private:
         {
             arg.setName(itr_nameArg->VariableName);
 
-            if (itr_nameArg->IsInterface)
+            if (itr_nameArg->IsInterface && !itr_nameArg->IsInterfacePointer)
             {
                 // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
                 // Storage is a {i8*,i8*}* pointer suitable for CallInterfaceMethod GEP.
@@ -2942,9 +2944,12 @@ public:
             // Check if it is an interface type first
             if (interfaceTable.count(resolvedTypeName) > 0)
             {
-                // Interface values are stored by value as {i8*, i8*} (vtable ptr + data ptr).
-                // Never add ->getPointerTo(): the alloca address itself serves as the {i8*,i8*}*.
-                return GetFatPtrType();
+                auto* fatTy = GetFatPtrType();
+                if (typeAndValue.ElemPointer)
+                    return fatTy->getPointerTo()->getPointerTo(); // {i8*,i8*}** (T* where T=IFace*)
+                if (allowPointer && typeAndValue.IsInterfacePointer)
+                    return fatTy->getPointerTo();                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
+                return fatTy;                                     // {i8*,i8*}  (bare fat ptr)
             }
             else
             {
@@ -3044,9 +3049,17 @@ public:
                                 result = (myFP == otherFP) ? 0 : 1;
                         }
 
-                        // Interface upcast using original names (interfaces are not enums)
+                        // Any pointer type is implicitly convertible to void*.
+                        if (result < 0 && arg.TypeAndValue.Pointer &&
+                            candidateParamItr->Pointer && candidateParamItr->TypeName == "void")
+                        {
+                            result = 0;
+                        }
+
+                        // Interface upcast using original names (interfaces are not enums).
+                        // Handles both struct→interface* (value) and struct*→interface* (pointer).
                         if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer &&
-                            !arg.TypeAndValue.IsInterface && !arg.TypeAndValue.Pointer &&
+                            !arg.TypeAndValue.IsInterface &&
                             StructImplementsInterface(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
                         {
                             result = 0;
@@ -3409,8 +3422,17 @@ public:
 
                 // Build fat value: vtable + data ptr → {i8*, i8*} by value
                 auto vtable = GetOrCreateVTable(structName, candParamItr->TypeName);
-                llvm::Value* dataPtr = arg.Storage;
-                if (dataPtr == nullptr)
+                llvm::Value* dataPtr = nullptr;
+                if (arg.TypeAndValue.Pointer)
+                {
+                    // struct* → interface*: data ptr IS the pointer value (not the alloca of the pointer).
+                    dataPtr = arg.Primary != nullptr ? arg.Primary : CreateLoad(arg.Storage);
+                }
+                else if (arg.Storage != nullptr)
+                {
+                    dataPtr = arg.Storage;
+                }
+                else
                 {
                     // Materialize a pointer to the struct value
                     auto structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
@@ -3497,7 +3519,10 @@ public:
         {
             if (candidate.Parameters[i].IsMove)
             {
-                if (matched[i].Storage != nullptr)
+                // Interface fat-ptr parameters (non-pointer) borrow the caller's data — don't zero it.
+                // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.
+                bool isInterfaceBorrow = candidate.Parameters[i].IsInterface && !candidate.Parameters[i].IsInterfacePointer;
+                if (matched[i].Storage != nullptr && !isInterfaceBorrow)
                 {
                     if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType))
                     {

@@ -1,3 +1,4 @@
 import "cruntime.cb";
 import "block_allocator.cb";
 import "stop_token.cb";
+import "channel.cb";
