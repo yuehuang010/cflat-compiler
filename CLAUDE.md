@@ -125,15 +125,15 @@ To add a new error test: create `Test/errors/err_<description>.cb`. No script ch
 ### Compilation Pipeline
 
 ```
-Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
-    → ForwardRefScanner (pre-pass)
-    → MyListener (code generation)
-    → LLVM Module → .ll / .bc → native .exe
+Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
+    -> ForwardRefScanner (pre-pass)
+    -> MyListener (code generation)
+    -> LLVM Module -> .ll / .bc -> native .exe
 ```
 
 ### Two-Pass Compilation
 
-1. **ForwardRefScanner** (`MyListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` → symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
+1. **ForwardRefScanner** (`MyListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` -> symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
 2. **MyListener** (`MyListener.h`): Walks the AST and emits LLVM IR using `MyCompilerLLVM` as the backend.
 
 Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MyListener` copy.

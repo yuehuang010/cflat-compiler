@@ -34,16 +34,16 @@ out\test_operators.exe
 
 ### Compilation Pipeline
 ```
-Source (.cb) → CFlatLexer/CFlatParser (ANTLR4) → Parse Tree
-    → ForwardRefScanner (pre-pass)
-    → MyListener (code generation)
-    → LLVM Module → .ll / .bc → native .exe
+Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
+    -> ForwardRefScanner (pre-pass)
+    -> MyListener (code generation)
+    -> LLVM Module -> .ll / .bc -> native .exe
 ```
 
 ### Two-Pass Design
 `MyListener.h` contains **both** passes as separate classes:
 
-1. **ForwardRefScanner** — pre-registers struct shells, function signatures, and generic instantiations. Enables forward references and monomorphizes generics (`Box<int>` → mangled name `Box__int`, double-underscore separator). Also detects `move` parameters and `if const` blocks.
+1. **ForwardRefScanner** — pre-registers struct shells, function signatures, and generic instantiations. Enables forward references and monomorphizes generics (`Box<int>` -> mangled name `Box__int`, double-underscore separator). Also detects `move` parameters and `if const` blocks.
 2. **MyListener** — walks the AST and emits LLVM IR via `MyCompilerLLVM`.
 
 **Critical:** Both passes contain their own copy of `ParseDeclarationSpecifiers()`. Any type-parsing change must be made in **both** copies.
@@ -108,7 +108,7 @@ Auto-compiled with every program. To add a new module: add the `.cb` file to `co
 ## Debugging Crashes
 - `CompilerManager.h` dumps compiler state on assert/abort automatically
 - `-v` for verbose diagnostics; `--out-lli` to inspect generated IR
-- LLVM assertion `"Ptr must have pointer type"` → `GetType()` was called without `allowPointer=true` for a pointer parameter
+- LLVM assertion `"Ptr must have pointer type"` -> `GetType()` was called without `allowPointer=true` for a pointer parameter
 
 ## VS Code Extension
 ```

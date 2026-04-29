@@ -102,7 +102,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
 
-    // Auto-import order: interfaces → program → runtime → string.
+    // Auto-import order: interfaces -> program -> runtime -> string.
     // program.cb declares __active_allocator; runtime.cb references it, so program must come first.
     if (!runtimeDir.empty())
     {
@@ -443,7 +443,7 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
     }
 
     // Auto-import core files in the same order as Compile():
-    // interfaces → program (pulls in block_allocator) → runtime → string.
+    // interfaces -> program (pulls in block_allocator) -> runtime -> string.
     // runtime.cb references BlockAllocator, which program.cb imports, so program must come first.
     if (!runtimeDir.empty())
     {

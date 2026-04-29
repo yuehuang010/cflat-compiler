@@ -497,7 +497,7 @@ bool testInboxPolymorphicMessages() {
 bool testWaitForExitWithToken() {
     bool result = true;
 
-    // Thread completes naturally → WaitForExit(token) returns true
+    // Thread completes naturally -> WaitForExit(token) returns true
     stop_source src;
     src.init();
     stop_token token = src.get_token();
@@ -516,7 +516,7 @@ bool testWaitForExitWithToken() {
 bool testWaitForExitCancelled() {
     bool result = true;
 
-    // Pre-cancelled token → WaitForExit returns false immediately
+    // Pre-cancelled token -> WaitForExit returns false immediately
     stop_source src;
     src.init();
     src.request_stop();

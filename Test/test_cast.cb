@@ -60,9 +60,9 @@ extern int main()
     // ── Integer conversion methods — narrowing ────────────────────────────────
 
     i32 v127  = 127;
-    i32 v128  = 128;     // 0x80 overflows signed i8 → -128
+    i32 v128  = 128;     // 0x80 overflows signed i8 -> -128
     i32 v32767 = 32767;
-    i32 v32768 = 32768;  // 0x8000 overflows signed i16 → -32768
+    i32 v32768 = 32768;  // 0x8000 overflows signed i16 -> -32768
 
     total++; passed += Test("127.to_i8()",       (int)v127.to_i8(),    127);
     total++; passed += Test("128.to_i8() wrap",  (int)v128.to_i8(),   -128);

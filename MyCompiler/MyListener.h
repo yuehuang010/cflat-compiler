@@ -77,7 +77,7 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     return m->directDeclarator()->getText();
 }
 
-// Normalize a generic type argument for use in mangled names (e.g. "Employee*" → "Employeeptr").
+// Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr").
 static std::string MangleTypeArg(const std::string& typeName)
 {
     std::string result;
@@ -162,7 +162,7 @@ private:
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                     {
-                        // Generic type instantiation: Box<MyType> → Box__MyType
+                        // Generic type instantiation: Box<MyType> -> Box__MyType
                         std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
@@ -681,7 +681,7 @@ private:
     static inline std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*> genericClassTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
     static inline std::unordered_set<std::string> instantiatedGenerics;
-    // Constraints: templateName → { typeParamName → [requiredInterface, …] }
+    // Constraints: templateName -> { typeParamName -> [requiredInterface, …] }
     static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
     static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
@@ -795,7 +795,7 @@ private:
                     if (fpSpec->typeSpecifier() != nullptr)
                     {
                         declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
-                        // Apply active generic type substitutions (e.g. T → int inside list<int>)
+                        // Apply active generic type substitutions (e.g. T -> int inside list<int>)
                         {
                             auto substIt = activeTypeSubstitutions.find(declType.FuncPtrReturnTypeName);
                             if (substIt != activeTypeSubstitutions.end())
@@ -895,7 +895,7 @@ private:
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 // When the substituted type is already a pointer AND there is an explicit '*',
-                // the result is pointer-to-pointer (e.g. T* where T=Employee* → Employee**).
+                // the result is pointer-to-pointer (e.g. T* where T=Employee* -> Employee**).
                 if (declType.Pointer && hasExplicitPointer)
                     declType.ElemPointer = true;
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
@@ -1109,7 +1109,7 @@ public:
     }
 
     // Infer the type arguments for a generic function template from the receiver's
-    // interface type name (e.g. "Container__int" → T="int") and instantiate it.
+    // interface type name (e.g. "Container__int" -> T="int") and instantiate it.
     // Returns the mangled name of the instantiated function, or empty string on failure.
     std::string InferAndInstantiateGenericFunction(const std::string& funcName, const std::string& receiverType)
     {
@@ -1683,7 +1683,7 @@ public:
 
                     compiler->CreateBlockBreak(blockInit, false);
 
-                    // Push scope; continue → increment, break/else → resume
+                    // Push scope; continue -> increment, break/else -> resume
                     compiler->InitializeBlock(blockInit, true, blockIncrement, blockResume, blockResume);
 
                     // Evaluate the collection expression (needs typed NamedVariable for dispatch)
@@ -1979,7 +1979,7 @@ public:
                         switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
                 }
 
-                // Push scope: break → resumeBlock, no continue (propagates to outer loop)
+                // Push scope: break -> resumeBlock, no continue (propagates to outer loop)
                 compiler->InitializeBlock(nullptr, true, nullptr, switchCtx.resumeBlock, nullptr);
 
                 switchStack.push_back(switchCtx);
@@ -1987,7 +1987,7 @@ public:
                 if (body && body->blockItemList())
                     ParseBlockItemList(body->blockItemList());
 
-                // Fallthrough at end of switch body → resume
+                // Fallthrough at end of switch body -> resume
                 compiler->CreateBlockBreak(switchCtx.resumeBlock, true);
 
                 switchStack.pop_back();
@@ -2497,7 +2497,7 @@ public:
                         if (typeAndValue.IsInterface)
                         {
                             // For interface (string) declarations, preserve NamedVariable type info
-                            // so we can do the struct→interface fat-struct upcast when needed.
+                            // so we can do the struct->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
                             // Classes that implement interfaces can be upcast. Structs cannot.
@@ -2510,7 +2510,7 @@ public:
                                     auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
                                     // BuildInterfaceFatValue needs a *pointer* to the struct data,
                                     // not the loaded struct value.
-                                    // - Pointer types (e.g. StringData*): the loaded value IS the pointer → use it directly.
+                                    // - Pointer types (e.g. StringData*): the loaded value IS the pointer -> use it directly.
                                     // - Value types (e.g. Point by value): use the alloca address; spill if no storage.
                                     llvm::Value* dataPtr;
                                     if (rightNV.TypeAndValue.Pointer)
@@ -2648,7 +2648,7 @@ public:
     }
 
     // Returns a NamedVariable (preserving TypeName) for simple single-child expression chains.
-    // Used by ParseDeclaration to get the struct TypeName for struct→interface upcasting.
+    // Used by ParseDeclaration to get the struct TypeName for struct->interface upcasting.
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
     MyCompilerLLVM::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
     {
@@ -2780,7 +2780,7 @@ public:
 
             if (operatorText == "??=")
             {
-                // Null-coalescing assignment: x ??= rhs  →  if (x == 0/null) x = rhs
+                // Null-coalescing assignment: x ??= rhs  ->  if (x == 0/null) x = rhs
                 auto* lhs = derefLoad();
 
                 auto* assignBlock  = compiler->CreateBasicBlock("nullcoalasgn_assign");
@@ -2883,7 +2883,7 @@ public:
 
         if (ctx->QuestionQuestion())
         {
-            // Null-coalescing: lhs ?? rhs  →  (lhs != null) ? lhs : rhs
+            // Null-coalescing: lhs ?? rhs  ->  (lhs != null) ? lhs : rhs
             llvm::Value* lhs = ParseLogicalOrExpression(logicCtx);
             if (!lhs) return {};
 
@@ -3639,7 +3639,7 @@ public:
                 auto* typeSpec = typeSpecs[0];
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                 {
-                    // Generic cast: (channel<int>*) → mangle to channel__int
+                    // Generic cast: (channel<int>*) -> mangle to channel__int
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                     std::vector<std::string> typeArgs;
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
@@ -3912,8 +3912,8 @@ public:
     {
         if (ctx->genericIdentifier() && ctx->genericIdentifier()->genericTypeParameters())
         {
-            // Generic type: Box<int> → Box__int
-            // Also apply type substitutions to arguments (e.g. Box<T> with T=int → Box__int)
+            // Generic type: Box<int> -> Box__int
+            // Also apply type substitutions to arguments (e.g. Box<T> with T=int -> Box__int)
             std::string base = ctx->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> args;
             for (auto* entry : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
@@ -3966,7 +3966,7 @@ public:
             sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
         }
 
-        // Call operator new: class-specific → global
+        // Call operator new: class-specific -> global
         llvm::Value* rawPtr = nullptr;
         std::string opNewName = typeName + ".operator new";
         MyCompilerLLVM::NamedVariable szArg;
@@ -3986,7 +3986,7 @@ public:
             return {};
         }
 
-        // Bitcast void* → T*
+        // Bitcast void* -> T*
         llvm::Type* ptrTy = elemType->getPointerTo();
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
 
@@ -4069,7 +4069,7 @@ public:
         auto* voidPtrTy = compiler->builder->getInt8Ty()->getPointerTo();
         llvm::Value* voidPtr = compiler->builder->CreateBitCast(ptrVal, voidPtrTy, "freeptr");
 
-        // 3. Call operator delete: class-specific → global
+        // 3. Call operator delete: class-specific -> global
         std::string opDelName = typeName + ".operator delete";
         MyCompilerLLVM::NamedVariable ptrArg;
         ptrArg.Primary = voidPtr;
@@ -4992,7 +4992,7 @@ public:
                                     }
 
                                     // Propagate struct TypeName for pointer args (e.g. move expressions, new)
-                                    // so struct*→interface* upcast matching works in ComputeOverloadFunction.
+                                    // so struct*->interface* upcast matching works in ComputeOverloadFunction.
                                     // Only propagate for known struct types — primitive TypeNames (char, bool,
                                     // int, …) must stay empty so LLVM-type comparison handles them correctly.
                                     if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
@@ -5806,7 +5806,7 @@ public:
         }
     }
 
-    // Compute the mangled name for a generic instantiation, e.g. Box<int, float> → "Box__int__float".
+    // Compute the mangled name for a generic instantiation, e.g. Box<int, float> -> "Box__int__float".
     std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs)
     {
         std::string name = baseName;
@@ -6330,11 +6330,11 @@ public:
                 mallocFn->getFunctionType(), mallocFn, {pkgSize}, "pkg_raw");
             auto* pkg = compiler->builder->CreateBitCast(pkgRaw, runArgsType->getPointerTo(), "pkg");
 
-            // Store this → pkg->self (field 0)
+            // Store this -> pkg->self (field 0)
             auto* selfGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 0, "pkg_self_gep");
             compiler->builder->CreateStore(thisArg, selfGEP);
 
-            // Store args → pkg->args (field 1): use the original argument value (pre-alloca copy)
+            // Store args -> pkg->args (field 1): use the original argument value (pre-alloca copy)
             auto* argsGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 1, "pkg_args_gep");
             compiler->builder->CreateStore(argsArg, argsGEP);
 
@@ -6351,7 +6351,7 @@ public:
             auto* threadFieldGEP = compiler->builder->CreateStructGEP(
                 progType, thisArg, threadIdx, "thread_field");
 
-            // Thread.start(&self->_thread, trampoline, pkg) → bool
+            // Thread.start(&self->_thread, trampoline, pkg) -> bool
             auto* trampolineFn  = compiler->programTable[name].TrampolineFunction;
             auto* trampolineFnPtr = compiler->builder->CreateBitCast(
                 trampolineFn, trampolineFnTy->getPointerTo());
@@ -6986,7 +6986,7 @@ public:
         return typeParams;
     }
 
-    // Returns { typeParamName → [requiredInterface, …] } from a whereClause context.
+    // Returns { typeParamName -> [requiredInterface, …] } from a whereClause context.
     std::unordered_map<std::string, std::vector<std::string>>
     ParseWhereClause(CFlatParser::WhereClauseContext* wc)
     {

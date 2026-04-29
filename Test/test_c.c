@@ -408,58 +408,58 @@ bool testUpconvert()
 {
     bool result = true;
 
-    // ── short → int ──────────────────────────────────────────────────────────
+    // ── short -> int ──────────────────────────────────────────────────────────
     result &= Test("short_to_int_pos",      conv_short_to_int(200),    200);
     result &= Test("short_to_int_neg",      conv_short_to_int(-200),  -200);
     result &= Test("short_to_int_zero",     conv_short_to_int(0),        0);
     result &= Test("short_to_int_min",      conv_short_to_int(-32768), -32768);
     result &= Test("short_to_int_max",      conv_short_to_int(32767),  32767);
 
-    // ── short → long long ────────────────────────────────────────────────────
+    // ── short -> long long ────────────────────────────────────────────────────
     result &= Test("short_to_ll_pos",       conv_short_to_ll(1000),    1000LL);
     result &= Test("short_to_ll_neg",       conv_short_to_ll(-1000),  -1000LL);
     result &= Test("short_to_ll_min",       conv_short_to_ll(-32768), -32768LL);
     result &= Test("short_to_ll_max",       conv_short_to_ll(32767),  32767LL);
 
-    // ── int → long long ──────────────────────────────────────────────────────
+    // ── int -> long long ──────────────────────────────────────────────────────
     result &= Test("int_to_ll_pos",         conv_int_to_ll(100000),    100000LL);
     result &= Test("int_to_ll_neg",         conv_int_to_ll(-100000),  -100000LL);
     result &= Test("int_to_ll_zero",        conv_int_to_ll(0),              0LL);
     result &= Test("int_to_ll_int_min",     conv_int_to_ll(-2147483648), -2147483648LL);
     result &= Test("int_to_ll_int_max",     conv_int_to_ll(2147483647),  2147483647LL);
 
-    // ── short → float ────────────────────────────────────────────────────────
+    // ── short -> float ────────────────────────────────────────────────────────
     result &= Test("short_to_float_pos",    conv_short_to_float(100),   100.0f);
     result &= Test("short_to_float_neg",    conv_short_to_float(-100), -100.0f);
     result &= Test("short_to_float_zero",   conv_short_to_float(0),      0.0f);
 
-    // ── int → float ──────────────────────────────────────────────────────────
+    // ── int -> float ──────────────────────────────────────────────────────────
     result &= Test("int_to_float_pos",      conv_int_to_float(42),     42.0f);
     result &= Test("int_to_float_neg",      conv_int_to_float(-42),   -42.0f);
     result &= Test("int_to_float_zero",     conv_int_to_float(0),       0.0f);
     result &= Test("int_to_float_large",    conv_int_to_float(1000000), 1000000.0f);
     result &= Test("int_to_float_large_neg",conv_int_to_float(-1000000),-1000000.0f);
 
-    // ── long long → float ────────────────────────────────────────────────────
+    // ── long long -> float ────────────────────────────────────────────────────
     result &= Test("ll_to_float_pos",       conv_ll_to_float(1000LL),   1000.0f);
     result &= Test("ll_to_float_neg",       conv_ll_to_float(-1000LL), -1000.0f);
 
-    // ── short → double ───────────────────────────────────────────────────────
+    // ── short -> double ───────────────────────────────────────────────────────
     result &= Test("short_to_double_pos",   conv_short_to_double(200),   200.0);
     result &= Test("short_to_double_neg",   conv_short_to_double(-200), -200.0);
 
-    // ── int → double ─────────────────────────────────────────────────────────
+    // ── int -> double ─────────────────────────────────────────────────────────
     result &= Test("int_to_double_pos",     conv_int_to_double(1000),   1000.0);
     result &= Test("int_to_double_neg",     conv_int_to_double(-1000), -1000.0);
     result &= Test("int_to_double_zero",    conv_int_to_double(0),         0.0);
     result &= Test("int_to_double_large",   conv_int_to_double(1000000), 1000000.0);
     result &= Test("int_to_double_large_neg",conv_int_to_double(-1000000),-1000000.0);
 
-    // ── long long → double ───────────────────────────────────────────────────
+    // ── long long -> double ───────────────────────────────────────────────────
     result &= Test("ll_to_double_pos",      conv_ll_to_double(100000LL),   100000.0);
     result &= Test("ll_to_double_neg",      conv_ll_to_double(-100000LL), -100000.0);
 
-    // ── float → double ───────────────────────────────────────────────────────
+    // ── float -> double ───────────────────────────────────────────────────────
     result &= Test("float_to_double_pos",   conv_float_to_double(3.14f),  (double)3.14f);
     result &= Test("float_to_double_neg",   conv_float_to_double(-3.14f), (double)-3.14f);
     result &= Test("float_to_double_zero",  conv_float_to_double(0.0f),   0.0);

@@ -150,11 +150,11 @@ extern int main()
         {
             Resource* r = new Resource();
             c->item = r;
-            // r exits scope: refcount 2→1, no free
+            // r exits scope: refcount 2->1, no free
         }
         passed += Test("stack_to_field_no_early_free", dtorCount, 0);
         total++;
-        // c exits scope: auto-freed, ~Container() frees c->item → dtorCount = 1
+        // c exits scope: auto-freed, ~Container() frees c->item -> dtorCount = 1
     }
     passed += Test("stack_to_field_freed_with_owner", dtorCount, 1);
     total++;

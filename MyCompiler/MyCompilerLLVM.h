@@ -2017,7 +2017,7 @@ public:
             auto targetSize = destType->getScalarSizeInBits();
             auto srcSize = srcType->getScalarSizeInBits();
 
-            // Widening only (e.g. float → double). Narrowing (double → float) is
+            // Widening only (e.g. float -> double). Narrowing (double -> float) is
             // not handled here — use a typed literal (0.0f) or an explicit cast at
             // the source level so types match before reaching this path.
             if (srcSize < targetSize)
@@ -3057,7 +3057,7 @@ public:
                         }
 
                         // Interface upcast using original names (interfaces are not enums).
-                        // Handles both struct→interface* (value) and struct*→interface* (pointer).
+                        // Handles both struct->interface* (value) and struct*->interface* (pointer).
                         if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer &&
                             !arg.TypeAndValue.IsInterface &&
                             StructImplementsInterface(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
@@ -3420,12 +3420,12 @@ public:
                         structName = st->getName().str();
                 }
 
-                // Build fat value: vtable + data ptr → {i8*, i8*} by value
+                // Build fat value: vtable + data ptr -> {i8*, i8*} by value
                 auto vtable = GetOrCreateVTable(structName, candParamItr->TypeName);
                 llvm::Value* dataPtr = nullptr;
                 if (arg.TypeAndValue.Pointer)
                 {
-                    // struct* → interface*: data ptr IS the pointer value (not the alloca of the pointer).
+                    // struct* -> interface*: data ptr IS the pointer value (not the alloca of the pointer).
                     dataPtr = arg.Primary != nullptr ? arg.Primary : CreateLoad(arg.Storage);
                 }
                 else if (arg.Storage != nullptr)
@@ -3444,7 +3444,7 @@ public:
             }
             else if (!inVariadicRange && candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
             {
-                // Interface → interface: pass fat struct by value
+                // Interface -> interface: pass fat struct by value
                 llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
                 argList.push_back(val);
             }

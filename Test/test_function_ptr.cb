@@ -125,18 +125,18 @@ bool testFunctionPointerInLoop()
     vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4; vals[4] = 5;
     int n5 = 5; int n1 = 1; int n0 = 0; int n7 = 7;
 
-    // reduce with add → sum 1..5 = 15
+    // reduce with add -> sum 1..5 = 15
     result &= Test("reduce add",       reduce(add, vals, n5, n0), 15);
-    // reduce with mul → product 1..5 = 120
+    // reduce with mul -> product 1..5 = 120
     result &= Test("reduce mul",       reduce(mul, vals, n5, n1), 120);
-    // mapSum doubleIt → 2+4+6+8+10 = 30
+    // mapSum doubleIt -> 2+4+6+8+10 = 30
     result &= Test("mapSum double",    mapSum(doubleIt, vals, n5), 30);
-    // mapSum square → 1+4+9+16+25 = 55
+    // mapSum square -> 1+4+9+16+25 = 55
     result &= Test("mapSum square",    mapSum(square,   vals, n5), 55);
-    // applyN doubleIt 3 times on 1 → 1*2*2*2 = 8
+    // applyN doubleIt 3 times on 1 -> 1*2*2*2 = 8
     int n3 = 3;
     result &= Test("applyN 3x double", applyN(doubleIt, n1, n3), 8);
-    // applyN 0 times → identity
+    // applyN 0 times -> identity
     result &= Test("applyN 0x",        applyN(doubleIt, n7, n0), 7);
 
     delete vals;
@@ -264,7 +264,7 @@ bool testLambdaCallsNamedFunction()
     result &= Test("doubleSq 3", doubleSq(3),  36);   // square(6)=36
     result &= Test("doubleSq 5", doubleSq(5), 100);   // square(10)=100
 
-    // isEven(square(x)): even input → even square; odd input → odd square
+    // isEven(square(x)): even input -> even square; odd input -> odd square
     function<bool(int)> evenSquare = (int x) => { return isEven(square(x)); };
     result &= Test("evenSquare even",  evenSquare(4), true);   // square(4)=16, even
     result &= Test("evenSquare odd",   evenSquare(3), false);  // square(3)=9, odd
@@ -341,8 +341,8 @@ bool testLambdaInHigherOrder()
     result &= Test("mapSum sq", mapSum((int x) => { return x * x; }, vals, n5), 55); // 1+4+9+16+25
 
     // applyN with lambda
-    result &= Test("applyN +2 x3", applyN((int x) => { return x + 2; }, n0, n3),  6); // 0→2→4→6
-    result &= Test("applyN *2 x4", applyN((int x) => { return x * 2; }, n1, n4), 16); // 1→2→4→8→16
+    result &= Test("applyN +2 x3", applyN((int x) => { return x + 2; }, n0, n3),  6); // 0->2->4->6
+    result &= Test("applyN *2 x4", applyN((int x) => { return x * 2; }, n1, n4), 16); // 1->2->4->8->16
 
     // countIf with lambda
     result &= Test("countIf >3", countIf((int x) => { return x > 3; }, vals, n5), 2);
