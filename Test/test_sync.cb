@@ -2,10 +2,205 @@ import "test_helper.cb";
 import "thread.cb";
 import "mutex.cb";
 import "atomic.cb";
+import "semaphore.cb";
+import "latch.cb";
+import "rwlock.cb";
+import "channel.cb";
+import "spsc_queue.cb";
+
+// ---------------------------------------------------------------------------
+// Thread tests
+// ---------------------------------------------------------------------------
+
+int writeToPtr(void* ctx) {
+    int* p = (int*)ctx;
+    *p = 99;
+    return 0;
+}
+
+int readFromPtr(void* ctx) {
+    int* p = (int*)ctx;
+    return *p;
+}
+
+struct ComputeCtx {
+    int input  = 0;
+    int output = 0;
+};
+
+int computeSquare(void* ctx) {
+    ComputeCtx* c = (ComputeCtx*)ctx;
+    c->output = c->input * c->input;
+    return 0;
+}
+
+bool testThreadWritesThroughPointer() {
+    bool result = true;
+    int value = 0;
+    Thread t;
+    t.start(writeToPtr, &value);
+    t.join();
+    result &= Test("write through ptr", value, 99);
+    return result;
+}
+
+bool testThreadReadsThroughPointer() {
+    bool result = true;
+    int value = 42;
+    Thread t;
+    t.start(readFromPtr, &value);
+    i32 code = t.join();
+    result &= Test("read through ptr", (int)code, 42);
+    return result;
+}
+
+bool testThreadExitCode() {
+    bool result = true;
+    Thread t;
+    t.start((void* ctx) => { return 42; }, nullptr);
+    i32 code = t.join();
+    result &= Test("exit code 42", (int)code, 42);
+    return result;
+}
+
+bool testMultipleThreadsConcurrent() {
+    bool result = true;
+    int a = 0;
+    int b = 0;
+    int c = 0;
+    Thread t1;
+    Thread t2;
+    Thread t3;
+    t1.start(writeToPtr, &a);
+    t2.start(writeToPtr, &b);
+    t3.start(writeToPtr, &c);
+    t1.join();
+    t2.join();
+    t3.join();
+    result &= Test("concurrent thread 1", a, 99);
+    result &= Test("concurrent thread 2", b, 99);
+    result &= Test("concurrent thread 3", c, 99);
+    return result;
+}
+
+bool testLambdaWritesViaCtx() {
+    bool result = true;
+    int value = 0;
+    Thread t;
+    t.start((void* ctx) => {
+        int* p = (int*)ctx;
+        *p = 123;
+        return 0;
+    }, &value);
+    t.join();
+    result &= Test("lambda writes via ctx", value, 123);
+    return result;
+}
+
+bool testLambdaExitCodeFromCtx() {
+    bool result = true;
+    int value = 10;
+    Thread t;
+    t.start((void* ctx) => {
+        int* p = (int*)ctx;
+        return *p * 3;
+    }, &value);
+    i32 code = t.join();
+    result &= Test("lambda exit code from ctx", (int)code, 30);
+    return result;
+}
+
+bool testThreadComputationViaStruct() {
+    bool result = true;
+    ComputeCtx ctx;
+    ctx.input  = 7;
+    ctx.output = 0;
+    Thread t;
+    t.start(computeSquare, &ctx);
+    t.join();
+    result &= Test("named fn computes square", ctx.output, 49);
+    return result;
+}
+
+bool testLambdaComputationViaStruct() {
+    bool result = true;
+    ComputeCtx ctx;
+    ctx.input  = 5;
+    ctx.output = 0;
+    Thread t;
+    t.start((void* vctx) => {
+        ComputeCtx* c = (ComputeCtx*)vctx;
+        c->output = c->input * c->input;
+        return 0;
+    }, &ctx);
+    t.join();
+    result &= Test("lambda computes square", ctx.output, 25);
+    return result;
+}
+
+bool testSequentialThreads() {
+    bool result = true;
+    int a = 0;
+    int b = 0;
+    Thread t1;
+    t1.start(writeToPtr, &a);
+    t1.join();
+    Thread t2;
+    t2.start(writeToPtr, &b);
+    t2.join();
+    result &= Test("sequential thread 1", a, 99);
+    result &= Test("sequential thread 2", b, 99);
+    return result;
+}
+
+bool testThreadExitCodeZero() {
+    bool result = true;
+    Thread t;
+    t.start((void* ctx) => { return 0; }, nullptr);
+    i32 code = t.join();
+    result &= Test("exit code 0", (int)code, 0);
+    return result;
+}
+
+bool testMultipleThreadsCompute() {
+    bool result = true;
+    ComputeCtx c0; c0.input = 1; c0.output = 0;
+    ComputeCtx c1; c1.input = 2; c1.output = 0;
+    ComputeCtx c2; c2.input = 3; c2.output = 0;
+    ComputeCtx c3; c3.input = 4; c3.output = 0;
+    ComputeCtx c4; c4.input = 5; c4.output = 0;
+    Thread t0; Thread t1; Thread t2; Thread t3; Thread t4;
+    t0.start(computeSquare, &c0);
+    t1.start(computeSquare, &c1);
+    t2.start(computeSquare, &c2);
+    t3.start(computeSquare, &c3);
+    t4.start(computeSquare, &c4);
+    t0.join(); t1.join(); t2.join(); t3.join(); t4.join();
+    result &= Test("parallel compute 1^2", c0.output,  1);
+    result &= Test("parallel compute 2^2", c1.output,  4);
+    result &= Test("parallel compute 3^2", c2.output,  9);
+    result &= Test("parallel compute 4^2", c3.output, 16);
+    result &= Test("parallel compute 5^2", c4.output, 25);
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 // mutex + lock statement tests
 // ---------------------------------------------------------------------------
+
+struct MutexIntCtx {
+    void* m = nullptr;  // mutex*
+    int*  v = nullptr;
+};
+
+int incrementShared(void* ctx) {
+    MutexIntCtx* mi = (MutexIntCtx*)ctx;
+    mutex* mp = (mutex*)mi->m;
+    lock (*mp) {
+        *mi->v = *mi->v + 1;
+    }
+    return 0;
+}
 
 bool testMutexManual() {
     bool result = true;
@@ -31,25 +226,6 @@ bool testLockStatement() {
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Threaded mutex test: two threads increment a shared counter under a lock.
-// ---------------------------------------------------------------------------
-
-// Context for threaded mutex test: passes mutex and counter as separate pointers.
-struct MutexIntCtx {
-    void* m = nullptr;  // mutex*
-    int*  v = nullptr;
-};
-
-int incrementShared(void* ctx) {
-    MutexIntCtx* mi = (MutexIntCtx*)ctx;
-    mutex* mp = (mutex*)mi->m;
-    lock (*mp) {
-        *mi->v = *mi->v + 1;
-    }
-    return 0;
-}
-
 bool testMutexWithThreads() {
     bool result = true;
     mutex m;
@@ -73,6 +249,21 @@ bool testMutexWithThreads() {
 // ---------------------------------------------------------------------------
 // atomic_counter tests
 // ---------------------------------------------------------------------------
+
+struct AtomicCtx {
+    atomic_counter* counter = nullptr;
+    int iterations = 0;
+};
+
+int atomicIncrementWorker(void* ctx) {
+    AtomicCtx* ac = (AtomicCtx*)ctx;
+    int i = 0;
+    while (i < ac->iterations) {
+        ac->counter->increment();
+        i = i + 1;
+    }
+    return 0;
+}
 
 bool testAtomicCounterIncrement() {
     bool result = true;
@@ -103,25 +294,6 @@ bool testAtomicCounterAdd() {
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Threaded atomic_counter test: 5 threads each increment 100 times.
-// ---------------------------------------------------------------------------
-
-struct AtomicCtx {
-    atomic_counter* counter = nullptr;
-    int iterations = 0;
-};
-
-int atomicIncrementWorker(void* ctx) {
-    AtomicCtx* ac = (AtomicCtx*)ctx;
-    int i = 0;
-    while (i < ac->iterations) {
-        ac->counter->increment();
-        i = i + 1;
-    }
-    return 0;
-}
-
 bool testAtomicCounterThreaded() {
     bool result = true;
     atomic_counter counter;
@@ -144,35 +316,23 @@ bool testAtomicCounterThreaded() {
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// atomic_flag spinlock test
-// ---------------------------------------------------------------------------
-
 bool testAtomicFlag() {
     bool result = true;
     atomic_flag flag;
 
-    // Initially clear — test_and_set returns false (was 0)
     bool was_set = flag.test_and_set();
     result &= Test("flag initially clear", (int)was_set, 0);
 
-    // Now set — test_and_set returns true (was 1)
     bool still_set = flag.test_and_set();
     result &= Test("flag was set", (int)still_set, 1);
 
-    // Clear it
     flag.clear();
 
-    // Now clear again
     bool after_clear = flag.test_and_set();
     result &= Test("flag after clear", (int)after_clear, 0);
     flag.clear();
     return result;
 }
-
-// ---------------------------------------------------------------------------
-// atomic<i32> / atomic<i64> tests
-// ---------------------------------------------------------------------------
 
 bool testAtomicI32() {
     bool result = true;
@@ -203,6 +363,479 @@ bool testAtomicI64() {
 }
 
 // ---------------------------------------------------------------------------
+// semaphore tests
+// ---------------------------------------------------------------------------
+
+struct SemCtx {
+    void* sem = nullptr;  // semaphore*
+};
+
+int semSignalWorker(void* ctx) {
+    SemCtx* sc = (SemCtx*)ctx;
+    semaphore* sp = (semaphore*)sc->sem;
+    sp->release();
+    return 0;
+}
+
+bool testSemaphoreBasic() {
+    bool result = true;
+    semaphore s;
+    s.init(3, 10);
+
+    s.acquire();
+    s.acquire();
+    s.acquire();
+
+    s.release();
+    s.release();
+    s.release();
+
+    result &= Test("semaphore basic acquire/release", 1, 1);
+    s.destroy();
+    return result;
+}
+
+bool testSemaphoreWithThreads() {
+    bool result = true;
+    semaphore s;
+    s.init(0, 10);
+
+    SemCtx ctx;
+    ctx.sem = (void*)&s;
+
+    Thread t1;
+    Thread t2;
+    t1.start(semSignalWorker, &ctx);
+    t2.start(semSignalWorker, &ctx);
+
+    s.acquire();
+    s.acquire();
+
+    t1.join();
+    t2.join();
+
+    result &= Test("semaphore threaded signal", 1, 1);
+    s.destroy();
+    return result;
+}
+
+bool testSemaphoreLockStatement() {
+    bool result = true;
+    semaphore s;
+    s.init(1, 1);
+
+    int counter = 0;
+    lock (s) {
+        counter = counter + 1;
+    }
+    result &= Test("semaphore lock statement", counter, 1);
+    s.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// latch tests
+// ---------------------------------------------------------------------------
+
+struct LatchCtx {
+    void* lch   = nullptr;  // latch*
+    int*  steps = nullptr;
+};
+
+int latchWorker(void* ctx) {
+    LatchCtx* lc = (LatchCtx*)ctx;
+    latch* lp = (latch*)lc->lch;
+    *lc->steps = *lc->steps + 1;
+    lp->count_down();
+    return 0;
+}
+
+bool testLatchBasic() {
+    bool result = true;
+    latch l;
+    l.init(1);
+    l.count_down();
+    l.wait();
+    result &= Test("latch count_down once then wait", 1, 1);
+    l.destroy();
+    return result;
+}
+
+bool testLatchWithThreads() {
+    bool result = true;
+    latch l;
+    l.init(3);
+    int steps = 0;
+
+    LatchCtx ctx;
+    ctx.lch   = (void*)&l;
+    ctx.steps = &steps;
+
+    Thread t1;
+    Thread t2;
+    Thread t3;
+    t1.start(latchWorker, &ctx);
+    t2.start(latchWorker, &ctx);
+    t3.start(latchWorker, &ctx);
+
+    l.wait();
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    result &= Test("latch 3 threads", steps, 3);
+    l.destroy();
+    return result;
+}
+
+bool testLatchAlreadyZero() {
+    bool result = true;
+    latch l;
+    l.init(1);
+    l.count_down();
+    l.wait();
+    l.wait();
+    result &= Test("latch wait idempotent", 1, 1);
+    l.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// rwlock tests
+// ---------------------------------------------------------------------------
+
+struct RwCtx {
+    void* rw  = nullptr;  // rwlock*
+    int*  val = nullptr;
+    int   add = 0;
+};
+
+int rwWriterWorker(void* ctx) {
+    RwCtx* rc = (RwCtx*)ctx;
+    rwlock* rp = (rwlock*)rc->rw;
+    rp->acquire_write();
+    *rc->val = *rc->val + rc->add;
+    rp->release_write();
+    return 0;
+}
+
+bool testRwlockExclusive() {
+    bool result = true;
+    rwlock rw;
+    int shared = 0;
+
+    rw.acquire_write();
+    shared = 42;
+    rw.release_write();
+
+    result &= Test("rwlock exclusive write", shared, 42);
+    return result;
+}
+
+bool testRwlockShared() {
+    bool result = true;
+    rwlock rw;
+    int shared = 99;
+
+    rw.acquire_read();
+    rw.acquire_read();
+    int val1 = shared;
+    int val2 = shared;
+    rw.release_read();
+    rw.release_read();
+
+    result &= Test("rwlock shared read", val1, 99);
+    result &= Test("rwlock shared read 2", val2, 99);
+    return result;
+}
+
+bool testRwlockLockStatement() {
+    bool result = true;
+    rwlock rw;
+    int shared = 0;
+
+    lock (rw) {
+        shared = 77;
+    }
+    result &= Test("rwlock lock statement (write)", shared, 77);
+    return result;
+}
+
+bool testRwlockWithThreads() {
+    bool result = true;
+    rwlock rw;
+    int value = 0;
+
+    RwCtx ctx1; ctx1.rw = (void*)&rw; ctx1.val = &value; ctx1.add = 10;
+    RwCtx ctx2; ctx2.rw = (void*)&rw; ctx2.val = &value; ctx2.add = 5;
+
+    Thread t1;
+    Thread t2;
+    t1.start(rwWriterWorker, &ctx1);
+    t2.start(rwWriterWorker, &ctx2);
+    t1.join();
+    t2.join();
+
+    result &= Test("rwlock two writer threads", value, 15);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// channel<int> tests
+// ---------------------------------------------------------------------------
+
+struct ChanCtx {
+    void* ch    = nullptr;  // channel<int>*
+    int   start = 0;
+    int   count = 0;
+};
+
+int chanProducer(void* ctx) {
+    ChanCtx* cc = (ChanCtx*)ctx;
+    channel<int>* chp = (channel<int>*)cc->ch;
+    int i = 0;
+    while (i < cc->count) {
+        chp->send(cc->start + i);
+        i++;
+    }
+    return 0;
+}
+
+int chanConsumerSum(void* ctx) {
+    ChanCtx* cc = (ChanCtx*)ctx;
+    channel<int>* chp = (channel<int>*)cc->ch;
+    int sum = 0;
+    int i = 0;
+    while (i < cc->count) {
+        sum = sum + chp->receive();
+        i++;
+    }
+    return sum;
+}
+
+bool testChannelBasicSendReceive() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(4);
+
+    ch.send(10);
+    ch.send(20);
+    ch.send(30);
+
+    result &= Test("channel recv 1", ch.receive(), 10);
+    result &= Test("channel recv 2", ch.receive(), 20);
+    result &= Test("channel recv 3", ch.receive(), 30);
+    result &= Test("channel capacity", ch.capacity(), 4);
+
+    ch.destroy();
+    return result;
+}
+
+bool testChannelCount() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(8);
+
+    ch.send(1);
+    ch.send(2);
+    result &= Test("channel count after 2 sends", ch.count(), 2);
+
+    ch.receive();
+    result &= Test("channel count after 1 recv", ch.count(), 1);
+
+    ch.destroy();
+    return result;
+}
+
+bool testChannelTryReceive() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(4);
+
+    int out = 0;
+    bool ok = ch.try_receive(&out);
+    result &= Test("try_receive empty returns false", (int)ok, 0);
+
+    ch.send(99);
+    ok = ch.try_receive(&out);
+    result &= Test("try_receive gets value", (int)ok, 1);
+    result &= Test("try_receive correct value", out, 99);
+
+    ch.destroy();
+    return result;
+}
+
+bool testChannelWrapAround() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(3);
+
+    ch.send(1); ch.send(2); ch.send(3);
+    result &= Test("wrap recv 1", ch.receive(), 1);
+    result &= Test("wrap recv 2", ch.receive(), 2);
+    ch.send(4); ch.send(5);
+    result &= Test("wrap recv 3", ch.receive(), 3);
+    result &= Test("wrap recv 4", ch.receive(), 4);
+    result &= Test("wrap recv 5", ch.receive(), 5);
+
+    ch.destroy();
+    return result;
+}
+
+bool testChannelProducerConsumer() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(8);
+
+    ChanCtx pctx; pctx.ch = (void*)&ch; pctx.start = 1; pctx.count = 5;
+    ChanCtx cctx; cctx.ch = (void*)&ch; cctx.start = 0; cctx.count = 5;
+
+    Thread producer;
+    Thread consumer;
+    producer.start(chanProducer,    &pctx);
+    consumer.start(chanConsumerSum, &cctx);
+
+    producer.join();
+    i32 sum = consumer.join();
+
+    result &= Test("channel producer/consumer sum", (int)sum, 15);
+    ch.destroy();
+    return result;
+}
+
+bool testChannelMultiProducer() {
+    bool result = true;
+    channel<int> ch;
+    ch.init(16);
+
+    ChanCtx p1ctx; p1ctx.ch = (void*)&ch; p1ctx.start = 0;  p1ctx.count = 5;
+    ChanCtx p2ctx; p2ctx.ch = (void*)&ch; p2ctx.start = 10; p2ctx.count = 5;
+    ChanCtx cctx;  cctx.ch  = (void*)&ch; cctx.start  = 0;  cctx.count  = 10;
+
+    Thread p1; Thread p2; Thread consumer;
+    p1.start(chanProducer,    &p1ctx);
+    p2.start(chanProducer,    &p2ctx);
+    consumer.start(chanConsumerSum, &cctx);
+
+    p1.join(); p2.join();
+    i32 sum = consumer.join();
+
+    result &= Test("channel multi-producer sum", (int)sum, 70);
+    ch.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// spsc_queue<int> tests
+// ---------------------------------------------------------------------------
+
+struct SpscCtx {
+    void* q     = nullptr;  // spsc_queue<int>*
+    int   items = 0;
+};
+
+int spscProducer(void* ctx) {
+    SpscCtx* sc = (SpscCtx*)ctx;
+    spsc_queue<int>* qp = (spsc_queue<int>*)sc->q;
+    int i = 1;
+    while (i <= sc->items) {
+        while (!qp->try_push(i)) { }
+        i++;
+    }
+    return 0;
+}
+
+int spscConsumer(void* ctx) {
+    SpscCtx* sc = (SpscCtx*)ctx;
+    spsc_queue<int>* qp = (spsc_queue<int>*)sc->q;
+    int sum = 0;
+    int i = 0;
+    int out = 0;
+    while (i < sc->items) {
+        while (!qp->try_pop(&out)) { }
+        sum = sum + out;
+        i++;
+    }
+    return sum;
+}
+
+bool testSpscBasic() {
+    bool result = true;
+    spsc_queue<int> q;
+    q.init(4);
+
+    result &= Test("spsc empty initially", (int)q.is_empty(), 1);
+
+    bool ok = q.try_push(10);
+    result &= Test("spsc push 1", (int)ok, 1);
+    ok = q.try_push(20);
+    result &= Test("spsc push 2", (int)ok, 1);
+    ok = q.try_push(30);
+    result &= Test("spsc push 3", (int)ok, 1);
+    ok = q.try_push(40);
+    result &= Test("spsc push 4", (int)ok, 1);
+    result &= Test("spsc full", (int)q.is_full(), 1);
+
+    ok = q.try_push(99);
+    result &= Test("spsc push when full fails", (int)ok, 0);
+
+    int out = 0;
+    q.try_pop(&out); result &= Test("spsc pop 1", out, 10);
+    q.try_pop(&out); result &= Test("spsc pop 2", out, 20);
+    q.try_pop(&out); result &= Test("spsc pop 3", out, 30);
+    q.try_pop(&out); result &= Test("spsc pop 4", out, 40);
+
+    result &= Test("spsc empty after drain", (int)q.is_empty(), 1);
+
+    ok = q.try_pop(&out);
+    result &= Test("spsc pop when empty fails", (int)ok, 0);
+
+    result &= Test("spsc capacity", q.capacity(), 4);
+
+    q.destroy();
+    return result;
+}
+
+bool testSpscWrapAround() {
+    bool result = true;
+    spsc_queue<int> q;
+    q.init(3);
+
+    q.try_push(1); q.try_push(2); q.try_push(3);
+    int out = 0;
+    q.try_pop(&out);
+    q.try_push(4);
+    q.try_pop(&out); result &= Test("wrap pop 2", out, 2);
+    q.try_pop(&out); result &= Test("wrap pop 3", out, 3);
+    q.try_pop(&out); result &= Test("wrap pop 4", out, 4);
+
+    q.destroy();
+    return result;
+}
+
+bool testSpscThreaded() {
+    bool result = true;
+    spsc_queue<int> q;
+    q.init(64);
+
+    SpscCtx pctx; pctx.q = (void*)&q; pctx.items = 100;
+    SpscCtx cctx; cctx.q = (void*)&q; cctx.items = 100;
+
+    Thread producer;
+    Thread consumer;
+    producer.start(spscProducer, &pctx);
+    consumer.start(spscConsumer, &cctx);
+
+    producer.join();
+    i32 sum = consumer.join();
+
+    result &= Test("spsc threaded sum 1..100", (int)sum, 5050);
+    q.destroy();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -210,6 +843,20 @@ extern int main() {
     int passed = 0;
     int total  = 0;
 
+    // Thread tests
+    total++; passed += testThreadWritesThroughPointer()  ? 1 : 0;
+    total++; passed += testThreadReadsThroughPointer()   ? 1 : 0;
+    total++; passed += testThreadExitCode()              ? 1 : 0;
+    total++; passed += testMultipleThreadsConcurrent()   ? 1 : 0;
+    total++; passed += testLambdaWritesViaCtx()          ? 1 : 0;
+    total++; passed += testLambdaExitCodeFromCtx()       ? 1 : 0;
+    total++; passed += testThreadComputationViaStruct()  ? 1 : 0;
+    total++; passed += testLambdaComputationViaStruct()  ? 1 : 0;
+    total++; passed += testSequentialThreads()           ? 1 : 0;
+    total++; passed += testThreadExitCodeZero()          ? 1 : 0;
+    total++; passed += testMultipleThreadsCompute()      ? 1 : 0;
+
+    // Mutex / atomic tests
     total++; passed += testMutexManual()              ? 1 : 0;
     total++; passed += testLockStatement()            ? 1 : 0;
     total++; passed += testMutexWithThreads()         ? 1 : 0;
@@ -221,6 +868,29 @@ extern int main() {
     total++; passed += testAtomicI32()                ? 1 : 0;
     total++; passed += testAtomicI64()                ? 1 : 0;
 
-    printf("Sync tests: %d/%d passed.\n", passed, total);
+    // Semaphore / latch / rwlock tests
+    total++; passed += testSemaphoreBasic()           ? 1 : 0;
+    total++; passed += testSemaphoreWithThreads()     ? 1 : 0;
+    total++; passed += testSemaphoreLockStatement()   ? 1 : 0;
+    total++; passed += testLatchBasic()               ? 1 : 0;
+    total++; passed += testLatchWithThreads()         ? 1 : 0;
+    total++; passed += testLatchAlreadyZero()         ? 1 : 0;
+    total++; passed += testRwlockExclusive()          ? 1 : 0;
+    total++; passed += testRwlockShared()             ? 1 : 0;
+    total++; passed += testRwlockLockStatement()      ? 1 : 0;
+    total++; passed += testRwlockWithThreads()        ? 1 : 0;
+
+    // Channel / spsc_queue tests
+    total++; passed += testChannelBasicSendReceive()  ? 1 : 0;
+    total++; passed += testChannelCount()             ? 1 : 0;
+    total++; passed += testChannelTryReceive()        ? 1 : 0;
+    total++; passed += testChannelWrapAround()        ? 1 : 0;
+    total++; passed += testChannelProducerConsumer()  ? 1 : 0;
+    total++; passed += testChannelMultiProducer()     ? 1 : 0;
+    total++; passed += testSpscBasic()                ? 1 : 0;
+    total++; passed += testSpscWrapAround()           ? 1 : 0;
+    total++; passed += testSpscThreaded()             ? 1 : 0;
+
+    printf("Thread/Sync tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

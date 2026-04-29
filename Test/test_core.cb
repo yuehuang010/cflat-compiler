@@ -3,6 +3,8 @@ import "list.cb";
 import "hashset.cb";
 import "dictionary.cb";
 import "pair.cb";
+import "stack.cb";
+import "queue.cb";
 
 // ── list<int> ────────────────────────────────────────────────────────────────
 
@@ -214,6 +216,60 @@ int testPair()
     return passed;
 }
 
+// ── stack<i32> ───────────────────────────────────────────────────────────────
+
+int testStack()
+{
+    int passed = 0;
+
+    stack<i32> s;
+
+    passed += Test("stack empty initially",  s.isEmpty(), true);
+
+    s.push(10);
+    s.push(20);
+    s.push(30);
+
+    passed += Test("stack count after 3 pushes", s.count(), 3);
+    passed += Test("stack not empty",            s.isEmpty(), false);
+    passed += Test("stack peek top",             (int)s.peek(), 30);
+
+    passed += Test("stack pop 1 (LIFO)", (int)s.pop(), 30);
+    passed += Test("stack pop 2",        (int)s.pop(), 20);
+    passed += Test("stack pop 3",        (int)s.pop(), 10);
+
+    passed += Test("stack empty after drain", s.isEmpty(), true);
+
+    return passed;
+}
+
+// ── queue<i32> ───────────────────────────────────────────────────────────────
+
+int testQueue()
+{
+    int passed = 0;
+
+    queue<i32> q;
+
+    passed += Test("queue empty initially",  q.isEmpty(), true);
+
+    q.enqueue(10);
+    q.enqueue(20);
+    q.enqueue(30);
+
+    passed += Test("queue count after 3 enqueues", q.count(), 3);
+    passed += Test("queue not empty",              q.isEmpty(), false);
+    passed += Test("queue peek front",             (int)q.peek(), 10);
+
+    passed += Test("queue dequeue 1 (FIFO)", (int)q.dequeue(), 10);
+    passed += Test("queue dequeue 2",        (int)q.dequeue(), 20);
+    passed += Test("queue dequeue 3",        (int)q.dequeue(), 30);
+
+    passed += Test("queue empty after drain", q.isEmpty(), true);
+
+    return passed;
+}
+
 // ── for ──────────────────────────────────────────────────────────────────
 
 int testFor()
@@ -290,7 +346,9 @@ extern int main()
     r = testHashset();      passed += r; total += 19;
     r = testDictionary();   passed += r; total += 34;
     r = testPair();         passed += r; total += 8;
-    r = testFor();      passed += r; total += 7;
+    r = testStack();        passed += r; total += 8;
+    r = testQueue();        passed += r; total += 8;
+    r = testFor();          passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

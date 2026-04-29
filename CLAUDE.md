@@ -172,7 +172,7 @@ Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing 
 - **Type aliases**: `using M = Math` — expands at reference time
 - **Module system**: `import "file.cb"` for multi-file compilation
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
-- **Null-safe access**: `ptr?.field` (only via function arg pointers, not locals)
+- **Null-safe access**: `ptr?.field` — works on any struct pointer (local variables, function arguments, struct member fields)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
 - **Operator overloading**: `operator+`, `operator==`, `operator new`, `operator delete`
 - **Function overloads** with type-based resolution and default parameters
@@ -208,7 +208,7 @@ Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructors
 
 ### Known Limitations
 
-- **Null-conditional (`?.`)**: Only for pointers passed as function arguments — not local variables or struct members
+- **Null-conditional (`?.`)**: Works on any struct pointer — function arguments, local variables, and struct member fields
 - **Generic struct defaults**: `V x = default` in function locals and nested generic fields may not codegen correctly; field-level `= default` works
 - **`move` on `removeAt`**: Owned pointer elements are not auto-freed on removal from a collection
 

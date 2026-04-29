@@ -353,21 +353,18 @@ bool testMultipleInterfaces()
 
 extern int main()
 {
-    bool allPassed = true;
+    int passed = 0;
+    int total  = 0;
 
-    allPassed &= testVTableDispatch();
-    allPassed &= testIsOperator();
-    allPassed &= testAsToStruct();
-    allPassed &= testAsToInterface();
-    allPassed &= testSwitchConcreteType();
-    allPassed &= testSwitchInterfaceCase();
-    allPassed &= testSwitchDefault();
-    allPassed &= testMultipleInterfaces();
+    total++; passed += testVTableDispatch()      ? 1 : 0;
+    total++; passed += testIsOperator()          ? 1 : 0;
+    total++; passed += testAsToStruct()          ? 1 : 0;
+    total++; passed += testAsToInterface()       ? 1 : 0;
+    total++; passed += testSwitchConcreteType()  ? 1 : 0;
+    total++; passed += testSwitchInterfaceCase() ? 1 : 0;
+    total++; passed += testSwitchDefault()       ? 1 : 0;
+    total++; passed += testMultipleInterfaces()  ? 1 : 0;
 
-    if (allPassed)
-    {
-        printf("All interface tests passed.\n");
-        return 0;
-    }
-    return 1;
+    printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
