@@ -1,0 +1,149 @@
+import "test_helper.cb";
+import "time.cb";
+
+// ── Duration: factory tick values ─────────────────────────────────────────────
+
+int testDurationFactories()
+{
+    int passed = 0;
+    passed += Test("fromTicks(100)",        Duration.fromTicks(100).ticks(),        (i64)100);
+    passed += Test("fromMicroseconds(1)",   Duration.fromMicroseconds(1).ticks(),   (i64)10);
+    passed += Test("fromMilliseconds(1)",   Duration.fromMilliseconds(1).ticks(),   (i64)10000);
+    passed += Test("fromSeconds(1)",        Duration.fromSeconds(1).ticks(),        (i64)10000000);
+    return passed;
+}
+
+// ── Duration: unit conversions ────────────────────────────────────────────────
+
+int testDurationConversions()
+{
+    int passed = 0;
+    Duration two = Duration.fromSeconds(2);
+    passed += Test("seconds(2s)",      two.seconds()      == 2.0,     true);
+    passed += Test("milliseconds(2s)", two.milliseconds() == 2000.0,  true);
+    passed += Test("microseconds(2s)", two.microseconds() == 2000000.0, true);
+
+    Duration half = Duration.fromSeconds(30);
+    passed += Test("minutes(30s)",     half.minutes()     == 0.5,     true);
+
+    Duration oneHour = Duration.fromSeconds(3600);
+    passed += Test("hours(3600s)",     oneHour.hours()    == 1.0,     true);
+    return passed;
+}
+
+// ── Duration: arithmetic operators ───────────────────────────────────────────
+
+int testDurationArithmetic()
+{
+    int passed = 0;
+    Duration a = Duration.fromSeconds(3);
+    Duration b = Duration.fromSeconds(2);
+    Duration sum  = a + b;
+    Duration diff = a - b;
+    passed += Test("operator+", sum.ticks(),  (i64)50000000);
+    passed += Test("operator-", diff.ticks(), (i64)10000000);
+    return passed;
+}
+
+// ── TimePoint ─────────────────────────────────────────────────────────────────
+
+int testTimePoint()
+{
+    int passed = 0;
+    TimePoint t = TimePoint.now();
+    passed += Test("now nonzero",   t.ticks() > 0,  true);
+
+    TimePoint a = TimePoint.now();
+    sleep(50);
+    TimePoint b = TimePoint.now();
+    Duration d = b - a;
+    passed += Test("tp subtraction > 0", d.ticks() > 0, true);
+    return passed;
+}
+
+// ── Stopwatch ─────────────────────────────────────────────────────────────────
+
+int testStopwatch()
+{
+    int passed = 0;
+
+    Stopwatch sw;
+    sw.start();
+    passed += Test("isRunning after start", sw.isRunning(), true);
+    sleep(100);
+    sw.stop();
+    passed += Test("isRunning after stop", sw.isRunning(), false);
+    passed += Test("elapsed > 50ms", sw.elapsed().milliseconds() >= 50.0, true);
+
+    sw.reset();
+    passed += Test("elapsed after reset", sw.elapsed().ticks() == 0, true);
+    passed += Test("isRunning after reset", sw.isRunning(), false);
+
+    sw.restart();
+    passed += Test("isRunning after restart", sw.isRunning(), true);
+    sw.stop();
+
+    // start is idempotent while running
+    sw.restart();
+    sw.start();   // should be a no-op
+    passed += Test("start idempotent", sw.isRunning(), true);
+
+    return passed;
+}
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+
+int testTimer()
+{
+    int passed = 0;
+
+    Timer t;
+    t.start(300);
+    passed += Test("not expired immediately", t.isExpired(), false);
+    passed += Test("remaining > 0", t.remaining().ticks() > 0, true);
+    passed += Test("elapsed >= 0", t.elapsed().ticks() >= 0, true);
+
+    sleep(400);
+    passed += Test("expired after sleep", t.isExpired(), true);
+    passed += Test("remaining is zero after expiry", t.remaining().ticks() == 0, true);
+
+    t.reset();
+    passed += Test("not running after reset", t.isExpired(), false);
+
+    t.restart();
+    passed += Test("not expired after restart", t.isExpired(), false);
+
+    return passed;
+}
+
+// ── sleep smoke test ──────────────────────────────────────────────────────────
+
+int testSleep()
+{
+    int passed = 0;
+    TimePoint before = TimePoint.now();
+    sleep(50);
+    TimePoint after = TimePoint.now();
+    Duration d = after - before;
+    passed += Test("sleep(50) elapsed > 0", d.ticks() > 0, true);
+    return passed;
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    passed += testDurationFactories();    total += 4;
+    passed += testDurationConversions();  total += 5;
+    passed += testDurationArithmetic();   total += 2;
+    passed += testTimePoint();            total += 2;
+    passed += testStopwatch();            total += 7;
+    passed += testTimer();                total += 7;
+    passed += testSleep();                total += 1;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

@@ -1,0 +1,252 @@
+// time.cb — Duration, TimePoint, Stopwatch, Timer, and sleep.
+//
+// Tick unit: 100-nanosecond intervals, matching C# DateTime/TimeSpan convention.
+//
+// Usage:
+//   import "time.cb";
+//
+//   // Measure elapsed time
+//   Stopwatch sw;
+//   sw.start();
+//   // ... do work ...
+//   sw.stop();
+//   printf("elapsed: %f ms\n", sw.elapsed().milliseconds());
+//
+//   // Countdown timer
+//   Timer t;
+//   t.start(500);            // 500 ms
+//   while (!t.isExpired()) { ... }
+//
+//   // Wall-clock timestamps
+//   TimePoint a = TimePoint.now();
+//   sleep(100);
+//   TimePoint b = TimePoint.now();
+//   Duration d = b - a;
+
+extern int  QueryPerformanceCounter(i64* count);
+extern int  QueryPerformanceFrequency(i64* freq);
+extern void GetSystemTimeAsFileTime(i64* fileTime);
+extern void Sleep(i32 ms);
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+i64 _timeQpcFreq = 0;
+
+i64 _timeGetQpcFreq()
+{
+    if (_timeQpcFreq == 0)
+        QueryPerformanceFrequency(&_timeQpcFreq);
+    return _timeQpcFreq;
+}
+
+// Convert QPC ticks to 100-ns intervals.
+// Split-seconds arithmetic avoids i64 overflow for arbitrarily long durations.
+i64 _qpcToTicks(i64 qpc)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 secs = qpc / freq;
+    i64 rem  = qpc % freq;
+    return secs * 10000000 + rem * 10000000 / freq;
+}
+
+i64 _qpcNow()
+{
+    i64 count = 0;
+    QueryPerformanceCounter(&count);
+    return count;
+}
+
+// ── Duration ─────────────────────────────────────────────────────────────────
+
+struct Duration
+{
+    i64 _ticks = 0;
+
+    static Duration fromTicks(i64 t)
+    {
+        Duration d;
+        d._ticks = t;
+        return d;
+    }
+
+    static Duration fromMicroseconds(i64 us)
+    {
+        Duration d;
+        d._ticks = us * 10;
+        return d;
+    }
+
+    static Duration fromMilliseconds(i64 ms)
+    {
+        Duration d;
+        d._ticks = ms * 10000;
+        return d;
+    }
+
+    static Duration fromSeconds(i64 s)
+    {
+        Duration d;
+        d._ticks = s * 10000000;
+        return d;
+    }
+
+    i64    ticks()        { return _ticks; }
+    double nanoseconds()  { return (double)_ticks * 100.0; }
+    double microseconds() { return (double)_ticks / 10.0; }
+    double milliseconds() { return (double)_ticks / 10000.0; }
+    double seconds()      { return (double)_ticks / 10000000.0; }
+    double minutes()      { return (double)_ticks / 600000000.0; }
+    double hours()        { return (double)_ticks / 36000000000.0; }
+
+    Duration operator+(Duration other)
+    {
+        Duration d;
+        d._ticks = _ticks + other._ticks;
+        return d;
+    }
+
+    Duration operator-(Duration other)
+    {
+        Duration d;
+        d._ticks = _ticks - other._ticks;
+        return d;
+    }
+};
+
+// ── TimePoint ─────────────────────────────────────────────────────────────────
+
+struct TimePoint
+{
+    i64 _ticks = 0;   // FILETIME: 100-ns intervals since Jan 1, 1601
+
+    static TimePoint now()
+    {
+        TimePoint tp;
+        GetSystemTimeAsFileTime(&tp._ticks);
+        return tp;
+    }
+
+    i64 ticks() { return _ticks; }
+
+    Duration operator-(TimePoint other)
+    {
+        Duration d;
+        d._ticks = _ticks - other._ticks;
+        return d;
+    }
+};
+
+// ── Stopwatch ─────────────────────────────────────────────────────────────────
+
+struct Stopwatch
+{
+    i64  _startQpc    = 0;
+    i64  _accumulated = 0;
+    bool _running     = false;
+
+    // Begin timing.  No-op if already running.
+    void start()
+    {
+        if (!_running)
+        {
+            _startQpc = _qpcNow();
+            _running  = true;
+        }
+    }
+
+    // Pause timing, accumulating elapsed ticks.
+    void stop()
+    {
+        if (_running)
+        {
+            _accumulated = _accumulated + _qpcToTicks(_qpcNow() - _startQpc);
+            _running     = false;
+        }
+    }
+
+    // Clear elapsed time and stop.
+    void reset()
+    {
+        _accumulated = 0;
+        _running     = false;
+    }
+
+    // Clear elapsed time and start from zero.
+    void restart()
+    {
+        _accumulated = 0;
+        _startQpc    = _qpcNow();
+        _running     = true;
+    }
+
+    Duration elapsed()
+    {
+        i64 total = _accumulated;
+        if (_running)
+            total = total + _qpcToTicks(_qpcNow() - _startQpc);
+        return Duration.fromTicks(total);
+    }
+
+    bool isRunning() { return _running; }
+};
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+
+struct Timer
+{
+    i64  _startQpc    = 0;
+    i64  _targetTicks = 0;
+    bool _running     = false;
+
+    // Start a countdown of the given number of milliseconds.
+    void start(i64 milliseconds)
+    {
+        _targetTicks = milliseconds * 10000;
+        _startQpc    = _qpcNow();
+        _running     = true;
+    }
+
+    // True once the target duration has elapsed.
+    bool isExpired()
+    {
+        if (!_running) return false;
+        return _qpcToTicks(_qpcNow() - _startQpc) >= _targetTicks;
+    }
+
+    // Time elapsed since start() was called.
+    Duration elapsed()
+    {
+        if (!_running) return Duration.fromTicks(0);
+        return Duration.fromTicks(_qpcToTicks(_qpcNow() - _startQpc));
+    }
+
+    // Time remaining until expiry (zero once expired).
+    Duration remaining()
+    {
+        if (!_running) return Duration.fromTicks(0);
+        i64 e = _qpcToTicks(_qpcNow() - _startQpc);
+        i64 r = _targetTicks - e;
+        return Duration.fromTicks(r > 0 ? r : 0);
+    }
+
+    // Stop the timer without clearing the target.
+    void reset()
+    {
+        _running = false;
+    }
+
+    // Restart the countdown with the same target duration.
+    void restart()
+    {
+        _startQpc = _qpcNow();
+        _running  = true;
+    }
+};
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+void sleep(i64 ms)
+{
+    if (ms > 0)
+        Sleep((i32)ms);
+}
