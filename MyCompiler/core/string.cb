@@ -197,6 +197,50 @@ struct stringbuilder
         if (_data != nullptr) _data[0] = 0;
     }
 
+    // Append a raw C string literal (const char*).
+    void append(const char* s)
+    {
+        appendCStr(s);
+    }
+
+    // Append a signed 32-bit integer formatted as decimal.
+    void append(i32 n)
+    {
+        i8* buf = new i8[32];
+        i32 len = sprintf(buf, "%d", n);
+        i32 newLen = _length + len;
+        _ensure(newLen + 1);
+        int i = 0;
+        while (i < len)
+        {
+            _data[_length + i] = buf[i];
+            i++;
+        }
+        _data[newLen] = 0;
+        _length = newLen;
+        delete[] buf;
+    }
+
+    // Append "true" or "false".
+    void append(bool b)
+    {
+        if (b) appendCStr("true");
+        else   appendCStr("false");
+    }
+
+    // Append a string followed by a newline character.
+    void appendLine(string s)
+    {
+        append(s);
+        appendChar(10);
+    }
+
+    void appendLine(const char* s)
+    {
+        appendCStr(s);
+        appendChar(10);
+    }
+
     // Return a string view over the current buffer.
     // The returned string shares the builder's buffer — do not free the builder
     // while the string is still in use.
@@ -208,6 +252,11 @@ struct stringbuilder
         return result;
     }
 
+    // Alias matching the IString convention.
+    string ToString()
+    {
+        return toString();
+    }
 
     ~stringbuilder()
     {

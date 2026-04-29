@@ -214,6 +214,98 @@ int testStringSwitch()
     return passed;
 }
 
+// ── stringbuilder (new overloads) ────────────────────────────────────────────
+
+int testStringBuilder()
+{
+    int passed = 0;
+
+    // append(string)
+    stringbuilder sb;
+    string s = "hello";
+    sb.append(s);
+    passed += Test("sb_append_str_len",  sb.length(), 5);
+    passed += Test("sb_append_str_data", sb.toString(), "hello");
+
+    // append(const char*) — string literal
+    sb.append(", world");
+    passed += Test("sb_append_cstr_len",  sb.length(), 12);
+    passed += Test("sb_append_cstr_data", sb.toString(), "hello, world");
+
+    // append(i32) — positive, zero, negative
+    sb.clear();
+    sb.append(42);
+    passed += Test("sb_append_int_pos",  sb.toString(), "42");
+
+    sb.clear();
+    sb.append(0);
+    passed += Test("sb_append_int_zero", sb.toString(), "0");
+
+    sb.clear();
+    sb.append(-7);
+    passed += Test("sb_append_int_neg",  sb.toString(), "-7");
+
+    // append(bool)
+    sb.clear();
+    sb.append(true);
+    passed += Test("sb_append_bool_true",  sb.toString(), "true");
+
+    sb.clear();
+    sb.append(false);
+    passed += Test("sb_append_bool_false", sb.toString(), "false");
+
+    // appendLine(const char*) — appends text + '\n'
+    sb.clear();
+    sb.appendLine("hello");
+    passed += Test("sb_appendLine_cstr_len",  sb.length(), 6);
+    passed += Test("sb_appendLine_cstr_data", sb.toString(), "hello\n");
+
+    // appendLine(string)
+    sb.clear();
+    string line = "world";
+    sb.appendLine(line);
+    passed += Test("sb_appendLine_str_len",  sb.length(), 6);
+    passed += Test("sb_appendLine_str_data", sb.toString(), "world\n");
+
+    // ToString() is an alias for toString()
+    sb.clear();
+    sb.append("abc");
+    passed += Test("sb_ToString", sb.ToString(), "abc");
+
+    // Mixed overloads: build a structured string
+    sb.clear();
+    sb.append("score=");
+    sb.append(99);
+    sb.append(",done=");
+    sb.append(true);
+    passed += Test("sb_mixed_build", sb.toString(), "score=99,done=true");
+
+    // Multiple appendLine calls produce multiple newlines
+    sb.clear();
+    sb.appendLine("line1");
+    sb.appendLine("line2");
+    passed += Test("sb_multi_line_len",  sb.length(), 12);
+    passed += Test("sb_multi_line_data", sb.toString(), "line1\nline2\n");
+
+    // Growth: force buffer reallocation (append 20 chars x 10 = 200 chars)
+    sb.clear();
+    int i = 0;
+    while (i < 10)
+    {
+        sb.append("01234567890123456789");
+        i++;
+    }
+    passed += Test("sb_growth_len", sb.length(), 200);
+
+    // Clear resets length; buffer is reusable
+    sb.clear();
+    passed += Test("sb_clear_len",  sb.length(), 0);
+    sb.append("reused");
+    passed += Test("sb_reuse_data", sb.toString(), "reused");
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -228,6 +320,7 @@ extern int main()
     r = testStringIString(); passed += r; total += 4;
     r = testInterpolation(); passed += r; total += 8;
     r = testStringSwitch();  passed += r; total += 6;
+    r = testStringBuilder(); passed += r; total += 20;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
