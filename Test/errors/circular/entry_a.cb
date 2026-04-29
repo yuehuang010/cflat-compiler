@@ -1,0 +1,6 @@
+import "b.cb";
+
+extern int main()
+{
+    return 0;
+}

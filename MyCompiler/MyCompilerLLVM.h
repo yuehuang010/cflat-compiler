@@ -433,6 +433,7 @@ public:
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
     std::unordered_set<std::string> importedFiles;
+    std::vector<std::string> importStack;  // DFS stack for circular import detection
     std::string importSearchDir;
     std::string runtimeDir;
     std::string sourceFileDir_;  // original source dir for LSP temp-file analysis

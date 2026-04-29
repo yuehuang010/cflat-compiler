@@ -1,0 +1,6 @@
+import "entry_self.cb";
+
+extern int main()
+{
+    return 0;
+}

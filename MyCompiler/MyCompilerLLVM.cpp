@@ -20,7 +20,14 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
 {
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
-    importedFiles.insert(std::filesystem::weakly_canonical(filename).string());
+    auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
+    importStack.push_back(rootCanonical);
+    struct RootGuard {
+        std::vector<std::string>& stack;
+        std::unordered_set<std::string>& done;
+        std::string key;
+        ~RootGuard() { stack.pop_back(); done.insert(key); }
+    } rootGuard{importStack, importedFiles, rootCanonical};
     auto exePath = args.getOption("output");
     auto lliPath = args.getOption("out-lli");
     auto bitcodePath = args.getOption("bitcode").value_or("");
@@ -289,9 +296,25 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     if (importedFiles.count(canonicalStr))
     {
         if (verbose) std::cout << "[verbose]   already imported: " << canonicalStr << "\n";
-        return true; // already imported or cycle
+        return true;
     }
-    importedFiles.insert(canonicalStr);
+    auto cycleIt = std::find(importStack.begin(), importStack.end(), canonicalStr);
+    if (cycleIt != importStack.end())
+    {
+        std::string chain;
+        for (auto it = cycleIt; it != importStack.end(); ++it)
+            chain += std::filesystem::path(*it).filename().string() + " -> ";
+        chain += std::filesystem::path(canonicalStr).filename().string();
+        LogError(std::format("Circular import detected: {}", chain));
+        return false;
+    }
+    importStack.push_back(canonicalStr);
+    struct ImportGuard {
+        std::vector<std::string>& stack;
+        std::unordered_set<std::string>& done;
+        std::string key;
+        ~ImportGuard() { stack.pop_back(); done.insert(key); }
+    } importGuard{importStack, importedFiles, canonicalStr};
 
     if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
 
@@ -388,7 +411,14 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
     MyListener::ClearGenericCaches();
 
     sourceFileName = std::filesystem::path(filePath).filename().string();
-    importedFiles.insert(std::filesystem::weakly_canonical(filePath).string());
+    auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
+    importStack.push_back(rootCanonical);
+    struct RootGuard {
+        std::vector<std::string>& stack;
+        std::unordered_set<std::string>& done;
+        std::string key;
+        ~RootGuard() { stack.pop_back(); done.insert(key); }
+    } rootGuard{importStack, importedFiles, rootCanonical};
     importSearchDir = importDir;
     runtimeDir = runtimeDirPath;
     verbose = false;
@@ -520,6 +550,7 @@ void MyCompilerLLVM::ResetForReanalysis()
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
     // on the next Analyze() call.
     importedFiles.clear();
+    importStack.clear();
     importedParseStates.clear();
 
     // Re-register the built-in string type that was wiped by the clears above.
