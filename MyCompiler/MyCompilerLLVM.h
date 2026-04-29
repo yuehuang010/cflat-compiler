@@ -312,6 +312,7 @@ public:
         llvm::StructType* RunArgsType = nullptr;       // { Name*, list__string }
         unsigned ExitCodeFieldIndex = 0;               // struct field index of exitCode
         unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
+        unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (BlockAllocator*)
     };
 
     class StackState

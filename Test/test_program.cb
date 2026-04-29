@@ -261,6 +261,51 @@ bool testProgramHeapStressLarge() {
 }
 
 // ---------------------------------------------------------------------------
+// Allocator inspection tests
+// ---------------------------------------------------------------------------
+
+bool testAllocatorNonNullAfterRun() {
+    bool result = true;
+    Minimal m;
+    list<string> args;
+    m.run(args);
+    m.WaitForExit();
+    result &= Test("_allocator non-null after run", m._allocator != nullptr, true);
+    return result;
+}
+
+bool testAllocatorNullBeforeRun() {
+    bool result = true;
+    Minimal m;
+    result &= Test("_allocator null before run", m._allocator == nullptr, true);
+    return result;
+}
+
+bool testAllocatorUsedBlocksCleanExit() {
+    bool result = true;
+    Minimal m;
+    list<string> args;
+    m.run(args);
+    m.WaitForExit();
+    // Minimal.main() makes no allocations — 0 blocks in use
+    result &= Test("usedBlocks clean exit", (int)m._allocator.usedBlocks(), 0);
+    return result;
+}
+
+bool testAllocatorUsedBlocksLeaked() {
+    bool result = true;
+    HeapStress h;
+    h.count = 5;
+    list<string> args;
+    h.run(args);
+    h.WaitForExit();
+    // HeapStress allocates count ints via new int, none are freed
+    result &= Test("heap stress sum 5", h.exitCode, 15);
+    result &= Test("usedBlocks == count leaked", (int)h._allocator.usedBlocks(), 5);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // stop_token tests
 // ---------------------------------------------------------------------------
 
@@ -323,8 +368,12 @@ extern int main() {
     total++; passed += testProgramArgsAndFieldCombined() ? 1 : 0;
     total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
     total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
-    total++; passed += testWaitForExitWithToken()        ? 1 : 0;
-    total++; passed += testWaitForExitCancelled()        ? 1 : 0;
+    total++; passed += testWaitForExitWithToken()          ? 1 : 0;
+    total++; passed += testWaitForExitCancelled()          ? 1 : 0;
+    total++; passed += testAllocatorNonNullAfterRun()      ? 1 : 0;
+    total++; passed += testAllocatorNullBeforeRun()        ? 1 : 0;
+    total++; passed += testAllocatorUsedBlocksCleanExit()  ? 1 : 0;
+    total++; passed += testAllocatorUsedBlocksLeaked()     ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -6123,8 +6123,9 @@ public:
             return;
         }
 
-        unsigned exitCodeIdx = compiler->programTable[name].ExitCodeFieldIndex;
-        unsigned threadIdx   = compiler->programTable[name].ThreadFieldIndex;
+        unsigned exitCodeIdx    = compiler->programTable[name].ExitCodeFieldIndex;
+        unsigned threadIdx      = compiler->programTable[name].ThreadFieldIndex;
+        unsigned allocatorIdx   = compiler->programTable[name].AllocatorFieldIndex;
 
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
@@ -6132,7 +6133,8 @@ public:
         // ======================================================================
         // EMIT TRAMPOLINE: int __program_run_Name(void* ctx)
         // Runs on the spawned thread. Sets up allocator, calls main, stores
-        // exitCode into self, frees the args packet, returns main's result.
+        // exitCode and allocator pointer into self, frees the args packet,
+        // returns main's result. Allocator cleanup happens in ~Name().
         // ======================================================================
         {
             MyCompilerLLVM::TypeAndValue intReturn;   intReturn.TypeName = "int";
@@ -6181,16 +6183,15 @@ public:
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(progType, self, exitCodeIdx, "exit_code_gep");
             compiler->builder->CreateStore(mainResult, exitCodeGEP);
 
-            // Cleanup: call BlockAllocator.cleanup(allocPtr)
-            compiler->builder->CreateCall(
-                blockAllocCleanupFn->getFunctionType(), blockAllocCleanupFn, {allocPtr});
-
-            // Free the BlockAllocator
-            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocRaw});
-
-            // Clear __active_allocator
+            // Clear __active_allocator — allocations are no longer tracked after main() returns
             compiler->builder->CreateStore(
                 llvm::ConstantPointerNull::get(blockAllocPtrType), activeAllocGlobal);
+
+            // Store allocator into self->_allocator so it remains inspectable after WaitForExit().
+            // Cleanup and free happen in ~Name() when the program struct is destroyed.
+            auto* allocatorFieldGEP = compiler->builder->CreateStructGEP(
+                progType, self, allocatorIdx, "alloc_field_gep");
+            compiler->builder->CreateStore(allocPtr, allocatorFieldGEP);
 
             // Free the args packet (trampoline owns it; run() transferred ownership on start success)
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
@@ -6327,6 +6328,47 @@ public:
                 compiler->CreateBlockBreak(nullptr, true);
             }
         }
+
+        // ======================================================================
+        // EMIT ~Name(): void ~Name(Name* this)   [only if user didn't provide one]
+        // Frees the BlockAllocator stored in _allocator after the program exits.
+        // Null-checks so it's safe to call even if run() was never called.
+        // ======================================================================
+        if (compiler->dataStructures[name].Destructor == nullptr)
+        {
+            MyCompilerLLVM::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+
+            auto* dtorFn = compiler->CreateFunctionDefinition("~" + name, voidReturn, {thisParam});
+            compiler->RegisterDestructor(name, dtorFn);
+
+            auto* thisArg = dtorFn->getArg(0);
+
+            // Load self->_allocator
+            auto* allocFieldGEP = compiler->builder->CreateStructGEP(
+                progType, thisArg, allocatorIdx, "alloc_field_gep");
+            auto* allocLoad = compiler->builder->CreateLoad(blockAllocPtrType, allocFieldGEP, "alloc_load");
+
+            // if (_allocator != nullptr) { cleanup(_allocator); free(_allocator); _allocator = nullptr; }
+            auto* nullAlloc    = llvm::ConstantPointerNull::get(blockAllocPtrType);
+            auto* isNotNull    = compiler->builder->CreateICmpNE(allocLoad, nullAlloc, "alloc_not_null");
+            auto* cleanupBlock = llvm::BasicBlock::Create(*compiler->context, "alloc_cleanup", dtorFn);
+            auto* doneBlock    = llvm::BasicBlock::Create(*compiler->context, "dtor_done",     dtorFn);
+            compiler->builder->CreateCondBr(isNotNull, cleanupBlock, doneBlock);
+
+            compiler->builder->SetInsertPoint(cleanupBlock);
+            compiler->builder->CreateCall(
+                blockAllocCleanupFn->getFunctionType(), blockAllocCleanupFn, {allocLoad});
+            auto* allocVoidPtr = compiler->builder->CreateBitCast(allocLoad, voidPtrType);
+            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocVoidPtr});
+            compiler->builder->CreateStore(nullAlloc, allocFieldGEP);
+            compiler->builder->CreateBr(doneBlock);
+
+            compiler->builder->SetInsertPoint(doneBlock);
+            compiler->CreateReturnCall(nullptr);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
     }
 
     void ParseProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx)
@@ -6352,14 +6394,16 @@ public:
         // Guard against user fields clashing with auto-injected synthetic fields
         for (auto& field : declList)
         {
-            if (field.VariableName == "exitCode" || field.VariableName == "_thread")
+            if (field.VariableName == "exitCode" || field.VariableName == "_thread"
+                || field.VariableName == "_allocator")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
-        // Inject synthetic fields: exitCode (int = -1) and _thread (Thread)
-        unsigned exitCodeFieldIndex = (unsigned)declList.size();
-        unsigned threadFieldIndex   = exitCodeFieldIndex + 1;
+        // Inject synthetic fields: exitCode (int = -1), _thread (Thread), _allocator (BlockAllocator*)
+        unsigned exitCodeFieldIndex  = (unsigned)declList.size();
+        unsigned threadFieldIndex    = exitCodeFieldIndex + 1;
+        unsigned allocatorFieldIndex = threadFieldIndex + 1;
         {
             MyCompilerLLVM::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -6370,6 +6414,12 @@ public:
             threadField.TypeName     = "Thread";
             threadField.VariableName = "_thread";
             declList.push_back(threadField);
+
+            MyCompilerLLVM::DeclTypeAndValue allocatorField;
+            allocatorField.TypeName     = "BlockAllocator";
+            allocatorField.VariableName = "_allocator";
+            allocatorField.Pointer      = true;
+            declList.push_back(allocatorField);
         }
 
         // Build struct type with user fields + synthetic fields
@@ -6426,6 +6476,17 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, threadInitVal, threadFieldIndex);
             }
 
+            // Synthetic field: _allocator = nullptr
+            {
+                auto* blockAllocType = compiler->dataStructures.count("BlockAllocator")
+                                       ? compiler->dataStructures["BlockAllocator"].StructType : nullptr;
+                if (blockAllocType)
+                {
+                    auto* nullAlloc = llvm::ConstantPointerNull::get(blockAllocType->getPointerTo());
+                    structVal = compiler->CreateInsertValue(structVal, nullAlloc, allocatorFieldIndex);
+                }
+            }
+
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -6474,10 +6535,11 @@ public:
         ProcessPendingInstantiations();
 
         // Set programTable before EmitProgramRunWrapper so it can read field indices
-        compiler->programTable[name].StructType        = structType;
-        compiler->programTable[name].ConfigFields      = declList;
-        compiler->programTable[name].ExitCodeFieldIndex = exitCodeFieldIndex;
-        compiler->programTable[name].ThreadFieldIndex   = threadFieldIndex;
+        compiler->programTable[name].StructType          = structType;
+        compiler->programTable[name].ConfigFields        = declList;
+        compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
+        compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
+        compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);
