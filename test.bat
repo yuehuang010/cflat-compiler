@@ -12,7 +12,7 @@ if "%~1"=="--worker-c" (
     set COMPILER=x64\Debug\MyCompiler.exe
     set SRC=Test
     set OUT=out
-    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -35,7 +35,7 @@ if "%~1"=="--worker-cb" (
     set SRC=Test
     set LIB=Test\library
     set OUT=out
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -70,6 +70,7 @@ set COMPILER=x64\Debug\MyCompiler.exe
 set SRC=Test
 set LIB=Test\library
 set OUT=out
+set MYCOMPILER_EXTRA=%*
 set EXCLUDE=test_helper
 set SCRIPT=%~f0
 set START_TIME=%TIME%

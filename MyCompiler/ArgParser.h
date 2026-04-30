@@ -96,8 +96,17 @@ public:
 				}
 				else
 				{
-					std::cerr << "Error: unknown argument '" << arg << "'.\n";
-					return false;
+					// Allow single-dash long flags like -O2, -O1
+					std::string name = arg.substr(1);
+					if (isFlag(name))
+					{
+						m_flagValues[name] = true;
+					}
+					else
+					{
+						std::cerr << "Error: unknown argument '" << arg << "'.\n";
+						return false;
+					}
 				}
 			}
 			else
