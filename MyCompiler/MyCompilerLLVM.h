@@ -729,6 +729,20 @@ private:
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
+            else if (!itr_nameArg->Pointer && GetType(*itr_nameArg)->isStructTy())
+            {
+                // Struct value parameter: store into an alloca so its address is available
+                // (e.g. for reflect(), GEP field access, and taking &param).
+                auto* structTy = GetType(*itr_nameArg);
+                auto* alloc = builder->CreateAlloca(structTy, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, alloc);
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = structTy,
+                    .Storage = alloc,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
             else
             {
                 NamedVariable namedVar

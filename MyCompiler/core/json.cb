@@ -1,0 +1,101 @@
+class JsonBuilder : IReflector
+{
+    stringbuilder sb = default;
+    bool firstField = true;
+
+    void beginObject(string name)
+    {
+        if (name.length() > 0)
+        {
+            if (!firstField) sb.appendChar(',');
+            firstField = false;
+            sb.appendChar('"');
+            sb.append(name);
+            sb.append("\":");
+        }
+        sb.appendChar('{');
+        firstField = true;
+    }
+
+    void endObject()
+    {
+        sb.appendChar('}');
+        firstField = false;
+    }
+
+    void beginArray(string name)
+    {
+        if (!firstField) sb.appendChar(',');
+        firstField = false;
+        sb.appendChar('"');
+        sb.append(name);
+        sb.append("\":[");
+        firstField = true;
+    }
+
+    void endArray()
+    {
+        sb.appendChar(']');
+        firstField = false;
+    }
+
+    void visitInt(string name, int value)
+    {
+        emitKey(name);
+        sb.append(value);
+    }
+
+    void visitBool(string name, bool value)
+    {
+        emitKey(name);
+        if (value) sb.append("true"); else sb.append("false");
+    }
+
+    void visitFloat(string name, float value)
+    {
+        emitKey(name);
+        char[32] buf;
+        i32 len = sprintf(&buf[0], "%g", value);
+        buf[len] = 0;
+        sb.appendCStr(&buf[0]);
+    }
+
+    void visitString(string name, string value)
+    {
+        emitKey(name);
+        sb.appendChar('"');
+        sb.append(value);
+        sb.appendChar('"');
+    }
+
+    void visitNull(string name)
+    {
+        emitKey(name);
+        sb.append("null");
+    }
+
+    void emitKey(string name)
+    {
+        if (!firstField) sb.appendChar(',');
+        firstField = false;
+        if (name.length() > 0)
+        {
+            sb.appendChar('"');
+            sb.append(name);
+            sb.append("\":");
+        }
+    }
+
+    string toString()
+    {
+        return sb.toString();
+    }
+
+    static string toJson<T>(T obj)
+    {
+        JsonBuilder builder;
+        IReflector visitor = builder;
+        reflect(obj, visitor);
+        return builder.toString();
+    }
+};

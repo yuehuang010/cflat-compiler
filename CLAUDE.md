@@ -233,13 +233,13 @@ Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructors
 
 ### Standard Library
 
-Core library files in `core/` are automatically compiled alongside every program:
+The `core/` directory is implicitly added to the import search path by the compiler. Only `runtime.cb` is automatically imported; all other core libraries must be explicitly imported with `import "filename.cb"`.
 
 | File | Exports |
 |------|---------|
-| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort |
-| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` — auto-imported between runtime and string |
-| `string.cb` | `string` value type, manipulation, `IString` implementation |
+| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort — **auto-imported** |
+| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` — requires `import "interfaces.cb"` |
+| `string.cb` | `string` value type, manipulation, `IString` implementation — requires `import "string.cb"` |
 | `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
 | `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` — hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
@@ -248,6 +248,8 @@ Core library files in `core/` are automatically compiled alongside every program
 | `queue.cb` | `queue<T>` — FIFO; `enqueue()`, `dequeue()`, `peek()` |
 | `pair.cb` | `pair<A,B>` — two-field generic struct |
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
+| `thread.cb` | `thread<T>` — Win32 thread wrapper; requires `import "thread.cb"` |
+| `random.cb` | Splitmix64 PRNG; requires `import "random.cb"` |
 
 To add a new core library: add the `.cb` file to `core/` and add an entry in MyCompiler.vcxproj with DeploymentContent.
 Use nullptr instead of null;

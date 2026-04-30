@@ -1189,6 +1189,56 @@ public:
         return {};
     }
 
+    // Infer type arguments for a generic function from call argument types and instantiate it.
+    // Handles simple positional matching: where parameter type == type param name, bind to arg TypeName.
+    std::string TryInferAndInstantiateFromArgs(const std::string& funcName,
+                                               const std::vector<MyCompilerLLVM::NamedVariable>& args)
+    {
+        auto templateIt = genericFunctionTemplates.find(funcName);
+        if (templateIt == genericFunctionTemplates.end()) return {};
+
+        auto* funcCtx = templateIt->second;
+        const auto& typeParams = genericFunctionTypeParams[funcName];
+        if (typeParams.empty()) return {};
+
+        auto* paramTypeList = funcCtx->parameterTypeList();
+        if (!paramTypeList || !paramTypeList->parameterList()) return {};
+        auto paramDecls = paramTypeList->parameterList()->parameterDeclaration();
+
+        std::unordered_map<std::string, std::string> inferred;
+        for (size_t i = 0; i < paramDecls.size() && i < args.size(); i++)
+        {
+            std::string paramTypeName;
+            for (auto* ds : paramDecls[i]->declarationSpecifiers()->declarationSpecifier())
+            {
+                auto* ts = ds->typeSpecifier();
+                if (!ts || !ts->genericIdentifier()) continue;
+                auto* gid = ts->genericIdentifier();
+                if (gid->Identifier()) { paramTypeName = gid->Identifier()->getText(); break; }
+            }
+            for (const auto& tp : typeParams)
+            {
+                if (paramTypeName == tp)
+                {
+                    std::string argType = args[i].TypeAndValue.TypeName;
+                    if (!argType.empty()) inferred[tp] = argType;
+                    break;
+                }
+            }
+        }
+
+        if (inferred.size() != typeParams.size()) return {};
+
+        std::vector<std::string> typeArgs;
+        for (const auto& tp : typeParams)
+        {
+            auto it = inferred.find(tp);
+            if (it == inferred.end()) return {};
+            typeArgs.push_back(it->second);
+        }
+        return InstantiateGenericFunction(funcName, typeArgs);
+    }
+
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -4896,6 +4946,8 @@ public:
 
                                     const std::string& typeName = field.TypeName;
                                     std::string displayName = field.VariableName;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "JsonName" && !ann.Value.empty()) { displayName = ann.Value; break; }
                                     auto* gep = compiler->builder->CreateStructGEP(sd.StructType, objPtr, (unsigned)i,
                                         field.VariableName + "_ptr");
 
@@ -5591,6 +5643,12 @@ public:
                                         auto inst = InferAndInstantiateGenericFunction(functionName, iface);
                                         if (!inst.empty()) { resolvedFuncName = inst; break; }
                                     }
+                                    // If interface-based inference failed, try to infer from argument types.
+                                    if (resolvedFuncName == functionName)
+                                    {
+                                        auto inst = TryInferAndInstantiateFromArgs(functionName, arguments);
+                                        if (!inst.empty()) resolvedFuncName = inst;
+                                    }
                                 }
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
                                 namedVar.Storage = nullptr;
@@ -5734,8 +5792,24 @@ public:
                     else if (rawText[j] == '}') depth--;
                     if (depth > 0) j++;
                 }
+                if (depth > 0)
+                {
+                    // No matching '}' within this string literal — treat '{' as a literal character.
+                    litAccum += '{';
+                    i++;
+                    continue;
+                }
                 std::string exprText = rawText.substr(exprStart, j - exprStart);
                 i = j + 1; // skip past '}'
+
+                // Empty or non-expression content (e.g. JSON {"key": "value"}) — keep as literal.
+                if (exprText.empty() || exprText[0] == '\\' || exprText[0] == '"')
+                {
+                    litAccum += '{';
+                    litAccum += exprText;
+                    litAccum += '}';
+                    continue;
+                }
 
                 flushLiteral();
 
@@ -6071,7 +6145,7 @@ public:
             return {};
 
         // Compiler intrinsics handled at the call site — not in the function table.
-        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof" || name == "reflect" || name == "toJson")
+        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof" || name == "reflect")
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));

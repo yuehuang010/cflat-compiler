@@ -1,0 +1,15 @@
+import "test_helper.cb";
+
+struct Employee {
+    string name = default;
+    int id = 0;
+};
+
+extern int main()
+{
+    Employee e;
+    e.name = "Alice";
+    e.id = 42;
+    printf("%s\n", e.name.data());
+    return 0;
+}

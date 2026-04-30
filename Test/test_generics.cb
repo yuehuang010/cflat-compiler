@@ -930,18 +930,119 @@ struct MathOps
     }
 };
 
+// --- Template with struct type ---
+struct TemplatePoint
+{
+    int x = 0;
+    int y = 0;
+};
+
+struct PointOps
+{
+    static TemplatePoint CombinePoints(TemplatePoint p1, TemplatePoint p2)
+    {
+        TemplatePoint result = default;
+        result.x = p1.x + p2.x;
+        result.y = p1.y + p2.y;
+        return result;
+    }
+};
+
+// --- Template with pointer type ---
+struct PointerOps
+{
+    static T* MakeCopy<T>(T* source)
+    {
+        T* copy = new T;
+        *copy = *source;
+        return copy;
+    }
+
+    static T Dereference<T>(T* ptr)
+    {
+        return *ptr;
+    }
+};
+
+// --- Template with interface type ---
+interface IComparable
+{
+    int CompareTo(IComparable other);
+};
+
+class IntComparable : IComparable
+{
+    int value = 0;
+
+    int CompareTo(IComparable other)
+    {
+        return 0;
+    }
+};
+
+struct InterfaceOps
+{
+    static T* WrapInterface<T>(T value)
+    {
+        T* ptr = new T;
+        *ptr = value;
+        return ptr;
+    }
+};
+
 bool testTemplateFunctions()
 {
     bool result = true;
 
-    // Global generic function with explicit type args
+    // Test 1: Global generic function with explicit type args - primitives
     result &= Test("global_template_int", PickFirst<int>(7, 3), 7);
     result &= Test("global_template_i64", PickFirst<i64>(10, 20), 10);
+    result &= Test("global_template_i32", PickFirst<i32>(99, 1), 99);
+    result &= Test("global_template_u32", PickFirst<u32>(50, 25), 50);
 
-    // Static member generic function
+    // Test 2: Static member generic function - primitives
     result &= Test("static_template_max_int", MathOps.Max<int>(3, 7), 7);
     result &= Test("static_template_max_neg", MathOps.Max<int>(-5, -1), -1);
-    result &= Test("static_template_clamp", MathOps.Clamp<int>(15, 0, 10), 10);
+    result &= Test("static_template_clamp_lo", MathOps.Clamp<int>(15, 0, 10), 10);
+    result &= Test("static_template_clamp_mid", MathOps.Clamp<int>(5, 0, 10), 5);
+    result &= Test("static_template_clamp_hi", MathOps.Clamp<i64>(5, 0, 10), 5);
+
+    // Test 3: Static method with struct type
+    TemplatePoint p1 = default;
+    p1.x = 3;
+    p1.y = 4;
+    TemplatePoint p2 = default;
+    p2.x = 1;
+    p2.y = 2;
+    TemplatePoint p3 = PointOps.CombinePoints(p1, p2);
+    result &= Test("struct_static_combine_x", p3.x, 4);
+    result &= Test("struct_static_combine_y", p3.y, 6);
+
+    // Test 4: Generic pointer type parameter
+    int* intPtr = new int;
+    *intPtr = 42;
+    int* intCopy = PointerOps.MakeCopy<int>(intPtr);
+    int derefValue = PointerOps.Dereference<int>(intCopy);
+    result &= Test("pointer_template_deref_int", derefValue, 42);
+    delete intCopy;
+
+    TemplatePoint* pointPtr = new TemplatePoint;
+    pointPtr->x = 10;
+    pointPtr->y = 20;
+    TemplatePoint* pointCopy = PointerOps.MakeCopy<TemplatePoint>(pointPtr);
+    int copiedX = PointerOps.Dereference<TemplatePoint>(pointCopy).x;
+    int copiedY = PointerOps.Dereference<TemplatePoint>(pointCopy).y;
+    result &= Test("pointer_template_copy_struct_x", copiedX, 10);
+    result &= Test("pointer_template_copy_struct_y", copiedY, 20);
+    delete pointCopy;
+    delete pointPtr;
+
+    // Test 5: Generic interface type parameter
+    IntComparable ic = default;
+    ic.value = 100;
+    IntComparable* icPtr = InterfaceOps.WrapInterface<IntComparable>(ic);
+    result &= Test("interface_template_wrap", icPtr->value, 100);
+    delete icPtr;
 
     return result;
 }

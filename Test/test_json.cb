@@ -1,0 +1,58 @@
+import "test_helper.cb";
+import "json.cb";
+
+annotation JsonName { string value; };
+annotation Private { };
+
+struct Address {
+    [JsonName("street_name")]
+    string street = default;
+    int zip = 0;
+};
+
+struct Employee {
+    [JsonName("full_name")]
+    string name = default;
+    int id = 0;
+    [Private]
+    string _token = default;
+    Address addr = default;
+};
+
+struct Point {
+    int x = 0;
+    int y = 0;
+};
+
+// Verify that '{' and '}' in string literals are not treated as interpolation.
+string buildBraces()
+{
+    stringbuilder sb;
+    sb.append("{");
+    sb.append("}");
+    return sb.toString();
+}
+
+extern int main()
+{
+    bool result = true;
+
+    result &= Test("curly_braces", buildBraces(), "{}");
+
+    Point p;
+    p.x = 3;
+    p.y = 7;
+    result &= Test("flat_struct", JsonBuilder.toJson(p), "{\"x\":3,\"y\":7}");
+
+    Employee e;
+    e.name = "Alice";
+    e.id = 42;
+    e._token = "secret";
+    e.addr.street = "Main St";
+    e.addr.zip = 12345;
+    result &= Test("nested_struct", JsonBuilder.toJson(e),
+        "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
+
+    if (result) printf("All json tests passed.\n");
+    return result ? 0 : 1;
+}
