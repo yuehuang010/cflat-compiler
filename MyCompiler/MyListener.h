@@ -705,6 +705,14 @@ private:
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
 
+    // Pack param index per template: index of the variadic param, or npos if not variadic
+    static inline std::unordered_map<std::string, size_t> genericStructPackIndex;
+    static inline std::unordered_map<std::string, size_t> genericClassPackIndex;
+    static inline std::unordered_map<std::string, size_t> genericFunctionPackIndex;
+
+    // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
+    std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
+
     static inline std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
     static inline std::unordered_set<std::string> instantiatedInterfaces;
@@ -3923,6 +3931,21 @@ public:
                         typeValue.TypeName.pop_back();
                     }
 
+                    // sizeof(T) where T is a pack param returns the element count
+                    if (prefixSizeof)
+                    {
+                        auto packIt = activePackSubstitutions.find(typeValue.TypeName);
+                        if (packIt != activePackSubstitutions.end())
+                        {
+                            MyCompilerLLVM::NamedVariable namedVar;
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(*compiler->context),
+                                (int)packIt->second.size());
+                            namedVar.TypeAndValue.TypeName = "int";
+                            return namedVar;
+                        }
+                    }
+
                     auto* llvmType = compiler->GetType(typeValue, nullptr, true);
                     if (llvmType && !llvmType->isVoidTy())  // Void is a valid type but let's use basic validity check
                     {
@@ -4079,6 +4102,21 @@ public:
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not determine type");
                     return {};
+                }
+
+                // sizeof(T) where T is a pack param returns the element count, not byte size
+                if (isSizeof)
+                {
+                    auto packIt = activePackSubstitutions.find(typeValue.TypeName);
+                    if (packIt != activePackSubstitutions.end())
+                    {
+                        MyCompilerLLVM::NamedVariable namedVar;
+                        namedVar.Primary = llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(*compiler->context),
+                            (int)packIt->second.size());
+                        namedVar.TypeAndValue.TypeName = "int";
+                        return namedVar;
+                    }
                 }
 
                 auto* llvmType = compiler->GetType(typeValue, nullptr, true);
@@ -6762,8 +6800,26 @@ public:
 
             // Set up type substitutions for this instantiation
             auto savedSubst = activeTypeSubstitutions;
-            for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
-                activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+            auto savedPackSubst = activePackSubstitutions;
+
+            auto packMapIt = genericStructPackIndex.find(pending.templateName);
+            size_t packIdx = (packMapIt != genericStructPackIndex.end()) ? packMapIt->second : std::string::npos;
+
+            if (packIdx == std::string::npos)
+            {
+                // Non-variadic: 1:1 mapping
+                for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
+                    activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+            }
+            else
+            {
+                // Fixed params before the pack
+                for (size_t i = 0; i < packIdx && i < pending.typeArgs.size(); i++)
+                    activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                // Pack param absorbs remaining type args
+                activePackSubstitutions[typeParams[packIdx]] =
+                    std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
+            }
 
             if (structIt != genericStructTemplates.end())
                 ParseStructDefinition(structIt->second, pending.mangledName);
@@ -6771,6 +6827,7 @@ public:
                 ParseClassDefinition(classIt->second, pending.mangledName);
 
             activeTypeSubstitutions = savedSubst;
+            activePackSubstitutions = savedPackSubst;
         }
     }
 
@@ -6802,6 +6859,12 @@ public:
             genericStructTemplates[structName] = ctx;
             genericStructTypeParams[structName] = typeParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
+            // Record which param (if any) is variadic — always the last one
+            {
+                auto entries = ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry();
+                bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+                genericStructPackIndex[structName] = hasPack ? (typeParams.size() - 1) : std::string::npos;
+            }
             return;
         }
 
@@ -6813,15 +6876,61 @@ public:
         // Queue and instantiate generic types used in field declarations before
         // ParseDeclarationList resolves them to LLVM types. Only needed at top-level
         // (non-template) scope; template instantiations already have activeTypeSubstitutions
-        // set and their generics are queued via ParseDeclarationSpecifiers.
-        if (activeTypeSubstitutions.empty())
+        // or activePackSubstitutions set and their generics are queued via ParseDeclarationSpecifiers.
+        if (activeTypeSubstitutions.empty() && activePackSubstitutions.empty())
         {
             for (auto decl : declarationList)
                 ScanAndQueueGenericTypeUses(decl);
             ProcessPendingInstantiations();
         }
 
-        auto declList = ParseDeclarationList(declarationList);
+        // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
+        std::vector<MyCompilerLLVM::DeclTypeAndValue> declList;
+        for (auto* decl : declarationList)
+        {
+            std::string packParamName;
+            if (decl->declarationSpecifiers())
+            {
+                for (auto* ds : decl->declarationSpecifiers()->declarationSpecifier())
+                {
+                    auto* ts = ds->typeSpecifier();
+                    if (!ts || !ts->genericIdentifier() || ts->genericIdentifier()->genericTypeParameters()) continue;
+                    auto* gid = ts->genericIdentifier();
+                    if (!gid->Identifier()) continue;
+                    std::string n = gid->Identifier()->getText();
+                    if (activePackSubstitutions.count(n)) { packParamName = n; break; }
+                }
+            }
+
+            if (packParamName.empty())
+            {
+                for (auto& f : ParseDeclarationList({decl}))
+                    declList.push_back(f);
+                continue;
+            }
+
+            std::string baseFieldName;
+            if (auto* idl = decl->initDeclaratorList())
+                if (!idl->initDeclarator().empty())
+                    if (auto* d = idl->initDeclarator()[0]->declarator())
+                        if (auto* dd = d->directDeclarator())
+                            baseFieldName = dd->getText();
+
+            auto& packTypes = activePackSubstitutions.at(packParamName);
+            auto savedPackItemSubst = activeTypeSubstitutions;
+            for (size_t i = 0; i < packTypes.size(); i++)
+            {
+                activeTypeSubstitutions[packParamName] = packTypes[i];
+                auto expanded = ParseDeclarationList({decl});
+                for (auto& f : expanded)
+                {
+                    f.VariableName = baseFieldName + "_" + std::to_string(i);
+                    declList.push_back(f);
+                }
+            }
+            activeTypeSubstitutions = savedPackItemSubst;
+        }
+
         if (compiler->IsVerbose())
             std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
 
@@ -7643,15 +7752,61 @@ public:
         // Queue and instantiate generic types used in field declarations before
         // ParseDeclarationList resolves them to LLVM types. Only needed at top-level
         // (non-template) scope; template instantiations already have activeTypeSubstitutions
-        // set and their generics are queued via ParseDeclarationSpecifiers.
-        if (activeTypeSubstitutions.empty())
+        // or activePackSubstitutions set and their generics are queued via ParseDeclarationSpecifiers.
+        if (activeTypeSubstitutions.empty() && activePackSubstitutions.empty())
         {
             for (auto decl : declarationList)
                 ScanAndQueueGenericTypeUses(decl);
             ProcessPendingInstantiations();
         }
 
-        auto declList = ParseDeclarationList(declarationList);
+        // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
+        std::vector<MyCompilerLLVM::DeclTypeAndValue> declList;
+        for (auto* decl : declarationList)
+        {
+            std::string packParamName;
+            if (decl->declarationSpecifiers())
+            {
+                for (auto* ds : decl->declarationSpecifiers()->declarationSpecifier())
+                {
+                    auto* ts = ds->typeSpecifier();
+                    if (!ts || !ts->genericIdentifier() || ts->genericIdentifier()->genericTypeParameters()) continue;
+                    auto* gid = ts->genericIdentifier();
+                    if (!gid->Identifier()) continue;
+                    std::string n = gid->Identifier()->getText();
+                    if (activePackSubstitutions.count(n)) { packParamName = n; break; }
+                }
+            }
+
+            if (packParamName.empty())
+            {
+                for (auto& f : ParseDeclarationList({decl}))
+                    declList.push_back(f);
+                continue;
+            }
+
+            std::string baseFieldName;
+            if (auto* idl = decl->initDeclaratorList())
+                if (!idl->initDeclarator().empty())
+                    if (auto* d = idl->initDeclarator()[0]->declarator())
+                        if (auto* dd = d->directDeclarator())
+                            baseFieldName = dd->getText();
+
+            auto& packTypes = activePackSubstitutions.at(packParamName);
+            auto savedPackItemSubst = activeTypeSubstitutions;
+            for (size_t i = 0; i < packTypes.size(); i++)
+            {
+                activeTypeSubstitutions[packParamName] = packTypes[i];
+                auto expanded = ParseDeclarationList({decl});
+                for (auto& f : expanded)
+                {
+                    f.VariableName = baseFieldName + "_" + std::to_string(i);
+                    declList.push_back(f);
+                }
+            }
+            activeTypeSubstitutions = savedPackItemSubst;
+        }
+
         if (compiler->IsVerbose())
             std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
 
@@ -7925,6 +8080,7 @@ public:
         if (!typeParamList)
             return typeParams;
 
+        bool seenPack = false;
         for (auto* entry : typeParamList->typeParameterEntry())
         {
             auto* typeSpec = entry->typeSpecifier();
@@ -7934,7 +8090,14 @@ public:
                 LogErrorContext(entry, "Generic type parameter must be an identifier, not a built-in type");
                 continue;
             }
+            if (seenPack)
+            {
+                LogErrorContext(entry, "Only the last type parameter may be a pack (T...)");
+                continue;
+            }
             typeParams.push_back(typeSpec->genericIdentifier()->Identifier()->getText());
+            if (entry->Ellipsis() != nullptr)
+                seenPack = true;
         }
 
         return typeParams;

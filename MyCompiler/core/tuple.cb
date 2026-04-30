@@ -1,0 +1,18 @@
+// tuple<T...> — a heterogeneous sequence of values indexed as item_0, item_1, …
+//
+// Usage:
+//   tuple<int, float, bool> t = default;
+//   t.item_0 = 42;
+//   t.item_1 = 3.14f;
+//   t.item_2 = true;
+//   int n = t.size();   // 3
+
+struct tuple<T...>
+{
+    T item = default;
+
+    int size()
+    {
+        return sizeof(T);
+    }
+};

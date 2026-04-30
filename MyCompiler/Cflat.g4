@@ -303,7 +303,7 @@ typeParameterList
     ;
 
 typeParameterEntry
-    : typeSpecifier pointer?
+    : typeSpecifier pointer? Ellipsis?
     ;
 
 whereClause

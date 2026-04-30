@@ -1,6 +1,7 @@
 import "test_helper.cb";
 import "list.cb";
 import "dictionary.cb";
+import "tuple.cb";
 
 // =============================================================
 // Generic struct tests (compile-time only monomorphization)
@@ -1235,6 +1236,306 @@ bool testConstrainedFunction()
     return result;
 }
 
+// ---- Variadic template tests ----
+
+struct PackTuple<T...>
+{
+    T item = default;
+};
+
+bool testVariadicStruct()
+{
+    PackTuple<int> t1 = default;
+    t1.item_0 = 42;
+    bool result = Test("variadic_1elem", t1.item_0, 42);
+
+    PackTuple<int, float> t2 = default;
+    t2.item_0 = 7;
+    t2.item_1 = 3.0f;
+    result &= Test("variadic_2elem_0", t2.item_0, 7);
+
+    PackTuple<int, int, int> t3 = default;
+    t3.item_0 = 1;
+    t3.item_1 = 2;
+    t3.item_2 = 3;
+    result &= Test("variadic_3elem_2", t3.item_2, 3);
+
+    return result;
+}
+
+struct PackWithFixed<K, V...>
+{
+    K key = default;
+    V value = default;
+};
+
+bool testVariadicFixedPlusPack()
+{
+    PackWithFixed<int, float> p1 = default;
+    p1.key = 99;
+    p1.value_0 = 1.5f;
+    bool result = Test("varfixed_key", p1.key, 99);
+
+    PackWithFixed<int, int, int> p2 = default;
+    p2.key = 5;
+    p2.value_0 = 10;
+    p2.value_1 = 20;
+    result &= Test("varfixed_val1", p2.value_1, 20);
+
+    return result;
+}
+
+struct SizeChecker<T...>
+{
+    int count()
+    {
+        return sizeof(T);
+    }
+};
+
+bool testVariadicSizeof()
+{
+    SizeChecker<int> s1 = default;
+    SizeChecker<int, float, bool> s3 = default;
+    bool result = Test("sizeof_pack_1", s1.count(), 1);
+    result &= Test("sizeof_pack_3", s3.count(), 3);
+    return result;
+}
+
+// =============================================================
+// tuple<T...> comprehensive tests
+// =============================================================
+
+bool testTuplePrimitives()
+{
+    bool result = true;
+
+    tuple<int> ti = default;
+    ti.item_0 = 42;
+    result &= Test("tuple_int_val",  ti.item_0, 42);
+    result &= Test("tuple_int_size", ti.size(),  1);
+
+    tuple<float> tf = default;
+    tf.item_0 = 2.5f;
+    result &= Test("tuple_float_val",  tf.item_0, 2.5f);
+    result &= Test("tuple_float_size", tf.size(),  1);
+
+    tuple<bool> tb = default;
+    tb.item_0 = true;
+    result &= Test("tuple_bool_val",  tb.item_0, true);
+    result &= Test("tuple_bool_size", tb.size(),  1);
+
+    tuple<i64> tl = default;
+    tl.item_0 = 9000000000;
+    result &= Test("tuple_i64_val",  tl.item_0, 9000000000);
+    result &= Test("tuple_i64_size", tl.size(),  1);
+
+    // four-element mixed: int, float, bool, i64
+    tuple<int, float, bool, i64> tmix = default;
+    tmix.item_0 = 7;
+    tmix.item_1 = 1.5f;
+    tmix.item_2 = true;
+    tmix.item_3 = 8000000000;
+    result &= Test("tuple_mix_int",   tmix.item_0, 7);
+    result &= Test("tuple_mix_float", tmix.item_1, 1.5f);
+    result &= Test("tuple_mix_bool",  tmix.item_2, true);
+    result &= Test("tuple_mix_i64",   tmix.item_3, 8000000000);
+    result &= Test("tuple_mix_size",  tmix.size(),  4);
+
+    return result;
+}
+
+bool testTupleSizedIntegers()
+{
+    bool result = true;
+
+    // signed: i8, i16, i32, i64
+    tuple<i8, i16, i32, i64> ts = default;
+    ts.item_0 = 100;
+    ts.item_1 = 30000;
+    ts.item_2 = 2000000;
+    ts.item_3 = 5000000000;
+    result &= Test("tuple_i8",          (int)ts.item_0, 100);
+    result &= Test("tuple_i16",         (int)ts.item_1, 30000);
+    result &= Test("tuple_i32",         ts.item_2,      2000000);
+    result &= Test("tuple_i64_sized",   ts.item_3,      5000000000);
+    result &= Test("tuple_signed_size", ts.size(),      4);
+
+    // unsigned: u8, u16, u32, u64
+    tuple<u8, u16, u32, u64> tu = default;
+    tu.item_0 = 200;
+    tu.item_1 = 50000;
+    tu.item_2 = 2000000;
+    tu.item_3 = 5000000000;
+    result &= Test("tuple_u8",            (int)tu.item_0, 200);
+    result &= Test("tuple_u16",           (int)tu.item_1, 50000);
+    result &= Test("tuple_u32",           (int)tu.item_2, 2000000);
+    result &= Test("tuple_u64_sized",     (i64)tu.item_3, 5000000000);
+    result &= Test("tuple_unsigned_size", tu.size(),      4);
+
+    return result;
+}
+
+bool testTupleStructs()
+{
+    bool result = true;
+
+    // single struct
+    tuple<Person> tp1 = default;
+    tp1.item_0.age = 25;
+    tp1.item_0.id  = 101;
+    result &= Test("tuple_struct_age",  tp1.item_0.age, 25);
+    result &= Test("tuple_struct_id",   tp1.item_0.id,  101);
+    result &= Test("tuple_struct_size", tp1.size(), 1);
+
+    // two structs of same type
+    tuple<Person, Person> tp2 = default;
+    tp2.item_0.age = 30;
+    tp2.item_0.id  = 102;
+    tp2.item_1.age = 40;
+    tp2.item_1.id  = 103;
+    result &= Test("tuple_struct2_age0", tp2.item_0.age, 30);
+    result &= Test("tuple_struct2_id0",  tp2.item_0.id,  102);
+    result &= Test("tuple_struct2_age1", tp2.item_1.age, 40);
+    result &= Test("tuple_struct2_id1",  tp2.item_1.id,  103);
+    result &= Test("tuple_struct2_size", tp2.size(), 2);
+
+    // mixed: struct + int + struct
+    tuple<TemplatePoint, int, Person> tms = default;
+    tms.item_0.x   = 3;
+    tms.item_0.y   = 4;
+    tms.item_1     = 77;
+    tms.item_2.age = 50;
+    result &= Test("tuple_mix_struct_x",   tms.item_0.x,   3);
+    result &= Test("tuple_mix_struct_y",   tms.item_0.y,   4);
+    result &= Test("tuple_mix_struct_int", tms.item_1,     77);
+    result &= Test("tuple_mix_struct_age", tms.item_2.age, 50);
+    result &= Test("tuple_mix_struct_sz",  tms.size(),     3);
+
+    return result;
+}
+
+bool testTupleClasses()
+{
+    bool result = true;
+
+    // single class
+    tuple<Player> tc1 = default;
+    tc1.item_0.points = 15;
+    result &= Test("tuple_class1_pts",  tc1.item_0.points,  15);
+    result &= Test("tuple_class1_scr",  tc1.item_0.Score(), 15);
+    result &= Test("tuple_class1_size", tc1.size(), 1);
+
+    // two different classes
+    tuple<Player, Robot> tc2 = default;
+    tc2.item_0.points = 20;
+    tc2.item_1.power  = 8;
+    result &= Test("tuple_class2_player", tc2.item_0.Score(), 20);
+    result &= Test("tuple_class2_robot",  tc2.item_1.Score(), 16);
+    result &= Test("tuple_class2_size",   tc2.size(), 2);
+
+    // three classes: Player, Robot, Medal (Medal implements IScorer + ILabeled)
+    tuple<Player, Robot, Medal> tc3 = default;
+    tc3.item_0.points = 10;
+    tc3.item_1.power  = 5;
+    tc3.item_2.value  = 7;
+    tc3.item_2.rank   = 2;
+    result &= Test("tuple_class3_player", tc3.item_0.Score(), 10);
+    result &= Test("tuple_class3_robot",  tc3.item_1.Score(), 10);
+    result &= Test("tuple_class3_medal",  tc3.item_2.Score(),  7);
+    result &= Test("tuple_class3_label",  tc3.item_2.Label(),  2);
+    result &= Test("tuple_class3_size",   tc3.size(), 3);
+
+    return result;
+}
+
+bool testTuplePointers()
+{
+    bool result = true;
+
+    // single struct pointer
+    Employee* e1 = new Employee;
+    e1->id     = 1;
+    e1->salary = 50000;
+    tuple<Employee*> tp1 = default;
+    tp1.item_0 = e1;
+    result &= Test("tuple_ptr1_id",     tp1.item_0->id,     1);
+    result &= Test("tuple_ptr1_salary", tp1.item_0->salary, 50000);
+    result &= Test("tuple_ptr1_size",   tp1.size(), 1);
+    delete tp1.item_0;
+
+    // two struct pointers
+    Employee* e2 = new Employee;
+    e2->id     = 2;
+    e2->salary = 60000;
+    Employee* e3 = new Employee;
+    e3->id     = 3;
+    e3->salary = 70000;
+    tuple<Employee*, Employee*> tp2 = default;
+    tp2.item_0 = e2;
+    tp2.item_1 = e3;
+    result &= Test("tuple_ptr2_id0",  tp2.item_0->id,     2);
+    result &= Test("tuple_ptr2_sal0", tp2.item_0->salary, 60000);
+    result &= Test("tuple_ptr2_id1",  tp2.item_1->id,     3);
+    result &= Test("tuple_ptr2_sal1", tp2.item_1->salary, 70000);
+    result &= Test("tuple_ptr2_size", tp2.size(), 2);
+    delete tp2.item_0;
+    delete tp2.item_1;
+
+    // mixed: int* + Employee* + bool*
+    int* ip = new int;
+    *ip = 777;
+    Employee* e4 = new Employee;
+    e4->id = 4;
+    bool* bp = new bool;
+    *bp = true;
+    tuple<int*, Employee*, bool*> tpm = default;
+    tpm.item_0 = ip;
+    tpm.item_1 = e4;
+    tpm.item_2 = bp;
+    result &= Test("tuple_ptr_mix_int",  *tpm.item_0,      777);
+    result &= Test("tuple_ptr_mix_emp",  tpm.item_1->id,   4);
+    result &= Test("tuple_ptr_mix_bool", *tpm.item_2,      true);
+    result &= Test("tuple_ptr_mix_size", tpm.size(),       3);
+    delete tpm.item_0;
+    delete tpm.item_1;
+    delete tpm.item_2;
+
+    return result;
+}
+
+bool testTupleInterfaces()
+{
+    bool result = true;
+
+    // Counter implements IReadable
+    Counter c1 = Counter();
+    tuple<IReadable> ti1 = default;
+    ti1.item_0 = c1;
+    result &= Test("tuple_iface1_read", ti1.item_0.Read(), 10);
+    result &= Test("tuple_iface1_size", ti1.size(), 1);
+
+    // ScaledValue implements both IReadable and IScalable
+    ScaledValue sv = ScaledValue();
+    tuple<IReadable, IScalable> ti2 = default;
+    ti2.item_0 = sv;
+    ti2.item_1 = sv;
+    result &= Test("tuple_iface2_read",  ti2.item_0.Read(),    3);
+    result &= Test("tuple_iface2_scale", ti2.item_1.Scale(4), 12);
+    result &= Test("tuple_iface2_size",  ti2.size(), 2);
+
+    // mixed: IReadable + int
+    Counter c2 = Counter();
+    tuple<IReadable, int> tim = default;
+    tim.item_0 = c2;
+    tim.item_1 = 99;
+    result &= Test("tuple_iface_mix_read", tim.item_0.Read(), 10);
+    result &= Test("tuple_iface_mix_int",  tim.item_1,        99);
+    result &= Test("tuple_iface_mix_size", tim.size(), 2);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -1266,6 +1567,15 @@ extern int main()
     result &= testMultipleConstraintsSameParam();
     result &= testConstrainedClass();
     result &= testConstrainedFunction();
+    result &= testVariadicStruct();
+    result &= testVariadicSizeof();
+    result &= testVariadicFixedPlusPack();
+    result &= testTuplePrimitives();
+    result &= testTupleSizedIntegers();
+    result &= testTupleStructs();
+    result &= testTupleClasses();
+    result &= testTuplePointers();
+    result &= testTupleInterfaces();
     if (result)
     {
         printf("All Test Passed.\n");
