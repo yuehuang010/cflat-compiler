@@ -16,6 +16,50 @@
 #include "MyListener.h"
 #include <filesystem>
 
+static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
+{
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(stream, line))
+        lines.push_back(line);
+    stream.clear();
+    stream.seekg(0);
+    return lines;
+}
+
+void MyCompilerLLVM::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
+                                       const std::vector<std::string>& sourceLines)
+{
+    for (const auto& d : diagnostics)
+    {
+        if (diagnosticSink_)
+        {
+            std::string msg = d.message;
+            if (!d.hint.empty())
+                msg += "\nhint: " + d.hint;
+            diagnosticSink_(d.file, static_cast<size_t>(d.line), static_cast<size_t>(d.col), msg);
+            // No throw — parse errors are pre-codegen; caller returns false.
+        }
+        else
+        {
+            std::cerr << std::format("{}({},{}): error: {}\n", d.file, d.line, d.col, d.message);
+
+            int lineIdx = d.line - 1;
+            if (lineIdx >= 0 && lineIdx < static_cast<int>(sourceLines.size()))
+            {
+                const std::string& srcLine = sourceLines[lineIdx];
+                std::cerr << "    " << srcLine << "\n";
+                std::string caret(4 + std::min(d.col, static_cast<int>(srcLine.size())), ' ');
+                caret += '^';
+                std::cerr << caret << "\n";
+            }
+
+            if (!d.hint.empty())
+                std::cerr << "hint: " << d.hint << "\n";
+        }
+    }
+}
+
 bool MyCompilerLLVM::Compile(const ArgParser& args)
 {
     auto filename = args.getPositional(0).value_or("");
@@ -142,16 +186,29 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         if (verbose) std::cout << "[verbose] parsing " << filename << "\n";
         std::ifstream stream;
         stream.open(filename);
-        antlr4::ANTLRInputStream input(stream);
+        auto sourceLines = ReadFileToLines(stream);
 
+        antlr4::ANTLRInputStream input(stream);
         CFlatLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
+
+        CFlatErrorListener errorListener(filename, sourceLines);
+        lexer.removeErrorListeners();
+        lexer.addErrorListener(&errorListener);
+        parser.removeErrorListeners();
+        parser.addErrorListener(&errorListener);
 
         tokens.fill();
 
         auto computeUnit = parser.compilationUnit();
         if (verbose) std::cout << "[verbose]   parse complete (" << tokens.getTokens().size() << " tokens)\n";
+
+        if (errorListener.hasErrors())
+        {
+            ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
+            return false;
+        }
 
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
@@ -330,13 +387,28 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
         std::cerr << "Error: failed to open imported file '" << canonicalStr << "'.\n";
         return false;
     }
+    auto importSourceLines = ReadFileToLines(*state.stream);
     state.input  = std::make_unique<antlr4::ANTLRInputStream>(*state.stream);
     state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
     state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
     state.parser = std::make_unique<CFlatParser>(state.tokens.get());
+
+    CFlatErrorListener importErrorListener(canonicalStr, importSourceLines);
+    state.lexer->removeErrorListeners();
+    state.lexer->addErrorListener(&importErrorListener);
+    state.parser->removeErrorListeners();
+    state.parser->addErrorListener(&importErrorListener);
+
     state.tokens->fill();
     auto computeUnit = state.parser->compilationUnit();
     if (verbose) std::cout << "[verbose]   parse complete (" << state.tokens->getTokens().size() << " tokens)\n";
+
+    if (importErrorListener.hasErrors())
+    {
+        ReportParseErrors(importErrorListener.getDiagnostics(), importSourceLines);
+        return false;
+    }
+
     auto* parserPtr = state.parser.get();
     state.canonicalPath = canonicalStr;
     importedParseStates.push_back(std::move(state));
@@ -476,13 +548,28 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
     {
         std::ifstream stream;
         stream.open(filePath);
+        auto analyzeSourceLines = ReadFileToLines(stream);
+
         antlr4::ANTLRInputStream input(stream);
         CFlatLexer lexer(&input);
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
+
+        CFlatErrorListener analyzeErrorListener(filePath, analyzeSourceLines);
+        lexer.removeErrorListeners();
+        lexer.addErrorListener(&analyzeErrorListener);
+        parser.removeErrorListeners();
+        parser.addErrorListener(&analyzeErrorListener);
+
         tokens.fill();
 
         auto computeUnit = parser.compilationUnit();
+
+        if (analyzeErrorListener.hasErrors())
+        {
+            ReportParseErrors(analyzeErrorListener.getDiagnostics(), analyzeSourceLines);
+            return false;
+        }
 
         // Process top-level imports before scanning
         if (auto* tu = computeUnit->translationUnit()) {

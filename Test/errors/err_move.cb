@@ -1,6 +1,6 @@
 // Tests that using a variable after it has been moved is a compile-time error.
 
-struct MoveResource { int id = 0; }
+struct MoveResource { int id = 0; };
 void MoveResource(MoveResource* self) { self->id = 0; }
 void consume(move MoveResource* r) { delete r; }
 

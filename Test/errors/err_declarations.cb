@@ -33,7 +33,7 @@ expect_error("enum value must be a constant integer expression") {
 }
 
 expect_error("Generic type parameter must be an identifier, not a built-in type") {
-    struct Box<int> { int value = 0; }
+    struct Box<int> { int value = 0; };
 }
 
 expect_error("does not implement") {

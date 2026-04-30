@@ -166,6 +166,8 @@ Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing 
 
 ### Language Features
 
+For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
+
 - **Generics**: `struct Box<T> { T value = default; }` — monomorphized at compile time
 - **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
 - **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`

@@ -1,4 +1,4 @@
-interface IReadable { int Read(); }
+interface IReadable { int Read(); };
 
 expect_error("pointer '*' is not allowed on interface type 'IReadable'") {
     IReadable* foo;

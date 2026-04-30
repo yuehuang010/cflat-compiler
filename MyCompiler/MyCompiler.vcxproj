@@ -350,6 +350,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ArgParser.h" />
+    <ClInclude Include="CFlatErrorListener.h" />
     <ClInclude Include="CompilerManager.h" />
     <ClInclude Include="Version.h" />
   </ItemGroup>

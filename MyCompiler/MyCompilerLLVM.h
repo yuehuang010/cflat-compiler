@@ -54,6 +54,7 @@
 #include "CompilerManager.h"
 
 #include "LspSymbolIndex.h"
+#include "CFlatErrorListener.h"
 
 struct ExpectedErrorReceived {};
 
@@ -4473,6 +4474,9 @@ public:
 
     void SetSymbolSink(LspSymbolIndex* sink) { symbolSink_ = sink; }
     LspSymbolIndex* GetSymbolSink() const { return symbolSink_; }
+
+    void ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
+                           const std::vector<std::string>& sourceLines);
 
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);
