@@ -1047,6 +1047,194 @@ bool testTemplateFunctions()
     return result;
 }
 
+// =============================================================
+// Generic type constraint tests (where T : IInterface)
+// =============================================================
+
+interface IScorer
+{
+    int Score();
+};
+
+interface ILabeled
+{
+    int Label();
+};
+
+class Player : IScorer
+{
+    int points = 0;
+    int Score() { return points; }
+};
+
+class Robot : IScorer
+{
+    int power = 0;
+    int Score() { return power * 2; }
+};
+
+class Medal : IScorer, ILabeled
+{
+    int value = 0;
+    int rank  = 0;
+    int Score() { return value; }
+    int Label() { return rank;  }
+};
+
+struct BestOf<T> where T : IScorer
+{
+    T first  = default;
+    T second = default;
+
+    int best()
+    {
+        int a = first.Score();
+        int b = second.Score();
+        return a > b ? a : b;
+    }
+};
+
+struct Duel<T, U> where T : IScorer, U : IScorer
+{
+    T challenger = default;
+    U defender   = default;
+
+    bool challengerWins()
+    {
+        return challenger.Score() > defender.Score();
+    }
+};
+
+struct TaggedBest<T> where T : IScorer, T : ILabeled
+{
+    T first  = default;
+    T second = default;
+
+    int bestScore()
+    {
+        int a = first.Score();
+        int b = second.Score();
+        return a > b ? a : b;
+    }
+
+    int bestLabel()
+    {
+        int la = first.Label();
+        int lb = second.Label();
+        return la > lb ? la : lb;
+    }
+};
+
+class ScoreAccumulator<T> where T : IScorer
+{
+    T item  = default;
+    int bonus = 0;
+
+    int total()
+    {
+        return item.Score() + bonus;
+    }
+};
+
+int MaxScore<T>(T* a, T* b) where T : IScorer
+{
+    int sa = a.Score();
+    int sb = b.Score();
+    return sa > sb ? sa : sb;
+}
+
+int SumScores<T>(T* a, T* b) where T : IScorer
+{
+    return a.Score() + b.Score();
+}
+
+bool testBasicStructConstraint()
+{
+    bool result = true;
+    BestOf<Player> bo;
+    bo.first.points  = 10;
+    bo.second.points = 20;
+    result &= Test("constraint_best_of_20", bo.best(), 20);
+    BestOf<Player> bo2;
+    bo2.first.points  = 99;
+    bo2.second.points = 7;
+    result &= Test("constraint_best_of_99", bo2.best(), 99);
+    return result;
+}
+
+bool testAlternativeConcreteType()
+{
+    bool result = true;
+    BestOf<Robot> br;
+    br.first.power  = 5;
+    br.second.power = 8;
+    result &= Test("constraint_robot_best_16", br.best(), 16);
+    BestOf<Robot> br2;
+    br2.first.power  = 9;
+    br2.second.power = 3;
+    result &= Test("constraint_robot_best_18", br2.best(), 18);
+    return result;
+}
+
+bool testTwoConstrainedParams()
+{
+    bool result = true;
+    Duel<Player, Robot> d;
+    d.challenger.points = 25;
+    d.defender.power    = 10;
+    result &= Test("constraint_duel_challenger_wins", d.challengerWins(), true);
+    Duel<Robot, Player> d2;
+    d2.challenger.power  = 3;
+    d2.defender.points   = 50;
+    result &= Test("constraint_duel_defender_wins", d2.challengerWins(), false);
+    return result;
+}
+
+bool testMultipleConstraintsSameParam()
+{
+    bool result = true;
+    TaggedBest<Medal> tb;
+    tb.first.value  = 10;
+    tb.first.rank   = 3;
+    tb.second.value = 7;
+    tb.second.rank  = 5;
+    result &= Test("constraint_tagged_best_score", tb.bestScore(), 10);
+    result &= Test("constraint_tagged_best_label", tb.bestLabel(), 5);
+    return result;
+}
+
+bool testConstrainedClass()
+{
+    bool result = true;
+    ScoreAccumulator<Player> sa;
+    sa.item.points = 30;
+    sa.bonus       = 5;
+    result &= Test("constraint_class_player_total", sa.total(), 35);
+    ScoreAccumulator<Robot> sar;
+    sar.item.power = 4;
+    sar.bonus      = 2;
+    result &= Test("constraint_class_robot_total", sar.total(), 10);
+    return result;
+}
+
+bool testConstrainedFunction()
+{
+    bool result = true;
+    Player p1;
+    p1.points = 15;
+    Player p2;
+    p2.points = 30;
+    result &= Test("constraint_func_max_player", MaxScore<Player>(&p1, &p2), 30);
+    result &= Test("constraint_func_sum_player", SumScores<Player>(&p1, &p2), 45);
+    Robot r1;
+    r1.power = 6;
+    Robot r2;
+    r2.power = 4;
+    result &= Test("constraint_func_max_robot", MaxScore<Robot>(&r1, &r2), 12);
+    result &= Test("constraint_func_sum_robot", SumScores<Robot>(&r1, &r2), 20);
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -1072,6 +1260,12 @@ extern int main()
     result &= testMixedGenericFields();
     result &= testIsPointerIntrinsic();
     result &= testTemplateFunctions();
+    result &= testBasicStructConstraint();
+    result &= testAlternativeConcreteType();
+    result &= testTwoConstrainedParams();
+    result &= testMultipleConstraintsSameParam();
+    result &= testConstrainedClass();
+    result &= testConstrainedFunction();
     if (result)
     {
         printf("All Test Passed.\n");

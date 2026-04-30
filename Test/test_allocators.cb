@@ -1,0 +1,135 @@
+import "arena.cb";
+import "block_allocator.cb";
+
+// =============================================================
+// Arena bump allocator tests
+// =============================================================
+
+bool testArena()
+{
+    Arena arena;
+
+    void* p1 = arena.alloc(16);
+    void* p2 = arena.alloc(32);
+    if (p1 == nullptr) return false;
+    if (p2 == nullptr) return false;
+    if (p1 == p2)      return false;
+
+    if (arena.used() != 48)          return false;
+    if (arena.allocated() < 48)      return false;
+
+    i32* nums = (i32*)arena.alloc(16);
+    if (nums == nullptr) return false;
+    nums[0] = 10; nums[1] = 20; nums[2] = 30; nums[3] = 40;
+    if (nums[0] != 10) return false;
+    if (nums[1] != 20) return false;
+    if (nums[2] != 30) return false;
+    if (nums[3] != 40) return false;
+
+    i32* zeroed = (i32*)arena.zalloc(16);
+    if (zeroed == nullptr) return false;
+    if (zeroed[0] != 0)    return false;
+    if (zeroed[3] != 0)    return false;
+
+    i64 allocBefore = arena.allocated();
+    arena.reset();
+    if (arena.used() != 0)               return false;
+    if (arena.allocated() != allocBefore) return false;
+
+    void* p3 = arena.alloc(16);
+    if (p3 == nullptr) return false;
+    if (p3 != p1)      return false;
+
+    arena.reset();
+    void* big = arena.alloc(131072);
+    if (big == nullptr)               return false;
+    if (arena.allocated() < 131072)   return false;
+
+    arena.reset();
+    arena.setBlockSize(64);
+    arena.alloc(64);
+    arena.alloc(64);
+    arena.alloc(64);
+    if (arena.used() != 192) return false;
+
+    return true;
+}
+
+// =============================================================
+// BlockAllocator fixed-block-size tests
+// =============================================================
+
+bool testBlockAllocator()
+{
+    BlockAllocator ba;
+
+    void* p1 = ba.alloc(32);
+    if (p1 == nullptr) return false;
+
+    void* p2 = ba.alloc(16);
+    if (p2 == nullptr) return false;
+    if (p1 == p2)      return false;
+
+    if (ba.usedBlocks() != 2) return false;
+    if (ba.totalBlocks() < 2) return false;
+
+    ba.dealloc(p1);
+    if (ba.usedBlocks() != 1) return false;
+
+    void* p3 = ba.alloc(8);
+    if (p3 == nullptr) return false;
+    if (p3 != p1)      return false;
+    if (ba.usedBlocks() != 2) return false;
+
+    void* big = ba.alloc(128);
+    if (big != nullptr) return false;
+
+    i32* nums = (i32*)ba.alloc(16);
+    if (nums == nullptr) return false;
+    nums[0] = 10; nums[1] = 20; nums[2] = 30; nums[3] = 40;
+    if (nums[0] != 10) return false;
+    if (nums[3] != 40) return false;
+    ba.dealloc((void*)nums);
+
+    ba.PrintUsage();
+
+    BlockAllocator ba2;
+
+    void* first = ba2.alloc(1);
+    if (first == nullptr) return false;
+
+    i64 pageCapacity = ba2.totalBlocks();
+    if (pageCapacity < 2) return false;
+
+    i64 filled = 1;
+    while (filled < pageCapacity)
+    {
+        void* slot = ba2.alloc(1);
+        if (slot == nullptr) return false;
+        filled = filled + 1;
+    }
+    if (ba2.usedBlocks() != pageCapacity)  return false;
+    if (ba2.totalBlocks() != pageCapacity) return false;
+
+    void* overflow = ba2.alloc(1);
+    if (overflow == nullptr)               return false;
+    if (ba2.totalBlocks() <= pageCapacity) return false;
+
+    ba2.PrintUsage();
+
+    return true;
+}
+
+extern int main()
+{
+    bool result = true;
+    result &= testArena();
+    result &= testBlockAllocator();
+
+    if (result)
+    {
+        printf("All allocator tests passed.\n");
+        return 0;
+    }
+    return 1;
+}

@@ -51,11 +51,11 @@ bool testStartsWith()
     StringView s = StringView();
     s.Init("hello world");
     bool result = true;
-    result &= Test("startsWith_match",    s.StartsWith("hello"),       true);
-    result &= Test("startsWith_full",     s.StartsWith("hello world"), true);
-    result &= Test("startsWith_mismatch", s.StartsWith("world"),       false);
-    result &= Test("startsWith_longer",   s.StartsWith("hello world!"),false);
-    result &= Test("startsWith_empty",    s.StartsWith(""),             true);
+    result &= Test("startsWith_match",    s.StartsWith("hello"),        true);
+    result &= Test("startsWith_full",     s.StartsWith("hello world"),  true);
+    result &= Test("startsWith_mismatch", s.StartsWith("world"),        false);
+    result &= Test("startsWith_longer",   s.StartsWith("hello world!"), false);
+    result &= Test("startsWith_empty",    s.StartsWith(""),              true);
     return result;
 }
 
