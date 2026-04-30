@@ -45,6 +45,23 @@ class list<T> : IEnumerable<T>, IList<T>
         _data[index] = value;
     }
 
+    // Remove the element at index and return it, transferring ownership to the
+    // caller.  The array slot is nulled so the list holds no dangling pointer.
+    // Use removeAt() when you want the list to free; use take() when you want
+    // to keep the element.  Only meaningful for pointer element types.
+    move T take(int index)
+    {
+        T removed = move _data[index];
+        int i = index;
+        while (i < _size - 1)
+        {
+            _data[i] = _data[i + 1];
+            i++;
+        }
+        _size--;
+        return removed;
+    }
+
     // Remove the element at index, shifting subsequent elements left.
     // When T is a pointer type, the removed element is freed automatically
     // (destructor called + memory released).  For value types this is a no-op.
@@ -133,6 +150,16 @@ class list<T> : IEnumerable<T>, IList<T>
 
     ~list()
     {
+        if const (is_pointer(T))
+        {
+            int i = 0;
+            while (i < _size)
+            {
+                if (_data[i] != nullptr)
+                    delete _data[i];
+                i++;
+            }
+        }
         if (_data != nullptr) delete[] _data;
     }
 };

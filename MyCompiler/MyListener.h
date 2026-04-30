@@ -297,21 +297,25 @@ private:
 
         std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
 
-        // Detect functions that heap-allocate and return a new string buffer.
+        // Detect functions that heap-allocate and return a new owned value.
         // operator+ always allocates; operator string(i32) uses malloc; user functions can
-        // opt in by declaring 'move string' as their return type.
-        bool returnsOwnedString = false;
+        // opt in by declaring 'move string' or 'move T*' as their return type.
+        bool returnsOwned = false;
         if (returnType.TypeName == "string")
         {
             if (name == "operator+")
-                returnsOwnedString = true;
+                returnsOwned = true;
             else if (name == "operator string" && allParams.size() == 1 && allParams[0].TypeName == "i32")
-                returnsOwnedString = true;
+                returnsOwned = true;
             else if (returnType.IsMove)
-                returnsOwnedString = true;
+                returnsOwned = true;
+        }
+        else if (returnType.IsMove && returnType.Pointer)
+        {
+            returnsOwned = true;
         }
 
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwnedString);
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned);
 
         if (auto* s = compiler->GetSymbolSink())
         {
@@ -1798,6 +1802,20 @@ public:
                     if (express != nullptr)
                     {
                         auto right = ParseExpression(express);
+                        if (compiler->currentFunctionReturnsOwned && right != nullptr
+                            && !llvm::isa<llvm::Constant>(right)
+                            && right->getType()->isPointerTy())
+                        {
+                            bool returnIsOwned = compiler->IsOwningValue(right)
+                                || compiler->lastCallReturnsOwned
+                                || compiler->lastOwningResult;
+                            if (!returnIsOwned)
+                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned — value must come from 'new', a move parameter, or another move-returning function");
+                        }
+                        // Clear ownership flags consumed by the return check so they don't
+                        // bleed into later return statements via different code paths.
+                        compiler->lastOwningResult = false;
+                        compiler->lastCallReturnsOwned = false;
                         compiler->CreateReturnCall(right);
                     }
                     else
@@ -2521,6 +2539,12 @@ public:
 
         std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
 
+        bool returnsOwned = false;
+        if (returnType.TypeName == "string" && returnType.IsMove)
+            returnsOwned = true;
+        else if (returnType.IsMove && returnType.Pointer)
+            returnsOwned = true;
+
         // Pre-scan declarations in the function body to queue and emit any generic
         // struct instantiations before the function's IR block is opened.
         // At this point no basic block is active, so it is safe to emit new functions.
@@ -2530,7 +2554,7 @@ public:
             ProcessPendingInstantiations();
         }
 
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line);
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned);
 
         compiler->InitializeBlock(&fn->front(), false);
 
@@ -2965,18 +2989,30 @@ public:
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
                         // mark this local as owning so the destructor frees the buffer on scope exit.
-                        if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwnedString)
+                        if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwned)
                         {
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsOwningString = true;
-                            compiler->lastCallReturnsOwnedString = false;
+                            compiler->lastCallReturnsOwned = false;
+                        }
+
+                        // Propagate pointer ownership: if the RHS was a move-returning pointer call,
+                        // mark this local as owning so it is freed on scope exit.
+                        if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
+                        {
+                            compiler->stackNamedVariable.back().namedVariable[name].IsOwning = true;
+                            compiler->lastCallReturnsOwned = false;
                         }
 
                         // Propagate new-allocation: mark local as owning its heap pointer.
-                        if (compiler->lastNewAllocated)
+                        // IsNewAllocated is set alongside IsOwning to enable refcount-on-field-escape
+                        // (move params have IsOwning but not IsNewAllocated).
+                        if (compiler->lastOwningResult)
                         {
-                            compiler->stackNamedVariable.back().namedVariable[name].IsNewAllocated = true;
-                            compiler->lastNewAllocated = false;
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.IsOwning = true;
+                            nv.IsNewAllocated = true;
+                            compiler->lastOwningResult = false;
                         }
                     }
                 }
@@ -3203,10 +3239,17 @@ public:
                     compiler->builder->CreateAdd(cur, compiler->builder->getInt32(1), "refinc"),
                     refAlloca);
             }
-            // Transfer ownership: if RHS was an owning move param, null its alloca so
-            // EmitDestructorsForScope won't free the pointer we just stored elsewhere.
+            // Transfer ownership: null the source alloca so EmitDestructorsForScope
+            // won't free the pointer we just stored elsewhere.
+            // Move params (IsOwning && !IsNewAllocated): null for any destination type.
+            // New-allocated locals (IsOwning && IsNewAllocated): null only for local destinations;
+            //   struct-field escapes use refcount above so both sides validly hold the pointer.
             if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
-                && rightNV.TypeAndValue.Pointer)
+                && rightNV.TypeAndValue.Pointer
+                && (!rightNV.IsNewAllocated
+                    || destination == nullptr
+                    || llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination)))
             {
                 if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
                     compiler->builder->CreateStore(
@@ -4441,7 +4484,7 @@ public:
         result.TypeAndValue.Pointer = true;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
-        compiler->lastNewAllocated = true;
+        compiler->lastOwningResult = true;
         return result;
     }
 
@@ -4528,11 +4571,10 @@ public:
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
+        // move on a value type is a no-op — ownership semantics only apply to pointers.
         if (!argNV.TypeAndValue.Pointer)
-        {
-            LogErrorContext(ctx, "'move' expression requires a pointer type.");
-            return {};
-        }
+            return argNV;
+
         if (argNV.Storage == nullptr)
         {
             LogErrorContext(ctx, "'move' expression requires an addressable source (field or local).");
@@ -4543,8 +4585,8 @@ public:
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
 
-        // Signal ParseDeclaration to mark the target local as IsNewAllocated.
-        compiler->lastNewAllocated = true;
+        // Signal ParseDeclaration to mark the target local as IsOwning.
+        compiler->lastOwningResult = true;
 
         MyCompilerLLVM::NamedVariable result;
         result.Primary      = ptrVal;
@@ -7415,7 +7457,21 @@ public:
                 }
 
                 std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs);
+                bool declReturnsOwned = false;
+                if (declReturnType.TypeName == "string")
+                {
+                    if (declName == "operator+")
+                        declReturnsOwned = true;
+                    else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
+                        declReturnsOwned = true;
+                    else if (declReturnType.IsMove)
+                        declReturnsOwned = true;
+                }
+                else if (declReturnType.IsMove && declReturnType.Pointer)
+                {
+                    declReturnsOwned = true;
+                }
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned);
             }
         }
 
@@ -8263,7 +8319,21 @@ public:
                 }
 
                 std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs);
+                bool declReturnsOwned = false;
+                if (declReturnType.TypeName == "string")
+                {
+                    if (declName == "operator+")
+                        declReturnsOwned = true;
+                    else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
+                        declReturnsOwned = true;
+                    else if (declReturnType.IsMove)
+                        declReturnsOwned = true;
+                }
+                else if (declReturnType.IsMove && declReturnType.Pointer)
+                {
+                    declReturnsOwned = true;
+                }
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned);
             }
         }
 

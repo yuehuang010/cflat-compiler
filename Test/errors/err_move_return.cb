@@ -1,0 +1,13 @@
+// Tests that returning a non-owned expression from a move T* function is a compile-time error.
+
+struct Widget { int id = 0; };
+
+move Widget* borrowLeak(Widget* w)
+{
+    expect_error("function declares 'move' return type but returned expression is not owned") {
+        return w;
+    }
+    return nullptr;
+}
+
+extern int main() { return 0; }

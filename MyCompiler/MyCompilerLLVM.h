@@ -272,11 +272,11 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
-        bool IsOwning = false;           // true for move parameters and owning local pointers — freed on scope exit
+        bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer — freed on scope exit
+        bool IsNewAllocated = false;     // true only for 'new'-allocated locals — enables refcount on field escape (cleared on null-source transfer)
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors — destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
-        bool IsNewAllocated = false;     // true when local was initialized with 'new' — freed at scope exit unless escaped
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         int IdentifierLine = 0;          // source location for use-after-move error reporting
@@ -369,7 +369,7 @@ public:
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
-        bool ReturnsOwnedString = false; // true when the function returns a heap-allocated string the caller must free
+        bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) — caller must free
     };
 
     struct InterfaceMethod
@@ -400,8 +400,9 @@ public:
 
     public:
     TypeAndValue lastCallReturnType;        // set by CreateOverloadedFunctionCall for post-call TypeAndValue queries
-    bool lastCallReturnsOwnedString = false; // set when the last call returned an owned heap string
-    bool lastNewAllocated = false;           // set by ParseNewExpression; consumed by ParseDeclaration
+    bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
+    bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
+    bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
 
     private:
 
@@ -589,7 +590,7 @@ private:
 
         for (const auto& [varName, namedVar] : frame.namedVariable)
         {
-            if (namedVar.TypeAndValue.Pointer && namedVar.IsNewAllocated)
+            if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
             {
                 if (namedVar.RefCountStorage == nullptr)
                 {
@@ -652,7 +653,7 @@ private:
         }
     }
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<MyCompilerLLVM::TypeAndValue> arguments)
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool returnsOwned = false)
     {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -663,6 +664,7 @@ private:
         stackState.resumeBlock = &fn->back();
         stackState.isFunction = true;
         stackState.functionName = friendlyName;
+        currentFunctionReturnsOwned = returnsOwned;
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -3105,7 +3107,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwnedString = false)
+    void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -3124,7 +3126,7 @@ public:
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
-                .ReturnsOwnedString = returnsOwnedString,
+                .ReturnsOwned = returnsOwned,
             };
 
             for (const auto& arg : arguments)
@@ -3164,7 +3166,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
 
@@ -3193,7 +3195,7 @@ public:
             fn = createFunctionProto(mangledName, functionType);
         }
 
-        createFunctionBlock(fn, functionName, arguments);
+        createFunctionBlock(fn, functionName, arguments, returnsOwned);
 
         if (diBuilder && diFile && line > 0)
         {
@@ -3217,6 +3219,7 @@ public:
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
+                .ReturnsOwned = returnsOwned,
             };
 
             for (const auto& arg : arguments)
@@ -3842,7 +3845,7 @@ public:
             if (atomicResult != nullptr)
             {
                 lastCallReturnType = candidate.ReturnType;
-                lastCallReturnsOwnedString = false;
+                lastCallReturnsOwned = false;
                 return atomicResult;
             }
         }
@@ -3851,7 +3854,7 @@ public:
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
-        lastCallReturnsOwnedString = candidate.ReturnsOwnedString;
+        lastCallReturnsOwned = candidate.ReturnsOwned;
 
         // Null out caller's storage for move parameters; mark variable as moved for compile-time checking.
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
@@ -4200,6 +4203,23 @@ public:
         return builder->CreateCall(func, arg);
     }
 
+    // Returns true if value is a load from an owning alloca in any live scope.
+    bool IsOwningValue(llvm::Value* value) const
+    {
+        if (!value) return false;
+        auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value);
+        if (!loadInst) return false;
+        auto* srcAlloca = loadInst->getPointerOperand();
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [varName, nv] : frame.namedVariable)
+                if (nv.Storage == srcAlloca && nv.IsOwning) return true;
+            for (const auto& [varName, nv] : frame.functionArgument)
+                if (nv.Storage == srcAlloca && nv.IsOwning) return true;
+        }
+        return false;
+    }
+
     void CreateReturnCall(llvm::Value* value)
     {
         // check if break has already been inserted.
@@ -4209,8 +4229,8 @@ public:
         // If returning an owned variable loaded from a local alloca, suppress its cleanup
         // so we don't free the value before the caller receives it.
         // The loaded snapshot in `value` already captures the pointer; the caller takes ownership.
-        NamedVariable* ownedStringReturnVar    = nullptr;
-        NamedVariable* ownedNewAllocReturnVar  = nullptr;
+        NamedVariable* ownedStringReturnVar = nullptr;
+        NamedVariable* ownedPtrReturnVar    = nullptr;
         if (value)
         {
             if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value))
@@ -4227,10 +4247,19 @@ public:
                                 nv.IsOwningString = false;  // suppress destructor
                                 return;
                             }
-                            if (nv.Storage == srcAlloca && nv.IsNewAllocated)
+                            if (nv.Storage == srcAlloca && nv.IsOwning)
                             {
-                                ownedNewAllocReturnVar = &nv;
-                                nv.IsNewAllocated = false;  // suppress cleanup on return path
+                                ownedPtrReturnVar = &nv;
+                                nv.IsOwning = false;  // suppress cleanup on return path
+                                return;
+                            }
+                        }
+                        for (auto& [varName, nv] : frame.functionArgument)
+                        {
+                            if (nv.Storage == srcAlloca && nv.IsOwning)
+                            {
+                                ownedPtrReturnVar = &nv;
+                                nv.IsOwning = false;  // suppress cleanup on return path
                                 return;
                             }
                         }
@@ -4247,8 +4276,8 @@ public:
         }
 
         // Restore flags (clean state, though the scope is about to be popped anyway)
-        if (ownedStringReturnVar)   ownedStringReturnVar->IsOwningString = true;
-        if (ownedNewAllocReturnVar) ownedNewAllocReturnVar->IsNewAllocated = true;
+        if (ownedStringReturnVar) ownedStringReturnVar->IsOwningString = true;
+        if (ownedPtrReturnVar)    ownedPtrReturnVar->IsOwning = true;
 
         // If we are inlining a return-block, capture the value and branch to continuation.
         if (returnCapture)

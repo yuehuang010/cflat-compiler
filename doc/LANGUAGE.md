@@ -35,6 +35,7 @@
   - [`is` and `as` Operators](#is-and-as-operators)
   - [Switch on Interface Type](#switch-on-interface-type)
 - [Ownership / Lifetime (`move`)](#ownership--lifetime-move-keyword)
+  - [`move` Return Type](#move-return-type)
 - [Namespaces & Modules](#namespaces--modules)
   - [Namespaces](#namespaces)
   - [`using` Aliases](#using-aliases)
@@ -599,6 +600,51 @@ consume(res);   // res is automatically nulled in the caller after this call
 - **Call site is silent** — no annotation required; the caller's pointer is automatically nulled after a `move` call.
 - `move` is a soft keyword detected by text matching, not an ANTLR token — identifiers named `move` still work.
 - For value types `move` is a no-op; ownership semantics only activate on pointer types.
+
+### `move` Return Type
+
+`move T*` on a function's return type declares that the caller receives ownership of the returned pointer — the caller is responsible for freeing it (or passing it along).
+
+```c
+// Caller receives ownership — pointer freed when r goes out of scope
+move Resource* createResource(int id)
+{
+    Resource* r = new Resource();
+    r->id = id;
+    return r;   // OK: new-allocated, caller owns it
+}
+
+// Forward ownership through a move parameter
+move Resource* forwardResource(move Resource* r)
+{
+    return r;   // OK: r is a move parameter — already owned
+}
+
+{
+    Resource* r = createResource(7);
+    // r is owned; freed at end of scope (destructor called once)
+}
+```
+
+**Rules at return sites** — the compiler enforces that the returned expression is genuinely owned:
+
+| Returned expression | Allowed? |
+|---|---|
+| Result of `new` | Yes |
+| `move` parameter | Yes |
+| Result of another `move T*`-returning call | Yes |
+| Borrowed parameter (`Resource* r`) | **Error** |
+| `nullptr` | Yes (no ownership transferred) |
+
+```c
+move Widget* leak(Widget* w)
+{
+    return w;   // compile error: returned expression is not owned
+}
+```
+
+- **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership — the local is freed at scope exit just like a `new`-allocated pointer.
+- **Forwarding**: a `move T*` function can return a `move` parameter directly; the cleanup that would normally run at scope exit is suppressed so the resource isn't freed prematurely.
 
 ---
 

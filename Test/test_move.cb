@@ -35,6 +35,19 @@ void borrow(Resource* r)
     int x = r->id;
 }
 
+// move T* return type — ownership propagates to caller
+move Resource* createResource(int id)
+{
+    Resource* r = new Resource();
+    r->id = id;
+    return r;
+}
+
+move Resource* forwardResource(move Resource* r)
+{
+    return r;
+}
+
 // ── list<string> helpers ──────────────────────────────────────────────────────
 // Passing list<string> value/pointer as a free-function parameter is a known
 // limitation; these helpers operate on extracted string values instead.
@@ -161,6 +174,44 @@ extern int main()
 
     passed += testListStringMove();
     total += 10;
+
+    // Test 5: move T* return — caller receives ownership, pointer freed at scope exit
+    dtorCount = 0;
+    {
+        Resource* r = createResource(7);
+    }
+    passed += Test("move_return_new_freed", dtorCount, 1);
+    total++;
+
+    // Test 6: move T* return — forward through move param, freed once
+    dtorCount = 0;
+    {
+        Resource* r = createResource(8);
+        Resource* r2 = forwardResource(r);
+    }
+    passed += Test("move_return_forward_freed_once", dtorCount, 1);
+    total++;
+
+    // Test 7: list::take — transfers ownership out of list; element freed by caller,
+    // not by list; list entry is nulled so no double-free
+    dtorCount = 0;
+    {
+        list<Resource*> items;
+        Resource* a = new Resource();
+        Resource* b = new Resource();
+        items.add(a);
+        items.add(b);
+        {
+            Resource* taken = items.take(0);
+            // taken owns the first element; b still in list
+        }
+        // taken freed at scope exit: dtorCount == 1
+        passed += Test("list_take_owned_freed", dtorCount, 1);
+        total++;
+        // list goes out of scope; remaining element (b) freed by list destructor
+    }
+    passed += Test("list_take_remaining_freed", dtorCount, 2);
+    total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
