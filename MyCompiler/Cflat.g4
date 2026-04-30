@@ -38,10 +38,19 @@ primaryExpression
     | genericIdentifier
     | StringLiteral+
     | lambdaExpression
+    | tupleExpression
     | '(' expression ')'
     | NameOf '(' expression ')'
     | TypeOf '(' expression ')'
     | TypeOf '(' typeSpecifier ')'
+    ;
+
+tupleExpression
+    : '(' tupleConstructEntry (',' tupleConstructEntry)+ ')'
+    ;
+
+tupleConstructEntry
+    : assignmentExpression
     ;
 
 genericAssocList
@@ -262,6 +271,20 @@ typeSpecifier
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
     | genericIdentifier
     | functionPointerSpecifier
+    | tupleTypeSpecifier
+    ;
+
+tupleTypeSpecifier
+    : '(' tupleTypeEntry (',' tupleTypeEntry)+ ')'
+    | '(' tupleTypePackEntry ')'
+    ;
+
+tupleTypePackEntry
+    : typeSpecifier Ellipsis
+    ;
+
+tupleTypeEntry
+    : typeSpecifier pointer?
     ;
 
 functionPointerSpecifier
@@ -480,6 +503,15 @@ blockItem
     : statement
     | declaration
     | usingDeclaration
+    | destructuringDeclaration
+    ;
+
+destructuringDeclaration
+    : '(' destructuringEntry (',' destructuringEntry)+ ')' '=' assignmentExpression ';'
+    ;
+
+destructuringEntry
+    : declarationSpecifiers Identifier
     ;
 
 expressionStatement

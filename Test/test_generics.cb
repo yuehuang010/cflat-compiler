@@ -1536,6 +1536,95 @@ bool testTupleInterfaces()
     return result;
 }
 
+// Returns a (int, float) tuple via tuple construction expression
+(int, float) makePoint()
+{
+    return (3, 1.5f);
+}
+
+// Returns a (int, float, bool) tuple
+(int, float, bool) makeTriple()
+{
+    return (42, 2.7f, true);
+}
+
+bool testTupleTypeSyntax()
+{
+    bool result = true;
+
+    // Phase 1: (int, float) as a type
+    (int, float) t = default;
+    t.item_0 = 10;
+    t.item_1 = 0.5f;
+    result &= Test("tuple_type_int",   t.item_0, 10);
+    result &= Test("tuple_type_float", t.item_1, 0.5f);
+    result &= Test("tuple_type_size",  t.size(), 2);
+
+    return result;
+}
+
+bool testTupleConstruct()
+{
+    bool result = true;
+
+    // Phase 2: (expr, expr) construction expression
+    (int, float) p = (7, 3.14f);
+    result &= Test("tuple_ctor_int",   p.item_0, 7);
+    result &= Test("tuple_ctor_float", p.item_1, 3.14f);
+
+    // Three-element construction
+    (int, float, bool) tri = (99, 1.1f, true);
+    result &= Test("tuple_ctor3_int",   tri.item_0, 99);
+    result &= Test("tuple_ctor3_float", tri.item_1, 1.1f);
+    result &= Test("tuple_ctor3_bool",  tri.item_2, true);
+
+    return result;
+}
+
+bool testTupleReturnAndDestructure()
+{
+    bool result = true;
+
+    // Phase 2+3: return a tuple and destructure it
+    (int x, float y) = makePoint();
+    result &= Test("destr_int",   x, 3);
+    result &= Test("destr_float", y, 1.5f);
+
+    // Three-element destructure
+    (int a, float b, bool c) = makeTriple();
+    result &= Test("destr3_int",   a, 42);
+    result &= Test("destr3_float", b, 2.7f);
+    result &= Test("destr3_bool",  c, true);
+
+    return result;
+}
+
+// Phase 4: ITuple<T...> — a third-party type that implements the interface
+class MyRange : ITuple<int, int>
+{
+    int lo = 0;
+    int hi = 0;
+
+    (int, int) get()
+    {
+        return (lo, hi);
+    }
+};
+
+bool testITuple()
+{
+    bool result = true;
+
+    MyRange r;
+    r.lo = 5;
+    r.hi = 10;
+    (int a, int b) = r.get();
+    result &= Test("ituple_lo", a, 5);
+    result &= Test("ituple_hi", b, 10);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -1576,6 +1665,10 @@ extern int main()
     result &= testTupleClasses();
     result &= testTuplePointers();
     result &= testTupleInterfaces();
+    result &= testTupleTypeSyntax();
+    result &= testTupleConstruct();
+    result &= testTupleReturnAndDestructure();
+    result &= testITuple();
     if (result)
     {
         printf("All Test Passed.\n");

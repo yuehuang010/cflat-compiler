@@ -22,6 +22,11 @@
   - [Generic Functions](#generic-functions)
   - [Generic Type Constraints](#generic-type-constraints)
   - [`is_pointer(T)` Intrinsic](#is_pointert-intrinsic)
+- [Tuples](#tuples-coretuplecb)
+  - [Tuple Type Syntax](#tuple-type-syntax)
+  - [Tuple Construction](#tuple-construction)
+  - [Destructuring Declaration](#destructuring-declaration)
+  - [`ITuple<T...>` Interface](#ituplet-interface)
 - [Interfaces & Polymorphism](#interfaces--polymorphism-coreinterfacescb)
   - [Defining and Implementing Interfaces](#defining-and-implementing-interfaces)
   - [Interface Parameters (VTable Dispatch)](#interface-parameters-vtable-dispatch)
@@ -360,6 +365,92 @@ void cleanup<T>(T elem)
         delete elem;   // only compiled for pointer instantiations
     }
 }
+```
+
+---
+
+
+## Tuples (`core/tuple.cb`)
+
+Tuples are heterogeneous fixed-length sequences. The underlying type is `tuple<T...>` (a variadic generic struct), but CFlat provides concise syntax for all common operations.
+
+### Tuple Type Syntax
+
+`(T1, T2, ...)` is syntactic sugar for `tuple<T1, T2, ...>`. Use it anywhere a type is expected:
+
+```c
+(int, float) point = default;
+point.item_0 = 3;
+point.item_1 = 1.5f;
+
+int n = point.size();   // 2 — number of elements
+```
+
+Fields are named `item_0`, `item_1`, … and can be accessed directly.
+
+### Tuple Construction
+
+A parenthesized expression list `(expr1, expr2, ...)` (two or more elements) constructs a tuple by value. The type is inferred from the elements:
+
+```c
+(int, float) p = (3, 1.5f);        // tuple<int, float>
+(int, float, bool) t = (42, 2.7f, true);
+```
+
+Tuples can be returned from functions:
+
+```c
+(int, float) makePoint()
+{
+    return (3, 1.5f);
+}
+```
+
+### Destructuring Declaration
+
+A tuple value can be unpacked into named local variables in a single declaration. The types must be written explicitly:
+
+```c
+(int x, float y) = makePoint();
+// x == 3, y == 1.5f
+
+(int a, float b, bool c) = makeTriple();
+```
+
+The right-hand side can be any expression that evaluates to a matching tuple type — a variable, a function call, or a construction expression.
+
+### `ITuple<T...>` Interface
+
+`ITuple<T...>` (in `interfaces.cb`) is a contract for types that can expose their contents as a tuple. Implement it to make a custom type destructurable via its `get()` method:
+
+```c
+import "interfaces.cb";
+
+class MyRange : ITuple<int, int>
+{
+    int lo = 0;
+    int hi = 0;
+
+    (int, int) get()
+    {
+        return (lo, hi);
+    }
+};
+
+MyRange r;
+r.lo = 5;
+r.hi = 10;
+
+(int a, int b) = r.get();   // a == 5, b == 10
+```
+
+The interface definition is:
+
+```c
+interface ITuple<T...>
+{
+    (T...) get();
+};
 ```
 
 ---
@@ -1097,7 +1188,8 @@ MyCompiler.exe <input.cb> [options]
 | File | Exports |
 |------|---------|
 | `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort — **auto-imported** |
-| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector` |
+| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
+| `tuple.cb` | `tuple<T...>` — variadic heterogeneous value type; fields `item_0`, `item_1`, …; `size()` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation |
 | `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
 | `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |

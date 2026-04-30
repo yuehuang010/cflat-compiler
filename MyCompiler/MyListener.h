@@ -136,6 +136,30 @@ private:
                         declType.IsMove = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
+                    // tuple type sugar: (T1, T2) -> tuple<T1, T2>
+                    if (typeSpec->tupleTypeSpecifier() != nullptr)
+                    {
+                        auto* tts = typeSpec->tupleTypeSpecifier();
+                        // Pack-only form (T...) resolved during instantiation — skip forward-declare here
+                        if (tts->tupleTypePackEntry() != nullptr)
+                            break;
+                        std::vector<std::string> typeArgs;
+                        for (auto* entry : tts->tupleTypeEntry())
+                        {
+                            std::string argName = entry->typeSpecifier()->getText();
+                            if (entry->pointer() != nullptr) argName += "*";
+                            typeArgs.push_back(argName);
+                        }
+                        std::string mangledName = "tuple";
+                        for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
+                        compiler->CreateStructType(mangledName, {});
+                        MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                        compiler->CreateFunctionDeclaration(mangledName, rt, {});
+                        declType.TypeName = mangledName;
+                        declType.Pointer = declSpec->pointer() != nullptr;
+                        declType.ArraySize = declSpec->assignmentExpression();
+                        break;
+                    }
                     // function pointer type: function<RetType(Params)> or bare 'function'
                     if (typeSpec->functionPointerSpecifier() != nullptr)
                     {
@@ -494,6 +518,27 @@ public:
             {
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                     tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
+
+                // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
+                if (typeSpec->tupleTypeSpecifier() != nullptr)
+                {
+                    auto* tts = typeSpec->tupleTypeSpecifier();
+                    // Pack-only form (T...) resolved during instantiation — skip forward-declare here
+                    if (tts->tupleTypePackEntry() == nullptr)
+                    {
+                        std::string mangledName = "tuple";
+                        for (auto* entry : tts->tupleTypeEntry())
+                        {
+                            std::string argName = entry->typeSpecifier()->getText();
+                            if (entry->pointer() != nullptr) argName += "*";
+                            mangledName += "__" + MangleTypeArg(argName);
+                        }
+                        auto* c = Compiler(tts);
+                        c->CreateStructType(mangledName, {});
+                        MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                        c->CreateFunctionDeclaration(mangledName, rt, {});
+                    }
+                }
             }
 
             if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
@@ -709,6 +754,7 @@ private:
     static inline std::unordered_map<std::string, size_t> genericStructPackIndex;
     static inline std::unordered_map<std::string, size_t> genericClassPackIndex;
     static inline std::unordered_map<std::string, size_t> genericFunctionPackIndex;
+    static inline std::unordered_map<std::string, size_t> genericInterfacePackIndex;
 
     // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
     std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
@@ -812,6 +858,54 @@ private:
                 {
                     declType.IsMove = true;
                     continue;  // not a type; look for the actual type in next specifier
+                }
+                // tuple type sugar: (T1, T2) -> tuple<T1, T2>
+                if (typeSpec->tupleTypeSpecifier() != nullptr)
+                {
+                    auto* tts = typeSpec->tupleTypeSpecifier();
+                    std::vector<std::string> typeArgs;
+                    if (tts->tupleTypePackEntry() != nullptr)
+                    {
+                        // (T...) — expand pack substitution
+                        std::string packName = tts->tupleTypePackEntry()->typeSpecifier()->getText();
+                        auto packIt = activePackSubstitutions.find(packName);
+                        if (packIt != activePackSubstitutions.end())
+                            typeArgs = packIt->second;
+                        else
+                            typeArgs.push_back(packName);
+                    }
+                    else
+                    {
+                        for (auto* entry : tts->tupleTypeEntry())
+                        {
+                            std::string argName = entry->typeSpecifier()->getText();
+                            bool argPtr = entry->pointer() != nullptr;
+                            // Apply active type substitutions (e.g. T -> int inside generic body)
+                            auto substIt = activeTypeSubstitutions.find(argName);
+                            if (substIt != activeTypeSubstitutions.end()) argName = substIt->second;
+                            if (argPtr) argName += "*";
+                            typeArgs.push_back(argName);
+                        }
+                    }
+                    std::string mangledName = MangledGenericName("tuple", typeArgs);
+                    declType.TypeName = mangledName;
+                    // Queue instantiation if inside a generic context and not already done
+                    if (!instantiatedGenerics.count(mangledName) &&
+                        (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
+                    {
+                        pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+                        instantiatedGenerics.insert(mangledName);
+                        auto* c = Compiler();
+                        if (!c->GetDataStructure(mangledName).StructType)
+                        {
+                            c->CreateStructType(mangledName, {});
+                            MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                            c->CreateFunctionDeclaration(mangledName, rt, {});
+                        }
+                    }
+                    declType.Pointer = declSpec->pointer() != nullptr;
+                    declType.ArraySize = declSpec->assignmentExpression();
+                    break;
                 }
                 // function pointer type: function<RetType(Params)> or bare 'function'
                 if (typeSpec->functionPointerSpecifier() != nullptr)
@@ -1042,6 +1136,11 @@ public:
             auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
             genericInterfaceTemplates[name] = ctx;
             genericInterfaceTypeParams[name] = typeParams;
+            {
+                auto entries = nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry();
+                bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+                genericInterfacePackIndex[name] = hasPack ? (typeParams.size() - 1) : std::string::npos;
+            }
             return;
         }
 
@@ -1064,7 +1163,8 @@ public:
     }
 
     void InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
-                                     const std::unordered_map<std::string, std::string>& substitutions)
+                                     const std::unordered_map<std::string, std::string>& substitutions,
+                                     const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions = {})
     {
         if (instantiatedInterfaces.count(mangledName)) return;
         instantiatedInterfaces.insert(mangledName);
@@ -1081,8 +1181,11 @@ public:
 
         // Apply substitutions to instantiate the interface methods
         auto savedSubst = activeTypeSubstitutions;
+        auto savedPackSubst = activePackSubstitutions;
         for (const auto& [k, v] : substitutions)
             activeTypeSubstitutions[k] = v;
+        for (const auto& [k, v] : packSubstitutions)
+            activePackSubstitutions[k] = v;
 
         std::vector<MyCompilerLLVM::InterfaceMethod> methods;
         for (auto method : ctx->interfaceMethod())
@@ -1100,6 +1203,7 @@ public:
         }
 
         activeTypeSubstitutions = savedSubst;
+        activePackSubstitutions = savedPackSubst;
         Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods);
     }
 
@@ -1485,6 +1589,7 @@ public:
             auto decl = blockItem->declaration();
             auto statement = blockItem->statement();
             auto usingDecl = blockItem->usingDeclaration();
+            auto destructuring = blockItem->destructuringDeclaration();
 
             if (decl != nullptr)
             {
@@ -1498,6 +1603,83 @@ public:
             {
                 ParseUsingDeclaration(usingDecl);
             }
+            else if (destructuring != nullptr)
+            {
+                ParseDestructuringDeclaration(destructuring);
+            }
+        }
+    }
+
+    void ParseDestructuringDeclaration(CFlatParser::DestructuringDeclarationContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+
+        // Evaluate the RHS once
+        auto rhsNV = ParseAssignmentExpressionNamed(ctx->assignmentExpression());
+        std::string rhsType = rhsNV.TypeAndValue.TypeName;
+
+        // Verify the RHS is a tuple type (mangled name starts with "tuple__")
+        if (rhsType.substr(0, 7) != "tuple__")
+        {
+            LogErrorContext(ctx, std::format("Destructuring requires a tuple type, got '{}'", rhsType));
+            return;
+        }
+
+        auto* structType = compiler->GetDataStructure(rhsType).StructType;
+        if (!structType)
+        {
+            LogErrorContext(ctx, std::format("Tuple type '{}' is not fully instantiated", rhsType));
+            return;
+        }
+
+        // Load the tuple value into a temporary alloca so we can GEP its fields
+        llvm::Value* tupleAlloca = rhsNV.Storage;
+        if (!tupleAlloca)
+        {
+            // RHS was a value not stored — create a temp alloca
+            tupleAlloca = compiler->CreateAlloca(structType);
+            compiler->builder->CreateStore(LoadNamedVariable(rhsNV), tupleAlloca);
+        }
+
+        const auto& structData = compiler->GetDataStructure(rhsType);
+        auto entries = ctx->destructuringEntry();
+
+        if (entries.size() != structData.StructFields.size())
+        {
+            LogErrorContext(ctx, std::format("Destructuring arity mismatch: {} variables for {} fields",
+                entries.size(), structData.StructFields.size()));
+            return;
+        }
+
+        // Declare each variable and load from the corresponding item_i field
+        for (size_t i = 0; i < entries.size(); i++)
+        {
+            auto* entry = entries[i];
+            auto declType = ParseDeclarationSpecifiers(entry->declarationSpecifiers());
+            std::string varName = entry->Identifier()->getText();
+
+            std::string fieldName = "item_" + std::to_string(i);
+            unsigned fieldIdx = 0;
+            for (const auto& f : structData.StructFields)
+            {
+                if (f.VariableName == fieldName) break;
+                fieldIdx++;
+            }
+
+            auto* gep = compiler->CreateStructGEP(structType, tupleAlloca, fieldIdx);
+            auto* fieldLLVMType = compiler->GetType(structData.StructFields[fieldIdx]);
+            auto* fieldVal = compiler->builder->CreateLoad(fieldLLVMType, gep);
+
+            // Allocate and store into the new variable
+            auto* alloca = compiler->CreateAlloca(fieldLLVMType);
+            compiler->builder->CreateStore(fieldVal, alloca);
+
+            declType.VariableName = varName;
+            MyCompilerLLVM::NamedVariable namedVar;
+            namedVar.TypeAndValue = declType;
+            namedVar.Storage = alloca;
+            namedVar.BaseType = fieldLLVMType;
+            compiler->stackNamedVariable.back().namedVariable[varName] = namedVar;
         }
     }
 
@@ -6320,9 +6502,110 @@ public:
         return result;
     }
 
+    // Map an LLVM type to its CFlat canonical type name for tuple construction.
+    std::string LLVMTypeToTypeName(llvm::Type* ty, const std::string& structHint = "")
+    {
+        if (!ty) return "";
+        if (ty->isIntegerTy(1))  return "bool";
+        if (ty->isIntegerTy(8))  return "i8";
+        if (ty->isIntegerTy(16)) return "i16";
+        if (ty->isIntegerTy(32)) return "int";
+        if (ty->isIntegerTy(64)) return "i64";
+        if (ty->isFloatTy())     return "float";
+        if (ty->isDoubleTy())    return "double";
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(ty))
+            return st->hasName() ? st->getName().str() : structHint;
+        if (!structHint.empty()) return structHint;
+        return "";
+    }
+
+    // Build a tuple<T1,T2,...> value from a parenthesized expression list: (e1, e2, ...)
+    MyCompilerLLVM::NamedVariable ParseTupleExpression(CFlatParser::TupleExpressionContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto entries = ctx->tupleConstructEntry();
+
+        // Evaluate each element and collect its type name
+        std::vector<llvm::Value*> elemValues;
+        std::vector<std::string> typeArgs;
+        for (auto* entry : entries)
+        {
+            auto nv = ParseAssignmentExpressionNamed(entry->assignmentExpression());
+            auto* loaded = LoadNamedVariable(nv);
+            elemValues.push_back(loaded);
+
+            // Prefer TypeAndValue.TypeName (set for variables); fall back to LLVM type
+            std::string typeName = nv.TypeAndValue.TypeName;
+            bool typeNameInferred = typeName.empty();
+            if (typeName.empty() && loaded)
+                typeName = LLVMTypeToTypeName(loaded->getType(), nv.TypeAndValue.TypeName);
+            // C integer promotion: untyped small-integer literals widen to int (i32)
+            if (typeNameInferred && (typeName == "i8" || typeName == "i16"))
+            {
+                typeName = "int";
+                loaded = compiler->builder->CreateSExt(loaded, llvm::Type::getInt32Ty(*compiler->context));
+                elemValues.back() = loaded;
+            }
+            if (nv.TypeAndValue.Pointer && !typeName.empty() && typeName.back() != '*')
+                typeName += "*";
+            typeArgs.push_back(typeName);
+        }
+
+        std::string mangledName = MangledGenericName("tuple", typeArgs);
+
+        // Ensure the tuple instantiation is processed before we use its struct layout
+        if (!instantiatedGenerics.count(mangledName) &&
+            (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
+        {
+            pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+            instantiatedGenerics.insert(mangledName);
+            if (!compiler->GetDataStructure(mangledName).StructType)
+            {
+                compiler->CreateStructType(mangledName, {});
+                MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                compiler->CreateFunctionDeclaration(mangledName, rt, {});
+            }
+        }
+        // ProcessPendingInstantiations calls ParseStructDefinition which calls
+        // CreateFunctionDefinition and moves the builder into the new constructor.
+        // Save and restore so we continue emitting into the caller's function body.
+        {
+            auto savedState = compiler->SaveBuilderState();
+            ProcessPendingInstantiations();
+            compiler->RestoreBuilderState(savedState);
+        }
+
+        // Allocate the tuple struct and store each element into item_i field
+        MyCompilerLLVM::TypeAndValue tupleType{ .TypeName = mangledName };
+        auto* structType = compiler->GetDataStructure(mangledName).StructType;
+        auto* alloca = compiler->CreateAlloca(structType);
+        const auto& structData = compiler->GetDataStructure(mangledName);
+        for (size_t i = 0; i < elemValues.size(); i++)
+        {
+            std::string fieldName = "item_" + std::to_string(i);
+            unsigned fieldIdx = 0;
+            for (const auto& f : structData.StructFields)
+            {
+                if (f.VariableName == fieldName) break;
+                fieldIdx++;
+            }
+            auto* gep = compiler->CreateStructGEP(structType, alloca, fieldIdx);
+            compiler->builder->CreateStore(elemValues[i], gep);
+        }
+
+        MyCompilerLLVM::NamedVariable result;
+        result.Storage = alloca;
+        result.Primary = compiler->builder->CreateLoad(structType, alloca);
+        result.TypeAndValue = tupleType;
+        return result;
+    }
+
     llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
+
+        if (auto* tupleCtx = ctx->tupleExpression())
+            return ParseTupleExpression(tupleCtx).Primary;
 
         if (auto* lambdaCtx = ctx->lambdaExpression())
             return ParseLambdaExpression(lambdaCtx).Primary;
@@ -6722,7 +7005,32 @@ public:
         for (auto declSpecItem : declSpec->declarationSpecifier())
         {
             auto typeSpec = declSpecItem->typeSpecifier();
-            if (!typeSpec || !typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->genericTypeParameters())
+            if (!typeSpec) continue;
+
+            // Tuple type sugar: (T1, T2) -> tuple<T1, T2>
+            if (typeSpec->tupleTypeSpecifier() != nullptr)
+            {
+                auto* tts = typeSpec->tupleTypeSpecifier();
+                // Pack-only form (T...) resolved during instantiation — skip queuing here
+                if (tts->tupleTypePackEntry() != nullptr)
+                    break;
+                std::vector<std::string> typeArgs;
+                for (auto* entry : tts->tupleTypeEntry())
+                {
+                    std::string argName = entry->typeSpecifier()->getText();
+                    if (entry->pointer() != nullptr) argName += "*";
+                    typeArgs.push_back(argName);
+                }
+                std::string mangledName = MangledGenericName("tuple", typeArgs);
+                if (!instantiatedGenerics.count(mangledName))
+                {
+                    pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+                    instantiatedGenerics.insert(mangledName);
+                }
+                break;
+            }
+
+            if (!typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->genericTypeParameters())
                 continue;
 
             // This is a generic type instantiation
@@ -6769,12 +7077,25 @@ public:
             {
                 if (ifaceIt != genericInterfaceTemplates.end())
                 {
-                    // It's a generic interface — instantiate it
+                    // It's a generic interface — instantiate it (pack-aware)
                     std::unordered_map<std::string, std::string> ifaceSubst;
+                    std::unordered_map<std::string, std::vector<std::string>> ifacePackSubst;
                     const auto& ifaceTypeParams = genericInterfaceTypeParams[pending.templateName];
-                    for (size_t i = 0; i < ifaceTypeParams.size() && i < pending.typeArgs.size(); i++)
-                        ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
-                    InstantiateGenericInterface(pending.templateName, pending.mangledName, ifaceSubst);
+                    auto packIdxIt = genericInterfacePackIndex.find(pending.templateName);
+                    size_t packIdx = (packIdxIt != genericInterfacePackIndex.end()) ? packIdxIt->second : std::string::npos;
+                    if (packIdx == std::string::npos)
+                    {
+                        for (size_t i = 0; i < ifaceTypeParams.size() && i < pending.typeArgs.size(); i++)
+                            ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                    }
+                    else
+                    {
+                        for (size_t i = 0; i < packIdx && i < pending.typeArgs.size(); i++)
+                            ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                        ifacePackSubst[ifaceTypeParams[packIdx]] =
+                            std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
+                    }
+                    InstantiateGenericInterface(pending.templateName, pending.mangledName, ifaceSubst, ifacePackSubst);
                 }
                 else if (Compiler()->IsVerbose())
                 {
@@ -7956,6 +8277,37 @@ public:
         // Pre-register interfaces before compiling method bodies so that
         // StructImplementsInterface() returns true for assignments inside methods
         // of the class itself (e.g. `IJSON result = this;` inside a class : IJSON).
+        // Helper: resolve concrete type args from an implements clause generic param list,
+        // expanding pack params (T...) using activePackSubstitutions.
+        auto resolveImplsTypeArgs = [&](CFlatParser::GenericTypeParametersContext* gtp) -> std::vector<std::string>
+        {
+            std::vector<std::string> args;
+            for (auto* entry : gtp->typeParameterList()->typeParameterEntry())
+            {
+                std::string name = entry->typeSpecifier() ? entry->typeSpecifier()->getText() : entry->getText();
+                bool isPack = entry->Ellipsis() != nullptr;
+                if (isPack)
+                {
+                    // Expand pack substitution: T... -> [int, float, ...]
+                    auto packIt = activePackSubstitutions.find(name);
+                    if (packIt != activePackSubstitutions.end())
+                        for (const auto& t : packIt->second)
+                            args.push_back(t);
+                    else
+                        args.push_back(name);
+                }
+                else
+                {
+                    auto substIt = activeTypeSubstitutions.find(name);
+                    if (substIt != activeTypeSubstitutions.end())
+                        args.push_back(substIt->second);
+                    else
+                        args.push_back(name);
+                }
+            }
+            return args;
+        };
+
         {
             std::vector<std::string> earlyIfaceNames;
             for (auto* genId : ctx->genericIdentifier())
@@ -7965,15 +8317,7 @@ public:
                 std::string ifaceName = ifaceBaseName;
                 if (genId->genericTypeParameters() != nullptr)
                 {
-                    std::vector<std::string> concreteTypeArgs;
-                    for (auto* entry : genId->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                    {
-                        std::string typeArg = entry->getText();
-                        auto substIt = activeTypeSubstitutions.find(typeArg);
-                        if (substIt != activeTypeSubstitutions.end())
-                            typeArg = substIt->second;
-                        concreteTypeArgs.push_back(typeArg);
-                    }
+                    auto concreteTypeArgs = resolveImplsTypeArgs(genId->genericTypeParameters());
                     ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
                 }
                 earlyIfaceNames.push_back(ifaceName);
@@ -8038,26 +8382,30 @@ public:
 
             if (genId->genericTypeParameters() != nullptr)
             {
-                // Compute concrete type args by applying active substitutions
-                std::vector<std::string> concreteTypeArgs;
-                for (auto* entry : genId->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                {
-                    std::string typeArg = entry->getText();
-                    auto substIt = activeTypeSubstitutions.find(typeArg);
-                    if (substIt != activeTypeSubstitutions.end())
-                        typeArg = substIt->second;
-                    concreteTypeArgs.push_back(typeArg);
-                }
-
+                auto concreteTypeArgs = resolveImplsTypeArgs(genId->genericTypeParameters());
                 ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
 
-                // Build substitution map for the interface template's type params
+                // Build substitution maps for the interface template's type params (pack-aware)
                 std::unordered_map<std::string, std::string> ifaceSubstitutions;
+                std::unordered_map<std::string, std::vector<std::string>> ifacePackSubstitutions;
                 const auto& ifaceTypeParams = genericInterfaceTypeParams[ifaceBaseName];
-                for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
-                    ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                auto ifacePackIdxIt = genericInterfacePackIndex.find(ifaceBaseName);
+                size_t ifacePackIdx = (ifacePackIdxIt != genericInterfacePackIndex.end())
+                                      ? ifacePackIdxIt->second : std::string::npos;
+                if (ifacePackIdx == std::string::npos)
+                {
+                    for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
+                        ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                }
+                else
+                {
+                    for (size_t i = 0; i < ifacePackIdx && i < concreteTypeArgs.size(); i++)
+                        ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                    ifacePackSubstitutions[ifaceTypeParams[ifacePackIdx]] =
+                        std::vector<std::string>(concreteTypeArgs.begin() + ifacePackIdx, concreteTypeArgs.end());
+                }
 
-                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions);
+                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions, ifacePackSubstitutions);
             }
 
             ifaceNames.push_back(ifaceName);

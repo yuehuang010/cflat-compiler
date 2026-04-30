@@ -76,3 +76,10 @@ interface IJSON {
     IJSON      getObject(string key);
     IJSONArray getArray(string key);
 };
+
+// Contract for types that can be destructured as a fixed-length tuple.
+// T... is the ordered list of element types; get() returns all elements as a tuple.
+interface ITuple<T...>
+{
+    (T...) get();
+};
