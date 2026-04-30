@@ -907,6 +907,45 @@ bool testIsPointerIntrinsic()
     return result;
 }
 
+// --- Templated global function (explicit type args) ---
+T PickFirst<T>(T a, T b)
+{
+    return a;
+}
+
+// --- Templated static member function ---
+struct MathOps
+{
+    static T Max<T>(T a, T b)
+    {
+        if (a > b) return a;
+        return b;
+    }
+
+    static T Clamp<T>(T val, T lo, T hi)
+    {
+        if (val < lo) return lo;
+        if (val > hi) return hi;
+        return val;
+    }
+};
+
+bool testTemplateFunctions()
+{
+    bool result = true;
+
+    // Global generic function with explicit type args
+    result &= Test("global_template_int", PickFirst<int>(7, 3), 7);
+    result &= Test("global_template_i64", PickFirst<i64>(10, 20), 10);
+
+    // Static member generic function
+    result &= Test("static_template_max_int", MathOps.Max<int>(3, 7), 7);
+    result &= Test("static_template_max_neg", MathOps.Max<int>(-5, -1), -1);
+    result &= Test("static_template_clamp", MathOps.Clamp<int>(15, 0, 10), 10);
+
+    return result;
+}
+
 extern int main()
 {
     bool result = true;
@@ -931,6 +970,7 @@ extern int main()
     result &= testMultiLayerGeneric();
     result &= testMixedGenericFields();
     result &= testIsPointerIntrinsic();
+    result &= testTemplateFunctions();
     if (result)
     {
         printf("All Test Passed.\n");

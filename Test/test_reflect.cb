@@ -1,0 +1,121 @@
+import "test_helper.cb";
+import "list.cb";
+
+annotation Private { };
+
+// ── Test structs ─────────────────────────────────────────────────────────────
+
+struct Point {
+    int x = 0;
+    int y = 0;
+};
+
+struct Person {
+    string name = default;
+    int age = 0;
+    [Private]
+    string _secret = default;
+    float score = 0.0;
+};
+
+struct Container {
+    Point origin = default;
+    bool active = false;
+};
+
+struct ItemCollection {
+    list<int> items = default;
+};
+
+// ── Minimal IReflector implementation ────────────────────────────────────────
+// Logs method calls to stdout in a testable format.
+
+class DebugReflector : IReflector {
+    void visitInt(string name, int value) {
+        printf("int:%s=%d;", name.data(), value);
+    }
+    void visitBool(string name, bool value) {
+        printf("bool:%s=%d;", name.data(), (int)value);
+    }
+    void visitFloat(string name, float value) {
+        printf("float:%s=%.1f;", name.data(), value);
+    }
+    void visitString(string name, string value) {
+        printf("str:%s=%s;", name.data(), value.data());
+    }
+    void visitNull(string name) {
+        printf("null:%s;", name.data());
+    }
+    void beginObject(string name) {
+        printf("begin:%s;", name.data());
+    }
+    void endObject() {
+        printf("end;");
+    }
+    void beginArray(string name) {
+        printf("arr:%s;", name.data());
+    }
+    void endArray() {
+        printf("endArr;");
+    }
+};
+
+extern int main()
+{
+    DebugReflector r;
+    IReflector visitor = r;
+
+    // ── Test 1: flat struct (Point) with two int fields ──────────────────────
+    printf("TEST1:");
+    Point p;
+    p.x = 3;
+    p.y = 7;
+    reflect(p, visitor);
+    printf("\n");
+
+    // ── Test 2: struct with string, int, float + [Private] ──────────────────
+    printf("TEST2:");
+    Person person;
+    person.name = "Alice";
+    person.age = 30;
+    person._secret = "token123";
+    person.score = 9.5;
+    reflect(person, visitor);
+    printf("\n");
+
+    // ── Test 3: nested struct (value type) ────────────────────────────────────
+    printf("TEST3:");
+    Container c;
+    c.origin.x = 1;
+    c.origin.y = 2;
+    c.active = true;
+    reflect(c, visitor);
+    printf("\n");
+
+    // ── Test 4: pointer to struct (non-null) ─────────────────────────────────
+    printf("TEST4:");
+    Point* pp = new Point();
+    pp.x = 10;
+    pp.y = 20;
+    reflect(pp, visitor);
+    printf("\n");
+    delete pp;
+
+    // ── Test 5: pointer to struct (null) ──────────────────────────────────────
+    printf("TEST5:");
+    Point* nullPtr = nullptr;
+    reflect(nullPtr, visitor);
+    printf("\n");
+
+    // ── Test 6: list field with int elements ──────────────────────────────────
+    printf("TEST6:");
+    ItemCollection ic;
+    ic.items.add(10);
+    ic.items.add(20);
+    ic.items.add(30);
+    reflect(ic, visitor);
+    printf("\n");
+
+    printf("All reflect tests completed.\n");
+    return 0;
+}

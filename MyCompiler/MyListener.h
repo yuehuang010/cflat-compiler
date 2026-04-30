@@ -4746,6 +4746,26 @@ public:
 
                         break;
                     }
+                    case CFlatParser::RuleGenericTypeParameters:
+                    {
+                        auto* genParams = dynamic_cast<CFlatParser::GenericTypeParametersContext*>(ruleContext);
+                        if (!primaryIdentifier.empty() && genericFunctionTemplates.count(primaryIdentifier))
+                        {
+                            std::vector<std::string> typeArgs;
+                            for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
+                            {
+                                std::string arg = entry->getText();
+                                auto it = activeTypeSubstitutions.find(arg);
+                                if (it != activeTypeSubstitutions.end())
+                                    arg = it->second;
+                                typeArgs.push_back(arg);
+                            }
+                            std::string mangled = InstantiateGenericFunction(primaryIdentifier, typeArgs);
+                            if (!mangled.empty())
+                                primaryIdentifier = mangled;
+                        }
+                        break;
+                    }
                     case CFlatParser::RuleArgumentExpressionList:
                     {
                         // Create Function Call
@@ -4798,6 +4818,310 @@ public:
                             }
                             namedVar.Primary = compiler->CreateGlobalString("annotationof", annValue);
                             namedVar.TypeAndValue.TypeName = "string";
+                            break;
+                        }
+
+                        // Intrinsic: reflect(obj, visitor)
+                        // Compile-time resolves obj's struct type T, synthesizes __reflect_T if needed,
+                        // then emits: visitor.beginObject(""); __reflect_T(obj, visitor); visitor.endObject();
+                        if (functionName == "reflect")
+                        {
+                            auto* compiler = Compiler(ctx);
+
+                            // 1. Validate arity
+                            if (argumentList.empty() || argumentList[0]->argumentNamedExpression().size() < 2)
+                            {
+                                LogErrorContext(ctx, "reflect() requires exactly two arguments: reflect(obj, visitor)");
+                                break;
+                            }
+                            auto namedArgCtx = argumentList[0]->argumentNamedExpression();
+
+                            // 2. Evaluate obj argument
+                            auto objNV = ParseAssignmentExpressionNamed(namedArgCtx[0]->assignmentExpression());
+                            std::string structTypeName = objNV.TypeAndValue.TypeName;
+                            bool isPtr = objNV.TypeAndValue.Pointer;
+
+                            // Validate struct type exists
+                            auto sd = compiler->GetDataStructure(structTypeName);
+                            if (!sd.StructType)
+                            {
+                                LogErrorContext(ctx, std::format("reflect(): first argument must be a struct type, got '{}'", structTypeName));
+                                break;
+                            }
+
+                            // 3. Evaluate visitor argument
+                            auto visitorNV = ParseAssignmentExpressionNamed(namedArgCtx[1]->assignmentExpression());
+                            if (!visitorNV.TypeAndValue.IsInterface || visitorNV.TypeAndValue.TypeName != "IReflector")
+                            {
+                                LogErrorContext(ctx, "reflect(): second argument must be an IReflector interface value");
+                                break;
+                            }
+
+                            // Get visitor alloca for interface method calls
+                            llvm::Value* visitorAlloca = visitorNV.Storage;
+                            if (!visitorAlloca)
+                            {
+                                // Visitor was a temporary — alloca it now
+                                auto* fatTy = compiler->GetFatPtrType();
+                                visitorAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_visitor_tmp");
+                                llvm::Value* visitorVal = visitorNV.Primary;
+                                if (!visitorVal)
+                                    visitorVal = compiler->CreateLoad(visitorNV.Storage);
+                                compiler->builder->CreateStore(visitorVal, visitorAlloca);
+                            }
+
+                            // 4. Inline reflection code with recursive lambda for nested structs
+                            auto emptyNameNV = compiler->MakeStringLiteralNV("");
+                            auto structData = compiler->GetDataStructure(structTypeName);
+                            if (!structData.StructType)
+                            {
+                                LogErrorContext(ctx, std::format("reflect: cannot find struct '{}'", structTypeName));
+                                break;
+                            }
+
+                            // Define recursive lambda to emit fields for any struct
+                            std::function<void(const MyCompilerLLVM::StructData&, llvm::Value*)> emitFields;
+                            emitFields = [&](const MyCompilerLLVM::StructData& sd, llvm::Value* objPtr)
+                            {
+                                MyCompilerLLVM::NamedVariable intNV, boolNV, floatNV, strNV;
+                                for (size_t i = 0; i < sd.StructFields.size(); i++)
+                                {
+                                    const auto& field = sd.StructFields[i];
+
+                                    // Skip [Private] fields
+                                    bool isPrivate = false;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "Private") { isPrivate = true; break; }
+                                    if (isPrivate) continue;
+
+                                    const std::string& typeName = field.TypeName;
+                                    std::string displayName = field.VariableName;
+                                    auto* gep = compiler->builder->CreateStructGEP(sd.StructType, objPtr, (unsigned)i,
+                                        field.VariableName + "_ptr");
+
+                                    if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64"
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64")
+                                        && !field.Pointer)
+                                    {
+                                        auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
+                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt32Ty(), false);
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        intNV = {};
+                                        intNV.Primary = widened;
+                                        intNV.TypeAndValue.TypeName = "int";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, intNV});
+                                    }
+                                    else if (typeName == "string" && !field.Pointer)
+                                    {
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        strNV = {};
+                                        strNV.Storage = gep;
+                                        strNV.TypeAndValue.TypeName = "string";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitString", {nameNV, strNV});
+                                    }
+                                    else if (typeName == "bool" && !field.Pointer)
+                                    {
+                                        auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        boolNV = {};
+                                        boolNV.Primary = val;
+                                        boolNV.TypeAndValue.TypeName = "bool";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {nameNV, boolNV});
+                                    }
+                                    else if ((typeName == "float" || typeName == "double") && !field.Pointer)
+                                    {
+                                        llvm::Value* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
+                                        if (typeName == "double")
+                                            val = compiler->builder->CreateFPCast(val, compiler->builder->getFloatTy());
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        floatNV = {};
+                                        floatNV.Primary = val;
+                                        floatNV.TypeAndValue.TypeName = "float";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat", {nameNV, floatNV});
+                                    }
+                                    // ── list<T> field (value type, not pointer) ──────────────
+                                    // Check BEFORE nested struct to avoid treating list as a struct
+                                    else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
+                                    {
+                                        std::string elemTypeName = typeName.substr(6); // strip "list__"
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginArray", {nameNV});
+
+                                        // Call count() on the list struct
+                                        MyCompilerLLVM::NamedVariable selfNV;
+                                        selfNV.Storage = gep;
+                                        selfNV.TypeAndValue.TypeName = typeName;
+                                        auto* countVal = compiler->CreateOverloadedFunctionCall("count", {selfNV});
+
+                                        // Loop: for (int i = 0; i < count; i++)
+                                        auto* i32Ty = compiler->builder->getInt32Ty();
+                                        auto* indexAlloca = compiler->builder->CreateAlloca(i32Ty, nullptr, "reflect_arr_idx");
+                                        compiler->builder->CreateStore(compiler->builder->getInt32(0), indexAlloca);
+
+                                        auto* condBB = compiler->CreateBasicBlock("reflect_arr_cond");
+                                        auto* bodyBB = compiler->CreateBasicBlock("reflect_arr_body");
+                                        auto* afterBB = compiler->CreateBasicBlock("reflect_arr_after");
+                                        compiler->builder->CreateBr(condBB);
+
+                                        // condition: i < count
+                                        compiler->builder->SetInsertPoint(condBB);
+                                        auto* idx = compiler->builder->CreateLoad(i32Ty, indexAlloca);
+                                        auto* cmp = compiler->builder->CreateICmpSLT(idx, countVal);
+                                        compiler->builder->CreateCondBr(cmp, bodyBB, afterBB);
+
+                                        // loop body: get element and dispatch
+                                        compiler->builder->SetInsertPoint(bodyBB);
+                                        auto* idx2 = compiler->builder->CreateLoad(i32Ty, indexAlloca);
+                                        MyCompilerLLVM::NamedVariable idxNV;
+                                        idxNV.Primary = idx2;
+                                        idxNV.TypeAndValue.TypeName = "int";
+                                        auto elemNV = compiler->CreateOverloadedFunctionCall("get", {selfNV, idxNV});
+                                        auto emptyNV = compiler->MakeStringLiteralNV("");
+
+                                        // Dispatch element by type
+                                        if ((elemTypeName == "int" || elemTypeName == "i8" || elemTypeName == "i16" || elemTypeName == "i32" || elemTypeName == "i64"
+                                             || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64"))
+                                        {
+                                            auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt32Ty(), false);
+                                            MyCompilerLLVM::NamedVariable elemIntNV;
+                                            elemIntNV.Primary = widened;
+                                            elemIntNV.TypeAndValue.TypeName = "int";
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {emptyNV, elemIntNV});
+                                        }
+                                        else if (elemTypeName == "bool")
+                                        {
+                                            MyCompilerLLVM::NamedVariable elemBoolNV;
+                                            elemBoolNV.Primary = elemNV;
+                                            elemBoolNV.TypeAndValue.TypeName = "bool";
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {emptyNV, elemBoolNV});
+                                        }
+                                        else if (elemTypeName == "float" || elemTypeName == "double")
+                                        {
+                                            llvm::Value* val = elemNV;
+                                            if (elemTypeName == "double")
+                                                val = compiler->builder->CreateFPCast(val, compiler->builder->getFloatTy());
+                                            MyCompilerLLVM::NamedVariable elemFloatNV;
+                                            elemFloatNV.Primary = val;
+                                            elemFloatNV.TypeAndValue.TypeName = "float";
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat", {emptyNV, elemFloatNV});
+                                        }
+                                        else if (elemTypeName == "string")
+                                        {
+                                            // For string, spill to alloca and set Storage
+                                            MyCompilerLLVM::TypeAndValue strTV;
+                                            strTV.TypeName = "string";
+                                            auto* strAlloca = compiler->builder->CreateAlloca(compiler->GetType(strTV), nullptr, "reflect_arr_elem");
+                                            compiler->builder->CreateStore(elemNV, strAlloca);
+                                            MyCompilerLLVM::NamedVariable elemStrNV;
+                                            elemStrNV.Storage = strAlloca;
+                                            elemStrNV.TypeAndValue.TypeName = "string";
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitString", {emptyNV, elemStrNV});
+                                        }
+                                        else if (compiler->dataStructures.count(elemTypeName))
+                                        {
+                                            // Struct element - spill to alloca and recurse
+                                            auto nestedData = compiler->GetDataStructure(elemTypeName);
+                                            auto* elemAlloca = compiler->builder->CreateAlloca(nestedData.StructType, nullptr, "reflect_arr_elem");
+                                            compiler->builder->CreateStore(elemNV, elemAlloca);
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginObject", {emptyNV});
+                                            emitFields(nestedData, elemAlloca);
+                                            compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endObject", {});
+                                        }
+
+                                        // i++
+                                        auto* nextIdx = compiler->builder->CreateAdd(idx2, compiler->builder->getInt32(1));
+                                        compiler->builder->CreateStore(nextIdx, indexAlloca);
+                                        compiler->builder->CreateBr(condBB);
+
+                                        // after loop
+                                        compiler->builder->SetInsertPoint(afterBB);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endArray", {});
+                                    }
+                                    // ── nested struct (value type) ────────────────────────────
+                                    else if (!field.Pointer && compiler->dataStructures.count(typeName))
+                                    {
+                                        auto nestedData = compiler->GetDataStructure(typeName);
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginObject", {nameNV});
+                                        emitFields(nestedData, gep);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endObject", {});
+                                    }
+                                    // ── nested struct pointer ─────────────────────────────────
+                                    else if (field.Pointer && compiler->dataStructures.count(typeName))
+                                    {
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        auto* ptrVal = compiler->builder->CreateLoad(
+                                            llvm::PointerType::getUnqual(*compiler->context), gep);
+                                        auto* isNull = compiler->builder->CreateICmpEQ(ptrVal,
+                                            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrVal->getType())));
+                                        auto* thenBB = compiler->CreateBasicBlock("reflect_null_f");
+                                        auto* elseBB = compiler->CreateBasicBlock("reflect_obj_f");
+                                        auto* mergeBB = compiler->CreateBasicBlock("reflect_merge_f");
+                                        compiler->builder->CreateCondBr(isNull, thenBB, elseBB);
+                                        // null branch
+                                        compiler->builder->SetInsertPoint(thenBB);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitNull", {nameNV});
+                                        compiler->builder->CreateBr(mergeBB);
+                                        // non-null branch
+                                        compiler->builder->SetInsertPoint(elseBB);
+                                        auto nestedData = compiler->GetDataStructure(typeName);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginObject", {nameNV});
+                                        emitFields(nestedData, ptrVal);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endObject", {});
+                                        compiler->builder->CreateBr(mergeBB);
+                                        // merge
+                                        compiler->builder->SetInsertPoint(mergeBB);
+                                    }
+                                }
+                            };
+
+                            llvm::Value* objPtr = nullptr;
+                            if (isPtr)
+                            {
+                                // Null-check for pointer obj
+                                objPtr = objNV.Primary;
+                                if (!objPtr)
+                                    objPtr = compiler->CreateLoad(objNV.Storage);
+                                auto ptrType = llvm::cast<llvm::PointerType>(objPtr->getType());
+                                auto* isNull = compiler->builder->CreateICmpEQ(objPtr,
+                                    llvm::ConstantPointerNull::get(ptrType));
+
+                                auto* thenBB = compiler->CreateBasicBlock("reflect_null");
+                                auto* elseBB = compiler->CreateBasicBlock("reflect_obj");
+                                auto* mergeBB = compiler->CreateBasicBlock("reflect_merge");
+                                compiler->builder->CreateCondBr(isNull, thenBB, elseBB);
+
+                                // null branch: visitNull("")
+                                compiler->builder->SetInsertPoint(thenBB);
+                                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitNull", {emptyNameNV});
+                                compiler->builder->CreateBr(mergeBB);
+
+                                // non-null branch: beginObject + reflect fields + endObject
+                                compiler->builder->SetInsertPoint(elseBB);
+                                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginObject", {emptyNameNV});
+                                emitFields(structData, objPtr);
+                                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endObject", {});
+                                compiler->builder->CreateBr(mergeBB);
+
+                                compiler->builder->SetInsertPoint(mergeBB);
+                            }
+                            else
+                            {
+                                // Value type: emit reflection code directly
+                                objPtr = objNV.Storage;
+                                if (!objPtr)
+                                {
+                                    LogErrorContext(ctx, "reflect(): cannot take address of temporary struct value");
+                                    break;
+                                }
+
+                                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginObject", {emptyNameNV});
+                                emitFields(structData, objPtr);
+                                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endObject", {});
+                            }
+
+                            // reflect() returns void
+                            namedVar = {};
                             break;
                         }
 
@@ -5747,7 +6071,7 @@ public:
             return {};
 
         // Compiler intrinsics handled at the call site — not in the function table.
-        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof")
+        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof" || name == "reflect" || name == "toJson")
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));
@@ -6289,7 +6613,20 @@ public:
                     continue;
                 }
                 if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
-                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                {
+                    if (func->genericTypeParameters() != nullptr)
+                    {
+                        std::string qualifiedName = structName + "." + funcName;
+                        auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
+                        genericFunctionTemplates[qualifiedName] = func;
+                        genericFunctionTypeParams[qualifiedName] = typeParams;
+                        genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                    }
+                    else
+                    {
+                        ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                    }
+                }
                 else
                     ParseFunctionDefinition(func, structName);
             }
@@ -7078,7 +7415,20 @@ public:
                     continue;
                 }
                 if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
-                    ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                {
+                    if (func->genericTypeParameters() != nullptr)
+                    {
+                        std::string qualifiedName = structName + "." + funcName;
+                        auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
+                        genericFunctionTemplates[qualifiedName] = func;
+                        genericFunctionTypeParams[qualifiedName] = typeParams;
+                        genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
+                    }
+                    else
+                    {
+                        ParseFunctionDefinition(func, {}, {}, structName + "." + funcName);
+                    }
+                }
                 else
                     ParseFunctionDefinition(func, structName);
             }

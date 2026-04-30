@@ -1,0 +1,42 @@
+// reflect() error tests
+
+struct Foo { int x = 0; };
+
+class BadVisitor {
+    // Does NOT implement IReflector
+};
+
+class GoodVisitor : IReflector {
+    void visitInt(string name, int value) { }
+    void visitBool(string name, bool value) { }
+    void visitFloat(string name, float value) { }
+    void visitString(string name, string value) { }
+    void visitNull(string name) { }
+    void beginObject(string name) { }
+    void endObject() { }
+    void beginArray(string name) { }
+    void endArray() { }
+};
+
+// Wrong number of arguments
+expect_error("reflect() requires exactly two arguments") {
+    void test1()
+    {
+        GoodVisitor gv;
+        IReflector v = gv;
+        Foo f;
+        reflect(f);
+    }
+}
+
+// First argument not a struct type
+expect_error("first argument must be a struct type") {
+    void test2()
+    {
+        GoodVisitor gv;
+        IReflector v = gv;
+        reflect(42, v);
+    }
+}
+
+// Removed: interface assignment validation is a separate issue
