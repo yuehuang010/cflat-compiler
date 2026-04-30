@@ -57,3 +57,22 @@ interface IReflector {
     void beginArray(string name);
     void endArray();
 };
+
+interface IJSONArray {
+    int    count();
+    int    getInt(int index);
+    bool   getBool(int index);
+    float  getFloat(int index);
+    string getString(int index);
+    IJSON  getObject(int index);
+};
+
+interface IJSON {
+    bool       hasField(string key);
+    int        getInt(string key);
+    bool       getBool(string key);
+    float      getFloat(string key);
+    string     getString(string key);
+    IJSON      getObject(string key);
+    IJSONArray getArray(string key);
+};

@@ -850,13 +850,25 @@ private:
         }
 
         // Create string.data(string self) -> i8*  [by value, extract field 0]
+        // Returns _ptr if non-null; otherwise returns a pointer to a static empty string.
+        // This makes data() safe on default-initialized strings (ptr==null, len==0).
         {
+            auto* emptyStrTy = llvm::ArrayType::get(builder->getInt8Ty(), 1);
+            auto* emptyStrGlobal = new llvm::GlobalVariable(
+                *module, emptyStrTy, /*isConstant=*/true,
+                llvm::GlobalValue::PrivateLinkage,
+                llvm::ConstantAggregateZero::get(emptyStrTy),
+                "__string_empty");
+
             auto* fnTy = llvm::FunctionType::get(ptrTy, { strTy }, false);
             auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.data", *module);
             fn->arg_begin()->setName("self");
             auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
             llvm::IRBuilder<> b(entry);
-            b.CreateRet(b.CreateExtractValue(&*fn->arg_begin(), { 0u }));
+            auto* ptr = b.CreateExtractValue(&*fn->arg_begin(), { 0u });
+            auto* nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
+            auto* isNull = b.CreateICmpEQ(ptr, nullPtr);
+            b.CreateRet(b.CreateSelect(isNull, emptyStrGlobal, ptr));
 
             TypeAndValue selfParam{ "string", "self", false };
             FunctionSymbol sym;
@@ -1604,11 +1616,24 @@ public:
             auto funcIt = functionTable.find(method.Name);
             if (funcIt != functionTable.end())
             {
+                // method.Parameters excludes 'this'; sym.Parameters[0] is 'this'.
+                // Match by struct this-pointer AND by the remaining parameter types/count,
+                // so overloads like getInt(string) vs getInt(int) resolve correctly.
+                size_t expectedParamCount = 1 + method.Parameters.size();
                 for (const auto& sym : funcIt->second)
                 {
-                    if (sym.Parameters.size() > 0 &&
-                        sym.Parameters[0].TypeName == structName &&
-                        sym.Parameters[0].Pointer)
+                    if (sym.Parameters.size() != expectedParamCount) continue;
+                    if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer) continue;
+                    bool paramsMatch = true;
+                    for (size_t pi = 0; pi < method.Parameters.size(); pi++)
+                    {
+                        if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
+                        {
+                            paramsMatch = false;
+                            break;
+                        }
+                    }
+                    if (paramsMatch)
                     {
                         fn = sym.Function;
                         break;
@@ -2795,12 +2820,29 @@ public:
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_SLE, left, right);
             }
             case Operation::LogicalAnd:
+            {
+                // Normalize both operands to i1 so bitwise AND behaves as logical AND.
+                // Without this, isdigit()-style functions (returning 4, 8, etc.) would
+                // AND to 0 with the i1-widened left side (1 & 4 == 0).
+                if (!left->getType()->isIntegerTy(1))
+                    left = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0), "tobool");
+                if (!right->getType()->isIntegerTy(1))
+                    right = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0), "tobool");
+                return builder->CreateAnd(left, right);
+            }
             case Operation::BitwiseAnd:
             case Operation::AndAssignment:
             {
                 return builder->CreateAnd(left, right);
             }
             case Operation::LogicalOr:
+            {
+                if (!left->getType()->isIntegerTy(1))
+                    left = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0), "tobool");
+                if (!right->getType()->isIntegerTy(1))
+                    right = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0), "tobool");
+                return builder->CreateOr(left, right);
+            }
             case Operation::BitwiseOr:
             case Operation::OrAssignment:
             {

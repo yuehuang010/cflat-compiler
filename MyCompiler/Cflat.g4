@@ -1260,7 +1260,7 @@ fragment EscapeSequence
     ;
 
 fragment SimpleEscapeSequence
-    : '\\' ['"?abfnrtv\\]
+    : '\\' ['"?abfnrtv\\{}]
     ;
 
 fragment OctalEscapeSequence

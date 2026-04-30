@@ -53,6 +53,31 @@ extern int main()
     result &= Test("nested_struct", JsonBuilder.toJson(e),
         "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
 
+    // ── fromJson round-trip tests ────────────────────────────────────────────
+
+    // Basic flat struct
+    Point p2 = JsonBuilder.fromJson<Point>("{\"x\":3,\"y\":7}");
+    result &= Test("fromJson_flat_x", p2.x, 3);
+    result &= Test("fromJson_flat_y", p2.y, 7);
+
+    // [JsonName] annotation — JSON key differs from field name
+    Employee e2 = JsonBuilder.fromJson<Employee>(
+        "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
+    result &= Test("fromJson_name",   e2.name,        "Alice");
+    result &= Test("fromJson_id",     e2.id,          42);
+    result &= Test("fromJson_street", e2.addr.street, "Main St");
+    result &= Test("fromJson_zip",    e2.addr.zip,    12345);
+
+    // [Private] field must keep its default (not populated from JSON)
+    result &= Test("fromJson_private_skipped", e2._token, "");
+
+    // Round-trip: toJson → fromJson → compare fields
+    Employee e3 = JsonBuilder.fromJson<Employee>(JsonBuilder.toJson(e));
+    result &= Test("roundtrip_name",   e3.name,        e.name);
+    result &= Test("roundtrip_id",     e3.id,          e.id);
+    result &= Test("roundtrip_street", e3.addr.street, e.addr.street);
+    result &= Test("roundtrip_zip",    e3.addr.zip,    e.addr.zip);
+
     if (result) printf("All json tests passed.\n");
     return result ? 0 : 1;
 }

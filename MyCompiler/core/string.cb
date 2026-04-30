@@ -241,18 +241,20 @@ struct stringbuilder
         appendChar(10);
     }
 
-    // Return a string view over the current buffer.
-    // The returned string shares the builder's buffer — do not free the builder
-    // while the string is still in use.
+    // Return a copy of the current buffer as a string.
+    // The builder remains intact; the returned string owns its own allocation.
     string toString()
     {
+        i8* copy = new i8[_length + 1];
+        int i = 0;
+        while (i < _length) { copy[i] = _data[i]; i++; }
+        copy[_length] = 0;
         string result;
-        result._ptr = _data;
+        result._ptr = copy;
         result._len = _length;
         return result;
     }
 
-    // Alias matching the IString convention.
     string ToString()
     {
         return toString();

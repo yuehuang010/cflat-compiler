@@ -2951,6 +2951,31 @@ public:
             lambdaExpectedType = {};
             auto right = LoadNamedVariable(rightNV);
 
+            // Interface upcast: struct* -> fat pointer when assigning to an interface variable.
+            // Mirrors the same logic in the declaration initializer path (ParseDeclaration).
+            if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
+                && right && right->getType() != compiler->GetFatPtrType())
+            {
+                std::string structName = rightNV.TypeAndValue.TypeName;
+                if (!structName.empty() && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
+                {
+                    auto vtable = compiler->GetOrCreateVTable(structName, namedVar.TypeAndValue.TypeName);
+                    llvm::Value* dataPtr;
+                    if (rightNV.TypeAndValue.Pointer)
+                        dataPtr = right;
+                    else
+                    {
+                        dataPtr = rightNV.Storage;
+                        if (!dataPtr)
+                        {
+                            dataPtr = compiler->CreateAlloca(right->getType());
+                            compiler->CreateAssignment(right, dataPtr);
+                        }
+                    }
+                    right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                }
+            }
+
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
             if (operatorText != "=")
             {
@@ -5177,6 +5202,265 @@ public:
                             break;
                         }
 
+                        // Compile-time intrinsic: reflect_set(obj, src)
+                        // Symmetric dual of reflect(). Walks obj's struct fields at compile time,
+                        // calls src.getXxx(fieldName) for each, and stores the result back into obj.
+                        // src must be an IJSON interface value. Respects [Private] and [JsonName].
+                        if (functionName == "reflect_set")
+                        {
+                            auto* compiler = Compiler(ctx);
+
+                            // 1. Validate arity
+                            if (argumentList.empty() || argumentList[0]->argumentNamedExpression().size() < 2)
+                            {
+                                LogErrorContext(ctx, "reflect_set() requires exactly two arguments: reflect_set(obj, src)");
+                                break;
+                            }
+                            auto namedArgCtx = argumentList[0]->argumentNamedExpression();
+
+                            // 2. Evaluate obj argument
+                            auto objNV = ParseAssignmentExpressionNamed(namedArgCtx[0]->assignmentExpression());
+                            std::string structTypeName = objNV.TypeAndValue.TypeName;
+                            bool isPtr = objNV.TypeAndValue.Pointer;
+
+                            auto sd = compiler->GetDataStructure(structTypeName);
+                            if (!sd.StructType)
+                            {
+                                LogErrorContext(ctx, std::format("reflect_set(): first argument must be a struct type, got '{}'", structTypeName));
+                                break;
+                            }
+
+                            // 3. Evaluate src argument — must be IJSON
+                            auto srcNV = ParseAssignmentExpressionNamed(namedArgCtx[1]->assignmentExpression());
+                            if (!srcNV.TypeAndValue.IsInterface || srcNV.TypeAndValue.TypeName != "IJSON")
+                            {
+                                LogErrorContext(ctx, "reflect_set(): second argument must be an IJSON interface value");
+                                break;
+                            }
+
+                            // Ensure src is in an alloca for interface method dispatch
+                            llvm::Value* srcAlloca = srcNV.Storage;
+                            if (!srcAlloca)
+                            {
+                                auto* fatTy = compiler->GetFatPtrType();
+                                srcAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_set_src");
+                                llvm::Value* srcVal = srcNV.Primary ? srcNV.Primary : compiler->CreateLoad(srcNV.Storage);
+                                compiler->builder->CreateStore(srcVal, srcAlloca);
+                            }
+
+                            // 4. Recursive lambda: populate fields of any struct from an IJSON alloca
+                            std::function<void(const MyCompilerLLVM::StructData&, llvm::Value*, llvm::Value*)> emitFieldSets;
+                            emitFieldSets = [&](const MyCompilerLLVM::StructData& sd, llvm::Value* objPtr, llvm::Value* srcA)
+                            {
+                                auto* fatTy = compiler->GetFatPtrType();
+
+                                for (size_t i = 0; i < sd.StructFields.size(); i++)
+                                {
+                                    const auto& field = sd.StructFields[i];
+
+                                    // Skip [Private] fields
+                                    bool isPrivate = false;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "Private") { isPrivate = true; break; }
+                                    if (isPrivate) continue;
+
+                                    const std::string& typeName = field.TypeName;
+                                    std::string displayName = field.VariableName;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "JsonName" && !ann.Value.empty()) { displayName = ann.Value; break; }
+
+                                    auto* gep = compiler->builder->CreateStructGEP(sd.StructType, objPtr, (unsigned)i,
+                                        field.VariableName + "_ptr");
+                                    auto nameNV = compiler->MakeStringLiteralNV(displayName);
+
+                                    // ── int / sized integer ──────────────────────────────────
+                                    if ((typeName == "int" || typeName == "i8" || typeName == "i16" || typeName == "i32" || typeName == "i64"
+                                         || typeName == "u8" || typeName == "u16" || typeName == "u32" || typeName == "u64")
+                                        && !field.Pointer)
+                                    {
+                                        auto* intVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getInt", {nameNV});
+                                        auto* narrowed = compiler->Upconvert(intVal, compiler->GetType(field), false);
+                                        compiler->builder->CreateStore(narrowed, gep);
+                                    }
+                                    // ── bool ─────────────────────────────────────────────────
+                                    else if (typeName == "bool" && !field.Pointer)
+                                    {
+                                        auto* boolVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getBool", {nameNV});
+                                        compiler->builder->CreateStore(boolVal, gep);
+                                    }
+                                    // ── float / double ────────────────────────────────────────
+                                    else if ((typeName == "float" || typeName == "double") && !field.Pointer)
+                                    {
+                                        auto* fVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getFloat", {nameNV});
+                                        if (typeName == "double")
+                                            fVal = compiler->builder->CreateFPCast(fVal, compiler->builder->getDoubleTy());
+                                        compiler->builder->CreateStore(fVal, gep);
+                                    }
+                                    // ── string ───────────────────────────────────────────────
+                                    else if (typeName == "string" && !field.Pointer)
+                                    {
+                                        auto* strVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getString", {nameNV});
+                                        compiler->builder->CreateStore(strVal, gep);
+                                    }
+                                    // ── list<T> (value type) ──────────────────────────────────
+                                    else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
+                                    {
+                                        std::string elemTypeName = typeName.substr(6);
+
+                                        // arr = src.getArray(name) → alloca fat ptr
+                                        auto* arrVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getArray", {nameNV});
+                                        auto* arrAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_set_arr");
+                                        compiler->builder->CreateStore(arrVal, arrAlloca);
+
+                                        // count = arr.count()
+                                        auto* countVal = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "count", {});
+
+                                        // Loop i = 0..count
+                                        auto* i32Ty = compiler->builder->getInt32Ty();
+                                        auto* idxAlloca = compiler->builder->CreateAlloca(i32Ty, nullptr, "reflect_set_idx");
+                                        compiler->builder->CreateStore(compiler->builder->getInt32(0), idxAlloca);
+
+                                        auto* condBB = compiler->CreateBasicBlock("rset_arr_cond");
+                                        auto* bodyBB = compiler->CreateBasicBlock("rset_arr_body");
+                                        auto* afterBB = compiler->CreateBasicBlock("rset_arr_after");
+                                        compiler->builder->CreateBr(condBB);
+
+                                        compiler->builder->SetInsertPoint(condBB);
+                                        auto* idx = compiler->builder->CreateLoad(i32Ty, idxAlloca);
+                                        compiler->builder->CreateCondBr(
+                                            compiler->builder->CreateICmpSLT(idx, countVal), bodyBB, afterBB);
+
+                                        compiler->builder->SetInsertPoint(bodyBB);
+                                        auto* idx2 = compiler->builder->CreateLoad(i32Ty, idxAlloca);
+                                        MyCompilerLLVM::NamedVariable idxNV;
+                                        idxNV.Primary = idx2;
+                                        idxNV.TypeAndValue.TypeName = "int";
+
+                                        // list self NV for add()
+                                        MyCompilerLLVM::NamedVariable listNV;
+                                        listNV.Storage = gep;
+                                        listNV.TypeAndValue.TypeName = typeName;
+
+                                        if (elemTypeName == "int" || elemTypeName == "i32")
+                                        {
+                                            auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getInt", {idxNV});
+                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            elemNV.Primary = v;
+                                            elemNV.TypeAndValue.TypeName = "int";
+                                            compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
+                                        }
+                                        else if (elemTypeName == "bool")
+                                        {
+                                            auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getBool", {idxNV});
+                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            elemNV.Primary = v;
+                                            elemNV.TypeAndValue.TypeName = "bool";
+                                            compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
+                                        }
+                                        else if (elemTypeName == "float" || elemTypeName == "double")
+                                        {
+                                            auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getFloat", {idxNV});
+                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            elemNV.Primary = v;
+                                            elemNV.TypeAndValue.TypeName = "float";
+                                            compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
+                                        }
+                                        else if (elemTypeName == "string")
+                                        {
+                                            auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getString", {idxNV});
+                                            MyCompilerLLVM::TypeAndValue strTV;
+                                            strTV.TypeName = "string";
+                                            auto* strAlloca = compiler->builder->CreateAlloca(compiler->GetType(strTV), nullptr, "rset_arr_str");
+                                            compiler->builder->CreateStore(v, strAlloca);
+                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            elemNV.Storage = strAlloca;
+                                            elemNV.TypeAndValue.TypeName = "string";
+                                            compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
+                                        }
+                                        else if (compiler->dataStructures.count(elemTypeName))
+                                        {
+                                            auto* subVal = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getObject", {idxNV});
+                                            auto* subAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "rset_arr_sub");
+                                            compiler->builder->CreateStore(subVal, subAlloca);
+
+                                            auto nestedData = compiler->GetDataStructure(elemTypeName);
+                                            auto* elemAlloca = compiler->builder->CreateAlloca(nestedData.StructType, nullptr, "rset_arr_elem");
+                                            compiler->builder->CreateStore(
+                                                llvm::Constant::getNullValue(nestedData.StructType), elemAlloca);
+                                            emitFieldSets(nestedData, elemAlloca, subAlloca);
+
+                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            elemNV.Storage = elemAlloca;
+                                            elemNV.TypeAndValue.TypeName = elemTypeName;
+                                            compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
+                                        }
+
+                                        // i++
+                                        compiler->builder->CreateStore(
+                                            compiler->builder->CreateAdd(idx2, compiler->builder->getInt32(1)), idxAlloca);
+                                        compiler->builder->CreateBr(condBB);
+                                        compiler->builder->SetInsertPoint(afterBB);
+                                    }
+                                    // ── nested struct (value) ─────────────────────────────────
+                                    else if (!field.Pointer && compiler->dataStructures.count(typeName))
+                                    {
+                                        auto* subVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getObject", {nameNV});
+                                        auto* subAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_set_sub");
+                                        compiler->builder->CreateStore(subVal, subAlloca);
+                                        auto nestedData = compiler->GetDataStructure(typeName);
+                                        emitFieldSets(nestedData, gep, subAlloca);
+                                    }
+                                    // ── nested struct pointer ─────────────────────────────────
+                                    else if (field.Pointer && compiler->dataStructures.count(typeName))
+                                    {
+                                        auto hasfieldNV = nameNV;
+                                        auto* hasVal = compiler->CallInterfaceMethod(srcA, "IJSON", "hasField", {hasfieldNV});
+                                        auto* thenBB = compiler->CreateBasicBlock("rset_ptr_then");
+                                        auto* mergeBB = compiler->CreateBasicBlock("rset_ptr_merge");
+                                        compiler->builder->CreateCondBr(hasVal, thenBB, mergeBB);
+
+                                        compiler->builder->SetInsertPoint(thenBB);
+                                        auto* subVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getObject", {nameNV});
+                                        auto* subAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_set_subp");
+                                        compiler->builder->CreateStore(subVal, subAlloca);
+
+                                        auto nestedData = compiler->GetDataStructure(typeName);
+                                        auto* newObj = compiler->builder->CreateCall(
+                                            compiler->module->getFunction("__alloc_" + typeName) ?
+                                                compiler->module->getFunction("__alloc_" + typeName) : nullptr,
+                                            {});
+                                        // Simpler: just zero-init an alloca and store pointer
+                                        auto* ptrAlloca = compiler->builder->CreateAlloca(nestedData.StructType, nullptr, "rset_ptr_obj");
+                                        compiler->builder->CreateStore(llvm::Constant::getNullValue(nestedData.StructType), ptrAlloca);
+                                        emitFieldSets(nestedData, ptrAlloca, subAlloca);
+                                        compiler->builder->CreateStore(ptrAlloca, gep);
+                                        compiler->builder->CreateBr(mergeBB);
+
+                                        compiler->builder->SetInsertPoint(mergeBB);
+                                    }
+                                }
+                            };
+
+                            // 5. Get obj pointer
+                            llvm::Value* objPtr = nullptr;
+                            if (isPtr)
+                                objPtr = objNV.Primary ? objNV.Primary : compiler->CreateLoad(objNV.Storage);
+                            else
+                            {
+                                objPtr = objNV.Storage;
+                                if (!objPtr)
+                                {
+                                    LogErrorContext(ctx, "reflect_set(): cannot take address of temporary struct value");
+                                    break;
+                                }
+                            }
+
+                            emitFieldSets(sd, objPtr, srcAlloca);
+
+                            namedVar = {};
+                            break;
+                        }
+
                         // Compile-time intrinsic: is_pointer(T) — returns 1 if the type parameter T
                         // resolves to a pointer type in the current generic instantiation, 0 otherwise.
                         // Useful with `if const` to branch on pointer vs value element types.
@@ -5715,6 +5999,7 @@ public:
 
     // Returns true if rawText (the full StringLiteral token text including quotes)
     // contains at least one unescaped '{' that starts an interpolation expression.
+    // '{{' is an escaped literal '{' and does NOT count as interpolation.
     bool HasInterpolation(const std::string& rawText)
     {
         bool inEscape = false;
@@ -5723,7 +6008,16 @@ public:
             char c = rawText[i];
             if (inEscape) { inEscape = false; continue; }
             if (c == '\\') { inEscape = true; continue; }
-            if (c == '{') return true;
+            if (c == '{')
+            {
+                // {{ is an escaped literal '{', not an interpolation start.
+                if (i + 1 < rawText.size() - 1 && rawText[i + 1] == '{')
+                {
+                    i++; // skip second '{'
+                    continue;
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -5782,6 +6076,14 @@ public:
             }
             if (c == '{')
             {
+                // {{ is a literal '{', not an interpolation start.
+                if (i + 1 < end && rawText[i + 1] == '{')
+                {
+                    litAccum += '{';
+                    i += 2;
+                    continue;
+                }
+
                 // Find matching '}'
                 size_t exprStart = i + 1;
                 int depth = 1;
@@ -5850,6 +6152,13 @@ public:
                 }
 
                 segments.push_back({ ptr, len });
+                continue;
+            }
+            // }} is a literal '}', not special on its own, but symmetric with {{.
+            if (c == '}' && i + 1 < end && rawText[i + 1] == '}')
+            {
+                litAccum += '}';
+                i += 2;
                 continue;
             }
             litAccum += c;
@@ -6030,7 +6339,7 @@ public:
             std::string rawText = ctx->getText();
             if (HasInterpolation(rawText))
                 return ParseFormatString(ctx, rawText);
-            std::string processed = ProcessRawText(rawText);
+            std::string processed = ProcessRawText(rawText, /*foldBraces=*/true);
             return compiler->CreateGlobalString("", processed);
         }
         else if (constant)
@@ -6145,7 +6454,11 @@ public:
             return {};
 
         // Compiler intrinsics handled at the call site — not in the function table.
-        if (name == "va_start" || name == "va_end" || name == "is_pointer" || name == "annotationof" || name == "reflect")
+        static const std::unordered_set<std::string> kIntrinsics = {
+            "va_start", "va_end", "is_pointer", "annotationof",
+            "reflect", "reflect_set",
+        };
+        if (kIntrinsics.count(name))
             return {};
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));
@@ -6180,6 +6493,8 @@ public:
         case 'b':  return '\b';
         case 'f':  return '\f';
         case 'v':  return '\v';
+        case '{':  return '{';
+        case '}':  return '}';
         default:   return esc;
         }
     }
@@ -6203,7 +6518,10 @@ public:
         return *itr;
     }
 
-    std::string ProcessRawText(const std::string& rawText)
+    // foldBraces: when true, {{ → { and }} → } (source-level escape for non-interpolated strings).
+    // Pass false when decoding accumulated literal content inside ParseFormatString, because
+    // that content may contain legitimate }} sequences (e.g. from JSON) that must not be folded.
+    std::string ProcessRawText(const std::string& rawText, bool foldBraces = false)
     {
         std::string output;
         auto itr = rawText.cbegin();
@@ -6222,6 +6540,12 @@ public:
             {
                 ++itr;
                 output += ProcessEscapeChar(itr, rawText.cend());
+            }
+            else if (foldBraces && (*itr == '{' || *itr == '}') && (itr + 1) != rawText.cend() && *(itr + 1) == *itr)
+            {
+                // {{ → { and }} → } (only for source-level non-interpolated strings)
+                output += *itr;
+                itr += 2;
             }
             else
             {
@@ -7472,6 +7796,35 @@ public:
         {
             if (auto* dtorFn = compiler->GetFunction("~" + structName))
                 compiler->RegisterDestructor(structName, dtorFn);
+        }
+
+        // Pre-register interfaces before compiling method bodies so that
+        // StructImplementsInterface() returns true for assignments inside methods
+        // of the class itself (e.g. `IJSON result = this;` inside a class : IJSON).
+        {
+            std::vector<std::string> earlyIfaceNames;
+            for (auto* genId : ctx->genericIdentifier())
+            {
+                if (!genId->Identifier()) continue;
+                std::string ifaceBaseName = genId->Identifier()->getText();
+                std::string ifaceName = ifaceBaseName;
+                if (genId->genericTypeParameters() != nullptr)
+                {
+                    std::vector<std::string> concreteTypeArgs;
+                    for (auto* entry : genId->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    {
+                        std::string typeArg = entry->getText();
+                        auto substIt = activeTypeSubstitutions.find(typeArg);
+                        if (substIt != activeTypeSubstitutions.end())
+                            typeArg = substIt->second;
+                        concreteTypeArgs.push_back(typeArg);
+                    }
+                    ifaceName = MangledGenericName(ifaceBaseName, concreteTypeArgs);
+                }
+                earlyIfaceNames.push_back(ifaceName);
+            }
+            if (!earlyIfaceNames.empty())
+                compiler->RegisterStructInterfaces(structName, earlyIfaceNames);
         }
 
         {
