@@ -51,6 +51,21 @@
     <None Include="core\stop_token.cb" />
     <None Include="core\block_allocator.cb" />
     <None Include="core\malloc_allocator.cb" />
+    <None Include="core\program.cb" />
+    <None Include="core\tuple.cb" />
+    <None Include="core\time.cb" />
+    <None Include="core\random.cb" />
+    <None Include="core\slab_allocator.cb" />
+    <None Include="core\fit_allocator.cb" />
+    <None Include="core\mutex.cb" />
+    <None Include="core\atomic.cb" />
+    <None Include="core\semaphore.cb" />
+    <None Include="core\latch.cb" />
+    <None Include="core\rwlock.cb" />
+    <None Include="core\channel.cb" />
+    <None Include="core\spsc_queue.cb" />
+    <None Include="core\json.cb" />
+    <None Include="core\arena.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />
@@ -81,6 +96,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="LspTypes.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="CFlatErrorListener.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
