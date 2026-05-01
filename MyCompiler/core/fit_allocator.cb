@@ -1,0 +1,392 @@
+// fit_allocator.cb — first-fit allocator with coalescing free list.
+//
+// Memory is sourced from VirtualAlloc segments (MEM_COMMIT|MEM_RESERVE).
+// Every allocation (slab and large) carries an 8-byte _FA_Header directly
+// before the user pointer. dealloc always backs up 8 bytes to find the
+// header; the sign of _size distinguishes the two paths:
+//
+//   _size > 0  → slab allocation  (free block via coalescing free list)
+//   _size < 0  → large allocation (free via VirtualFree)
+//
+// Large-alloc VirtualAlloc layout:
+//   [base + 0]  _FA_LargePrefix._totalSize (8 bytes — VirtualAlloc size)
+//   [base + 8]  _FA_LargePrefix._next      (8 bytes — linked list)
+//   [base + 16] _FA_Header._size           (8 bytes — stored as -userSize)
+//   [base + 24] user data                  ← returned pointer
+//
+// Slab-alloc block layout (within a segment):
+//   [block + 0] _FA_Header._size           (8 bytes — stored as +userSize)
+//   [block + 8] user data                  ← returned pointer
+//
+// The free list is a sorted doubly-linked list of free blocks ordered by
+// address. Adjacent free blocks are coalesced on dealloc (O(1)).
+//
+// Allocation: O(n) first-fit scan. Segment growth: new VirtualAlloc on miss.
+// Requests > half the segment size go directly to the large path.
+
+extern void  GetSystemInfo(void* lpSystemInfo);
+extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
+extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
+
+struct _FA_SysInfo
+{
+    u32 _oemId            = default;
+    u32 _pageSize         = default;
+    i8* _minAddr          = default;
+    i8* _maxAddr          = default;
+    i64 _procMask         = default;
+    u32 _numProc          = default;
+    u32 _procType         = default;
+    u32 _allocGranularity = default;
+    u16 _procLevel        = default;
+    u16 _procRevision     = default;
+};
+
+// 8-byte header at ptr[-8] for every allocation.
+struct _FA_Header
+{
+    i64 _size = 0;   // +userSize for slab; -userSize for large
+};
+
+// Free block overlay — shares the same address as _FA_Header.
+struct _FA_FreeBlock
+{
+    i64            _size = 0;        // same field as _FA_Header._size (positive)
+    _FA_FreeBlock* _prev = nullptr;
+    _FA_FreeBlock* _next = nullptr;
+};
+
+// Prefix stored at VirtualAlloc base for large allocations (16 bytes).
+// Followed immediately by an _FA_Header, then user data.
+struct _FA_LargePrefix
+{
+    i64 _totalSize = 0;        // VirtualAlloc'd bytes
+    i8* _next      = nullptr;  // intrusive list of live large allocs
+};
+
+// One VirtualAlloc'd segment for slab allocations.
+struct _FA_Segment
+{
+    i8*          _base = nullptr;
+    i64          _size = 0;
+    _FA_Segment* _next = nullptr;
+};
+
+class FitAllocator : IAllocator
+{
+    _FA_Segment*   _segments   = nullptr;
+    _FA_FreeBlock* _freeHead   = nullptr;
+    i8*            _largeHead  = nullptr;
+    i64            _segSize    = 0;
+    i64            _pageSize   = 0;
+    i64            _usedBytes  = 0;   // live slab bytes
+    i64            _largeBytes = 0;   // live large bytes
+    i64            _largeCount = 0;
+
+    i64 _hdrSize()        { return (i64)sizeof(_FA_Header); }
+    i64 _freeHdrSize()    { return (i64)sizeof(_FA_FreeBlock); }
+    i64 _largePfxSize()   { return (i64)sizeof(_FA_LargePrefix); }
+
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    void _init()
+    {
+        _FA_SysInfo* si = (_FA_SysInfo*)malloc((i64)sizeof(_FA_SysInfo));
+        GetSystemInfo((void*)si);
+        _pageSize = (i64)si->_pageSize;
+        free((void*)si);
+
+        _segSize = (i64)1048576;  // 1 MB default segment
+        _growSegment(_segSize);
+    }
+
+    void _growSegment(i64 size)
+    {
+        i64 aligned = (size + _pageSize - (i64)1) / _pageSize * _pageSize;
+
+        _FA_Segment* seg = (_FA_Segment*)malloc((i64)sizeof(_FA_Segment));
+        seg->_size = aligned;
+        seg->_next = _segments;
+        _segments  = seg;
+
+        i8* base = (i8*)VirtualAlloc(nullptr, aligned, 0x3000u, 0x04u);
+        seg->_base = base;
+
+        // Entire segment is one free block.
+        i64 userSpace = aligned - _hdrSize();
+        _FA_FreeBlock* fb = (_FA_FreeBlock*)base;
+        fb->_size = userSpace;
+        fb->_prev = nullptr;
+        fb->_next = nullptr;
+        _freeListInsert(fb);
+    }
+
+    // -----------------------------------------------------------------------
+    // Free list (address-sorted doubly-linked)
+    // -----------------------------------------------------------------------
+
+    void _freeListInsert(_FA_FreeBlock* fb)
+    {
+        if (_freeHead == nullptr || (i64)fb < (i64)_freeHead)
+        {
+            fb->_next = _freeHead;
+            fb->_prev = nullptr;
+            if (_freeHead != nullptr) _freeHead->_prev = fb;
+            _freeHead = fb;
+            return;
+        }
+        _FA_FreeBlock* cur = _freeHead;
+        while (cur->_next != nullptr && (i64)cur->_next < (i64)fb)
+            cur = cur->_next;
+        fb->_next = cur->_next;
+        fb->_prev = cur;
+        if (cur->_next != nullptr) cur->_next->_prev = fb;
+        cur->_next = fb;
+    }
+
+    void _freeListRemove(_FA_FreeBlock* fb)
+    {
+        if (fb->_prev != nullptr)
+            fb->_prev->_next = fb->_next;
+        else
+            _freeHead = fb->_next;
+        if (fb->_next != nullptr)
+            fb->_next->_prev = fb->_prev;
+        fb->_prev = nullptr;
+        fb->_next = nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // Split / coalesce
+    // -----------------------------------------------------------------------
+
+    void _maybeSplit(_FA_FreeBlock* fb, i64 needed)
+    {
+        i64 minTail = _freeHdrSize();
+        i64 tail    = fb->_size - needed;
+        if (tail < _hdrSize() + minTail) return;
+
+        i8* tailPtr = (i8*)((i64)fb + _hdrSize() + needed);
+        _FA_FreeBlock* tail_fb = (_FA_FreeBlock*)tailPtr;
+        tail_fb->_size = tail - _hdrSize();
+        tail_fb->_prev = nullptr;
+        tail_fb->_next = nullptr;
+        fb->_size = needed;
+        _freeListInsert(tail_fb);
+    }
+
+    void _coalesce(_FA_FreeBlock* fb)
+    {
+        // Coalesce with next neighbor.
+        if (fb->_next != nullptr)
+        {
+            i8* fbEnd = (i8*)((i64)fb + _hdrSize() + fb->_size);
+            if (fbEnd == (i8*)fb->_next)
+            {
+                _FA_FreeBlock* nx = fb->_next;
+                fb->_size = fb->_size + _hdrSize() + nx->_size;
+                _freeListRemove(nx);
+            }
+        }
+        // Coalesce with previous neighbor.
+        if (fb->_prev != nullptr)
+        {
+            i8* prevEnd = (i8*)((i64)fb->_prev + _hdrSize() + fb->_prev->_size);
+            if (prevEnd == (i8*)fb)
+            {
+                _FA_FreeBlock* pv = fb->_prev;
+                pv->_size = pv->_size + _hdrSize() + fb->_size;
+                _freeListRemove(fb);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-allocation path (> half segment size)
+    // -----------------------------------------------------------------------
+
+    void* _allocLarge(i64 size)
+    {
+        i64 pfxSize = _largePfxSize();   // 16
+        i64 hdrSize = _hdrSize();        // 8
+        i64 gran    = (i64)0x10000;
+        i64 total   = (pfxSize + hdrSize + size + gran - (i64)1) / gran * gran;
+
+        i8* base = (i8*)VirtualAlloc(nullptr, total, 0x3000u, 0x04u);
+        if (base == nullptr) return nullptr;
+
+        _FA_LargePrefix* pfx = (_FA_LargePrefix*)base;
+        pfx->_totalSize = total;
+        pfx->_next      = _largeHead;
+        _largeHead      = base;
+
+        // _FA_Header sits right after the prefix.
+        _FA_Header* hdr = (_FA_Header*)((i64)base + pfxSize);
+        hdr->_size = -size;  // negative → large allocation
+
+        _largeBytes = _largeBytes + size;
+        _largeCount = _largeCount + 1;
+
+        return (void*)((i64)base + pfxSize + hdrSize);
+    }
+
+    void _freeLarge(void* ptr)
+    {
+        i64 pfxSize = _largePfxSize();
+        i64 hdrSize = _hdrSize();
+
+        i8* base = (i8*)((i64)ptr - pfxSize - hdrSize);
+        _FA_LargePrefix* pfx = (_FA_LargePrefix*)base;
+
+        _FA_Header* hdr = (_FA_Header*)((i64)base + pfxSize);
+        i64 userSize = -(hdr->_size);
+        _largeBytes = _largeBytes - userSize;
+        _largeCount = _largeCount - 1;
+
+        // Unlink from large list.
+        i8* prev = nullptr;
+        i8* cur  = _largeHead;
+        while (cur != nullptr)
+        {
+            _FA_LargePrefix* cp = (_FA_LargePrefix*)cur;
+            if (cur == base)
+            {
+                if (prev == nullptr)
+                    _largeHead = cp->_next;
+                else
+                {
+                    _FA_LargePrefix* pp = (_FA_LargePrefix*)prev;
+                    pp->_next = cp->_next;
+                }
+                break;
+            }
+            prev = cur;
+            cur  = cp->_next;
+        }
+        VirtualFree((void*)base, 0, 0x8000u);
+    }
+
+    // -----------------------------------------------------------------------
+    // IAllocator
+    // -----------------------------------------------------------------------
+
+    void* alloc(i64 size)
+    {
+        if (size <= 0) return nullptr;
+        if (_segments == nullptr) _init();
+
+        if (size > _segSize / (i64)2) return _allocLarge(size);
+
+        // First-fit scan.
+        _FA_FreeBlock* fb = _freeHead;
+        while (fb != nullptr)
+        {
+            if (fb->_size >= size) break;
+            fb = fb->_next;
+        }
+
+        if (fb == nullptr)
+        {
+            _growSegment(_segSize);
+            fb = _freeHead;
+            while (fb != nullptr)
+            {
+                if (fb->_size >= size) break;
+                fb = fb->_next;
+            }
+            if (fb == nullptr) return nullptr;
+        }
+
+        _freeListRemove(fb);
+        _maybeSplit(fb, size);
+
+        _FA_Header* hdr = (_FA_Header*)fb;
+        hdr->_size = size;  // positive → slab
+
+        _usedBytes = _usedBytes + size;
+        return (void*)((i64)fb + _hdrSize());
+    }
+
+    void dealloc(void* ptr)
+    {
+        if (ptr == nullptr) return;
+
+        i8* base = (i8*)((i64)ptr - _hdrSize());
+        _FA_Header* hdr = (_FA_Header*)base;
+
+        if (hdr->_size < 0)
+        {
+            _freeLarge(ptr);
+            return;
+        }
+
+        _usedBytes = _usedBytes - hdr->_size;
+
+        _FA_FreeBlock* fb = (_FA_FreeBlock*)base;
+        fb->_prev = nullptr;
+        fb->_next = nullptr;
+        _freeListInsert(fb);
+        _coalesce(fb);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats / diagnostics
+    // -----------------------------------------------------------------------
+
+    i64 usedBytes() { return _usedBytes + _largeBytes; }
+
+    i64 freeBytes()
+    {
+        i64 total = 0;
+        _FA_FreeBlock* fb = _freeHead;
+        while (fb != nullptr) { total = total + fb->_size; fb = fb->_next; }
+        return total;
+    }
+
+    void printUsage()
+    {
+        if (_segments == nullptr) { printf("FitAllocator: not initialized\n"); return; }
+        i64 segTotal = 0;
+        int segCount = 0;
+        _FA_Segment* s = _segments;
+        while (s != nullptr) { segTotal = segTotal + s->_size; segCount = segCount + 1; s = s->_next; }
+        printf("FitAllocator: segments=%d  segBytes=%lld  used=%lld  free=%lld\n",
+            segCount, segTotal, _usedBytes, freeBytes());
+        printf("  large: count=%lld  bytes=%lld\n", _largeCount, _largeBytes);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+
+    void cleanup()
+    {
+        _FA_Segment* s = _segments;
+        while (s != nullptr)
+        {
+            _FA_Segment* next = s->_next;
+            VirtualFree((void*)s->_base, 0, 0x8000u);
+            free((void*)s);
+            s = next;
+        }
+        _segments = nullptr;
+        _freeHead = nullptr;
+
+        i8* cur = _largeHead;
+        while (cur != nullptr)
+        {
+            _FA_LargePrefix* p = (_FA_LargePrefix*)cur;
+            i8* next = p->_next;
+            VirtualFree((void*)cur, 0, 0x8000u);
+            cur = next;
+        }
+        _largeHead  = nullptr;
+        _largeBytes = 0;
+        _largeCount = 0;
+        _usedBytes  = 0;
+    }
+
+    ~FitAllocator() { cleanup(); }
+};

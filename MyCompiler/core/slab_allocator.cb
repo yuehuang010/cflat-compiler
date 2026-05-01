@@ -1,0 +1,366 @@
+// slab_allocator.cb — segregated-fit slab allocator with O(1) alloc and dealloc.
+//
+// Reserves one contiguous address region (8 × _regionSize bytes) at init.
+// Each of the 8 size classes owns a fixed sub-region. Slab lookup on dealloc
+// is pure pointer arithmetic — no header read, no list scan:
+//
+//   slabIdx = (ptr - _base) >> _regionShift
+//
+// Physical memory is committed in 4K increments (MEM_COMMIT on demand within
+// the reserved region). This avoids committing a full 64K VirtualAlloc chunk
+// when only a handful of blocks are needed.
+//
+// Freed blocks are recycled via a per-slab external free stack (a compact
+// malloc'd array of pointers). LIFO order keeps recently-freed blocks warm.
+//
+// NOTE: per-page decommit (MEM_DECOMMIT on empty pages) is not implemented
+// in v1. Physical memory grows until cleanup() is called.
+//
+// Size classes: 8, 16, 32, 64, 128, 256, 512, 1024 bytes.
+// Requests > 1024 bytes go directly to VirtualAlloc (large-alloc path).
+//
+// Usage:
+//   SlabAllocator sa;
+//   void* p = sa.alloc(48);    // returns a 64-byte block (class 3)
+//   sa.dealloc(p);             // O(1): shift + array push
+//   sa.printUsage();
+//   sa.cleanup();
+
+extern void  GetSystemInfo(void* lpSystemInfo);
+extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
+extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
+
+struct _SA_SysInfo
+{
+    u32 _oemId            = default;  //  0
+    u32 _pageSize         = default;  //  4 — dwPageSize (4096 typically)
+    i8* _minAddr          = default;  //  8
+    i8* _maxAddr          = default;  // 16
+    i64 _procMask         = default;  // 24
+    u32 _numProc          = default;  // 32
+    u32 _procType         = default;  // 36
+    u32 _allocGranularity = default;  // 40 — dwAllocationGranularity (65536 typically)
+    u16 _procLevel        = default;  // 44
+    u16 _procRevision     = default;  // 46
+};
+
+// One slot in the per-slab free stack. Wrapping i8* avoids double-pointer syntax.
+struct _SA_Entry { i8* _ptr = nullptr; };
+
+// Header prepended to every large-alloc VirtualAlloc region.
+struct _SA_LargeHdr
+{
+    i64 _userSize   = 0;        // bytes requested by caller
+    i64 _regionSize = 0;        // total VirtualAlloc'd bytes (for VirtualFree)
+    i8* _next       = nullptr;  // intrusive linked list of live large allocs
+};
+
+// Per-size-class state.
+struct _SA_Slab
+{
+    i8*        _base        = nullptr;  // start of this slab's reserved sub-region
+    i64        _commitEnd   = 0;        // bytes committed so far from _base
+    _SA_Entry* _freeStack   = nullptr;  // malloc'd array of recycled pointers
+    int        _freeTop     = 0;        // stack top (next push index)
+    int        _freeCap     = 0;        // allocated stack capacity
+    i64        _blockSize   = 0;
+    i64        _allocCount  = 0;        // live user allocations
+    i64        _commitPages = 0;        // 4K pages committed
+};
+
+class SlabAllocator : IAllocator
+{
+    _SA_Slab* _slabs       = nullptr;  // malloc'd array of 8; null until _init()
+    i8*       _base        = nullptr;  // base of entire reserved region
+    i64       _regionSize  = 0;        // bytes per slab sub-region (power of 2)
+    i64       _regionShift = 0;        // log2(_regionSize)
+    i64       _pageSize    = 0;        // OS page size (typically 4096)
+    i8*       _largeHead   = nullptr;  // singly-linked list of large allocs
+    i64       _largeBytes  = 0;
+    i64       _largeCount  = 0;
+
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    void _init()
+    {
+        _SA_SysInfo* si = (_SA_SysInfo*)malloc((i64)sizeof(_SA_SysInfo));
+        GetSystemInfo((void*)si);
+        _pageSize = (i64)si->_pageSize;           // 4K OS page size
+        free((void*)si);
+
+        // Each slab owns 16 MB (2^24). Total reservation: 8 × 16 MB = 128 MB.
+        // MEM_RESERVE (0x2000) only — no physical pages committed yet.
+        _regionShift = (i64)24;
+        _regionSize  = (i64)1 << (int)_regionShift;
+        _base = (i8*)VirtualAlloc(nullptr, (i64)8 * _regionSize, 0x2000u, 0x04u);
+
+        _slabs = (_SA_Slab*)malloc((i64)8 * (i64)sizeof(_SA_Slab));
+        memset((void*)_slabs, 0, (i64)8 * (i64)sizeof(_SA_Slab));
+
+        int i = 0;
+        while (i < 8)
+        {
+            _slabs[i]._base      = (i8*)((i64)_base + (i64)i * _regionSize);
+            _slabs[i]._blockSize = _blockSizeFor(i);
+            i = i + 1;
+        }
+    }
+
+    i64 _blockSizeFor(int cls)
+    {
+        if (cls == 0) return (i64)8;
+        if (cls == 1) return (i64)16;
+        if (cls == 2) return (i64)32;
+        if (cls == 3) return (i64)64;
+        if (cls == 4) return (i64)128;
+        if (cls == 5) return (i64)256;
+        if (cls == 6) return (i64)512;
+        return (i64)1024;
+    }
+
+    int _classFor(i64 size)
+    {
+        if (size <= (i64)8)    return 0;
+        if (size <= (i64)16)   return 1;
+        if (size <= (i64)32)   return 2;
+        if (size <= (i64)64)   return 3;
+        if (size <= (i64)128)  return 4;
+        if (size <= (i64)256)  return 5;
+        if (size <= (i64)512)  return 6;
+        if (size <= (i64)1024) return 7;
+        return -1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Free stack (per-slab external array, indexed by class)
+    // -----------------------------------------------------------------------
+
+    void _pushFree(int cls, i8* ptr)
+    {
+        if (_slabs[cls]._freeTop == _slabs[cls]._freeCap)
+        {
+            int newCap = _slabs[cls]._freeCap == 0 ? 64 : _slabs[cls]._freeCap * 2;
+            _SA_Entry* newStack = (_SA_Entry*)malloc((i64)newCap * (i64)sizeof(_SA_Entry));
+            int k = 0;
+            while (k < _slabs[cls]._freeTop)
+            {
+                newStack[k] = _slabs[cls]._freeStack[k];
+                k = k + 1;
+            }
+            if (_slabs[cls]._freeStack != nullptr) free((void*)_slabs[cls]._freeStack);
+            _slabs[cls]._freeStack = newStack;
+            _slabs[cls]._freeCap   = newCap;
+        }
+        _slabs[cls]._freeStack[_slabs[cls]._freeTop]._ptr = ptr;
+        _slabs[cls]._freeTop = _slabs[cls]._freeTop + 1;
+    }
+
+    i8* _popFree(int cls)
+    {
+        _slabs[cls]._freeTop = _slabs[cls]._freeTop - 1;
+        return _slabs[cls]._freeStack[_slabs[cls]._freeTop]._ptr;
+    }
+
+    // Commit one 4K page for slab[cls] and push all its blocks onto the free stack.
+    // Blocks are pushed highest-address first so that block 0 ends up on top (LIFO).
+    void _addPage(int cls)
+    {
+        if (_slabs[cls]._commitEnd + _pageSize > _regionSize) return;  // region exhausted
+
+        i8* page = (i8*)((i64)_slabs[cls]._base + _slabs[cls]._commitEnd);
+        // MEM_COMMIT (0x1000) within the already-reserved region.
+        VirtualAlloc((void*)page, _pageSize, 0x1000u, 0x04u);
+        _slabs[cls]._commitEnd   = _slabs[cls]._commitEnd   + _pageSize;
+        _slabs[cls]._commitPages = _slabs[cls]._commitPages + 1;
+
+        i64 blockSize  = _slabs[cls]._blockSize;
+        i64 blockCount = _pageSize / blockSize;
+
+        // Push in reverse so block 0 (lowest address) is at the stack top → returned first.
+        i64 k = blockCount - 1;
+        while (k >= 0)
+        {
+            _pushFree(cls, (i8*)((i64)page + k * blockSize));
+            k = k - 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-allocation path (> 1024 bytes)
+    // -----------------------------------------------------------------------
+
+    void* _allocLarge(i64 size)
+    {
+        i64 hdrSize = (i64)sizeof(_SA_LargeHdr);
+        i64 gran    = (i64)0x10000;  // 64K VirtualAlloc granularity
+        i64 total   = (hdrSize + size + gran - (i64)1) / gran * gran;
+
+        i8* base = (i8*)VirtualAlloc(nullptr, total, 0x3000u, 0x04u);
+        if (base == nullptr) return nullptr;
+
+        _SA_LargeHdr* hdr = (_SA_LargeHdr*)base;
+        hdr->_userSize   = size;
+        hdr->_regionSize = total;
+        hdr->_next       = _largeHead;
+        _largeHead       = base;
+        _largeBytes      = _largeBytes + size;
+        _largeCount      = _largeCount + 1;
+
+        return (void*)((i64)base + hdrSize);
+    }
+
+    void _freeLarge(void* ptr)
+    {
+        i64 hdrSize       = (i64)sizeof(_SA_LargeHdr);
+        i8* base          = (i8*)((i64)ptr - hdrSize);
+        _SA_LargeHdr* hdr = (_SA_LargeHdr*)base;
+
+        _largeBytes = _largeBytes - hdr->_userSize;
+        _largeCount = _largeCount - 1;
+
+        // Unlink from large list.
+        i8* prev = nullptr;
+        i8* cur  = _largeHead;
+        while (cur != nullptr)
+        {
+            _SA_LargeHdr* ch = (_SA_LargeHdr*)cur;
+            if (cur == base)
+            {
+                if (prev == nullptr)
+                    _largeHead = ch->_next;
+                else
+                {
+                    _SA_LargeHdr* ph = (_SA_LargeHdr*)prev;
+                    ph->_next = ch->_next;
+                }
+                break;
+            }
+            prev = cur;
+            cur  = ch->_next;
+        }
+        VirtualFree((void*)base, 0, 0x8000u);
+    }
+
+    // -----------------------------------------------------------------------
+    // IAllocator
+    // -----------------------------------------------------------------------
+
+    void* alloc(i64 size)
+    {
+        if (size <= 0) return nullptr;
+        if (_slabs == nullptr) _init();
+
+        int cls = _classFor(size);
+        if (cls < 0) return _allocLarge(size);
+
+        if (_slabs[cls]._freeTop == 0) _addPage(cls);
+        if (_slabs[cls]._freeTop == 0) return nullptr;  // region exhausted
+
+        i8* ptr = _popFree(cls);
+        _slabs[cls]._allocCount = _slabs[cls]._allocCount + 1;
+        return (void*)ptr;
+    }
+
+    // O(1): slab index derived from pointer offset — no header read, no scan.
+    void dealloc(void* ptr)
+    {
+        if (ptr == nullptr || _base == nullptr) return;
+
+        i64 offset = (i64)ptr - (i64)_base;
+        if (offset < (i64)0 || offset >= (i64)8 * _regionSize)
+        {
+            _freeLarge(ptr);
+            return;
+        }
+
+        int cls = (int)(offset >> (int)_regionShift);
+        _pushFree(cls, (i8*)ptr);
+        _slabs[cls]._allocCount = _slabs[cls]._allocCount - 1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats / diagnostics
+    // -----------------------------------------------------------------------
+
+    i64 usedBytes()
+    {
+        if (_slabs == nullptr) return 0;
+        i64 total = _largeBytes;
+        int i = 0;
+        while (i < 8)
+        {
+            total = total + _slabs[i]._allocCount * _slabs[i]._blockSize;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    i64 committedBytes()
+    {
+        if (_slabs == nullptr) return 0;
+        i64 total = 0;
+        int i = 0;
+        while (i < 8)
+        {
+            total = total + _slabs[i]._commitEnd;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    void printUsage()
+    {
+        if (_slabs == nullptr) { printf("SlabAllocator: not initialized\n"); return; }
+        printf("SlabAllocator: pageSize=%lld  regionSize=%lld\n", _pageSize, _regionSize);
+        int i = 0;
+        while (i < 8)
+        {
+            printf("  slab[%d] block=%4lld  pages=%lld  live=%lld  freeStack=%d\n",
+                i, _slabs[i]._blockSize, _slabs[i]._commitPages,
+                _slabs[i]._allocCount, _slabs[i]._freeTop);
+            i = i + 1;
+        }
+        printf("  large: count=%lld  bytes=%lld\n", _largeCount, _largeBytes);
+        printf("  total: used=%lld  committed=%lld\n", usedBytes(), committedBytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+
+    void cleanup()
+    {
+        if (_slabs != nullptr)
+        {
+            int i = 0;
+            while (i < 8)
+            {
+                if (_slabs[i]._freeStack != nullptr) free((void*)_slabs[i]._freeStack);
+                i = i + 1;
+            }
+            free((void*)_slabs);
+            _slabs = nullptr;
+        }
+        if (_base != nullptr)
+        {
+            VirtualFree((void*)_base, 0, 0x8000u);
+            _base = nullptr;
+        }
+        i8* cur = _largeHead;
+        while (cur != nullptr)
+        {
+            _SA_LargeHdr* h = (_SA_LargeHdr*)cur;
+            i8* next = h->_next;
+            VirtualFree((void*)cur, 0, 0x8000u);
+            cur = next;
+        }
+        _largeHead  = nullptr;
+        _largeBytes = 0;
+        _largeCount = 0;
+        _pageSize   = 0;
+    }
+
+    ~SlabAllocator() { cleanup(); }
+};
