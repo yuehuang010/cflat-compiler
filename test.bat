@@ -24,8 +24,8 @@ if "%~1"=="--worker-c" (
         exit /b
     )
     set T1=!TIME!
-    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
-    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
     set /a ECS=CS1-CS0
     if !ECS! lss 0 set /a ECS+=8640000
     set /a ES=ECS/100
@@ -56,8 +56,8 @@ if "%~1"=="--worker-cb" (
         exit /b
     )
     set T1=!TIME!
-    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
-    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
     set /a ECS=CS1-CS0
     if !ECS! lss 0 set /a ECS+=8640000
     set /a ES=ECS/100
@@ -78,8 +78,8 @@ if "%~1"=="--worker-err" (
         echo FAILED: test_err>"!OUT!\results\test_err.result"
     ) else (
         set T1=!TIME!
-        for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
-        for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+        for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+        for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
         set /a ECS=CS1-CS0
         if !ECS! lss 0 set /a ECS+=8640000
         set /a ES=ECS/100
@@ -174,8 +174,8 @@ if %ERRORS% EQU 0 (
 setlocal
 set T0=%~1
 set T1=%~2
-for /f "tokens=1-4 delims=:." %%a in ("%T0: =0%") do set /a S0=%%a*3600+%%b*60+%%c
-for /f "tokens=1-4 delims=:." %%a in ("%T1: =0%") do set /a S1=%%a*3600+%%b*60+%%c
+for /f "tokens=1-4 delims=:." %%a in ("%T0: =0%") do set /a S0=1%%a*3600+1%%b*60+1%%c-366100
+for /f "tokens=1-4 delims=:." %%a in ("%T1: =0%") do set /a S1=1%%a*3600+1%%b*60+1%%c-366100
 set /a SECS=S1-S0
 if !SECS! lss 0 set /a SECS+=86400
 echo Elapsed: !SECS!s

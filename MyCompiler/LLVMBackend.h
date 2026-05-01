@@ -330,6 +330,7 @@ public:
         unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (IAllocator fat-ptr)
         unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
         unsigned InboxFieldIndex = 0;                  // struct field index of inbox (channel<IMessage>)
+        unsigned StopSourceFieldIndex = 0;             // struct field index of _stop_source (stop_source)
     };
 
     class StackState

@@ -646,6 +646,39 @@ public:
             compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, tokenParam });
         }
 
+        // Pre-declare WaitForExit(Name* this, int timeoutMs) -> bool
+        {
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            LLVMBackend::DeclTypeAndValue msParam;
+            msParam.TypeName     = "int";
+            msParam.VariableName = "timeoutMs";
+            compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, msParam });
+        }
+
+        // Pre-declare Kill(Name* this) -> void
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("Kill", voidReturn, { thisParam });
+        }
+
+        // Pre-declare RequestStop(Name* this) -> void
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("RequestStop", voidReturn, { thisParam });
+        }
+
         // Pre-declare member functions (including user's main) and destructor
         for (auto func : ctx->functionDefinition())
             ScanFunctionDefinition(func, name);
@@ -7802,6 +7835,13 @@ public:
         unsigned threadIdx      = compiler->programTable[name].ThreadFieldIndex;
         unsigned allocatorIdx   = compiler->programTable[name].AllocatorFieldIndex;
         unsigned onStdoutIdx    = compiler->programTable[name].OnStdoutFieldIndex;
+        unsigned stopSrcIdx     = compiler->programTable[name].StopSourceFieldIndex;
+
+        auto* stopSrcInitFn        = FindMethodOf("init",           "stop_source");
+        auto* stopSrcRequestStopFn = FindMethodOf("request_stop",   "stop_source");
+        auto* stopSrcDisposeFn     = FindMethodOf("dispose",        "stop_source");
+        auto* stopSrcType          = compiler->dataStructures.count("stop_source")
+                                     ? compiler->dataStructures["stop_source"].StructType : nullptr;
 
         // Look up the thread-local stdout hook global (declared in cruntime.cb)
         llvm::GlobalVariable* stdoutHookGlobal = nullptr;
@@ -8019,6 +8059,15 @@ public:
                         llvm::ConstantAggregateZero::get(listStringType), runArgNV.Storage);
             }
 
+            // Init _stop_source before spawning — gives main() a live token to check
+            if (stopSrcInitFn && stopSrcType)
+            {
+                auto* stopSrcGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, stopSrcIdx, "stop_src_gep");
+                compiler->builder->CreateCall(
+                    stopSrcInitFn->getFunctionType(), stopSrcInitFn, {stopSrcGEP});
+            }
+
             // Get &self->_thread (stored field; initialized by the program ctor)
             auto* threadFieldGEP = compiler->builder->CreateStructGEP(
                 progType, thisArg, threadIdx, "thread_field");
@@ -8107,6 +8156,100 @@ public:
         }
 
         // ======================================================================
+        // EMIT WaitForExit(int): bool WaitForExit(Name* this, int timeoutMs)
+        // Single try_join call with the given timeout. Returns true if the thread
+        // exited within the timeout; false if still running (handles intact).
+        // ======================================================================
+        {
+            auto* threadTryJoinFn = FindMethodOf("try_join", "Thread");
+            if (threadTryJoinFn)
+            {
+                LLVMBackend::TypeAndValue boolReturn;  boolReturn.TypeName = "bool";
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+                LLVMBackend::DeclTypeAndValue msParam;
+                msParam.TypeName = "int";  msParam.VariableName = "timeoutMs";
+
+                auto* waitFn = compiler->CreateFunctionDefinition("WaitForExit", boolReturn, {thisParam, msParam});
+
+                auto* thisArg = waitFn->getArg(0);
+                auto* msArg   = waitFn->getArg(1);
+
+                auto* threadFieldGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, threadIdx, "thread_field");
+
+                auto* result = compiler->builder->CreateCall(
+                    threadTryJoinFn->getFunctionType(), threadTryJoinFn,
+                    {threadFieldGEP, msArg}, "try_join_result");
+
+                compiler->builder->CreateRet(result);
+                compiler->CreateBlockBreak(nullptr, true);
+            }
+        }
+
+        // ======================================================================
+        // EMIT RequestStop(): void RequestStop(Name* this)
+        // Signals the program's _stop_source so main() can observe it via
+        // _stop_source.get_token().stop_requested(). Cooperative — main() must check.
+        // ======================================================================
+        {
+            if (stopSrcRequestStopFn && stopSrcType)
+            {
+                LLVMBackend::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+
+                compiler->CreateFunctionDefinition("RequestStop", voidReturn, {thisParam});
+
+                auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
+
+                auto* stopSrcGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, stopSrcIdx, "stop_src_gep");
+                compiler->builder->CreateCall(
+                    stopSrcRequestStopFn->getFunctionType(), stopSrcRequestStopFn, {stopSrcGEP});
+
+                compiler->CreateReturnCall(nullptr);
+                compiler->CreateBlockBreak(nullptr, true);
+            }
+        }
+
+        // ======================================================================
+        // EMIT Kill(): void Kill(Name* this)
+        // Signals RequestStop() first (cooperative), then forcibly terminates
+        // via TerminateThread. Leaks allocator state and thread-held resources.
+        // ======================================================================
+        {
+            auto* threadTerminateFn = FindMethodOf("terminate", "Thread");
+            if (threadTerminateFn)
+            {
+                LLVMBackend::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+
+                compiler->CreateFunctionDefinition("Kill", voidReturn, {thisParam});
+
+                auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
+
+                // Signal the stop token first — gives cooperative loops a chance to observe it.
+                if (stopSrcRequestStopFn && stopSrcType)
+                {
+                    auto* stopSrcGEP = compiler->builder->CreateStructGEP(
+                        progType, thisArg, stopSrcIdx, "stop_src_gep");
+                    compiler->builder->CreateCall(
+                        stopSrcRequestStopFn->getFunctionType(), stopSrcRequestStopFn, {stopSrcGEP});
+                }
+
+                auto* threadFieldGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, threadIdx, "thread_field");
+                compiler->builder->CreateCall(
+                    threadTerminateFn->getFunctionType(), threadTerminateFn, {threadFieldGEP});
+
+                compiler->CreateReturnCall(nullptr);
+                compiler->CreateBlockBreak(nullptr, true);
+            }
+        }
+
+        // ======================================================================
         // EMIT ~Name(): void ~Name(Name* this)   [only if user didn't provide one]
         // Calls cleanup() and frees the IAllocator stored in _allocator.
         // Null-checks so it's safe to call even if run() was never called.
@@ -8148,6 +8291,16 @@ public:
             compiler->builder->CreateBr(doneBlock);
 
             compiler->builder->SetInsertPoint(doneBlock);
+
+            // Dispose _stop_source (no-op if _state is null, safe to call after Kill())
+            if (stopSrcDisposeFn && stopSrcType)
+            {
+                auto* stopSrcGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, stopSrcIdx, "stop_src_gep");
+                compiler->builder->CreateCall(
+                    stopSrcDisposeFn->getFunctionType(), stopSrcDisposeFn, {stopSrcGEP});
+            }
+
             compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -8186,18 +8339,19 @@ public:
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
                 || field.VariableName == "_allocator" || field.VariableName == "onStdout"
-                || field.VariableName == "inbox")
+                || field.VariableName == "inbox" || field.VariableName == "_stop_source")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), inbox (channel<IMessage>)
-        unsigned exitCodeFieldIndex  = (unsigned)declList.size();
-        unsigned threadFieldIndex    = exitCodeFieldIndex + 1;
-        unsigned allocatorFieldIndex = threadFieldIndex + 1;
-        unsigned onStdoutFieldIndex  = allocatorFieldIndex + 1;
-        unsigned inboxFieldIndex     = onStdoutFieldIndex + 1;
+        // onStdout (function<void(char*)>), inbox (channel<IMessage>), _stop_source (stop_source)
+        unsigned exitCodeFieldIndex    = (unsigned)declList.size();
+        unsigned threadFieldIndex      = exitCodeFieldIndex + 1;
+        unsigned allocatorFieldIndex   = threadFieldIndex + 1;
+        unsigned onStdoutFieldIndex    = allocatorFieldIndex + 1;
+        unsigned inboxFieldIndex       = onStdoutFieldIndex + 1;
+        unsigned stopSrcFieldIndex     = inboxFieldIndex + 1;
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -8227,6 +8381,11 @@ public:
             inboxField.TypeName     = "channel__IMessage";
             inboxField.VariableName = "inbox";
             declList.push_back(inboxField);
+
+            LLVMBackend::DeclTypeAndValue stopSrcField;
+            stopSrcField.TypeName     = "stop_source";
+            stopSrcField.VariableName = "_stop_source";
+            declList.push_back(stopSrcField);
         }
 
         // Build struct type with user fields + synthetic fields
@@ -8306,6 +8465,14 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, inboxInitVal, inboxFieldIndex);
             }
 
+            // Synthetic field: _stop_source = stop_source() (zero-init; init() called in run())
+            if (auto* stopSrcCtorFn = compiler->GetFunction("stop_source"))
+            {
+                auto* stopSrcInitVal = compiler->builder->CreateCall(
+                    stopSrcCtorFn->getFunctionType(), stopSrcCtorFn, {}, "stop_src_zero");
+                structVal = compiler->CreateInsertValue(structVal, stopSrcInitVal, stopSrcFieldIndex);
+            }
+
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
         }
@@ -8359,8 +8526,9 @@ public:
         compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
-        compiler->programTable[name].OnStdoutFieldIndex  = onStdoutFieldIndex;
-        compiler->programTable[name].InboxFieldIndex     = inboxFieldIndex;
+        compiler->programTable[name].OnStdoutFieldIndex    = onStdoutFieldIndex;
+        compiler->programTable[name].InboxFieldIndex       = inboxFieldIndex;
+        compiler->programTable[name].StopSourceFieldIndex  = stopSrcFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);

@@ -107,6 +107,45 @@ program CrashNull {
     }
 };
 
+// SupervisedWorker: computes sum 1..workload, returns it as exit code
+program SupervisedWorker {
+    int workload = 0;
+
+    int main(move list<string> args) {
+        int sum = 0;
+        int i = 1;
+        while (i <= workload) {
+            sum = sum + i;
+            i++;
+        }
+        return sum;
+    }
+};
+
+// Supervisor: spawns 3 SupervisedWorkers concurrently, waits for all,
+// returns sum of their exit codes
+program Supervisor {
+    int main(move list<string> args) {
+        SupervisedWorker w0;
+        SupervisedWorker w1;
+        SupervisedWorker w2;
+        w0.workload = 3;   // sum(1..3)  = 6
+        w1.workload = 5;   // sum(1..5)  = 15
+        w2.workload = 10;  // sum(1..10) = 55
+
+        list<string> empty;
+        w0.run(empty);
+        w1.run(empty);
+        w2.run(empty);
+
+        w0.WaitForExit();
+        w1.WaitForExit();
+        w2.WaitForExit();
+
+        return w0.exitCode + w1.exitCode + w2.exitCode;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Test functions
 // ---------------------------------------------------------------------------
@@ -618,6 +657,81 @@ bool testWaitForExitCancelled() {
     result &= Test("WaitForExit(cancelled token) returns false", done, false);
     src.dispose();
 
+    // WaitForExit(token) returning false does NOT join — caller must join before
+    // the program goes out of scope, otherwise the thread is still accessing the struct.
+    prog.WaitForExit();
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// WaitForExit(int) and Kill() tests
+// ---------------------------------------------------------------------------
+
+program SpinForever {
+    int main(move list<string> args) {
+        while (true) { }
+        return 0;
+    }
+};
+
+// Loops until its stop token is signalled; returns 42 on clean exit.
+program CoopLoop {
+    int main(move list<string> args) {
+        stop_token tok = _stop_source.get_token();
+        while (!tok.stop_requested()) { }
+        return 42;
+    }
+};
+
+bool testRequestStop() {
+    bool result = true;
+    CoopLoop prog;
+    list<string> args;
+    prog.run(args);
+    prog.RequestStop();
+    prog.WaitForExit();
+    result &= Test("RequestStop cooperative exit", prog.exitCode, 42);
+    return result;
+}
+
+bool testWaitForExitTimeoutFast() {
+    bool result = true;
+    // Fast program: WaitForExit with a generous timeout should return true.
+    Minimal prog;
+    list<string> args;
+    prog.run(args);
+    bool done = prog.WaitForExit(5000);
+    result &= Test("WaitForExit(ms) fast program", done, true);
+    result &= Test("WaitForExit(ms) exitCode", prog.exitCode, 0);
+    return result;
+}
+
+bool testKillInfiniteLoop() {
+    bool result = true;
+    SpinForever prog;
+    list<string> args;
+    prog.run(args);
+    // Short timeout — infinite loop won't finish.
+    bool done = prog.WaitForExit(100);
+    result &= Test("WaitForExit(ms) infinite loop timeout", done, false);
+    // Kill the stuck thread so the test process can exit cleanly.
+    prog.Kill();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor tests
+// ---------------------------------------------------------------------------
+
+bool testSupervisorSpawnsChildren() {
+    bool result = true;
+    Supervisor sup;
+    list<string> args;
+    sup.run(args);
+    sup.WaitForExit();
+    // 6 + 15 + 55 = 76
+    result &= Test("supervisor spawns children", sup.exitCode, 76);
     return result;
 }
 
@@ -628,8 +742,11 @@ bool testWaitForExitCancelled() {
 extern int main() {
     int passed = 0;
     int total  = 0;
+    int dbg = 0;
 
+    printf("T%d\n", dbg++);
     total++; passed += testProgramBasicArgsAndField()    ? 1 : 0;
+    printf("T%d\n", dbg++);
     total++; passed += testProgramMinimalNoFields()      ? 1 : 0;
     total++; passed += testProgramEmptyArgs()            ? 1 : 0;
     total++; passed += testProgramExitCodeZero()         ? 1 : 0;
@@ -658,6 +775,10 @@ extern int main() {
     total++; passed += testInboxSumMessages()                ? 1 : 0;
     total++; passed += testInboxPolymorphicMessages()        ? 1 : 0;
     total++; passed += testProgramCrashRecovery()           ? 1 : 0;
+    total++; passed += testRequestStop()                    ? 1 : 0;
+    total++; passed += testWaitForExitTimeoutFast()         ? 1 : 0;
+    total++; passed += testKillInfiniteLoop()               ? 1 : 0;
+    total++; passed += testSupervisorSpawnsChildren()        ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

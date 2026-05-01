@@ -1,6 +1,7 @@
 extern i32   WaitForSingleObject(void* handle, i32 ms);
 extern i32   GetExitCodeThread(void* handle, i32* code);
 extern void  CloseHandle(void* handle);
+extern bool  TerminateThread(void* handle, i32 exitCode);
 
 // Args packet allocated with malloc so thread infrastructure bypasses any
 // per-program tracked allocator.
@@ -66,5 +67,17 @@ struct Thread {
             return true;
         }
         return false;
+    }
+
+    // Forcibly terminates the thread. Leaks any resources the thread held;
+    // use only when cooperative cancellation is not possible.
+    void terminate() {
+        if (_handle != nullptr) {
+            TerminateThread(_handle, -1);
+            CloseHandle(_handle);
+            free((void*)_args);
+            _handle = nullptr;
+            _args   = nullptr;
+        }
     }
 };
