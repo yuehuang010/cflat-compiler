@@ -12,6 +12,7 @@ if "%~1"=="--worker-c" (
     set COMPILER=x64\Debug\MyCompiler.exe
     set SRC=Test
     set OUT=out
+    set T0=!TIME!
     !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
@@ -22,7 +23,15 @@ if "%~1"=="--worker-c" (
         echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
         exit /b
     )
-    echo PASS>"!OUT!\results\!NAME!.result"
+    set T1=!TIME!
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+    set /a ECS=CS1-CS0
+    if !ECS! lss 0 set /a ECS+=8640000
+    set /a ES=ECS/100
+    set /a EF=ECS-ES*100
+    if !EF! lss 10 set EF=0!EF!
+    echo PASS !ES!.!EF!s>"!OUT!\results\!NAME!.result"
     exit /b
 )
 
@@ -35,6 +44,7 @@ if "%~1"=="--worker-cb" (
     set SRC=Test
     set LIB=Test\library
     set OUT=out
+    set T0=!TIME!
     !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
@@ -45,7 +55,15 @@ if "%~1"=="--worker-cb" (
         echo FAILED: !NAME! - run error>"!OUT!\results\!NAME!.result"
         exit /b
     )
-    echo PASS>"!OUT!\results\!NAME!.result"
+    set T1=!TIME!
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+    set /a ECS=CS1-CS0
+    if !ECS! lss 0 set /a ECS+=8640000
+    set /a ES=ECS/100
+    set /a EF=ECS-ES*100
+    if !EF! lss 10 set EF=0!EF!
+    echo PASS !ES!.!EF!s>"!OUT!\results\!NAME!.result"
     exit /b
 )
 
@@ -54,11 +72,20 @@ REM Worker mode: run test_err.bat, capture output to log file
 REM ===========================================================================
 if "%~1"=="--worker-err" (
     set OUT=out
+    set T0=!TIME!
     call "%~dp0test_err.bat" > "!OUT!\results\test_err.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: test_err>"!OUT!\results\test_err.result"
     ) else (
-        echo PASS>"!OUT!\results\test_err.result"
+        set T1=!TIME!
+        for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=%%a*360000+%%b*6000+%%c*100+%%d
+        for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=%%a*360000+%%b*6000+%%c*100+%%d
+        set /a ECS=CS1-CS0
+        if !ECS! lss 0 set /a ECS+=8640000
+        set /a ES=ECS/100
+        set /a EF=ECS-ES*100
+        if !EF! lss 10 set EF=0!EF!
+        echo PASS !ES!.!EF!s>"!OUT!\results\test_err.result"
     )
     exit /b
 )
@@ -121,14 +148,15 @@ if !DONE! lss !LAUNCHED! (
 set /a ERRORS=0
 for %%R in (%OUT%\results\*.result) do (
     set /p RESULT=<"%%R"
-    if /I "!RESULT!" neq "PASS" (
+    if /I "!RESULT:~0,4!" neq "PASS" (
         echo.
         echo === %%~nR ===
         type "%%~dpnR.log"
         echo !RESULT!
         set /a ERRORS+=1
     ) else (
-        echo PASSED: %%~nR
+        set ELAPSED=!RESULT:~5!
+        echo PASSED: %%~nR  [!ELAPSED!]
     )
 )
 
