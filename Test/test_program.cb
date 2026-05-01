@@ -98,6 +98,15 @@ program ArgsSum {
     }
 };
 
+// CrashNull: dereferences a null pointer — triggers an access violation.
+// SEH in the trampoline catches it and stores exitCode = -1.
+program CrashNull {
+    int main(move list<string> args) {
+        int* p = nullptr;
+        return *p;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Test functions
 // ---------------------------------------------------------------------------
@@ -563,6 +572,17 @@ bool testListOwnershipNoLeaks() {
     return result;
 }
 
+bool testProgramCrashRecovery() {
+    bool result = true;
+    CrashNull p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    // SEH catches the access violation; trampoline stores -1 and exits the thread cleanly.
+    result &= Test("crash recovery exit code", p.exitCode, -1);
+    return result;
+}
+
 bool testWaitForExitWithToken() {
     bool result = true;
 
@@ -637,6 +657,7 @@ extern int main() {
     total++; passed += testInboxMultipleMessages()           ? 1 : 0;
     total++; passed += testInboxSumMessages()                ? 1 : 0;
     total++; passed += testInboxPolymorphicMessages()        ? 1 : 0;
+    total++; passed += testProgramCrashRecovery()           ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

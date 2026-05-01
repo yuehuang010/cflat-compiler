@@ -7830,6 +7830,21 @@ public:
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
 
+        // SEH filter: always return EXCEPTION_EXECUTE_HANDLER (1) — catch everything.
+        // Emitted once per module (deduped by name). Uses an isolated IRBuilder so the
+        // main builder's insertion point is not disturbed.
+        llvm::Function* sehFilterFn = compiler->module->getFunction("__cflat_seh_filter_always");
+        if (!sehFilterFn)
+        {
+            auto* filterTy = llvm::FunctionType::get(i32Type, {voidPtrType, voidPtrType}, false);
+            sehFilterFn = llvm::Function::Create(
+                filterTy, llvm::Function::InternalLinkage,
+                "__cflat_seh_filter_always", *compiler->module);
+            auto* fEntry = llvm::BasicBlock::Create(*compiler->context, "entry", sehFilterFn);
+            llvm::IRBuilder<> fb(fEntry);
+            fb.CreateRet(fb.getInt32(1));
+        }
+
         // ======================================================================
         // EMIT TRAMPOLINE: int __program_run_Name(void* ctx)
         // Runs on the spawned thread. Sets up allocator, calls main, stores
@@ -7843,6 +7858,17 @@ public:
             auto* trampolineFn = compiler->CreateFunctionDefinition(
                 "__program_run_" + name, intReturn, {ctxParam});
             compiler->programTable[name].TrampolineFunction = trampolineFn;
+
+            // Install Windows SEH personality so hardware faults in main() are caught.
+            llvm::Function* cshFn = compiler->module->getFunction("__C_specific_handler");
+            if (!cshFn)
+            {
+                auto* cshTy = llvm::FunctionType::get(i32Type, /*isVarArg=*/true);
+                cshFn = llvm::cast<llvm::Function>(
+                    compiler->module->getOrInsertFunction("__C_specific_handler", cshTy).getCallee());
+                cshFn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+            }
+            trampolineFn->setPersonalityFn(cshFn);
 
             auto* ctxArg = trampolineFn->getArg(0);
 
@@ -7904,29 +7930,55 @@ public:
                 compiler->builder->CreateStore(onStdoutVal, stdoutHookGlobal);
             }
 
+            // SEH basic blocks — four-way split replacing the old linear sequence.
+            auto* normalBB   = llvm::BasicBlock::Create(*compiler->context, "main_normal",  trampolineFn);
+            auto* dispatchBB = llvm::BasicBlock::Create(*compiler->context, "seh_dispatch", trampolineFn);
+            auto* catchBB    = llvm::BasicBlock::Create(*compiler->context, "seh_catch",    trampolineFn);
+            auto* cleanupBB  = llvm::BasicBlock::Create(*compiler->context, "seh_cleanup",  trampolineFn);
+
             // Load list__string args by value from the packet
             auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
-            // Call Name.main(self, args)
-            auto* mainResult = compiler->builder->CreateCall(
-                mainFn->getFunctionType(), mainFn, {self, argsVal}, "main_result");
+            // exitCodeGEP must dominate both the normal and catch paths — compute before invoke.
+            auto* exitCodeGEP = compiler->builder->CreateStructGEP(
+                progType, self, exitCodeIdx, "exit_code_gep");
 
-            // Store main's return code into self->exitCode
-            auto* exitCodeGEP = compiler->builder->CreateStructGEP(progType, self, exitCodeIdx, "exit_code_gep");
-            compiler->builder->CreateStore(mainResult, exitCodeGEP);
+            // Invoke main() — normal return lands in normalBB, any fault unwinds to dispatchBB.
+            auto* invokeInst = compiler->builder->CreateInvoke(
+                mainFn->getFunctionType(), mainFn,
+                normalBB, dispatchBB,
+                {self, argsVal}, "main_result");
 
-            // Clear __active_allocator — tracked alloc ends when main() returns.
+            // normalBB: main returned cleanly — store the real exit code and fall through to cleanup.
+            compiler->builder->SetInsertPoint(normalBB);
+            compiler->builder->CreateStore(invokeInst, exitCodeGEP);
+            compiler->builder->CreateBr(cleanupBB);
+
+            // dispatchBB: top-level catchswitch — routes all exceptions to catchBB.
+            compiler->builder->SetInsertPoint(dispatchBB);
+            auto* catchSwitch = compiler->builder->CreateCatchSwitch(
+                llvm::ConstantTokenNone::get(*compiler->context),
+                nullptr, 1, "cs");
+            catchSwitch->addHandler(catchBB);
+
+            // catchBB: catch everything (filter returns 1), store sentinel -1, rejoin cleanup.
+            compiler->builder->SetInsertPoint(catchBB);
+            auto* catchPad = compiler->builder->CreateCatchPad(
+                catchSwitch, {static_cast<llvm::Value*>(sehFilterFn)}, "cp");
+            compiler->builder->CreateStore(
+                llvm::ConstantInt::get(i32Type, static_cast<uint64_t>(-1), /*isSigned=*/true),
+                exitCodeGEP);
+            compiler->builder->CreateCatchRet(catchPad, cleanupBB);
+
+            // cleanupBB: shared teardown — both normal and exception paths converge here.
+            compiler->builder->SetInsertPoint(cleanupBB);
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
-
-            // Clear stdout hook
             compiler->builder->CreateStore(
                 llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(hookFnPtrType)),
                 stdoutHookGlobal);
-
-            // Free the args packet (trampoline owns it; run() transferred ownership on start success)
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
-
-            compiler->CreateReturnCall(mainResult);
+            auto* finalExitCode = compiler->builder->CreateLoad(i32Type, exitCodeGEP, "final_exit");
+            compiler->CreateReturnCall(finalExitCode);
             compiler->CreateBlockBreak(nullptr, true);
         }
 
