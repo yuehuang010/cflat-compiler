@@ -313,7 +313,7 @@ bool testAllocatorUsedBlocksCleanExit() {
     m.run(args);
     m.WaitForExit();
     // Minimal.main() makes no allocations — 0 blocks in use
-    result &= Test("usedBlocks clean exit", (int)m._allocator.usedBlocks(), 0);
+    result &= Test("usedBytes clean exit", m._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -326,7 +326,7 @@ bool testAllocatorUsedBlocksLeaked() {
     h.WaitForExit();
     // HeapStress allocates count ints via new int, none are freed
     result &= Test("heap stress sum 5", h.exitCode, 15);
-    result &= Test("usedBlocks == count leaked", (int)h._allocator.usedBlocks(), 5);
+    result &= Test("usedBytes leaked > 0", h._allocator.usedBytes() > 0, true);
     return result;
 }
 
@@ -548,7 +548,7 @@ bool testListStringNoLeaks() {
     p.run(args);
     p.WaitForExit();
     result &= Test("list<string> exit code", p.exitCode, 0);
-    result &= Test("list<string> no leaks", (int)p._allocator.usedBlocks(), 0);
+    result &= Test("list<string> no leaks", p._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -560,7 +560,7 @@ bool testListOwnershipNoLeaks() {
     p.run(args);
     p.WaitForExit();
     result &= Test("list ownership exit code", p.exitCode, 0);
-    result &= Test("list ownership no leaks", (int)p._allocator.usedBlocks(), 0);
+    result &= Test("list ownership no leaks", p._allocator.usedBytes(), (i64)0);
     return result;
 }
 

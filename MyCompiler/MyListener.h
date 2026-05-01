@@ -3929,6 +3929,8 @@ public:
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         std::string typeName = structTy->getName().str();
+        // Interface fat-ptrs compare by data pointer — let CreateOperation handle it.
+        if (typeName == "__iface_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
@@ -7758,30 +7760,31 @@ public:
         auto* compiler = compilerLLVM;
 
         // Resolve types — all must be concrete by this point (ProcessPendingInstantiations ran)
-        auto* progType       = compiler->dataStructures[name].StructType;
-        auto* blockAllocType = compiler->dataStructures.count("BlockAllocator")
-                               ? compiler->dataStructures["BlockAllocator"].StructType : nullptr;
-        auto* listStringType = compiler->dataStructures.count("list__string")
-                               ? compiler->dataStructures["list__string"].StructType : nullptr;
-        auto* threadType     = compiler->dataStructures.count("Thread")
-                               ? compiler->dataStructures["Thread"].StructType : nullptr;
+        auto* progType        = compiler->dataStructures[name].StructType;
+        auto* defAllocType    = compiler->dataStructures.count("BlockAllocator")
+                                ? compiler->dataStructures["BlockAllocator"].StructType : nullptr;
+        auto* listStringType  = compiler->dataStructures.count("list__string")
+                                ? compiler->dataStructures["list__string"].StructType : nullptr;
+        auto* threadType      = compiler->dataStructures.count("Thread")
+                                ? compiler->dataStructures["Thread"].StructType : nullptr;
+        auto* fatTy           = compiler->GetFatPtrType();   // {i8*, i8*}
 
-        if (!progType || !blockAllocType || !listStringType || !threadType)
+        if (!progType || !defAllocType || !listStringType || !threadType)
         {
             compiler->LogError(std::format(
                 "program '{}': missing required type (BlockAllocator={}, list__string={}, Thread={})",
                 name,
-                blockAllocType ? "ok" : "missing",
+                defAllocType  ? "ok" : "missing",
                 listStringType ? "ok" : "missing",
-                threadType     ? "ok" : "missing"));
+                threadType    ? "ok" : "missing"));
             return;
         }
 
-        auto* progPtrType       = progType->getPointerTo();
-        auto* blockAllocPtrType = blockAllocType->getPointerTo();
-        auto* voidPtrType       = compiler->builder->getInt8Ty()->getPointerTo();
-        auto* i32Type           = llvm::Type::getInt32Ty(*compiler->context);
-        auto* i64Type           = llvm::Type::getInt64Ty(*compiler->context);
+        auto* progPtrType    = progType->getPointerTo();
+        auto* defAllocPtrTy  = defAllocType->getPointerTo();
+        auto* voidPtrType    = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* i32Type        = llvm::Type::getInt32Ty(*compiler->context);
+        auto* i64Type        = llvm::Type::getInt64Ty(*compiler->context);
 
         // __RunArgs_Name = { Name*, list__string }
         auto* runArgsType = llvm::StructType::create(
@@ -7789,16 +7792,15 @@ public:
         compiler->programTable[name].RunArgsType = runArgsType;
 
         // Look up helper functions
-        auto* mallocFn           = compiler->GetFunction("malloc");
-        auto* freeFn             = compiler->GetFunction("free");
-        auto* blockAllocCtorFn   = compiler->GetFunction("BlockAllocator");
-        auto* blockAllocCleanupFn = FindMethodOf("cleanup", "BlockAllocator");
-        auto* threadCtorFn       = compiler->GetFunction("Thread");
-        auto* threadStartFn      = FindMethodOf("start", "Thread");
-        auto* threadJoinFn       = FindMethodOf("join", "Thread");
-        auto* mainFn             = FindMethodOf("main", name);
+        auto* mallocFn         = compiler->GetFunction("malloc");
+        auto* freeFn           = compiler->GetFunction("free");
+        auto* defAllocCtorFn   = compiler->GetFunction("BlockAllocator");
+        auto* threadCtorFn     = compiler->GetFunction("Thread");
+        auto* threadStartFn    = FindMethodOf("start", "Thread");
+        auto* threadJoinFn     = FindMethodOf("join", "Thread");
+        auto* mainFn           = FindMethodOf("main", name);
 
-        if (!mallocFn || !freeFn || !blockAllocCtorFn || !blockAllocCleanupFn
+        if (!mallocFn || !freeFn || !defAllocCtorFn
             || !threadCtorFn || !threadStartFn || !threadJoinFn || !mainFn)
         {
             compiler->LogError(std::format("program '{}': missing helper function for run() generation", name));
@@ -7854,20 +7856,43 @@ public:
             // Pointer to list__string (field 1) — passed by value to main
             auto* argsGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 1, "args_gep");
 
-            // Allocate BlockAllocator on heap using raw malloc (tracked alloc not active yet)
-            auto* blockAllocSize = compiler->GetTypeSizeBytes(blockAllocType);
-            auto* allocRaw = compiler->builder->CreateCall(
-                mallocFn->getFunctionType(), mallocFn, {blockAllocSize}, "alloc_raw");
-            auto* allocPtr = compiler->builder->CreateBitCast(allocRaw, blockAllocPtrType, "alloc_ptr");
+            // Load self->_allocator (IAllocator fat-ptr); user may have set it before run().
+            auto* allocFieldGEP = compiler->builder->CreateStructGEP(
+                progType, self, allocatorIdx, "alloc_field_gep");
+            auto* existingFatPtr = compiler->builder->CreateLoad(fatTy, allocFieldGEP, "existing_alloc");
 
-            // Initialize BlockAllocator via its default constructor (returns struct by value)
-            auto* allocInitVal = compiler->builder->CreateCall(
-                blockAllocCtorFn->getFunctionType(), blockAllocCtorFn, {}, "alloc_init");
-            compiler->builder->CreateStore(allocInitVal, allocPtr);
+            // Check data ptr (field 1): null means user left _allocator unset → use default.
+            auto* existingDataPtr = compiler->builder->CreateExtractValue(existingFatPtr, {1u}, "existing_data");
+            auto* isNull = compiler->builder->CreateICmpEQ(
+                existingDataPtr,
+                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                "alloc_is_null");
 
-            // Set thread-local __active_allocator = allocPtr
+            auto* defaultBlock = llvm::BasicBlock::Create(*compiler->context, "alloc_default", trampolineFn);
+            auto* useBlock     = llvm::BasicBlock::Create(*compiler->context, "alloc_use",     trampolineFn);
+            compiler->builder->CreateCondBr(isNull, defaultBlock, useBlock);
+
+            // Default path: create a BlockAllocator on the heap and build its IAllocator fat-ptr.
+            compiler->builder->SetInsertPoint(defaultBlock);
+            auto* defAllocSize = compiler->GetTypeSizeBytes(defAllocType);
+            auto* defAllocRaw  = compiler->builder->CreateCall(
+                mallocFn->getFunctionType(), mallocFn, {defAllocSize}, "def_alloc_raw");
+            auto* defAllocPtr  = compiler->builder->CreateBitCast(defAllocRaw, defAllocPtrTy, "def_alloc_ptr");
+            auto* defAllocInit = compiler->builder->CreateCall(
+                defAllocCtorFn->getFunctionType(), defAllocCtorFn, {}, "def_alloc_init");
+            compiler->builder->CreateStore(defAllocInit, defAllocPtr);
+            auto* defVtable    = compiler->GetOrCreateVTable("BlockAllocator", "IAllocator");
+            auto* defFatPtr    = compiler->BuildInterfaceFatValue(defVtable, defAllocPtr);
+            compiler->builder->CreateStore(defFatPtr, allocFieldGEP);
+            compiler->builder->CreateBr(useBlock);
+
+            // Merge: load the (possibly just-written) fat-ptr from self->_allocator.
+            compiler->builder->SetInsertPoint(useBlock);
+            auto* activeFatPtr = compiler->builder->CreateLoad(fatTy, allocFieldGEP, "active_alloc");
+
+            // Set thread-local __active_allocator to the IAllocator fat-ptr.
             auto* activeAllocGlobal = compiler->globalNamedVariable["__active_allocator"];
-            compiler->builder->CreateStore(allocPtr, activeAllocGlobal);
+            compiler->builder->CreateStore(activeFatPtr, activeAllocGlobal);
 
             // Install stdout hook: load self->onStdout and store into __stdout_hook
             {
@@ -7889,20 +7914,13 @@ public:
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(progType, self, exitCodeIdx, "exit_code_gep");
             compiler->builder->CreateStore(mainResult, exitCodeGEP);
 
-            // Clear __active_allocator — allocations are no longer tracked after main() returns
-            compiler->builder->CreateStore(
-                llvm::ConstantPointerNull::get(blockAllocPtrType), activeAllocGlobal);
+            // Clear __active_allocator — tracked alloc ends when main() returns.
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
 
             // Clear stdout hook
             compiler->builder->CreateStore(
                 llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(hookFnPtrType)),
                 stdoutHookGlobal);
-
-            // Store allocator into self->_allocator so it remains inspectable after WaitForExit().
-            // Cleanup and free happen in ~Name() when the program struct is destroyed.
-            auto* allocatorFieldGEP = compiler->builder->CreateStructGEP(
-                progType, self, allocatorIdx, "alloc_field_gep");
-            compiler->builder->CreateStore(allocPtr, allocatorFieldGEP);
 
             // Free the args packet (trampoline owns it; run() transferred ownership on start success)
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
@@ -8042,7 +8060,7 @@ public:
 
         // ======================================================================
         // EMIT ~Name(): void ~Name(Name* this)   [only if user didn't provide one]
-        // Frees the BlockAllocator stored in _allocator after the program exits.
+        // Calls cleanup() and frees the IAllocator stored in _allocator.
         // Null-checks so it's safe to call even if run() was never called.
         // ======================================================================
         if (compiler->dataStructures[name].Destructor == nullptr)
@@ -8056,24 +8074,29 @@ public:
 
             auto* thisArg = dtorFn->getArg(0);
 
-            // Load self->_allocator
-            auto* allocFieldGEP = compiler->builder->CreateStructGEP(
+            // Load self->_allocator (IAllocator fat-ptr)
+            auto* dtor_allocFieldGEP = compiler->builder->CreateStructGEP(
                 progType, thisArg, allocatorIdx, "alloc_field_gep");
-            auto* allocLoad = compiler->builder->CreateLoad(blockAllocPtrType, allocFieldGEP, "alloc_load");
+            auto* allocFatPtr = compiler->builder->CreateLoad(fatTy, dtor_allocFieldGEP, "alloc_fat_ptr");
 
-            // if (_allocator != nullptr) { cleanup(_allocator); free(_allocator); _allocator = nullptr; }
-            auto* nullAlloc    = llvm::ConstantPointerNull::get(blockAllocPtrType);
-            auto* isNotNull    = compiler->builder->CreateICmpNE(allocLoad, nullAlloc, "alloc_not_null");
+            // if (data ptr != null) { cleanup(); free(data); zero _allocator; }
+            auto* allocDataPtr = compiler->builder->CreateExtractValue(allocFatPtr, {1u}, "alloc_data");
+            auto* isNotNull    = compiler->builder->CreateICmpNE(
+                allocDataPtr,
+                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                "alloc_not_null");
             auto* cleanupBlock = llvm::BasicBlock::Create(*compiler->context, "alloc_cleanup", dtorFn);
             auto* doneBlock    = llvm::BasicBlock::Create(*compiler->context, "dtor_done",     dtorFn);
             compiler->builder->CreateCondBr(isNotNull, cleanupBlock, doneBlock);
 
             compiler->builder->SetInsertPoint(cleanupBlock);
-            compiler->builder->CreateCall(
-                blockAllocCleanupFn->getFunctionType(), blockAllocCleanupFn, {allocLoad});
-            auto* allocVoidPtr = compiler->builder->CreateBitCast(allocLoad, voidPtrType);
-            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocVoidPtr});
-            compiler->builder->CreateStore(nullAlloc, allocFieldGEP);
+            // alloca a fat-ptr slot so CallInterfaceMethod can GEP into it
+            auto* allocFatPtrSlot = compiler->builder->CreateAlloca(fatTy, nullptr, "alloc_fat_slot");
+            compiler->builder->CreateStore(allocFatPtr, allocFatPtrSlot);
+            compiler->CallInterfaceMethod(allocFatPtrSlot, "IAllocator", "cleanup", {});
+            // free the underlying memory (data ptr is already in allocDataPtr)
+            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocDataPtr});
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), dtor_allocFieldGEP);
             compiler->builder->CreateBr(doneBlock);
 
             compiler->builder->SetInsertPoint(doneBlock);
@@ -8120,7 +8143,7 @@ public:
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
-        // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (BlockAllocator*),
+        // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
         // onStdout (function<void(char*)>), inbox (channel<IMessage>)
         unsigned exitCodeFieldIndex  = (unsigned)declList.size();
         unsigned threadFieldIndex    = exitCodeFieldIndex + 1;
@@ -8139,8 +8162,9 @@ public:
             declList.push_back(threadField);
 
             MyCompilerLLVM::DeclTypeAndValue allocatorField;
-            allocatorField.TypeName     = "BlockAllocator";
+            allocatorField.TypeName     = "IAllocator";
             allocatorField.VariableName = "_allocator";
+            allocatorField.IsInterface  = true;
             allocatorField.Pointer      = true;
             declList.push_back(allocatorField);
 
@@ -8211,15 +8235,11 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, threadInitVal, threadFieldIndex);
             }
 
-            // Synthetic field: _allocator = nullptr
+            // Synthetic field: _allocator = zero (null IAllocator fat-ptr)
             {
-                auto* blockAllocType = compiler->dataStructures.count("BlockAllocator")
-                                       ? compiler->dataStructures["BlockAllocator"].StructType : nullptr;
-                if (blockAllocType)
-                {
-                    auto* nullAlloc = llvm::ConstantPointerNull::get(blockAllocType->getPointerTo());
-                    structVal = compiler->CreateInsertValue(structVal, nullAlloc, allocatorFieldIndex);
-                }
+                auto* fatTy = compiler->GetFatPtrType();
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fatTy), allocatorFieldIndex);
             }
 
             // Synthetic field: onStdout = nullptr

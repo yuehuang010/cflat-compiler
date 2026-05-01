@@ -327,7 +327,7 @@ public:
         llvm::StructType* RunArgsType = nullptr;       // { Name*, list__string }
         unsigned ExitCodeFieldIndex = 0;               // struct field index of exitCode
         unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
-        unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (BlockAllocator*)
+        unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (IAllocator fat-ptr)
         unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
         unsigned InboxFieldIndex = 0;                  // struct field index of inbox (channel<IMessage>)
     };
@@ -2130,11 +2130,17 @@ public:
                     initValue = llvm::ConstantFP::get(destinationType, fpValue->getValueAPF());
                 }
             }
+            // Coerce a null-value (e.g. nullptr) to the destination type when types differ.
+            // Handles fat-ptr structs and function pointers initialized with = nullptr.
+            else if (initValue->isNullValue() && initValue->getType() != destinationType)
+            {
+                initValue = llvm::Constant::getNullValue(destinationType);
+            }
         }
         else
         {
-            // initialize to 0
-            initValue = CreateConstant(typeValue.TypeName, "0");
+            // Zero-initialize — works for all types: primitives, pointers, structs, fat-ptrs.
+            initValue = llvm::Constant::getNullValue(destinationType);
         }
 
         auto gVar = new llvm::GlobalVariable(
@@ -2800,10 +2806,21 @@ public:
             }
             case Operation::Equal:
             {
+                // Interface fat-ptr compared to nullptr: ICmp on the data pointer field only.
+                if (left->getType() != right->getType() && left->getType()->isStructTy())
+                {
+                    left  = builder->CreateExtractValue(left, {1u});
+                    right = llvm::Constant::getNullValue(left->getType());
+                }
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
             }
             case Operation::NotEqual:
             {
+                if (left->getType() != right->getType() && left->getType()->isStructTy())
+                {
+                    left  = builder->CreateExtractValue(left, {1u});
+                    right = llvm::Constant::getNullValue(left->getType());
+                }
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
             }
             case Operation::Greater:

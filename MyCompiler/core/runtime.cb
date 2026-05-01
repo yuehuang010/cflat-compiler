@@ -1,27 +1,18 @@
 // CFlat runtime — allocator interface
 import "cruntime.cb";
+import "interfaces.cb";
 
-thread_local BlockAllocator* __active_allocator = nullptr;
+thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null data = inactive
 
 void __register_handle(void* handle, void* closeFn)
 {
     // stub — handle tracking is future work
 }
 
-void* __runtime_alloc(BlockAllocator* a, i64 size)
-{
-    return a.alloc(size);
-}
-
-void __runtime_dealloc(BlockAllocator* a, void* ptr)
-{
-    a.dealloc(ptr);
-}
-
 void* operator new(i64 size)
 {
     if (__active_allocator != nullptr)
-        return __runtime_alloc(__active_allocator, size);
+        return __active_allocator.alloc(size);
     return malloc(size);
 }
 
@@ -29,7 +20,7 @@ void operator delete(void* ptr)
 {
     if (__active_allocator != nullptr)
     {
-        __runtime_dealloc(__active_allocator, ptr);
+        __active_allocator.dealloc(ptr);
         return;
     }
     free(ptr);
