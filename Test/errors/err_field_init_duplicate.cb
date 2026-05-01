@@ -1,0 +1,8 @@
+struct Point { int x = 0; int y = 0; };
+
+extern int main()
+{
+    expect_error("Duplicate field initializer for 'x'");
+    Point p = { x=1, x=2 };
+    return 0;
+}

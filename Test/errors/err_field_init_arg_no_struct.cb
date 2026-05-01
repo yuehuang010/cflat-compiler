@@ -1,0 +1,9 @@
+void takeInt(int x) { }
+
+extern int main()
+{
+    expect_error("field initializer: cannot infer struct type for argument position 0") {
+        takeInt({ x=1 });
+    }
+    return 0;
+}

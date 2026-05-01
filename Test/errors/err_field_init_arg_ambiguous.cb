@@ -1,0 +1,13 @@
+struct Point { int x = 0; int y = 0; };
+struct Size  { int w = 0; int h = 0; };
+
+void draw(Point p) { }
+void draw(Size s)  { }
+
+extern int main()
+{
+    expect_error("field initializer: ambiguous struct type at argument position 0") {
+        draw({ x=1 });
+    }
+    return 0;
+}

@@ -257,7 +257,7 @@ public:
         CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
 
         // Used for default parameter values
-        CFlatParser::AssignmentExpressionContext* DefaultValue = nullptr;
+        CFlatParser::InitializerContext* DefaultValue = nullptr;
 
         bool external = false;
         bool threadLocal = false;

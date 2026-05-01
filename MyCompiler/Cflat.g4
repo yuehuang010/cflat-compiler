@@ -62,7 +62,7 @@ genericAssociation
     ;
 
 postfixExpression
-    : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}') (
+    : primaryExpression (
         '[' expression ']'
         | '(' argumentExpressionList ')'
         | ('.' | '->' | QuestionDot) (Identifier | Move) genericTypeParameters?
@@ -77,6 +77,8 @@ argumentExpressionList
 
 argumentNamedExpression
     : (Identifier ':')? assignmentExpression
+    | Identifier ':' '{' initializerList ','? '}'
+    | '{' initializerList ','? '}'
     | '...'
     ;
 
@@ -424,7 +426,7 @@ parameterList
     ;
 
 parameterDeclaration
-    : declarationSpecifiers declarator ('=' assignmentExpression)?
+    : declarationSpecifiers declarator ('=' initializer)?
     | declarationSpecifiers abstractDeclarator?
     ;
 
@@ -451,20 +453,11 @@ initializer
     ;
 
 initializerList
-    : designation? initializer (',' designation? initializer)*
+    : fieldInit (',' fieldInit)*
     ;
 
-designation
-    : designatorList '='
-    ;
-
-designatorList
-    : designator+
-    ;
-
-designator
-    : '[' constantExpression ']'
-    | '.' Identifier
+fieldInit
+    : Identifier '=' assignmentExpression
     ;
 
 statement
@@ -639,6 +632,7 @@ destructorDefinition
 newExpression
     : New typeSpecifier ('(' argumentExpressionList ')')?
     | New typeSpecifier '[' assignmentExpression ']'
+    | New typeSpecifier '{' initializerList ','? '}'
     ;
 
 moveExpression

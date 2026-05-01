@@ -251,7 +251,7 @@ private:
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = directDeclarer->getText();
-            paramType.DefaultValue = paramDecl->assignmentExpression();
+            paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);
         }
         return params;
@@ -2473,10 +2473,33 @@ public:
 
             for (int i = cutoff; i < (int)params.size(); i++)
             {
-                auto defaultVal = ParseAssignmentExpression(params[i].DefaultValue);
+                auto* initCtx = params[i].DefaultValue;
+                llvm::Value* defaultVal = nullptr;
+                if (auto* ae = initCtx->assignmentExpression())
+                {
+                    defaultVal = ParseAssignmentExpression(ae);
+                }
+                else if (initCtx->Default())
+                {
+                    defaultVal = GenerateDefaultValue(params[i]);
+                }
+                else if (auto* initList = initCtx->initializerList())
+                {
+                    // Field initializer default: build the struct, apply overrides, pass by value.
+                    defaultVal = GenerateDefaultValue(params[i]);
+                    if (defaultVal)
+                    {
+                        auto* alloca = compiler->CreateAlloca(defaultVal->getType());
+                        compiler->CreateAssignment(defaultVal, alloca);
+                        EmitFieldInitializer(alloca, params[i].TypeName, initList);
+                        defaultVal = compiler->CreateLoad(alloca);
+                    }
+                }
                 MyCompilerLLVM::NamedVariable namedVar;
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
+                namedVar.TypeAndValue.TypeName = params[i].TypeName;
+                namedVar.TypeAndValue.Pointer = params[i].Pointer;
                 callArgs.push_back(namedVar);
             }
 
@@ -2949,6 +2972,12 @@ public:
                     {
                         right = GenerateDefaultValue(typeAndValue);
                     }
+                    else if (initializer->initializerList() != nullptr)
+                    {
+                        // Field initializer: MyStruct s = { field=val, ... }
+                        // Initialize with the default constructor first, then override named fields.
+                        right = GenerateDefaultValue(typeAndValue);
+                    }
                 }
 
                 if (right == nullptr && typeAndValue.IsNullable)
@@ -2986,6 +3015,10 @@ public:
                     if (right != nullptr)
                     {
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+
+                        // Apply field initializer overrides after the default value is stored.
+                        if (initializer && initializer->initializerList())
+                            EmitFieldInitializer(alloc, typeAndValue.TypeName, initializer->initializerList());
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
                         // mark this local as owning so the destructor frees the buffer on scope exit.
@@ -4401,6 +4434,148 @@ public:
         return Compiler(ctx)->ResolveQualifiedName(name);
     }
 
+    // Resolves the struct type expected at a call-site field initializer argument.
+    // Pass effectiveParamIdx >= 0 for positional args (already offset by implicit 'this').
+    // Pass effectiveParamIdx = -1 and non-empty namedParam for named-parameter form.
+    std::string ResolveInitializerArgType(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& functionName,
+        int effectiveParamIdx,
+        const std::string& namedParam)
+    {
+        auto* compiler = Compiler(ctx);
+        auto it = compiler->functionTable.find(functionName);
+        if (it == compiler->functionTable.end())
+        {
+            LogErrorContext(ctx, std::format("field initializer: unknown function '{}'", functionName));
+            return "";
+        }
+
+        std::string resolved;
+        bool ambiguous = false;
+        for (const auto& sym : it->second)
+        {
+            const MyCompilerLLVM::TypeAndValue* param = nullptr;
+            if (!namedParam.empty())
+            {
+                for (const auto& p : sym.Parameters)
+                {
+                    if (p.VariableName == namedParam) { param = &p; break; }
+                }
+            }
+            else if (effectiveParamIdx >= 0 && effectiveParamIdx < (int)sym.Parameters.size())
+            {
+                param = &sym.Parameters[effectiveParamIdx];
+            }
+
+            if (param && !param->TypeName.empty() && compiler->IsDataStructure(param->TypeName))
+            {
+                if (resolved.empty())
+                    resolved = param->TypeName;
+                else if (resolved != param->TypeName)
+                    ambiguous = true;
+            }
+        }
+
+        if (ambiguous)
+        {
+            LogErrorContext(ctx, namedParam.empty()
+                ? std::format("field initializer: ambiguous struct type at argument position {}", effectiveParamIdx)
+                : std::format("field initializer: ambiguous struct type for parameter '{}'", namedParam));
+            return "";
+        }
+        if (resolved.empty())
+        {
+            LogErrorContext(ctx, namedParam.empty()
+                ? std::format("field initializer: cannot infer struct type for argument position {}", effectiveParamIdx)
+                : std::format("field initializer: parameter '{}' is not a struct type", namedParam));
+            return "";
+        }
+        return resolved;
+    }
+
+    void EmitFieldInitializer(
+        llvm::Value* structPtr,
+        const std::string& typeName,
+        CFlatParser::InitializerListContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto it = compiler->dataStructures.find(typeName);
+        if (it == compiler->dataStructures.end())
+        {
+            LogErrorContext(ctx, std::format("Field initializer: '{}' is not a known struct type", typeName));
+            return;
+        }
+        const auto& sd = it->second;
+
+        std::unordered_set<std::string> seen;
+        for (auto* fi : ctx->fieldInit())
+        {
+            std::string fieldName = fi->Identifier()->getText();
+            if (!seen.insert(fieldName).second)
+            {
+                LogErrorContext(fi, std::format("Duplicate field initializer for '{}'", fieldName));
+                continue;
+            }
+
+            int fieldIdx = -1;
+            MyCompilerLLVM::DeclTypeAndValue fieldType;
+            for (int i = 0; i < (int)sd.StructFields.size(); i++)
+            {
+                if (sd.StructFields[i].VariableName == fieldName)
+                {
+                    fieldIdx = i;
+                    fieldType = sd.StructFields[i];
+                    break;
+                }
+            }
+            if (fieldIdx < 0)
+            {
+                LogErrorContext(fi, std::format("'{}' has no field named '{}'", typeName, fieldName));
+                continue;
+            }
+
+            auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression());
+            llvm::Value* val = LoadNamedVariable(rightNV);
+            if (!val) continue;
+
+            // Coerce char* string literals to the string struct type
+            if (fieldType.TypeName == "string" && !fieldType.Pointer
+                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+            {
+                auto* c = llvm::dyn_cast<llvm::Constant>(val);
+                if (c && compiler->IsStringLiteralConstant(c))
+                    val = compiler->WrapStringLiteralAsString(val);
+                else if (compiler->GetFunction("operator string"))
+                {
+                    MyCompilerLLVM::NamedVariable argNV;
+                    argNV.Primary = val;
+                    argNV.BaseType = val->getType();
+                    val = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
+                }
+            }
+            // Coerce struct pointer to interface fat pointer
+            else if (fieldType.IsInterface && val->getType() != compiler->GetFatPtrType())
+            {
+                std::string srcName = rightNV.TypeAndValue.TypeName;
+                if (!srcName.empty() && compiler->StructImplementsInterface(srcName, fieldType.TypeName))
+                {
+                    auto vtable = compiler->GetOrCreateVTable(srcName, fieldType.TypeName);
+                    llvm::Value* dataPtr = rightNV.TypeAndValue.Pointer ? val : rightNV.Storage;
+                    if (!dataPtr)
+                    {
+                        dataPtr = compiler->CreateAlloca(val->getType());
+                        compiler->CreateAssignment(val, dataPtr);
+                    }
+                    val = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                }
+            }
+
+            auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
+            compiler->builder->CreateStore(val, gep);
+        }
+    }
+
     MyCompilerLLVM::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -4478,6 +4653,10 @@ public:
             if (structVal)
                 compiler->builder->CreateStore(structVal, typedPtr);
         }
+
+        // Apply field initializer: new Type { field=val, ... }
+        if (auto* initList = ctx->initializerList())
+            EmitFieldInitializer(typedPtr, typeName, initList);
 
         MyCompilerLLVM::NamedVariable result;
         result.TypeAndValue.TypeName = typeName;
@@ -4631,7 +4810,7 @@ public:
     {
         /*
         * postfixExpression
-            : (primaryExpression | '(' typeName ')' '{' initializerList ','? '}')
+            : primaryExpression
             (
                 '[' expression ']'
                 | '(' argumentExpressionList? ')'
@@ -6045,6 +6224,35 @@ public:
                                         argVar.BaseType = vaValue->getType();
                                         argVar.TypeAndValue.TypeName = "va_list";
                                         arguments.emplace_back(argVar);
+                                        continue;
+                                    }
+
+                                    // Field initializer argument: { field=val, ... } or paramName: { field=val, ... }
+                                    if (namedArgument->initializerList())
+                                    {
+                                        auto* argNameToken = namedArgument->Identifier();
+                                        std::string namedParam = argNameToken ? argNameToken->getText() : "";
+                                        int effectiveIdx = namedParam.empty() ? (int)(argIdx + paramOffset) : -1;
+                                        std::string structType = ResolveInitializerArgType(ctx, functionName, effectiveIdx, namedParam);
+                                        if (!structType.empty())
+                                        {
+                                            MyCompilerLLVM::DeclTypeAndValue paramType;
+                                            paramType.TypeName = structType;
+                                            llvm::Value* defaultVal = GenerateDefaultValue(paramType);
+                                            if (defaultVal)
+                                            {
+                                                auto* alloca = Compiler(ctx)->CreateAlloca(defaultVal->getType());
+                                                Compiler(ctx)->CreateAssignment(defaultVal, alloca);
+                                                EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
+                                                llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
+                                                MyCompilerLLVM::NamedVariable argVar;
+                                                argVar.Primary = loaded;
+                                                argVar.BaseType = loaded->getType();
+                                                argVar.TypeAndValue.TypeName = structType;
+                                                argVar.TypeAndValue.VariableName = namedParam;
+                                                arguments.emplace_back(argVar);
+                                            }
+                                        }
                                         continue;
                                     }
 
@@ -8667,7 +8875,7 @@ public:
                 }
             }
 
-            paramType.DefaultValue = paramDecl->assignmentExpression();
+            paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);
 
             if (paramType.VariableName == "")
