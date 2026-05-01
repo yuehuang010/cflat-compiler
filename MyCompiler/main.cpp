@@ -38,6 +38,7 @@ int main(int argc, char* argv[])
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
+    args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
     args.addFlag("nologo", 0, "Hide compiler version and completion messages");
 
     if (!args.parse(argc, argv))

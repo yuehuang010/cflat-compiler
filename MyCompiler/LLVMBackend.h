@@ -520,6 +520,11 @@ private:
     {
         auto fn = llvm::Function::Create(returnType, llvm::Function::ExternalLinkage, name, *module);
 
+        // CFlat treats null pointer dereferences as defined behavior (hardware fault → SEH).
+        // This attribute prevents instcombine from removing loads/stores through null pointers
+        // as UB, preserving the fault so the program construct's SEH handler can catch it.
+        fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
+
         llvm::verifyFunction(*fn);
 
         return fn;
@@ -1159,6 +1164,7 @@ private:
         return true;
     }
 
+    void RunBaselinePasses();
     void OptimizeModule(int optimizationLevel);
 
     bool SaveToFile(std::string filename)
@@ -3219,6 +3225,10 @@ public:
         {
             fn = createFunctionProto(mangledName, functionType);
         }
+
+        // CFlat treats null pointer dereferences as defined behavior (hardware fault → SEH).
+        // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
+        fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
         createFunctionBlock(fn, functionName, arguments, returnsOwned);
 

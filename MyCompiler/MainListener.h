@@ -7933,6 +7933,11 @@ public:
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(
                 progType, self, exitCodeIdx, "exit_code_gep");
 
+            // noinline: prevents the optimizer from inlining main() into this trampoline.
+            // If main() were inlined, null-dereference faults would move out of the invoke's
+            // protected region and Windows SEH would not route them to dispatchBB.
+            mainFn->addFnAttr(llvm::Attribute::NoInline);
+
             // Invoke main() — normal return lands in normalBB, any fault unwinds to dispatchBB.
             auto* invokeInst = compiler->builder->CreateInvoke(
                 mainFn->getFunctionType(), mainFn,

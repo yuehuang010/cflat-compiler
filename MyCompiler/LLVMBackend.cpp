@@ -6,6 +6,10 @@
 #include <llvm\IR\Verifier.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <llvm\Passes\PassBuilder.h>
+#include <llvm\Transforms\Utils\Mem2Reg.h>
+#include <llvm\Transforms\Scalar\SROA.h>
+#include <llvm\Transforms\InstCombine\InstCombine.h>
+#include <llvm\Transforms\Scalar\SimplifyCFG.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -286,6 +290,12 @@ bool LLVMBackend::Compile(const ArgParser& args)
         return false;
     }
 
+    if (!args.hasFlag("no-opt"))
+    {
+        if (verbose) std::cout << "[verbose] running baseline passes (sroa, mem2reg, instcombine, simplifycfg)\n";
+        RunBaselinePasses();
+    }
+
     int optLevel = args.getOptimizationLevel();
     if (optLevel > 0)
     {
@@ -449,6 +459,31 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
 
     sourceFileName = savedSourceFileName;
     return true;
+}
+
+void LLVMBackend::RunBaselinePasses()
+{
+    llvm::PassBuilder PB;
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
+    FPM.addPass(llvm::PromotePass());
+    FPM.addPass(llvm::InstCombinePass());
+    FPM.addPass(llvm::SimplifyCFGPass());
+
+    llvm::ModulePassManager MPM;
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    MPM.run(*module, MAM);
 }
 
 void LLVMBackend::OptimizeModule(int optimizationLevel)
