@@ -46,6 +46,31 @@ program MultiField {
     }
 };
 
+// Resource: simple heap-allocated struct used by ListOwnership
+struct Resource {
+    int id    = 0;
+    int value = 0;
+};
+
+// ListOwnership: adds `count` heap-allocated Resource* into a list<Resource*>
+// via move; the list destructor frees all elements, leaving zero leaks.
+program ListOwnership {
+    int count = 0;
+
+    int main(move list<string> args) {
+        list<Resource*> items;
+        int i = 0;
+        while (i < count) {
+            Resource* r = new Resource;
+            r->id    = i;
+            r->value = i * 10;
+            items.add(move r);
+            i++;
+        }
+        return 0;
+    }
+};
+
 // HeapStress: allocates `count` ints on the heap, returns their sum;
 // BlockAllocator is responsible for cleanup
 program HeapStress {
@@ -494,6 +519,51 @@ bool testInboxPolymorphicMessages() {
 // stop_token tests
 // ---------------------------------------------------------------------------
 
+// ListStringOwnership: adds string literals into a list<string>.
+// String literals point to static memory, so only the list's backing array
+// goes through operator new. The list destructor frees it, leaving no leaks.
+// Count is capped at 4: sizeof(string)==16, so 4 strings fill exactly one
+// 64-byte block; growing to capacity 8 (128 bytes) would exceed the block
+// allocator's block size and return null.
+program ListStringOwnership {
+    int count = 0;
+
+    int main(move list<string> args) {
+        list<string> items;
+        int i = 0;
+        while (i < count) {
+            string s = "hello";
+            items.add(s);
+            i++;
+        }
+        return 0;
+    }
+};
+
+bool testListStringNoLeaks() {
+    bool result = true;
+    ListStringOwnership p;
+    p.count = 4;  // 4 strings × 16 bytes = 64 bytes = one block; count>4 would overflow
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("list<string> exit code", p.exitCode, 0);
+    result &= Test("list<string> no leaks", (int)p._allocator.usedBlocks(), 0);
+    return result;
+}
+
+bool testListOwnershipNoLeaks() {
+    bool result = true;
+    ListOwnership p;
+    p.count = 5;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("list ownership exit code", p.exitCode, 0);
+    result &= Test("list ownership no leaks", (int)p._allocator.usedBlocks(), 0);
+    return result;
+}
+
 bool testWaitForExitWithToken() {
     bool result = true;
 
@@ -553,6 +623,8 @@ extern int main() {
     total++; passed += testProgramArgsAndFieldCombined() ? 1 : 0;
     total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
     total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
+    total++; passed += testListStringNoLeaks()              ? 1 : 0;
+    total++; passed += testListOwnershipNoLeaks()           ? 1 : 0;
     total++; passed += testWaitForExitWithToken()          ? 1 : 0;
     total++; passed += testWaitForExitCancelled()          ? 1 : 0;
     total++; passed += testAllocatorNonNullAfterRun()      ? 1 : 0;
