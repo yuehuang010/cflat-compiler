@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <stdlib.h>
 
-#include "MyCompilerLLVM.h"
+#include "LLVMBackend.h"
 #include "CompilerManager.h"
 #include "ArgParser.h"
 #include "Version.h"
@@ -66,7 +66,7 @@ int main(int argc, char* argv[])
     _get_pgmptr(&pgmptr);
     std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
 
-    MyCompilerLLVM compiler;
+    LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));

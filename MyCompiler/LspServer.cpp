@@ -4,8 +4,8 @@
 #include "LspTypes.h"
 #include "LspSymbolIndex.h"
 #include "JsonRpcLoop.h"
-#include "MyCompilerLLVM.h"
-#include "MyListener.h"
+#include "LLVMBackend.h"
+#include "MainListener.h"
 
 #include <filesystem>
 #include <format>
@@ -211,7 +211,7 @@ public:
         , runtimeDir_(runtimeDir)
         , importSearchDir_(importDir)
         , verbose_(verbose)
-        , compiler_(std::make_unique<MyCompilerLLVM>())
+        , compiler_(std::make_unique<LLVMBackend>())
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
         compiler_->SetRuntimeDir(runtimeDir_);
@@ -687,7 +687,7 @@ private:
             if (!recovered)
             {
                 if (verbose_) std::cerr << "[lsp] compiler crash during analysis, resetting\n";
-                compiler_ = std::make_unique<MyCompilerLLVM>();
+                compiler_ = std::make_unique<LLVMBackend>();
                 compiler_->SetRuntimeDir(runtimeDir_);
                 compiler_->SetVerbose(verbose_);
                 analysisCount_ = 0;
@@ -768,7 +768,7 @@ private:
     std::unordered_map<std::string, OpenDocument> docs_;
 
     std::mutex analysisMutex_;
-    std::unique_ptr<MyCompilerLLVM> compiler_;
+    std::unique_ptr<LLVMBackend> compiler_;
     int analysisCount_    = 0;
     int tempFileCounter_  = 0;
 

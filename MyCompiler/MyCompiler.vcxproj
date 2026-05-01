@@ -167,10 +167,10 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="MyCompilerLLVM.cpp" />
-    <ClInclude Include="MyCompilerLLVM.h" />
-    <ClInclude Include="MyListener.h" />
-    <ClCompile Include="MyCompiler.cpp" />
+    <ClCompile Include="LLVMBackend.cpp" />
+    <ClInclude Include="LLVMBackend.h" />
+    <ClInclude Include="MainListener.h" />
+    <ClCompile Include="main.cpp" />
     <ClCompile Include="JsonRpcLoop.cpp" />
     <ClInclude Include="JsonRpcLoop.h" />
     <ClCompile Include="LspServer.cpp" />

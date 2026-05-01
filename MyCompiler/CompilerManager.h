@@ -6,7 +6,7 @@
 #include <crtdbg.h>
 #include <llvm/Support/Error.h>
 
-class MyCompilerLLVM;
+class LLVMBackend;
 
 // DumpAllState is defined after MyCompilerLLVM is fully declared (see bottom of MyCompilerLLVM.h).
 // This header only holds the class layout and the hook installer.
@@ -20,12 +20,12 @@ public:
         return instance;
     }
 
-    void Register(MyCompilerLLVM* compiler)
+    void Register(LLVMBackend* compiler)
     {
         compilers_.push_back(compiler);
     }
 
-    void Unregister(MyCompilerLLVM* compiler)
+    void Unregister(LLVMBackend* compiler)
     {
         auto it = std::find(compilers_.begin(), compilers_.end(), compiler);
         if (it != compilers_.end())
@@ -53,7 +53,7 @@ public:
 private:
     CompilerManager() = default;
 
-    std::vector<MyCompilerLLVM*> compilers_;
+    std::vector<LLVMBackend*> compilers_;
 
     static void AbortHandler(int)
     {

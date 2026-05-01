@@ -1,12 +1,12 @@
 ﻿#pragma once
 // ============================================================
-// MyListener.h — CFlat front-end: ForwardRefScanner + MyListener
+// MainListener.h — CFlat front-end: ForwardRefScanner + MyListener
 // ============================================================
 // SECTION         LINE     DESCRIPTION
 // ───────────────────────────────────────────────────────────
 // §1              15-67    File-level helpers
 // §2              72-195   ForwardRefScanner class (pre-pass)
-// §3              200-517  MyListener class (code generation)
+// §3              200-517  MainListener class (code generation)
 //   §3.1  591             ParseDeclarationSpecifiers (codegen)
 //   §3.2  847             Interface/generic instantiation
 //   §3.3 1020             Top-level declarations
@@ -30,7 +30,7 @@
 #include "CFlatParser.h"
 #include "CFlatLexer.h"
 #include "CFlatBaseListener.h"
-#include "MyCompilerLLVM.h"
+#include "LLVMBackend.h"
 #include "LspSymbolIndex.h"
 
 // Returns true when a function's entire body is a single 'return { ... };' statement,
@@ -112,18 +112,18 @@ static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
 class ForwardRefScanner
 {
 private:
-    MyCompilerLLVM* compilerLLVM;
+    LLVMBackend* compilerLLVM;
 
-    MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
+    LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx)
     {
         compilerLLVM->SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
         return compilerLLVM;
     }
 
-    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
+    LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
         auto* compiler = Compiler(declSpecs);
-        MyCompilerLLVM::DeclTypeAndValue declType;
+        LLVMBackend::DeclTypeAndValue declType;
         for (auto declSpec : declSpecs->declarationSpecifier())
         {
             auto typeSpec = declSpec->typeSpecifier();
@@ -153,7 +153,7 @@ private:
                         std::string mangledName = "tuple";
                         for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
                         compiler->CreateStructType(mangledName, {});
-                        MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                        LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
                         declType.TypeName = mangledName;
                         declType.Pointer = declSpec->pointer() != nullptr;
@@ -173,7 +173,7 @@ private:
                             {
                                 for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                                 {
-                                    MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
+                                    LLVMBackend::TypeAndValue::FuncPtrParam p;
                                     p.TypeName = param->typeSpecifier()->getText();
                                     p.Pointer = param->pointer() != nullptr;
                                     declType.FuncPtrParams.push_back(p);
@@ -197,7 +197,7 @@ private:
                     // uses inside function bodies are resolvable before the full
                     // definition is emitted by ProcessPendingInstantiations().
                     compiler->CreateStructType(mangledName, {});
-                    MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
+                    LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                     compiler->CreateFunctionDeclaration(mangledName, returnType, {});
                     declType.TypeName = mangledName;
                 }
@@ -238,16 +238,16 @@ private:
         return declType;
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
+    std::vector<LLVMBackend::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
     {
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
+        std::vector<LLVMBackend::DeclTypeAndValue> params;
         if (paramTypeList == nullptr)
             return params;
 
         auto paramList = paramTypeList->parameterList();
         for (auto paramDecl : paramList->parameterDeclaration())
         {
-            MyCompilerLLVM::DeclTypeAndValue paramType = ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
+            LLVMBackend::DeclTypeAndValue paramType = ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = directDeclarer->getText();
@@ -288,14 +288,14 @@ private:
         }
         else if (!structName.empty())
         {
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = structName;
             thisParam.VariableName = structName + "__";
             thisParam.Pointer = true;
             params.insert(params.begin(), thisParam);
         }
 
-        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+        std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
         // Detect functions that heap-allocate and return a new owned value.
         // operator+ always allocates; operator string(i32) uses malloc; user functions can
@@ -354,7 +354,7 @@ private:
         }
         for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)params.size(); cutoff++)
         {
-            std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
+            std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
             compiler->CreateFunctionDeclaration(name, returnType, wrapperParams, false, false);
         }
     }
@@ -373,10 +373,10 @@ private:
         for (auto* term : ctx->Identifier())
             parentNames.push_back(term->getText());
 
-        std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+        std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : ctx->interfaceMethod())
         {
-            MyCompilerLLVM::InterfaceMethod m;
+            LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
@@ -431,7 +431,7 @@ private:
                         "struct " + typeName);
 
         // Pre-declare default constructor
-        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = typeName };
+        LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
         compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
         // Pre-declare member functions (and detect constructor overloads)
@@ -442,7 +442,7 @@ private:
                 // Constructor overload — no implicit this* parameter, returns the type
                 if (!func->parameterTypeList()) continue; // no-arg already declared above
                 auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
-                std::vector<MyCompilerLLVM::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
+                std::vector<LLVMBackend::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
                 compiler->CreateFunctionDeclaration(typeName, returnType, allCtorParams);
             }
             else
@@ -454,11 +454,11 @@ private:
         // Pre-declare destructor
         for (auto dtor : ctx->destructorDefinition())
         {
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = typeName;
             thisParam.VariableName = typeName + "__";
             thisParam.Pointer = true;
-            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
             compiler->CreateFunctionDeclaration("~" + typeName, voidReturn, { thisParam });
         }
     }
@@ -474,7 +474,7 @@ private:
     }
 
 public:
-    ForwardRefScanner(MyCompilerLLVM* compiler) : compilerLLVM(compiler) {}
+    ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
 
     // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
     // struct type + default constructor for each generic instantiation found.
@@ -514,7 +514,7 @@ public:
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                     mangledName += "__" + MangleTypeArg(entry->getText());
                 compiler->CreateStructType(mangledName, {});
-                MyCompilerLLVM::TypeAndValue returnType{ .TypeName = mangledName };
+                LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
             };
 
@@ -539,7 +539,7 @@ public:
                         }
                         auto* c = Compiler(tts);
                         c->CreateStructType(mangledName, {});
-                        MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                        LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                         c->CreateFunctionDeclaration(mangledName, rt, {});
                     }
                 }
@@ -585,7 +585,7 @@ public:
 
         // Register opaque struct shell and default constructor
         compiler->CreateStructType(name, {});
-        MyCompilerLLVM::TypeAndValue returnType{ .TypeName = name };
+        LLVMBackend::TypeAndValue returnType{ .TypeName = name };
         compiler->CreateFunctionDeclaration(name, returnType, {});
 
         // Pre-register channel<IMessage> so the synthetic inbox field resolves during the main pass
@@ -594,15 +594,15 @@ public:
             if (!compiler->dataStructures.count(channelMangledName))
             {
                 compiler->CreateStructType(channelMangledName, {});
-                MyCompilerLLVM::TypeAndValue chReturnType{ .TypeName = channelMangledName };
+                LLVMBackend::TypeAndValue chReturnType{ .TypeName = channelMangledName };
                 compiler->CreateFunctionDeclaration(channelMangledName, chReturnType, {});
             }
         }
 
         // Pre-declare trampoline: int __program_run_Name(void*)
         {
-            MyCompilerLLVM::TypeAndValue intReturn{ .TypeName = "int" };
-            MyCompilerLLVM::DeclTypeAndValue ctxParam;
+            LLVMBackend::TypeAndValue intReturn{ .TypeName = "int" };
+            LLVMBackend::DeclTypeAndValue ctxParam;
             ctxParam.TypeName = "void";
             ctxParam.VariableName = "ctx";
             ctxParam.Pointer = true;
@@ -611,12 +611,12 @@ public:
 
         // Pre-declare run(Name* this, list__string args) -> bool
         {
-            MyCompilerLLVM::TypeAndValue boolReturn{ .TypeName = "bool" };
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;
             thisParam.VariableName = name + "__";
             thisParam.Pointer = true;
-            MyCompilerLLVM::DeclTypeAndValue argsParam;
+            LLVMBackend::DeclTypeAndValue argsParam;
             argsParam.TypeName = "list__string";
             argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
@@ -625,8 +625,8 @@ public:
 
         // Pre-declare WaitForExit(Name* this) -> void
         {
-            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;
             thisParam.VariableName = name + "__";
             thisParam.Pointer = true;
@@ -635,12 +635,12 @@ public:
 
         // Pre-declare WaitForExit(Name* this, stop_token token) -> bool
         {
-            MyCompilerLLVM::TypeAndValue boolReturn{ .TypeName = "bool" };
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName     = name;
             thisParam.VariableName = name + "__";
             thisParam.Pointer      = true;
-            MyCompilerLLVM::DeclTypeAndValue tokenParam;
+            LLVMBackend::DeclTypeAndValue tokenParam;
             tokenParam.TypeName     = "stop_token";
             tokenParam.VariableName = "token";
             compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, tokenParam });
@@ -651,8 +651,8 @@ public:
             ScanFunctionDefinition(func, name);
         for (auto dtor : ctx->destructorDefinition())
         {
-            MyCompilerLLVM::TypeAndValue voidReturn{ .TypeName = "void" };
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;
             thisParam.VariableName = name + "__";
             thisParam.Pointer = true;
@@ -700,7 +700,7 @@ public:
             for (auto* extDecl : expectErrDecl->externalDeclaration())
                 ScanExternalDeclaration(extDecl, namespaceName);
         }
-        // if const declarations are skipped here; they are handled in MyListener
+        // if const declarations are skipped here; they are handled in MainListener
         // which has access to expression evaluation and can determine the taken branch
     }
 
@@ -716,33 +716,33 @@ public:
 };
 
 
-class MyListener : public CFlatBaseListener
+class MainListener : public CFlatBaseListener
 {
 private:
     CFlatParser* parser;
-    MyCompilerLLVM* compilerLLVM;
+    LLVMBackend* compilerLLVM;
     std::string sourceFileName;
 
-    MyCompilerLLVM* Compiler(antlr4::ParserRuleContext* ctx)
+    LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx)
     {
         if (ctx)
             compilerLLVM->SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
         return compilerLLVM;
     }
-    inline MyCompilerLLVM* Compiler() { return compilerLLVM; }
+    inline LLVMBackend* Compiler() { return compilerLLVM; }
 
     std::unordered_map<llvm::Value*, int> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
     // Lambda state: expected type (set by ParseDeclaration before evaluating RHS)
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
-    MyCompilerLLVM::TypeAndValue lambdaExpectedType;
-    MyCompilerLLVM::TypeAndValue lastLambdaType;
+    LLVMBackend::TypeAndValue lambdaExpectedType;
+    LLVMBackend::TypeAndValue lastLambdaType;
 
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
 
-    // Generic template state is shared across all MyListener instances so that
+    // Generic template state is shared across all MainListener instances so that
     // templates declared in an imported file remain visible when the importing
     // file needs to instantiate them.
     static inline std::unordered_map<std::string, CFlatParser::StructDefinitionContext*> genericStructTemplates;
@@ -846,9 +846,9 @@ private:
         return resolved;
     }
 
-    MyCompilerLLVM::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
+    LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
     {
-        MyCompilerLLVM::DeclTypeAndValue declType;
+        LLVMBackend::DeclTypeAndValue declType;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
 
@@ -904,7 +904,7 @@ private:
                         if (!c->GetDataStructure(mangledName).StructType)
                         {
                             c->CreateStructType(mangledName, {});
-                            MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                            LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                             c->CreateFunctionDeclaration(mangledName, rt, {});
                         }
                     }
@@ -939,7 +939,7 @@ private:
                         {
                             for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
                             {
-                                MyCompilerLLVM::TypeAndValue::FuncPtrParam p;
+                                LLVMBackend::TypeAndValue::FuncPtrParam p;
                                 p.TypeName = param->typeSpecifier()->getText();
                                 // Apply active generic type substitutions; strip trailing * into Pointer flag
                                 {
@@ -988,7 +988,7 @@ private:
                             if (!c->GetDataStructure(mangledName).StructType)
                             {
                                 c->CreateStructType(mangledName, {});
-                                MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                                LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                                 c->CreateFunctionDeclaration(mangledName, rt, {});
                             }
                         }
@@ -1057,7 +1057,7 @@ private:
         return declType;
     }
 
-    MyCompilerLLVM::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx)
+    LLVMBackend::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx)
     {
         auto declSpecs = ctx->declarationSpecifiers();
 
@@ -1067,7 +1067,7 @@ private:
     // Returns the default value for a type:
     //   - struct types (local scope): calls the default constructor.
     //   - everything else (or global scope): zero-initializes.
-    llvm::Value* GenerateDefaultValue(const MyCompilerLLVM::DeclTypeAndValue& typeValue)
+    llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue)
     {
         auto* compiler = Compiler();
         // Apply active type-parameter substitutions as a fallback in case the caller
@@ -1098,7 +1098,7 @@ private:
     }
 
 public:
-    MyListener(CFlatParser* parser, MyCompilerLLVM* compilerLLVM, const std::string& filename)
+    MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename)
     {
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
@@ -1149,16 +1149,16 @@ public:
             return;
         }
 
-        std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+        std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : ctx->interfaceMethod())
         {
-            MyCompilerLLVM::InterfaceMethod m;
+            LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
-                MyCompilerLLVM::TypeAndValue tv = p;
+                LLVMBackend::TypeAndValue tv = p;
                 m.Parameters.push_back(tv);
             }
             methods.push_back(std::move(m));
@@ -1192,16 +1192,16 @@ public:
         for (const auto& [k, v] : packSubstitutions)
             activePackSubstitutions[k] = v;
 
-        std::vector<MyCompilerLLVM::InterfaceMethod> methods;
+        std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : ctx->interfaceMethod())
         {
-            MyCompilerLLVM::InterfaceMethod m;
+            LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
-                MyCompilerLLVM::TypeAndValue tv = p;
+                LLVMBackend::TypeAndValue tv = p;
                 m.Parameters.push_back(tv);
             }
             methods.push_back(std::move(m));
@@ -1309,7 +1309,7 @@ public:
     // Infer type arguments for a generic function from call argument types and instantiate it.
     // Handles simple positional matching: where parameter type == type param name, bind to arg TypeName.
     std::string TryInferAndInstantiateFromArgs(const std::string& funcName,
-                                               const std::vector<MyCompilerLLVM::NamedVariable>& args)
+                                               const std::vector<LLVMBackend::NamedVariable>& args)
     {
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
@@ -1680,7 +1680,7 @@ public:
             compiler->builder->CreateStore(fieldVal, alloca);
 
             declType.VariableName = varName;
-            MyCompilerLLVM::NamedVariable namedVar;
+            LLVMBackend::NamedVariable namedVar;
             namedVar.TypeAndValue = declType;
             namedVar.Storage = alloca;
             namedVar.BaseType = fieldLLVMType;
@@ -2025,7 +2025,7 @@ public:
                     }
                     else
                     {
-                        MyCompilerLLVM::NamedVariable selfArg = collNV;
+                        LLVMBackend::NamedVariable selfArg = collNV;
                         selfArg.TypeAndValue.VariableName = "";
                         countVal = compiler->CreateOverloadedFunctionCall("count", { selfArg });
                     }
@@ -2055,7 +2055,7 @@ public:
                     // Inner block: load element, run body
                     compiler->InitializeBlock(blockInner, false);
 
-                    MyCompilerLLVM::NamedVariable indexNV;
+                    LLVMBackend::NamedVariable indexNV;
                     indexNV.Primary  = compiler->CreateLoad(indexAlloca);
                     indexNV.BaseType = i32Ty;
                     indexNV.TypeAndValue.TypeName = "int";
@@ -2067,7 +2067,7 @@ public:
                     }
                     else
                     {
-                        MyCompilerLLVM::NamedVariable selfArg = collNV;
+                        LLVMBackend::NamedVariable selfArg = collNV;
                         selfArg.TypeAndValue.VariableName = "";
                         elemVal = compiler->CreateOverloadedFunctionCall("get", { selfArg, indexNV });
                     }
@@ -2396,7 +2396,7 @@ public:
             }
 
             // 2. Call mutex.acquire().
-            MyCompilerLLVM::NamedVariable selfArg = mutexNV;
+            LLVMBackend::NamedVariable selfArg = mutexNV;
             selfArg.TypeAndValue.VariableName = "";
             compiler->CreateOverloadedFunctionCall("acquire", { selfArg });
 
@@ -2412,7 +2412,7 @@ public:
             // 4. Push a new scope with lockCleanup set so any exit (return, scope-close)
             //    automatically calls unlock().
             compiler->InitializeBlock(nullptr, true);
-            compiler->stackNamedVariable.back().lockCleanup = MyCompilerLLVM::StackState::LockCleanup{
+            compiler->stackNamedVariable.back().lockCleanup = LLVMBackend::StackState::LockCleanup{
                 .UnlockFn  = unlockFn,
                 .MutexPtr  = mutexNV.Storage,
             };
@@ -2433,8 +2433,8 @@ public:
 
     void GenerateDefaultParamOverloads(
         const std::string& name,
-        const MyCompilerLLVM::DeclTypeAndValue& returnType,
-        const std::vector<MyCompilerLLVM::DeclTypeAndValue>& params,
+        const LLVMBackend::DeclTypeAndValue& returnType,
+        const std::vector<LLVMBackend::DeclTypeAndValue>& params,
         bool varargs,
         size_t line)
     {
@@ -2459,13 +2459,13 @@ public:
         //   wrapper(int a)        -> f(a, 10, 20)
         for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
         {
-            std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
+            std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
 
             auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
             compiler->InitializeBlock(&wrapperFn->front(), false);
 
             // Build the full argument list for the forwarding call
-            std::vector<MyCompilerLLVM::NamedVariable> callArgs;
+            std::vector<LLVMBackend::NamedVariable> callArgs;
 
             for (int i = 0; i < cutoff; i++)
             {
@@ -2496,7 +2496,7 @@ public:
                         defaultVal = compiler->CreateLoad(alloca);
                     }
                 }
-                MyCompilerLLVM::NamedVariable namedVar;
+                LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = defaultVal;
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
                 namedVar.TypeAndValue.TypeName = params[i].TypeName;
@@ -2545,7 +2545,7 @@ public:
 
         if (!structName.empty())
         {
-            MyCompilerLLVM::DeclTypeAndValue typeValue;
+            LLVMBackend::DeclTypeAndValue typeValue;
             typeValue.TypeName = structName;
             typeValue.VariableName = structName + "__";
             typeValue.Pointer = true;
@@ -2561,7 +2561,7 @@ public:
             return;
         }
 
-        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+        std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
         bool returnsOwned = false;
         if (returnType.TypeName == "string" && returnType.IsMove)
@@ -2637,9 +2637,9 @@ public:
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
 
-    std::vector<MyCompilerLLVM::AnnotationValue> ParseAnnotationList(CFlatParser::AnnotationListContext* annList)
+    std::vector<LLVMBackend::AnnotationValue> ParseAnnotationList(CFlatParser::AnnotationListContext* annList)
     {
-        std::vector<MyCompilerLLVM::AnnotationValue> result;
+        std::vector<LLVMBackend::AnnotationValue> result;
         if (!annList) return result;
 
         auto* compiler = Compiler(annList);
@@ -2685,9 +2685,9 @@ public:
         return result;
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseDeclarationList(std::vector<CFlatParser::DeclarationContext*> ctx)
+    std::vector<LLVMBackend::DeclTypeAndValue> ParseDeclarationList(std::vector<CFlatParser::DeclarationContext*> ctx)
     {
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> result;
+        std::vector<LLVMBackend::DeclTypeAndValue> result;
 
         if (ctx.size() > 0)
         {
@@ -2773,7 +2773,7 @@ public:
                 value = valLLVM->getSExtValue();
             }
 
-            MyCompilerLLVM::TypeAndValue tv;
+            LLVMBackend::TypeAndValue tv;
             // Use the enum's declared name as the type for the enumerator variable so
             // overload resolution can consider enum type. The GetType call will resolve
             // the enum to its backing type when emitting IR.
@@ -2843,8 +2843,8 @@ public:
             if (paramTypeList != nullptr || hasParens)
             {
                 // If there is parameter list (or empty parens), then it is a function.
-                auto declParams = paramTypeList ? ParseParameterTypeList(paramTypeList) : std::vector<MyCompilerLLVM::DeclTypeAndValue>{};
-                std::vector<MyCompilerLLVM::TypeAndValue> allParams(declParams.begin(), declParams.end());
+                auto declParams = paramTypeList ? ParseParameterTypeList(paramTypeList) : std::vector<LLVMBackend::DeclTypeAndValue>{};
+                std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
                 compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
@@ -2857,7 +2857,7 @@ public:
                 }
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
-                    std::vector<MyCompilerLLVM::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
+                    std::vector<LLVMBackend::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
                     compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false);
                 }
             }
@@ -2930,7 +2930,7 @@ public:
                                     }
                                     else if (compiler->GetFunction("operator string"))
                                     {
-                                        MyCompilerLLVM::NamedVariable argNV;
+                                        LLVMBackend::NamedVariable argNV;
                                         argNV.Primary = right;
                                         argNV.BaseType = right->getType();
                                         argNV.TypeAndValue.TypeName = "char";
@@ -3059,7 +3059,7 @@ public:
     // Returns a NamedVariable (preserving TypeName) for simple single-child expression chains.
     // Used by ParseDeclaration to get the struct TypeName for struct->interface upcasting.
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
-    MyCompilerLLVM::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
     {
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
@@ -3117,7 +3117,7 @@ public:
         // Fall back: call ParseConditionalExpression directly (when no assignment) so we can
         // recover the isUnsigned flag from TypedValue and synthesize the TypeName for Upconvert.
         {
-            MyCompilerLLVM::NamedVariable result;
+            LLVMBackend::NamedVariable result;
             auto* condCtx = ctx->conditionalExpression();
             if (condCtx && !ctx->assignmentOperator())
             {
@@ -3317,7 +3317,7 @@ public:
         return nullptr;
     }
 
-    MyCompilerLLVM::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
@@ -3393,7 +3393,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
@@ -3409,7 +3409,7 @@ public:
             // Always use resultStorage path. The elseBlock optimization was broken:
             // when the first || operand is true it jumped to blockFalse instead of blockTrue,
             // because only the false-destination is stored in the block context.
-            MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+            LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
             auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
             auto resumeBlock = compiler->CreateBasicBlock("resumeOR");
 
@@ -3427,7 +3427,7 @@ public:
 
                     compiler->InitializeBlock(falseBlock, false);
                     llvm::Value* right = ParseLogicalAndExpression(logicCtx);
-                    left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalOr, left, right);
+                    left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
                     compiler->CreateAssignment(left, resultStorage);
                 }
             }
@@ -3442,7 +3442,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
@@ -3471,13 +3471,13 @@ public:
 
                         compiler->InitializeBlock(trueBlock, false);
                         llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+                        left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                     }
                 }
             }
             else
             {
-                MyCompilerLLVM::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+                LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
                 auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
                 auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
 
@@ -3495,7 +3495,7 @@ public:
 
                         compiler->InitializeBlock(trueBlock, false);
                         llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compiler->CreateOperation(MyCompilerLLVM::Operation::LogicalAnd, left, right);
+                        left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                         compiler->CreateAssignment(left, resultStorage);
                     }
                 }
@@ -3512,7 +3512,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx)
     {
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size() == 1)
@@ -3525,7 +3525,7 @@ public:
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
                 auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i]);
-                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseOr, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
         }
@@ -3534,7 +3534,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx)
     {
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size() == 1)
@@ -3547,7 +3547,7 @@ public:
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
                 auto rv = ParseAndExpression(andCtxs[i]);
-                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseXor, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
         }
@@ -3556,7 +3556,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx)
     {
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size() == 1)
@@ -3569,7 +3569,7 @@ public:
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 auto rv = ParseEqualityExpression(nextCtxs[i]);
-                acc = Compiler(ctx)->CreateOperation(MyCompilerLLVM::Operation::BitwiseAnd, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
         }
@@ -3578,7 +3578,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx)
     {
         auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
@@ -3601,7 +3601,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx)
     {
         auto relCtx = ctx->relationalExpression();
         if (!relCtx)
@@ -3778,7 +3778,7 @@ public:
         return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
 
-    MyCompilerLLVM::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx)
     {
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
@@ -3801,7 +3801,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.size() == 1)
@@ -3825,7 +3825,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx)
     {
         auto nextCtxs = ctx->multiplicativeExpression();
 
@@ -3858,7 +3858,7 @@ public:
         return {};
     }
 
-    llvm::Value* LoadNamedVariable(MyCompilerLLVM::NamedVariable& namedVar)
+    llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
         if (namedVar.IsMoved && namedVar.IdentifierLine > 0)
@@ -3935,7 +3935,7 @@ public:
         if (!compiler->GetFunction(opName)) return nullptr;
 
         auto makeRightNV = [&]() {
-            MyCompilerLLVM::NamedVariable rightNV;
+            LLVMBackend::NamedVariable rightNV;
             rightNV.Primary  = rvalue;
             rightNV.BaseType = rvalue ? rvalue->getType() : nullptr;
             if (rvalue && rvalue->getType()->isStructTy())
@@ -3988,7 +3988,7 @@ public:
             auto* tempAlloca = compiler->CreateAlloca(structTy);
             compiler->CreateAssignment(lvalue, tempAlloca);
 
-            MyCompilerLLVM::NamedVariable thisNV;
+            LLVMBackend::NamedVariable thisNV;
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.Primary = tempAlloca;
@@ -3999,7 +3999,7 @@ public:
         {
             // By-value dispatch: built-in value types like string whose operators
             // are defined as operator+(T a, ...) rather than operator+(T* a, ...).
-            MyCompilerLLVM::NamedVariable thisNV;
+            LLVMBackend::NamedVariable thisNV;
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = false;
             thisNV.Primary  = lvalue;
@@ -4011,7 +4011,7 @@ public:
         return nullptr;
     }
 
-    MyCompilerLLVM::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
+    LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx)
     {
         auto nextCtxs = ctx->castExpression();
 
@@ -4046,7 +4046,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false)
+    LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false)
     {
         auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
@@ -4084,12 +4084,12 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx)
+    LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx)
     {
         auto specCtx = ctx->specifierQualifierList();
         auto abstractDecl = ctx->abstractDeclarator();
 
-        MyCompilerLLVM::TypeAndValue typeValue;
+        LLVMBackend::TypeAndValue typeValue;
 
         if (specCtx)
         {
@@ -4130,7 +4130,7 @@ public:
         return typeValue;
     }
 
-    MyCompilerLLVM::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto postFixCtx = ctx->postfixExpression();
@@ -4172,7 +4172,7 @@ public:
                 if (likelyType)
                 {
                     // Try to parse as a type
-                    MyCompilerLLVM::TypeAndValue typeValue;
+                    LLVMBackend::TypeAndValue typeValue;
                     typeValue.TypeName = postfixText;
 
                     // Check for trailing * (pointer)
@@ -4188,7 +4188,7 @@ public:
                         auto packIt = activePackSubstitutions.find(typeValue.TypeName);
                         if (packIt != activePackSubstitutions.end())
                         {
-                            MyCompilerLLVM::NamedVariable namedVar;
+                            LLVMBackend::NamedVariable namedVar;
                             namedVar.Primary = llvm::ConstantInt::get(
                                 llvm::Type::getInt32Ty(*compiler->context),
                                 (int)packIt->second.size());
@@ -4212,7 +4212,7 @@ public:
 
                         if (result)
                         {
-                            MyCompilerLLVM::NamedVariable namedVar;
+                            LLVMBackend::NamedVariable namedVar;
                             namedVar.Primary = result;
                             namedVar.TypeAndValue.TypeName = "i64";
                             namedVar.Storage = nullptr;
@@ -4355,7 +4355,7 @@ public:
                     auto packIt = activePackSubstitutions.find(typeValue.TypeName);
                     if (packIt != activePackSubstitutions.end())
                     {
-                        MyCompilerLLVM::NamedVariable namedVar;
+                        LLVMBackend::NamedVariable namedVar;
                         namedVar.Primary = llvm::ConstantInt::get(
                             llvm::Type::getInt32Ty(*compiler->context),
                             (int)packIt->second.size());
@@ -4383,7 +4383,7 @@ public:
                 }
 
                 // Return as a named variable with i64 type
-                MyCompilerLLVM::NamedVariable namedVar;
+                LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = result;
                 namedVar.TypeAndValue.TypeName = "i64";
                 namedVar.Storage = nullptr;
@@ -4442,7 +4442,7 @@ public:
         bool ambiguous = false;
         for (const auto& sym : it->second)
         {
-            const MyCompilerLLVM::TypeAndValue* param = nullptr;
+            const LLVMBackend::TypeAndValue* param = nullptr;
             if (!namedParam.empty())
             {
                 for (const auto& p : sym.Parameters)
@@ -4506,7 +4506,7 @@ public:
             }
 
             int fieldIdx = -1;
-            MyCompilerLLVM::DeclTypeAndValue fieldType;
+            LLVMBackend::DeclTypeAndValue fieldType;
             for (int i = 0; i < (int)sd.StructFields.size(); i++)
             {
                 if (sd.StructFields[i].VariableName == fieldName)
@@ -4535,7 +4535,7 @@ public:
                     val = compiler->WrapStringLiteralAsString(val);
                 else if (compiler->GetFunction("operator string"))
                 {
-                    MyCompilerLLVM::NamedVariable argNV;
+                    LLVMBackend::NamedVariable argNV;
                     argNV.Primary = val;
                     argNV.BaseType = val->getType();
                     val = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
@@ -4563,7 +4563,7 @@ public:
         }
     }
 
-    MyCompilerLLVM::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
@@ -4578,7 +4578,7 @@ public:
             typeIsPtr = true;
         }
 
-        MyCompilerLLVM::TypeAndValue typeInfo{ .TypeName = typeName, .Pointer = typeIsPtr };
+        LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName, .Pointer = typeIsPtr };
         llvm::Type* elemType = compiler->GetType(typeInfo);
 
         // Compute allocation size
@@ -4598,7 +4598,7 @@ public:
         // Call operator new: class-specific -> global
         llvm::Value* rawPtr = nullptr;
         std::string opNewName = typeName + ".operator new";
-        MyCompilerLLVM::NamedVariable szArg;
+        LLVMBackend::NamedVariable szArg;
         szArg.Primary = sizeVal;
         szArg.BaseType = sizeVal->getType();
         if (!typeName.empty() && compiler->GetFunction(opNewName))
@@ -4622,7 +4622,7 @@ public:
         // For non-array new of a class type: call constructor and store result
         if (!isArray && compiler->GetFunction(typeName))
         {
-            std::vector<MyCompilerLLVM::NamedVariable> ctorArgs;
+            std::vector<LLVMBackend::NamedVariable> ctorArgs;
             auto argList = ctx->argumentExpressionList();
             if (argList != nullptr)
             {
@@ -4630,7 +4630,7 @@ public:
                 {
                     llvm::Value* argVal = ParseAssignmentExpression(namedArg->assignmentExpression());
                     if (!argVal) break;
-                    MyCompilerLLVM::NamedVariable argVar;
+                    LLVMBackend::NamedVariable argVar;
                     argVar.Primary = argVal;
                     argVar.BaseType = argVal->getType();
                     ctorArgs.push_back(argVar);
@@ -4645,7 +4645,7 @@ public:
         if (auto* initList = ctx->initializerList())
             EmitFieldInitializer(typedPtr, typeName, initList);
 
-        MyCompilerLLVM::NamedVariable result;
+        LLVMBackend::NamedVariable result;
         result.TypeAndValue.TypeName = typeName;
         result.TypeAndValue.Pointer = true;
         result.Primary = typedPtr;
@@ -4654,7 +4654,7 @@ public:
         return result;
     }
 
-    MyCompilerLLVM::NamedVariable ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         bool isArray = ctx->LeftBracket() != nullptr;
@@ -4704,7 +4704,7 @@ public:
 
         // 3. Call operator delete: class-specific -> global
         std::string opDelName = typeName + ".operator delete";
-        MyCompilerLLVM::NamedVariable ptrArg;
+        LLVMBackend::NamedVariable ptrArg;
         ptrArg.Primary = voidPtr;
         ptrArg.BaseType = voidPtrTy;
         if (!typeName.empty() && compiler->GetFunction(opDelName))
@@ -4731,7 +4731,7 @@ public:
         return {};
     }
 
-    MyCompilerLLVM::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
@@ -4754,7 +4754,7 @@ public:
         // Signal ParseDeclaration to mark the target local as IsOwning.
         compiler->lastOwningResult = true;
 
-        MyCompilerLLVM::NamedVariable result;
+        LLVMBackend::NamedVariable result;
         result.Primary      = ptrVal;
         result.Storage      = nullptr;
         result.BaseType     = ptrVal ? ptrVal->getType() : nullptr;
@@ -4762,19 +4762,19 @@ public:
         return result;
     }
 
-    MyCompilerLLVM::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
 
         // Collect arguments passed to operator string(...)
-        std::vector<MyCompilerLLVM::NamedVariable> arguments;
+        std::vector<LLVMBackend::NamedVariable> arguments;
         if (auto* argList = ctx->argumentExpressionList())
         {
             for (auto* argExpr : argList->argumentNamedExpression())
             {
                 llvm::Value* argVal = ParseAssignmentExpression(argExpr->assignmentExpression());
                 if (!argVal) break;
-                MyCompilerLLVM::NamedVariable argVar;
+                LLVMBackend::NamedVariable argVar;
                 argVar.Primary = argVal;
                 argVar.BaseType = argVal->getType();
                 arguments.push_back(argVar);
@@ -4785,7 +4785,7 @@ public:
         auto result = compiler->CreateOverloadedFunctionCall("operator string", arguments);
         if (!result) { LogErrorContext(ctx, "'operator string' is not defined"); return {}; }
 
-        MyCompilerLLVM::NamedVariable ret;
+        LLVMBackend::NamedVariable ret;
         ret.Primary = result;
         ret.TypeAndValue.TypeName = "string";
         ret.TypeAndValue.IsInterface = false;
@@ -4793,7 +4793,7 @@ public:
         return ret;
     }
 
-    MyCompilerLLVM::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
+    LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
         * postfixExpression
@@ -4811,9 +4811,9 @@ public:
         {
             size_t prevRuleId = 0;
             size_t prevToken = 0;
-            MyCompilerLLVM::NamedVariable namedVar;
-            MyCompilerLLVM::NamedVariable structVar;
-            MyCompilerLLVM::NamedVariable interfaceVar;
+            LLVMBackend::NamedVariable namedVar;
+            LLVMBackend::NamedVariable structVar;
+            LLVMBackend::NamedVariable interfaceVar;
             std::string primaryIdentifier;
             std::string namespaceContext;
 
@@ -5153,7 +5153,7 @@ public:
                             && structVar.BaseType && structVar.BaseType->isStructTy()
                             && Compiler(ctx)->GetFunction("operator[]"))
                         {
-                            MyCompilerLLVM::NamedVariable thisNV = structVar;
+                            LLVMBackend::NamedVariable thisNV = structVar;
                             thisNV.TypeAndValue.VariableName = "";
                             if (!thisNV.TypeAndValue.Pointer && thisNV.Storage == nullptr && thisNV.Primary != nullptr)
                             {
@@ -5162,7 +5162,7 @@ public:
                                 thisNV.Storage = temp;
                             }
 
-                            MyCompilerLLVM::NamedVariable idxNV;
+                            LLVMBackend::NamedVariable idxNV;
                             idxNV.Primary  = rvalue;
                             idxNV.BaseType = rvalue->getType();
 
@@ -5383,10 +5383,10 @@ public:
                             }
 
                             // Define recursive lambda to emit fields for any struct
-                            std::function<void(const MyCompilerLLVM::StructData&, llvm::Value*)> emitFields;
-                            emitFields = [&](const MyCompilerLLVM::StructData& sd, llvm::Value* objPtr)
+                            std::function<void(const LLVMBackend::StructData&, llvm::Value*)> emitFields;
+                            emitFields = [&](const LLVMBackend::StructData& sd, llvm::Value* objPtr)
                             {
-                                MyCompilerLLVM::NamedVariable intNV, boolNV, floatNV, strNV;
+                                LLVMBackend::NamedVariable intNV, boolNV, floatNV, strNV;
                                 for (size_t i = 0; i < sd.StructFields.size(); i++)
                                 {
                                     const auto& field = sd.StructFields[i];
@@ -5453,7 +5453,7 @@ public:
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginArray", {nameNV});
 
                                         // Call count() on the list struct
-                                        MyCompilerLLVM::NamedVariable selfNV;
+                                        LLVMBackend::NamedVariable selfNV;
                                         selfNV.Storage = gep;
                                         selfNV.TypeAndValue.TypeName = typeName;
                                         auto* countVal = compiler->CreateOverloadedFunctionCall("count", {selfNV});
@@ -5477,7 +5477,7 @@ public:
                                         // loop body: get element and dispatch
                                         compiler->builder->SetInsertPoint(bodyBB);
                                         auto* idx2 = compiler->builder->CreateLoad(i32Ty, indexAlloca);
-                                        MyCompilerLLVM::NamedVariable idxNV;
+                                        LLVMBackend::NamedVariable idxNV;
                                         idxNV.Primary = idx2;
                                         idxNV.TypeAndValue.TypeName = "int";
                                         auto elemNV = compiler->CreateOverloadedFunctionCall("get", {selfNV, idxNV});
@@ -5488,14 +5488,14 @@ public:
                                              || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64"))
                                         {
                                             auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt32Ty(), false);
-                                            MyCompilerLLVM::NamedVariable elemIntNV;
+                                            LLVMBackend::NamedVariable elemIntNV;
                                             elemIntNV.Primary = widened;
                                             elemIntNV.TypeAndValue.TypeName = "int";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {emptyNV, elemIntNV});
                                         }
                                         else if (elemTypeName == "bool")
                                         {
-                                            MyCompilerLLVM::NamedVariable elemBoolNV;
+                                            LLVMBackend::NamedVariable elemBoolNV;
                                             elemBoolNV.Primary = elemNV;
                                             elemBoolNV.TypeAndValue.TypeName = "bool";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {emptyNV, elemBoolNV});
@@ -5505,7 +5505,7 @@ public:
                                             llvm::Value* val = elemNV;
                                             if (elemTypeName == "double")
                                                 val = compiler->builder->CreateFPCast(val, compiler->builder->getFloatTy());
-                                            MyCompilerLLVM::NamedVariable elemFloatNV;
+                                            LLVMBackend::NamedVariable elemFloatNV;
                                             elemFloatNV.Primary = val;
                                             elemFloatNV.TypeAndValue.TypeName = "float";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat", {emptyNV, elemFloatNV});
@@ -5513,11 +5513,11 @@ public:
                                         else if (elemTypeName == "string")
                                         {
                                             // For string, spill to alloca and set Storage
-                                            MyCompilerLLVM::TypeAndValue strTV;
+                                            LLVMBackend::TypeAndValue strTV;
                                             strTV.TypeName = "string";
                                             auto* strAlloca = compiler->builder->CreateAlloca(compiler->GetType(strTV), nullptr, "reflect_arr_elem");
                                             compiler->builder->CreateStore(elemNV, strAlloca);
-                                            MyCompilerLLVM::NamedVariable elemStrNV;
+                                            LLVMBackend::NamedVariable elemStrNV;
                                             elemStrNV.Storage = strAlloca;
                                             elemStrNV.TypeAndValue.TypeName = "string";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitString", {emptyNV, elemStrNV});
@@ -5677,8 +5677,8 @@ public:
                             }
 
                             // 4. Recursive lambda: populate fields of any struct from an IJSON alloca
-                            std::function<void(const MyCompilerLLVM::StructData&, llvm::Value*, llvm::Value*)> emitFieldSets;
-                            emitFieldSets = [&](const MyCompilerLLVM::StructData& sd, llvm::Value* objPtr, llvm::Value* srcA)
+                            std::function<void(const LLVMBackend::StructData&, llvm::Value*, llvm::Value*)> emitFieldSets;
+                            emitFieldSets = [&](const LLVMBackend::StructData& sd, llvm::Value* objPtr, llvm::Value* srcA)
                             {
                                 auto* fatTy = compiler->GetFatPtrType();
 
@@ -5760,19 +5760,19 @@ public:
 
                                         compiler->builder->SetInsertPoint(bodyBB);
                                         auto* idx2 = compiler->builder->CreateLoad(i32Ty, idxAlloca);
-                                        MyCompilerLLVM::NamedVariable idxNV;
+                                        LLVMBackend::NamedVariable idxNV;
                                         idxNV.Primary = idx2;
                                         idxNV.TypeAndValue.TypeName = "int";
 
                                         // list self NV for add()
-                                        MyCompilerLLVM::NamedVariable listNV;
+                                        LLVMBackend::NamedVariable listNV;
                                         listNV.Storage = gep;
                                         listNV.TypeAndValue.TypeName = typeName;
 
                                         if (elemTypeName == "int" || elemTypeName == "i32")
                                         {
                                             auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getInt", {idxNV});
-                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            LLVMBackend::NamedVariable elemNV;
                                             elemNV.Primary = v;
                                             elemNV.TypeAndValue.TypeName = "int";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
@@ -5780,7 +5780,7 @@ public:
                                         else if (elemTypeName == "bool")
                                         {
                                             auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getBool", {idxNV});
-                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            LLVMBackend::NamedVariable elemNV;
                                             elemNV.Primary = v;
                                             elemNV.TypeAndValue.TypeName = "bool";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
@@ -5788,7 +5788,7 @@ public:
                                         else if (elemTypeName == "float" || elemTypeName == "double")
                                         {
                                             auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getFloat", {idxNV});
-                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            LLVMBackend::NamedVariable elemNV;
                                             elemNV.Primary = v;
                                             elemNV.TypeAndValue.TypeName = "float";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
@@ -5796,11 +5796,11 @@ public:
                                         else if (elemTypeName == "string")
                                         {
                                             auto* v = compiler->CallInterfaceMethod(arrAlloca, "IJSONArray", "getString", {idxNV});
-                                            MyCompilerLLVM::TypeAndValue strTV;
+                                            LLVMBackend::TypeAndValue strTV;
                                             strTV.TypeName = "string";
                                             auto* strAlloca = compiler->builder->CreateAlloca(compiler->GetType(strTV), nullptr, "rset_arr_str");
                                             compiler->builder->CreateStore(v, strAlloca);
-                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            LLVMBackend::NamedVariable elemNV;
                                             elemNV.Storage = strAlloca;
                                             elemNV.TypeAndValue.TypeName = "string";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
@@ -5817,7 +5817,7 @@ public:
                                                 llvm::Constant::getNullValue(nestedData.StructType), elemAlloca);
                                             emitFieldSets(nestedData, elemAlloca, subAlloca);
 
-                                            MyCompilerLLVM::NamedVariable elemNV;
+                                            LLVMBackend::NamedVariable elemNV;
                                             elemNV.Storage = elemAlloca;
                                             elemNV.TypeAndValue.TypeName = elemTypeName;
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
@@ -5984,7 +5984,7 @@ public:
                             // Bind 'this' if present
                             if (paramOffset > 0)
                             {
-                                MyCompilerLLVM::NamedVariable thisVar;
+                                LLVMBackend::NamedVariable thisVar;
                                 if (structVar.BaseType)
                                 {
                                     thisVar = structVar;
@@ -5997,7 +5997,7 @@ public:
                                 if (thisVar.Storage != nullptr)
                                 {
                                     const auto& thisParam = rb->Params[0];
-                                    MyCompilerLLVM::TypeAndValue tv;
+                                    LLVMBackend::TypeAndValue tv;
                                     tv.TypeName = thisParam.TypeName;
                                     tv.VariableName = thisParam.VariableName;
                                     tv.Pointer = thisParam.Pointer;
@@ -6020,7 +6020,7 @@ public:
                                 {
                                     auto argValue = this->ParseAssignmentExpression(namedArgCtx[i]->assignmentExpression());
                                     const auto& param = rb->Params[i + paramOffset];
-                                    MyCompilerLLVM::TypeAndValue tv;
+                                    LLVMBackend::TypeAndValue tv;
                                     tv.TypeName = param.TypeName;
                                     tv.VariableName = param.VariableName;
                                     tv.Pointer = param.Pointer;
@@ -6050,7 +6050,7 @@ public:
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
                             // Collect extra call arguments
-                            std::vector<MyCompilerLLVM::NamedVariable> extraArgs;
+                            std::vector<LLVMBackend::NamedVariable> extraArgs;
                             if (argumentList.size() > 0)
                             {
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
@@ -6058,7 +6058,7 @@ public:
                                 {
                                     auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
                                     if (!argValue) break;
-                                    MyCompilerLLVM::NamedVariable argVar;
+                                    LLVMBackend::NamedVariable argVar;
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
 
@@ -6108,8 +6108,8 @@ public:
                                 if (extFuncName.empty())
                                     extFuncName = primaryIdentifier;
 
-                                std::vector<MyCompilerLLVM::NamedVariable> allArgs;
-                                MyCompilerLLVM::NamedVariable ifaceArg = interfaceVar;
+                                std::vector<LLVMBackend::NamedVariable> allArgs;
+                                LLVMBackend::NamedVariable ifaceArg = interfaceVar;
                                 ifaceArg.TypeAndValue.VariableName = "";
                                 allArgs.push_back(ifaceArg);
                                 for (const auto& e : extraArgs)
@@ -6162,10 +6162,10 @@ public:
                                 }
                             }
 
-                            std::vector<MyCompilerLLVM::NamedVariable> arguments;
+                            std::vector<LLVMBackend::NamedVariable> arguments;
                             if (structVar.BaseType)
                             {
-                                MyCompilerLLVM::NamedVariable argumentNamedVar = structVar; // Copy;
+                                LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 arguments.push_back(argumentNamedVar);
                             }
@@ -6183,7 +6183,7 @@ public:
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
 
                                 // Look up the function signature to set lambdaExpectedType for lambda arguments.
-                                const MyCompilerLLVM::FunctionSymbol* funcSym = nullptr;
+                                const LLVMBackend::FunctionSymbol* funcSym = nullptr;
                                 {
                                     auto it = Compiler(ctx)->functionTable.find(functionName);
                                     if (it != Compiler(ctx)->functionTable.end() && !it->second.empty())
@@ -6205,14 +6205,14 @@ public:
                                         }
                                         if (!Compiler(ctx)->autoVaListAlloca)
                                         {
-                                            MyCompilerLLVM::TypeAndValue vaTv;
+                                            LLVMBackend::TypeAndValue vaTv;
                                             vaTv.TypeName = "va_list";
                                             vaTv.VariableName = "__va_forward";
                                             Compiler(ctx)->autoVaListAlloca = Compiler(ctx)->CreateLocalVariable(vaTv);
                                             Compiler(ctx)->CreateVaStart(Compiler(ctx)->autoVaListAlloca);
                                         }
                                         llvm::Value* vaValue = Compiler(ctx)->CreateLoad(Compiler(ctx)->autoVaListAlloca);
-                                        MyCompilerLLVM::NamedVariable argVar;
+                                        LLVMBackend::NamedVariable argVar;
                                         argVar.Primary = vaValue;
                                         argVar.BaseType = vaValue->getType();
                                         argVar.TypeAndValue.TypeName = "va_list";
@@ -6229,7 +6229,7 @@ public:
                                         std::string structType = ResolveInitializerArgType(ctx, functionName, effectiveIdx, namedParam);
                                         if (!structType.empty())
                                         {
-                                            MyCompilerLLVM::DeclTypeAndValue paramType;
+                                            LLVMBackend::DeclTypeAndValue paramType;
                                             paramType.TypeName = structType;
                                             llvm::Value* defaultVal = GenerateDefaultValue(paramType);
                                             if (defaultVal)
@@ -6238,7 +6238,7 @@ public:
                                                 Compiler(ctx)->CreateAssignment(defaultVal, alloca);
                                                 EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
                                                 llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
-                                                MyCompilerLLVM::NamedVariable argVar;
+                                                LLVMBackend::NamedVariable argVar;
                                                 argVar.Primary = loaded;
                                                 argVar.BaseType = loaded->getType();
                                                 argVar.TypeAndValue.TypeName = structType;
@@ -6262,7 +6262,7 @@ public:
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     lambdaExpectedType = {};
                                     if (!argValue) break; // caller's block was terminated (e.g. return-block inline)
-                                    MyCompilerLLVM::NamedVariable argVar;
+                                    LLVMBackend::NamedVariable argVar;
 
                                     if (argName)
                                         argVar.TypeAndValue.VariableName = argName->getText();
@@ -6602,7 +6602,7 @@ public:
                 else
                 {
                     // Call operator string to convert to string struct
-                    MyCompilerLLVM::NamedVariable arg = nv;
+                    LLVMBackend::NamedVariable arg = nv;
                     arg.TypeAndValue.VariableName = "";
                     auto* strVal = compiler->CreateOverloadedFunctionCall("operator string", { arg });
                     if (!strVal)
@@ -6654,7 +6654,7 @@ public:
         auto* ptrBase = compiler->builder->CreateConstInBoundsGEP2_32(ptrArrTy, ptrArr, 0, 0);
         auto* lenBase = compiler->builder->CreateConstInBoundsGEP2_32(i32ArrTy, lenArr, 0, 0);
 
-        MyCompilerLLVM::NamedVariable nvPtrs, nvLens, nvCount;
+        LLVMBackend::NamedVariable nvPtrs, nvLens, nvCount;
         nvPtrs.Primary  = ptrBase;
         nvPtrs.TypeAndValue = { "i8", "ptrs", true, false };
         nvLens.Primary  = lenBase;
@@ -6665,17 +6665,17 @@ public:
         return compiler->CreateOverloadedFunctionCall("__strconcat", { nvPtrs, nvLens, nvCount });
     }
 
-    MyCompilerLLVM::NamedVariable ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
 
         // Parse lambda parameter list
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
+        std::vector<LLVMBackend::DeclTypeAndValue> params;
         if (auto* paramList = ctx->lambdaParamList())
         {
             for (auto* param : paramList->lambdaParam())
             {
-                MyCompilerLLVM::DeclTypeAndValue p;
+                LLVMBackend::DeclTypeAndValue p;
                 p.TypeName = compiler->ResolveTypeAlias(param->typeSpecifier()->getText());
                 p.Pointer = param->pointer() != nullptr;
                 p.IsInterface = compiler->IsInterfaceType(p.TypeName);
@@ -6686,7 +6686,7 @@ public:
         }
 
         // Return type from lambdaExpectedType (threaded from declaration or argument context)
-        MyCompilerLLVM::TypeAndValue returnType;
+        LLVMBackend::TypeAndValue returnType;
         returnType.TypeName = lambdaExpectedType.FuncPtrReturnTypeName;
         returnType.Pointer = lambdaExpectedType.FuncPtrReturnPointer;
         if (returnType.TypeName.empty())
@@ -6697,7 +6697,7 @@ public:
         // Save builder position — lambda body emits a separate LLVM function
         auto savedState = compiler->SaveBuilderState();
 
-        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+        std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
 
@@ -6726,20 +6726,20 @@ public:
         compiler->RestoreBuilderState(savedState);
 
         // Build the function-pointer TypeAndValue describing this lambda
-        MyCompilerLLVM::TypeAndValue tv;
+        LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
         tv.FuncPtrReturnTypeName = returnType.TypeName;
         tv.FuncPtrReturnPointer = returnType.Pointer;
         for (const auto& p : params)
         {
-            MyCompilerLLVM::TypeAndValue::FuncPtrParam fp;
+            LLVMBackend::TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
             tv.FuncPtrParams.push_back(fp);
         }
 
         lastLambdaType = tv;
-        MyCompilerLLVM::NamedVariable result;
+        LLVMBackend::NamedVariable result;
         result.Primary = fn;
         result.TypeAndValue = tv;
         return result;
@@ -6763,7 +6763,7 @@ public:
     }
 
     // Build a tuple<T1,T2,...> value from a parenthesized expression list: (e1, e2, ...)
-    MyCompilerLLVM::NamedVariable ParseTupleExpression(CFlatParser::TupleExpressionContext* ctx)
+    LLVMBackend::NamedVariable ParseTupleExpression(CFlatParser::TupleExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
         auto entries = ctx->tupleConstructEntry();
@@ -6805,7 +6805,7 @@ public:
             if (!compiler->GetDataStructure(mangledName).StructType)
             {
                 compiler->CreateStructType(mangledName, {});
-                MyCompilerLLVM::TypeAndValue rt{ .TypeName = mangledName };
+                LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, rt, {});
             }
         }
@@ -6819,7 +6819,7 @@ public:
         }
 
         // Allocate the tuple struct and store each element into item_i field
-        MyCompilerLLVM::TypeAndValue tupleType{ .TypeName = mangledName };
+        LLVMBackend::TypeAndValue tupleType{ .TypeName = mangledName };
         auto* structType = compiler->GetDataStructure(mangledName).StructType;
         auto* alloca = compiler->CreateAlloca(structType);
         const auto& structData = compiler->GetDataStructure(mangledName);
@@ -6836,7 +6836,7 @@ public:
             compiler->builder->CreateStore(elemValues[i], gep);
         }
 
-        MyCompilerLLVM::NamedVariable result;
+        LLVMBackend::NamedVariable result;
         result.Storage = alloca;
         result.Primary = compiler->builder->CreateLoad(structType, alloca);
         result.TypeAndValue = tupleType;
@@ -6927,7 +6927,7 @@ public:
                     constantText[1] == '\''))
             {
                 char c = ParseCharLiteral(constantText);
-                return compiler->CreateConstant(MyCompilerLLVM::ConstantVariant(c));
+                return compiler->CreateConstant(LLVMBackend::ConstantVariant(c));
             }
             else
             {
@@ -6941,14 +6941,14 @@ public:
         return nullptr;
     }
 
-    MyCompilerLLVM::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node)
+    LLVMBackend::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node)
     {
         auto* compiler = Compiler();
         if (!node)
             return {};
 
         std::string name = node->getText();
-        MyCompilerLLVM::NamedVariable namedVar = {};
+        LLVMBackend::NamedVariable namedVar = {};
 
         // Check compile-time macros (constant throughout compilation)
         auto macro = compiler->GetCompileTimeMacro(name);
@@ -7449,7 +7449,7 @@ public:
         }
 
         // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> declList;
+        std::vector<LLVMBackend::DeclTypeAndValue> declList;
         for (auto* decl : declarationList)
         {
             std::string packParamName;
@@ -7510,7 +7510,7 @@ public:
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
-        MyCompilerLLVM::TypeAndValue returnType{
+        LLVMBackend::TypeAndValue returnType{
             .TypeName = structName,
         };
         // Flush any nested generic instantiations queued while parsing field declarations,
@@ -7557,7 +7557,7 @@ public:
 
             llvm::Value* structVal = llvm::UndefValue::get(structType);
 
-            MyCompilerLLVM::TypeAndValue myStruct;
+            LLVMBackend::TypeAndValue myStruct;
             myStruct.TypeName = structName;
             myStruct.VariableName = "_" + structName;
 
@@ -7631,7 +7631,7 @@ public:
                     auto* declParamList = func->parameterTypeList();
                     auto declParams = this->ParseParameterTypeList(declParamList);
                     bool declVarargs = declParamList->Ellipsis() != nullptr;
-                    std::vector<MyCompilerLLVM::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                    std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
                     compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
                     continue;
                 }
@@ -7650,14 +7650,14 @@ public:
 
                 if (!isStaticLike)
                 {
-                    MyCompilerLLVM::DeclTypeAndValue thisParam;
+                    LLVMBackend::DeclTypeAndValue thisParam;
                     thisParam.TypeName = structName;
                     thisParam.VariableName = structName + "__";
                     thisParam.Pointer = true;
                     declParams.insert(declParams.begin(), thisParam);
                 }
 
-                std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+                std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
                 bool declReturnsOwned = false;
                 if (declReturnType.TypeName == "string")
                 {
@@ -7842,8 +7842,8 @@ public:
         // returns main's result. Allocator cleanup happens in ~Name().
         // ======================================================================
         {
-            MyCompilerLLVM::TypeAndValue intReturn;   intReturn.TypeName = "int";
-            MyCompilerLLVM::DeclTypeAndValue ctxParam;
+            LLVMBackend::TypeAndValue intReturn;   intReturn.TypeName = "int";
+            LLVMBackend::DeclTypeAndValue ctxParam;
             ctxParam.TypeName = "void";  ctxParam.VariableName = "ctx";  ctxParam.Pointer = true;
             auto* trampolineFn = compiler->CreateFunctionDefinition(
                 "__program_run_" + name, intReturn, {ctxParam});
@@ -7978,10 +7978,10 @@ public:
         // whether the thread started. Does NOT join — caller uses WaitForExit().
         // ======================================================================
         {
-            MyCompilerLLVM::TypeAndValue boolReturn;  boolReturn.TypeName = "bool";
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue boolReturn;  boolReturn.TypeName = "bool";
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
-            MyCompilerLLVM::DeclTypeAndValue argsParam;
+            LLVMBackend::DeclTypeAndValue argsParam;
             argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
 
@@ -8047,8 +8047,8 @@ public:
         // Blocks until the program thread exits. exitCode field is readable after.
         // ======================================================================
         {
-            MyCompilerLLVM::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
             compiler->CreateFunctionDefinition("WaitForExit", voidReturn, {thisParam});
@@ -8078,10 +8078,10 @@ public:
 
             if (stopTokenType && waitOrStopFn)
             {
-                MyCompilerLLVM::TypeAndValue boolReturn;   boolReturn.TypeName = "bool";
-                MyCompilerLLVM::DeclTypeAndValue thisParam;
+                LLVMBackend::TypeAndValue boolReturn;   boolReturn.TypeName = "bool";
+                LLVMBackend::DeclTypeAndValue thisParam;
                 thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
-                MyCompilerLLVM::DeclTypeAndValue tokenParam;
+                LLVMBackend::DeclTypeAndValue tokenParam;
                 tokenParam.TypeName = "stop_token";  tokenParam.VariableName = "token";
 
                 auto* waitFn = compiler->CreateFunctionDefinition("WaitForExit", boolReturn, {thisParam, tokenParam});
@@ -8108,8 +8108,8 @@ public:
         // ======================================================================
         if (compiler->dataStructures[name].Destructor == nullptr)
         {
-            MyCompilerLLVM::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
-            MyCompilerLLVM::DeclTypeAndValue thisParam;
+            LLVMBackend::TypeAndValue voidReturn;  voidReturn.TypeName = "void";
+            LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
             auto* dtorFn = compiler->CreateFunctionDefinition("~" + name, voidReturn, {thisParam});
@@ -8194,31 +8194,31 @@ public:
         unsigned onStdoutFieldIndex  = allocatorFieldIndex + 1;
         unsigned inboxFieldIndex     = onStdoutFieldIndex + 1;
         {
-            MyCompilerLLVM::DeclTypeAndValue exitCodeField;
+            LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
             exitCodeField.VariableName = "exitCode";
             declList.push_back(exitCodeField);
 
-            MyCompilerLLVM::DeclTypeAndValue threadField;
+            LLVMBackend::DeclTypeAndValue threadField;
             threadField.TypeName     = "Thread";
             threadField.VariableName = "_thread";
             declList.push_back(threadField);
 
-            MyCompilerLLVM::DeclTypeAndValue allocatorField;
+            LLVMBackend::DeclTypeAndValue allocatorField;
             allocatorField.TypeName     = "IAllocator";
             allocatorField.VariableName = "_allocator";
             allocatorField.IsInterface  = true;
             allocatorField.Pointer      = true;
             declList.push_back(allocatorField);
 
-            MyCompilerLLVM::DeclTypeAndValue onStdoutField;
+            LLVMBackend::DeclTypeAndValue onStdoutField;
             onStdoutField.VariableName          = "onStdout";
             onStdoutField.IsFunctionPointer     = true;
             onStdoutField.FuncPtrReturnTypeName = "void";
             onStdoutField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdoutField);
 
-            MyCompilerLLVM::DeclTypeAndValue inboxField;
+            LLVMBackend::DeclTypeAndValue inboxField;
             inboxField.TypeName     = "channel__IMessage";
             inboxField.VariableName = "inbox";
             declList.push_back(inboxField);
@@ -8231,7 +8231,7 @@ public:
 
         // Create default constructor (same pattern as ParseStructDefinition)
         {
-            MyCompilerLLVM::TypeAndValue returnType;
+            LLVMBackend::TypeAndValue returnType;
             returnType.TypeName = name;
             compiler->CreateFunctionDefinition(name, returnType, {});
 
@@ -8409,7 +8409,7 @@ public:
         }
 
         // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> declList;
+        std::vector<LLVMBackend::DeclTypeAndValue> declList;
         for (auto* decl : declarationList)
         {
             std::string packParamName;
@@ -8467,7 +8467,7 @@ public:
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
-        MyCompilerLLVM::TypeAndValue returnType{
+        LLVMBackend::TypeAndValue returnType{
             .TypeName = structName,
         };
         // Flush any nested generic instantiations queued while parsing field declarations,
@@ -8513,7 +8513,7 @@ public:
 
             llvm::Value* structVal = llvm::UndefValue::get(structType);
 
-            MyCompilerLLVM::TypeAndValue myStruct;
+            LLVMBackend::TypeAndValue myStruct;
             myStruct.TypeName = structName;
             myStruct.VariableName = "_" + structName;
 
@@ -8563,7 +8563,7 @@ public:
                     auto* declParamList = func->parameterTypeList();
                     auto declParams = this->ParseParameterTypeList(declParamList);
                     bool declVarargs = declParamList->Ellipsis() != nullptr;
-                    std::vector<MyCompilerLLVM::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                    std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
                     compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
                     continue;
                 }
@@ -8582,14 +8582,14 @@ public:
 
                 if (!isStaticLike)
                 {
-                    MyCompilerLLVM::DeclTypeAndValue thisParam;
+                    LLVMBackend::DeclTypeAndValue thisParam;
                     thisParam.TypeName = structName;
                     thisParam.VariableName = structName + "__";
                     thisParam.Pointer = true;
                     declParams.insert(declParams.begin(), thisParam);
                 }
 
-                std::vector<MyCompilerLLVM::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+                std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
                 bool declReturnsOwned = false;
                 if (declReturnType.TypeName == "string")
                 {
@@ -8850,9 +8850,9 @@ public:
             ProcessPendingInstantiations();
         }
 
-        MyCompilerLLVM::DeclTypeAndValue returnType;
+        LLVMBackend::DeclTypeAndValue returnType;
         returnType.TypeName = structName;
-        std::vector<MyCompilerLLVM::TypeAndValue> allParams(params.begin(), params.end());
+        std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
         // Open constructor function — no this* parameter; returns the struct by value
         auto fn = compiler->CreateFunctionDefinition(structName, returnType, allParams, false, varargs, line);
@@ -8870,7 +8870,7 @@ public:
             compiler->builder->CreateStore(defaultVal, thisAlloca);
 
         // Register the alloca as the implicit 'this' pointer so member field access works
-        MyCompilerLLVM::TypeAndValue thisTv;
+        LLVMBackend::TypeAndValue thisTv;
         thisTv.TypeName = structName;
         thisTv.VariableName = structName + "__";
         thisTv.Pointer = true;
@@ -8892,14 +8892,14 @@ public:
     void ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName)
     {
         auto* compiler = Compiler(ctx);
-        MyCompilerLLVM::DeclTypeAndValue thisParam;
+        LLVMBackend::DeclTypeAndValue thisParam;
         thisParam.TypeName = structName;
         thisParam.VariableName = structName + "__";
         thisParam.Pointer = true;
 
-        std::vector<MyCompilerLLVM::TypeAndValue> params = { thisParam };
+        std::vector<LLVMBackend::TypeAndValue> params = { thisParam };
 
-        MyCompilerLLVM::TypeAndValue returnType;
+        LLVMBackend::TypeAndValue returnType;
         returnType.TypeName = "void";
 
         int line = static_cast<int>(ctx->getStart()->getLine());
@@ -8917,9 +8917,9 @@ public:
         compiler->ClearCurrentSubprogram();
     }
 
-    std::vector<MyCompilerLLVM::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
+    std::vector<LLVMBackend::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList)
     {
-        std::vector<MyCompilerLLVM::DeclTypeAndValue> params;
+        std::vector<LLVMBackend::DeclTypeAndValue> params;
 
         if (paramTypeList == nullptr)
             return params;
@@ -8929,7 +8929,7 @@ public:
 
         for (auto paramDecl : paramDeclList)
         {
-            MyCompilerLLVM::DeclTypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
+            LLVMBackend::DeclTypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
             if (auto declarer = paramDecl->declarator())
             {
                 if (auto directDeclarer = declarer->directDeclarator())
@@ -8951,7 +8951,7 @@ public:
         return params;
     }
 
-    MyCompilerLLVM::ConstantVariant ParseNumberConstant(std::string rawNumber)
+    LLVMBackend::ConstantVariant ParseNumberConstant(std::string rawNumber)
     {
         // Support suffixes: u/U, l/L, ll/LL, f/F, d/D and floating point forms with '.' or exponent.
         if (rawNumber.empty())

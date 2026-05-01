@@ -79,11 +79,11 @@ test.bat
 To run a single test manually:
 
 ```bash
-x64/Debug/MyCompiler.exe MyCompiler/Test/test_operators.cb -o out/test_operators.exe --out-lli out/test_operators.ll
+x64/Debug/MyCompiler.exe Test/test_operators.cb -i Test/library -o out/test_operators.exe --out-lli out/test_operators.ll
 out\test_operators.exe
 ```
 
-Current tests (all in `MyCompiler/Test/`): `testfile` (C); `testfile2`, `test_generics`, `test_operators`, `test_is_as`, `test_core`, `test_core_string`, `test_filesystem`, `test_static`, `test_nullable`, `test_move`, `test_program` (CFlat); `testfile_module`, `test_library_string`, `test_overload` (CFlat with `-i lib`).
+Current tests (all in `Test/`, all CFlat with `-i Test\library`): `test_allocators`, `test_basic`, `test_core`, `test_core_string`, `test_field_init`, `test_filesystem`, `test_fit_allocator`, `test_function_ptr`, `test_generics`, `test_interface`, `test_json`, `test_library_string`, `test_math`, `test_module`, `test_move`, `test_operators`, `test_program`, `test_random`, `test_reflect`, `test_sizeof`, `test_slab_allocator`, `test_sync`, `test_time`. (`test_helper.cb` is a shared helper, not run directly.)
 
 ### Error tests
 
@@ -127,30 +127,34 @@ To add a new error test: create `Test/errors/err_<description>.cb`. No script ch
 ```
 Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
     -> ForwardRefScanner (pre-pass)
-    -> MyListener (code generation)
+    -> MainListener (code generation)
     -> LLVM Module -> .ll / .bc -> native .exe
 ```
 
 ### Two-Pass Compilation
 
-1. **ForwardRefScanner** (`MyListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` -> symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
-2. **MyListener** (`MyListener.h`): Walks the AST and emits LLVM IR using `MyCompilerLLVM` as the backend.
+1. **ForwardRefScanner** (`MainListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` -> symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
+2. **MainListener** (`MainListener.h`): Walks the AST and emits LLVM IR using `LLVMBackend` as the backend.
 
-Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MyListener` copy.
+Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MainListener` copy.
 
 ### Core Components
 
 | File | Role |
 |------|------|
-| `CFlat.g4` | ANTLR4 grammar defining CFlat syntax (~1,200 lines) |
-| `MyCompilerLLVM.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
-| `MyListener.h` | AST visitor implementing both passes (~4,100 lines) |
+| `CFlat.g4` | ANTLR4 grammar defining CFlat syntax |
+| `LLVMBackend.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
+| `MainListener.h` | AST visitor implementing both ForwardRefScanner and codegen passes |
 | `CompilerManager.h` | Singleton crash handler — installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
 | `ArgParser.h` | CLI argument parsing |
-| `MyCompiler.cpp` | Entry point |
+| `main.cpp` | Entry point |
+| `LspServer.h/.cpp` | Language Server Protocol server (hover, completion, go-to-definition) |
+| `LspSymbolIndex.h/.cpp` | LSP symbol index built during compilation |
+| `JsonRpcLoop.h/.cpp` | JSON-RPC protocol loop for LSP communication |
+| `LspTypes.h` | LSP type definitions |
 | `core/` | Standard library — compiled alongside every program |
 
-### Key Internal State (in `MyCompilerLLVM`)
+### Key Internal State (in `LLVMBackend`)
 
 - `stackNamedVariable`: Deque of scopes tracking local variables per block/function
 - `globalNamedVariable`: Global variable map
@@ -200,7 +204,7 @@ void borrow(Resource* r)        { ... }  // caller still owns r
 - For value types (int, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true`.
 - `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; `list::removeAt()` auto-frees pointer elements (destructor + delete); `dictionary::remove()` does not.
 
-Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.
+Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.
 
 ### Compile-Time Features
 
@@ -219,11 +223,11 @@ Implementation: `EmitOwningPtrCleanup()` in `MyCompilerLLVM.h`; `EmitDestructors
 | Goal | Where to change |
 |------|----------------|
 | New syntax | Edit `CFlat.g4`; rebuild triggers ANTLR regeneration |
-| New type or IR operation | Add methods to `MyCompilerLLVM.h` |
-| New statement or expression | Add `Parse*()` / `exit*()` handler in `MyListener.h` |
-| Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MyListener.h` |
-| New binary operator | `TryBinaryOperatorOverload()` in `MyListener.h` + `Operation` enum in `MyCompilerLLVM.h` |
-| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MyListener.h` — do NOT add to the ANTLR lexer |
+| New type or IR operation | Add methods to `LLVMBackend.h` |
+| New statement or expression | Add `Parse*()` / `exit*()` handler in `MainListener.h` |
+| Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MainListener.h` |
+| New binary operator | `TryBinaryOperatorOverload()` in `MainListener.h` + `Operation` enum in `LLVMBackend.h` |
+| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MainListener.h` — do NOT add to the ANTLR lexer |
 | New grammar keyword statement | Add rule to `CFlat.g4`; add `ctx->newRule()` retrieval in `ParseStatement`; add no-op overrides in `ForwardRefScanner` if the rule can appear at file scope |
 
 ### Debugging Compiler Crashes
@@ -252,6 +256,23 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
 | `thread.cb` | `thread<T>` — Win32 thread wrapper; requires `import "thread.cb"` |
 | `random.cb` | Splitmix64 PRNG; requires `import "random.cb"` |
+| `channel.cb` | `channel<T>` — MPMC blocking channel; requires `import "channel.cb"` |
+| `spsc_queue.cb` | `spsc_queue<T>` — wait-free single-producer/single-consumer ring buffer |
+| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement — thread synchronization primitives |
+| `latch.cb` | `latch` — one-shot countdown synchronization |
+| `semaphore.cb` | `semaphore` — counting semaphore |
+| `rwlock.cb` | `rwlock` — reader-writer lock |
+| `stop_token.cb` | `stop_token` / `stop_source` — cooperative cancellation |
+| `time.cb` | `Time.now()`, sleep, duration utilities |
+| `tuple.cb` | `tuple<A,B,C>` — fixed-arity generic struct |
+| `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` — JSON serialization |
+| `arena.cb` | Arena bump allocator |
+| `block_allocator.cb` | Block-based pooled allocator (used by `program` thread startup) |
+| `malloc_allocator.cb` | Thin wrapper around system malloc/free |
+| `fit_allocator.cb` | Fit allocation strategy |
+| `slab_allocator.cb` | Slab allocator for fixed-size objects |
+| `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
+| `cruntime.cb` | Raw C runtime bindings (printf, memcpy, etc.) |
 
 To add a new core library: add the `.cb` file to `core/` and add an entry in MyCompiler.vcxproj with DeploymentContent.
 Use nullptr instead of null;

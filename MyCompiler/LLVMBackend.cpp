@@ -12,8 +12,8 @@
 #include "CFlatParser.h"
 #include "CFlatLexer.h"
 #include "CFlatBaseListener.h"
-#include "MyCompilerLLVM.h"
-#include "MyListener.h"
+#include "LLVMBackend.h"
+#include "MainListener.h"
 #include <filesystem>
 
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
@@ -27,7 +27,7 @@ static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
     return lines;
 }
 
-void MyCompilerLLVM::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
+void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
                                        const std::vector<std::string>& sourceLines)
 {
     for (const auto& d : diagnostics)
@@ -60,7 +60,7 @@ void MyCompilerLLVM::ReportParseErrors(const std::vector<ParseDiagnostic>& diagn
     }
 }
 
-bool MyCompilerLLVM::Compile(const ArgParser& args)
+bool LLVMBackend::Compile(const ArgParser& args)
 {
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
@@ -242,7 +242,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
         }
 
         if (verbose) std::cout << "[verbose] code-gen walk (" << sourceFileName << ")\n";
-        auto myListener = std::make_unique<MyListener>(&parser, this, sourceFileName);
+        auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
         stream.close();
@@ -316,7 +316,7 @@ bool MyCompilerLLVM::Compile(const ArgParser& args)
     return true;
 }
 
-bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -443,7 +443,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
 
     // Code-gen walk the imported file
     if (verbose) std::cout << "[verbose]   code-gen walk: " << importFilename << "\n";
-    auto myListener = std::make_unique<MyListener>(parserPtr, this, sourceFileName);
+    auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
     antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
 
@@ -451,7 +451,7 @@ bool MyCompilerLLVM::CompileImportedFile(const std::string& importingFilePath, c
     return true;
 }
 
-void MyCompilerLLVM::OptimizeModule(int optimizationLevel)
+void LLVMBackend::OptimizeModule(int optimizationLevel)
 {
     if (optimizationLevel == 0)
         return;
@@ -477,11 +477,11 @@ void MyCompilerLLVM::OptimizeModule(int optimizationLevel)
     MPM.run(*module, MAM);
 }
 
-bool MyCompilerLLVM::Analyze(const std::string& filePath,
+bool LLVMBackend::Analyze(const std::string& filePath,
                               const std::string& importDir,
                               const std::string& runtimeDirPath)
 {
-    MyListener::ClearGenericCaches();
+    MainListener::ClearGenericCaches();
 
     sourceFileName = std::filesystem::path(filePath).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
@@ -595,7 +595,7 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
         }
 
         // Code-gen walk
-        auto myListener = std::make_unique<MyListener>(&parser, this, sourceFileName);
+        auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
         stream.close();
@@ -606,7 +606,7 @@ bool MyCompilerLLVM::Analyze(const std::string& filePath,
     return true;
 }
 
-void MyCompilerLLVM::ResetForReanalysis()
+void LLVMBackend::ResetForReanalysis()
 {
     module = std::make_unique<llvm::Module>("cflat", *context);
     builder = std::make_unique<llvm::IRBuilder<>>(*context);

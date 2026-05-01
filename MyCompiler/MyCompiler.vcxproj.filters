@@ -15,10 +15,10 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="MyCompiler.cpp">
+    <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="MyCompilerLLVM.cpp">
+    <ClCompile Include="LLVMBackend.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="JsonRpcLoop.cpp">
@@ -80,10 +80,10 @@
     <ClInclude Include="Version.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="MyCompilerLLVM.h">
+    <ClInclude Include="LLVMBackend.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="MyListener.h">
+    <ClInclude Include="MainListener.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="JsonRpcLoop.h">

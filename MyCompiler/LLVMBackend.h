@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-// MyCompilerLLVM.h — LLVM IR backend, type system, symbol tables
+// LLVMBackend.h — LLVM IR backend, type system, symbol tables
 // ============================================================
 // SECTION      LINE     DESCRIPTION
 // ───────────────────────────────────────────────────────────
@@ -65,7 +65,7 @@ struct CompilerAbortException {
     size_t column;
 };
 
-class MyCompilerLLVM
+class LLVMBackend
 {
 public:
     enum class Operation
@@ -268,7 +268,7 @@ public:
     struct NamedVariable
     {
     public:
-        MyCompilerLLVM::TypeAndValue TypeAndValue;
+        LLVMBackend::TypeAndValue TypeAndValue;
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
@@ -433,7 +433,7 @@ public:
         exit(1);
     }
 
-    friend class MyListener;
+    friend class MainListener;
     friend class ForwardRefScanner;
 
     std::unique_ptr<llvm::IRBuilder<>> builder;
@@ -653,7 +653,7 @@ private:
         }
     }
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool returnsOwned = false)
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false)
     {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -1401,12 +1401,12 @@ private:
     }
 
 public:
-    MyCompilerLLVM()
+    LLVMBackend()
     {
         Init();
         CompilerManager::Instance().Register(this);
     }
-    ~MyCompilerLLVM()
+    ~LLVMBackend()
     {
         CompilerManager::Instance().Unregister(this);
 
@@ -2514,7 +2514,7 @@ public:
     }
 
     // Create StructType or OpaqueStruct
-    llvm::StructType* CreateStructType(std::string name, std::vector<MyCompilerLLVM::DeclTypeAndValue> typeAndValues)
+    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues)
     {
         if (typeAndValues.size() > 0)
         {
@@ -3132,7 +3132,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false)
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -3163,12 +3163,12 @@ public:
         }
     }
 
-    llvm::FunctionType* GetFunctionType(MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+    llvm::FunctionType* GetFunctionType(LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false)
     {
         std::vector<llvm::Type*> types;
         types.reserve(arguments.size());
 
-        for (const MyCompilerLLVM::TypeAndValue& arg : arguments)
+        for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
             types.emplace_back(GetType(arg));
         }
@@ -3177,7 +3177,7 @@ public:
         return ft;
     }
 
-    std::string ComputeMangledName(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool varargs = false)
+    std::string ComputeMangledName(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false)
     {
         std::string argumentString = {};
 
@@ -3191,7 +3191,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, MyCompilerLLVM::TypeAndValue returnType, std::vector<MyCompilerLLVM::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
 
@@ -3258,7 +3258,7 @@ public:
         return fn;
     }
 
-    llvm::Type* GetType(const MyCompilerLLVM::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
+    llvm::Type* GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
     {
         if (typeAndValue.IsFunctionPointer)
         {
@@ -3381,8 +3381,8 @@ public:
                             return (it != enumBackingTypes.end()) ? it->second : tn;
                         };
 
-                    MyCompilerLLVM::TypeAndValue tmpArg = arg.TypeAndValue;
-                    MyCompilerLLVM::TypeAndValue tmpParam = *candidateParamItr;
+                    LLVMBackend::TypeAndValue tmpArg = arg.TypeAndValue;
+                    LLVMBackend::TypeAndValue tmpParam = *candidateParamItr;
 
                     tmpArg.TypeName = resolveName(tmpArg.TypeName);
                     tmpParam.TypeName = resolveName(tmpParam.TypeName);
@@ -3482,7 +3482,7 @@ public:
         return possibleResult;
     }
 
-    std::vector<MyCompilerLLVM::NamedVariable> MatchFunction(const std::vector<MyCompilerLLVM::NamedVariable>& inputArguments, const std::vector<MyCompilerLLVM::TypeAndValue>& targetArguments)
+    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments)
     {
         // Two pass match.
         // 1) Align named arguments
@@ -3574,7 +3574,7 @@ public:
         }
 
         // recombine
-        std::vector<MyCompilerLLVM::NamedVariable> result(inputSize);
+        std::vector<LLVMBackend::NamedVariable> result(inputSize);
         for (int i = 0; i < inputSize; i++)
         {
             result[posMap[i]] = inputArguments[i];
@@ -3669,7 +3669,7 @@ public:
         return nullptr; // not an atomic builtin
     }
 
-    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<MyCompilerLLVM::NamedVariable> arguments)
+    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<LLVMBackend::NamedVariable> arguments)
     {
         functionName = ResolveQualifiedName(functionName);
         auto funcSym = functionTable.find(functionName);
