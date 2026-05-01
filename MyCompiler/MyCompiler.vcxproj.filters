@@ -50,6 +50,7 @@
     <None Include="core\thread.cb" />
     <None Include="core\stop_token.cb" />
     <None Include="core\block_allocator.cb" />
+    <None Include="core\malloc_allocator.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />

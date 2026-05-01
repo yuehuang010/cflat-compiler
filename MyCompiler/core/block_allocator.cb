@@ -207,7 +207,8 @@ class BlockAllocator : IAllocator
         return total;
     }
 
-    i64 usedBytes() { return usedBlocks() * _blockSize; }
+    i64 usedBytes()  { return usedBlocks() * _blockSize; }
+    i64 totalBytes() { return (i64)0; }
 
     // Total block capacity across all pages.
     i64 totalBlocks()

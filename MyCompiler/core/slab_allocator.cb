@@ -297,6 +297,8 @@ class SlabAllocator : IAllocator
         return total;
     }
 
+    i64 totalBytes() { return (i64)0; }
+
     i64 committedBytes()
     {
         if (_slabs == nullptr) return 0;

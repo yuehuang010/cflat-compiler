@@ -335,7 +335,8 @@ class FitAllocator : IAllocator
     // Stats / diagnostics
     // -----------------------------------------------------------------------
 
-    i64 usedBytes() { return _usedBytes + _largeBytes; }
+    i64 usedBytes()  { return _usedBytes + _largeBytes; }
+    i64 totalBytes() { return (i64)0; }
 
     i64 freeBytes()
     {

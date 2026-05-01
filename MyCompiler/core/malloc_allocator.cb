@@ -1,0 +1,13 @@
+// malloc_allocator.cb — passthrough IAllocator that forwards directly to malloc/free.
+// Suitable as the default program allocator when block or slab allocation is not needed.
+
+class MallocAllocator : IAllocator
+{
+    i64 _totalBytes = 0;
+
+    void* alloc(i64 size)   { _totalBytes = _totalBytes + size; return malloc(size); }
+    void  dealloc(void* ptr){ free(ptr); }
+    void  cleanup()         { }
+    i64   usedBytes()       { return (i64)0; }
+    i64   totalBytes()      { return _totalBytes; }
+};
