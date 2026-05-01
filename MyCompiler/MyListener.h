@@ -3873,8 +3873,6 @@ public:
                 return namedVar.Primary;
             if (namedVar.Storage != nullptr)
             {
-                // Local variables and globals store the pointer value inside an alloca/global.
-                // Function arguments have the pointer value as the argument itself — return directly.
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
                     llvm::isa<llvm::GlobalVariable>(namedVar.Storage) ||
                     llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
@@ -4071,16 +4069,8 @@ public:
             // (e.g., i64 load from a u32 field corrupts the adjacent field).
             if (namedVar.Primary == nullptr && namedVar.Storage != nullptr)
             {
-                // Pointer parameters use Storage = &arg (the parameter register value),
-                // not an alloca. Loading from the parameter register would dereference
-                // the pointer, not read the pointer itself. Use the register value directly.
-                if (llvm::isa<llvm::Argument>(namedVar.Storage))
-                    namedVar.Primary = namedVar.Storage;
-                else
-                {
-                    auto srcType = compiler->GetType(namedVar.TypeAndValue);
-                    namedVar.Primary = compiler->CreateLoad(srcType, namedVar.Storage);
-                }
+                auto srcType = compiler->GetType(namedVar.TypeAndValue);
+                namedVar.Primary = compiler->CreateLoad(srcType, namedVar.Storage);
                 namedVar.Storage = nullptr;
             }
 
@@ -4283,13 +4273,7 @@ public:
                 namedVar.TypeAndValue.Pointer = false;
                 namedVar.TypeAndValue.IsInterfacePointer = false; // dereference removes the pointer-to-fat-ptr level
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
-                // Pointer parameters use Storage = argument register (not an alloca), so the
-                // register IS the pointer value — loading from it would add an extra indirection.
-                llvm::Value* loadedPtr;
-                if (llvm::isa<llvm::Argument>(namedVar.Storage))
-                    loadedPtr = namedVar.Storage;
-                else
-                    loadedPtr = compiler->CreateLoad(namedVar.Storage);
+                llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
                 // The deref'd location: loadedPtr is the address; pointeeType is what it holds.
                 // Storing it in Storage (not Primary) makes it usable as both lvalue and rvalue.
                 namedVar.Storage  = loadedPtr;
@@ -6018,7 +6002,13 @@ public:
                                     tv.VariableName = thisParam.VariableName;
                                     tv.Pointer = thisParam.Pointer;
                                     auto* alloca = Compiler(ctx)->CreateLocalVariable(tv);
-                                    Compiler(ctx)->CreateAssignment(thisVar.Storage, alloca);
+                                    // thisVar.Storage may be a promoted-param alloca holding a pointer;
+                                    // load through it to get the actual pointer value to bind.
+                                    llvm::Value* thisVal = thisVar.Storage;
+                                    if (thisVar.TypeAndValue.Pointer
+                                        && llvm::isa<llvm::AllocaInst>(thisVal))
+                                        thisVal = Compiler(ctx)->CreateLoad(thisVal);
+                                    Compiler(ctx)->CreateAssignment(thisVal, alloca);
                                 }
                             }
 

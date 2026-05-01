@@ -748,12 +748,16 @@ private:
             }
             else
             {
+                // Alloca all remaining params (scalars and non-owning pointers) so they
+                // are writable (CreateStore targets) just like local variables.
+                auto* ty = GetType(*itr_nameArg, nullptr, itr_nameArg->Pointer);
+                auto* alloc = builder->CreateAlloca(ty, nullptr, itr_nameArg->VariableName);
+                builder->CreateStore(&arg, alloc);
                 NamedVariable namedVar
                 {
                     .TypeAndValue = *itr_nameArg,
-                    .BaseType = GetType(*itr_nameArg, nullptr, false),
-                    .Primary = itr_nameArg->Pointer ? nullptr : &arg,
-                    .Storage = itr_nameArg->Pointer ? &arg : nullptr,
+                    .BaseType = ty,
+                    .Storage = alloc,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
@@ -1759,7 +1763,11 @@ public:
             const auto& param = methodInfo->Parameters[i];
             if (param.Pointer)
             {
-                callArgs.push_back(nv.GetValue());
+                // Storage may be a promoted-param alloca holding the pointer; load to get the value.
+                if (nv.Primary == nullptr && nv.Storage != nullptr && llvm::isa<llvm::AllocaInst>(nv.Storage))
+                    callArgs.push_back(CreateLoad(nv.Storage));
+                else
+                    callArgs.push_back(nv.GetValue());
             }
             else
             {
@@ -3828,7 +3836,15 @@ public:
                     argList.push_back(tempAlloca);
                 }
                 else
-                    argList.push_back(arg.GetValue());
+                {
+                    // arg is a pointer type; Storage may be an alloca holding the pointer
+                    // (promoted param). Load through it to get the actual pointer value.
+                    if (arg.Primary == nullptr && arg.Storage != nullptr
+                        && llvm::isa<llvm::AllocaInst>(arg.Storage))
+                        argList.push_back(CreateLoad(arg.Storage));
+                    else
+                        argList.push_back(arg.GetValue());
+                }
             }
             else
             {
@@ -3975,7 +3991,14 @@ public:
                     return {};
 
                 const auto& memberStructName = thisIt->first;
-                const auto& memberStructInstance = thisIt->second.Storage;
+                // Storage is either an alloca-of-struct (constructor) or an alloca-of-ptr (method param).
+                // For the latter, load through it to get the actual struct pointer before GEP.
+                llvm::Value* memberStructInstance = thisIt->second.Storage;
+                if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(memberStructInstance))
+                {
+                    if (alloca->getAllocatedType()->isPointerTy())
+                        memberStructInstance = CreateLoad(alloca);
+                }
                 auto truncName = memberStructName.substr(0, memberStructName.size() - 2);
                 auto findResult = dataStructures.find(truncName);
                 if (findResult != dataStructures.end())
