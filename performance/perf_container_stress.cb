@@ -1,0 +1,84 @@
+// Benchmark 3: list<int*> container stress.
+//
+// Exercises the full add-iterate-destruct lifecycle of a list<int*> with
+// N=200,000 elements.  The list doubles its backing array ~18 times, creating
+// a realistic mixed-size allocation pattern: many small (new int, 4 bytes)
+// plus periodic medium backing-array reallocations (32 B → 64 B → … → ~3 MB).
+// BlockAllocator is excluded because backing arrays exceed its 64-byte limit.
+
+import "list.cb";
+import "thread.cb";
+import "interfaces.cb";
+import "time.cb";
+import "malloc_allocator.cb";
+import "slab_allocator.cb";
+import "fit_allocator.cb";
+import "perf_framework.cb";
+
+program BenchContainerStress
+{
+    int count      = 0;
+    i64 measuredUs = 0;
+    i64 sumResult  = 0;
+
+    int main(move list<string> args)
+    {
+        Stopwatch sw;
+        sw.start();
+
+        list<int*> items;
+        int i = 0;
+        int* p = nullptr;   // declared before loop — avoid alloca in loop body
+        while (i < count)
+        {
+            p = new int;
+            *p = i;
+            items.add(move p);
+            i++;
+        }
+
+        i = 0;
+        int* q = nullptr;
+        while (i < items.count())
+        {
+            q = items.get(i);
+            sumResult = sumResult + (i64)*q;
+            i++;
+        }
+
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+        // list<int*> destructor frees all elements here
+    }
+};
+
+extern int main()
+{
+    int N = 200000;
+    list<string> emptyArgs;
+    PerfHeader("Container Stress: list<int*> add+iterate+destruct (N=200000)");
+
+    BenchContainerStress bm;
+    bm.count = N;
+    bm._allocator = new MallocAllocator;
+    bm.run(emptyArgs);
+    bm.WaitForExit();
+    PerfPrint("MallocAllocator", (i64)N, bm.measuredUs);
+
+    BenchContainerStress bs;
+    bs.count = N;
+    bs._allocator = new SlabAllocator;
+    bs.run(emptyArgs);
+    bs.WaitForExit();
+    PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
+
+    BenchContainerStress bf;
+    bf.count = N;
+    bf._allocator = new FitAllocator;
+    bf.run(emptyArgs);
+    bf.WaitForExit();
+    PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+
+    return 0;
+}

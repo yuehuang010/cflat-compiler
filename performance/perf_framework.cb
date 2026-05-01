@@ -1,0 +1,15 @@
+import "time.cb";
+
+void PerfHeader(char* bench)
+{
+    printf("\n--- %s ---\n", bench);
+    printf("  %-18s  %10s  %12s  %8s\n", "Allocator", "Ops", "us", "ns/op");
+}
+
+void PerfPrint(char* allocName, i64 ops, i64 us)
+{
+    i64 safeUs = us;
+    if (safeUs == (i64)0) { safeUs = (i64)1; }
+    i64 nsPerOp = (safeUs * (i64)1000) / ops;
+    printf("  %-18s  %10lld  %12lld  %8lld\n", allocName, ops, safeUs, nsPerOp);
+}

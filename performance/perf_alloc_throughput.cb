@@ -1,0 +1,80 @@
+// Benchmark 1: raw alloc/dealloc throughput.
+//
+// Each allocator runs N iterations of (new int / delete) in a tight loop.
+// BlockAllocator is included because sizeof(int) = 4 bytes fits its 64-byte
+// block size.  The timer runs inside main() to exclude thread-startup overhead.
+//
+// Note: pointer variables must be declared BEFORE the loop.  CFlat emits
+// alloca instructions at the declaration site.  Declaring inside the loop
+// would place allocas in the loop body, consuming N×8 bytes of stack.
+
+import "list.cb";
+import "thread.cb";
+import "interfaces.cb";
+import "time.cb";
+import "malloc_allocator.cb";
+import "block_allocator.cb";
+import "slab_allocator.cb";
+import "fit_allocator.cb";
+import "perf_framework.cb";
+
+program BenchThroughput
+{
+    int iters      = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        Stopwatch sw;
+        sw.start();
+        int i = 0;
+        int* p = nullptr;   // declared before loop — alloca hoisted to entry block
+        while (i < iters)
+        {
+            p = new int;
+            *p = i;
+            delete p;
+            i++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+extern int main()
+{
+    int N = 500000;
+    list<string> emptyArgs;
+    PerfHeader("Alloc/Dealloc Throughput (N=500000, new int / delete)");
+
+    BenchThroughput bm;
+    bm.iters = N;
+    bm._allocator = new MallocAllocator;
+    bm.run(emptyArgs);
+    bm.WaitForExit();
+    PerfPrint("MallocAllocator", (i64)N, bm.measuredUs);
+
+    BenchThroughput bb;
+    bb.iters = N;
+    bb._allocator = new BlockAllocator;
+    bb.run(emptyArgs);
+    bb.WaitForExit();
+    PerfPrint("BlockAllocator", (i64)N, bb.measuredUs);
+
+    BenchThroughput bs;
+    bs.iters = N;
+    bs._allocator = new SlabAllocator;
+    bs.run(emptyArgs);
+    bs.WaitForExit();
+    PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
+
+    BenchThroughput bf;
+    bf.iters = N;
+    bf._allocator = new FitAllocator;
+    bf.run(emptyArgs);
+    bf.WaitForExit();
+    PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+
+    return 0;
+}

@@ -1,0 +1,83 @@
+// Benchmark 2: peak live-object pressure.
+//
+// Allocates N int* objects into a list<int*> so all are live simultaneously,
+// iterates to sum them (prevents dead-code elimination), then lets the list
+// destructor free all elements at once.  BlockAllocator is excluded because
+// the list's backing array grows beyond its 64-byte block limit.
+
+import "list.cb";
+import "thread.cb";
+import "interfaces.cb";
+import "time.cb";
+import "malloc_allocator.cb";
+import "slab_allocator.cb";
+import "fit_allocator.cb";
+import "perf_framework.cb";
+
+program BenchPeakMemory
+{
+    int count      = 0;
+    i64 measuredUs = 0;
+    i64 sumResult  = 0;
+
+    int main(move list<string> args)
+    {
+        Stopwatch sw;
+        sw.start();
+
+        list<int*> items;
+        int i = 0;
+        int* p = nullptr;   // declared before loop — avoid alloca in loop body
+        while (i < count)
+        {
+            p = new int;
+            *p = i + 1;
+            items.add(move p);
+            i++;
+        }
+
+        i = 0;
+        int* q = nullptr;
+        while (i < items.count())
+        {
+            q = items.get(i);
+            sumResult = sumResult + (i64)*q;
+            i++;
+        }
+
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+        // list<int*> destructor frees all elements here
+    }
+};
+
+extern int main()
+{
+    int N = 50000;
+    list<string> emptyArgs;
+    PerfHeader("Peak Memory: hold N live allocs then free-all (N=50000 int*)");
+
+    BenchPeakMemory bm;
+    bm.count = N;
+    bm._allocator = new MallocAllocator;
+    bm.run(emptyArgs);
+    bm.WaitForExit();
+    PerfPrint("MallocAllocator", (i64)N, bm.measuredUs);
+
+    BenchPeakMemory bs;
+    bs.count = N;
+    bs._allocator = new SlabAllocator;
+    bs.run(emptyArgs);
+    bs.WaitForExit();
+    PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
+
+    BenchPeakMemory bf;
+    bf.count = N;
+    bf._allocator = new FitAllocator;
+    bf.run(emptyArgs);
+    bf.WaitForExit();
+    PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+
+    return 0;
+}

@@ -1,0 +1,113 @@
+// Benchmark 4: program construct lifecycle overhead.
+//
+// Runs the same program K=100 times sequentially.  Each run spawns a thread,
+// installs the allocator, performs M=1000 small allocs, and joins.  The outer
+// Stopwatch measures total wall-clock time including all thread and allocator
+// setup/teardown.  BlockAllocator is included because sizeof(int)=4 bytes fits.
+//
+// The allocator is created once (directly into _allocator) and reused across
+// all K runs; _allocator is preserved between run()+WaitForExit() calls.
+
+import "list.cb";
+import "thread.cb";
+import "interfaces.cb";
+import "time.cb";
+import "malloc_allocator.cb";
+import "block_allocator.cb";
+import "slab_allocator.cb";
+import "fit_allocator.cb";
+import "perf_framework.cb";
+
+program WorkUnit
+{
+    int workItems = 0;
+    int dummySum  = 0;
+
+    int main(move list<string> args)
+    {
+        int i   = 0;
+        int sum = 0;
+        int* p  = nullptr;  // declared before loop — avoid alloca in loop body
+        while (i < workItems)
+        {
+            p = new int;
+            *p = i;
+            sum = sum + *p;
+            delete p;
+            i++;
+        }
+        dummySum = sum;
+        return sum % 256;
+    }
+};
+
+extern int main()
+{
+    int K = 100;
+    int M = 1000;
+    list<string> emptyArgs;
+    PerfHeader("Program Lifecycle: K=100 runs x M=1000 allocs each");
+    printf("  (ns/op = average time per run+WaitForExit cycle)\n");
+
+    WorkUnit pm;
+    pm.workItems  = M;
+    pm._allocator = new MallocAllocator;
+    Stopwatch swm;
+    swm.start();
+    int k = 0;
+    while (k < K)
+    {
+        pm.run(emptyArgs);
+        pm.WaitForExit();
+        k++;
+    }
+    swm.stop();
+    PerfPrint("MallocAllocator", (i64)K, (i64)swm.elapsed().microseconds());
+
+    WorkUnit pb;
+    pb.workItems  = M;
+    pb._allocator = new BlockAllocator;
+    Stopwatch swb;
+    swb.start();
+    k = 0;
+    while (k < K)
+    {
+        pb.run(emptyArgs);
+        pb.WaitForExit();
+        k++;
+    }
+    swb.stop();
+    PerfPrint("BlockAllocator", (i64)K, (i64)swb.elapsed().microseconds());
+
+    WorkUnit ps;
+    ps.workItems  = M;
+    ps._allocator = new SlabAllocator;
+    Stopwatch sws;
+    sws.start();
+    k = 0;
+    while (k < K)
+    {
+        ps.run(emptyArgs);
+        ps.WaitForExit();
+        k++;
+    }
+    sws.stop();
+    PerfPrint("SlabAllocator", (i64)K, (i64)sws.elapsed().microseconds());
+
+    WorkUnit pf;
+    pf.workItems  = M;
+    pf._allocator = new FitAllocator;
+    Stopwatch swf;
+    swf.start();
+    k = 0;
+    while (k < K)
+    {
+        pf.run(emptyArgs);
+        pf.WaitForExit();
+        k++;
+    }
+    swf.stop();
+    PerfPrint("FitAllocator", (i64)K, (i64)swf.elapsed().microseconds());
+
+    return 0;
+}

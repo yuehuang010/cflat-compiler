@@ -277,13 +277,20 @@ class FitAllocator : IAllocator
         if (size <= 0) return nullptr;
         if (_segments == nullptr) _init();
 
-        if (size > _segSize / (i64)2) return _allocLarge(size);
+        // Freed block overlays _prev + _next into user area; need at least 16 bytes.
+        i64 allocSize = size;
+        {
+            i64 minFree = _freeHdrSize() - _hdrSize();
+            if (allocSize < minFree) { allocSize = minFree; }
+        }
+
+        if (allocSize > _segSize / (i64)2) return _allocLarge(allocSize);
 
         // First-fit scan.
         _FA_FreeBlock* fb = _freeHead;
         while (fb != nullptr)
         {
-            if (fb->_size >= size) break;
+            if (fb->_size >= allocSize) break;
             fb = fb->_next;
         }
 
@@ -293,19 +300,19 @@ class FitAllocator : IAllocator
             fb = _freeHead;
             while (fb != nullptr)
             {
-                if (fb->_size >= size) break;
+                if (fb->_size >= allocSize) break;
                 fb = fb->_next;
             }
             if (fb == nullptr) return nullptr;
         }
 
         _freeListRemove(fb);
-        _maybeSplit(fb, size);
+        _maybeSplit(fb, allocSize);
 
         _FA_Header* hdr = (_FA_Header*)fb;
-        hdr->_size = size;  // positive → slab
+        hdr->_size = allocSize;  // positive → slab
 
-        _usedBytes = _usedBytes + size;
+        _usedBytes = _usedBytes + allocSize;
         return (void*)((i64)fb + _hdrSize());
     }
 
