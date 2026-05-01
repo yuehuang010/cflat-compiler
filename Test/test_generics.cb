@@ -1627,53 +1627,49 @@ bool testITuple()
 
 extern int main()
 {
-    bool result = true;
-    result &= testGenericStructs();
-    result &= testInterface();
-    result &= testGenericInterface();
-    result &= testReturnListFreeFunc();
-    result &= testReturnListMethod();
-    result &= testNestedGenericDefault();
-    result &= testGenericLocalDefault();
-    result &= testOverloadedConstructors();
-    result &= testConstructorDefaultArgs();
-    result &= testListStruct();
-    result &= testDictionaryStruct();
-    result &= testForStruct();
-    result &= testListPointer();
-    result &= testDoubleNestedGeneric();
-    result &= testTripleNestedGeneric();
-    result &= testPairOfBoxes();
-    result &= testContainerOfPairs();
-    result &= testGenericWrapperMethods();
-    result &= testMultiLayerGeneric();
-    result &= testMixedGenericFields();
-    result &= testIsPointerIntrinsic();
-    result &= testTemplateFunctions();
-    result &= testBasicStructConstraint();
-    result &= testAlternativeConcreteType();
-    result &= testTwoConstrainedParams();
-    result &= testMultipleConstraintsSameParam();
-    result &= testConstrainedClass();
-    result &= testConstrainedFunction();
-    result &= testVariadicStruct();
-    result &= testVariadicSizeof();
-    result &= testVariadicFixedPlusPack();
-    result &= testTuplePrimitives();
-    result &= testTupleSizedIntegers();
-    result &= testTupleStructs();
-    result &= testTupleClasses();
-    result &= testTuplePointers();
-    result &= testTupleInterfaces();
-    result &= testTupleTypeSyntax();
-    result &= testTupleConstruct();
-    result &= testTupleReturnAndDestructure();
-    result &= testITuple();
-    if (result)
-    {
-        printf("All Test Passed.\n");
-        return 0;
-    }
-
-    return 1;
+    int passed = 0;
+    int total  = 0;
+    total++; passed += testGenericStructs();
+    total++; passed += testInterface()                   ? 1 : 0;
+    total++; passed += testGenericInterface()            ? 1 : 0;
+    total++; passed += testReturnListFreeFunc()          ? 1 : 0;
+    total++; passed += testReturnListMethod()            ? 1 : 0;
+    total++; passed += testNestedGenericDefault()        ? 1 : 0;
+    total++; passed += testGenericLocalDefault()         ? 1 : 0;
+    total++; passed += testOverloadedConstructors()      ? 1 : 0;
+    total++; passed += testConstructorDefaultArgs()      ? 1 : 0;
+    total++; passed += testListStruct()                  ? 1 : 0;
+    total++; passed += testDictionaryStruct()            ? 1 : 0;
+    total++; passed += testForStruct()                   ? 1 : 0;
+    total++; passed += testListPointer()                 ? 1 : 0;
+    total++; passed += testDoubleNestedGeneric()         ? 1 : 0;
+    total++; passed += testTripleNestedGeneric()         ? 1 : 0;
+    total++; passed += testPairOfBoxes()                 ? 1 : 0;
+    total++; passed += testContainerOfPairs()            ? 1 : 0;
+    total++; passed += testGenericWrapperMethods()       ? 1 : 0;
+    total++; passed += testMultiLayerGeneric()           ? 1 : 0;
+    total++; passed += testMixedGenericFields()          ? 1 : 0;
+    total++; passed += testIsPointerIntrinsic()          ? 1 : 0;
+    total++; passed += testTemplateFunctions()           ? 1 : 0;
+    total++; passed += testBasicStructConstraint()       ? 1 : 0;
+    total++; passed += testAlternativeConcreteType()     ? 1 : 0;
+    total++; passed += testTwoConstrainedParams()        ? 1 : 0;
+    total++; passed += testMultipleConstraintsSameParam() ? 1 : 0;
+    total++; passed += testConstrainedClass()            ? 1 : 0;
+    total++; passed += testConstrainedFunction()         ? 1 : 0;
+    total++; passed += testVariadicStruct()              ? 1 : 0;
+    total++; passed += testVariadicSizeof()              ? 1 : 0;
+    total++; passed += testVariadicFixedPlusPack()       ? 1 : 0;
+    total++; passed += testTuplePrimitives()             ? 1 : 0;
+    total++; passed += testTupleSizedIntegers()          ? 1 : 0;
+    total++; passed += testTupleStructs()                ? 1 : 0;
+    total++; passed += testTupleClasses()                ? 1 : 0;
+    total++; passed += testTuplePointers()               ? 1 : 0;
+    total++; passed += testTupleInterfaces()             ? 1 : 0;
+    total++; passed += testTupleTypeSyntax()             ? 1 : 0;
+    total++; passed += testTupleConstruct()              ? 1 : 0;
+    total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
+    total++; passed += testITuple()                      ? 1 : 0;
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
