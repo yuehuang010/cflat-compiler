@@ -1,0 +1,293 @@
+// Comprehensive sort-with-lambda tests.
+// Covers: int, float, struct, pointer, class, interface, captured comparator,
+// and edge cases (empty, single, duplicates, already-sorted, reverse-sorted).
+
+import "list.cb";
+
+// ─── Supporting types ────────────────────────────────────────────────────────
+
+struct Point {
+    int x = 0;
+    int y = 0;
+};
+
+class Employee {
+    int id   = 0;
+    int rank = 0;
+    int getRank() { return rank; }
+};
+
+interface IPriority {
+    int priority();
+};
+
+class LowItem : IPriority {
+    int priority() { return 10; }
+};
+
+class MidItem : IPriority {
+    int priority() { return 50; }
+};
+
+class HighItem : IPriority {
+    int priority() { return 90; }
+};
+
+// Single concrete class used to test interface dispatch inside a sort comparator.
+class PrioItem : IPriority {
+    int score = 0;
+    int priority() { return score; }
+};
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+bool testSortInt()
+{
+    bool ok = true;
+
+    list<int> asc;
+    asc.add(5); asc.add(2); asc.add(8); asc.add(1); asc.add(9); asc.add(3);
+    asc.sort((int a, int b) => { return a < b; });
+    ok &= asc.get(0) == 1;
+    ok &= asc.get(1) == 2;
+    ok &= asc.get(2) == 3;
+    ok &= asc.get(3) == 5;
+    ok &= asc.get(4) == 8;
+    ok &= asc.get(5) == 9;
+
+    list<int> desc;
+    desc.add(5); desc.add(2); desc.add(8); desc.add(1); desc.add(9); desc.add(3);
+    desc.sort((int a, int b) => { return a > b; });
+    ok &= desc.get(0) == 9;
+    ok &= desc.get(1) == 8;
+    ok &= desc.get(2) == 5;
+    ok &= desc.get(3) == 3;
+    ok &= desc.get(4) == 2;
+    ok &= desc.get(5) == 1;
+
+    if (!ok) printf("FAIL: testSortInt\n");
+    return ok;
+}
+
+bool testSortFloat()
+{
+    bool ok = true;
+
+    list<float> nums;
+    nums.add(3.5f); nums.add(1.0f); nums.add(4.0f); nums.add(1.5f); nums.add(2.5f);
+    nums.sort((float a, float b) => { return a < b; });
+
+    ok &= nums.get(0) == 1.0f;
+    ok &= nums.get(1) == 1.5f;
+    ok &= nums.get(2) == 2.5f;
+    ok &= nums.get(3) == 3.5f;
+    ok &= nums.get(4) == 4.0f;
+
+    if (!ok) printf("FAIL: testSortFloat\n");
+    return ok;
+}
+
+bool testSortStruct()
+{
+    bool ok = true;
+
+    // Sort by x field ascending
+    list<Point> byX;
+    Point p1; p1.x = 5; p1.y = 1;
+    Point p2; p2.x = 2; p2.y = 4;
+    Point p3; p3.x = 8; p3.y = 2;
+    Point p4; p4.x = 1; p4.y = 7;
+    byX.add(p1); byX.add(p2); byX.add(p3); byX.add(p4);
+    byX.sort((Point a, Point b) => { return a.x < b.x; });
+    ok &= byX.get(0).x == 1;
+    ok &= byX.get(1).x == 2;
+    ok &= byX.get(2).x == 5;
+    ok &= byX.get(3).x == 8;
+
+    // Sort by y field descending
+    list<Point> byY;
+    Point q1; q1.x = 0; q1.y = 3;
+    Point q2; q2.x = 0; q2.y = 7;
+    Point q3; q3.x = 0; q3.y = 1;
+    Point q4; q4.x = 0; q4.y = 5;
+    byY.add(q1); byY.add(q2); byY.add(q3); byY.add(q4);
+    byY.sort((Point a, Point b) => { return a.y > b.y; });
+    ok &= byY.get(0).y == 7;
+    ok &= byY.get(1).y == 5;
+    ok &= byY.get(2).y == 3;
+    ok &= byY.get(3).y == 1;
+
+    if (!ok) printf("FAIL: testSortStruct\n");
+    return ok;
+}
+
+bool testSortPointer()
+{
+    bool ok = true;
+
+    // list<Point*> takes ownership; destructor frees all elements at scope exit.
+    list<Point*> pts;
+    Point* p1 = new Point; p1->x = 30;
+    Point* p2 = new Point; p2->x = 10;
+    Point* p3 = new Point; p3->x = 50;
+    Point* p4 = new Point; p4->x = 20;
+    pts.add(p1); pts.add(p2); pts.add(p3); pts.add(p4);
+
+    pts.sort((Point* a, Point* b) => { return a->x < b->x; });
+
+    ok &= pts.get(0)->x == 10;
+    ok &= pts.get(1)->x == 20;
+    ok &= pts.get(2)->x == 30;
+    ok &= pts.get(3)->x == 50;
+
+    if (!ok) printf("FAIL: testSortPointer\n");
+    return ok;
+}
+
+bool testSortClass()
+{
+    bool ok = true;
+
+    list<Employee> emps;
+    Employee e1; e1.id = 1; e1.rank = 40;
+    Employee e2; e2.id = 2; e2.rank = 10;
+    Employee e3; e3.id = 3; e3.rank = 70;
+    Employee e4; e4.id = 4; e4.rank = 25;
+    emps.add(e1); emps.add(e2); emps.add(e3); emps.add(e4);
+
+    emps.sort((Employee a, Employee b) => { return a.getRank() < b.getRank(); });
+
+    ok &= emps.get(0).getRank() == 10;
+    ok &= emps.get(1).getRank() == 25;
+    ok &= emps.get(2).getRank() == 40;
+    ok &= emps.get(3).getRank() == 70;
+
+    if (!ok) printf("FAIL: testSortClass\n");
+    return ok;
+}
+
+bool testSortInterface()
+{
+    bool ok = true;
+
+    // Sort concrete PrioItem values using interface dispatch in the comparator.
+    // Verifies that vtable calls work correctly as the comparison key inside a sort lambda.
+    list<PrioItem> items;
+    PrioItem p1; p1.score = 30;
+    PrioItem p2; p2.score = 10;
+    PrioItem p3; p3.score = 50;
+    PrioItem p4; p4.score = 20;
+    items.add(p1); items.add(p2); items.add(p3); items.add(p4);
+
+    items.sort((PrioItem a, PrioItem b) => {
+        IPriority ia = a;
+        IPriority ib = b;
+        return ia.priority() < ib.priority();
+    });
+
+    ok &= items.get(0).score == 10;
+    ok &= items.get(1).score == 20;
+    ok &= items.get(2).score == 30;
+    ok &= items.get(3).score == 50;
+
+    if (!ok) printf("FAIL: testSortInterface\n");
+    return ok;
+}
+
+bool testSortCapturedKey()
+{
+    bool ok = true;
+
+    // Booleans are value-captured: lambda holds a copy of flipSort at capture time.
+    bool flipSort = false;
+
+    list<int> nums;
+    nums.add(5); nums.add(2); nums.add(8);
+
+    // Capture flipSort=false → ascending comparator
+    function<bool(int,int)> cmpAsc = (int a, int b) => {
+        if (flipSort) return a > b;
+        return a < b;
+    };
+    nums.sort(cmpAsc);
+    ok &= nums.get(0) == 2;
+    ok &= nums.get(2) == 8;
+
+    // Changing the outer flag does not affect the already-captured copy
+    flipSort = true;
+    nums.sort(cmpAsc);    // still uses captured flipSort=false → still ascending
+    ok &= nums.get(0) == 2;
+    ok &= nums.get(2) == 8;
+
+    // New lambda captures the updated flag (flipSort=true) → descending
+    function<bool(int,int)> cmpDesc = (int a, int b) => {
+        if (flipSort) return a > b;
+        return a < b;
+    };
+    nums.sort(cmpDesc);
+    ok &= nums.get(0) == 8;
+    ok &= nums.get(2) == 2;
+
+    if (!ok) printf("FAIL: testSortCapturedKey\n");
+    return ok;
+}
+
+bool testSortEdgeCases()
+{
+    bool ok = true;
+
+    // Empty list — must not crash
+    list<int> empty;
+    empty.sort((int a, int b) => { return a < b; });
+    ok &= empty.count() == 0;
+
+    // Single element — no-op
+    list<int> one;
+    one.add(42);
+    one.sort((int a, int b) => { return a < b; });
+    ok &= one.get(0) == 42;
+
+    // All elements equal
+    list<int> same;
+    same.add(7); same.add(7); same.add(7); same.add(7);
+    same.sort((int a, int b) => { return a < b; });
+    ok &= same.get(0) == 7;
+    ok &= same.get(3) == 7;
+
+    // Already sorted
+    list<int> sorted;
+    sorted.add(1); sorted.add(2); sorted.add(3); sorted.add(4);
+    sorted.sort((int a, int b) => { return a < b; });
+    ok &= sorted.get(0) == 1;
+    ok &= sorted.get(3) == 4;
+
+    // Reverse sorted
+    list<int> rev;
+    rev.add(4); rev.add(3); rev.add(2); rev.add(1);
+    rev.sort((int a, int b) => { return a < b; });
+    ok &= rev.get(0) == 1;
+    ok &= rev.get(3) == 4;
+
+    if (!ok) printf("FAIL: testSortEdgeCases\n");
+    return ok;
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testSortInt()         ? 1 : 0;
+    total++; passed += testSortFloat()       ? 1 : 0;
+    total++; passed += testSortStruct()      ? 1 : 0;
+    total++; passed += testSortPointer()     ? 1 : 0;
+    total++; passed += testSortClass()       ? 1 : 0;
+    total++; passed += testSortInterface()   ? 1 : 0;
+    total++; passed += testSortCapturedKey() ? 1 : 0;
+    total++; passed += testSortEdgeCases()   ? 1 : 0;
+
+    printf("Sort tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
