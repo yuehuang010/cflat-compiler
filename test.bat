@@ -68,25 +68,26 @@ if "%~1"=="--worker-cb" (
 )
 
 REM ===========================================================================
-REM Worker mode: run test_err.bat, capture output to log file
+REM Worker mode: run one group of error tests via test_err.bat --group N
 REM ===========================================================================
 if "%~1"=="--worker-err" (
+    set GRP=%~2
     set OUT=out
     set T0=!TIME!
-    call "%~dp0test_err.bat" > "!OUT!\results\test_err.log" 2>&1
+    call "%~dp0test_err.bat" --group !GRP! > "!OUT!\results\test_err_!GRP!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
-        echo FAILED: test_err>"!OUT!\results\test_err.result"
-    ) else (
-        set T1=!TIME!
-        for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
-        for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
-        set /a ECS=CS1-CS0
-        if !ECS! lss 0 set /a ECS+=8640000
-        set /a ES=ECS/100
-        set /a EF=ECS-ES*100
-        if !EF! lss 10 set EF=0!EF!
-        echo PASS !ES!.!EF!s>"!OUT!\results\test_err.result"
+        echo FAILED: test_err_!GRP!>"!OUT!\results\test_err_!GRP!.result"
+        exit /b
     )
+    set T1=!TIME!
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    set /a ECS=CS1-CS0
+    if !ECS! lss 0 set /a ECS+=8640000
+    set /a ES=ECS/100
+    set /a EF=ECS-ES*100
+    if !EF! lss 10 set EF=0!EF!
+    echo PASS !ES!.!EF!s>"!OUT!\results\test_err_!GRP!.result"
     exit /b
 )
 
@@ -109,9 +110,11 @@ del /q "%OUT%\results\*.log" 2>nul
 
 set /a LAUNCHED=0
 
-REM Launch error tests first — they're slower and benefit most from early start
-set /a LAUNCHED+=1
-start "" /b cmd /c "%SCRIPT% --worker-err"
+REM Launch error tests as 3 parallel groups — each group runs its subset sequentially
+set /a LAUNCHED+=3
+start "" /b cmd /c "%SCRIPT% --worker-err 1"
+start "" /b cmd /c "%SCRIPT% --worker-err 2"
+start "" /b cmd /c "%SCRIPT% --worker-err 3"
 
 for %%F in (%SRC%\test_*.c) do (
     call :IsExcluded %%~nF
