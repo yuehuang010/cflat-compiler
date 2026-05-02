@@ -455,7 +455,7 @@ program EchoWorker {
             if (msg is StopMsg) break;
             if (msg is PingMsg) {
                 PingMsg* ping = msg as PingMsg;
-                received = received + ping->value;
+                received = received + ping.value;
             }
         }
         return received;
@@ -471,7 +471,7 @@ program SumWorker {
             if (msg is StopMsg) break;
             if (msg is SumMsg) {
                 SumMsg* s = msg as SumMsg;
-                total = total + s->a + s->b;
+                total = total + s.a + s.b;
             }
         }
         return total;
@@ -486,7 +486,7 @@ bool testInboxSingleMessage() {
     w.run(args);
 
     PingMsg* m = new PingMsg;
-    m->value = 7;
+    m.value = 7;
     w.inbox.send(move m);
     w.inbox.send(new StopMsg);
 
@@ -505,7 +505,7 @@ bool testInboxMultipleMessages() {
     int i = 0;
     while (i < 5) {
         PingMsg* m = new PingMsg;
-        m->value = i + 1;
+        m.value = i + 1;
         w.inbox.send(move m);
         i++;
     }
@@ -524,13 +524,13 @@ bool testInboxSumMessages() {
     w.run(args);
 
     SumMsg* m1 = new SumMsg;
-    m1->a = 3;
-    m1->b = 4;
+    m1.a = 3;
+    m1.b = 4;
     w.inbox.send(move m1);
 
     SumMsg* m2 = new SumMsg;
-    m2->a = 10;
-    m2->b = 20;
+    m2.a = 10;
+    m2.b = 20;
     w.inbox.send(move m2);
 
     w.inbox.send(new StopMsg);
@@ -548,12 +548,12 @@ bool testInboxPolymorphicMessages() {
 
     // Mix PingMsg and SumMsg — worker only handles PingMsg
     SumMsg* skip = new SumMsg;
-    skip->a = 99;
-    skip->b = 99;
+    skip.a = 99;
+    skip.b = 99;
     w.inbox.send(move skip);
 
     PingMsg* ping = new PingMsg;
-    ping->value = 42;
+    ping.value = 42;
     w.inbox.send(move ping);
 
     w.inbox.send(new StopMsg);

@@ -220,7 +220,8 @@ private:
                 if (declType.IsInterface)
                 {
                     declType.IsInterfacePointer = declSpec->pointer() != nullptr;
-                    declType.Pointer = true;
+                    if (declType.IsInterfacePointer)
+                        declType.Pointer = true;
                 }
                 if (declSpec->Question())
                 {
@@ -1086,7 +1087,8 @@ private:
                     // IsInterfacePointer: this represents a pointer TO a fat-ptr, not the fat-ptr itself.
                     // True when T* where T=IFace (hasExplicitPointer), or T where T=IFace* (substPointer).
                     declType.IsInterfacePointer = hasExplicitPointer || substPointer;
-                    declType.Pointer = true;
+                    if (declType.IsInterfacePointer)
+                        declType.Pointer = true;
                 }
                 if (declSpec->Question())
                 {
@@ -6917,7 +6919,8 @@ public:
                 p.TypeName = compiler->ResolveTypeAlias(param->typeSpecifier()->getText());
                 p.Pointer = param->pointer() != nullptr;
                 p.IsInterface = compiler->IsInterfaceType(p.TypeName);
-                if (p.IsInterface) p.Pointer = true;
+                if (p.IsInterface)
+                    p.IsInterfacePointer = param->pointer() != nullptr;
                 p.VariableName = param->Identifier()->getText();
                 params.push_back(p);
             }

@@ -411,6 +411,31 @@ bool testListInterfaceIsAs()
     return result;
 }
 
+bool testListInterfaceForeach()
+{
+    bool result = true;
+
+    list<IShape> shapes;
+
+    Circle c;  c.r = 5;  shapes.add(c);   // area 75
+    Square sq; sq.s = 4; shapes.add(sq);  // area 16
+    Triangle t; t.b = 6; shapes.add(t);   // area 3
+
+    int sum = 0;
+    for (IShape s in shapes)
+        sum += s.area();
+
+    result &= Test("foreach_sum", sum, 94);  // 75+16+3
+
+    int count = 0;
+    for (IShape s in shapes)
+        count++;
+
+    result &= Test("foreach_count", count, 3);
+
+    return result;
+}
+
 bool testListInterfaceSort()
 {
     bool result = true;
@@ -472,6 +497,7 @@ extern int main()
     total++; passed += testMultipleInterfaces()  ? 1 : 0;
     total++; passed += testListInterfaceBasic()  ? 1 : 0;
     total++; passed += testListInterfaceIsAs()   ? 1 : 0;
+    total++; passed += testListInterfaceForeach() ? 1 : 0;
     total++; passed += testListInterfaceSort()   ? 1 : 0;
     total++; passed += testChannelInterface()    ? 1 : 0;
 

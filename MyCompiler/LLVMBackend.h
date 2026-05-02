@@ -3548,8 +3548,8 @@ public:
                         }
 
                         // Interface upcast using original names (interfaces are not enums).
-                        // Handles both struct->interface* (value) and struct*->interface* (pointer).
-                        if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer &&
+                        // Handles both struct->interface (value) and struct*->interface (pointer).
+                        if (result < 0 && candidateParamItr->IsInterface &&
                             !arg.TypeAndValue.IsInterface &&
                             StructImplementsInterface(arg.TypeAndValue.TypeName, candidateParamItr->TypeName))
                         {
@@ -3562,8 +3562,8 @@ public:
                     auto candidateParam = GetType(*candidateParamItr);
                     result = CompareUpconvert(arg.BaseType, candidateParam);
 
-                    // Interface upcast: struct value (TypeName empty, BaseType is struct) to interface* param
-                    if (result < 0 && candidateParamItr->IsInterface && candidateParamItr->Pointer && arg.BaseType)
+                    // Interface upcast: struct value (TypeName empty, BaseType is struct) to interface param
+                    if (result < 0 && candidateParamItr->IsInterface && arg.BaseType)
                     {
                         if (auto* st = llvm::dyn_cast<llvm::StructType>(arg.BaseType))
                         {
@@ -3901,7 +3901,7 @@ public:
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
 
-            if (!inVariadicRange && candParamItr->IsInterface && candParamItr->Pointer && !arg.TypeAndValue.IsInterface)
+            if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
             {
                 // Derive struct name from TypeName if available, else from BaseType
                 std::string structName = arg.TypeAndValue.TypeName;
