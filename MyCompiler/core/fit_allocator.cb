@@ -24,9 +24,6 @@
 // Allocation: O(n) first-fit scan. Segment growth: new VirtualAlloc on miss.
 // Requests > half the segment size go directly to the large path.
 
-extern void  GetSystemInfo(void* lpSystemInfo);
-extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
-extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
 
 struct _FA_SysInfo
 {

@@ -1,10 +1,5 @@
 // C runtime bindings — extern declarations and wrappers for standard C library functions
 
-// === I/O Functions ===
-extern void* __acrt_iob_func(int fd);
-extern int __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern int __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
-
 // === Memory Functions ===
 extern void* malloc(i64 size);
 extern void  free(void* ptr);

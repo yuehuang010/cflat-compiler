@@ -10,11 +10,6 @@
 //
 // lock statement works: lock (s) { } acquires and releases one slot.
 
-extern void* CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
-extern i32   WaitForSingleObject(void* handle, i32 ms);
-extern i32   ReleaseSemaphore(void* handle, i32 count, i32* prev);
-extern void  CloseHandle(void* handle);
-
 struct semaphore {
     void* _handle = nullptr;
 

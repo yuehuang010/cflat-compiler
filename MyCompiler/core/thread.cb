@@ -1,16 +1,9 @@
-extern i32   WaitForSingleObject(void* handle, i32 ms);
-extern i32   GetExitCodeThread(void* handle, i32* code);
-extern void  CloseHandle(void* handle);
-extern bool  TerminateThread(void* handle, i32 exitCode);
-
 // Args packet allocated with malloc so thread infrastructure bypasses any
 // per-program tracked allocator.
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
 };
-
-extern void* CreateThread(void* attr, i64 stackSize, function<int(void*)> fn, void* param, i32 flags, i32* id);
 
 // Win32 LPTHREAD_START_ROUTINE. Receives void* from Win32, casts to __ThreadArgs*,
 // calls fn(ctx), and returns the result.  join() frees the args packet.

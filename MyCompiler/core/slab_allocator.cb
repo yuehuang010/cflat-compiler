@@ -26,10 +26,6 @@
 //   sa.printUsage();
 //   sa.cleanup();
 
-extern void  GetSystemInfo(void* lpSystemInfo);
-extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
-extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
-
 struct _SA_SysInfo
 {
     u32 _oemId            = default;  //  0

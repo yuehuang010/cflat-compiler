@@ -20,7 +20,7 @@ Provide an Architecture overview before analyzing code changes.  Verify with the
 
 ## Building
 
-Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM). Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
+Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
 msbuild MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
@@ -84,6 +84,8 @@ out\test_operators.exe
 ```
 
 Current tests (all in `Test/`, all CFlat with `-i Test\library`): `test_allocators`, `test_basic`, `test_core`, `test_core_string`, `test_field_init`, `test_filesystem`, `test_fit_allocator`, `test_function_ptr`, `test_generics`, `test_interface`, `test_json`, `test_library_string`, `test_math`, `test_module`, `test_move`, `test_operators`, `test_program`, `test_random`, `test_reflect`, `test_sizeof`, `test_slab_allocator`, `test_sync`, `test_time`. (`test_helper.cb` is a shared helper, not run directly.)
+
+test.bat uses wildard `Test/*.*` to locate tests.  Remember to remove debug test or else it would be picked up by the wildcard expansion.
 
 ### Error tests
 

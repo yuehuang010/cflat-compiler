@@ -20,17 +20,6 @@
 //   _slots counts available write slots  (starts at capacity, blocks sender when 0).
 //   _items counts available read items   (starts at 0, blocks receiver when 0).
 
-extern void* malloc(i64 size);
-extern void  free(void* ptr);
-extern void  InitializeCriticalSection(void* cs);
-extern void  DeleteCriticalSection(void* cs);
-extern void  EnterCriticalSection(void* cs);
-extern void  LeaveCriticalSection(void* cs);
-extern void* CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
-extern i32   WaitForSingleObject(void* handle, i32 ms);
-extern i32   ReleaseSemaphore(void* handle, i32 count, i32* prev);
-extern void  CloseHandle(void* handle);
-
 i32 __CHANNEL_CS_SIZE = 40;   // sizeof(CRITICAL_SECTION) on x64
 
 class channel<T>

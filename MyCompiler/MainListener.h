@@ -1598,6 +1598,17 @@ public:
 
         auto branchDecls = branchBlock->externalDeclaration();
 
+        // Process any imports in the taken branch before forward-scanning it.
+        for (auto* extDecl : branchDecls)
+        {
+            if (auto* imp = extDecl->importDeclaration())
+            {
+                std::string raw = imp->StringLiteral()->getText();
+                std::string importFilename = raw.substr(1, raw.size() - 2);
+                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename);
+            }
+        }
+
         // First pass: forward ref scan the taken branch to register symbols
         ForwardRefScanner scanner(Compiler());
         for (auto* extDecl : branchDecls)

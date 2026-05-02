@@ -13,15 +13,6 @@
 // NOTE: break / continue that escape a lock {} block will NOT call unlock.
 // Avoid breaking out of a lock block.
 
-// Win32 CRITICAL_SECTION is an opaque struct; we hold it behind a void* so
-// CFlat does not need to know its size.  Allocated lazily on first lock().
-extern void* malloc(i64 size);
-extern void  free(void* ptr);
-extern void  InitializeCriticalSection(void* cs);
-extern void  DeleteCriticalSection(void* cs);
-extern void  EnterCriticalSection(void* cs);
-extern void  LeaveCriticalSection(void* cs);
-
 // sizeof(CRITICAL_SECTION) on x64 Windows is 40 bytes.
 i32 __CRITICAL_SECTION_SIZE = 40;
 

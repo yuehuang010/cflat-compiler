@@ -69,6 +69,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
+    currentSourceFilePath_ = rootCanonical;
     importStack.push_back(rootCanonical);
     struct RootGuard {
         std::vector<std::string>& stack;
@@ -147,43 +148,22 @@ bool LLVMBackend::Compile(const ArgParser& args)
         auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
         SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
 
+        auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
+        SetCompileTimeMacro("WIN64", win64Const, "int");
+        auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
+        SetCompileTimeMacro("WIN32", win32Const, "int");
+
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
 
-    // Auto-import order: interfaces -> program -> runtime -> string.
-    // program.cb declares __active_allocator; runtime.cb references it, so program must come first.
-    if (!runtimeDir.empty())
+    if (!runtimeDir.empty() && !skipRuntimeImport)
     {
-        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
-        if (verbose) std::cout << "[verbose] auto-importing interfaces: " << interfacesPath.string() << "\n";
-        if (std::filesystem::exists(interfacesPath))
-            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
+        auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+        if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
+        if (std::filesystem::exists(runtimePath))
+            CompileImportedFile(runtimePath.string(), "runtime.cb");
         else if (verbose)
-            std::cout << "[verbose]   interfaces.cb not found, skipping\n";
-
-        auto programPath = std::filesystem::path(runtimeDir) / "core" / "program.cb";
-        if (verbose) std::cout << "[verbose] auto-importing program: " << programPath.string() << "\n";
-        if (std::filesystem::exists(programPath))
-            CompileImportedFile(programPath.string(), "program.cb");
-        else if (verbose)
-            std::cout << "[verbose]   program.cb not found, skipping\n";
-
-        if (!skipRuntimeImport) {
-            auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
-            if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
-            if (std::filesystem::exists(runtimePath))
-                CompileImportedFile(runtimePath.string(), "runtime.cb");
-            else if (verbose)
-                std::cout << "[verbose]   runtime.cb not found, skipping\n";
-        }
-
-        auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
-        if (verbose) std::cout << "[verbose] auto-importing string: " << stringPath.string() << "\n";
-        if (std::filesystem::exists(stringPath))
-            CompileImportedFile(stringPath.string(), "string.cb");
-        else if (verbose)
-            std::cout << "[verbose]   string.cb not found, skipping\n";
-
+            std::cout << "[verbose]   runtime.cb not found, skipping\n";
     }
 
     {
@@ -440,7 +420,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
 
     auto savedSourceFileName = sourceFileName;
+    auto savedSourceFilePath = currentSourceFilePath_;
     sourceFileName = std::filesystem::path(canonicalStr).filename().string();
+    currentSourceFilePath_ = canonicalStr;
 
     // Forward-ref scan the imported file
     {
@@ -458,6 +440,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
 
     sourceFileName = savedSourceFileName;
+    currentSourceFilePath_ = savedSourceFilePath;
     return true;
 }
 
@@ -520,6 +503,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
     sourceFileName = std::filesystem::path(filePath).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
+    currentSourceFilePath_ = rootCanonical;
     importStack.push_back(rootCanonical);
     struct RootGuard {
         std::vector<std::string>& stack;
@@ -547,30 +531,18 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         }
         auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
         SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
+        auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
+        SetCompileTimeMacro("WIN64", win64Const, "int");
+        auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
+        SetCompileTimeMacro("WIN32", win32Const, "int");
     }
 
-    // Auto-import core files in the same order as Compile():
-    // interfaces -> program (pulls in block_allocator) -> runtime -> string.
-    // runtime.cb references BlockAllocator, which program.cb imports, so program must come first.
     if (!runtimeDir.empty())
+    if (!skipRuntimeImport)
     {
-        auto interfacesPath = std::filesystem::path(runtimeDir) / "core" / "interfaces.cb";
-        if (std::filesystem::exists(interfacesPath))
-            CompileImportedFile(interfacesPath.string(), "interfaces.cb");
-
-        auto programPath = std::filesystem::path(runtimeDir) / "core" / "program.cb";
-        if (std::filesystem::exists(programPath))
-            CompileImportedFile(programPath.string(), "program.cb");
-
-        if (!skipRuntimeImport) {
-            auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
-            if (std::filesystem::exists(runtimePath))
-                CompileImportedFile(runtimePath.string(), "runtime.cb");
-        }
-
-        auto stringPath = std::filesystem::path(runtimeDir) / "core" / "string.cb";
-        if (std::filesystem::exists(stringPath))
-            CompileImportedFile(stringPath.string(), "string.cb");
+        auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+        if (std::filesystem::exists(runtimePath))
+            CompileImportedFile(runtimePath.string(), "runtime.cb");
     }
 
     if (!std::filesystem::exists(filePath))

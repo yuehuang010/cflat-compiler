@@ -48,10 +48,6 @@ struct _SysLogicalProcInfo
     u32 _pad2          = default;  // 28 — trailing pad to reach 32 bytes
 };
 
-extern void  GetSystemInfo(void* lpSystemInfo);
-extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
-extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
-extern int   GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
 
 // Per-page bookkeeping stored alongside the page's raw buffer pointer.
 struct _BlockPage

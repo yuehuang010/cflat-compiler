@@ -1,28 +1,6 @@
-// CFlat runtime — allocator interface
-import "cruntime.cb";
-import "interfaces.cb";
-
-thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null data = inactive
-
-void __register_handle(void* handle, void* closeFn)
-{
-    // stub — handle tracking is future work
-}
-
-void* operator new(i64 size)
-{
-    if (__active_allocator != nullptr)
-        return __active_allocator.alloc(size);
-    return malloc(size);
-}
-
-void operator delete(void* ptr)
-{
-    if (__active_allocator != nullptr)
-    {
-        __active_allocator.dealloc(ptr);
-        return;
-    }
-    free(ptr);
-}
+// CFlat runtime — core library entry point.
+import "os.cb";
+import "memory.cb";
+import "program.cb";
+import "string.cb";
 

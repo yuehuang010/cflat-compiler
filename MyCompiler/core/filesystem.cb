@@ -6,38 +6,6 @@
 import "string.cb";
 import "list.cb";
 
-// ── C runtime / Win32 declarations ───────────────────────────────────────────
-
-if const (__PLATFORM__ >= 32)
-{
-    // Windows/UCRT C runtime functions (available on all Windows platforms)
-    extern void* fopen(const char* path, const char* mode);
-    extern int   fclose(void* stream);
-    extern int   fread(i8* buf, int size, int count, void* stream);
-    extern int   fwrite(i8* buf, int size, int count, void* stream);
-    extern i8*   fgets(i8* buf, int size, void* stream);
-    extern int   feof(void* stream);
-    extern int   fseek(void* stream, int offset, int origin);
-    extern int   ftell(void* stream);
-
-    extern int   _unlink(const char* path);
-    extern int   MoveFileExA(const char* existing, const char* newPath, int flags);
-    extern int   _access(const char* path, int mode);
-    extern int   _mkdir(const char* path);
-    extern int   _rmdir(const char* path);
-    extern i8*   _getcwd(i8* buf, int size);
-    extern int   _chdir(const char* path);
-    extern int   strcmp(const char* a, const char* b);
-
-    // Win32 FindFirstFile/FindNextFile — handle returned/accepted as i64 so we can
-    // compare against INVALID_HANDLE_VALUE (-1) without a void* cast.
-    // (Available on all Windows platforms: win32 and win64)
-    extern i64   FindFirstFileA(const char* pattern, i8* findData);
-    extern int   FindNextFileA(i64 handle, i8* findData);
-    extern int   FindClose(i64 handle);
-    extern int   GetFileAttributesA(const char* path);
-}
-
 // ── File ─────────────────────────────────────────────────────────────────────
 
 class File

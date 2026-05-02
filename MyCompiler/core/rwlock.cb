@@ -16,10 +16,6 @@
 // SRWLOCK is a single pointer-sized opaque value.  Storing it as void* and
 // passing &_lock to the Win32 functions works because SRWLOCK == { PVOID }.
 
-extern void AcquireSRWLockExclusive(void** srw);
-extern void ReleaseSRWLockExclusive(void** srw);
-extern void AcquireSRWLockShared(void** srw);
-extern void ReleaseSRWLockShared(void** srw);
 
 struct rwlock {
     void* _lock = nullptr;   // SRWLOCK value; zero == unlocked

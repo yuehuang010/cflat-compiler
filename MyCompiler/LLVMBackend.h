@@ -512,6 +512,7 @@ private:
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
+    std::string currentSourceFilePath_;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
     std::unique_ptr<llvm::DIBuilder> diBuilder;

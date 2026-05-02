@@ -23,11 +23,6 @@
 //   TimePoint b = TimePoint.now();
 //   Duration d = b - a;
 
-extern int  QueryPerformanceCounter(i64* count);
-extern int  QueryPerformanceFrequency(i64* freq);
-extern void GetSystemTimeAsFileTime(i64* fileTime);
-extern void Sleep(i32 ms);
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 i64 _timeQpcFreq = 0;

@@ -1,0 +1,31 @@
+// memory.cb — operator new/delete and the active allocator slot.
+//
+// Separated from runtime.cb so string.cb can import it directly,
+// avoiding the bootstrapping problem (string.cb uses 'new').
+
+import "interfaces.cb";
+import "cruntime.cb";
+
+thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null data = inactive
+
+void __register_handle(void* handle, void* closeFn)
+{
+    // stub — handle tracking is future work
+}
+
+void* operator new(i64 size)
+{
+    if (__active_allocator != nullptr)
+        return __active_allocator.alloc(size);
+    return malloc(size);
+}
+
+void operator delete(void* ptr)
+{
+    if (__active_allocator != nullptr)
+    {
+        __active_allocator.dealloc(ptr);
+        return;
+    }
+    free(ptr);
+}
