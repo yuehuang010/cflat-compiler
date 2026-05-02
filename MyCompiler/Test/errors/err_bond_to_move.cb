@@ -1,0 +1,10 @@
+// bonded value cannot be passed to a move parameter
+expect_error("cannot pass bonded value to 'move' parameter") {
+    int* Borrow(bond int* src) { return src; }
+    void Consume(move int* p) { delete p; }
+
+    void Test(bond int* src) {
+        int* v = Borrow(src);
+        Consume(v);
+    }
+}

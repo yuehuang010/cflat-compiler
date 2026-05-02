@@ -113,6 +113,7 @@ public:
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
+        bool IsBond = false;     // parameter declared with 'bond' — return value borrows from this parameter; return must not outlive it
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
@@ -277,6 +278,8 @@ public:
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors — destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
+        std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         int IdentifierLine = 0;          // source location for use-after-move error reporting
@@ -404,6 +407,8 @@ public:
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
+    bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
+    std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
 
     private:
 
@@ -3894,11 +3899,30 @@ public:
             }
         }
 
+        // Check: bonded value must not be passed to a move parameter (would transfer ownership out of scope).
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+        {
+            if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
+                LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter — bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
+        }
+
         auto* result = CreateFunctionCall(candidate.Function, argList);
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnsOwned = candidate.ReturnsOwned;
+
+        // Populate bond side-channel: collect source variable names for bond parameters.
+        lastCallIsBonded = false;
+        lastCallBondedSources.clear();
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+        {
+            if (candidate.Parameters[i].IsBond && !matched[i].CallerName.empty())
+            {
+                lastCallIsBonded = true;
+                lastCallBondedSources.push_back(matched[i].CallerName);
+            }
+        }
 
         // Null out caller's storage for move parameters; mark variable as moved for compile-time checking.
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
@@ -4102,6 +4126,54 @@ public:
         }
 
         return {};
+    }
+
+    // Returns the 0-based stack depth where name is declared, SIZE_MAX if not found.
+    // Searches both functionArgument and namedVariable in each frame (innermost first).
+    size_t FindVariableScopeDepth(const std::string& name) const
+    {
+        size_t depth = stackNamedVariable.size();
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            --depth;
+            if (frame.functionArgument.count(name) || frame.namedVariable.count(name))
+                return depth;
+        }
+        return SIZE_MAX;
+    }
+
+    // Returns the name of a live bonded local that currently borrows from sourceName, or "" if none.
+    std::string FindActiveBondBorrower(const std::string& sourceName) const
+    {
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [name, nv] : frame.namedVariable)
+            {
+                if (nv.IsBonded)
+                {
+                    for (const auto& src : nv.BondedSources)
+                    {
+                        if (src == sourceName)
+                            return name;
+                    }
+                }
+            }
+        }
+        return {};
+    }
+
+    // Clears the bond on a local variable (called when the bonded variable is reassigned).
+    void ClearVariableBond(const std::string& name)
+    {
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+            {
+                it->second.IsBonded = false;
+                it->second.BondedSources.clear();
+                return;
+            }
+        }
     }
 
     void MarkVariableMoved(const std::string& name)

@@ -1,0 +1,4 @@
+// bond and move are mutually exclusive on the same parameter
+expect_error("'bond' and 'move' are mutually exclusive") {
+    int* Get(bond move int* p) { return p; }
+}

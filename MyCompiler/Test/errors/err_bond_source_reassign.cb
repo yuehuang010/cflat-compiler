@@ -1,0 +1,9 @@
+// reassigning a bond source while a bonded reference is live is an error
+expect_error("cannot reassign 'src' while 'v' holds a bonded reference") {
+    int* Borrow(bond int* src) { return src; }
+
+    void Test(int* src, int* other) {
+        int* v = Borrow(src);
+        src = other;   // error: v still holds a bond to src
+    }
+}

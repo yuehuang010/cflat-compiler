@@ -1,0 +1,13 @@
+// bonded value cannot be assigned to a variable in a wider scope
+expect_error("is in a wider scope than its bond source") {
+    int* Borrow(bond int* src) { return src; }
+
+    void Test() {
+        int* outer = nullptr;
+        {
+            int* x = new int;
+            outer = Borrow(x);   // error: outer is wider scope than x
+            delete x;
+        }
+    }
+}

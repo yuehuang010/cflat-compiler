@@ -130,10 +130,15 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
-                    // 'move' is a soft keyword — recognized as a parameter ownership qualifier
+                    // 'move' and 'bond' are soft keywords — recognized as parameter ownership qualifiers
                     if (typeSpec->getText() == "move")
                     {
                         declType.IsMove = true;
+                        continue;  // not a type; look for the actual type in next specifier
+                    }
+                    if (typeSpec->getText() == "bond")
+                    {
+                        declType.IsBond = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
                     // tuple type sugar: (T1, T2) -> tuple<T1, T2>
@@ -251,6 +256,8 @@ private:
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = directDeclarer->getText();
+            if (paramType.IsMove && paramType.IsBond)
+                Compiler(paramDecl)->LogError(std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
             paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);
         }
@@ -729,9 +736,17 @@ public:
             ScanProgramDefinition(progDef);
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
-            // Scan function/struct definitions inside the expect_error block so forward refs work.
-            for (auto* extDecl : expectErrDecl->externalDeclaration())
-                ScanExternalDeclaration(extDecl, namespaceName);
+            // Set expectedError so errors during the scan are caught rather than aborting.
+            std::string rawText = expectErrDecl->StringLiteral()->getText();
+            rawText = rawText.substr(1, rawText.size() - 2); // strip surrounding quotes
+            compilerLLVM->expectedError = rawText;
+            try
+            {
+                for (auto* extDecl : expectErrDecl->externalDeclaration())
+                    ScanExternalDeclaration(extDecl, namespaceName);
+            }
+            catch (const ExpectedErrorReceived&) {}
+            compilerLLVM->expectedError.clear();
         }
         // if const declarations are skipped here; they are handled in MainListener
         // which has access to expression evaluation and can determine the taken branch
@@ -891,10 +906,15 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
-                // 'move' is a soft keyword — recognized as a parameter ownership qualifier
+                // 'move' and 'bond' are soft keywords — recognized as parameter ownership qualifiers
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
+                    continue;  // not a type; look for the actual type in next specifier
+                }
+                if (typeSpec->getText() == "bond")
+                {
+                    declType.IsBond = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
                 // tuple type sugar: (T1, T2) -> tuple<T1, T2>
@@ -1835,7 +1855,14 @@ public:
                     auto express = jump->expression();
                     if (express != nullptr)
                     {
-                        auto right = ParseExpression(express);
+                        // Evaluate via NV path so we can inspect bond info alongside ownership.
+                        auto assignExpr = express->assignmentExpression();
+                        LLVMBackend::NamedVariable returnNV;
+                        if (assignExpr != nullptr)
+                            returnNV = ParseAssignmentExpressionNamed(assignExpr);
+                        auto right = LoadNamedVariable(returnNV);
+                        ProcessPlusPlus();
+
                         if (compiler->currentFunctionReturnsOwned && right != nullptr
                             && !llvm::isa<llvm::Constant>(right)
                             && right->getType()->isPointerTy())
@@ -1846,10 +1873,27 @@ public:
                             if (!returnIsOwned)
                                 LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned — value must come from 'new', a move parameter, or another move-returning function");
                         }
-                        // Clear ownership flags consumed by the return check so they don't
-                        // bleed into later return statements via different code paths.
+
+                        // Bond return check: bonded value may only be returned if all its sources
+                        // are 'bond' parameters of the current function (not locals).
+                        auto checkBondSources = [&](const std::vector<std::string>& sources) {
+                            for (const auto& source : sources)
+                            {
+                                auto funcArg = compiler->GetFunctionArgument(source);
+                                if (funcArg.GetValue() == nullptr || !funcArg.TypeAndValue.IsBond)
+                                    LogErrorContext(jump, std::format("returning bonded value whose source '{}' is not a 'bond' parameter — bonded values cannot escape their source's scope", source));
+                            }
+                        };
+                        if (returnNV.IsBonded)
+                            checkBondSources(returnNV.BondedSources);
+                        if (compiler->lastCallIsBonded)
+                            checkBondSources(compiler->lastCallBondedSources);
+
+                        // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
                         compiler->lastCallReturnsOwned = false;
+                        compiler->lastCallIsBonded = false;
+                        compiler->lastCallBondedSources.clear();
                         compiler->CreateReturnCall(right);
                     }
                     else
@@ -3081,6 +3125,16 @@ public:
                             nv.IsNewAllocated = true;
                             compiler->lastOwningResult = false;
                         }
+
+                        // Propagate bond: if the RHS was a bonded call result, tag this local.
+                        if (compiler->lastCallIsBonded)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.IsBonded = true;
+                            nv.BondedSources = compiler->lastCallBondedSources;
+                            compiler->lastCallIsBonded = false;
+                            compiler->lastCallBondedSources.clear();
+                        }
                     }
                 }
             }
@@ -3240,9 +3294,42 @@ public:
                 return derefLoad();
             }
 
+            // Bond source reassignment check: error if LHS is a live bond source.
+            // Must run before RHS evaluation so the error fires on the assignment statement.
+            if (operatorText == "=" && !namedVar.CallerName.empty())
+            {
+                auto borrower = compiler->FindActiveBondBorrower(namedVar.CallerName);
+                if (!borrower.empty())
+                    LogErrorContext(ctx, std::format("cannot reassign '{}' while '{}' holds a bonded reference to it — assign null to '{}' first to break the bond", namedVar.CallerName, borrower, borrower));
+            }
+
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
             lambdaExpectedType = {};
             auto right = LoadNamedVariable(rightNV);
+
+            // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
+            // than its bond source, and cannot be stored into struct fields (GEP destinations).
+            if (operatorText == "=" && (rightNV.IsBonded || compiler->lastCallIsBonded))
+            {
+                const auto& bondedSources = rightNV.IsBonded ? rightNV.BondedSources : compiler->lastCallBondedSources;
+                if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
+                {
+                    // Struct field or heap dereference — bonded values cannot be stored there.
+                    LogErrorContext(ctx, "bonded value cannot be stored in a struct field or through a pointer — bond lifetime would be untrackable");
+                }
+                else if (!namedVar.CallerName.empty())
+                {
+                    size_t lhsDepth = compiler->FindVariableScopeDepth(namedVar.CallerName);
+                    for (const auto& source : bondedSources)
+                    {
+                        size_t srcDepth = compiler->FindVariableScopeDepth(source);
+                        if (srcDepth != SIZE_MAX && lhsDepth < srcDepth)
+                            LogErrorContext(ctx, std::format("bonded value cannot be assigned to '{}' — '{}' is in a wider scope than its bond source '{}'", namedVar.CallerName, namedVar.CallerName, source));
+                    }
+                }
+                compiler->lastCallIsBonded = false;
+                compiler->lastCallBondedSources.clear();
+            }
 
             // Interface upcast: struct* -> fat pointer when assigning to an interface variable.
             // Mirrors the same logic in the declaration initializer path (ParseDeclaration).
@@ -3337,6 +3424,9 @@ public:
             // Reassignment to a moved variable makes it live again.
             if (operatorText == "=" && !namedVar.CallerName.empty())
                 compiler->MarkVariableUnmoved(namedVar.CallerName);
+            // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
+            if (operatorText == "=" && !namedVar.CallerName.empty())
+                compiler->ClearVariableBond(namedVar.CallerName);
             return assignResult;
         }
         else if (unaryCtx)
@@ -6308,6 +6398,9 @@ public:
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    // Propagate bond info so bond-to-move checks work at the call site.
+                                    argVar.IsBonded = argNV.IsBonded;
+                                    argVar.BondedSources = argNV.BondedSources;
 
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
@@ -9110,6 +9203,9 @@ public:
                     paramType.VariableName = directDeclarer->getText();
                 }
             }
+
+            if (paramType.IsMove && paramType.IsBond)
+                LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
 
             paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);

@@ -1,0 +1,9 @@
+// A function that correctly propagates bond — should compile without error
+// (no expect_error here, so the compiler just needs to succeed)
+int* Borrow(bond int* src) { return src; }
+
+// This function correctly declares its source as bond and returns it
+int* Forward(bond int* src) {
+    int* v = Borrow(src);
+    return v;
+}
