@@ -36,6 +36,7 @@
   - [Switch on Interface Type](#switch-on-interface-type)
 - [Ownership / Lifetime (`move`)](#ownership--lifetime-move-keyword)
   - [`move` Return Type](#move-return-type)
+  - [`bond` Lifetime Keyword](#bond-lifetime-keyword)
 - [Namespaces & Modules](#namespaces--modules)
   - [Namespaces](#namespaces)
   - [`using` Aliases](#using-aliases)
@@ -285,25 +286,75 @@ apply(add, 5, 6);   // 11
 
 ### Lambdas
 
-Anonymous functions use C#-style arrow syntax. Lambdas compile to named functions internally and are compatible with `function<T>`:
+Anonymous functions use C#-style arrow syntax and are compatible with `function<T>`. Capture is automatic — the lambda body is scanned at compile time and outer variables are captured without any explicit capture list.
+
+**Non-capturing lambda** — captures nothing; works identically to a named function:
 
 ```c
-function<int(int, int)> addL = (int a, int b) => { return a + b; };
-addL(3, 4);   // 7
+function<int(int, int)> add = (int a, int b) => { return a + b; };
+add(3, 4);   // 7
 
-// Pass inline as argument
+// Passed inline as an argument
 apply((int a, int b) => { return a * b; }, 5, 6);   // 30
 
-// Zero-parameter lambda
+// Zero-parameter
 function<int()> getK = () => { return 42; };
 
-// Lambdas can contain full control flow
+// Full control flow inside the body
 function<int(int)> sign = (int x) => {
     if (x > 0) return 1;
     if (x < 0) return -1;
     return 0;
 };
 ```
+
+**Value capture** — primitives, pointer types, and `string` are copied into the closure at lambda creation time. Subsequent changes to the outer variable do not affect the captured copy:
+
+```c
+int offset = 10;
+function<int(int)> addOffset = (int x) => { return x + offset; };
+addOffset(5);   // 15
+offset = 99;    // does NOT change the captured copy
+addOffset(5);   // still 15
+```
+
+Pointer captures copy the pointer value — both the lambda and the outer code share the same pointed-to memory:
+
+```c
+int* p = new int;
+*p = 42;
+function<int()> read = () => { return *p; };
+*p = 77;
+read();   // 77 — both sides access the same heap cell
+```
+
+**Reference capture** — non-pointer struct and class values are captured by reference. The lambda holds a pointer to the outer variable; mutations on either side are immediately visible to the other:
+
+```c
+struct Counter { int value = 0; };
+
+Counter c;
+function<void()> inc = () => { c.value = c.value + 1; };
+inc(); inc(); inc();
+c.value;   // 3 — lambda mutations are visible in the caller
+
+c.value = 10;   // outer mutation
+inc();
+c.value;   // 11 — outer mutation was visible inside the lambda
+```
+
+**Lifetime constraint** — a lambda that reference-captures a local variable is *bonded* to it. The lambda cannot be returned from the function or assigned to a variable in a wider scope, because doing so would leave the lambda holding a dangling pointer to a stack variable that has gone out of scope:
+
+```c
+function<void()> bad()
+{
+    Counter c;
+    function<void()> inc = () => { c.value = c.value + 1; };
+    return inc;   // compile error: bonded value whose source 'c' is not a 'bond' parameter
+}
+```
+
+The lambda can be freely passed to functions called within the same scope — only escape (return or wider-scope assignment) is prevented.
 
 ---
 
@@ -645,6 +696,48 @@ move Widget* leak(Widget* w)
 
 - **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership — the local is freed at scope exit just like a `new`-allocated pointer.
 - **Forwarding**: a `move T*` function can return a `move` parameter directly; the cleanup that would normally run at scope exit is suppressed so the resource isn't freed prematurely.
+
+### `bond` Lifetime Keyword
+
+`bond` annotates a function parameter to declare that the return value borrows from it — the caller's variable cannot be replaced or freed while a bonded local exists that refers to it. This catches dangling-reference bugs at compile time with no annotation required at call sites:
+
+```c
+// The return value borrows from src; it must not outlive src.
+int* Borrow(bond int* src) { return src; }
+
+int a = 10;
+int* view = Borrow(&a);   // view is bonded to a
+```
+
+**Rules enforced by the compiler:**
+
+| Violation | Error |
+|-----------|-------|
+| Assign bonded value to a wider-scope variable | bonded value cannot be assigned to `x` — `x` is in a wider scope than its bond source |
+| Store bonded value into a struct field or through a pointer | bonded value cannot be stored in a struct field or through a pointer |
+| Reassign the bond source while the bond is live | cannot reassign `a` while `view` holds a bonded reference to it |
+| Pass bonded value to a `move` parameter | bonded value cannot be passed to a `move` parameter |
+| Return a bonded value whose source is a local (not a `bond` param) | returning bonded value whose source `x` is not a `bond` parameter |
+
+**Breaking a bond** — assigning `null` (or `nullptr`) to the bonded variable clears the bond, after which the source may be freely reassigned:
+
+```c
+int a = 10;
+int* view = Borrow(&a);
+view = nullptr;   // bond cleared
+a = 20;           // OK now
+```
+
+**Propagating a bond up the call chain** — a function that receives a `bond` parameter may return it, and the compiler tags the caller's local as bonded in turn:
+
+```c
+int* ForwardBorrow(bond int* src) { return src; }
+
+int a = 10;
+int* p = ForwardBorrow(&a);   // p is bonded to a
+```
+
+`bond` and `move` are mutually exclusive on the same parameter. `bond` is a soft keyword (text-matched at parse time), so identifiers and methods named `bond` still work in other contexts.
 
 ---
 

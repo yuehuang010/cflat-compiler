@@ -1578,6 +1578,66 @@ public:
         return llvm::StructType::create(*context, { ptrTy, ptrTy }, fatPtrName);
     }
 
+    // {i8* fnptr, i8* envptr} — storage type for all in-function function<T> variables.
+    llvm::StructType* GetClosureFatPtrType() const
+    {
+        const char* name = "__closure_fat_ptr";
+        if (auto* existing = llvm::StructType::getTypeByName(*context, name)) return existing;
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        return llvm::StructType::create(*context, { ptrTy, ptrTy }, name);
+    }
+
+    // Creates __shim_<name>(i8* env, original params...) that ignores env and calls original.
+    llvm::Function* GetOrCreateFunctionShim(llvm::Function* original)
+    {
+        std::string shimName = "__shim_" + original->getName().str();
+        if (auto* existing = module->getFunction(shimName)) return existing;
+
+        auto* origTy  = original->getFunctionType();
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+
+        std::vector<llvm::Type*> shimParamTypes = {i8PtrTy};
+        for (auto* paramTy : origTy->params())
+            shimParamTypes.push_back(paramTy);
+
+        auto* shimTy = llvm::FunctionType::get(origTy->getReturnType(), shimParamTypes, false);
+        auto* shim   = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage, shimName, module.get());
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", shim);
+        llvm::IRBuilder<> b(entry);
+
+        std::vector<llvm::Value*> callArgs;
+        auto argIt = shim->arg_begin();
+        ++argIt; // skip env
+        for (; argIt != shim->arg_end(); ++argIt)
+            callArgs.push_back(&*argIt);
+
+        if (origTy->getReturnType()->isVoidTy())
+        {
+            b.CreateCall(origTy, original, callArgs);
+            b.CreateRetVoid();
+        }
+        else
+        {
+            b.CreateRet(b.CreateCall(origTy, original, callArgs));
+        }
+        return shim;
+    }
+
+    // Wraps a named function in a {shim_i8ptr, null} closure fat struct value.
+    llvm::Value* WrapBareValueAsFatStruct(llvm::Function* original)
+    {
+        auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
+        auto* shim     = GetOrCreateFunctionShim(original);
+        auto* shimAsI8 = builder->CreateBitCast(shim, i8PtrTy, "shim_i8");
+        auto* nullEnv  = llvm::ConstantPointerNull::get(i8PtrTy);
+        auto* closureTy = GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(closureTy);
+        fat = builder->CreateInsertValue(fat, shimAsI8, {0u});
+        fat = builder->CreateInsertValue(fat, nullEnv,  {1u});
+        return fat;
+    }
+
     bool InterfaceInheritsFrom(const std::string& child, const std::string& parent) const
     {
         auto it = interfaceParents.find(child);
@@ -2826,10 +2886,13 @@ public:
             }
             case Operation::Equal:
             {
-                // Interface fat-ptr compared to nullptr: ICmp on the data pointer field only.
+                // Fat-ptr compared to nullptr: ICmp on a distinguishing field.
+                // Closure fat ptr: compare fnptr (field 0); interface fat ptr: data ptr (field 1).
                 if (left->getType() != right->getType() && left->getType()->isStructTy())
                 {
-                    left  = builder->CreateExtractValue(left, {1u});
+                    auto* st = llvm::cast<llvm::StructType>(left->getType());
+                    unsigned field = (st->getName() == "__closure_fat_ptr") ? 0u : 1u;
+                    left  = builder->CreateExtractValue(left, {field});
                     right = llvm::Constant::getNullValue(left->getType());
                 }
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_EQ, left, right);
@@ -2838,7 +2901,9 @@ public:
             {
                 if (left->getType() != right->getType() && left->getType()->isStructTy())
                 {
-                    left  = builder->CreateExtractValue(left, {1u});
+                    auto* st = llvm::cast<llvm::StructType>(left->getType());
+                    unsigned field = (st->getName() == "__closure_fat_ptr") ? 0u : 1u;
+                    left  = builder->CreateExtractValue(left, {field});
                     right = llvm::Constant::getNullValue(left->getType());
                 }
                 return builder->CreateICmp(llvm::ICmpInst::ICMP_NE, left, right);
@@ -3026,10 +3091,17 @@ public:
         return tv;
     }
 
-    // Emits an indirect call through a function pointer value.
+    // Emits an indirect call through a closure fat struct {i8* fnptr, i8* envptr}.
     llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr, std::vector<llvm::Value*> args)
     {
-        std::vector<llvm::Type*> paramTypes;
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+
+        // Extract fn ptr (field 0) and env ptr (field 1) from the closure fat struct.
+        auto* fnPtrI8 = builder->CreateExtractValue(funcPtr, {0u}, "fn_i8");
+        auto* envPtr  = builder->CreateExtractValue(funcPtr, {1u}, "env_ptr");
+
+        // Build invoker function type: (i8* env, user_params...) -> RetType
+        std::vector<llvm::Type*> paramTypes = {i8PtrTy};
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
@@ -3037,16 +3109,30 @@ public:
         }
         TypeAndValue retTV;
         retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
-        retTV.Pointer = funcPtrType.FuncPtrReturnPointer;
-        auto* retTy = GetType(retTV);
-        auto* funcTy = llvm::FunctionType::get(retTy, paramTypes, false);
+        retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
+        auto* retTy     = GetType(retTV);
+        auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
+        auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
 
-        // Upconvert args to match param types
-        for (size_t i = 0; i < args.size() && i < paramTypes.size(); i++)
-            args[i] = Upconvert(args[i], paramTypes[i]);
+        // Upconvert user args to match declared param types (index 0 is env, skip it).
+        // String literals arrive as i8* — wrap them into %string{ptr,len} when the
+        // param expects a string value type.
+        for (size_t i = 0; i < args.size() && i + 1 < paramTypes.size(); i++)
+        {
+            auto* destTy = paramTypes[i + 1];
+            auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
+            if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
+                args[i] = WrapStringLiteralAsString(args[i]);
+            else
+                args[i] = Upconvert(args[i], destTy);
+        }
+
+        // Prepend env to call args
+        std::vector<llvm::Value*> fullArgs = {envPtr};
+        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
 
         lastCallReturnType = retTV;
-        auto* result = builder->CreateCall(funcTy, funcPtr, args);
+        auto* result = builder->CreateCall(invokerTy, fnPtr, fullArgs);
         return retTy->isVoidTy() ? nullptr : result;
     }
 
@@ -3146,7 +3232,7 @@ public:
 
     void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false)
     {
-        auto functionType = GetFunctionType(returnType, arguments, varargs);
+        auto functionType = GetFunctionType(returnType, arguments, varargs, external);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (module->getFunction(mangledName) != nullptr)
@@ -3175,18 +3261,38 @@ public:
         }
     }
 
-    llvm::FunctionType* GetFunctionType(LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false)
+    // Returns the C-compatible LLVM type: for IsFunctionPointer, bare fn ptr (not fat struct).
+    // Used for extern function declarations to preserve C ABI compatibility.
+    llvm::Type* GetCCompatibleType(const TypeAndValue& tv) const
+    {
+        if (tv.IsFunctionPointer)
+        {
+            std::vector<llvm::Type*> paramTypes;
+            for (const auto& p : tv.FuncPtrParams)
+            {
+                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+                paramTypes.push_back(GetType(pTV));
+            }
+            TypeAndValue retTV;
+            retTV.TypeName = tv.FuncPtrReturnTypeName;
+            retTV.Pointer  = tv.FuncPtrReturnPointer;
+            return llvm::FunctionType::get(GetType(retTV), paramTypes, false)->getPointerTo();
+        }
+        return GetType(tv);
+    }
+
+    llvm::FunctionType* GetFunctionType(LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false, bool externC = false)
     {
         std::vector<llvm::Type*> types;
         types.reserve(arguments.size());
 
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
-            types.emplace_back(GetType(arg));
+            types.emplace_back(externC ? GetCCompatibleType(arg) : GetType(arg));
         }
 
-        auto ft = llvm::FunctionType::get(GetType(returnType), types, varargs);
-        return ft;
+        auto* retTy = externC ? GetCCompatibleType(returnType) : GetType(returnType);
+        return llvm::FunctionType::get(retTy, types, varargs);
     }
 
     std::string ComputeMangledName(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false)
@@ -3205,7 +3311,7 @@ public:
 
     llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false)
     {
-        llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs);
+        llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
@@ -3278,19 +3384,7 @@ public:
     {
         if (typeAndValue.IsFunctionPointer)
         {
-            std::vector<llvm::Type*> paramTypes;
-            for (const auto& p : typeAndValue.FuncPtrParams)
-            {
-                TypeAndValue pTV;
-                pTV.TypeName = p.TypeName;
-                pTV.Pointer = p.Pointer;
-                paramTypes.push_back(GetType(pTV));
-            }
-            TypeAndValue retTV;
-            retTV.TypeName = typeAndValue.FuncPtrReturnTypeName;
-            retTV.Pointer = typeAndValue.FuncPtrReturnPointer;
-            auto* retTy = GetType(retTV);
-            return llvm::FunctionType::get(retTy, paramTypes, false)->getPointerTo();
+            return GetClosureFatPtrType();
         }
 
         llvm::Type* type = nullptr;
@@ -3387,7 +3481,21 @@ public:
             for (const auto& arg : arguments)
             {
                 int result = -1;
-                if (arg.TypeAndValue.TypeName != "")
+
+                // function<T> parameter: accept any function-compatible argument (named function,
+                // lambda fat struct, or stored function<T> variable). Type fidelity is checked at codegen.
+                if (candidateParamItr->IsFunctionPointer
+                    && (arg.TypeAndValue.IsFunctionPointer
+                        || arg.TypeAndValue.TypeName == "__closure_fat_ptr"
+                        || (arg.BaseType && arg.BaseType->isStructTy()
+                            && llvm::isa<llvm::StructType>(arg.BaseType)
+                            && llvm::cast<llvm::StructType>(arg.BaseType)->getName() == "__closure_fat_ptr")
+                        || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary))
+                        || (arg.BaseType && arg.BaseType->isPointerTy())))
+                {
+                    result = 0;
+                }
+                else if (arg.TypeAndValue.TypeName != "")
                 {
                     // Resolve enum types for comparison: if either arg or param is an enum, use its backing type
                     auto resolveName = [&](const std::string& tn) -> std::string
@@ -3861,6 +3969,41 @@ public:
                     else
                         argList.push_back(arg.GetValue());
                 }
+            }
+            else if (!inVariadicRange && candParamItr->IsFunctionPointer)
+            {
+                // function<T> parameter — dispatch depends on whether the callee is extern C.
+                llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
+                // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
+                auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType((unsigned)argList.size());
+                if (llvmParamTy->isStructTy())
+                {
+                    // Internal function<T>: provide a closure fat struct {i8*, i8*}.
+                    if (val && !val->getType()->isStructTy())
+                    {
+                        if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
+                            val = WrapBareValueAsFatStruct(fn);
+                    }
+                }
+                else
+                {
+                    // Extern C-compatible parameter: provide a bare C function pointer.
+                    if (val && val->getType()->isStructTy())
+                    {
+                        // Fat struct — extract the fn ptr (field 0) and cast to expected type.
+                        auto* fnI8 = builder->CreateExtractValue(val, {0u});
+                        val = builder->CreateBitCast(fnI8, llvmParamTy, "fn_for_extern");
+                    }
+                    else if (val && !val->getType()->isPointerTy())
+                    {
+                        val = builder->CreateBitCast(val, llvmParamTy, "fn_for_extern");
+                    }
+                    else if (val)
+                    {
+                        val = builder->CreateBitCast(val, llvmParamTy, "fn_for_extern");
+                    }
+                }
+                argList.push_back(val);
             }
             else
             {

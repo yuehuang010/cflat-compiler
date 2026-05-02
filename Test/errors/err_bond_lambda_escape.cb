@@ -1,0 +1,17 @@
+// Returning a lambda that reference-captures a local struct must fail with a
+// bond escape error — the lambda would outlive the captured stack variable.
+
+struct Counter {
+    int value = default;
+};
+
+function<void()> escape() {
+    expect_error("bonded value whose source 'c' is not a 'bond' parameter");
+    Counter c;
+    function<void()> inc = () => { c.value = c.value + 1; };
+    return inc;
+}
+
+extern int main() {
+    return 0;
+}

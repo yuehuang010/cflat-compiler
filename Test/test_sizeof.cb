@@ -180,8 +180,9 @@ extern int main() {
     if (sizeof_dunder != 16) return 11;
 
     // Struct with function<T> pointer field — sizeof must return correct size
+    // function<T> is a fat struct {i8*, i8*} = 16 bytes, plus void* ctx = 8 bytes -> 24 total
     i64 sizeof_funcptr_field = sizeof(FuncPtrFieldStruct);
-    if (sizeof_funcptr_field != 16) return 12;
+    if (sizeof_funcptr_field != 24) return 12;
 
     return 0;
 }

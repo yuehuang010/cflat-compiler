@@ -3044,6 +3044,12 @@ public:
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
+                            // Wrap named function in closure fat struct when declaring function<T>.
+                            if (right && typeAndValue.IsFunctionPointer && !right->getType()->isStructTy())
+                            {
+                                if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
+                                    right = compiler->WrapBareValueAsFatStruct(fn);
+                            }
                         }
                     }
                     else if (initializer->Default() != nullptr)
@@ -3295,8 +3301,11 @@ public:
             }
 
             // Bond source reassignment check: error if LHS is a live bond source.
+            // Only fire when destination is the variable's own alloca/global — field assignments
+            // (GEP destinations) mutate the struct in place and do not invalidate any bond.
             // Must run before RHS evaluation so the error fires on the assignment statement.
-            if (operatorText == "=" && !namedVar.CallerName.empty())
+            if (operatorText == "=" && !namedVar.CallerName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination)))
             {
                 auto borrower = compiler->FindActiveBondBorrower(namedVar.CallerName);
                 if (!borrower.empty())
@@ -3306,6 +3315,14 @@ public:
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
             lambdaExpectedType = {};
             auto right = LoadNamedVariable(rightNV);
+
+            // Wrap named function in closure fat struct when assigning to a function<T> variable.
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+                && right && !right->getType()->isStructTy())
+            {
+                if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
+                    right = compiler->WrapBareValueAsFatStruct(fn);
+            }
 
             // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
             // than its bond source, and cannot be stored into struct fields (GEP destinations).
@@ -6791,6 +6808,101 @@ public:
         return compiler->CreateOverloadedFunctionCall("__strconcat", { nvPtrs, nvLens, nvCount });
     }
 
+    struct CaptureInfo
+    {
+        std::string Name;
+        LLVMBackend::TypeAndValue TV;
+        bool ByReference;       // true for non-pointer struct types (capture by reference)
+        llvm::Value* OuterStorage;
+    };
+
+    // Walk the lambda body AST and collect variables captured from the enclosing function scope.
+    std::vector<CaptureInfo> CollectLambdaCaptures(
+        antlr4::ParserRuleContext* bodyCtx,
+        const std::set<std::string>& lambdaParamNames,
+        LLVMBackend* compiler)
+    {
+        std::set<std::string> seenNames;
+        std::vector<CaptureInfo> captures;
+
+        std::function<void(antlr4::tree::ParseTree*)> walk = [&](antlr4::tree::ParseTree* node)
+        {
+            if (!node) return;
+
+            // Stop at nested lambdas — they capture their own closures separately.
+            if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+                return;
+
+            // primaryExpression::genericIdentifier is the only AST node representing a
+            // standalone identifier (not a member name after '.' or a named-arg label).
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+            {
+                if (auto* gi = primary->genericIdentifier())
+                {
+                    std::string name = gi->Identifier()->getText();
+                    if (!seenNames.count(name)
+                        && !lambdaParamNames.count(name)
+                        && !compiler->globalNamedVariable.count(name)
+                        && !compiler->functionTable.count(name)
+                        && !compiler->dataStructures.count(name))
+                    {
+                        for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                        {
+                            auto localIt = frame.namedVariable.find(name);
+                            if (localIt != frame.namedVariable.end())
+                            {
+                                const auto& nv = localIt->second;
+                                if (nv.Storage)
+                                {
+                                    seenNames.insert(name);
+                                    CaptureInfo ci;
+                                    ci.Name = name;
+                                    ci.TV   = nv.TypeAndValue;
+                                    ci.OuterStorage = nv.Storage;
+                                    // string is a value type ({i8*,i32}): its methods take string by value,
+                                    // so it must be value-captured like primitives to avoid pointer mismatch.
+                                    ci.ByReference  = !ci.TV.Pointer
+                                        && !ci.TV.IsFunctionPointer
+                                        && !ci.TV.IsPrimitive()
+                                        && ci.TV.TypeName != "string"
+                                        && compiler->dataStructures.count(ci.TV.TypeName);
+                                    captures.push_back(ci);
+                                }
+                                break;
+                            }
+                            auto argIt = frame.functionArgument.find(name);
+                            if (argIt != frame.functionArgument.end())
+                            {
+                                const auto& nv = argIt->second;
+                                if (nv.Storage)
+                                {
+                                    seenNames.insert(name);
+                                    CaptureInfo ci;
+                                    ci.Name = name;
+                                    ci.TV   = nv.TypeAndValue;
+                                    ci.OuterStorage = nv.Storage;
+                                    ci.ByReference  = !ci.TV.Pointer
+                                        && !ci.TV.IsFunctionPointer
+                                        && !ci.TV.IsPrimitive()
+                                        && ci.TV.TypeName != "string"
+                                        && compiler->dataStructures.count(ci.TV.TypeName);
+                                    captures.push_back(ci);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (size_t i = 0; i < node->children.size(); i++)
+                walk(node->children[i]);
+        };
+
+        if (bodyCtx) walk(bodyCtx);
+        return captures;
+    }
+
     LLVMBackend::NamedVariable ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -6818,14 +6930,105 @@ public:
         if (returnType.TypeName.empty())
             returnType.TypeName = "void";
 
-        std::string lambdaName = compiler->CreateAnonFunctionName();
+        // Keep lambda counter in sync: closure name matches lambda name index.
+        size_t lambdaIdx  = compiler->lambdaCounter;
+        std::string lambdaName = compiler->CreateAnonFunctionName(); // post-increments lambdaCounter
 
-        // Save builder position — lambda body emits a separate LLVM function
+        std::set<std::string> lambdaParamNames;
+        for (const auto& p : params)
+            lambdaParamNames.insert(p.VariableName);
+
+        // Scan body for captures from the enclosing function scope BEFORE saving builder state.
+        auto captures = CollectLambdaCaptures(ctx->lambdaBody(), lambdaParamNames, compiler);
+
+        // Build closure struct alloca in the OUTER function before switching IR context.
+        llvm::AllocaInst* closureAlloca = nullptr;
+        llvm::StructType* closureStructTy = nullptr;
+        auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+
+        if (!captures.empty())
+        {
+            std::string closureName = "__closure_" + std::to_string(lambdaIdx);
+            std::vector<llvm::Type*> closureFields;
+            for (const auto& cap : captures)
+            {
+                if (cap.ByReference)
+                    closureFields.push_back(compiler->GetDataStructure(cap.TV.TypeName).StructType->getPointerTo());
+                else
+                    closureFields.push_back(compiler->GetType(cap.TV));
+            }
+            closureStructTy = llvm::StructType::create(*compiler->context, closureFields, closureName);
+            closureAlloca   = compiler->builder->CreateAlloca(closureStructTy, nullptr, closureName);
+
+            for (size_t i = 0; i < captures.size(); i++)
+            {
+                auto* fieldGEP = compiler->builder->CreateStructGEP(closureStructTy, closureAlloca, (unsigned)i);
+                if (captures[i].ByReference)
+                {
+                    // Store pointer to outer struct (alloca address) in closure field.
+                    compiler->builder->CreateStore(captures[i].OuterStorage, fieldGEP);
+                }
+                else
+                {
+                    // Store a copy of the value in the closure field.
+                    auto* val = compiler->CreateLoad(compiler->GetType(captures[i].TV), captures[i].OuterStorage);
+                    compiler->builder->CreateStore(val, fieldGEP);
+                }
+            }
+        }
+
+        // Save builder position — invoker emits into a separate LLVM function.
         auto savedState = compiler->SaveBuilderState();
 
-        std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
+        // Invoker signature: (i8* __env, user_params...) -> RetType
+        LLVMBackend::DeclTypeAndValue envParam;
+        envParam.TypeName = "void"; envParam.Pointer = true; envParam.VariableName = "__env";
+        std::vector<LLVMBackend::TypeAndValue> allParams;
+        allParams.push_back(envParam);
+        allParams.insert(allParams.end(), params.begin(), params.end());
+
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
+
+        // Unpack captured variables from env into the invoker's scope.
+        if (!captures.empty() && closureStructTy)
+        {
+            auto* envArg    = fn->getArg(0);
+            auto* closurePtr = compiler->builder->CreateBitCast(
+                envArg, closureStructTy->getPointerTo(), "closure");
+
+            for (size_t i = 0; i < captures.size(); i++)
+            {
+                auto* fieldGEP = compiler->builder->CreateStructGEP(
+                    closureStructTy, closurePtr, (unsigned)i);
+                const auto& cap = captures[i];
+                auto& captureNV = compiler->stackNamedVariable.back().namedVariable[cap.Name];
+
+                if (cap.ByReference)
+                {
+                    // Load pointer to outer struct; register as a pointer-type variable.
+                    auto* structTy  = compiler->GetDataStructure(cap.TV.TypeName).StructType;
+                    auto* outerPtr  = compiler->builder->CreateLoad(
+                        structTy->getPointerTo(), fieldGEP, cap.Name + "_ref");
+                    LLVMBackend::TypeAndValue captureTV = cap.TV;
+                    captureTV.Pointer = true;
+                    captureNV.Primary = outerPtr;
+                    captureNV.TypeAndValue = captureTV;
+                    captureNV.BaseType     = structTy->getPointerTo();
+                }
+                else
+                {
+                    // Load copied value; store into a local alloca so the body can modify it.
+                    auto* capTy  = compiler->GetType(cap.TV);
+                    auto* capVal = compiler->builder->CreateLoad(capTy, fieldGEP, cap.Name + "_val");
+                    auto* capAlloca = compiler->builder->CreateAlloca(capTy, nullptr, cap.Name);
+                    compiler->builder->CreateStore(capVal, capAlloca);
+                    captureNV.Storage = capAlloca;
+                    captureNV.TypeAndValue = cap.TV;
+                    captureNV.BaseType     = capTy;
+                }
+            }
+        }
 
         // Parse body
         if (auto* body = ctx->lambdaBody())
@@ -6851,23 +7054,51 @@ public:
         compiler->CreateBlockBreak(nullptr, true);
         compiler->RestoreBuilderState(savedState);
 
-        // Build the function-pointer TypeAndValue describing this lambda
+        // Build user-visible function-pointer TypeAndValue (no __env param).
         LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
         tv.FuncPtrReturnTypeName = returnType.TypeName;
-        tv.FuncPtrReturnPointer = returnType.Pointer;
+        tv.FuncPtrReturnPointer  = returnType.Pointer;
         for (const auto& p : params)
         {
             LLVMBackend::TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
-            fp.Pointer = p.Pointer;
+            fp.Pointer  = p.Pointer;
             tv.FuncPtrParams.push_back(fp);
         }
 
+        // Build closure fat struct {invoker_as_i8ptr, closure_as_i8ptr_or_null}.
+        auto* fnAsI8   = compiler->builder->CreateBitCast(fn, i8PtrTy, "lambda_fn_i8");
+        llvm::Value* envForFat = closureAlloca
+            ? compiler->builder->CreateBitCast(closureAlloca, i8PtrTy, "closure_i8")
+            : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(i8PtrTy));
+
+        auto* closureFatTy = compiler->GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(closureFatTy);
+        fat = compiler->builder->CreateInsertValue(fat, fnAsI8,     {0u});
+        fat = compiler->builder->CreateInsertValue(fat, envForFat,  {1u});
+
         lastLambdaType = tv;
         LLVMBackend::NamedVariable result;
-        result.Primary = fn;
+        result.Primary     = fat;
         result.TypeAndValue = tv;
+
+        // Phase 6: Bond tracking — reference-captured variables are held by pointer.
+        // The lambda borrows stack addresses that cannot outlive their source scope.
+        for (const auto& cap : captures)
+        {
+            if (cap.ByReference)
+            {
+                result.IsBonded = true;
+                result.BondedSources.push_back(cap.Name);
+            }
+        }
+        if (result.IsBonded)
+        {
+            compiler->lastCallIsBonded       = true;
+            compiler->lastCallBondedSources  = result.BondedSources;
+        }
+
         return result;
     }
 
@@ -8102,7 +8333,7 @@ public:
             compiler->builder->SetInsertPoint(cleanupBB);
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
             compiler->builder->CreateStore(
-                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(hookFnPtrType)),
+                llvm::Constant::getNullValue(hookFnPtrType),
                 stdoutHookGlobal);
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
             auto* finalExitCode = compiler->builder->CreateLoad(i32Type, exitCodeGEP, "final_exit");
@@ -8166,12 +8397,12 @@ public:
                 progType, thisArg, threadIdx, "thread_field");
 
             // Thread.start(&self->_thread, trampoline, pkg) -> bool
+            // Thread.start() takes function<int(void*)> as a fat struct {i8*, i8*}.
             auto* trampolineFn  = compiler->programTable[name].TrampolineFunction;
-            auto* trampolineFnPtr = compiler->builder->CreateBitCast(
-                trampolineFn, trampolineFnTy->getPointerTo());
+            auto* trampolineFat = compiler->WrapBareValueAsFatStruct(trampolineFn);
             auto* startResult = compiler->builder->CreateCall(
                 threadStartFn->getFunctionType(), threadStartFn,
-                {threadFieldGEP, trampolineFnPtr, pkgRaw}, "start_result");
+                {threadFieldGEP, trampolineFat, pkgRaw}, "start_result");
 
             // On start failure: free pkg, return false
             auto* successBlock = llvm::BasicBlock::Create(*compiler->context, "start_ok",   runFn);
@@ -8542,12 +8773,12 @@ public:
                     structVal, llvm::Constant::getNullValue(fatTy), allocatorFieldIndex);
             }
 
-            // Synthetic field: onStdout = nullptr
+            // Synthetic field: onStdout = nullptr (fat struct {i8*, i8*})
             {
                 auto& onStdoutDecl = declList[onStdoutFieldIndex];
-                auto* fnPtrType = llvm::cast<llvm::PointerType>(compiler->GetType(onStdoutDecl));
-                auto* nullFnPtr = llvm::ConstantPointerNull::get(fnPtrType);
-                structVal = compiler->CreateInsertValue(structVal, nullFnPtr, onStdoutFieldIndex);
+                auto* fieldType = compiler->GetType(onStdoutDecl);
+                auto* nullVal = llvm::Constant::getNullValue(fieldType);
+                structVal = compiler->CreateInsertValue(structVal, nullVal, onStdoutFieldIndex);
             }
 
             // Synthetic field: inbox = channel__IMessage() (zero-init; caller must call inbox.init(N) before run())
