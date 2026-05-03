@@ -12,76 +12,170 @@
 //
 //   int out = 0;
 //   bool ok = ch.try_receive(&out);   // non-blocking receive
+//   bool ok = ch.try_pop(&out);       // same, IQueue-compatible name
 //
 //   ch.destroy();            // free OS resources and ring buffer
 //
 // Implementation:
-//   ring buffer + CRITICAL_SECTION (mutex) + two Win32 semaphores.
-//   _slots counts available write slots  (starts at capacity, blocks sender when 0).
-//   _items counts available read items   (starts at 0, blocks receiver when 0).
+//   ring buffer + CRITICAL_SECTION + two Win32 CONDITION_VARIABLEs.
+//   _slots_cv wakes blocked senders when a slot opens.
+//   _items_cv wakes blocked receivers when an item arrives.
+//   Condition variables are only signaled on state transitions (empty->non-empty,
+//   full->not-full), so under high throughput WakeConditionVariable is a user-mode
+//   no-op when no threads are waiting — far cheaper than semaphores.
+
+import "interfaces.cb";
 
 i32 __CHANNEL_CS_SIZE = 40;   // sizeof(CRITICAL_SECTION) on x64
+i32 __CHANNEL_CV_SIZE = 8;    // sizeof(CONDITION_VARIABLE) on x64
+
+extern void InitializeConditionVariable(void* cv);
+extern i32  SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+extern void WakeConditionVariable(void* cv);
 
 class channel<T>
 {
-    T*    _buf   = nullptr;   // ring buffer (heap-allocated array of cap slots)
-    int   _cap   = 0;         // ring buffer capacity
-    int   _count = 0;         // current item count
-    int   _head  = 0;         // next write position (producer advances this)
-    int   _tail  = 0;         // next read position  (consumer advances this)
-    void* _cs    = nullptr;   // CRITICAL_SECTION protecting _buf/_count/_head/_tail
-    void* _slots = nullptr;   // semaphore: available write slots (init=cap,  max=cap)
-    void* _items = nullptr;   // semaphore: available read  items (init=0,    max=cap)
+    T*    _buf      = nullptr;   // ring buffer (heap-allocated array of cap slots)
+    int   _cap      = 0;         // ring buffer capacity
+    int   _count    = 0;         // current item count
+    int   _head     = 0;         // next write position (producer advances this)
+    int   _tail     = 0;         // next read position  (consumer advances this)
+    void* _cs       = nullptr;   // CRITICAL_SECTION protecting all fields
+    void* _slots_cv = nullptr;   // CONDITION_VARIABLE — signaled when a slot opens
+    void* _items_cv = nullptr;   // CONDITION_VARIABLE — signaled when an item arrives
 
     // Allocate resources.  Must be called before send/receive.
     void init(int cap) {
-        _buf   = new T[cap];
-        _cap   = cap;
-        _count = 0;
-        _head  = 0;
-        _tail  = 0;
-        _cs    = malloc(__CHANNEL_CS_SIZE);
+        _buf      = new T[cap];
+        _cap      = cap;
+        _count    = 0;
+        _head     = 0;
+        _tail     = 0;
+        _cs       = malloc(__CHANNEL_CS_SIZE);
+        _slots_cv = malloc(__CHANNEL_CV_SIZE);
+        _items_cv = malloc(__CHANNEL_CV_SIZE);
         InitializeCriticalSection(_cs);
-        _slots = CreateSemaphoreA(nullptr, cap, cap, nullptr);
-        _items = CreateSemaphoreA(nullptr, 0,   cap, nullptr);
+        InitializeConditionVariable(_slots_cv);
+        InitializeConditionVariable(_items_cv);
     }
 
     // Blocking send.  Blocks until a slot is available, then writes the item.
     // For pointer types T, ownership is transferred (caller's pointer is nulled).
     void send(move T item) {
-        WaitForSingleObject(_slots, -1);
         EnterCriticalSection(_cs);
+        while (_count == _cap) {
+            SleepConditionVariableCS(_slots_cv, _cs, -1);
+        }
         _buf[_head] = item;
         _head = (_head + 1) % _cap;
         _count++;
+        int new_count = _count;
         LeaveCriticalSection(_cs);
-        ReleaseSemaphore(_items, 1, nullptr);
+        if (new_count == 1) {
+            WakeConditionVariable(_items_cv);
+        }
     }
 
     // Blocking receive.  Blocks until an item is available, then returns it.
     T receive() {
-        WaitForSingleObject(_items, -1);
         EnterCriticalSection(_cs);
+        while (_count == 0) {
+            SleepConditionVariableCS(_items_cv, _cs, -1);
+        }
         T value = _buf[_tail];
         _tail = (_tail + 1) % _cap;
         _count--;
+        int remaining = _count;
         LeaveCriticalSection(_cs);
-        ReleaseSemaphore(_slots, 1, nullptr);
+        if (remaining == _cap - 1) {
+            WakeConditionVariable(_slots_cv);
+        }
+        if (remaining > 0) {
+            WakeConditionVariable(_items_cv);
+        }
         return value;
     }
 
     // Non-blocking receive.  Returns true and writes to *out if an item was available;
     // returns false (and leaves *out unchanged) if the channel is empty.
     bool try_receive(T* out) {
-        i32 r = WaitForSingleObject(_items, 0);
-        if (r != 0) return false;
         EnterCriticalSection(_cs);
+        if (_count == 0) {
+            LeaveCriticalSection(_cs);
+            return false;
+        }
         *out = _buf[_tail];
         _tail = (_tail + 1) % _cap;
         _count--;
+        int remaining = _count;
         LeaveCriticalSection(_cs);
-        ReleaseSemaphore(_slots, 1, nullptr);
+        if (remaining == _cap - 1) {
+            WakeConditionVariable(_slots_cv);
+        }
+        if (remaining > 0) {
+            WakeConditionVariable(_items_cv);
+        }
         return true;
+    }
+
+    // IQueue-compatible non-blocking send.  Returns false if the channel is full.
+    bool try_push(T item) {
+        EnterCriticalSection(_cs);
+        if (_count == _cap) {
+            LeaveCriticalSection(_cs);
+            return false;
+        }
+        _buf[_head] = item;
+        _head = (_head + 1) % _cap;
+        _count++;
+        int new_count = _count;
+        LeaveCriticalSection(_cs);
+        if (new_count == 1) {
+            WakeConditionVariable(_items_cv);
+        }
+        return true;
+    }
+
+    // IQueue-compatible non-blocking receive.
+    bool try_pop(T* out) {
+        EnterCriticalSection(_cs);
+        if (_count == 0) {
+            LeaveCriticalSection(_cs);
+            return false;
+        }
+        *out = _buf[_tail];
+        _tail = (_tail + 1) % _cap;
+        _count--;
+        int remaining = _count;
+        LeaveCriticalSection(_cs);
+        if (remaining == _cap - 1) {
+            WakeConditionVariable(_slots_cv);
+        }
+        if (remaining > 0) {
+            WakeConditionVariable(_items_cv);
+        }
+        return true;
+    }
+
+    // IQueue-compatible blocking send (alias for send).
+    void push(move T item) {
+        EnterCriticalSection(_cs);
+        while (_count == _cap) {
+            SleepConditionVariableCS(_slots_cv, _cs, -1);
+        }
+        _buf[_head] = item;
+        _head = (_head + 1) % _cap;
+        _count++;
+        int new_count = _count;
+        LeaveCriticalSection(_cs);
+        if (new_count == 1) {
+            WakeConditionVariable(_items_cv);
+        }
+    }
+
+    // IQueue-compatible blocking receive (alias for receive).
+    T pop() {
+        return receive();
     }
 
     // Maximum number of items the channel can hold.
@@ -98,10 +192,10 @@ class channel<T>
     // Called automatically by the destructor; safe to call explicitly when
     // the channel must be cleaned up before it goes out of scope.
     void destroy() {
-        if (_buf   != nullptr) { delete[] _buf;                  _buf   = nullptr; }
-        if (_cs    != nullptr) { DeleteCriticalSection(_cs); free(_cs); _cs = nullptr; }
-        if (_slots != nullptr) { CloseHandle(_slots);            _slots = nullptr; }
-        if (_items != nullptr) { CloseHandle(_items);            _items = nullptr; }
+        if (_buf      != nullptr) { delete[] _buf;                  _buf      = nullptr; }
+        if (_cs       != nullptr) { DeleteCriticalSection(_cs); free(_cs); _cs = nullptr; }
+        if (_slots_cv != nullptr) { free(_slots_cv);                _slots_cv = nullptr; }
+        if (_items_cv != nullptr) { free(_items_cv);                _items_cv = nullptr; }
     }
 
     ~channel() {

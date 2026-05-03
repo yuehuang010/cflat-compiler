@@ -1835,7 +1835,41 @@ public:
         {
             const auto& nv = extraArgNVs[i];
             const auto& param = methodInfo->Parameters[i];
-            if (param.Pointer)
+            if (param.IsInterface && !nv.TypeAndValue.IsInterface)
+            {
+                // Concrete struct/pointer -> interface fat ptr upconversion.
+                std::string structName = nv.TypeAndValue.TypeName;
+                if (structName.empty() && nv.BaseType)
+                {
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(nv.BaseType))
+                        structName = st->getName().str();
+                }
+                auto vtable = GetOrCreateVTable(structName, param.TypeName);
+                llvm::Value* argDataPtr = nullptr;
+                if (nv.TypeAndValue.Pointer)
+                {
+                    argDataPtr = nv.Primary != nullptr ? nv.Primary : CreateLoad(nv.Storage);
+                }
+                else if (nv.Storage != nullptr)
+                {
+                    argDataPtr = nv.Storage;
+                }
+                else
+                {
+                    auto structTy = nv.BaseType ? nv.BaseType : GetType(nv.TypeAndValue);
+                    auto tempAlloca = builder->CreateAlloca(structTy);
+                    builder->CreateStore(nv.Primary, tempAlloca);
+                    argDataPtr = tempAlloca;
+                }
+                callArgs.push_back(BuildInterfaceFatValue(vtable, argDataPtr));
+            }
+            else if (param.IsInterface && nv.TypeAndValue.IsInterface)
+            {
+                // Interface -> interface: pass fat struct by value.
+                llvm::Value* val = nv.Primary ? nv.Primary : CreateLoad(nv.Storage);
+                callArgs.push_back(val);
+            }
+            else if (param.Pointer)
             {
                 // Storage may be a promoted-param alloca holding the pointer; load to get the value.
                 if (nv.Primary == nullptr && nv.Storage != nullptr && llvm::isa<llvm::AllocaInst>(nv.Storage))

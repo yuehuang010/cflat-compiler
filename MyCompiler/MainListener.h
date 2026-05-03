@@ -6209,11 +6209,20 @@ public:
                                 auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
                                 for (const auto& namedArgument : namedArgCtx)
                                 {
-                                    auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                    auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     if (!argValue) break;
                                     LLVMBackend::NamedVariable argVar;
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    argVar.Storage = argNV.Storage;
+                                    argVar.IsOwning = argNV.IsOwning;
+                                    argVar.IsOwningString = argNV.IsOwningString;
+                                    argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    argVar.CallerName = argNV.CallerName;
+                                    argVar.TypeAndValue.IsInterface = argNV.TypeAndValue.IsInterface;
+                                    argVar.IsBonded = argNV.IsBonded;
+                                    argVar.BondedSources = argNV.BondedSources;
 
                                     // Extract struct name if this is a struct type
                                     if (auto* st = llvm::dyn_cast<llvm::StructType>(argValue->getType()))
@@ -6221,6 +6230,14 @@ public:
                                         auto structName = st->getName().str();
                                         if (!structName.empty())
                                             argVar.TypeAndValue.TypeName = structName;
+                                    }
+
+                                    // Propagate struct TypeName for pointer args so struct*->interface upcast works
+                                    if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
+                                        && !argNV.TypeAndValue.TypeName.empty()
+                                        && Compiler(ctx)->IsDataStructure(argNV.TypeAndValue.TypeName))
+                                    {
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
                                     }
 
                                     extraArgs.emplace_back(argVar);
@@ -8751,19 +8768,26 @@ public:
             ProcessPendingInstantiations();
         }
 
+        // Ensure IQueue<IMessage> interface is instantiated so the inbox fat-ptr vtable can be built.
+        if (!instantiatedInterfaces.count("IQueue__IMessage"))
+        {
+            pendingInstantiations.push_back({"IQueue", {"IMessage"}, "IQueue__IMessage"});
+            ProcessPendingInstantiations();
+        }
+
         // Guard against user fields clashing with auto-injected synthetic fields
         for (auto& field : declList)
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
                 || field.VariableName == "_allocator" || field.VariableName == "onStdout"
-                || field.VariableName == "inbox" || field.VariableName == "_stop_source"
+                || field.VariableName == "inbox" || field.VariableName == "_stop_source" || field.VariableName == "_inbox"
                 || field.VariableName == "trackHandles")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), inbox (channel<IMessage>), _stop_source (stop_source),
+        // onStdout (function<void(char*)>), inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
         // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion)
         unsigned exitCodeFieldIndex    = (unsigned)declList.size();
         unsigned threadFieldIndex      = exitCodeFieldIndex + 1;
@@ -8797,9 +8821,14 @@ public:
             onStdoutField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdoutField);
 
+            // inbox: IQueue<IMessage> fat-ptr — swappable before run() just like _allocator.
+            // By default the constructor pre-allocates a channel<IMessage> and builds the fat-ptr.
+            // Users can replace it with any IQueue<IMessage> implementation via `p.inbox = &myQueue`.
             LLVMBackend::DeclTypeAndValue inboxField;
-            inboxField.TypeName     = "channel__IMessage";
+            inboxField.TypeName     = "IQueue__IMessage";
             inboxField.VariableName = "inbox";
+            inboxField.IsInterface  = true;
+            inboxField.Pointer      = true;
             declList.push_back(inboxField);
 
             LLVMBackend::DeclTypeAndValue stopSrcField;
@@ -8891,12 +8920,34 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullVal, onStdoutFieldIndex);
             }
 
-            // Synthetic field: inbox = channel__IMessage() (zero-init; caller must call inbox.init(N) before run())
-            if (auto* inboxCtorFn = compiler->GetFunction("channel__IMessage"))
+            // Synthetic field: inbox = IQueue<IMessage> fat-ptr pointing to a heap-allocated
+            // channel<IMessage> (zero-init).  Pre-allocating ensures inbox.init(N) is safe to
+            // call before run().  Users replace it with `p.inbox = &myQueue` to swap the impl.
             {
-                auto* inboxInitVal = compiler->builder->CreateCall(
-                    inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_init");
-                structVal = compiler->CreateInsertValue(structVal, inboxInitVal, inboxFieldIndex);
+                auto* fatTy = compiler->GetFatPtrType();
+                auto dsIt = compiler->dataStructures.find("channel__IMessage");
+                auto* inboxCtorFn = compiler->GetFunction("channel__IMessage");
+                auto* mallocInboxFn = compiler->GetFunction("malloc");
+                if (dsIt != compiler->dataStructures.end() && inboxCtorFn && mallocInboxFn)
+                {
+                    auto* channelType    = dsIt->second.StructType;
+                    auto* channelSize    = compiler->GetTypeSizeBytes(channelType);
+                    auto* channelRaw     = compiler->builder->CreateCall(
+                        mallocInboxFn->getFunctionType(), mallocInboxFn, {channelSize}, "inbox_raw");
+                    auto* channelPtr     = compiler->builder->CreateBitCast(
+                        channelRaw, channelType->getPointerTo(), "inbox_ptr");
+                    auto* channelZeroVal = compiler->builder->CreateCall(
+                        inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_zero");
+                    compiler->builder->CreateStore(channelZeroVal, channelPtr);
+                    auto* inboxVtable    = compiler->GetOrCreateVTable("channel__IMessage", "IQueue__IMessage");
+                    auto* inboxFatPtr    = compiler->BuildInterfaceFatValue(inboxVtable, channelPtr);
+                    structVal = compiler->CreateInsertValue(structVal, inboxFatPtr, inboxFieldIndex);
+                }
+                else
+                {
+                    structVal = compiler->CreateInsertValue(
+                        structVal, llvm::Constant::getNullValue(fatTy), inboxFieldIndex);
+                }
             }
 
             // Synthetic field: _stop_source = stop_source() (zero-init; init() called in run())

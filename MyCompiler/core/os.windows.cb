@@ -27,6 +27,10 @@ extern void  AcquireSRWLockExclusive(void** srw);
 extern void  ReleaseSRWLockExclusive(void** srw);
 extern void  AcquireSRWLockShared(void** srw);
 extern void  ReleaseSRWLockShared(void** srw);
+extern void  InitializeConditionVariable(void* cv);
+extern i32   SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+extern void  WakeConditionVariable(void* cv);
+extern void  WakeAllConditionVariable(void* cv);
 
 // Win32 Virtual Memory
 extern void  GetSystemInfo(void* lpSystemInfo);

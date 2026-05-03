@@ -485,12 +485,10 @@ bool testInboxSingleMessage() {
     w.inbox.init(8);
     list<string> args;
     w.run(args);
-
     PingMsg* m = new PingMsg;
     m.value = 7;
     w.inbox.send(move m);
     w.inbox.send(new StopMsg);
-
     w.WaitForExit();
     result &= Test("inbox single ping", w.exitCode, 7);
     return result;
@@ -777,11 +775,8 @@ bool testTrackHandles() {
 extern int main() {
     int passed = 0;
     int total  = 0;
-    int dbg = 0;
 
-    printf("T%d\n", dbg++);
     total++; passed += testProgramBasicArgsAndField()    ? 1 : 0;
-    printf("T%d\n", dbg++);
     total++; passed += testProgramMinimalNoFields()      ? 1 : 0;
     total++; passed += testProgramEmptyArgs()            ? 1 : 0;
     total++; passed += testProgramExitCodeZero()         ? 1 : 0;

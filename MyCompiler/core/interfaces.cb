@@ -47,6 +47,20 @@ interface IAllocator
     i64   totalBytes();
 };
 
+interface IQueue<T>
+{
+    void push(move T item);       // blocking send; ownership transferred for pointer types
+    T    pop();                    // blocking receive
+    bool try_push(T item);        // non-blocking send; returns false if full
+    bool try_pop(T* out);         // non-blocking receive; returns false if empty
+    void send(move T item);       // alias for push (program inbox backward compat)
+    T    receive();                // alias for pop  (program inbox backward compat)
+    bool try_receive(T* out);     // alias for try_pop (program inbox backward compat)
+    void init(int capacity);
+    int  capacity();
+    void destroy();
+};
+
 interface IMessage { };
 
 interface IReflector {
