@@ -4014,6 +4014,7 @@ public:
             auto lv = ParseMultiplicativeExpression(nextCtxs[0]);
             llvm::Value* lvalue = lv.value;
             bool lu = lv.isUnsigned;
+            llvm::Type* elemType = lv.elemType;
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
@@ -4022,12 +4023,38 @@ public:
                 bool ru = rv.isUnsigned;
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
-                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
-                lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
-                lu = lu || ru;
+                if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
+                {
+                    // ptr - ptr → i64 byte difference
+                    auto* i64Ty = Compiler(ctx)->builder->getInt64Ty();
+                    lvalue = Compiler(ctx)->builder->CreateSub(
+                        Compiler(ctx)->builder->CreatePtrToInt(lvalue, i64Ty),
+                        Compiler(ctx)->builder->CreatePtrToInt(rvalue, i64Ty),
+                        "ptrdiff");
+                    elemType = nullptr;
+                }
+                else if (elemType && lvalue->getType()->isPointerTy()
+                    && rvalue && rvalue->getType()->isIntegerTy()
+                    && (op == "+" || op == "-"))
+                {
+                    // Pointer arithmetic: ptr + int / ptr - int → GEP
+                    if (op == "-")
+                        rvalue = Compiler(ctx)->builder->CreateNeg(rvalue, "neg");
+                    lvalue = Compiler(ctx)->CreateGEP(elemType, lvalue, rvalue, "ptrarith");
+                    // elemType stays the same — result is still a pointer to the same element type
+                }
+                else
+                {
+                    auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+                    lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                    lu = lu || ru;
+                    elemType = nullptr;  // arithmetic result is no longer a pointer
+                }
             }
 
-            return { lvalue, lu };
+            LLVMBackend::TypedValue result{ lvalue, lu };
+            result.elemType = elemType;
+            return result;
         }
 
         LogErrorContext(ctx, "Additive expression has no operands.");
@@ -4195,7 +4222,16 @@ public:
         {
             auto namedVar = ParseCastExpression(nextCtxs[0]);
             bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
-            return { LoadNamedVariable(namedVar), isUnsigned };
+            llvm::Type* elemType = nullptr;
+            if (namedVar.TypeAndValue.Pointer)
+            {
+                auto elemTV = namedVar.TypeAndValue;
+                elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
+                elemType = Compiler(nextCtxs[0])->GetType(elemTV);
+            }
+            LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
+            result.elemType = elemType;
+            return result;
         }
         else if (nextCtxs.size() > 1)
         {

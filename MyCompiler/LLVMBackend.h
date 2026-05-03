@@ -298,8 +298,9 @@ public:
     // operator llvm::Value*() lets it substitute for Value* transparently at call sites.
     struct TypedValue
     {
-        llvm::Value* value     = nullptr;
+        llvm::Value* value      = nullptr;
         bool         isUnsigned = false;
+        llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -2356,6 +2357,14 @@ public:
     {
         llvm::LoadInst* loadInst = CreateLoad(destination);
 
+        if (loadInst->getType()->isPointerTy())
+        {
+            // Pointer increment/decrement: byte arithmetic via i8 GEP.
+            auto* step = llvm::ConstantInt::get(builder->getInt64Ty(), amount);
+            auto* newPtr = builder->CreateGEP(builder->getInt8Ty(), loadInst, step, "ptrinc");
+            return builder->CreateStore(newPtr, destination);
+        }
+
         auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
         auto newValue = CreateOperation(Operation::Add, loadInst, value);
         return builder->CreateStore(newValue, destination);
@@ -2835,6 +2844,77 @@ public:
         if (left == nullptr)
             return right;
 
+        // Pointer operations: must run before Upconvert, which would corrupt pointer/int pairs.
+        if (left->getType()->isPointerTy() || right->getType()->isPointerTy())
+        {
+            auto* i64Ty = builder->getInt64Ty();
+            bool leftIsPtr  = left->getType()->isPointerTy();
+            bool rightIsPtr = right->getType()->isPointerTy();
+            switch (op)
+            {
+            case Operation::Less:
+            case Operation::Greater:
+            case Operation::LessEqual:
+            case Operation::GreaterEqual:
+            {
+                // Address comparison: convert both sides to i64 and compare as unsigned integers.
+                if (leftIsPtr)  left  = builder->CreatePtrToInt(left,  i64Ty);
+                else if (!left->getType()->isIntegerTy(64))  left  = builder->CreateSExt(left,  i64Ty);
+                if (rightIsPtr) right = builder->CreatePtrToInt(right, i64Ty);
+                else if (!right->getType()->isIntegerTy(64)) right = builder->CreateSExt(right, i64Ty);
+                auto pred = op == Operation::Less      ? llvm::ICmpInst::ICMP_ULT :
+                            op == Operation::Greater   ? llvm::ICmpInst::ICMP_UGT :
+                            op == Operation::LessEqual ? llvm::ICmpInst::ICMP_ULE :
+                                                         llvm::ICmpInst::ICMP_UGE;
+                return builder->CreateICmp(pred, left, right);
+            }
+            case Operation::BitwiseAnd:
+            case Operation::AndAssignment:
+            case Operation::BitwiseOr:
+            case Operation::OrAssignment:
+            case Operation::BitwiseXor:
+            case Operation::XorAssignment:
+            {
+                // Bitwise masking: ptrtoint, op, inttoptr.  Result type matches the pointer side.
+                auto* ptrTy = leftIsPtr ? left->getType() : right->getType();
+                if (leftIsPtr)  left  = builder->CreatePtrToInt(left,  i64Ty);
+                else if (!left->getType()->isIntegerTy(64))  left  = builder->CreateZExtOrTrunc(left,  i64Ty);
+                if (rightIsPtr) right = builder->CreatePtrToInt(right, i64Ty);
+                else if (!right->getType()->isIntegerTy(64)) right = builder->CreateZExtOrTrunc(right, i64Ty);
+                llvm::Value* res;
+                switch (op)
+                {
+                case Operation::BitwiseAnd: case Operation::AndAssignment: res = builder->CreateAnd(left, right); break;
+                case Operation::BitwiseOr:  case Operation::OrAssignment:  res = builder->CreateOr(left,  right); break;
+                default:                                                    res = builder->CreateXor(left, right); break;
+                }
+                return builder->CreateIntToPtr(res, ptrTy);
+            }
+            case Operation::Add:
+            case Operation::AddAssignment:
+            case Operation::Subtract:
+            case Operation::MinusAssignment:
+            {
+                if (leftIsPtr && rightIsPtr)
+                {
+                    // ptr - ptr: byte difference as i64.
+                    left  = builder->CreatePtrToInt(left,  i64Ty);
+                    right = builder->CreatePtrToInt(right, i64Ty);
+                    return builder->CreateSub(left, right, "ptrdiff");
+                }
+                // ptr ± int (no element-type context here): byte arithmetic via i8 GEP.
+                auto* ptrVal = leftIsPtr  ? left  : right;
+                auto* intVal = leftIsPtr  ? right : left;
+                if ((op == Operation::Subtract || op == Operation::MinusAssignment) && leftIsPtr)
+                    intVal = builder->CreateNeg(intVal, "neg");
+                intVal = Upconvert(intVal, i64Ty);
+                return builder->CreateGEP(builder->getInt8Ty(), ptrVal, intVal, "ptrarith");
+            }
+            default:
+                break;  // ==, !=, logical ops, etc. fall through to the integer path below
+            }
+        }
+
         // Upconvert both
         left = Upconvert(left, right);
         right = Upconvert(right, left);
@@ -3013,6 +3093,10 @@ public:
     {
         if (left == nullptr)
             return right;
+
+        // Delegate pointer operations before Upconvert can corrupt pointer/int pairs.
+        if (left->getType()->isPointerTy() || right->getType()->isPointerTy())
+            return CreateOperation(op, left, right);
 
         left  = Upconvert(left,  right, leftIsUnsigned);
         right = Upconvert(right, left,  rightIsUnsigned);

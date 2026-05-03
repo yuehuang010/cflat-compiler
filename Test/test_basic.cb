@@ -1443,6 +1443,51 @@ extern int main()
     total++; passed += testStatic()                      ? 1 : 0;
     total++; passed += testCast()                        ? 1 : 0;
     total++; passed += testNullableTypes()               ? 1 : 0;
+    total++; passed += testPointerArithmetic()           ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
+}
+
+// =============================================================
+// Pointer arithmetic tests
+// =============================================================
+
+bool testPointerArithmetic()
+{
+    bool result = true;
+
+    // Basic ptr + int
+    int* arr = new int[4];
+    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+
+    int* p1 = arr + 1;
+    result &= Test("ptr+1 elem", p1[0], 20);
+
+    int* p2 = arr + 2;
+    result &= Test("ptr+2 elem", p2[0], 30);
+
+    // ptr - int
+    int* p3 = p2 - 1;
+    result &= Test("ptr-1 elem", p3[0], 20);
+
+    // Chained arithmetic
+    int* p4 = arr + 1 + 1;
+    result &= Test("ptr+1+1 elem", p4[0], 30);
+
+    // i8* arithmetic
+    i8* buf = (i8*)new i8[4];
+    buf[0] = 65; buf[1] = 66; buf[2] = 67; buf[3] = 0;
+
+    i8* b1 = buf + 1;
+    result &= Test("i8*+1", (int)b1[0], 66);
+
+    i8* b2 = b1 + 1;
+    result &= Test("i8*+1+1", (int)b2[0], 67);
+
+    i8* b3 = b2 - 2;
+    result &= Test("i8*-2", (int)b3[0], 65);
+
+    delete[] arr;
+    delete[] buf;
+    return result;
 }

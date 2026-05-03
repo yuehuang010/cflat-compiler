@@ -48,7 +48,7 @@ class Arena
         i64 aligned = _align8(size);
         if (_head == nullptr) _newBlock(aligned);
         if (_head->_used + aligned > _head->_size) _newBlock(aligned);
-        void* ptr = (void*)&_head->_data[_head->_used];
+        void* ptr = (void*)(_head->_data + _head->_used);
         _head->_used = _head->_used + aligned;
         return ptr;
     }

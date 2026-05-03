@@ -98,7 +98,7 @@ class SlabAllocator : IAllocator
         int i = 0;
         while (i < 8)
         {
-            _slabs[i]._base      = (i8*)((i64)_base + (i64)i * _regionSize);
+            _slabs[i]._base      = _base + (i64)i * _regionSize;
             _slabs[i]._blockSize = _blockSizeFor(i);
             i = i + 1;
         }
@@ -165,7 +165,7 @@ class SlabAllocator : IAllocator
     {
         if (_slabs[cls]._commitEnd + _pageSize > _regionSize) return;  // region exhausted
 
-        i8* page = (i8*)((i64)_slabs[cls]._base + _slabs[cls]._commitEnd);
+        i8* page = _slabs[cls]._base + _slabs[cls]._commitEnd;
         // MEM_COMMIT (0x1000) within the already-reserved region.
         VirtualAlloc((void*)page, _pageSize, 0x1000u, 0x04u);
         _slabs[cls]._commitEnd   = _slabs[cls]._commitEnd   + _pageSize;
@@ -178,7 +178,7 @@ class SlabAllocator : IAllocator
         i64 k = blockCount - 1;
         while (k >= 0)
         {
-            _pushFree(cls, (i8*)((i64)page + k * blockSize));
+            _pushFree(cls, page + k * blockSize);
             k = k - 1;
         }
     }
@@ -204,13 +204,13 @@ class SlabAllocator : IAllocator
         _largeBytes      = _largeBytes + size;
         _largeCount      = _largeCount + 1;
 
-        return (void*)((i64)base + hdrSize);
+        return (void*)(base + hdrSize);
     }
 
     void _freeLarge(void* ptr)
     {
         i64 hdrSize       = (i64)sizeof(_SA_LargeHdr);
-        i8* base          = (i8*)((i64)ptr - hdrSize);
+        i8* base          = (i8*)ptr - hdrSize;
         _SA_LargeHdr* hdr = (_SA_LargeHdr*)base;
 
         _largeBytes = _largeBytes - hdr->_userSize;

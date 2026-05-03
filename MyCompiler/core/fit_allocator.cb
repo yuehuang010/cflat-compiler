@@ -165,7 +165,7 @@ class FitAllocator : IAllocator
         i64 tail    = fb->_size - needed;
         if (tail < _hdrSize() + minTail) return;
 
-        i8* tailPtr = (i8*)((i64)fb + _hdrSize() + needed);
+        i8* tailPtr = (i8*)fb + _hdrSize() + needed;
         _FA_FreeBlock* tail_fb = (_FA_FreeBlock*)tailPtr;
         tail_fb->_size = tail - _hdrSize();
         tail_fb->_prev = nullptr;
@@ -179,7 +179,7 @@ class FitAllocator : IAllocator
         // Coalesce with next neighbor.
         if (fb->_next != nullptr)
         {
-            i8* fbEnd = (i8*)((i64)fb + _hdrSize() + fb->_size);
+            i8* fbEnd = (i8*)fb + _hdrSize() + fb->_size;
             if (fbEnd == (i8*)fb->_next)
             {
                 _FA_FreeBlock* nx = fb->_next;
@@ -190,7 +190,7 @@ class FitAllocator : IAllocator
         // Coalesce with previous neighbor.
         if (fb->_prev != nullptr)
         {
-            i8* prevEnd = (i8*)((i64)fb->_prev + _hdrSize() + fb->_prev->_size);
+            i8* prevEnd = (i8*)fb->_prev + _hdrSize() + fb->_prev->_size;
             if (prevEnd == (i8*)fb)
             {
                 _FA_FreeBlock* pv = fb->_prev;
@@ -220,13 +220,13 @@ class FitAllocator : IAllocator
         _largeHead      = base;
 
         // _FA_Header sits right after the prefix.
-        _FA_Header* hdr = (_FA_Header*)((i64)base + pfxSize);
+        _FA_Header* hdr = (_FA_Header*)(base + pfxSize);
         hdr->_size = -size;  // negative → large allocation
 
         _largeBytes = _largeBytes + size;
         _largeCount = _largeCount + 1;
 
-        return (void*)((i64)base + pfxSize + hdrSize);
+        return (void*)(base + pfxSize + hdrSize);
     }
 
     void _freeLarge(void* ptr)
@@ -234,10 +234,10 @@ class FitAllocator : IAllocator
         i64 pfxSize = _largePfxSize();
         i64 hdrSize = _hdrSize();
 
-        i8* base = (i8*)((i64)ptr - pfxSize - hdrSize);
+        i8* base = (i8*)ptr - pfxSize - hdrSize;
         _FA_LargePrefix* pfx = (_FA_LargePrefix*)base;
 
-        _FA_Header* hdr = (_FA_Header*)((i64)base + pfxSize);
+        _FA_Header* hdr = (_FA_Header*)(base + pfxSize);
         i64 userSize = -(hdr->_size);
         _largeBytes = _largeBytes - userSize;
         _largeCount = _largeCount - 1;
@@ -310,14 +310,14 @@ class FitAllocator : IAllocator
         hdr->_size = allocSize;  // positive → slab
 
         _usedBytes = _usedBytes + allocSize;
-        return (void*)((i64)fb + _hdrSize());
+        return (void*)((i8*)fb + _hdrSize());
     }
 
     void dealloc(void* ptr)
     {
         if (ptr == nullptr) return;
 
-        i8* base = (i8*)((i64)ptr - _hdrSize());
+        i8* base = (i8*)ptr - _hdrSize();
         _FA_Header* hdr = (_FA_Header*)base;
 
         if (hdr->_size < 0)

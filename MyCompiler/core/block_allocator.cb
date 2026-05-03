@@ -84,7 +84,7 @@ class BlockAllocator : IAllocator
         int i = 0;
         while (i < (int)count)
         {
-            _SysLogicalProcInfo* e = (_SysLogicalProcInfo*)&buf[(i64)i * entrySize];
+            _SysLogicalProcInfo* e = (_SysLogicalProcInfo*)(buf + (i64)i * entrySize);
             if (e->_relationship == 2 && e->_cacheLevel == 3)  // RelationCache, Level 3
             {
                 _blockSize = (i64)e->_cacheLineSize;
@@ -151,7 +151,7 @@ class BlockAllocator : IAllocator
                     {
                         bitmap[bi] = 1;
                         _pages[pi]._usedCount = _pages[pi]._usedCount + 1;
-                        return (void*)&_pages[pi]._data[bitmapSize + (i64)bi * _blockSize];
+                        return (void*)(_pages[pi]._data + bitmapSize + (i64)bi * _blockSize);
                     }
                     bi = bi + 1;
                 }
@@ -165,7 +165,7 @@ class BlockAllocator : IAllocator
         i64 bitmapSize = (_pages[last]._blockCount + _blockSize - 1) / _blockSize * _blockSize;
         _pages[last]._data[0]   = 1;
         _pages[last]._usedCount = 1;
-        return (void*)&_pages[last]._data[bitmapSize];
+        return (void*)(_pages[last]._data + bitmapSize);
     }
 
     // Marks the block containing ptr as free.
@@ -176,7 +176,7 @@ class BlockAllocator : IAllocator
         while (pi < _pageCount)
         {
             i64 bitmapSize = (_pages[pi]._blockCount + _blockSize - 1) / _blockSize * _blockSize;
-            i64 blocksAddr = (i64)&_pages[pi]._data[bitmapSize];
+            i64 blocksAddr = (i64)(_pages[pi]._data + bitmapSize);
             i64 blocksEnd  = blocksAddr + _pages[pi]._blockCount * _blockSize;
 
             if (ptrAddr >= blocksAddr && ptrAddr < blocksEnd)
