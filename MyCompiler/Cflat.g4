@@ -545,6 +545,7 @@ jumpStatement
         | 'break'
         | 'return' expression?
         | 'return' compoundStatement
+        | 'return' Default
     ) ';'
     ;
 

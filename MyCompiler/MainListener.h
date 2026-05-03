@@ -1856,7 +1856,14 @@ public:
         {
             if (jump->Return())
             {
-                if (auto* blockBody = jump->compoundStatement())
+                if (jump->Default() != nullptr)
+                {
+                    // return default; — zero-initialize the return type (null for pointers/interfaces, 0 for integers)
+                    auto* retTy = compiler->currentFunction->getReturnType();
+                    auto* defaultVal = retTy->isVoidTy() ? nullptr : llvm::Constant::getNullValue(retTy);
+                    compiler->CreateReturnCall(defaultVal);
+                }
+                else if (auto* blockBody = jump->compoundStatement())
                 {
                     compiler->InitializeBlock(nullptr, true);
                     if (auto* blockItems = blockBody->blockItemList())
@@ -3033,6 +3040,9 @@ public:
                                     }
                                 }
                             }
+                            // nullptr constant assigned to an interface variable — produce null fat pointer {null, null}
+                            if (llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
+                                right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
                         }
                         else
                         {
@@ -3069,6 +3079,7 @@ public:
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                     right = compiler->WrapBareValueAsFatStruct(fn);
                             }
+
                         }
                     }
                     else if (initializer->Default() != nullptr)

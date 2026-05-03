@@ -702,6 +702,101 @@ bool testDefault()
 }
 
 // =============================================================
+// return default; tests
+// =============================================================
+
+struct RdPoint
+{
+    int x = 10;
+    int y = 20;
+};
+
+class RdNode
+{
+    int val = 99;
+};
+
+int rdInt()       { return default; }
+float rdFloat()   { return default; }
+bool rdBool()     { return default; }
+i64 rdI64()       { return default; }
+int* rdIntPtr()   { return default; }
+RdNode* rdClassPtr() { return default; }
+RdPoint rdStruct() { return default; }
+string rdString() { return default; }
+
+int rdCondInt(bool flag)
+{
+    if (flag)
+        return 99;
+    return default;
+}
+
+RdPoint rdCondStruct(bool flag)
+{
+    if (flag)
+    {
+        RdPoint p;
+        p.x = 7;
+        p.y = 8;
+        return p;
+    }
+    return default;
+}
+
+bool testReturnDefaultPrimitives()
+{
+    bool result = true;
+    result &= Test("rd_int",   rdInt(),   0);
+    result &= Test("rd_float", rdFloat(), 0.0f);
+    result &= Test("rd_bool",  rdBool(),  false);
+    result &= Test("rd_i64",   rdI64(),   (i64)0);
+    return result;
+}
+
+bool testReturnDefaultPointers()
+{
+    bool result = true;
+    result &= Test("rd_int_ptr",   rdIntPtr()   == nullptr ? 1 : 0, 1);
+    result &= Test("rd_class_ptr", rdClassPtr() == nullptr ? 1 : 0, 1);
+    return result;
+}
+
+bool testReturnDefaultStruct()
+{
+    bool result = true;
+    RdPoint pt = rdStruct();
+    // return default; zero-initializes — fields are 0, not declared defaults (10, 20)
+    result &= Test("rd_struct_x", pt.x, 0);
+    result &= Test("rd_struct_y", pt.y, 0);
+    return result;
+}
+
+bool testReturnDefaultString()
+{
+    bool result = true;
+    string s = rdString();
+    result &= Test("rd_string_len", s.length(), 0);
+    return result;
+}
+
+bool testReturnDefaultConditional()
+{
+    bool result = true;
+    result &= Test("rd_cond_taken",   rdCondInt(true),  99);
+    result &= Test("rd_cond_default", rdCondInt(false), 0);
+
+    RdPoint p1 = rdCondStruct(true);
+    result &= Test("rd_cond_struct_x", p1.x, 7);
+    result &= Test("rd_cond_struct_y", p1.y, 8);
+
+    RdPoint p2 = rdCondStruct(false);
+    result &= Test("rd_cond_struct_zero_x", p2.x, 0);
+    result &= Test("rd_cond_struct_zero_y", p2.y, 0);
+    return result;
+}
+
+// =============================================================
 // string type tests
 // string is a built-in value type: { i8* _ptr, i32 _len }
 // with data() -> i8* and length() -> i32 member functions.
@@ -1327,6 +1422,11 @@ extern int main()
     total++; passed += testNullCoalescing()              ? 1 : 0;
     total++; passed += testNullCoalescingAssignment()    ? 1 : 0;
     total++; passed += testDefault()                     ? 1 : 0;
+    total++; passed += testReturnDefaultPrimitives()     ? 1 : 0;
+    total++; passed += testReturnDefaultPointers()       ? 1 : 0;
+    total++; passed += testReturnDefaultStruct()         ? 1 : 0;
+    total++; passed += testReturnDefaultString()         ? 1 : 0;
+    total++; passed += testReturnDefaultConditional()    ? 1 : 0;
     total++; passed += Test("testNewDelete", testNewDelete(), 42);
     total++; passed += Test("testNewArray", testNewArray(), 99);
     total++; passed += Test("testNewWithConstructor", testNewWithConstructor(), 123);
