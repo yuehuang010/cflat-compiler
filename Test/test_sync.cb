@@ -836,6 +836,49 @@ bool testSpscThreaded() {
 }
 
 // ---------------------------------------------------------------------------
+// Embedded sub-struct initialization tests
+// ---------------------------------------------------------------------------
+
+struct WithEmbeddedFlag {
+    int    value = 0;
+    atomic_flag flag;   // no = default — tests sub-struct auto-init
+    int    other = 7;
+};
+
+struct WithEmbeddedCounter {
+    atomic_counter hits;  // no = default
+};
+
+bool testEmbeddedAtomicFlagInitialized() {
+    bool result = true;
+    WithEmbeddedFlag s;
+
+    // First test_and_set must return false (flag starts clear).
+    bool was_set = s.flag.test_and_set();
+    result &= Test("embedded flag initially clear", (int)was_set, 0);
+
+    // Second call must see it held.
+    bool still_set = s.flag.test_and_set();
+    result &= Test("embedded flag now set", (int)still_set, 1);
+
+    s.flag.clear();
+
+    // Surrounding fields must be unaffected.
+    result &= Test("embedded flag: value field intact", s.value, 0);
+    result &= Test("embedded flag: other field intact", s.other, 7);
+    return result;
+}
+
+bool testEmbeddedAtomicCounterInitialized() {
+    bool result = true;
+    WithEmbeddedCounter s;
+    result &= Test("embedded counter starts at 0", (int)s.hits.read(), 0);
+    s.hits.increment();
+    result &= Test("embedded counter after increment", (int)s.hits.read(), 1);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -879,6 +922,10 @@ extern int main() {
     total++; passed += testRwlockShared()             ? 1 : 0;
     total++; passed += testRwlockLockStatement()      ? 1 : 0;
     total++; passed += testRwlockWithThreads()        ? 1 : 0;
+
+    // Embedded sub-struct initialization tests
+    total++; passed += testEmbeddedAtomicFlagInitialized()    ? 1 : 0;
+    total++; passed += testEmbeddedAtomicCounterInitialized() ? 1 : 0;
 
     // Channel / spsc_queue tests
     total++; passed += testChannelBasicSendReceive()  ? 1 : 0;

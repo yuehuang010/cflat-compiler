@@ -2668,7 +2668,7 @@ public:
             ProcessPendingInstantiations();
         }
 
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned);
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty());
 
         compiler->InitializeBlock(&fn->front(), false);
 
@@ -3060,6 +3060,12 @@ public:
                             // Wrap named function in closure fat struct when declaring function<T>.
                             if (right && typeAndValue.IsFunctionPointer && !right->getType()->isStructTy())
                             {
+                                // Re-resolve by name to avoid picking a struct method that shares the
+                                // same plain key in functionTable (e.g. atomic_counter::add vs add).
+                                std::string funcName = assignmentExpression->getText();
+                                int expectedParams = (int)typeAndValue.FuncPtrParams.size();
+                                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams))
+                                    right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                     right = compiler->WrapBareValueAsFatStruct(fn);
                             }
@@ -3333,6 +3339,12 @@ public:
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
                 && right && !right->getType()->isStructTy())
             {
+                // Re-resolve by name to avoid picking a struct method that shares the
+                // same plain key in functionTable (e.g. atomic_counter::add vs add).
+                std::string funcName = assignCtx->getText();
+                int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
+                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams))
+                    right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                     right = compiler->WrapBareValueAsFatStruct(fn);
             }
@@ -5058,9 +5070,10 @@ public:
                                 {
                                     namedVar = globalNV;
                                 }
-                                else if (auto func = Compiler(ctx)->GetFunction(primaryIdentifier))
+                                else if (Compiler(ctx)->GetFunction(primaryIdentifier))
                                 {
-                                    namedVar.Primary = func;
+                                    namedVar.Primary = Compiler(ctx)->GetFunctionForFuncPtr(primaryIdentifier);
+                                    namedVar.CallerName = primaryIdentifier;
                                 }
                                 else
                                 {
@@ -7395,9 +7408,12 @@ public:
                 return globalNV;
         }
 
-        if (auto func = compiler->GetFunction(name))
+        if (compiler->GetFunction(name))
         {
-            namedVar.Primary = func;
+            // Use GetFunctionForFuncPtr so that a plain name resolves to the top-level
+            // function rather than a struct method registered under the same key.
+            namedVar.Primary = compiler->GetFunctionForFuncPtr(name);
+            namedVar.CallerName = name;
             return namedVar;
         }
 
@@ -7935,11 +7951,6 @@ public:
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
-                else
-                {
-                    std::cout << "Uninitialize field \"" << structName << "::" << typeValue.VariableName << "\".\n";
-                }
-
                 initializers.push_back(rvalue);
             }
 
@@ -7953,9 +7964,18 @@ public:
 
             for (auto rvalue : initializers)
             {
+                auto* destType = structType->getTypeAtIndex(structIndex);
+                // No explicit initializer on a struct-typed field — call its default ctor.
+                if (rvalue == nullptr && destType->isStructTy())
+                {
+                    std::string fieldTypeName = declList[structIndex].TypeName;
+                    if (compiler->GetFunction(fieldTypeName))
+                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                    else
+                        rvalue = llvm::Constant::getNullValue(destType);
+                }
                 if (rvalue != nullptr)
                 {
-                    auto* destType = structType->getTypeAtIndex(structIndex);
                     rvalue = compiler->Upconvert(rvalue, destType);
                     if (rvalue->getType() != destType && destType->isStructTy())
                     {
@@ -8060,7 +8080,7 @@ public:
                 {
                     declReturnsOwned = true;
                 }
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned);
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
             }
         }
 
@@ -9168,11 +9188,6 @@ public:
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
-                else
-                {
-                    std::cout << "Uninitialized field \"" << structName << "::" << typeValue.VariableName << "\".\n";
-                }
-
                 initializers.push_back(rvalue);
             }
 
@@ -9186,9 +9201,18 @@ public:
 
             for (auto rvalue : initializers)
             {
+                auto* destType = structType->getTypeAtIndex(structIndex);
+                // No explicit initializer on a struct-typed field — call its default ctor.
+                if (rvalue == nullptr && destType->isStructTy())
+                {
+                    std::string fieldTypeName = declList[structIndex].TypeName;
+                    if (compiler->GetFunction(fieldTypeName))
+                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                    else
+                        rvalue = llvm::Constant::getNullValue(destType);
+                }
                 if (rvalue != nullptr)
                 {
-                    auto* destType = structType->getTypeAtIndex(structIndex);
                     rvalue = compiler->Upconvert(rvalue, destType);
                     if (rvalue->getType() != destType && destType->isStructTy())
                     {
@@ -9269,7 +9293,7 @@ public:
                 {
                     declReturnsOwned = true;
                 }
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned);
+                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
             }
         }
 

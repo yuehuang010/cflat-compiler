@@ -375,6 +375,7 @@ public:
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) — caller must free
+        bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
     };
 
     struct InterfaceMethod
@@ -3112,12 +3113,20 @@ public:
         auto it = functionTable.find(functionName);
         if (it == functionTable.end() || it->second.empty())
             return {};
-        const auto& sym = it->second.front();
+
+        // Prefer non-method overloads so that a plain function name isn't
+        // shadowed by a struct method registered under the same key.
+        const FunctionSymbol* chosen = &it->second.front();
+        for (const auto& sym : it->second)
+        {
+            if (!sym.IsMethod) { chosen = &sym; break; }
+        }
+
         TypeAndValue tv;
         tv.IsFunctionPointer = true;
-        tv.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
-        tv.FuncPtrReturnPointer = sym.ReturnType.Pointer;
-        for (const auto& p : sym.Parameters)
+        tv.FuncPtrReturnTypeName = chosen->ReturnType.TypeName;
+        tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
+        for (const auto& p : chosen->Parameters)
         {
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
@@ -3266,7 +3275,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false)
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs, external);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -3286,6 +3295,7 @@ public:
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
                 .ReturnsOwned = returnsOwned,
+                .IsMethod = isMethod,
             };
 
             for (const auto& arg : arguments)
@@ -3345,7 +3355,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -3403,6 +3413,7 @@ public:
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
                 .ReturnsOwned = returnsOwned,
+                .IsMethod = isMethod,
             };
 
             for (const auto& arg : arguments)
@@ -3411,6 +3422,18 @@ public:
             }
 
             symList.push_back(funcSym);
+        }
+        else if (isMethod)
+        {
+            // ForwardRefScanner registered this symbol; propagate IsMethod in case it wasn't set there.
+            auto it = functionTable.find(functionName);
+            if (it != functionTable.end())
+            {
+                for (auto& sym : it->second)
+                {
+                    if (sym.Function == fn) { sym.IsMethod = true; break; }
+                }
+            }
         }
 
         return fn;
@@ -4017,6 +4040,12 @@ public:
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
                     if (val && !val->getType()->isStructTy())
                     {
+                        // Re-resolve by CallerName to skip method overloads sharing the same key.
+                        if (!arg.CallerName.empty())
+                        {
+                            if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, -1))
+                                val = correctFn;
+                        }
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
                             val = WrapBareValueAsFatStruct(fn);
                     }
@@ -4157,6 +4186,37 @@ public:
         }
 
         return module->getFunction(functionName);
+    }
+
+    // Like GetFunction, but prefers non-method (top-level) overloads.
+    // Used when assigning a named function to a function<T> variable to avoid
+    // picking a struct method that shares the same plain name.
+    llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1)
+    {
+        functionName = ResolveQualifiedName(functionName);
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end() || it->second.empty())
+            return module->getFunction(functionName);
+
+        const auto& overloads = it->second;
+        if (overloads.size() == 1)
+            return overloads.front().Function;
+
+        // Prefer non-method overloads with matching param count.
+        for (const auto& sym : overloads)
+        {
+            if (sym.IsMethod) continue;
+            if (expectedParamCount < 0 || (int)sym.Parameters.size() == expectedParamCount)
+                return sym.Function;
+        }
+        // Fallback: any overload whose effective (non-self) param count matches.
+        for (const auto& sym : overloads)
+        {
+            int effectiveCount = sym.IsMethod ? (int)sym.Parameters.size() - 1 : (int)sym.Parameters.size();
+            if (expectedParamCount < 0 || effectiveCount == expectedParamCount)
+                return sym.Function;
+        }
+        return overloads.front().Function;
     }
 
     NamedVariable GetLocalVariable(std::string name)
