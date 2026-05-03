@@ -12,7 +12,7 @@ echo.
 
 if not exist "%OUT%" mkdir "%OUT%"
 
-set FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle
+set FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle perf_yes_stdout perf_yes_channel
 
 echo Compiling benchmarks...
 for %%F in (%FILES%) do (

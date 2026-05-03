@@ -1,0 +1,64 @@
+import "list.cb";
+import "thread.cb";
+import "time.cb";
+import "channel.cb";
+import "stop_token.cb";
+
+channel<int> g_channel;
+
+program YesProducer
+{
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        while (!token.stop_requested())
+        {
+            g_channel.send(1);
+        }
+        return 0;
+    }
+};
+
+program YesConsumer
+{
+    i64 count = default;
+
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        int val = 0;
+        while (!token.stop_requested())
+        {
+            if (g_channel.try_receive(&val))
+            {
+                count = count + (i64)1;
+            }
+        }
+        return 0;
+    }
+};
+
+extern int main()
+{
+    list<string> args;
+
+    g_channel.init(4096);
+
+    YesProducer producer;
+    YesConsumer consumer;
+    producer.run(args);
+    consumer.run(args);
+
+    sleep(10000);
+
+    producer.RequestStop();
+    consumer.RequestStop();
+    producer.WaitForExit();
+    consumer.WaitForExit();
+
+    printf("\n--- Yes (channel) ---\n");
+    printf("  %lld Y/s\n", consumer.count / (i64)10);
+
+    g_channel.destroy();
+    return 0;
+}
