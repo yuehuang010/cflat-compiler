@@ -1,5 +1,6 @@
 import "list.cb";
 import "thread.cb";
+import "filesystem.cb";
 import "test_helper.cb";
 
 // ---------------------------------------------------------------------------
@@ -736,6 +737,40 @@ bool testSupervisorSpawnsChildren() {
 }
 
 // ---------------------------------------------------------------------------
+// Handle tracker tests
+// ---------------------------------------------------------------------------
+
+program TrackHandlesCrash {
+    string _path = "";
+
+    int main(move list<string> args) {
+        File f;
+        f.openWrite(_path);
+        // Intentionally crash without closing — tracker must close the handle
+        int* p = nullptr;
+        return *p;
+    }
+};
+
+bool testTrackHandles() {
+    bool result = true;
+    string path = "test_track_tmp.txt";
+    File.remove(path);
+
+    TrackHandlesCrash p;
+    p._path = path;
+    p.trackHandles = true;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("trackHandles crash exitCode", p.exitCode, -1);
+
+    // If the tracker closed the handle, we can delete the file (no sharing violation).
+    result &= Test("trackHandles handle closed on crash", File.remove(path), true);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -779,6 +814,7 @@ extern int main() {
     total++; passed += testWaitForExitTimeoutFast()         ? 1 : 0;
     total++; passed += testKillInfiniteLoop()               ? 1 : 0;
     total++; passed += testSupervisorSpawnsChildren()        ? 1 : 0;
+    total++; passed += testTrackHandles()                   ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -8169,11 +8169,12 @@ public:
             return;
         }
 
-        unsigned exitCodeIdx    = compiler->programTable[name].ExitCodeFieldIndex;
-        unsigned threadIdx      = compiler->programTable[name].ThreadFieldIndex;
-        unsigned allocatorIdx   = compiler->programTable[name].AllocatorFieldIndex;
-        unsigned onStdoutIdx    = compiler->programTable[name].OnStdoutFieldIndex;
-        unsigned stopSrcIdx     = compiler->programTable[name].StopSourceFieldIndex;
+        unsigned exitCodeIdx      = compiler->programTable[name].ExitCodeFieldIndex;
+        unsigned threadIdx        = compiler->programTable[name].ThreadFieldIndex;
+        unsigned allocatorIdx     = compiler->programTable[name].AllocatorFieldIndex;
+        unsigned onStdoutIdx      = compiler->programTable[name].OnStdoutFieldIndex;
+        unsigned stopSrcIdx       = compiler->programTable[name].StopSourceFieldIndex;
+        unsigned trackHandlesIdx  = compiler->programTable[name].TrackHandlesFieldIndex;
 
         auto* stopSrcInitFn        = FindMethodOf("init",           "stop_source");
         auto* stopSrcRequestStopFn = FindMethodOf("request_stop",   "stop_source");
@@ -8298,6 +8299,29 @@ public:
                 compiler->builder->CreateStore(onStdoutVal, stdoutHookGlobal);
             }
 
+            // Enable handle tracker: load self->trackHandles and store into __handle_tracker_enabled
+            llvm::GlobalVariable* handleTrackerEnabledGlobal = nullptr;
+            llvm::GlobalVariable* handleTrackerHeadGlobal    = nullptr;
+            {
+                auto it = compiler->globalNamedVariable.find("__handle_tracker_enabled");
+                if (it != compiler->globalNamedVariable.end()) handleTrackerEnabledGlobal = it->second;
+                auto it2 = compiler->globalNamedVariable.find("__handle_tracker_head");
+                if (it2 != compiler->globalNamedVariable.end()) handleTrackerHeadGlobal = it2->second;
+            }
+            if (handleTrackerEnabledGlobal)
+            {
+                auto* trackGEP = compiler->builder->CreateStructGEP(
+                    progType, self, trackHandlesIdx, "track_handles_gep");
+                // Field is int (i32) to avoid i1-in-ConstantStruct LLVM assertion; convert to i1 for the global
+                auto* trackI32 = compiler->builder->CreateLoad(
+                    llvm::Type::getInt32Ty(*compiler->context), trackGEP, "track_handles_i32");
+                auto* trackI1  = compiler->builder->CreateICmpNE(
+                    trackI32,
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                    "track_handles_val");
+                compiler->builder->CreateStore(trackI1, handleTrackerEnabledGlobal);
+            }
+
             // SEH basic blocks — four-way split replacing the old linear sequence.
             auto* normalBB   = llvm::BasicBlock::Create(*compiler->context, "main_normal",  trampolineFn);
             auto* dispatchBB = llvm::BasicBlock::Create(*compiler->context, "seh_dispatch", trampolineFn);
@@ -8349,6 +8373,61 @@ public:
             compiler->builder->CreateStore(
                 llvm::Constant::getNullValue(hookFnPtrType),
                 stdoutHookGlobal);
+
+            // Handle tracker cleanup: disable tracker first (so fclose won't re-enter the list),
+            // then walk the linked list and fclose any handles still open from a crash.
+            if (handleTrackerEnabledGlobal && handleTrackerHeadGlobal)
+            {
+                compiler->builder->CreateStore(
+                    llvm::ConstantInt::getFalse(*compiler->context), handleTrackerEnabledGlobal);
+
+                auto* fcloseTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
+                auto* fcloseFn = compiler->module->getOrInsertFunction("fclose", fcloseTy).getCallee();
+
+                auto* nodeTy = llvm::StructType::getTypeByName(*compiler->context, "__HandleNode");
+
+                auto* htrackLoopBB  = llvm::BasicBlock::Create(*compiler->context, "htrack_loop",  trampolineFn);
+                auto* htrackBodyBB  = llvm::BasicBlock::Create(*compiler->context, "htrack_body",  trampolineFn);
+                auto* htrackCloseBB = llvm::BasicBlock::Create(*compiler->context, "htrack_close", trampolineFn);
+                auto* htrackSkipBB  = llvm::BasicBlock::Create(*compiler->context, "htrack_skip",  trampolineFn);
+                auto* htrackDoneBB  = llvm::BasicBlock::Create(*compiler->context, "htrack_done",  trampolineFn);
+                compiler->builder->CreateBr(htrackLoopBB);
+
+                // Loop header: load head, exit if null
+                compiler->builder->SetInsertPoint(htrackLoopBB);
+                auto* headVal  = compiler->builder->CreateLoad(voidPtrType, handleTrackerHeadGlobal, "htrack_head");
+                auto* headNull = compiler->builder->CreateICmpEQ(
+                    headVal,
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                    "htrack_head_null");
+                compiler->builder->CreateCondBr(headNull, htrackDoneBB, htrackBodyBB);
+
+                // Loop body: load handle and next from node
+                compiler->builder->SetInsertPoint(htrackBodyBB);
+                auto* handleGEP = compiler->builder->CreateStructGEP(nodeTy, headVal, 0, "htrack_handle_gep");
+                auto* handleVal = compiler->builder->CreateLoad(voidPtrType, handleGEP, "htrack_handle");
+                auto* nextGEP   = compiler->builder->CreateStructGEP(nodeTy, headVal, 1, "htrack_next_gep");
+                auto* nextVal   = compiler->builder->CreateLoad(voidPtrType, nextGEP, "htrack_next");
+                auto* handleNull = compiler->builder->CreateICmpEQ(
+                    handleVal,
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                    "htrack_handle_null");
+                compiler->builder->CreateCondBr(handleNull, htrackSkipBB, htrackCloseBB);
+
+                // Close the handle
+                compiler->builder->SetInsertPoint(htrackCloseBB);
+                compiler->builder->CreateCall(fcloseTy, fcloseFn, {handleVal});
+                compiler->builder->CreateBr(htrackSkipBB);
+
+                // Advance head, free current node, continue loop
+                compiler->builder->SetInsertPoint(htrackSkipBB);
+                compiler->builder->CreateStore(nextVal, handleTrackerHeadGlobal);
+                compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {headVal});
+                compiler->builder->CreateBr(htrackLoopBB);
+
+                compiler->builder->SetInsertPoint(htrackDoneBB);
+            }
+
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
             auto* finalExitCode = compiler->builder->CreateLoad(i32Type, exitCodeGEP, "final_exit");
             compiler->CreateReturnCall(finalExitCode);
@@ -8677,19 +8756,22 @@ public:
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
                 || field.VariableName == "_allocator" || field.VariableName == "onStdout"
-                || field.VariableName == "inbox" || field.VariableName == "_stop_source")
+                || field.VariableName == "inbox" || field.VariableName == "_stop_source"
+                || field.VariableName == "trackHandles")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), inbox (channel<IMessage>), _stop_source (stop_source)
+        // onStdout (function<void(char*)>), inbox (channel<IMessage>), _stop_source (stop_source),
+        // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion)
         unsigned exitCodeFieldIndex    = (unsigned)declList.size();
         unsigned threadFieldIndex      = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex   = threadFieldIndex + 1;
         unsigned onStdoutFieldIndex    = allocatorFieldIndex + 1;
         unsigned inboxFieldIndex       = onStdoutFieldIndex + 1;
         unsigned stopSrcFieldIndex     = inboxFieldIndex + 1;
+        unsigned trackHandlesFieldIndex = stopSrcFieldIndex + 1;
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -8724,6 +8806,11 @@ public:
             stopSrcField.TypeName     = "stop_source";
             stopSrcField.VariableName = "_stop_source";
             declList.push_back(stopSrcField);
+
+            LLVMBackend::DeclTypeAndValue trackHandlesField;
+            trackHandlesField.TypeName     = "int";
+            trackHandlesField.VariableName = "trackHandles";
+            declList.push_back(trackHandlesField);
         }
 
         // Build struct type with user fields + synthetic fields
@@ -8760,6 +8847,15 @@ public:
                 {
                     auto* destType = structType->getTypeAtIndex(idx);
                     rvalue = compiler->Upconvert(rvalue, destType);
+                    if (rvalue->getType() != destType && destType->isStructTy())
+                    {
+                        // Initializer type doesn't match struct field type (same fallback as ParseStructDefinition).
+                        std::string fieldTypeName = declList[idx].TypeName;
+                        if (compiler->GetFunction(fieldTypeName))
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                        else
+                            rvalue = llvm::Constant::getNullValue(destType);
+                    }
                     structVal = compiler->CreateInsertValue(structVal, rvalue, idx);
                 }
                 idx++;
@@ -8810,6 +8906,12 @@ public:
                     stopSrcCtorFn->getFunctionType(), stopSrcCtorFn, {}, "stop_src_zero");
                 structVal = compiler->CreateInsertValue(structVal, stopSrcInitVal, stopSrcFieldIndex);
             }
+
+            // Synthetic field: trackHandles = 0 (int, not bool — avoids i1-in-ConstantStruct assertion)
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                trackHandlesFieldIndex);
 
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
@@ -8864,9 +8966,10 @@ public:
         compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
-        compiler->programTable[name].OnStdoutFieldIndex    = onStdoutFieldIndex;
-        compiler->programTable[name].InboxFieldIndex       = inboxFieldIndex;
-        compiler->programTable[name].StopSourceFieldIndex  = stopSrcFieldIndex;
+        compiler->programTable[name].OnStdoutFieldIndex      = onStdoutFieldIndex;
+        compiler->programTable[name].InboxFieldIndex         = inboxFieldIndex;
+        compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
+        compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);

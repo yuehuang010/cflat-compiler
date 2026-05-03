@@ -14,29 +14,33 @@ class File
 
     bool openRead(string path)
     {
-        if (_handle != nullptr) fclose(_handle);
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
         _handle = fopen(path.data(), "rb");
+        if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool openWrite(string path)
     {
-        if (_handle != nullptr) fclose(_handle);
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
         _handle = fopen(path.data(), "wb");
+        if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool openAppend(string path)
     {
-        if (_handle != nullptr) fclose(_handle);
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
         _handle = fopen(path.data(), "ab");
+        if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool open(string path, string mode)
     {
-        if (_handle != nullptr) fclose(_handle);
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
         _handle = fopen(path.data(), mode.data());
+        if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
@@ -44,6 +48,7 @@ class File
     {
         if (_handle != nullptr)
         {
+            __handle_tracker_remove(_handle);
             fclose(_handle);
             _handle = nullptr;
         }
@@ -201,7 +206,11 @@ class File
 
     ~File()
     {
-        if (_handle != nullptr) fclose(_handle);
+        if (_handle != nullptr)
+        {
+            __handle_tracker_remove(_handle);
+            fclose(_handle);
+        }
     }
 };
 

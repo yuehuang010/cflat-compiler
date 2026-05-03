@@ -116,3 +116,40 @@ extern int atexit(void* func);
 // === Other Utilities ===
 extern int rand();
 extern void srand(u32 seed);
+
+// === Handle Tracker ===
+// Per-thread linked-list tracker for open FILE handles.
+// Enabled by the program trampoline when trackHandles = true.
+struct __HandleNode {
+    void* handle = nullptr;
+    void* next   = nullptr;
+};
+
+thread_local bool  __handle_tracker_enabled = false;
+thread_local void* __handle_tracker_head    = nullptr;
+
+void __handle_tracker_add(void* handle) {
+    if (!__handle_tracker_enabled) return;
+    __HandleNode* node = (__HandleNode*)malloc((i64)16);
+    node->handle = handle;
+    node->next   = __handle_tracker_head;
+    __handle_tracker_head = (void*)node;
+}
+
+void __handle_tracker_remove(void* handle) {
+    if (!__handle_tracker_enabled) return;
+    __HandleNode* prev = nullptr;
+    __HandleNode* curr = (__HandleNode*)__handle_tracker_head;
+    while (curr != nullptr) {
+        if (curr->handle == handle) {
+            if (prev == nullptr)
+                __handle_tracker_head = curr->next;
+            else
+                prev->next = curr->next;
+            free((void*)curr);
+            return;
+        }
+        prev = curr;
+        curr = (__HandleNode*)curr->next;
+    }
+}
