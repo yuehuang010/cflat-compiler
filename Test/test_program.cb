@@ -440,6 +440,124 @@ bool testOnStdoutNullByDefault() {
 }
 
 // ---------------------------------------------------------------------------
+// onStdin tests
+// ---------------------------------------------------------------------------
+
+// Canned line provider: returns malloc'd copies of lines by index, then nullptr (EOF).
+// The runtime's __stdin_next_char frees each returned pointer, so we must heap-allocate.
+int g_stdin_idx = 0;
+
+char* provide_stdin() {
+    int idx = g_stdin_idx;
+    g_stdin_idx++;
+    const char* src = nullptr;
+    if (idx == 0) src = "hello\n";
+    else if (idx == 1) src = "world\n";
+    else if (idx == 2) src = "foo\n";
+    else return nullptr;
+    i64 len = (i64)strlen(src);
+    char* s = (char*)malloc(len + 1);
+    strcpy(s, src);
+    return s;
+}
+
+// Canned integer provider for scanf tests — same malloc convention.
+int g_scanf_idx = 0;
+
+char* provide_stdin_scanf() {
+    int idx = g_scanf_idx;
+    g_scanf_idx++;
+    const char* src = nullptr;
+    if (idx == 0) src = "10\n";
+    else if (idx == 1) src = "20\n";
+    else if (idx == 2) src = "30\n";
+    else return nullptr;
+    i64 len = (i64)strlen(src);
+    char* s = (char*)malloc(len + 1);
+    strcpy(s, src);
+    return s;
+}
+
+// Program that reads lineCount lines via fgets and accumulates their lengths.
+program ReadLinesFgets {
+    int lineCount = 3;
+    int totalLen  = 0;
+
+    int main(move list<string> args) {
+        char* buf = (char*)malloc(256);
+        int i = 0;
+        while (i < lineCount) {
+            void* stdinStream = __acrt_iob_func(0);
+            if (fgets(buf, 256, stdinStream) == nullptr) break;
+            totalLen += strlen(buf);
+            i++;
+        }
+        free(buf);
+        return totalLen;
+    }
+};
+
+// Program that reads lineCount integers via scanf and sums them.
+program ReadLinesScanf {
+    int lineCount = 3;
+    int total     = 0;
+
+    int main(move list<string> args) {
+        int i = 0;
+        while (i < lineCount) {
+            int n = 0;
+            if (scanf("%d", &n) != 1) break;
+            total += n;
+            i++;
+        }
+        return total;
+    }
+};
+
+bool testOnStdinFgets() {
+    bool result = true;
+    g_stdin_idx = 0;
+    ReadLinesFgets p;
+    p.lineCount = 3;
+    p.onStdin = provide_stdin;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    // "hello\n"=6, "world\n"=6, "foo\n"=4 -> 16
+    result &= Test("onStdin fgets total", p.exitCode, 16);
+    result &= Test("onStdin fgets totalLen", p.totalLen, 16);
+    return result;
+}
+
+bool testOnStdinScanf() {
+    bool result = true;
+    g_scanf_idx = 0;
+    ReadLinesScanf p;
+    p.lineCount = 3;
+    p.onStdin = provide_stdin_scanf;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    // 10 + 20 + 30 = 60
+    result &= Test("onStdin scanf total", p.exitCode, 60);
+    result &= Test("onStdin scanf field", p.total, 60);
+    return result;
+}
+
+bool testOnStdinNullByDefault() {
+    bool result = true;
+    // When onStdin is not set, the program should still run (it won't block since
+    // lineCount=0 means no reads). We just verify exitCode is correct.
+    ReadLinesFgets p;
+    p.lineCount = 0;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("onStdin default null exitCode", p.exitCode, 0);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // inbox (actor mailbox) tests
 // ---------------------------------------------------------------------------
 
@@ -800,6 +918,9 @@ extern int main() {
     total++; passed += testOnStdoutNamedCallback()          ? 1 : 0;
     total++; passed += testOnStdoutSecondCallback()          ? 1 : 0;
     total++; passed += testOnStdoutNullByDefault()          ? 1 : 0;
+    total++; passed += testOnStdinFgets()                   ? 1 : 0;
+    total++; passed += testOnStdinScanf()                   ? 1 : 0;
+    total++; passed += testOnStdinNullByDefault()           ? 1 : 0;
     total++; passed += testInboxSingleMessage()              ? 1 : 0;
     total++; passed += testInboxMultipleMessages()           ? 1 : 0;
     total++; passed += testInboxSumMessages()                ? 1 : 0;

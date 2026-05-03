@@ -8221,6 +8221,7 @@ public:
         unsigned threadIdx        = compiler->programTable[name].ThreadFieldIndex;
         unsigned allocatorIdx     = compiler->programTable[name].AllocatorFieldIndex;
         unsigned onStdoutIdx      = compiler->programTable[name].OnStdoutFieldIndex;
+        unsigned onStdinIdx       = compiler->programTable[name].OnStdinFieldIndex;
         unsigned stopSrcIdx       = compiler->programTable[name].StopSourceFieldIndex;
         unsigned trackHandlesIdx  = compiler->programTable[name].TrackHandlesFieldIndex;
 
@@ -8243,6 +8244,14 @@ public:
             return;
         }
         auto* hookFnPtrType = stdoutHookGlobal->getValueType(); // void(char*)* LLVM type
+
+        // Look up the thread-local stdin hook global (declared in cruntime.cb); optional
+        llvm::GlobalVariable* stdinHookGlobal = nullptr;
+        {
+            auto it = compiler->globalNamedVariable.find("__stdin_hook");
+            if (it != compiler->globalNamedVariable.end()) stdinHookGlobal = it->second;
+        }
+        auto* stdinHookFnPtrType = stdinHookGlobal ? stdinHookGlobal->getValueType() : nullptr;
 
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
@@ -8347,6 +8356,16 @@ public:
                 compiler->builder->CreateStore(onStdoutVal, stdoutHookGlobal);
             }
 
+            // Install stdin hook: load self->onStdin and store into __stdin_hook
+            if (stdinHookGlobal)
+            {
+                auto* onStdinGEP = compiler->builder->CreateStructGEP(
+                    progType, self, onStdinIdx, "on_stdin_gep");
+                auto* onStdinVal = compiler->builder->CreateLoad(
+                    stdinHookFnPtrType, onStdinGEP, "on_stdin_fn");
+                compiler->builder->CreateStore(onStdinVal, stdinHookGlobal);
+            }
+
             // Enable handle tracker: load self->trackHandles and store into __handle_tracker_enabled
             llvm::GlobalVariable* handleTrackerEnabledGlobal = nullptr;
             llvm::GlobalVariable* handleTrackerHeadGlobal    = nullptr;
@@ -8419,8 +8438,10 @@ public:
             compiler->builder->SetInsertPoint(cleanupBB);
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
             compiler->builder->CreateStore(
-                llvm::Constant::getNullValue(hookFnPtrType),
-                stdoutHookGlobal);
+                llvm::Constant::getNullValue(hookFnPtrType), stdoutHookGlobal);
+            if (stdinHookGlobal)
+                compiler->builder->CreateStore(
+                    llvm::Constant::getNullValue(stdinHookFnPtrType), stdinHookGlobal);
 
             // Handle tracker cleanup: disable tracker first (so fclose won't re-enter the list),
             // then walk the linked list and fclose any handles still open from a crash.
@@ -8818,14 +8839,16 @@ public:
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
+        // onStdout (function<void(char*)>), onStdin (function<char*()>),
+        // inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
         // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion)
-        unsigned exitCodeFieldIndex    = (unsigned)declList.size();
-        unsigned threadFieldIndex      = exitCodeFieldIndex + 1;
-        unsigned allocatorFieldIndex   = threadFieldIndex + 1;
-        unsigned onStdoutFieldIndex    = allocatorFieldIndex + 1;
-        unsigned inboxFieldIndex       = onStdoutFieldIndex + 1;
-        unsigned stopSrcFieldIndex     = inboxFieldIndex + 1;
+        unsigned exitCodeFieldIndex     = (unsigned)declList.size();
+        unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
+        unsigned allocatorFieldIndex    = threadFieldIndex + 1;
+        unsigned onStdoutFieldIndex     = allocatorFieldIndex + 1;
+        unsigned onStdinFieldIndex      = onStdoutFieldIndex + 1;
+        unsigned inboxFieldIndex        = onStdinFieldIndex + 1;
+        unsigned stopSrcFieldIndex      = inboxFieldIndex + 1;
         unsigned trackHandlesFieldIndex = stopSrcFieldIndex + 1;
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
@@ -8851,6 +8874,14 @@ public:
             onStdoutField.FuncPtrReturnTypeName = "void";
             onStdoutField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdoutField);
+
+            LLVMBackend::DeclTypeAndValue onStdinField;
+            onStdinField.VariableName          = "onStdin";
+            onStdinField.IsFunctionPointer     = true;
+            onStdinField.FuncPtrReturnTypeName = "char";
+            onStdinField.FuncPtrReturnPointer  = true;
+            onStdinField.FuncPtrParams         = {};
+            declList.push_back(onStdinField);
 
             // inbox: IQueue<IMessage> fat-ptr — swappable before run() just like _allocator.
             // By default the constructor pre-allocates a channel<IMessage> and builds the fat-ptr.
@@ -8943,12 +8974,20 @@ public:
                     structVal, llvm::Constant::getNullValue(fatTy), allocatorFieldIndex);
             }
 
-            // Synthetic field: onStdout = nullptr (fat struct {i8*, i8*})
+            // Synthetic field: onStdout = nullptr (fat closure struct {i8*, i8*})
             {
                 auto& onStdoutDecl = declList[onStdoutFieldIndex];
                 auto* fieldType = compiler->GetType(onStdoutDecl);
-                auto* nullVal = llvm::Constant::getNullValue(fieldType);
-                structVal = compiler->CreateInsertValue(structVal, nullVal, onStdoutFieldIndex);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdoutFieldIndex);
+            }
+
+            // Synthetic field: onStdin = nullptr (fat closure struct {i8*, i8*})
+            {
+                auto& onStdinDecl = declList[onStdinFieldIndex];
+                auto* fieldType = compiler->GetType(onStdinDecl);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdinFieldIndex);
             }
 
             // Synthetic field: inbox = IQueue<IMessage> fat-ptr pointing to a heap-allocated
@@ -9049,6 +9088,7 @@ public:
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
         compiler->programTable[name].OnStdoutFieldIndex      = onStdoutFieldIndex;
+        compiler->programTable[name].OnStdinFieldIndex       = onStdinFieldIndex;
         compiler->programTable[name].InboxFieldIndex         = inboxFieldIndex;
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;

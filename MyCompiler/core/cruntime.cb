@@ -11,6 +11,14 @@ extern void* realloc(void* ptr, i64 size);
 thread_local function<void(char*)> __stdout_hook = default;
 thread_local bool __stdout_in_hook = false;  // re-entrancy guard: callbacks may call printf
 
+// Per-thread stdin hook set by 'program' constructs. When non-null, fgets/scanf
+// read from the hook instead of the real console. The line buffer and position
+// cursor let one hook call serve multiple character-level reads (e.g. scanf).
+thread_local function<char*()> __stdin_hook     = default;
+thread_local bool              __stdin_in_hook  = false;  // re-entrancy guard
+thread_local char*             __stdin_line     = nullptr; // current line from hook
+thread_local int               __stdin_line_pos = 0;       // read cursor within __stdin_line
+
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
@@ -74,6 +82,104 @@ extern int vsprintf(char* buf, const char* fmt, va_list ap) {
 
 extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
     return __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
+}
+
+// === Stdin hook support ===
+
+// Windows CRT internals for the scanf fallback and hooked sscanf path.
+extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+extern int __stdio_common_vsscanf(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
+
+// Used by the fgets fallback to read one character from any stream.
+extern int fgetc(void* stream);
+
+// Internal: return next character from the hook line-buffer, refilling via the hook
+// when the current line is exhausted.  Returns -1 on EOF (hook returned nullptr).
+int __stdin_next_char() {
+    if (__stdin_line == nullptr || __stdin_line[__stdin_line_pos] == '\0') {
+        if (__stdin_line != nullptr) { free(__stdin_line); __stdin_line = nullptr; }
+        __stdin_in_hook = true;
+        __stdin_line = __stdin_hook();
+        __stdin_in_hook = false;
+        __stdin_line_pos = 0;
+        if (__stdin_line == nullptr) return -1;  // EOF
+    }
+    int c = (int)(u8)__stdin_line[__stdin_line_pos];
+    __stdin_line_pos++;
+    return c;
+}
+
+// fgets — when the stdin hook is active and the stream is stdin, serve bytes from
+// the hook line-buffer instead of blocking on the real console.
+extern char* fgets(char* buf, int count, void* stream) {
+    void* stdinStream = __acrt_iob_func(0);
+    if (__stdin_hook != nullptr && !__stdin_in_hook && stream == stdinStream) {
+        int i = 0;
+        while (i < count - 1) {
+            int c = __stdin_next_char();
+            if (c == -1) { if (i == 0) return nullptr; break; }  // EOF
+            buf[i] = (char)c;
+            i++;
+            if (c == '\n') break;
+        }
+        buf[i] = '\0';
+        return i > 0 ? buf : nullptr;
+    }
+    // Fallback: read character by character from the real stream.
+    if (count <= 0) return nullptr;
+    int i = 0;
+    while (i < count - 1) {
+        int c = fgetc(stream);
+        if (c == -1) { if (i == 0) return nullptr; break; }  // EOF
+        buf[i] = (char)c;
+        i++;
+        if (c == '\n') break;
+    }
+    buf[i] = '\0';
+    return i > 0 ? buf : nullptr;
+}
+
+// scanf — when the stdin hook is active, copy the current line into a local buffer
+// and parse it with the Windows CRT vsscanf backend.  After parsing the line cursor
+// advances to EOL (correct for one-value-per-line; multi-value same-line reads are
+// a known v1 limitation).
+extern int scanf(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    if (__stdin_hook != nullptr && !__stdin_in_hook) {
+        // Refill the line buffer if exhausted.
+        if (__stdin_line == nullptr || __stdin_line[__stdin_line_pos] == '\0') {
+            if (__stdin_line != nullptr) { free(__stdin_line); __stdin_line = nullptr; }
+            __stdin_in_hook = true;
+            __stdin_line = __stdin_hook();
+            __stdin_in_hook = false;
+            __stdin_line_pos = 0;
+            if (__stdin_line == nullptr) { va_end(ap); return -1; }  // EOF
+        }
+        // Copy the remaining portion of the line into a fresh buffer for vsscanf.
+        // This avoids ptr+int pointer arithmetic which CFlat doesn't support directly.
+        char* tmp = (char*)malloc(4096);
+        int ti = 0;
+        int si = __stdin_line_pos;
+        while (ti < 4095 && __stdin_line[si] != '\0') { tmp[ti] = __stdin_line[si]; ti++; si++; }
+        tmp[ti] = '\0';
+        int result = __stdio_common_vsscanf(0, tmp, (i64)ti, fmt, nullptr, ap);
+        free(tmp);
+        // Advance the line cursor to end of line (and past the newline) so the
+        // next call sees a fresh line rather than stalling on the trailing '\n'.
+        if (result > 0) {
+            while (__stdin_line[__stdin_line_pos] != '\0' && __stdin_line[__stdin_line_pos] != '\n')
+                __stdin_line_pos++;
+            if (__stdin_line[__stdin_line_pos] == '\n')
+                __stdin_line_pos++;
+        }
+        va_end(ap);
+        return result;
+    }
+    void* stdinStream = __acrt_iob_func(0);
+    int result = __stdio_common_vfscanf(0, stdinStream, fmt, nullptr, ap);
+    va_end(ap);
+    return result;
 }
 
 // === String Functions ===
