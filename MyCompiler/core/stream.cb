@@ -1,0 +1,33 @@
+import "channel.cb";
+import "cruntime.cb";
+
+struct stream {
+    channel<i64> _channel;
+    int bufferSize = 32;
+
+    void init() {
+        _channel.init(bufferSize);
+    }
+
+    // Called by the onStdout hook. Copies data into an owned buffer and enqueues it.
+    // The caller (cruntime printf wrapper) frees `data` after this returns.
+    void write(char* data) {
+        i64 len = (i64)strlen(data);
+        char* copy = (char*)malloc(len + 1);
+        memcpy(copy, data, len + 1);
+        _channel.send((i64)copy);
+    }
+
+    // Called by the onStdin hook. Blocks until a line is available.
+    // Returns the owned char* (cruntime frees it); returns nullptr to signal EOF.
+    char* read() {
+        i64 out = _channel.receive();
+        return (char*)out;
+    }
+
+    // Signal EOF to the consumer. Must be called after the producer program exits.
+    // Sends a nullptr sentinel so the consumer's blocking read() returns nullptr (EOF).
+    void close() {
+        _channel.send(0);
+    }
+};

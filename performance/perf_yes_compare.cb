@@ -1,9 +1,10 @@
-// Throughput comparison across four producer-consumer variants.
+// Throughput comparison across five producer-consumer variants.
 // Each variant runs for BENCH_SECS seconds; results are printed as a table.
 //
 //   channel   + program    — MPMC bounded channel, program actor overhead
 //   spsc_queue + program   — wait-free SPSC ring, program actor overhead
 //   channel   + raw Thread — same channel, raw Win32 threads (no program overhead)
+//   stream    + program    — printf/fgets pipe via stream struct (>> operator)
 //   single-threaded loop   — no queue, no threads; tight increment loop (ceiling)
 //
 // All threaded variants use non-blocking push/pop so the stop flag is checked promptly.
@@ -13,6 +14,7 @@ import "thread.cb";
 import "time.cb";
 import "channel.cb";
 import "spsc_queue.cb";
+import "stream.cb";
 import "stop_token.cb";
 
 extern int  __atomic_i32_load(int* ptr);
@@ -102,6 +104,34 @@ int raw_consumer(void* ctx)
     return 0;
 }
 
+// ── Variant 4: stream + program (printf → fgets pipe) ────────────────────────
+
+stream g_stream;
+
+program StreamProducer
+{
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        while (!token.stop_requested()) { printf("Y\n"); }
+        return 0;
+    }
+};
+
+program StreamConsumer
+{
+    i64 count = default;
+
+    int main(move list<string> args)
+    {
+        char* buf = (char*)malloc(64);
+        void* stdinStream = __acrt_iob_func(0);
+        while (fgets(buf, 64, stdinStream) != nullptr) { count = count + (i64)1; }
+        free(buf);
+        return 0;
+    }
+};
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -113,7 +143,7 @@ extern int main()
     printf("Running each variant for %d seconds...\n\n", BENCH_SECS);
 
     // variant 1
-    printf("[1/4] channel   + program\n");
+    printf("[1/5] channel   + program\n");
     g_ch.init(4096);
     ChProducer  chProd;
     ChConsumer  chCons;
@@ -128,7 +158,7 @@ extern int main()
     g_ch.destroy();
 
     // variant 2
-    printf("[2/4] spsc_queue + program\n");
+    printf("[2/5] spsc_queue + program\n");
     g_spsc.init(4096);
     SpscProducer spscProd;
     SpscConsumer spscCons;
@@ -143,7 +173,7 @@ extern int main()
     g_spsc.destroy();
 
     // variant 3
-    printf("[3/4] channel   + raw Thread\n");
+    printf("[3/5] channel   + raw Thread\n");
     g_ch2.init(4096);
     Thread tProd;
     Thread tCons;
@@ -156,8 +186,25 @@ extern int main()
     i64 raw_tps = g_raw_count / dur_s;
     g_ch2.destroy();
 
-    // variant 4: single-threaded tight loop — no queue, no threads
-    printf("[4/4] single-threaded loop\n");
+    // variant 4: stream + program (printf/fgets pipe)
+    printf("[4/5] stream    + program\n");
+    g_stream.bufferSize = 4096;
+    g_stream.init();
+    StreamProducer strProd;
+    StreamConsumer strCons;
+    strProd >> g_stream;
+    g_stream >> strCons;
+    strProd.run(args);
+    strCons.run(args);
+    sleep(dur_ms);
+    strProd.RequestStop();
+    strProd.WaitForExit();
+    g_stream.close();
+    strCons.WaitForExit();
+    i64 stream_tps = strCons.count / dur_s;
+
+    // variant 5: single-threaded tight loop — no queue, no threads
+    printf("[5/5] single-threaded loop\n");
     Stopwatch sw;
     sw.start();
     i64 st_count = (i64)0;
@@ -171,6 +218,7 @@ extern int main()
     printf("%-32s %15lld\n", "spsc_queue + program",        spsc_tps);
     printf("%-32s %15lld\n", "channel   + program",         ch_tps);
     printf("%-32s %15lld\n", "channel   + raw Thread",      raw_tps);
+    printf("%-32s %15lld\n", "stream    + program",         stream_tps);
     printf("\n");
 
     return 0;

@@ -3977,6 +3977,128 @@ public:
         return {};
     }
 
+    // Walk a single-child expression chain to the leaf Identifier terminal.
+    // Returns the identifier name, or "" if the expression is complex (e.g., arithmetic, member access).
+    std::string TryGetSimpleIdentifier(antlr4::ParserRuleContext* ctx)
+    {
+        if (!ctx) return "";
+        auto& children = ctx->children;
+        if (children.size() == 1)
+        {
+            if (auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(children[0]))
+            {
+                if (term->getSymbol()->getType() == CFlatLexer::Identifier)
+                    return term->getText();
+            }
+            if (auto* child = dynamic_cast<antlr4::ParserRuleContext*>(children[0]))
+                return TryGetSimpleIdentifier(child);
+        }
+        return "";
+    }
+
+    // Find the llvm::Function* for a method named `methodName` whose first parameter is `stream`.
+    llvm::Function* FindStreamMethodFn(LLVMBackend* compiler, const std::string& methodName)
+    {
+        auto it = compiler->functionTable.find(methodName);
+        if (it == compiler->functionTable.end()) return nullptr;
+        for (const auto& sym : it->second)
+        {
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == "stream")
+                return sym.Function;
+        }
+        return nullptr;
+    }
+
+    // Wire p1.onStdout to write into the stream. Called for `p1 >> s`.
+    void EmitProgramToStreamWire(const std::string& progName,
+        llvm::Value* progStorage, llvm::Value* streamStorage,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto* i8PtrTy  = compiler->builder->getInt8Ty()->getPointerTo();
+
+        auto* writeFn = FindStreamMethodFn(compiler, "write");
+        if (!writeFn)
+        {
+            LogErrorContext(ctx, "stream::write not found — import \"stream.cb\" before using >>.");
+            return;
+        }
+
+        // Create/reuse __stream_write_shim(i8* env, char* data) — casts env to stream*, calls write.
+        llvm::Function* shim = compiler->module->getFunction("__stream_write_shim");
+        if (!shim)
+        {
+            auto* charPtrTy = i8PtrTy;  // char* and i8* are the same in LLVM
+            auto* shimTy    = llvm::FunctionType::get(
+                compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy}, false);
+            shim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
+                "__stream_write_shim", *compiler->module);
+            auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
+            llvm::IRBuilder<> b(bb);
+            auto* streamTy = compiler->GetDataStructure("stream").StructType;
+            auto* selfPtr  = b.CreateBitCast(shim->getArg(0), streamTy->getPointerTo(), "stream_self");
+            b.CreateCall(writeFn->getFunctionType(), writeFn, {selfPtr, shim->getArg(1)});
+            b.CreateRetVoid();
+        }
+
+        // Build fat closure {shim_i8*, stream_i8*} and store into prog.onStdout.
+        auto* shimI8 = compiler->builder->CreateBitCast(shim, i8PtrTy, "write_shim_i8");
+        auto* envI8  = compiler->builder->CreateBitCast(streamStorage, i8PtrTy, "stream_env_i8");
+        auto* fatTy  = compiler->GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(fatTy);
+        fat = compiler->builder->CreateInsertValue(fat, shimI8, {0u});
+        fat = compiler->builder->CreateInsertValue(fat, envI8,  {1u});
+
+        auto& pd  = compiler->programTable[progName];
+        auto* gep = compiler->builder->CreateStructGEP(
+            pd.StructType, progStorage, pd.OnStdoutFieldIndex, "on_stdout_gep");
+        compiler->builder->CreateStore(fat, gep);
+    }
+
+    // Wire p2.onStdin to read from the stream. Called for `s >> p2`.
+    void EmitStreamToProgramWire(llvm::Value* streamStorage,
+        const std::string& progName, llvm::Value* progStorage,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto* i8PtrTy  = compiler->builder->getInt8Ty()->getPointerTo();
+
+        auto* readFn = FindStreamMethodFn(compiler, "read");
+        if (!readFn)
+        {
+            LogErrorContext(ctx, "stream::read not found — import \"stream.cb\" before using >>.");
+            return;
+        }
+
+        // Create/reuse __stream_read_shim(i8* env) -> char* — casts env to stream*, calls read.
+        llvm::Function* shim = compiler->module->getFunction("__stream_read_shim");
+        if (!shim)
+        {
+            auto* charPtrTy = i8PtrTy;
+            auto* shimTy    = llvm::FunctionType::get(charPtrTy, {i8PtrTy}, false);
+            shim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
+                "__stream_read_shim", *compiler->module);
+            auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
+            llvm::IRBuilder<> b(bb);
+            auto* streamTy = compiler->GetDataStructure("stream").StructType;
+            auto* selfPtr  = b.CreateBitCast(shim->getArg(0), streamTy->getPointerTo(), "stream_self");
+            auto* result   = b.CreateCall(readFn->getFunctionType(), readFn, {selfPtr}, "line");
+            b.CreateRet(result);
+        }
+
+        auto* shimI8 = compiler->builder->CreateBitCast(shim, i8PtrTy, "read_shim_i8");
+        auto* envI8  = compiler->builder->CreateBitCast(streamStorage, i8PtrTy, "stream_env_i8");
+        auto* fatTy  = compiler->GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(fatTy);
+        fat = compiler->builder->CreateInsertValue(fat, shimI8, {0u});
+        fat = compiler->builder->CreateInsertValue(fat, envI8,  {1u});
+
+        auto& pd  = compiler->programTable[progName];
+        auto* gep = compiler->builder->CreateStructGEP(
+            pd.StructType, progStorage, pd.OnStdinFieldIndex, "on_stdin_gep");
+        compiler->builder->CreateStore(fat, gep);
+    }
+
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
@@ -3993,6 +4115,50 @@ public:
             std::string op = ctx->children[1]->getText();
             if (op == ">" && ctx->children.size() > 2 && ctx->children[2]->getText() == ">")
                 op = ">>";
+
+            if (op == ">>")
+            {
+                auto* compiler = Compiler(ctx);
+                std::string lhsName = TryGetSimpleIdentifier(nextCtxs[0]);
+                std::string rhsName = TryGetSimpleIdentifier(nextCtxs[1]);
+
+                auto lhsNV = lhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(lhsName);
+                if (!lhsName.empty() && lhsNV.Storage == nullptr)
+                    lhsNV = compiler->GetGlobalVariableNV(lhsName);
+                auto rhsNV = rhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(rhsName);
+                if (!rhsName.empty() && rhsNV.Storage == nullptr)
+                    rhsNV = compiler->GetGlobalVariableNV(rhsName);
+
+                const std::string& lhsType = lhsNV.TypeAndValue.TypeName;
+                const std::string& rhsType = rhsNV.TypeAndValue.TypeName;
+                llvm::Value* lhsStorage    = lhsNV.Storage;
+                llvm::Value* rhsStorage    = rhsNV.Storage;
+
+                bool lhsIsProgram = !lhsType.empty() && compiler->programTable.count(lhsType) > 0;
+                bool rhsIsProgram = !rhsType.empty() && compiler->programTable.count(rhsType) > 0;
+                bool lhsIsStream  = lhsType == "stream";
+                bool rhsIsStream  = rhsType == "stream";
+
+                if (lhsIsProgram && rhsIsStream && lhsStorage && rhsStorage)
+                {
+                    EmitProgramToStreamWire(lhsType, lhsStorage, rhsStorage, ctx);
+                    return rv;  // return stream value so `p1 >> s >> p2` can chain
+                }
+                if (lhsIsStream && rhsIsProgram && rhsStorage)
+                {
+                    llvm::Value* streamPtr = lhsStorage;
+                    if (!streamPtr)
+                    {
+                        // Spill loaded value (chain case: `(p1 >> s) >> p2` produces a loaded stream)
+                        auto* streamTy = compiler->GetDataStructure("stream").StructType;
+                        streamPtr = compiler->builder->CreateAlloca(streamTy, nullptr, "stream_spill");
+                        compiler->builder->CreateStore(lv.value, streamPtr);
+                    }
+                    EmitStreamToProgramWire(streamPtr, rhsType, rhsStorage, ctx);
+                    return rv;  // return program value
+                }
+            }
+
             auto result = Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };
         }
