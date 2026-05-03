@@ -334,9 +334,12 @@ public:
         unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (IAllocator fat-ptr)
         unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
         unsigned OnStdinFieldIndex = 0;                // struct field index of onStdin (function<char*()>)
+        unsigned OnStdinReturnFieldIndex = 0;          // struct field index of onStdinReturn (function<void(char*)>)
         unsigned InboxFieldIndex = 0;                  // struct field index of inbox (channel<IMessage>)
         unsigned StopSourceFieldIndex = 0;             // struct field index of _stop_source (stop_source)
         unsigned TrackHandlesFieldIndex = 0;           // struct field index of trackHandles (bool)
+        unsigned OutFieldIndex      = (unsigned)-1;     // struct field index of _out (stream*); -1 when stream.cb not imported
+        unsigned InStreamFieldIndex = (unsigned)-1;     // struct field index of _in  (stream*); -1 when stream.cb not imported
     };
 
     class StackState
@@ -2383,6 +2386,17 @@ public:
     /// </summary>
     llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "")
     {
+        // When the base is a GlobalVariable (a Constant), IRBuilder's ConstantFolder
+        // tries to fold the GEP into a ConstantExpr. In LLVM 18 opaque pointer mode
+        // this internally calls ConstantExpr::getCast with an invalid type combination,
+        // triggering an assertion. Bypass the folder by inserting a real GEP instruction.
+        if (llvm::isa<llvm::GlobalVariable>(structAlloc))
+        {
+            llvm::Value* idxs[] = { builder->getInt32(0), builder->getInt32(index) };
+            auto* gep = llvm::GetElementPtrInst::CreateInBounds(structType, structAlloc, idxs);
+            builder->Insert(gep, variableName);
+            return gep;
+        }
         return builder->CreateStructGEP(structType, structAlloc, index, variableName);
     }
 

@@ -64,8 +64,9 @@ bool testStreamBasicPipe() {
     return result;
 }
 
-// Small buffer: bufferSize = 1 forces the producer to block until the consumer
-// reads each item. Should still deliver all lines correctly.
+// Small buffer: bufferSize = 1 means each printf output exceeds the 1-byte text
+// buffer and is sent directly (bypass path). Producer blocks per-message until
+// the consumer returns the buffer. Should still deliver all lines correctly.
 bool testStreamSmallBuffer() {
     bool result = true;
 

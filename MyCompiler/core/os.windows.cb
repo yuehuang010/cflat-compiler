@@ -7,6 +7,7 @@ extern i32   WaitForSingleObject(void* handle, i32 ms);
 extern i32   GetExitCodeThread(void* handle, i32* code);
 extern void  CloseHandle(void* handle);
 extern bool  TerminateThread(void* handle, i32 exitCode);
+extern u64   SetThreadAffinityMask(void* handle, u64 mask);
 
 // Win32 Timing
 extern int   QueryPerformanceCounter(i64* count);
@@ -29,6 +30,7 @@ extern void  AcquireSRWLockShared(void** srw);
 extern void  ReleaseSRWLockShared(void** srw);
 extern void  InitializeConditionVariable(void* cv);
 extern i32   SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+extern i32   SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
 extern void  WakeConditionVariable(void* cv);
 extern void  WakeAllConditionVariable(void* cv);
 

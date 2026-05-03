@@ -7,32 +7,54 @@ extern void* calloc(i64 count, i64 size);
 extern void* realloc(void* ptr, i64 size);
 
 // Per-thread stdout hook set by 'program' constructs. When non-null, printf/vprintf
-// format into a heap buffer and call the hook instead of writing to the console.
-thread_local function<void(char*)> __stdout_hook = default;
-thread_local bool __stdout_in_hook = false;  // re-entrancy guard: callbacks may call printf
+// format into a thread-local buffer and call the hook with a NON-OWNING pointer + length.
+// The hook must NOT free the buffer — it is reused across calls.
+thread_local function<void(char*, int)> __stdout_hook = default;
+thread_local bool  __stdout_in_hook  = false;   // re-entrancy guard: callbacks may call printf
+thread_local char* __stdout_tls_buf  = nullptr;  // per-thread reusable format buffer
+thread_local int   __stdout_tls_cap  = 0;        // current capacity of __stdout_tls_buf
 
 // Per-thread stdin hook set by 'program' constructs. When non-null, fgets/scanf
 // read from the hook instead of the real console. The line buffer and position
 // cursor let one hook call serve multiple character-level reads (e.g. scanf).
-thread_local function<char*()> __stdin_hook     = default;
-thread_local bool              __stdin_in_hook  = false;  // re-entrancy guard
-thread_local char*             __stdin_line     = nullptr; // current line from hook
-thread_local int               __stdin_line_pos = 0;       // read cursor within __stdin_line
+thread_local function<char*()>      __stdin_hook        = default;
+thread_local bool                   __stdin_in_hook     = false;  // re-entrancy guard
+thread_local char*                  __stdin_line        = nullptr; // current line from hook
+thread_local int                    __stdin_line_pos    = 0;       // read cursor within __stdin_line
+// When set (by stream >> program wiring), called instead of free() when a read buffer is exhausted.
+// Allows stream to return pool buffers rather than freeing them on every call.
+thread_local function<void(char*)>  __stdin_return_hook = default;
+// Cached per-thread stdin FILE* — avoids calling __acrt_iob_func(0) on every fgets call.
+thread_local void* __cached_stdin = nullptr;
 
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
     if (__stdout_hook != nullptr && !__stdout_in_hook) {
         __stdout_in_hook = true;
-        char* buf = (char*)malloc(4096);
-        int needed = __stdio_common_vsprintf(0, buf, 4096, fmt, nullptr, ap);
-        if (needed >= 4096) {
-            free(buf);
-            buf = (char*)malloc((i64)needed + 1);
-            __stdio_common_vsprintf(0, buf, (i64)needed + 1, fmt, nullptr, ap);
+        // Fast path: no '%' in fmt — fmt is the literal output, skip vsprintf entirely.
+        int len = 0;
+        bool has_format = false;
+        while (fmt[len] != '\0') {
+            if (fmt[len] == '%') { has_format = true; break; }
+            len++;
         }
-        __stdout_hook(buf);
-        free(buf);
+        if (!has_format) {
+            __stdout_hook((char*)fmt, len);  // non-owning, hook must NOT free
+        } else {
+            if (__stdout_tls_buf == nullptr) {
+                __stdout_tls_buf = (char*)malloc(4096);
+                __stdout_tls_cap = 4096;
+            }
+            int needed = __stdio_common_vsprintf(0, __stdout_tls_buf, __stdout_tls_cap, fmt, nullptr, ap);
+            if (needed >= __stdout_tls_cap) {
+                free(__stdout_tls_buf);
+                __stdout_tls_buf = (char*)malloc((i64)needed + 1);
+                __stdout_tls_cap = needed + 1;
+                __stdio_common_vsprintf(0, __stdout_tls_buf, __stdout_tls_cap, fmt, nullptr, ap);
+            }
+            __stdout_hook(__stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
+        }
         __stdout_in_hook = false;
     } else {
         void* stdout_stream = __acrt_iob_func(1);
@@ -60,15 +82,30 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
 extern int vprintf(const char* fmt, va_list ap) {
     if (__stdout_hook != nullptr && !__stdout_in_hook) {
         __stdout_in_hook = true;
-        char* buf = (char*)malloc(4096);
-        int len = __stdio_common_vsprintf(0, buf, 4096, fmt, nullptr, ap);
-        if (len >= 4096) {
-            free(buf);
-            buf = (char*)malloc((i64)len + 1);
-            __stdio_common_vsprintf(0, buf, (i64)len + 1, fmt, nullptr, ap);
+        // Fast path: no '%' in fmt — fmt is the literal output, skip vsprintf entirely.
+        int len = 0;
+        bool has_format = false;
+        while (fmt[len] != '\0') {
+            if (fmt[len] == '%') { has_format = true; break; }
+            len++;
         }
-        __stdout_hook(buf);
-        free(buf);
+        if (!has_format) {
+            __stdout_hook((char*)fmt, len);  // non-owning, hook must NOT free
+        } else {
+            if (__stdout_tls_buf == nullptr) {
+                __stdout_tls_buf = (char*)malloc(4096);
+                __stdout_tls_cap = 4096;
+            }
+            int needed = __stdio_common_vsprintf(0, __stdout_tls_buf, __stdout_tls_cap, fmt, nullptr, ap);
+            if (needed >= __stdout_tls_cap) {
+                free(__stdout_tls_buf);
+                __stdout_tls_buf = (char*)malloc((i64)needed + 1);
+                __stdout_tls_cap = needed + 1;
+                __stdio_common_vsprintf(0, __stdout_tls_buf, __stdout_tls_cap, fmt, nullptr, ap);
+            }
+            __stdout_hook(__stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
+            len = needed;
+        }
         __stdout_in_hook = false;
         return len;
     }
@@ -92,12 +129,19 @@ extern int __stdio_common_vsscanf(u64 options, const char* buf, i64 bufSize, con
 
 // Used by the fgets fallback to read one character from any stream.
 extern int fgetc(void* stream);
+extern void* memcpy(void* dest, const void* src, i64 n);
 
 // Internal: return next character from the hook line-buffer, refilling via the hook
 // when the current line is exhausted.  Returns -1 on EOF (hook returned nullptr).
 int __stdin_next_char() {
     if (__stdin_line == nullptr || __stdin_line[__stdin_line_pos] == '\0') {
-        if (__stdin_line != nullptr) { free(__stdin_line); __stdin_line = nullptr; }
+        if (__stdin_line != nullptr) {
+            if (__stdin_return_hook != nullptr)
+                __stdin_return_hook(__stdin_line);  // return buffer to pool (stream path)
+            else
+                free(__stdin_line);                 // free normally (user-hook path)
+            __stdin_line = nullptr;
+        }
         __stdin_in_hook = true;
         __stdin_line = __stdin_hook();
         __stdin_in_hook = false;
@@ -112,18 +156,38 @@ int __stdin_next_char() {
 // fgets — when the stdin hook is active and the stream is stdin, serve bytes from
 // the hook line-buffer instead of blocking on the real console.
 extern char* fgets(char* buf, int count, void* stream) {
-    void* stdinStream = __acrt_iob_func(0);
-    if (__stdin_hook != nullptr && !__stdin_in_hook && stream == stdinStream) {
-        int i = 0;
-        while (i < count - 1) {
-            int c = __stdin_next_char();
-            if (c == -1) { if (i == 0) return nullptr; break; }  // EOF
-            buf[i] = (char)c;
-            i++;
-            if (c == '\n') break;
+    if (__cached_stdin == nullptr) { __cached_stdin = __acrt_iob_func(0); }
+    if (__stdin_hook != nullptr && !__stdin_in_hook && stream == __cached_stdin) {
+        // Load both TLS fields once into locals — avoids re-reading TLS in the refill
+        // check, the scan loop, and the copy step.
+        char* src = __stdin_line;
+        int   pos = __stdin_line_pos;
+        // Refill the line buffer if exhausted.
+        if (src == nullptr || src[pos] == '\0') {
+            if (src != nullptr) {
+                if (__stdin_return_hook != nullptr)
+                    __stdin_return_hook(src);
+                else
+                    free(src);
+            }
+            __stdin_in_hook = true;
+            src = __stdin_hook();
+            __stdin_in_hook = false;
+            __stdin_line = src;
+            pos = 0;
+            __stdin_line_pos = 0;
+            if (src == nullptr) return nullptr;  // EOF
         }
-        buf[i] = '\0';
-        return i > 0 ? buf : nullptr;
+        // Find the next '\n' and bulk-copy with memcpy — no TLS in the hot path.
+        int end = pos;
+        while (src[end] != '\0' && src[end] != '\n') { end++; }
+        if (src[end] == '\n') { end++; }   // include the '\n'
+        int line_len = end - pos;
+        int copy_len = line_len < count - 1 ? line_len : count - 1;
+        memcpy(buf, src + pos, (i64)copy_len);
+        buf[copy_len] = '\0';
+        __stdin_line_pos = pos + copy_len;  // one TLS write
+        return copy_len > 0 ? buf : nullptr;
     }
     // Fallback: read character by character from the real stream.
     if (count <= 0) return nullptr;
@@ -149,7 +213,13 @@ extern int scanf(const char* fmt, ...) {
     if (__stdin_hook != nullptr && !__stdin_in_hook) {
         // Refill the line buffer if exhausted.
         if (__stdin_line == nullptr || __stdin_line[__stdin_line_pos] == '\0') {
-            if (__stdin_line != nullptr) { free(__stdin_line); __stdin_line = nullptr; }
+            if (__stdin_line != nullptr) {
+                if (__stdin_return_hook != nullptr)
+                    __stdin_return_hook(__stdin_line);  // return buffer to pool (stream path)
+                else
+                    free(__stdin_line);                 // free normally (user-hook path)
+                __stdin_line = nullptr;
+            }
             __stdin_in_hook = true;
             __stdin_line = __stdin_hook();
             __stdin_in_hook = false;
@@ -176,8 +246,8 @@ extern int scanf(const char* fmt, ...) {
         va_end(ap);
         return result;
     }
-    void* stdinStream = __acrt_iob_func(0);
-    int result = __stdio_common_vfscanf(0, stdinStream, fmt, nullptr, ap);
+    if (__cached_stdin == nullptr) { __cached_stdin = __acrt_iob_func(0); }
+    int result = __stdio_common_vfscanf(0, __cached_stdin, fmt, nullptr, ap);
     va_end(ap);
     return result;
 }

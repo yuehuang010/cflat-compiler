@@ -1,33 +1,189 @@
-import "channel.cb";
 import "cruntime.cb";
+import "mutex.cb";
+
+// Double-buffered text pipe between two 'program' constructs.
+//
+// Mirrors the C++ double-buffer design: one mutex + two condition variables.
+// _cvFull  — wakes the consumer when a full buffer is ready.
+// _cvEmpty — wakes the producer when an empty buffer is returned.
+//
+// The consumer sleeps (SleepConditionVariableCS) while the producer fills
+// the buffer, so there is no cache-line contention on the hot write path.
+// Blocking only occurs when both buffers are simultaneously full (consumer slow).
+//
+// Usage:
+//   stream s;
+//   s.bufferSize = 65536;   // optional — default is 65536 bytes
+//   s.init();
+//   p1 >> s;                // wires p1.onStdout → s.write()
+//   s >> p2;                // wires p2.onStdin  → s.read(), p2.onStdinReturn → s.return_buffer()
+//   p1.run(args); p2.run(args);
+//   p1.WaitForExit();
+//   s.close();              // flush remaining data + send EOF sentinel
+//   p2.WaitForExit();
 
 struct stream {
-    channel<i64> _channel;
-    int bufferSize = 32;
+    int bufferSize = 65536;
+
+    char* _bufA     = nullptr;
+    char* _bufB     = nullptr;
+    char* _writeBuf = nullptr;
+    int   _writePos = 0;
+
+    mutex _mu;
+    void* _cvFull  = nullptr;  // CONDITION_VARIABLE: consumer waits here for a full buffer
+    void* _cvEmpty = nullptr;  // CONDITION_VARIABLE: producer waits here for an empty buffer
+
+    char* _pendingFull = nullptr;  // full buffer handed off to consumer (nullptr = none ready)
+    int   _pendingLen  = 0;        // byte count of _pendingFull (set alongside _pendingFull)
+    char* _emptyPool   = nullptr;  // empty buffer returned by consumer (nullptr = none ready)
+    bool  _eof         = false;
 
     void init() {
-        _channel.init(bufferSize);
+        _bufA = (char*)malloc((i64)bufferSize);
+        _bufB = (char*)malloc((i64)bufferSize);
+        _writeBuf = _bufA;
+        _writePos = 0;
+        _cvFull  = malloc((i64)8);  // sizeof(CONDITION_VARIABLE) == ptr-sized
+        _cvEmpty = malloc((i64)8);
+        InitializeConditionVariable(_cvFull);
+        InitializeConditionVariable(_cvEmpty);
+        _mu.acquire();
+        _emptyPool = _bufB;    // seed: bufB ready for first swap
+        _mu.release();
     }
 
-    // Called by the onStdout hook. Copies data into an owned buffer and enqueues it.
-    // The caller (cruntime printf wrapper) frees `data` after this returns.
+    // Publish the current write buffer and block until the consumer returns an empty one.
+    void _flushWrite() {
+        if (_writePos == 0) return;
+        _writeBuf[_writePos] = '\0';
+
+        _mu.acquire();
+        while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+        _pendingFull = _writeBuf;
+        _pendingLen  = _writePos;
+        WakeConditionVariable(_cvFull);
+
+        while (_emptyPool == nullptr) { _mu.sleep_cv(_cvEmpty); }
+        _writeBuf  = _emptyPool;
+        _emptyPool = nullptr;
+        _writePos  = 0;
+        _mu.release();
+    }
+
+    // Called by the onStdout hook (p1 >> s).  Takes ownership of `data` (malloc'd by printf).
     void write(char* data) {
-        i64 len = (i64)strlen(data);
-        char* copy = (char*)malloc(len + 1);
-        memcpy(copy, data, len + 1);
-        _channel.send((i64)copy);
+        int len = strlen(data);
+        if (len == 0) { free(data); return; }
+
+        // Oversized: flush pending data then send this buffer directly (bypass pool).
+        if (len >= bufferSize) {
+            _flushWrite();
+            _mu.acquire();
+            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            _pendingFull = data;
+            _pendingLen  = len;
+            WakeConditionVariable(_cvFull);
+            _mu.release();
+            return;
+        }
+
+        if (_writePos + len >= bufferSize) { _flushWrite(); }
+
+        int i = 0;
+        while (i < len) { _writeBuf[_writePos] = data[i]; _writePos++; i++; }
+        _writeBuf[_writePos] = '\0';
+        free(data);
     }
 
-    // Called by the onStdin hook. Blocks until a line is available.
-    // Returns the owned char* (cruntime frees it); returns nullptr to signal EOF.
+    // Copy len bytes from data into the stream without taking ownership.
+    // Use this from raw threads where the caller holds a static or stack buffer.
+    void write_bytes(char* data, int len) {
+        if (len == 0) return;
+
+        // Oversized: flush pending then malloc+copy and publish directly (bypass pool).
+        if (len >= bufferSize) {
+            _flushWrite();
+            char* buf = (char*)malloc((i64)len + 1);
+            memcpy(buf, data, (i64)len);
+            buf[len] = '\0';
+            _mu.acquire();
+            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            _pendingFull = buf;
+            _pendingLen  = len;
+            WakeConditionVariable(_cvFull);
+            _mu.release();
+            return;
+        }
+
+        if (_writePos + len >= bufferSize) { _flushWrite(); }
+
+        memcpy(_writeBuf + _writePos, data, (i64)len);
+        _writePos = _writePos + len;
+        _writeBuf[_writePos] = '\0';
+    }
+
+    // Force any buffered data to the consumer immediately (useful for line-by-line streaming).
+    void flush() {
+        _flushWrite();
+    }
+
+    // Called by the onStdin hook (s >> p2).  Sleeps until a buffer is available.
+    // Returns nullptr on EOF (after close() has been called and all data consumed).
     char* read() {
-        i64 out = _channel.receive();
-        return (char*)out;
+        _mu.acquire();
+        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(_cvFull); }
+        if (_pendingFull == nullptr) { _mu.release(); return nullptr; }
+        char* buf    = _pendingFull;
+        _pendingFull = nullptr;
+        WakeConditionVariable(_cvFull);   // unblock producer waiting for the slot to clear
+        _mu.release();
+        return buf;
     }
 
-    // Signal EOF to the consumer. Must be called after the producer program exits.
-    // Sends a nullptr sentinel so the consumer's blocking read() returns nullptr (EOF).
+    // Like read() but also returns the byte count — allows the caller to use a
+    // length-bounded loop instead of scanning for '\0', enabling LLVM vectorization.
+    char* read_buf(int* out_len) {
+        _mu.acquire();
+        while (_pendingFull == nullptr && !_eof) { _mu.sleep_cv(_cvFull); }
+        if (_pendingFull == nullptr) { _mu.release(); out_len[0] = 0; return nullptr; }
+        char* buf    = _pendingFull;
+        out_len[0]   = _pendingLen;
+        _pendingFull = nullptr;
+        WakeConditionVariable(_cvFull);
+        _mu.release();
+        return buf;
+    }
+
+    // Called by onStdinReturn when the consumer is done with a buffer.
+    // Pool buffers are returned to the empty pool; oversized buffers are freed.
+    void return_buffer(char* buf) {
+        if (buf == _bufA || buf == _bufB) {
+            _mu.acquire();
+            _emptyPool = buf;
+            WakeConditionVariable(_cvEmpty);
+            _mu.release();
+        } else {
+            free((void*)buf);
+        }
+    }
+
+    // Flush remaining data and send an EOF sentinel to the consumer.
+    // Must be called after the producer exits and before WaitForExit() on the consumer.
     void close() {
-        _channel.send(0);
+        _flushWrite();
+        _mu.acquire();
+        while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+        _eof = true;
+        WakeConditionVariable(_cvFull);
+        _mu.release();
+    }
+
+    ~stream() {
+        if (_bufA    != nullptr) { free((void*)_bufA);   _bufA    = nullptr; }
+        if (_bufB    != nullptr) { free((void*)_bufB);   _bufB    = nullptr; }
+        if (_cvFull  != nullptr) { free(_cvFull);         _cvFull  = nullptr; }
+        if (_cvEmpty != nullptr) { free(_cvEmpty);        _cvEmpty = nullptr; }
+        _mu.destroy();
     }
 };

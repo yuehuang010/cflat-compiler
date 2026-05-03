@@ -10,12 +10,8 @@
 // All threaded variants use non-blocking push/pop so the stop flag is checked promptly.
 
 import "list.cb";
-import "thread.cb";
 import "time.cb";
-import "channel.cb";
 import "spsc_queue.cb";
-import "stream.cb";
-import "stop_token.cb";
 
 extern int  __atomic_i32_load(int* ptr);
 extern void __atomic_i32_store(int* ptr, int val);
@@ -24,7 +20,11 @@ int BENCH_SECS = 5;
 
 // ── Variant 1: channel<int> + program ────────────────────────────────────────
 
-channel<int> g_ch;
+// Global pointers: the actual storage lives in main() to avoid global struct
+// initialization issues; pointers are set before any program.run() call.
+channel<int>*    g_ch    = nullptr;
+spsc_queue<int>* g_spsc  = nullptr;
+channel<int>*    g_ch2   = nullptr;
 
 program ChProducer
 {
@@ -54,8 +54,6 @@ program ChConsumer
 
 // ── Variant 2: spsc_queue<int> + program ─────────────────────────────────────
 
-spsc_queue<int> g_spsc;
-
 program SpscProducer
 {
     int main(move list<string> args)
@@ -84,7 +82,6 @@ program SpscConsumer
 
 // ── Variant 3: channel<int> + raw Thread (no program construct) ───────────────
 
-channel<int> g_ch2;
 int g_raw_stop  = 0;
 i64 g_raw_count = 0;
 
@@ -104,16 +101,48 @@ int raw_consumer(void* ctx)
     return 0;
 }
 
-// ── Variant 4: stream + program (printf → fgets pipe) ────────────────────────
+// ── Variant 6: stream + raw Thread (no program construct) ────────────────────
 
-stream g_stream;
+stream*  g_stream_raw       = nullptr;
+i64      g_stream_raw_count = 0;
+
+int stream_raw_producer(void* ctx)
+{
+    char* line = (char*)"Y\n";
+    while (__atomic_i32_load(&g_raw_stop) == 0) { g_stream_raw.write_bytes(line, 2); }
+    g_stream_raw.close();
+    return 0;
+}
+
+int stream_raw_consumer(void* ctx)
+{
+    i64 count = (i64)0;
+    int len = 0;
+    char* buf = g_stream_raw.read_buf(&len);
+    while (buf != nullptr)
+    {
+        int i = 0;
+        while (i < len) { if (buf[i] == '\n') { count = count + (i64)1; } i++; }
+        g_stream_raw.return_buffer(buf);
+        buf = g_stream_raw.read_buf(&len);
+    }
+    g_stream_raw_count = count;
+    return 0;
+}
+
+// ── Variant 4: stream + program ───────────────────────────────────────────────
+// Producer writes via _out.write_bytes() — bypasses printf/TLS overhead entirely.
+// Consumer reads via fgets — the hooked fgets now bulk-copies per line using
+// local-variable scan + memcpy, touching TLS only on refill and line_pos update.
 
 program StreamProducer
 {
     int main(move list<string> args)
     {
         stop_token token = _stop_source.get_token();
-        while (!token.stop_requested()) { printf("Y\n"); }
+        stream* out = _out;
+        char* line = (char*)"Y\n";
+        while (!token.stop_requested()) { out.write_bytes(line, 2); }
         return 0;
     }
 };
@@ -143,8 +172,10 @@ extern int main()
     printf("Running each variant for %d seconds...\n\n", BENCH_SECS);
 
     // variant 1
-    printf("[1/5] channel   + program\n");
-    g_ch.init(4096);
+    printf("[1/6] channel   + program\n");
+    channel<int> ch;
+    ch.init(4096);
+    g_ch = &ch;
     ChProducer  chProd;
     ChConsumer  chCons;
     chProd.run(args);
@@ -155,11 +186,13 @@ extern int main()
     chProd.WaitForExit();
     chCons.WaitForExit();
     i64 ch_tps = chCons.count / dur_s;
-    g_ch.destroy();
+    ch.destroy();
 
     // variant 2
-    printf("[2/5] spsc_queue + program\n");
-    g_spsc.init(4096);
+    printf("[2/6] spsc_queue + program\n");
+    spsc_queue<int> spsc;
+    spsc.init(4096);
+    g_spsc = &spsc;
     SpscProducer spscProd;
     SpscConsumer spscCons;
     spscProd.run(args);
@@ -170,11 +203,13 @@ extern int main()
     spscProd.WaitForExit();
     spscCons.WaitForExit();
     i64 spsc_tps = spscCons.count / dur_s;
-    g_spsc.destroy();
+    spsc.destroy();
 
     // variant 3
-    printf("[3/5] channel   + raw Thread\n");
-    g_ch2.init(4096);
+    printf("[3/6] channel   + raw Thread\n");
+    channel<int> ch2;
+    ch2.init(4096);
+    g_ch2 = &ch2;
     Thread tProd;
     Thread tCons;
     tProd.start(raw_producer, nullptr);
@@ -184,31 +219,61 @@ extern int main()
     tProd.join();
     tCons.join();
     i64 raw_tps = g_raw_count / dur_s;
-    g_ch2.destroy();
+    ch2.destroy();
 
-    // variant 4: stream + program (printf/fgets pipe)
-    printf("[4/5] stream    + program\n");
-    g_stream.bufferSize = 4096;
-    g_stream.init();
+    // variant 4: stream + program (_out.write_bytes / fgets)
+    printf("[4/6] stream    + program\n");
+    stream s;
+    s.bufferSize = 4096;
+    s.init();
     StreamProducer strProd;
     StreamConsumer strCons;
-    strProd >> g_stream;
-    g_stream >> strCons;
+    strProd >> s;
+    s >> strCons;
     strProd.run(args);
     strCons.run(args);
+    strProd._thread.setAffinity((u64)1);  // core 0
+    strCons._thread.setAffinity((u64)2);  // core 1
     sleep(dur_ms);
     strProd.RequestStop();
     strProd.WaitForExit();
-    g_stream.close();
+    s.close();
     strCons.WaitForExit();
     i64 stream_tps = strCons.count / dur_s;
 
-    // variant 5: single-threaded tight loop — no queue, no threads
-    printf("[5/5] single-threaded loop\n");
-    Stopwatch sw;
-    sw.start();
+    // variant 5: stream + raw Thread (direct write_bytes, no program overhead)
+    printf("[5/6] stream    + raw Thread\n");
+    stream sRaw;
+    sRaw.bufferSize = 65536;
+    sRaw.init();
+    g_stream_raw = &sRaw;
+    __atomic_i32_store(&g_raw_stop, 0);
+    Thread tStrProd;
+    Thread tStrCons;
+    tStrProd.start(stream_raw_producer, nullptr);
+    tStrCons.start(stream_raw_consumer, nullptr);
+    tStrProd.setAffinity((u64)1);  // core 0
+    tStrCons.setAffinity((u64)2);  // core 1
+    sleep(dur_ms);
+    __atomic_i32_store(&g_raw_stop, 1);
+    tStrProd.join();
+    tStrCons.join();
+    i64 stream_raw_tps = g_stream_raw_count / dur_s;
+
+    // variant 6: single-threaded tight loop — no queue, no threads
+    // Check time every 65536 iterations (same cadence as the C++ reference) so the
+    // loop body is just an increment — not a QueryPerformanceCounter + division.
+    printf("[6/6] single-threaded loop\n");
+    i64 st_freq  = _timeGetQpcFreq();
+    i64 st_dur   = (i64)BENCH_SECS * st_freq;
+    i64 st_t0    = _qpcNow();
     i64 st_count = (i64)0;
-    while (sw.elapsed().milliseconds() < (double)dur_ms) { st_count = st_count + (i64)1; }
+    while (true) {
+        st_count = st_count + (i64)1;
+        if ((st_count & (i64)0xFFFF) == (i64)0) {
+            if (_qpcNow() - st_t0 >= st_dur) break;
+        }
+    }
     i64 st_tps = st_count / dur_s;
 
     printf("\n");
@@ -219,6 +284,7 @@ extern int main()
     printf("%-32s %15lld\n", "channel   + program",         ch_tps);
     printf("%-32s %15lld\n", "channel   + raw Thread",      raw_tps);
     printf("%-32s %15lld\n", "stream    + program",         stream_tps);
+    printf("%-32s %15lld\n", "stream    + raw Thread",      stream_raw_tps);
     printf("\n");
 
     return 0;

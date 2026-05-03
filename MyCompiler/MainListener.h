@@ -4017,27 +4017,30 @@ public:
         auto* compiler = Compiler(ctx);
         auto* i8PtrTy  = compiler->builder->getInt8Ty()->getPointerTo();
 
-        auto* writeFn = FindStreamMethodFn(compiler, "write");
-        if (!writeFn)
+        auto* writeBytesFn = FindStreamMethodFn(compiler, "write_bytes");
+        if (!writeBytesFn)
         {
-            LogErrorContext(ctx, "stream::write not found — import \"stream.cb\" before using >>.");
+            LogErrorContext(ctx, "stream::write_bytes not found — import \"stream.cb\" before using >>.");
             return;
         }
 
-        // Create/reuse __stream_write_shim(i8* env, char* data) — casts env to stream*, calls write.
+        // Create/reuse __stream_write_shim(i8* env, char* data, i32 len) — casts env to stream*, calls write_bytes.
+        // The hook is non-owning: printf passes a thread-local buffer; the shim copies it via write_bytes.
         llvm::Function* shim = compiler->module->getFunction("__stream_write_shim");
         if (!shim)
         {
             auto* charPtrTy = i8PtrTy;  // char* and i8* are the same in LLVM
+            auto* i32Ty     = llvm::Type::getInt32Ty(*compiler->context);
             auto* shimTy    = llvm::FunctionType::get(
-                compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy}, false);
+                compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy, i32Ty}, false);
             shim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
                 "__stream_write_shim", *compiler->module);
             auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
             llvm::IRBuilder<> b(bb);
             auto* streamTy = compiler->GetDataStructure("stream").StructType;
             auto* selfPtr  = b.CreateBitCast(shim->getArg(0), streamTy->getPointerTo(), "stream_self");
-            b.CreateCall(writeFn->getFunctionType(), writeFn, {selfPtr, shim->getArg(1)});
+            b.CreateCall(writeBytesFn->getFunctionType(), writeBytesFn,
+                {selfPtr, shim->getArg(1), shim->getArg(2)});
             b.CreateRetVoid();
         }
 
@@ -4053,6 +4056,14 @@ public:
         auto* gep = compiler->builder->CreateStructGEP(
             pd.StructType, progStorage, pd.OnStdoutFieldIndex, "on_stdout_gep");
         compiler->builder->CreateStore(fat, gep);
+
+        // Also store the stream pointer into _out so programs can call _out.write_bytes() directly.
+        if (pd.OutFieldIndex != (unsigned)-1)
+        {
+            auto* outGep = compiler->builder->CreateStructGEP(
+                pd.StructType, progStorage, pd.OutFieldIndex, "out_gep");
+            compiler->builder->CreateStore(streamStorage, outGep);
+        }
     }
 
     // Wire p2.onStdin to read from the stream. Called for `s >> p2`.
@@ -4097,6 +4108,46 @@ public:
         auto* gep = compiler->builder->CreateStructGEP(
             pd.StructType, progStorage, pd.OnStdinFieldIndex, "on_stdin_gep");
         compiler->builder->CreateStore(fat, gep);
+
+        // Wire return_buffer: when the consumer is done with a buffer, return it to the pool.
+        auto* returnFn = FindStreamMethodFn(compiler, "return_buffer");
+        if (returnFn)
+        {
+            // Create/reuse __stream_return_buffer_shim(i8* env, char* buf) — calls stream.return_buffer.
+            llvm::Function* returnShim = compiler->module->getFunction("__stream_return_buffer_shim");
+            if (!returnShim)
+            {
+                auto* charPtrTy = i8PtrTy;
+                auto* shimTy    = llvm::FunctionType::get(
+                    compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy}, false);
+                returnShim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
+                    "__stream_return_buffer_shim", *compiler->module);
+                auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", returnShim);
+                llvm::IRBuilder<> b(bb);
+                auto* streamTy = compiler->GetDataStructure("stream").StructType;
+                auto* selfPtr  = b.CreateBitCast(returnShim->getArg(0), streamTy->getPointerTo(), "stream_self");
+                b.CreateCall(returnFn->getFunctionType(), returnFn, {selfPtr, returnShim->getArg(1)});
+                b.CreateRetVoid();
+            }
+
+            auto* returnShimI8 = compiler->builder->CreateBitCast(returnShim, i8PtrTy, "return_shim_i8");
+            auto* returnEnvI8  = compiler->builder->CreateBitCast(streamStorage, i8PtrTy, "stream_env_i8_ret");
+            llvm::Value* returnFat = llvm::UndefValue::get(fatTy);
+            returnFat = compiler->builder->CreateInsertValue(returnFat, returnShimI8, {0u});
+            returnFat = compiler->builder->CreateInsertValue(returnFat, returnEnvI8,  {1u});
+
+            auto* retGep = compiler->builder->CreateStructGEP(
+                pd.StructType, progStorage, pd.OnStdinReturnFieldIndex, "on_stdin_return_gep");
+            compiler->builder->CreateStore(returnFat, retGep);
+        }
+
+        // Also store the stream pointer into _in so programs can call _in.read_buf() directly.
+        if (pd.InStreamFieldIndex != (unsigned)-1)
+        {
+            auto* inGep = compiler->builder->CreateStructGEP(
+                pd.StructType, progStorage, pd.InStreamFieldIndex, "in_gep");
+            compiler->builder->CreateStore(streamStorage, inGep);
+        }
     }
 
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
@@ -8422,10 +8473,11 @@ public:
         unsigned exitCodeIdx      = compiler->programTable[name].ExitCodeFieldIndex;
         unsigned threadIdx        = compiler->programTable[name].ThreadFieldIndex;
         unsigned allocatorIdx     = compiler->programTable[name].AllocatorFieldIndex;
-        unsigned onStdoutIdx      = compiler->programTable[name].OnStdoutFieldIndex;
-        unsigned onStdinIdx       = compiler->programTable[name].OnStdinFieldIndex;
-        unsigned stopSrcIdx       = compiler->programTable[name].StopSourceFieldIndex;
-        unsigned trackHandlesIdx  = compiler->programTable[name].TrackHandlesFieldIndex;
+        unsigned onStdoutIdx         = compiler->programTable[name].OnStdoutFieldIndex;
+        unsigned onStdinIdx          = compiler->programTable[name].OnStdinFieldIndex;
+        unsigned onStdinReturnIdx    = compiler->programTable[name].OnStdinReturnFieldIndex;
+        unsigned stopSrcIdx          = compiler->programTable[name].StopSourceFieldIndex;
+        unsigned trackHandlesIdx     = compiler->programTable[name].TrackHandlesFieldIndex;
 
         auto* stopSrcInitFn        = FindMethodOf("init",           "stop_source");
         auto* stopSrcRequestStopFn = FindMethodOf("request_stop",   "stop_source");
@@ -8454,6 +8506,13 @@ public:
             if (it != compiler->globalNamedVariable.end()) stdinHookGlobal = it->second;
         }
         auto* stdinHookFnPtrType = stdinHookGlobal ? stdinHookGlobal->getValueType() : nullptr;
+
+        // Look up the thread-local stdin return hook global (declared in cruntime.cb); optional
+        llvm::GlobalVariable* stdinReturnHookGlobal = nullptr;
+        {
+            auto it = compiler->globalNamedVariable.find("__stdin_return_hook");
+            if (it != compiler->globalNamedVariable.end()) stdinReturnHookGlobal = it->second;
+        }
 
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
@@ -8566,6 +8625,16 @@ public:
                 auto* onStdinVal = compiler->builder->CreateLoad(
                     stdinHookFnPtrType, onStdinGEP, "on_stdin_fn");
                 compiler->builder->CreateStore(onStdinVal, stdinHookGlobal);
+            }
+
+            // Install stdin return hook: load self->onStdinReturn and store into __stdin_return_hook
+            if (stdinReturnHookGlobal)
+            {
+                auto* onStdinReturnGEP = compiler->builder->CreateStructGEP(
+                    progType, self, onStdinReturnIdx, "on_stdin_return_gep");
+                auto* onStdinReturnVal = compiler->builder->CreateLoad(
+                    stdinReturnHookGlobal->getValueType(), onStdinReturnGEP, "on_stdin_return_fn");
+                compiler->builder->CreateStore(onStdinReturnVal, stdinReturnHookGlobal);
             }
 
             // Enable handle tracker: load self->trackHandles and store into __handle_tracker_enabled
@@ -9034,8 +9103,9 @@ public:
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
                 || field.VariableName == "_allocator" || field.VariableName == "onStdout"
+                || field.VariableName == "onStdin" || field.VariableName == "onStdinReturn"
                 || field.VariableName == "inbox" || field.VariableName == "_stop_source" || field.VariableName == "_inbox"
-                || field.VariableName == "trackHandles")
+                || field.VariableName == "trackHandles" || field.VariableName == "_out" || field.VariableName == "_in")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
@@ -9043,15 +9113,20 @@ public:
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
         // onStdout (function<void(char*)>), onStdin (function<char*()>),
         // inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
-        // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion)
+        // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion),
+        // _out / _in (stream* — only when stream.cb is imported; set by >> for direct write_bytes/read_buf access)
         unsigned exitCodeFieldIndex     = (unsigned)declList.size();
         unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex    = threadFieldIndex + 1;
-        unsigned onStdoutFieldIndex     = allocatorFieldIndex + 1;
-        unsigned onStdinFieldIndex      = onStdoutFieldIndex + 1;
-        unsigned inboxFieldIndex        = onStdinFieldIndex + 1;
-        unsigned stopSrcFieldIndex      = inboxFieldIndex + 1;
-        unsigned trackHandlesFieldIndex = stopSrcFieldIndex + 1;
+        unsigned onStdoutFieldIndex      = allocatorFieldIndex + 1;
+        unsigned onStdinFieldIndex       = onStdoutFieldIndex + 1;
+        unsigned onStdinReturnFieldIndex = onStdinFieldIndex + 1;
+        unsigned inboxFieldIndex         = onStdinReturnFieldIndex + 1;
+        unsigned stopSrcFieldIndex       = inboxFieldIndex + 1;
+        unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
+        unsigned outFieldIndex           = (unsigned)-1;  // set below if stream.cb is imported
+        unsigned inStreamFieldIndex      = (unsigned)-1;  // set below if stream.cb is imported
+        bool     hasStreamType           = compiler->dataStructures.count("stream") > 0;
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -9074,7 +9149,7 @@ public:
             onStdoutField.VariableName          = "onStdout";
             onStdoutField.IsFunctionPointer     = true;
             onStdoutField.FuncPtrReturnTypeName = "void";
-            onStdoutField.FuncPtrParams         = {{"char", true}};
+            onStdoutField.FuncPtrParams         = {{"char", true}, {"int", false}};
             declList.push_back(onStdoutField);
 
             LLVMBackend::DeclTypeAndValue onStdinField;
@@ -9084,6 +9159,13 @@ public:
             onStdinField.FuncPtrReturnPointer  = true;
             onStdinField.FuncPtrParams         = {};
             declList.push_back(onStdinField);
+
+            LLVMBackend::DeclTypeAndValue onStdinReturnField;
+            onStdinReturnField.VariableName          = "onStdinReturn";
+            onStdinReturnField.IsFunctionPointer     = true;
+            onStdinReturnField.FuncPtrReturnTypeName = "void";
+            onStdinReturnField.FuncPtrParams         = {{"char", true}};
+            declList.push_back(onStdinReturnField);
 
             // inbox: IQueue<IMessage> fat-ptr — swappable before run() just like _allocator.
             // By default the constructor pre-allocates a channel<IMessage> and builds the fat-ptr.
@@ -9104,6 +9186,22 @@ public:
             trackHandlesField.TypeName     = "int";
             trackHandlesField.VariableName = "trackHandles";
             declList.push_back(trackHandlesField);
+
+            if (hasStreamType) {
+                LLVMBackend::DeclTypeAndValue outField;
+                outField.TypeName     = "stream";
+                outField.VariableName = "_out";
+                outField.Pointer      = true;
+                outFieldIndex = (unsigned)declList.size();
+                declList.push_back(outField);
+
+                LLVMBackend::DeclTypeAndValue inField;
+                inField.TypeName     = "stream";
+                inField.VariableName = "_in";
+                inField.Pointer      = true;
+                inStreamFieldIndex = (unsigned)declList.size();
+                declList.push_back(inField);
+            }
         }
 
         // Build struct type with user fields + synthetic fields
@@ -9192,6 +9290,14 @@ public:
                     structVal, llvm::Constant::getNullValue(fieldType), onStdinFieldIndex);
             }
 
+            // Synthetic field: onStdinReturn = nullptr (fat closure struct {i8*, i8*})
+            {
+                auto& onStdinReturnDecl = declList[onStdinReturnFieldIndex];
+                auto* fieldType = compiler->GetType(onStdinReturnDecl);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdinReturnFieldIndex);
+            }
+
             // Synthetic field: inbox = IQueue<IMessage> fat-ptr pointing to a heap-allocated
             // channel<IMessage> (zero-init).  Pre-allocating ensures inbox.init(N) is safe to
             // call before run().  Users replace it with `p.inbox = &myQueue` to swap the impl.
@@ -9235,6 +9341,15 @@ public:
                 structVal,
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                 trackHandlesFieldIndex);
+
+            // Synthetic fields: _out = nullptr, _in = nullptr (stream*; only present when stream.cb is imported)
+            if (outFieldIndex != (unsigned)-1)
+            {
+                auto* streamTy = compiler->GetDataStructure("stream").StructType;
+                auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
+            }
 
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
@@ -9289,11 +9404,14 @@ public:
         compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
         compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
         compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
-        compiler->programTable[name].OnStdoutFieldIndex      = onStdoutFieldIndex;
-        compiler->programTable[name].OnStdinFieldIndex       = onStdinFieldIndex;
-        compiler->programTable[name].InboxFieldIndex         = inboxFieldIndex;
+        compiler->programTable[name].OnStdoutFieldIndex       = onStdoutFieldIndex;
+        compiler->programTable[name].OnStdinFieldIndex        = onStdinFieldIndex;
+        compiler->programTable[name].OnStdinReturnFieldIndex  = onStdinReturnFieldIndex;
+        compiler->programTable[name].InboxFieldIndex          = inboxFieldIndex;
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
+        compiler->programTable[name].OutFieldIndex           = outFieldIndex;
+        compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);

@@ -289,3 +289,66 @@ install.bat  # install into VS Code
 ```
 
 Reload VS Code to activate syntax highlighting for `.cb` files.
+
+## Performance Benchmarking
+
+### Running benchmarks
+
+Always use `performance.bat` — it compiles all benchmarks with `-O2` and runs both the CFlat and C++ reference variants:
+
+```bash
+performance.bat
+```
+
+Never compile benchmarks manually without `-O2`. Unoptimized numbers are misleading — the single-threaded loop drops from ~5B to ~300M iter/s without it, and stream throughput roughly halves.
+
+Manual compile (if needed):
+
+```bash
+x64/Debug/MyCompiler.exe performance/perf_yes_compare.cb -i MyCompiler/core -o performance/perf_yes_compare.exe -O2
+```
+
+### Benchmark files
+
+| File | Description |
+|------|-------------|
+| `performance/perf_yes_compare.cb` | 6 CFlat variants: channel+program, spsc+program, channel+raw Thread, stream+program, stream+raw Thread, single-threaded loop |
+| `performance/perf_yes_compare.cpp` | 2 C++ reference variants: raw threads + double-buffered stream, single-threaded loop |
+
+### Reference throughput (on a typical dev machine, `-O2`)
+
+| Variant | CFlat | C++ |
+|---------|-------|-----|
+| single-threaded loop | ~5,000M iter/s | ~4,960M iter/s |
+| stream + raw Thread | ~280–300M lines/s | ~386M lines/s |
+| stream + program | ~200M lines/s | — |
+| channel + raw Thread | ~10M lines/s | — |
+| channel + program | ~10–25M lines/s | — |
+| spsc + program | ~19–31M lines/s | — |
+
+**Notes on stream + program**: producer uses `_out.write_bytes()` directly (bypasses `printf`/TLS entirely; set by `>>` operator). Consumer uses `_in.read_buf()` directly (bypasses `fgets`/`__stdin_hook`/TLS; set by `>>` operator). Gap vs raw-thread (~300M) is stop_token polling overhead on the producer side.
+
+**Notes on channel variants**: the channel uses a spinlock (`__atomic_flag_test_and_set`). Under two-thread contention the `_lock` cache line bounces between cores every operation (~100–300ns/acquire), giving ~10M ops/sec regardless of program vs raw-thread overhead.
+
+### Stream design notes
+
+`stream` (`core/stream.cb`) is a double-buffered text pipe backed by a Win32 SRW lock + two `CONDITION_VARIABLE`s — mirroring the C++ reference:
+
+- `_cvFull`: consumer waits here when no full buffer is ready
+- `_cvEmpty`: producer waits here when no empty buffer is available for the next fill
+- The lock is a Win32 SRW lock (via `mutex.sleep_cv`) — lighter than CRITICAL_SECTION, matching C++'s `std::mutex` backing
+
+For best consumer throughput, use `read_buf(int* out_len)` instead of `read()` — it exposes the buffer length so the inner loop has a known trip count that LLVM can auto-vectorize:
+
+```cflat
+int len = 0;
+char* buf = g_stream.read_buf(&len);
+while (buf != nullptr) {
+    int i = 0;
+    while (i < len) { if (buf[i] == '\n') { count = count + (i64)1; } i++; }
+    g_stream.return_buffer(buf);
+    buf = g_stream.read_buf(&len);
+}
+```
+
+Pin producer and consumer to separate cores with `Thread.setAffinity(u64 mask)` or `prog._thread.setAffinity(mask)` to avoid OS scheduling jitter.

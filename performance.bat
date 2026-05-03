@@ -87,6 +87,37 @@ for %%F in (%BENCH_FILES%) do (
     )
 )
 
+REM ===========================================================================
+REM C++ comparison benchmark (compile + run)
+REM ===========================================================================
+echo.
+echo ===================================================
+echo  C++ Comparison Benchmark
+echo ===================================================
+echo.
+
+set CPP_SRC=performance\perf_yes_compare.cpp
+set CPP_EXE=out\perf\perf_yes_compare_cpp.exe
+set VCVARS="C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat"
+
+if not exist %VCVARS% (
+    echo SKIP: vcvarsall.bat not found at %VCVARS%
+    goto :Done
+)
+
+echo Compiling %CPP_SRC%...
+cmd /c "%VCVARS% x64 > nul 2>&1 && cl /O2 /std:c++17 /EHsc /nologo %CPP_SRC% /Fe%CPP_EXE% /Fo%OUT%\ > %OUT%\results\perf_yes_compare_cpp.log 2>&1"
+if !ERRORLEVEL! neq 0 (
+    echo ERROR: C++ compile failed:
+    type %OUT%\results\perf_yes_compare_cpp.log
+    goto :Done
+)
+echo   perf_yes_compare.cpp
+
+echo.
+%CPP_EXE%
+
+:Done
 echo.
 echo ===================================================
 echo  Done.
