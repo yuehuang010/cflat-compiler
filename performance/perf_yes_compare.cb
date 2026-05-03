@@ -1,0 +1,177 @@
+// Throughput comparison across four producer-consumer variants.
+// Each variant runs for BENCH_SECS seconds; results are printed as a table.
+//
+//   channel   + program    — MPMC bounded channel, program actor overhead
+//   spsc_queue + program   — wait-free SPSC ring, program actor overhead
+//   channel   + raw Thread — same channel, raw Win32 threads (no program overhead)
+//   single-threaded loop   — no queue, no threads; tight increment loop (ceiling)
+//
+// All threaded variants use non-blocking push/pop so the stop flag is checked promptly.
+
+import "list.cb";
+import "thread.cb";
+import "time.cb";
+import "channel.cb";
+import "spsc_queue.cb";
+import "stop_token.cb";
+
+extern int  __atomic_i32_load(int* ptr);
+extern void __atomic_i32_store(int* ptr, int val);
+
+int BENCH_SECS = 5;
+
+// ── Variant 1: channel<int> + program ────────────────────────────────────────
+
+channel<int> g_ch;
+
+program ChProducer
+{
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        while (!token.stop_requested()) { g_ch.try_push(1); }
+        return 0;
+    }
+};
+
+program ChConsumer
+{
+    i64 count = default;
+
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        int val = 0;
+        while (!token.stop_requested())
+        {
+            if (g_ch.try_receive(&val)) { count = count + (i64)1; }
+        }
+        return 0;
+    }
+};
+
+// ── Variant 2: spsc_queue<int> + program ─────────────────────────────────────
+
+spsc_queue<int> g_spsc;
+
+program SpscProducer
+{
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        while (!token.stop_requested()) { g_spsc.try_push(1); }
+        return 0;
+    }
+};
+
+program SpscConsumer
+{
+    i64 count = default;
+
+    int main(move list<string> args)
+    {
+        stop_token token = _stop_source.get_token();
+        int val = 0;
+        while (!token.stop_requested())
+        {
+            if (g_spsc.try_pop(&val)) { count = count + (i64)1; }
+        }
+        return 0;
+    }
+};
+
+// ── Variant 3: channel<int> + raw Thread (no program construct) ───────────────
+
+channel<int> g_ch2;
+int g_raw_stop  = 0;
+i64 g_raw_count = 0;
+
+int raw_producer(void* ctx)
+{
+    while (__atomic_i32_load(&g_raw_stop) == 0) { g_ch2.try_push(1); }
+    return 0;
+}
+
+int raw_consumer(void* ctx)
+{
+    int val = 0;
+    while (__atomic_i32_load(&g_raw_stop) == 0)
+    {
+        if (g_ch2.try_receive(&val)) { g_raw_count = g_raw_count + (i64)1; }
+    }
+    return 0;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    list<string> args;
+    int dur_ms = BENCH_SECS * 1000;
+    i64 dur_s  = (i64)BENCH_SECS;
+
+    printf("Running each variant for %d seconds...\n\n", BENCH_SECS);
+
+    // variant 1
+    printf("[1/4] channel   + program\n");
+    g_ch.init(4096);
+    ChProducer  chProd;
+    ChConsumer  chCons;
+    chProd.run(args);
+    chCons.run(args);
+    sleep(dur_ms);
+    chProd.RequestStop();
+    chCons.RequestStop();
+    chProd.WaitForExit();
+    chCons.WaitForExit();
+    i64 ch_tps = chCons.count / dur_s;
+    g_ch.destroy();
+
+    // variant 2
+    printf("[2/4] spsc_queue + program\n");
+    g_spsc.init(4096);
+    SpscProducer spscProd;
+    SpscConsumer spscCons;
+    spscProd.run(args);
+    spscCons.run(args);
+    sleep(dur_ms);
+    spscProd.RequestStop();
+    spscCons.RequestStop();
+    spscProd.WaitForExit();
+    spscCons.WaitForExit();
+    i64 spsc_tps = spscCons.count / dur_s;
+    g_spsc.destroy();
+
+    // variant 3
+    printf("[3/4] channel   + raw Thread\n");
+    g_ch2.init(4096);
+    Thread tProd;
+    Thread tCons;
+    tProd.start(raw_producer, nullptr);
+    tCons.start(raw_consumer, nullptr);
+    sleep(dur_ms);
+    __atomic_i32_store(&g_raw_stop, 1);
+    tProd.join();
+    tCons.join();
+    i64 raw_tps = g_raw_count / dur_s;
+    g_ch2.destroy();
+
+    // variant 4: single-threaded tight loop — no queue, no threads
+    printf("[4/4] single-threaded loop\n");
+    Stopwatch sw;
+    sw.start();
+    i64 st_count = (i64)0;
+    while (sw.elapsed().milliseconds() < (double)dur_ms) { st_count = st_count + (i64)1; }
+    i64 st_tps = st_count / dur_s;
+
+    printf("\n");
+    printf("%-32s %15s\n", "Variant",                      "iter/s");
+    printf("%-32s %15s\n", "--------------------------------", "---------------");
+    printf("%-32s %15lld\n", "single-threaded loop",        st_tps);
+    printf("%-32s %15lld\n", "spsc_queue + program",        spsc_tps);
+    printf("%-32s %15lld\n", "channel   + program",         ch_tps);
+    printf("%-32s %15lld\n", "channel   + raw Thread",      raw_tps);
+    printf("\n");
+
+    return 0;
+}
