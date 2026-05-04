@@ -4,6 +4,27 @@ struct MoveResource { int id = 0; };
 void MoveResource(MoveResource* self) { self->id = 0; }
 void consume(move MoveResource* r) { delete r; }
 
+struct Holder { MoveResource* item = nullptr; };
+void Holder(Holder* self) {}
+
+// use after move — assign move param to struct field, then read param again
+expect_error("use of moved variable 'child'") {
+    void storeAndRead(Holder* h, move MoveResource* child)
+    {
+        h->item = child;
+        int y = child->id;
+    }
+}
+
+// use after move — move param assigned to a field in each branch, read after the if/else
+expect_error("use of moved variable 'child2'") {
+    void storeAndReadBranched(Holder* h, Holder* h2, move MoveResource* child2)
+    {
+        if (1) { h->item = child2; } else { h2->item = child2; }
+        int y = child2->id;
+    }
+}
+
 extern int main()
 {
     // use after move — pass to another call
@@ -18,6 +39,20 @@ extern int main()
         MoveResource* r2 = new MoveResource();
         consume(r2);
         int x = r2->id;
+    }
+
+    // use after move — move happens inside an if, read happens after the if
+    expect_error("use of moved variable 'r3'") {
+        MoveResource* r3 = new MoveResource();
+        if (1) consume(r3);
+        consume(r3);
+    }
+
+    // use after move — move happens inside an else, read happens after the if/else
+    expect_error("use of moved variable 'r4'") {
+        MoveResource* r4 = new MoveResource();
+        if (0) { } else { consume(r4); }
+        consume(r4);
     }
 
     return 0;

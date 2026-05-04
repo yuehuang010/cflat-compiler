@@ -4554,6 +4554,57 @@ public:
         }
     }
 
+    // Snapshots the IsMoved flag for all variables in all active scopes.
+    std::map<std::string, bool> SaveMovedState() const
+    {
+        std::map<std::string, bool> state;
+        for (const auto& frame : stackNamedVariable)
+        {
+            for (const auto& [name, nv] : frame.functionArgument)
+                state[name] = nv.IsMoved;
+            for (const auto& [name, nv] : frame.namedVariable)
+                state[name] = nv.IsMoved;
+        }
+        return state;
+    }
+
+    // Restores the IsMoved flag from a snapshot (only for variables still in scope).
+    void RestoreMovedState(const std::map<std::string, bool>& state)
+    {
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [name, nv] : frame.functionArgument)
+                if (auto it = state.find(name); it != state.end())
+                    nv.IsMoved = it->second;
+            for (auto& [name, nv] : frame.namedVariable)
+                if (auto it = state.find(name); it != state.end())
+                    nv.IsMoved = it->second;
+        }
+    }
+
+    // Merges two post-branch states: a variable is moved if it was moved in either branch.
+    void MergeMovedStates(const std::map<std::string, bool>& thenState,
+                          const std::map<std::string, bool>& elseState)
+    {
+        for (auto& frame : stackNamedVariable)
+        {
+            for (auto& [name, nv] : frame.functionArgument)
+            {
+                auto t = thenState.find(name);
+                auto e = elseState.find(name);
+                if (t != thenState.end() && e != elseState.end())
+                    nv.IsMoved = t->second || e->second;
+            }
+            for (auto& [name, nv] : frame.namedVariable)
+            {
+                auto t = thenState.find(name);
+                auto e = elseState.find(name);
+                if (t != thenState.end() && e != elseState.end())
+                    nv.IsMoved = t->second || e->second;
+            }
+        }
+    }
+
     llvm::GlobalVariable* GetGlobalVariable(std::string name)
     {
         auto result = globalNamedVariable.find(name);

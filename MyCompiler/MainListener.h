@@ -2273,17 +2273,27 @@ public:
                 auto condition = ParseExpression(expression);
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
+                auto preIfMovedState = compiler->SaveMovedState();
+
                 compiler->InitializeBlock(blockTrue, false);
                 ParseStatement(innerStatement[0]);
+                auto thenMovedState = compiler->SaveMovedState();
 
                 compiler->CreateBlockBreak(blockResume, true);
 
                 if (blockElse != nullptr)
                 {
+                    // Restore pre-branch moved state so else doesn't inherit if-branch moves.
+                    compiler->RestoreMovedState(preIfMovedState);
+
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
                     ParseStatement(innerStatement[1]);
+                    auto elseMovedState = compiler->SaveMovedState();
                     compiler->CreateBlockBreak(blockResume, true);
+
+                    // Merge: variable is moved if moved in either branch.
+                    compiler->MergeMovedStates(thenMovedState, elseMovedState);
                 }
 
                 // resume
@@ -3508,8 +3518,11 @@ public:
                     || llvm::isa<llvm::GlobalVariable>(destination)))
             {
                 if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
+                {
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
+                    compiler->MarkVariableMoved(rightNV.CallerName);
+                }
             }
             // Transfer ownership for move string: null _ptr so string.dtor is a no-op
             // after the value has been moved to persistent storage (e.g. list::add).
