@@ -171,7 +171,20 @@ struct stream {
     // Flush remaining data and send an EOF sentinel to the consumer.
     // Must be called after the producer exits and before WaitForExit() on the consumer.
     void close() {
-        _flushWrite();
+        // Publish the last partial buffer WITHOUT waiting for the empty pool.
+        // _flushWrite() would deadlock here: the consumer exits after reading the last buffer
+        // without returning it (fgets only returns a buffer when it needs the next one), so
+        // _emptyPool never gets set and the _cvEmpty wait in _flushWrite() hangs forever.
+        if (_writePos > 0) {
+            _writeBuf[_writePos] = '\0';
+            _mu.acquire();
+            while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
+            _pendingFull = _writeBuf;
+            _pendingLen  = _writePos;
+            _writePos    = 0;
+            WakeConditionVariable(_cvFull);
+            _mu.release();
+        }
         _mu.acquire();
         while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
         _eof = true;
