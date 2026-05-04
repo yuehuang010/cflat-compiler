@@ -77,6 +77,16 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     return m->directDeclarator()->getText();
 }
 
+// Extract the plain identifier from a directDeclarator (handles both bare names and C-style array syntax).
+static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
+{
+    if (!d) return "";
+    // C-style array form: (Identifier | Move) '[' assignmentExpression ']'
+    if (d->assignmentExpression())
+        return d->Identifier() ? d->Identifier()->getText() : "move";
+    return d->getText();
+}
+
 // Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr").
 static std::string MangleTypeArg(const std::string& typeName)
 {
@@ -256,7 +266,7 @@ private:
             LLVMBackend::DeclTypeAndValue paramType = ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
-                    paramType.VariableName = directDeclarer->getText();
+                    paramType.VariableName = getDirectDeclName(directDeclarer);
             if (paramType.IsMove && paramType.IsBond)
                 Compiler(paramDecl)->LogError(std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
             paramType.DefaultValue = paramDecl->initializer();
@@ -712,7 +722,7 @@ public:
             if (auto* initList = decl->initDeclaratorList())
                 for (auto* initDecl : initList->initDeclarator())
                     if (auto* dir = initDecl->declarator())
-                        fields.push_back(dir->directDeclarator()->getText());
+                        fields.push_back(getDirectDeclName(dir->directDeclarator()));
         }
         compiler->annotationRegistry[name] = fields;
     }
@@ -1467,7 +1477,7 @@ public:
             if (auto* initList = decl->initDeclaratorList())
                 for (auto* initDecl : initList->initDeclarator())
                     if (auto* dir = initDecl->declarator())
-                        fields.push_back(dir->directDeclarator()->getText());
+                        fields.push_back(getDirectDeclName(dir->directDeclarator()));
         }
         compiler->annotationRegistry[name] = fields;
     }
@@ -2801,7 +2811,17 @@ public:
                     auto declarator = initDecl->declarator();
                     auto initializer = initDecl->initializer();
 
-                    std::string name = declarator->directDeclarator()->getText();
+                    auto* directDecl = declarator->directDeclarator();
+                    std::string name = getDirectDeclName(directDecl);
+                    if (directDecl->assignmentExpression())
+                    {
+                        // C-style fixed-size array field: char buf[N]
+                        auto* sizeVal = ParseAssignmentExpression(directDecl->assignmentExpression());
+                        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
+                            typeAndValue.ConstArraySize = ci->getZExtValue();
+                        else
+                            LogErrorContext(directDecl, "array size must be a compile-time constant");
+                    }
                     typeAndValue.VariableName = name;
                     typeAndValue.Initializer = initializer;
                     typeAndValue.Annotations = annotations;
@@ -2961,7 +2981,10 @@ public:
             else if (direct != nullptr)
             {
                 auto identList = declarator->identifierList();
-                std::string name = direct->getText();
+                std::string name = getDirectDeclName(direct);
+                // C-style array local: char buf[N] — override arraySize for this declarator
+                if (direct->assignmentExpression() && typeAndValue.ArraySize == nullptr)
+                    arraySize = ParseAssignmentExpression(direct->assignmentExpression());
                 typeAndValue.VariableName = name;
 
                 if (identList != nullptr)
@@ -5405,8 +5428,18 @@ public:
                                     if (structVar.Storage)
                                     {
                                         namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                        namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
-                                        namedVar.BaseType = namedVar.Primary->getType();
+                                        auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
+                                        if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                        {
+                                            // Array field: keep GEP pointer; don't load the whole array
+                                            namedVar.Primary = nullptr;
+                                            namedVar.BaseType = fieldLLVMType;
+                                        }
+                                        else
+                                        {
+                                            namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                                            namedVar.BaseType = namedVar.Primary->getType();
+                                        }
                                     }
                                     else if (structVar.Primary)
                                     {
@@ -5660,6 +5693,15 @@ public:
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue = elementTypeAndValue;
+                        }
+                        else if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
+                        {
+                            // Fixed-size array (char buf[N]): two-index GEP {0, i} to reach element i
+                            llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
+                            namedVar.Storage = Compiler(ctx)->builder->CreateGEP(
+                                arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
+                            namedVar.BaseType = arrTy->getElementType();
+                            namedVar.TypeAndValue.ConstArraySize = 0;
                         }
                         else
                         {
@@ -8146,7 +8188,7 @@ public:
                 if (!idl->initDeclarator().empty())
                     if (auto* d = idl->initDeclarator()[0]->declarator())
                         if (auto* dd = d->directDeclarator())
-                            baseFieldName = dd->getText();
+                            baseFieldName = getDirectDeclName(dd);
 
             auto& packTypes = activePackSubstitutions.at(packParamName);
             auto savedPackItemSubst = activeTypeSubstitutions;
@@ -9494,7 +9536,7 @@ public:
                 if (!idl->initDeclarator().empty())
                     if (auto* d = idl->initDeclarator()[0]->declarator())
                         if (auto* dd = d->directDeclarator())
-                            baseFieldName = dd->getText();
+                            baseFieldName = getDirectDeclName(dd);
 
             auto& packTypes = activePackSubstitutions.at(packParamName);
             auto savedPackItemSubst = activeTypeSubstitutions;

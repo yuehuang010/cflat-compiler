@@ -122,6 +122,8 @@ public:
         struct FuncPtrParam { std::string TypeName; bool Pointer = false; };
         std::vector<FuncPtrParam> FuncPtrParams;
 
+        uint64_t ConstArraySize = 0; // non-zero for C-style fixed arrays: char buf[N] in struct fields
+
         bool IsPrimitive() const
         {
             return IsInteger() != -1 || IsUnsignedInteger() != -1 || IsFloatingPoint() != -1
@@ -3600,6 +3602,9 @@ public:
                 }
             }
         }
+
+        if (typeAndValue.ConstArraySize > 0)
+            return llvm::ArrayType::get(type, typeAndValue.ConstArraySize);
 
         if (allowPointer && typeAndValue.Pointer)
         {

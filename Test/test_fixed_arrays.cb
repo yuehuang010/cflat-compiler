@@ -1,0 +1,50 @@
+import "string.cb";
+
+struct Packet
+{
+    char data[64];
+    int length = 0;
+};
+
+int sumBytes(char* buf, int len)
+{
+    int sum = 0;
+    int i = 0;
+    while (i < len)
+    {
+        sum = sum + (int)buf[i];
+        i++;
+    }
+    return sum;
+}
+
+extern int main()
+{
+    // Local C-style array
+    char buf[8];
+    buf[0] = (char)10;
+    buf[1] = (char)20;
+    buf[2] = (char)30;
+    int s = (int)buf[0] + (int)buf[1] + (int)buf[2];
+    if (s != 60)
+    {
+        printf("FAIL: local array sum expected 60, got %d\n", s);
+        return 1;
+    }
+
+    // Struct field C-style array
+    Packet pkt;
+    pkt.data[0] = (char)'H';
+    pkt.data[1] = (char)'i';
+    pkt.data[2] = (char)0;
+    pkt.length = 2;
+
+    if ((int)pkt.data[0] != (int)'H' || (int)pkt.data[1] != (int)'i')
+    {
+        printf("FAIL: struct array field mismatch\n");
+        return 1;
+    }
+
+    printf("PASS\n");
+    return 0;
+}

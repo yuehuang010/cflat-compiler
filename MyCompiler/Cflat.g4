@@ -406,6 +406,7 @@ declarator
 directDeclarator
     : (Identifier | Move)
     | (Identifier | Move) ':' DigitSequence  // bit field
+    | (Identifier | Move) '[' assignmentExpression ']'  // C-style fixed-size array
     | '(' declarator ')'
     ;
 
