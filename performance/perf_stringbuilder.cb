@@ -1,0 +1,183 @@
+// Benchmark: stringbuilder append functions at four payload lengths (10 / 50 / 100 / 1000).
+//
+// Each helper runs N iterations of: sb.clear(); sb.<op>(payload);
+// The builder is declared once outside the loop so _ensure() only allocates on
+// the first few calls; subsequent iterations hit the already-warm buffer.
+//
+// Sections:
+//   append(string)        — copies string value by length+memcpy path
+//   append(const char*)   — calls strlen then copies (len=1000 omitted, no literal)
+//   appendLine(string)    — append + appendChar('\n')
+//   appendLine(const char*)
+//   append(i32)           — sprintf into a 32-byte scratch buf then copy
+//   append(bool)          — dispatches to appendCStr("true"/"false")
+//   appendChar(i8)        — single-byte hot path
+
+import "string.cb";
+import "time.cb";
+import "perf_framework.cb";
+
+// ── append(string) ────────────────────────────────────────────────────────────
+
+i64 bench_append_str(int N, string s)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append(s); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── append(const char*) ───────────────────────────────────────────────────────
+
+i64 bench_append_cstr10(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append("0123456789"); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_append_cstr50(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append("01234567890123456789012345678901234567890123456789"); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_append_cstr100(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── appendLine(string) ────────────────────────────────────────────────────────
+
+i64 bench_appendline_str(int N, string s)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.appendLine(s); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── appendLine(const char*) ───────────────────────────────────────────────────
+
+i64 bench_appendline_cstr10(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.appendLine("0123456789"); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── append(i32) ───────────────────────────────────────────────────────────────
+
+i64 bench_append_int(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append(42); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── append(bool) ─────────────────────────────────────────────────────────────
+
+i64 bench_append_bool(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.append(true); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── appendChar(i8) ────────────────────────────────────────────────────────────
+
+i64 bench_append_char(int N)
+{
+    stringbuilder sb;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N) { sb.clear(); sb.appendChar('x'); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int N = 500000;
+
+    // Build string payloads of controlled lengths.
+    // A scratch builder is used here; benchmark builders are created fresh inside each helper.
+    stringbuilder setup;
+    string s10 = "0123456789";
+
+    int k = 0;
+    while (k < 5)   { setup.append(s10); k++; }
+    string s50 = setup.toString();
+
+    setup.clear();
+    k = 0;
+    while (k < 10)  { setup.append(s10); k++; }
+    string s100 = setup.toString();
+
+    setup.clear();
+    k = 0;
+    while (k < 100) { setup.append(s10); k++; }
+    string s1000 = setup.toString();
+
+    printf("Payload lengths: s10=%d  s50=%d  s100=%d  s1000=%d\n",
+        s10.length(), s50.length(), s100.length(), s1000.length());
+
+    PerfHeader("append(string) — N=500000");
+    PerfPrint("len=10",   (i64)N, bench_append_str(N, s10));
+    PerfPrint("len=50",   (i64)N, bench_append_str(N, s50));
+    PerfPrint("len=100",  (i64)N, bench_append_str(N, s100));
+    PerfPrint("len=1000", (i64)N, bench_append_str(N, s1000));
+
+    PerfHeader("append(const char*) — N=500000");
+    PerfPrint("len=10",  (i64)N, bench_append_cstr10(N));
+    PerfPrint("len=50",  (i64)N, bench_append_cstr50(N));
+    PerfPrint("len=100", (i64)N, bench_append_cstr100(N));
+
+    PerfHeader("appendLine(string) — N=500000");
+    PerfPrint("len=10",   (i64)N, bench_appendline_str(N, s10));
+    PerfPrint("len=50",   (i64)N, bench_appendline_str(N, s50));
+    PerfPrint("len=100",  (i64)N, bench_appendline_str(N, s100));
+    PerfPrint("len=1000", (i64)N, bench_appendline_str(N, s1000));
+
+    PerfHeader("appendLine(const char*) — N=500000");
+    PerfPrint("len=10", (i64)N, bench_appendline_cstr10(N));
+
+    PerfHeader("append(i32) — N=500000");
+    PerfPrint("value=42", (i64)N, bench_append_int(N));
+
+    PerfHeader("append(bool) — N=500000");
+    PerfPrint("value=true", (i64)N, bench_append_bool(N));
+
+    PerfHeader("appendChar(i8) — N=500000");
+    PerfPrint("char='x'", (i64)N, bench_append_char(N));
+
+    printf("\n");
+    return 0;
+}

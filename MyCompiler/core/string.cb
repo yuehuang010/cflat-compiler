@@ -119,6 +119,40 @@ string operator+(string a, IString b)
     return a + b->ToString();
 }
 
+// ── string_view ───────────────────────────────────────────────────────────────
+// Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
+struct string_view
+{
+    i8* _ptr = nullptr;
+    i32 _len = 0;
+
+    i8* data()      { return _ptr; }
+    i32 length()    { return _len; }
+    i8  get(i32 i)  { return _ptr[i]; }
+};
+
+// Return a view of the entire string, bonded to the source.
+string_view* view(bond string* self)
+{
+    string_view* sv = new string_view;
+    sv->_ptr = self->_ptr;
+    sv->_len = self->_len;
+    return sv;
+}
+
+// Return a view of bytes [start, end), bonded to the source.  Indices are clamped.
+string_view* span(bond string* self, i32 start, i32 end)
+{
+    i32 len = self->_len;
+    if (start < 0) start = 0;
+    if (end > len) end = len;
+    if (start > end) start = end;
+    string_view* sv = new string_view;
+    sv->_ptr = self->_ptr + start;
+    sv->_len = end - start;
+    return sv;
+}
+
 // ── stringbuilder ────────────────────────────────────────────────────────────
 // Mutable, growable string buffer.
 struct stringbuilder

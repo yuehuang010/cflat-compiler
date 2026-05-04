@@ -1,5 +1,6 @@
 import "cruntime.cb";
 import "mutex.cb";
+import "string.cb";
 
 // Double-buffered text pipe between two 'program' constructs.
 //
@@ -94,6 +95,11 @@ struct stream {
         while (i < len) { _writeBuf[_writePos] = data[i]; _writePos++; i++; }
         _writeBuf[_writePos] = '\0';
         free(data);
+    }
+
+    // Write a string value into the stream (does not take ownership).
+    void write(string str) {
+        write_bytes((char*)str.data(), str.length());
     }
 
     // Copy len bytes from data into the stream without taking ownership.
