@@ -444,9 +444,17 @@ private:
         compiler->CreateStructType(typeName, {});
 
         if (auto* s = compiler->GetSymbolSink())
+        {
             s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFileName(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                         "struct " + typeName);
+            // Also register under the unqualified name so Lookup("Point") finds "Geometry.Point".
+            size_t dot = typeName.rfind('.');
+            if (dot != std::string::npos)
+                s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFileName(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "struct " + typeName);
+        }
 
         // Pre-declare default constructor
         LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
@@ -1621,7 +1629,21 @@ public:
         std::string namespaceName = ctx->Identifier()->getText();
         if (!parentNamespace.empty())
             namespaceName = parentNamespace + "." + namespaceName;
-        Compiler(ctx)->RegisterNamespace(namespaceName);
+        auto* compiler = Compiler(ctx);
+        compiler->RegisterNamespace(namespaceName);
+
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            s->Register(SymbolKind::Namespace, namespaceName, compiler->GetSourceFileName(),
+                        (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                        "namespace " + namespaceName);
+            // Also register under the unqualified name so Lookup("Inner") finds "Outer.Inner".
+            size_t dot = namespaceName.rfind('.');
+            if (dot != std::string::npos)
+                s->Register(SymbolKind::Namespace, namespaceName.substr(dot + 1), compiler->GetSourceFileName(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "namespace " + namespaceName);
+        }
 
         for (auto* extDecl : ctx->externalDeclaration())
             ParseExternalDeclaration(extDecl, namespaceName);

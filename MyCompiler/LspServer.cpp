@@ -471,6 +471,23 @@ private:
         auto index = GetCurrentIndex();
         const SymbolDef* def = word.empty() ? nullptr : index->Lookup(word);
 
+        // Cursor is on a local variable name — follow through to the type's definition.
+        if (!def)
+        {
+            const std::string* typeName = word.empty() ? nullptr : index->LookupVariableType(word);
+            if (typeName)
+            {
+                def = index->Lookup(*typeName);
+                // Also try the unqualified part of the type name ("Point" from "Geometry.Point").
+                if (!def)
+                {
+                    size_t dot = typeName->rfind('.');
+                    if (dot != std::string::npos)
+                        def = index->Lookup(typeName->substr(dot + 1));
+                }
+            }
+        }
+
         if (!def) { SendResponse(id, nullptr); return; }
 
         lsp::Range range{

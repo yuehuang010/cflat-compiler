@@ -229,6 +229,77 @@ def test_diagnostic_lifecycle(client: LspClient) -> str | None:
     return None
 
 
+def test_def_non_primitives(client: LspClient) -> str | None:
+    """Go-to-definition covers every non-primitive kind: namespace, struct, local var type, local var name."""
+    # Source has no indentation so column positions are trivial to count.
+    # Line numbers (0-based):
+    #  0  namespace Geometry {
+    #  1  struct Point {
+    #  2  int x = 0;
+    #  3  int y = 0;
+    #  4  };
+    #  5  struct Circle {
+    #  6  int cx = 0;
+    #  7  int cy = 0;
+    #  8  int radius = 0;
+    #  9  };
+    # 10  }
+    # 11  extern int main() {
+    # 12  Geometry.Point p;
+    # 13  Geometry.Circle c;
+    # 14  return 0;
+    # 15  }
+    source = (
+        "namespace Geometry {\n"
+        "struct Point {\n"
+        "int x = 0;\n"
+        "int y = 0;\n"
+        "};\n"
+        "struct Circle {\n"
+        "int cx = 0;\n"
+        "int cy = 0;\n"
+        "int radius = 0;\n"
+        "};\n"
+        "}\n"
+        "extern int main() {\n"
+        "Geometry.Point p;\n"
+        "Geometry.Circle c;\n"
+        "return 0;\n"
+        "}\n"
+    )
+    uri = _uri_for("def_non_primitives")
+    _open_doc(client, uri, source)
+    wait_diagnostics_for(client, uri)
+
+    # Each entry: (description, line, col)
+    cases = [
+        # Declarations
+        ("namespace Geometry (decl)",   0, 10),  # 'G' of Geometry
+        ("struct Point (decl)",         1,  7),  # 'P' of Point
+        ("struct Circle (decl)",        5,  7),  # 'C' of Circle
+        # Usage as local variable type
+        ("Point type in 'Geometry.Point p'",  12,  9),  # 'P' of Point after 'Geometry.'
+        ("Circle type in 'Geometry.Circle c'", 13,  9),  # 'C' of Circle after 'Geometry.'
+        # Variable names (cursor on the variable identifier itself)
+        ("local var 'p' (struct type)",  12, 15),  # 'p' after 'Geometry.Point '
+        ("local var 'c' (struct type)",  13, 16),  # 'c' after 'Geometry.Circle '
+    ]
+
+    failures = []
+    for desc, line, col in cases:
+        resp = client.request("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        })
+        results = resp.get("result") or []
+        if not results:
+            failures.append(f"{desc} (line={line}, col={col}): no definition returned")
+
+    if not failures:
+        return None
+    return "\n        ".join(failures)
+
+
 def test_negative_hover_before_initialize(exe: str) -> str | None:
     """Hover before initialize should return an error response, not crash."""
     client = LspClient(exe)
@@ -326,6 +397,11 @@ def run_all(exe: str) -> bool:
         record("server resilience", test_server_resilience(client))
     except Exception as e:
         record("server resilience", f"EXCEPTION: {e}")
+
+    try:
+        record("def: non-primitives (namespace/struct/local var)", test_def_non_primitives(client))
+    except Exception as e:
+        record("def: non-primitives (namespace/struct/local var)", f"EXCEPTION: {e}")
 
     # Shutdown main client.
     try:
