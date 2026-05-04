@@ -794,9 +794,10 @@ program SpinForever {
 
 // Loops until its stop token is signalled; returns 42 on clean exit.
 program CoopLoop {
+    stop_token token = default;
+
     int main(move list<string> args) {
-        stop_token tok = _stop_source.get_token();
-        while (!tok.stop_requested()) { }
+        while (!token.stop_requested()) { }
         return 42;
     }
 };
@@ -805,10 +806,14 @@ bool testRequestStop() {
     bool result = true;
     CoopLoop prog;
     list<string> args;
+    stop_source src;
+    src.init();
+    prog.token = src.get_token();
     prog.run(args);
-    prog.RequestStop();
+    src.request_stop();
     prog.WaitForExit();
     result &= Test("RequestStop cooperative exit", prog.exitCode, 42);
+    src.dispose();
     return result;
 }
 

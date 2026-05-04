@@ -66,6 +66,7 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 
 ## Testing
 - Always run `test.bat` after compiler changes to verify all tests pass before declaring work complete.
+- `test.bat` runs all tests in parallel and should complete in under a minute. A test that hangs will be killed after 60 seconds.
 - Do NOT create separate compiler integration tests - test.bat already validates the compiler end-to-end.
 - Do NOT revert changes to check if baseline is correct.  Assume all tests are passing and failed test are from the current changes.  Ask before reverting changes to validate baseline.
 - When tests fail after a fix, investigate root causes; do not weaken/dilute test assertions to make them pass. Ask before disabling tests.

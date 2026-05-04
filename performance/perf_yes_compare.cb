@@ -18,6 +18,23 @@ extern void __atomic_i32_store(int* ptr, int val);
 
 int BENCH_SECS = 5;
 
+void fmt_commas(i64 n, char* out) {
+    char tmp[24];
+    sprintf(tmp, "%lld", n);
+    int src_len = 0;
+    while (tmp[src_len] != '\0') src_len++;
+    int out_pos = 0;
+    int i = 0;
+    while (i < src_len) {
+        int digits_left = src_len - i;
+        if (i > 0 && digits_left % 3 == 0) { out[out_pos] = ','; out_pos++; }
+        out[out_pos] = tmp[i];
+        out_pos++;
+        i++;
+    }
+    out[out_pos] = '\0';
+}
+
 // ── Variant 1: channel<int> + program ────────────────────────────────────────
 
 // Global pointers: the actual storage lives in main() to avoid global struct
@@ -28,9 +45,10 @@ channel<int>*    g_ch2   = nullptr;
 
 program ChProducer
 {
+    stop_token token = default;
+
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         while (!token.stop_requested()) { g_ch.try_push(1); }
         return 0;
     }
@@ -38,11 +56,11 @@ program ChProducer
 
 program ChConsumer
 {
+    stop_token token = default;
     i64 count = default;
 
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         int val = 0;
         while (!token.stop_requested())
         {
@@ -56,9 +74,10 @@ program ChConsumer
 
 program SpscProducer
 {
+    stop_token token = default;
+
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         while (!token.stop_requested()) { g_spsc.try_push(1); }
         return 0;
     }
@@ -66,11 +85,11 @@ program SpscProducer
 
 program SpscConsumer
 {
+    stop_token token = default;
     i64 count = default;
 
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         int val = 0;
         while (!token.stop_requested())
         {
@@ -137,9 +156,10 @@ int stream_raw_consumer(void* ctx)
 
 program StreamProducer
 {
+    stop_token token = default;
+
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         stream* out = _out;
         char* line = (char*)"Y\n";
         while (!token.stop_requested()) { out.write_bytes(line, 2); }
@@ -178,13 +198,17 @@ extern int main()
     g_ch = &ch;
     ChProducer  chProd;
     ChConsumer  chCons;
+    stop_source chSrc;
+    chSrc.init();
+    chProd.token = chSrc.get_token();
+    chCons.token = chSrc.get_token();
     chProd.run(args);
     chCons.run(args);
     sleep(dur_ms);
-    chProd.RequestStop();
-    chCons.RequestStop();
+    chSrc.request_stop();
     chProd.WaitForExit();
     chCons.WaitForExit();
+    chSrc.dispose();
     i64 ch_tps = chCons.count / dur_s;
     ch.destroy();
 
@@ -195,13 +219,17 @@ extern int main()
     g_spsc = &spsc;
     SpscProducer spscProd;
     SpscConsumer spscCons;
+    stop_source spscSrc;
+    spscSrc.init();
+    spscProd.token = spscSrc.get_token();
+    spscCons.token = spscSrc.get_token();
     spscProd.run(args);
     spscCons.run(args);
     sleep(dur_ms);
-    spscProd.RequestStop();
-    spscCons.RequestStop();
+    spscSrc.request_stop();
     spscProd.WaitForExit();
     spscCons.WaitForExit();
+    spscSrc.dispose();
     i64 spsc_tps = spscCons.count / dur_s;
     spsc.destroy();
 
@@ -228,6 +256,9 @@ extern int main()
     s.init();
     StreamProducer strProd;
     StreamConsumer strCons;
+    stop_source streamSrc;
+    streamSrc.init();
+    strProd.token = streamSrc.get_token();
     strProd >> s;
     s >> strCons;
     strProd.run(args);
@@ -235,10 +266,11 @@ extern int main()
     strProd._thread.setAffinity((u64)1);  // core 0
     strCons._thread.setAffinity((u64)2);  // core 1
     sleep(dur_ms);
-    strProd.RequestStop();
+    streamSrc.request_stop();
     strProd.WaitForExit();
     s.close();
     strCons.WaitForExit();
+    streamSrc.dispose();
     i64 stream_tps = strCons.count / dur_s;
 
     // variant 5: stream + raw Thread (direct write_bytes, no program overhead)
@@ -279,12 +311,13 @@ extern int main()
     printf("\n");
     printf("%-32s %15s\n", "Variant",                      "iter/s");
     printf("%-32s %15s\n", "--------------------------------", "---------------");
-    printf("%-32s %15lld\n", "single-threaded loop",        st_tps);
-    printf("%-32s %15lld\n", "spsc_queue + program",        spsc_tps);
-    printf("%-32s %15lld\n", "channel   + program",         ch_tps);
-    printf("%-32s %15lld\n", "channel   + raw Thread",      raw_tps);
-    printf("%-32s %15lld\n", "stream    + program",         stream_tps);
-    printf("%-32s %15lld\n", "stream    + raw Thread",      stream_raw_tps);
+    char buf[32];
+    fmt_commas(st_tps,         buf); printf("%-32s %15s\n", "single-threaded loop",  buf);
+    fmt_commas(spsc_tps,       buf); printf("%-32s %15s\n", "spsc_queue + program",  buf);
+    fmt_commas(ch_tps,         buf); printf("%-32s %15s\n", "channel   + program",   buf);
+    fmt_commas(raw_tps,        buf); printf("%-32s %15s\n", "channel   + raw Thread",buf);
+    fmt_commas(stream_tps,     buf); printf("%-32s %15s\n", "stream    + program",   buf);
+    fmt_commas(stream_raw_tps, buf); printf("%-32s %15s\n", "stream    + raw Thread",buf);
     printf("\n");
 
     return 0;

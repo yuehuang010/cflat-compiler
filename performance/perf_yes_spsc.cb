@@ -8,9 +8,10 @@ spsc_queue<int> g_spsc;
 
 program SpscProducer
 {
+    stop_token token = default;
+
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         while (!token.stop_requested())
         {
             g_spsc.push(1);
@@ -21,11 +22,11 @@ program SpscProducer
 
 program SpscConsumer
 {
+    stop_token token = default;
     i64 count = default;
 
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         int val = 0;
         while (!token.stop_requested())
         {
@@ -46,15 +47,19 @@ extern int main()
 
     SpscProducer producer;
     SpscConsumer consumer;
+    stop_source src;
+    src.init();
+    producer.token = src.get_token();
+    consumer.token = src.get_token();
     producer.run(args);
     consumer.run(args);
 
     sleep(10000);
 
-    producer.RequestStop();
-    consumer.RequestStop();
+    src.request_stop();
     producer.WaitForExit();
     consumer.WaitForExit();
+    src.dispose();
 
     printf("\n--- Yes (spsc_queue) ---\n");
     printf("  %lld msg/s\n", consumer.count / (i64)10);

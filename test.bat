@@ -132,14 +132,16 @@ for %%F in (%SRC%\test_*.cb) do (
     )
 )
 
-REM Wait for all workers to finish (up to 120 seconds)
+REM Wait for all workers to finish (up to 60 seconds)
 set /a WAITED=0
 :WaitLoop
 set /a DONE=0
 for %%R in (%OUT%\results\*.result) do set /a DONE+=1
 if !DONE! lss !LAUNCHED! (
-    if !WAITED! geq 120 (
-        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after 120s
+    if !WAITED! geq 60 (
+        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after 60s
+        taskkill /f /im MyCompiler.exe >nul 2>&1
+        for %%F in (%OUT%\test_*.exe) do taskkill /f /im "%%~nxF" >nul 2>&1
         goto :Collect
     )
     ping -n 2 127.0.0.1 >nul 2>&1

@@ -6,11 +6,11 @@ import "stop_token.cb";
 // Forward declare so on_y can reference the consumer.
 program YesConsumer
 {
+    stop_token token = default;
     i64 count = default;
 
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         while (!token.stop_requested()) { }
         return 0;
     }
@@ -25,9 +25,10 @@ void on_y(char* s)
 
 program YesProducer
 {
+    stop_token token = default;
+
     int main(move list<string> args)
     {
-        stop_token token = _stop_source.get_token();
         while (!token.stop_requested())
         {
             printf("Y");
@@ -46,15 +47,19 @@ extern int main()
     YesProducer producer;
     producer.onStdout = on_y;
 
+    stop_source src;
+    src.init();
+    producer.token = src.get_token();
+    consumer.token = src.get_token();
     producer.run(args);
     consumer.run(args);
 
     sleep(10000);
 
-    producer.RequestStop();
-    consumer.RequestStop();
+    src.request_stop();
     producer.WaitForExit();
     consumer.WaitForExit();
+    src.dispose();
 
     printf("\n--- Yes (stdout) ---\n");
     printf("  %lld Y/s\n", consumer.count / (i64)10);
