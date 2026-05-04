@@ -1,162 +1,241 @@
-// channel<T> — bounded MPMC ring buffer with spinlock.
+// channel<T> — bounded MPMC ring buffer, Vyukov sequence-based algorithm.
 //
-// Safe ownership transfer between threads.  Blocks the sender when full,
-// blocks the receiver when empty.
+// Lock-free.  N producers and M consumers may call push/try_push and
+// pop/try_pop concurrently without data races.
 //
 // Usage:
 //   channel<int> ch;
-//   ch.init(16);             // ring buffer of 16 slots
+//   ch.init(4096);           // capacity MUST be a power of two
 //
 //   ch.send(42);             // blocks if full; moves ownership for pointer types
 //   int v = ch.receive();    // blocks if empty
 //
 //   int out = 0;
-//   bool ok = ch.try_receive(&out);   // non-blocking receive
-//   bool ok = ch.try_pop(&out);       // same, IQueue-compatible name
+//   bool ok = ch.try_receive(&out);
+//   bool ok = ch.try_pop(&out);
+//   ch.destroy();
 //
-//   ch.destroy();            // free ring buffer
+// Algorithm (Dmitry Vyukov, 2010):
+//   Each slot carries a sequence number alongside the stored value.
+//   _head and _tail are monotonically increasing i64 cursors advanced via CAS.
+//   A producer claims slot (pos & _mask) by CAS-ing _head from pos to pos+1.
+//   It writes the value then stores seq[slot] = pos+1 to signal the consumer.
+//   A consumer claims slot (pos & _mask) by CAS-ing _tail from pos to pos+1.
+//   It reads the value then stores seq[slot] = pos+_cap to recycle the slot.
 //
-// Implementation:
-//   ring buffer + i32 spinlock (atomic test-and-set / clear).
-//   _head and _tail are separated by 60 bytes of padding so they land on
-//   different 64-byte cache lines, avoiding false sharing between the
-//   producer (writes _head) and consumer (writes _tail).
-//   Blocking send/receive spin-wait rather than sleeping in the OS.
+// Capacity MUST be a power of two — the hot path uses bitmasking (pos & _mask)
+// instead of division.  init() enforces this; non-power-of-two values are
+// rounded up to the next power of two automatically.
+//
+// Cache line layout (64 bytes each):
+//   Line 0: _buf* + _seq* + _cap + _mask          — read-only after init
+//   Line 1: _head                                  — producer-local
+//   Line 2: _tail                                  — consumer-local
 
 import "interfaces.cb";
 import "atomic.cb";
 
 class channel<T>
 {
-    // ── shared fields ─────────────────────────────────────────────────────────
-    T*  _buf   = nullptr;   // ring buffer
-    int _cap   = 0;         // capacity
-    i32 _lock  = 0;         // spinlock: 0 = free, 1 = held
-    int _count = 0;         // current item count
-    // 11 ints of padding push _head to offset 64 (a fresh cache line).
-    // Layout: ptr(8) + cap(4) + lock(4) + count(4) + 11×pad(44) = 64.
-    int _p0 = 0; int _p1 = 0; int _p2  = 0; int _p3  = 0;
-    int _p4 = 0; int _p5 = 0; int _p6  = 0; int _p7  = 0;
-    int _p8 = 0; int _p9 = 0; int _p10 = 0;
+    // ── cache line 0: shared read-only config ─────────────────────────────────
+    // buf*(8) + seq*(8) + cap(8) + mask(8) + 4×pad(32) = 64 bytes
+    T*   _buf  = nullptr;
+    i64* _seq  = nullptr;
+    i64  _cap  = 0;
+    i64  _mask = 0;
+    i64  _c0 = 0; i64 _c1 = 0; i64 _c2 = 0; i64 _c3 = 0;
 
-    // ── producer cache line ───────────────────────────────────────────────────
-    int _head = 0;          // next write index (producer advances)
-    // 15 ints of padding push _tail to offset 128.
-    int _h0 = 0; int _h1 = 0; int _h2  = 0; int _h3  = 0;
-    int _h4 = 0; int _h5 = 0; int _h6  = 0; int _h7  = 0;
-    int _h8 = 0; int _h9 = 0; int _h10 = 0; int _h11 = 0;
-    int _h12 = 0; int _h13 = 0; int _h14 = 0;
+    // ── cache line 1: producer cursor ─────────────────────────────────────────
+    // head(8) + 7×pad(56) = 64 bytes
+    i64 _head = 0;
+    i64 _h0 = 0; i64 _h1 = 0; i64 _h2 = 0; i64 _h3 = 0;
+    i64 _h4 = 0; i64 _h5 = 0; i64 _h6 = 0;
 
-    // ── consumer cache line ───────────────────────────────────────────────────
-    int _tail = 0;          // next read index  (consumer advances)
-
-    // ── spinlock helpers ──────────────────────────────────────────────────────
-
-    void _acquire() {
-        while (__atomic_flag_test_and_set(&_lock)) { }
-    }
-
-    void _release() {
-        __atomic_flag_clear(&_lock);
-    }
+    // ── cache line 2: consumer cursor ─────────────────────────────────────────
+    // tail(8) + 7×pad(56) = 64 bytes
+    i64 _tail = 0;
+    i64 _t0 = 0; i64 _t1 = 0; i64 _t2 = 0; i64 _t3 = 0;
+    i64 _t4 = 0; i64 _t5 = 0; i64 _t6 = 0;
 
     // ── public API ────────────────────────────────────────────────────────────
 
     void init(int cap) {
-        _buf   = new T[cap];
-        _cap   = cap;
-        _count = 0;
-        _head  = 0;
-        _tail  = 0;
-        _lock  = 0;
-    }
-
-    // Blocking send — spin-waits until a slot is available.
-    void send(move T item) {
-        _acquire();
-        while (_count == _cap) { _release(); _acquire(); }
-        _buf[_head] = item;
-        _head = (_head + 1) % _cap;
-        _count++;
-        _release();
-    }
-
-    // Blocking receive — spin-waits until an item is available.
-    T receive() {
-        _acquire();
-        while (_count == 0) { _release(); _acquire(); }
-        T value = _buf[_tail];
-        _tail = (_tail + 1) % _cap;
-        _count--;
-        _release();
-        return value;
+        // Round up to the next power of two so bitmasking is safe.
+        i64 n = (i64)1;
+        while (n < (i64)cap) { n = n * (i64)2; }
+        _cap  = n;
+        _mask = n - (i64)1;
+        _buf  = new T[_cap];
+        _seq  = (i64*)malloc(_cap * (i64)8);
+        int i = 0;
+        while (i < (int)_cap) { _seq[i] = (i64)i; i++; }
+        __atomic_i64_store(&_head, (i64)0);
+        __atomic_i64_store(&_tail, (i64)0);
     }
 
     // Non-blocking send.  Returns false if the channel is full.
     bool try_push(T item) {
-        _acquire();
-        if (_count == _cap) {
-            _release();
-            return false;
+        i64 pos = __atomic_i64_load(&_head);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - pos;
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
+                    _buf[slot] = item;
+                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    return true;
+                }
+                pos = __atomic_i64_load(&_head);
+            } else if (dif < (i64)0) {
+                return false;  // full
+            } else {
+                pos = __atomic_i64_load(&_head);
+            }
         }
-        _buf[_head] = item;
-        _head = (_head + 1) % _cap;
-        _count++;
-        _release();
-        return true;
+        return false;
     }
 
-    // Non-blocking receive.  Returns true and writes to *out if an item was
-    // available; returns false (leaving *out unchanged) if the channel is empty.
+    // Non-blocking receive.  Returns true and writes *out if an item is available.
     bool try_receive(T* out) {
-        _acquire();
-        if (_count == 0) {
-            _release();
-            return false;
+        i64 pos = __atomic_i64_load(&_tail);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - (pos + (i64)1);
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
+                    *out = _buf[slot];
+                    __atomic_i64_store(seqPtr, pos + _cap);
+                    return true;
+                }
+                pos = __atomic_i64_load(&_tail);
+            } else if (dif < (i64)0) {
+                return false;  // empty
+            } else {
+                pos = __atomic_i64_load(&_tail);
+            }
         }
-        *out = _buf[_tail];
-        _tail = (_tail + 1) % _cap;
-        _count--;
-        _release();
-        return true;
+        return false;
     }
 
-    // IQueue-compatible aliases — each has its own body to avoid
-    // generic forwarding issues with interface type parameters.
+    // IQueue-compatible aliases — separate bodies to avoid generic forwarding issues.
     bool try_pop(T* out) {
-        _acquire();
-        if (_count == 0) { _release(); return false; }
-        *out = _buf[_tail];
-        _tail = (_tail + 1) % _cap;
-        _count--;
-        _release();
-        return true;
+        i64 pos = __atomic_i64_load(&_tail);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - (pos + (i64)1);
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
+                    *out = _buf[slot];
+                    __atomic_i64_store(seqPtr, pos + _cap);
+                    return true;
+                }
+                pos = __atomic_i64_load(&_tail);
+            } else if (dif < (i64)0) {
+                return false;
+            } else {
+                pos = __atomic_i64_load(&_tail);
+            }
+        }
+        return false;
+    }
+
+    // Blocking send — spins until a slot is available.
+    void send(move T item) {
+        i64 pos = __atomic_i64_load(&_head);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - pos;
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
+                    _buf[slot] = item;
+                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    return;
+                }
+            }
+            pos = __atomic_i64_load(&_head);
+        }
+    }
+
+    // Blocking receive — spins until an item is available.
+    T receive() {
+        i64 pos = __atomic_i64_load(&_tail);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - (pos + (i64)1);
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
+                    T value = _buf[slot];
+                    __atomic_i64_store(seqPtr, pos + _cap);
+                    return value;
+                }
+            }
+            pos = __atomic_i64_load(&_tail);
+        }
+        T sentinel = default;
+        return sentinel;
     }
 
     void push(move T item) {
-        _acquire();
-        while (_count == _cap) { _release(); _acquire(); }
-        _buf[_head] = item;
-        _head = (_head + 1) % _cap;
-        _count++;
-        _release();
+        i64 pos = __atomic_i64_load(&_head);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - pos;
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
+                    _buf[slot] = item;
+                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    return;
+                }
+            }
+            pos = __atomic_i64_load(&_head);
+        }
     }
 
     T pop() {
-        _acquire();
-        while (_count == 0) { _release(); _acquire(); }
-        T value = _buf[_tail];
-        _tail = (_tail + 1) % _cap;
-        _count--;
-        _release();
-        return value;
+        i64 pos = __atomic_i64_load(&_tail);
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  dif    = seq - (pos + (i64)1);
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
+                    T value = _buf[slot];
+                    __atomic_i64_store(seqPtr, pos + _cap);
+                    return value;
+                }
+            }
+            pos = __atomic_i64_load(&_tail);
+        }
+        T sentinel = default;
+        return sentinel;
     }
 
-    int capacity() { return _cap; }
-    int count()    { return _count; }
+    int capacity() { return (int)_cap; }
+
+    int count() {
+        i64 head = __atomic_i64_load(&_head);
+        i64 tail = __atomic_i64_load(&_tail);
+        i64 n    = head - tail;
+        if (n < (i64)0) { n = (i64)0; }
+        return (int)n;
+    }
 
     void destroy() {
         if (_buf != nullptr) { delete[] _buf; _buf = nullptr; }
+        if (_seq != nullptr) { free((void*)_seq); _seq = nullptr; }
     }
 
     ~channel() {
