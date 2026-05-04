@@ -77,6 +77,16 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 test.bat
 ```
 
+### LSP Tests
+
+Run the LSP test suite (smoke tests + fixture/scenario tests) with:
+
+```bash
+test_lsp.bat
+```
+
+LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h` (symbol registration), run `test_lsp.bat` to verify LSP behaviour. These are kept separate from `test.bat`.
+
 To run a single test manually:
 
 ```bash

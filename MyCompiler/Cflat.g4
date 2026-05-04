@@ -611,12 +611,12 @@ functionDefinition
     ;
 
 structDefinition
-    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
-    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
+    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
     ;
 
 classDefinition
-    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
     ;
 
 programDefinition

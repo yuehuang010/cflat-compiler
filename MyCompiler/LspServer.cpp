@@ -488,6 +488,27 @@ private:
             }
         }
 
+        // Cursor is on a field access (e.g. "myvar.center") — navigate to the field declaration.
+        if (!def && !word.empty())
+        {
+            auto [receiver, _partial] = extractReceiverAt(text, line, character);
+            if (!receiver.empty())
+            {
+                const std::string* typeName = index->LookupVariableType(receiver);
+                if (typeName)
+                {
+                    // Try "Circle.center", then "Circle.center" via bare type name.
+                    def = index->Lookup(*typeName + "." + word);
+                    if (!def)
+                    {
+                        size_t dot = typeName->rfind('.');
+                        if (dot != std::string::npos)
+                            def = index->Lookup(typeName->substr(dot + 1) + "." + word);
+                    }
+                }
+            }
+        }
+
         if (!def) { SendResponse(id, nullptr); return; }
 
         lsp::Range range{

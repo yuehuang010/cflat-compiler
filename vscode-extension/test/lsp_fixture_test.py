@@ -300,6 +300,88 @@ def test_def_non_primitives(client: LspClient) -> str | None:
     return "\n        ".join(failures)
 
 
+def test_def_nested_struct(client: LspClient) -> str | None:
+    """Go-to-definition covers nested struct/class declarations and their usages."""
+    # Source has no indentation so column positions are trivial to count.
+    # Line numbers (0-based):
+    #  0  struct OuterStruct {
+    #  1  struct InnerStruct {
+    #  2  int x = 0;
+    #  3  int y = 0;
+    #  4  };
+    #  5  InnerStruct inner;
+    #  6  int value = 0;
+    #  7  };
+    #  8  extern int main() {
+    #  9  OuterStruct o;
+    # 10  OuterStruct.InnerStruct standalone;
+    # 11  int v = o.inner.x;
+    # 12  return 0;
+    # 13  }
+    source = (
+        "struct OuterStruct {\n"
+        "struct InnerStruct {\n"
+        "int x = 0;\n"
+        "int y = 0;\n"
+        "};\n"
+        "InnerStruct inner;\n"
+        "int value = 0;\n"
+        "};\n"
+        "extern int main() {\n"
+        "OuterStruct o;\n"
+        "OuterStruct.InnerStruct standalone;\n"
+        "int v = o.inner.x;\n"
+        "return 0;\n"
+        "}\n"
+    )
+    uri = _uri_for("def_nested_struct")
+    _open_doc(client, uri, source)
+    wait_diagnostics_for(client, uri)
+
+    # Cases that must return a definition result.
+    must_find = [
+        # Nested type name as field type: "InnerStruct inner;"
+        ("InnerStruct type in field decl",           5,  0),  # 'I' of InnerStruct
+        # Nested type in qualified standalone var: "OuterStruct.InnerStruct standalone;"
+        ("InnerStruct in qualified var decl",        10, 12),  # 'I' of InnerStruct after 'OuterStruct.'
+        # Variable name whose type is a nested struct
+        ("local var 'o' (OuterStruct type)",          9,  0),  # 'o' resolves via variableTypes
+        # Field access: "o.inner" — navigate to the 'inner' field declaration
+        ("field access 'o.inner'",                   11, 10),  # 'i' of inner after 'int v = o.'
+    ]
+
+    # Cases where the cursor is already at the definition — must return null.
+    must_be_null = [
+        # Field name at its own declaration site
+        ("field name 'inner' at its own decl",        5, 12),  # 'i' of inner after 'InnerStruct '
+    ]
+
+    failures = []
+
+    for desc, line, col in must_find:
+        resp = client.request("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        })
+        results = resp.get("result") or []
+        if not results:
+            failures.append(f"{desc} (line={line}, col={col}): no definition returned")
+
+    for desc, line, col in must_be_null:
+        resp = client.request("textDocument/definition", {
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": col},
+        })
+        results = resp.get("result") or []
+        if results:
+            target_line = results[0].get("range", {}).get("start", {}).get("line")
+            failures.append(f"{desc} (line={line}, col={col}): expected null, got line {target_line}")
+
+    if not failures:
+        return None
+    return "\n        ".join(failures)
+
+
 def test_negative_hover_before_initialize(exe: str) -> str | None:
     """Hover before initialize should return an error response, not crash."""
     client = LspClient(exe)
@@ -402,6 +484,11 @@ def run_all(exe: str) -> bool:
         record("def: non-primitives (namespace/struct/local var)", test_def_non_primitives(client))
     except Exception as e:
         record("def: non-primitives (namespace/struct/local var)", f"EXCEPTION: {e}")
+
+    try:
+        record("def: nested struct/class", test_def_nested_struct(client))
+    except Exception as e:
+        record("def: nested struct/class", f"EXCEPTION: {e}")
 
     # Shutdown main client.
     try:

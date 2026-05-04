@@ -1384,6 +1384,102 @@ bool testNullableTypes()
 }
 
 // =============================================================
+// Nested struct / class tests
+// =============================================================
+
+struct OuterStruct {
+    struct InnerStruct {
+        int x = 0;
+        int y = 0;
+    };
+    InnerStruct inner;
+    int value = 0;
+
+    int sum()
+    {
+        return inner.x + inner.y + value;
+    }
+};
+
+class OuterClass {
+    class InnerClass {
+        int a = 0;
+        int b = 0;
+
+        int product()
+        {
+            return a * b;
+        }
+    };
+    InnerClass data;
+};
+
+class ClassWithInnerStruct {
+    struct Point {
+        int x = 0;
+        int y = 0;
+    };
+    Point origin;
+    Point corner;
+};
+
+struct StructWithInnerClass {
+    class Color {
+        int r = 0;
+        int g = 0;
+        int b = 0;
+
+        int brightness()
+        {
+            return r + g + b;
+        }
+    };
+    Color tint;
+};
+
+bool testNestedStructClass()
+{
+    bool result = true;
+
+    OuterStruct o;
+    o.inner.x = 3;
+    o.inner.y = 7;
+    o.value = 10;
+    result &= Test("nested struct field access", o.inner.x, 3);
+    result &= Test("nested struct method", o.sum(), 20);
+
+    OuterStruct.InnerStruct standalone;
+    standalone.x = 100;
+    standalone.y = 200;
+    result &= Test("nested type qualified x", standalone.x, 100);
+    result &= Test("nested type qualified y", standalone.y, 200);
+
+    OuterClass oc;
+    oc.data.a = 4;
+    oc.data.b = 5;
+    result &= Test("nested class field a", oc.data.a, 4);
+    result &= Test("nested class method product", oc.data.product(), 20);
+
+    ClassWithInnerStruct cws;
+    cws.origin.x = 0;
+    cws.origin.y = 0;
+    cws.corner.x = 10;
+    cws.corner.y = 20;
+    result &= Test("class with inner struct origin x", cws.origin.x, 0);
+    result &= Test("class with inner struct corner x", cws.corner.x, 10);
+    result &= Test("class with inner struct corner y", cws.corner.y, 20);
+
+    StructWithInnerClass swc;
+    swc.tint.r = 100;
+    swc.tint.g = 150;
+    swc.tint.b = 200;
+    result &= Test("struct with inner class field r", swc.tint.r, 100);
+    result &= Test("struct with inner class brightness", swc.tint.brightness(), 450);
+
+    return result;
+}
+
+// =============================================================
 // Primitive type alias tests (using Alias = primitiveType)
 // =============================================================
 
@@ -1489,6 +1585,7 @@ extern int main()
     total++; passed += testNullableTypes()               ? 1 : 0;
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
+    total++; passed += testNestedStructClass()           ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

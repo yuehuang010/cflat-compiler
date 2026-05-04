@@ -487,6 +487,12 @@ private:
             LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
             compiler->CreateFunctionDeclaration("~" + typeName, voidReturn, { thisParam });
         }
+
+        // Recursively pre-declare nested struct/class definitions
+        for (auto* nestedStruct : ctx->structDefinition())
+            ScanStructDefinition(nestedStruct, typeName);
+        for (auto* nestedClass : ctx->classDefinition())
+            ScanClassDefinition(nestedClass, typeName);
     }
 
     void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
@@ -825,6 +831,10 @@ private:
     // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
     std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
 
+    // Struct scope stack: pushed when parsing fields/methods of a struct/class so that
+    // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
+    std::vector<std::string> structScopeStack;
+
     static inline std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
     static inline std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
     static inline std::unordered_set<std::string> instantiatedInterfaces;
@@ -1078,6 +1088,13 @@ private:
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
+                    // If still unresolved, try qualifying with the enclosing struct scope (e.g. Inner -> Outer.Inner)
+                    if (!structScopeStack.empty() && !Compiler(declSpecs)->IsDataStructure(typeName))
+                    {
+                        std::string qualified = structScopeStack.back() + "." + typeName;
+                        if (Compiler(declSpecs)->IsDataStructure(qualified))
+                            typeName = qualified;
+                    }
                     // Resolve type aliases (e.g. user-defined aliases)
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     declType.TypeName = typeName;
@@ -8153,6 +8170,16 @@ public:
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
+
+        // Process nested struct/class definitions before fields so their types are available
+        for (auto* nestedStruct : ctx->structDefinition())
+            ParseStructDefinition(nestedStruct, {}, structName);
+        for (auto* nestedClass : ctx->classDefinition())
+            ParseClassDefinition(nestedClass, {}, structName);
+
+        // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
+        structScopeStack.push_back(structName);
+
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
 
@@ -8454,6 +8481,8 @@ public:
 
         // Process any generic instantiations that were queued during this struct definition
         // ProcessPendingInstantiations();
+
+        structScopeStack.pop_back();
     }
 
     // Find the first registered overload of `methodName` whose first parameter type is `firstParamType`.
@@ -9501,6 +9530,16 @@ public:
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
+
+        // Process nested struct/class definitions before fields so their types are available
+        for (auto* nestedStruct : ctx->structDefinition())
+            ParseStructDefinition(nestedStruct, {}, structName);
+        for (auto* nestedClass : ctx->classDefinition())
+            ParseClassDefinition(nestedClass, {}, structName);
+
+        // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
+        structScopeStack.push_back(structName);
+
         auto declarationList = ctx->declaration();
         std::vector<llvm::Type*> types;
 
@@ -9868,6 +9907,8 @@ public:
 
         // Process any generic instantiations that were queued during this class definition
         // ProcessPendingInstantiations();
+
+        structScopeStack.pop_back();
     }
 
     std::vector<std::string> ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams)
