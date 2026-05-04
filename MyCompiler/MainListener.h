@@ -8349,6 +8349,13 @@ public:
             for (const auto& field : sd.StructFields)
             {
                 if (field.VariableName.empty()) continue;
+                std::string annSig;
+                for (const auto& ann : field.Annotations)
+                {
+                    annSig += "[" + ann.Name;
+                    if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
+                    annSig += "] ";
+                }
                 std::string typeSig = field.TypeName;
                 if (field.Pointer) typeSig += "*";
                 if (field.ElemPointer) typeSig += "*";
@@ -8356,7 +8363,7 @@ public:
                             compiler->GetSourceFileName(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            typeSig + " " + field.VariableName);
+                            annSig + typeSig + " " + field.VariableName);
             }
         }
 
@@ -9442,6 +9449,13 @@ public:
             for (const auto& field : sd.StructFields)
             {
                 if (field.VariableName.empty()) continue;
+                std::string annSig;
+                for (const auto& ann : field.Annotations)
+                {
+                    annSig += "[" + ann.Name;
+                    if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
+                    annSig += "] ";
+                }
                 std::string typeSig = field.TypeName;
                 if (field.Pointer) typeSig += "*";
                 if (field.ElemPointer) typeSig += "*";
@@ -9449,7 +9463,7 @@ public:
                             compiler->GetSourceFileName(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            typeSig + " " + field.VariableName);
+                            annSig + typeSig + " " + field.VariableName);
             }
         }
 
