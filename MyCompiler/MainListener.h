@@ -8585,34 +8585,28 @@ public:
         auto* stopSrcType          = compiler->dataStructures.count("stop_source")
                                      ? compiler->dataStructures["stop_source"].StructType : nullptr;
 
-        // Look up the thread-local stdout hook global (declared in cruntime.cb)
-        llvm::GlobalVariable* stdoutHookGlobal = nullptr;
+        // __ProgramTLS field indices — must match struct __ProgramTLS in cruntime.cb
+        constexpr int kPTLS_stdout_hook            = 0;
+        constexpr int kPTLS_stdin_hook             = 4;
+        constexpr int kPTLS_stdin_return_hook      = 8;
+        constexpr int kPTLS_handle_tracker_enabled = 10;
+        constexpr int kPTLS_handle_tracker_head    = 11;
+
+        // Look up the single thread-local TLS struct (declared in cruntime.cb)
+        llvm::GlobalVariable* progTlsGlobal = nullptr;
         {
-            auto it = compiler->globalNamedVariable.find("__stdout_hook");
-            if (it != compiler->globalNamedVariable.end()) stdoutHookGlobal = it->second;
+            auto it = compiler->globalNamedVariable.find("__prog_tls");
+            if (it != compiler->globalNamedVariable.end()) progTlsGlobal = it->second;
         }
-        if (!stdoutHookGlobal)
+        if (!progTlsGlobal)
         {
             compiler->LogError(std::format(
-                "program '{}': __stdout_hook not found — cruntime.cb must be imported", name));
+                "program '{}': __prog_tls not found — cruntime.cb must be imported", name));
             return;
         }
-        auto* hookFnPtrType = stdoutHookGlobal->getValueType(); // void(char*)* LLVM type
-
-        // Look up the thread-local stdin hook global (declared in cruntime.cb); optional
-        llvm::GlobalVariable* stdinHookGlobal = nullptr;
-        {
-            auto it = compiler->globalNamedVariable.find("__stdin_hook");
-            if (it != compiler->globalNamedVariable.end()) stdinHookGlobal = it->second;
-        }
-        auto* stdinHookFnPtrType = stdinHookGlobal ? stdinHookGlobal->getValueType() : nullptr;
-
-        // Look up the thread-local stdin return hook global (declared in cruntime.cb); optional
-        llvm::GlobalVariable* stdinReturnHookGlobal = nullptr;
-        {
-            auto it = compiler->globalNamedVariable.find("__stdin_return_hook");
-            if (it != compiler->globalNamedVariable.end()) stdinReturnHookGlobal = it->second;
-        }
+        auto* progTlsType        = llvm::StructType::getTypeByName(*compiler->context, "__ProgramTLS");
+        auto* hookFnPtrType      = progTlsType->getElementType(kPTLS_stdout_hook);
+        auto* stdinHookFnPtrType = progTlsType->getElementType(kPTLS_stdin_hook);
 
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
@@ -8708,56 +8702,54 @@ public:
             auto* activeAllocGlobal = compiler->globalNamedVariable["__active_allocator"];
             compiler->builder->CreateStore(activeFatPtr, activeAllocGlobal);
 
-            // Install stdout hook: load self->onStdout and store into __stdout_hook
+            // Install stdout hook: load self->onStdout and store into __prog_tls.stdout_hook
             {
                 auto* onStdoutGEP = compiler->builder->CreateStructGEP(
                     progType, self, onStdoutIdx, "on_stdout_gep");
                 auto* onStdoutVal = compiler->builder->CreateLoad(
                     hookFnPtrType, onStdoutGEP, "on_stdout_fn");
-                compiler->builder->CreateStore(onStdoutVal, stdoutHookGlobal);
+                auto* stdoutHookGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdout_hook, "stdout_hook_gep");
+                compiler->builder->CreateStore(onStdoutVal, stdoutHookGEP);
             }
 
-            // Install stdin hook: load self->onStdin and store into __stdin_hook
-            if (stdinHookGlobal)
+            // Install stdin hook: load self->onStdin and store into __prog_tls.stdin_hook
             {
                 auto* onStdinGEP = compiler->builder->CreateStructGEP(
                     progType, self, onStdinIdx, "on_stdin_gep");
                 auto* onStdinVal = compiler->builder->CreateLoad(
                     stdinHookFnPtrType, onStdinGEP, "on_stdin_fn");
-                compiler->builder->CreateStore(onStdinVal, stdinHookGlobal);
+                auto* stdinHookGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdin_hook, "stdin_hook_gep");
+                compiler->builder->CreateStore(onStdinVal, stdinHookGEP);
             }
 
-            // Install stdin return hook: load self->onStdinReturn and store into __stdin_return_hook
-            if (stdinReturnHookGlobal)
+            // Install stdin return hook: load self->onStdinReturn and store into __prog_tls.stdin_return_hook
             {
                 auto* onStdinReturnGEP = compiler->builder->CreateStructGEP(
                     progType, self, onStdinReturnIdx, "on_stdin_return_gep");
+                auto* stdinReturnHookType = progTlsType->getElementType(kPTLS_stdin_return_hook);
                 auto* onStdinReturnVal = compiler->builder->CreateLoad(
-                    stdinReturnHookGlobal->getValueType(), onStdinReturnGEP, "on_stdin_return_fn");
-                compiler->builder->CreateStore(onStdinReturnVal, stdinReturnHookGlobal);
+                    stdinReturnHookType, onStdinReturnGEP, "on_stdin_return_fn");
+                auto* stdinReturnHookGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdin_return_hook, "stdin_return_hook_gep");
+                compiler->builder->CreateStore(onStdinReturnVal, stdinReturnHookGEP);
             }
 
-            // Enable handle tracker: load self->trackHandles and store into __handle_tracker_enabled
-            llvm::GlobalVariable* handleTrackerEnabledGlobal = nullptr;
-            llvm::GlobalVariable* handleTrackerHeadGlobal    = nullptr;
-            {
-                auto it = compiler->globalNamedVariable.find("__handle_tracker_enabled");
-                if (it != compiler->globalNamedVariable.end()) handleTrackerEnabledGlobal = it->second;
-                auto it2 = compiler->globalNamedVariable.find("__handle_tracker_head");
-                if (it2 != compiler->globalNamedVariable.end()) handleTrackerHeadGlobal = it2->second;
-            }
-            if (handleTrackerEnabledGlobal)
+            // Enable handle tracker: load self->trackHandles and store into __prog_tls.handle_tracker_enabled
             {
                 auto* trackGEP = compiler->builder->CreateStructGEP(
                     progType, self, trackHandlesIdx, "track_handles_gep");
-                // Field is int (i32) to avoid i1-in-ConstantStruct LLVM assertion; convert to i1 for the global
+                // Field is int (i32) to avoid i1-in-ConstantStruct LLVM assertion; convert to i1 for the TLS field
                 auto* trackI32 = compiler->builder->CreateLoad(
                     llvm::Type::getInt32Ty(*compiler->context), trackGEP, "track_handles_i32");
                 auto* trackI1  = compiler->builder->CreateICmpNE(
                     trackI32,
                     llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                     "track_handles_val");
-                compiler->builder->CreateStore(trackI1, handleTrackerEnabledGlobal);
+                auto* enabledGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_handle_tracker_enabled, "htrack_enabled_gep");
+                compiler->builder->CreateStore(trackI1, enabledGEP);
             }
 
             // SEH basic blocks — four-way split replacing the old linear sequence.
@@ -8808,18 +8800,26 @@ public:
             // cleanupBB: shared teardown — both normal and exception paths converge here.
             compiler->builder->SetInsertPoint(cleanupBB);
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
-            compiler->builder->CreateStore(
-                llvm::Constant::getNullValue(hookFnPtrType), stdoutHookGlobal);
-            if (stdinHookGlobal)
+            {
+                auto* stdoutHookGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdout_hook, "stdout_hook_gep");
                 compiler->builder->CreateStore(
-                    llvm::Constant::getNullValue(stdinHookFnPtrType), stdinHookGlobal);
+                    llvm::Constant::getNullValue(hookFnPtrType), stdoutHookGEP);
+                auto* stdinHookGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdin_hook, "stdin_hook_gep");
+                compiler->builder->CreateStore(
+                    llvm::Constant::getNullValue(stdinHookFnPtrType), stdinHookGEP);
+            }
 
             // Handle tracker cleanup: disable tracker first (so fclose won't re-enter the list),
             // then walk the linked list and fclose any handles still open from a crash.
-            if (handleTrackerEnabledGlobal && handleTrackerHeadGlobal)
             {
+                auto* enabledGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_handle_tracker_enabled, "htrack_enabled_gep");
                 compiler->builder->CreateStore(
-                    llvm::ConstantInt::getFalse(*compiler->context), handleTrackerEnabledGlobal);
+                    llvm::ConstantInt::getFalse(*compiler->context), enabledGEP);
+                auto* headFieldGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_handle_tracker_head, "htrack_head_field_gep");
 
                 auto* fcloseTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
                 auto* fcloseFn = compiler->module->getOrInsertFunction("fclose", fcloseTy).getCallee();
@@ -8835,7 +8835,7 @@ public:
 
                 // Loop header: load head, exit if null
                 compiler->builder->SetInsertPoint(htrackLoopBB);
-                auto* headVal  = compiler->builder->CreateLoad(voidPtrType, handleTrackerHeadGlobal, "htrack_head");
+                auto* headVal  = compiler->builder->CreateLoad(voidPtrType, headFieldGEP, "htrack_head");
                 auto* headNull = compiler->builder->CreateICmpEQ(
                     headVal,
                     llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
@@ -8861,7 +8861,7 @@ public:
 
                 // Advance head, free current node, continue loop
                 compiler->builder->SetInsertPoint(htrackSkipBB);
-                compiler->builder->CreateStore(nextVal, handleTrackerHeadGlobal);
+                compiler->builder->CreateStore(nextVal, headFieldGEP);
                 compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {headVal});
                 compiler->builder->CreateBr(htrackLoopBB);
 

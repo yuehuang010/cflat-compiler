@@ -331,13 +331,13 @@ x64/Debug/MyCompiler.exe performance/perf_yes_compare.cb -i MyCompiler/core -o p
 | Variant | CFlat | C++ |
 |---------|-------|-----|
 | single-threaded loop | ~5,000M iter/s | ~4,960M iter/s |
-| stream + raw Thread | ~280–300M lines/s | ~386M lines/s |
-| stream + program | ~200M lines/s | — |
-| channel + raw Thread | ~16M lines/s | — |
-| channel + program | ~28M lines/s | — |
-| spsc + program | ~19–31M lines/s | — |
+| stream + raw Thread | ~295M lines/s | ~343M lines/s |
+| stream + program | ~76M lines/s | — |
+| channel + raw Thread | ~12M lines/s | — |
+| channel + program | ~46M lines/s | — |
+| spsc + program | ~28M lines/s | — |
 
-**Notes on stream + program**: producer uses `_out.write_bytes()` directly (bypasses `printf`/TLS entirely; set by `>>` operator). Consumer uses `_in.read_buf()` directly (bypasses `fgets`/`__stdin_hook`/TLS; set by `>>` operator). Gap vs raw-thread (~300M) is stop_token polling overhead on the producer side.
+**Notes on stream + program**: producer uses `_out.write_bytes()` directly (bypasses `printf`/TLS entirely; set by `>>` operator). Consumer uses `_in.read_buf()` directly (bypasses `fgets`/`__stdin_hook`/TLS; set by `>>` operator). Gap vs raw-thread (~295M) is stop_token polling overhead on the producer side.
 
 **Notes on channel variants**: the channel uses two spinlocks on separate cache lines (`_head_lock` for producers, `_tail_lock` for consumers). Under 1P:1C workloads the locks never contend with each other. Each side caches the other's cursor (`_cached_tail`/`_cached_head`) so the hot path never touches the remote cache line. No shared `_count` — full/empty are detected via head/tail comparison.
 
