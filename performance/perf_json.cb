@@ -1,0 +1,266 @@
+// JSON serialization/deserialization throughput benchmark.
+//
+// Three payload sizes (small / medium / large) x three operations
+// (write=toJson, read=fromJson, roundtrip=both) = 9 rows.
+//
+// Each row runs N iterations and reports elapsed time via PerfPrint (ns/op).
+// String allocation is included in the measurement — that is the realistic
+// workload since toJson always builds a fresh string.
+
+import "json.cb";
+import "time.cb";
+import "perf_framework.cb";
+
+// ── Payload structs ───────────────────────────────────────────────────────────
+
+// Small: 2 int fields → ~{"id":1,"value":42} (18 chars)
+struct SmallPayload {
+    int id    = 0;
+    int value = 0;
+};
+
+// Medium: 6 mixed fields → ~90 chars
+struct MediumPayload {
+    int    id     = 0;
+    string name   = default;
+    bool   active = false;
+    int    score  = 0;
+    float  ratio  = 0;
+    int    count  = 0;
+};
+
+// Large: 12 mixed fields → ~250 chars
+struct LargePayload {
+    int    id        = 0;
+    string name      = default;
+    bool   active    = false;
+    int    score     = 0;
+    float  ratio     = 0;
+    int    count     = 0;
+    string tag       = default;
+    int    priority  = 0;
+    bool   verified  = false;
+    int    offset    = 0;
+    float  weight    = 0;
+    int    level     = 0;
+};
+
+// ── Benchmark helpers ─────────────────────────────────────────────────────────
+
+// Returns microseconds elapsed for N iterations of toJson on a SmallPayload.
+i64 bench_small_write(int N)
+{
+    SmallPayload p;
+    p.id    = 1;
+    p.value = 42;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        string s = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_medium_write(int N)
+{
+    MediumPayload p;
+    p.id     = 7;
+    p.name   = "benchmark";
+    p.active = true;
+    p.score  = 9900;
+    p.ratio  = 0.75f;
+    p.count  = 512;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        string s = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_large_write(int N)
+{
+    LargePayload p;
+    p.id       = 99;
+    p.name     = "large-benchmark-payload";
+    p.active   = true;
+    p.score    = 1234567;
+    p.ratio    = 3.14f;
+    p.count    = 8192;
+    p.tag      = "performance-test";
+    p.priority = 5;
+    p.verified = false;
+    p.offset   = -100;
+    p.weight   = 1.618f;
+    p.level    = 42;
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        string s = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+// ── Read benchmarks ───────────────────────────────────────────────────────────
+
+i64 bench_small_read(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_medium_read(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_large_read(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        LargePayload p = JsonBuilder.fromJson<LargePayload>(json);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+// ── Roundtrip benchmarks ──────────────────────────────────────────────────────
+
+i64 bench_small_roundtrip(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json);
+        string out = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_medium_roundtrip(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json);
+        string out = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_large_roundtrip(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq();
+    i64 t0 = _qpcNow();
+    int i = 0;
+    while (i < N)
+    {
+        LargePayload p = JsonBuilder.fromJson<LargePayload>(json);
+        string out = JsonBuilder.toJson(p);
+        i++;
+    }
+    i64 t1 = _qpcNow();
+    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    int N = 50000;
+
+    // Pre-build canonical JSON strings for read/roundtrip tests.
+    SmallPayload sp;
+    sp.id    = 1;
+    sp.value = 42;
+    string smallJson = JsonBuilder.toJson(sp);
+
+    MediumPayload mp;
+    mp.id     = 7;
+    mp.name   = "benchmark";
+    mp.active = true;
+    mp.score  = 9900;
+    mp.ratio  = 0.75f;
+    mp.count  = 512;
+    string medJson = JsonBuilder.toJson(mp);
+
+    LargePayload lp;
+    lp.id       = 99;
+    lp.name     = "large-benchmark-payload";
+    lp.active   = true;
+    lp.score    = 1234567;
+    lp.ratio    = 3.14f;
+    lp.count    = 8192;
+    lp.tag      = "performance-test";
+    lp.priority = 5;
+    lp.verified = false;
+    lp.offset   = -100;
+    lp.weight   = 1.618f;
+    lp.level    = 42;
+    string largeJson = JsonBuilder.toJson(lp);
+
+    printf("JSON strings:\n");
+    printf("  small  (%d chars): %s\n", smallJson.length(), smallJson.data());
+    printf("  medium (%d chars): %s\n", medJson.length(),  medJson.data());
+    printf("  large  (%d chars): %s\n", largeJson.length(), largeJson.data());
+    printf("\n");
+
+    PerfHeader("JSON Write — toJson (N=50000)");
+    PerfPrint("small  (2 fields)",  (i64)N, bench_small_write(N));
+    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_write(N));
+    PerfPrint("large  (12 fields)", (i64)N, bench_large_write(N));
+
+    PerfHeader("JSON Read — fromJson (N=50000)");
+    PerfPrint("small  (2 fields)",  (i64)N, bench_small_read(N, smallJson));
+    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_read(N, medJson));
+    PerfPrint("large  (12 fields)", (i64)N, bench_large_read(N, largeJson));
+
+    PerfHeader("JSON Roundtrip — fromJson + toJson (N=50000)");
+    PerfPrint("small  (2 fields)",  (i64)N, bench_small_roundtrip(N, smallJson));
+    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_roundtrip(N, medJson));
+    PerfPrint("large  (12 fields)", (i64)N, bench_large_roundtrip(N, largeJson));
+
+    printf("\n");
+    return 0;
+}

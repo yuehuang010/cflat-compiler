@@ -33,7 +33,7 @@ if not exist "%OUT%\results" mkdir "%OUT%\results"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
 
-set BENCH_FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle perf_yes_compare
+set BENCH_FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle perf_yes_compare perf_json
 
 REM Launch all compilations in parallel
 set /a LAUNCHED=0
