@@ -576,23 +576,17 @@ public:
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
-        auto identifiers = ctx->Identifier();
 
         std::string alias;
         if (ctx->String())
             alias = ctx->String()->getText();
-        else if (!identifiers.empty())
-            alias = identifiers[0]->getText();
+        else if (ctx->Identifier() != nullptr)
+            alias = ctx->Identifier()->getText();
 
-        std::string target;
-        size_t start = ctx->String() ? 0 : 1;
-        for (size_t i = start; i < identifiers.size(); i++)
-        {
-            if (!target.empty()) target += ".";
-            target += identifiers[i]->getText();
-        }
+        std::string target = ctx->typeSpecifier()->getText();
 
-        if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0)
+        if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0
+            || LLVMBackend::IsPrimitiveTypeName(target))
             compiler->RegisterTypeAlias(alias, target);
     }
 
@@ -1424,27 +1418,20 @@ public:
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
-        auto identifiers = ctx->Identifier();
 
         // The alias name may be a plain Identifier or the 'string' keyword token.
         std::string alias;
         if (ctx->String())
             alias = ctx->String()->getText();
-        else if (!identifiers.empty())
-            alias = identifiers[0]->getText();
+        else if (ctx->Identifier() != nullptr)
+            alias = ctx->Identifier()->getText();
 
-        // Build the target from the remaining identifiers.
-        std::string target;
-        size_t start = ctx->String() ? 0 : 1;
-        for (size_t i = start; i < identifiers.size(); i++)
-        {
-            if (!target.empty()) target += ".";
-            target += identifiers[i]->getText();
-        }
+        std::string target = ctx->typeSpecifier()->getText();
 
-        // If the target names a known type (interface or struct), register a type alias.
+        // If the target names a known type (interface, struct, or primitive), register a type alias.
         // Otherwise treat it as a namespace alias.
-        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr)
+        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr
+            || LLVMBackend::IsPrimitiveTypeName(target))
         {
             compiler->RegisterTypeAlias(alias, target);
             if (auto* s = compiler->GetSymbolSink())

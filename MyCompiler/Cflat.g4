@@ -595,7 +595,7 @@ ifConstBlock
     ;
 
 usingDeclaration
-    : Using (Identifier | String) '=' Identifier ('.' Identifier)* ';'
+    : Using (Identifier | String) '=' typeSpecifier ';'
     ;
 
 importDeclaration

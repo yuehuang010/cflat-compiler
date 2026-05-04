@@ -1383,6 +1383,50 @@ bool testNullableTypes()
     return result;
 }
 
+// =============================================================
+// Primitive type alias tests (using Alias = primitiveType)
+// =============================================================
+
+using MyInt  = int;
+using MyU32  = u32;
+using MyI64  = i64;
+using MyBool = bool;
+using MyF32  = float;
+
+MyInt  primitiveAliasAdd(MyInt a, MyInt b) { return a + b; }
+MyU32  primitiveAliasU32(MyU32 a, MyU32 b) { return a + b; }
+MyI64  primitiveAliasI64(MyI64 a, MyI64 b) { return a + b; }
+
+bool testPrimitiveTypeAlias()
+{
+    bool result = true;
+
+    MyInt  i = 10;
+    result &= Test("alias_int_decl",      i,                      10);
+    result &= Test("alias_int_func",      primitiveAliasAdd(3, 4), 7);
+
+    MyU32  u = 300000;
+    result &= Test("alias_u32_decl",      u,                       300000);
+    result &= Test("alias_u32_func",      primitiveAliasU32(10, 5), 15);
+
+    MyI64  l = 1000000000;
+    result &= Test("alias_i64_decl",      l,                       (i64)1000000000);
+    result &= Test("alias_i64_func",      primitiveAliasI64(100, 200), (i64)300);
+
+    MyBool b = true;
+    result &= Test("alias_bool_decl",     b,                       true);
+
+    MyF32  f = 1.5f;
+    result &= Test("alias_float_decl",    f,                       1.5f);
+
+    // Local alias inside a function
+    using LocalU8 = u8;
+    LocalU8 byte = 255;
+    result &= Test("local_alias_u8",      (int)byte,               255);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1444,6 +1488,7 @@ extern int main()
     total++; passed += testCast()                        ? 1 : 0;
     total++; passed += testNullableTypes()               ? 1 : 0;
     total++; passed += testPointerArithmetic()           ? 1 : 0;
+    total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

@@ -1,67 +1,70 @@
 // Windows platform extern declarations — Win32 API and MSVC CRT.
-// Imported by os.cb when WIN64 or WIN32 is defined.
+// Imported by os.cb when __WIN64__ or __WIN32__ is defined.
+
+// Win32 int is always 32-bit regardless of host pointer width.
+using win_int = i32;
 
 // Win32 Threading
-extern void* CreateThread(void* attr, i64 stackSize, function<int(void*)> fn, void* param, i32 flags, i32* id);
-extern i32   WaitForSingleObject(void* handle, i32 ms);
-extern i32   GetExitCodeThread(void* handle, i32* code);
-extern void  CloseHandle(void* handle);
-extern bool  TerminateThread(void* handle, i32 exitCode);
-extern u64   SetThreadAffinityMask(void* handle, u64 mask);
+extern void*    CreateThread(void* attr, i64 stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
+extern i32      WaitForSingleObject(void* handle, i32 ms);
+extern i32      GetExitCodeThread(void* handle, i32* code);
+extern void     CloseHandle(void* handle);
+extern bool     TerminateThread(void* handle, i32 exitCode);
+extern u64      SetThreadAffinityMask(void* handle, u64 mask);
 
 // Win32 Timing
-extern int   QueryPerformanceCounter(i64* count);
-extern int   QueryPerformanceFrequency(i64* freq);
-extern void  GetSystemTimeAsFileTime(i64* fileTime);
-extern void  Sleep(i32 ms);
+extern win_int  QueryPerformanceCounter(i64* count);
+extern win_int  QueryPerformanceFrequency(i64* freq);
+extern void     GetSystemTimeAsFileTime(i64* fileTime);
+extern void     Sleep(i32 ms);
 
 // Win32 Synchronization
-extern void  InitializeCriticalSection(void* cs);
-extern void  DeleteCriticalSection(void* cs);
-extern void  EnterCriticalSection(void* cs);
-extern void  LeaveCriticalSection(void* cs);
-extern void* CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
-extern void  ReleaseSemaphore(void* handle, i32 count, i32* prev);
-extern void* CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
-extern i32   SetEvent(void* handle);
-extern void  AcquireSRWLockExclusive(void** srw);
-extern void  ReleaseSRWLockExclusive(void** srw);
-extern void  AcquireSRWLockShared(void** srw);
-extern void  ReleaseSRWLockShared(void** srw);
-extern void  InitializeConditionVariable(void* cv);
-extern i32   SleepConditionVariableCS(void* cv, void* cs, i32 ms);
-extern i32   SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
-extern void  WakeConditionVariable(void* cv);
-extern void  WakeAllConditionVariable(void* cv);
+extern void     InitializeCriticalSection(void* cs);
+extern void     DeleteCriticalSection(void* cs);
+extern void     EnterCriticalSection(void* cs);
+extern void     LeaveCriticalSection(void* cs);
+extern void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
+extern void     ReleaseSemaphore(void* handle, i32 count, i32* prev);
+extern void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
+extern i32      SetEvent(void* handle);
+extern void     AcquireSRWLockExclusive(void** srw);
+extern void     ReleaseSRWLockExclusive(void** srw);
+extern void     AcquireSRWLockShared(void** srw);
+extern void     ReleaseSRWLockShared(void** srw);
+extern void     InitializeConditionVariable(void* cv);
+extern i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+extern i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
+extern void     WakeConditionVariable(void* cv);
+extern void     WakeAllConditionVariable(void* cv);
 
 // Win32 Virtual Memory
-extern void  GetSystemInfo(void* lpSystemInfo);
-extern void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
-extern int   VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
-extern void  GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
+extern void     GetSystemInfo(void* lpSystemInfo);
+extern void*    VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
+extern win_int  VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
+extern void     GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
 
 // Win32 Filesystem
-extern void* fopen(const char* path, const char* mode);
-extern int   fclose(void* stream);
-extern int   fread(i8* buf, int size, int count, void* stream);
-extern int   fwrite(i8* buf, int size, int count, void* stream);
-extern i8*   fgets(i8* buf, int size, void* stream);
-extern int   feof(void* stream);
-extern int   fseek(void* stream, int offset, int origin);
-extern int   ftell(void* stream);
-extern int   _unlink(const char* path);
-extern int   MoveFileExA(const char* existing, const char* newPath, int flags);
-extern int   _access(const char* path, int mode);
-extern int   _mkdir(const char* path);
-extern int   _rmdir(const char* path);
-extern i8*   _getcwd(i8* buf, int size);
-extern int   _chdir(const char* path);
-extern i64   FindFirstFileA(const char* pattern, i8* findData);
-extern int   FindNextFileA(i64 handle, i8* findData);
-extern int   FindClose(i64 handle);
-extern int   GetFileAttributesA(const char* path);
+extern void*    fopen(const char* path, const char* mode);
+extern win_int  fclose(void* stream);
+extern win_int  fread(i8* buf, win_int size, win_int count, void* stream);
+extern win_int  fwrite(i8* buf, win_int size, win_int count, void* stream);
+extern i8*      fgets(i8* buf, win_int size, void* stream);
+extern win_int  feof(void* stream);
+extern win_int  fseek(void* stream, win_int offset, win_int origin);
+extern win_int  ftell(void* stream);
+extern win_int  _unlink(const char* path);
+extern win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
+extern win_int  _access(const char* path, win_int mode);
+extern win_int  _mkdir(const char* path);
+extern win_int  _rmdir(const char* path);
+extern i8*      _getcwd(i8* buf, win_int size);
+extern win_int  _chdir(const char* path);
+extern i64      FindFirstFileA(const char* pattern, i8* findData);
+extern win_int  FindNextFileA(i64 handle, i8* findData);
+extern win_int  FindClose(i64 handle);
+extern win_int  GetFileAttributesA(const char* path);
 
 // MSVC CRT
-extern void* __acrt_iob_func(int fd);
-extern int   __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern int   __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
+extern void*    __acrt_iob_func(win_int fd);
+extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+extern win_int  __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);

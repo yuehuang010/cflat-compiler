@@ -149,9 +149,11 @@ bool LLVMBackend::Compile(const ArgParser& args)
         SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
 
         auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
-        SetCompileTimeMacro("WIN64", win64Const, "int");
+        SetCompileTimeMacro("__WIN64__", win64Const, "int");
         auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
-        SetCompileTimeMacro("WIN32", win32Const, "int");
+        SetCompileTimeMacro("__WIN32__", win32Const, "int");
+        auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+        SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
 
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
@@ -532,9 +534,11 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
         SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
         auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
-        SetCompileTimeMacro("WIN64", win64Const, "int");
+        SetCompileTimeMacro("__WIN64__", win64Const, "int");
         auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
-        SetCompileTimeMacro("WIN32", win32Const, "int");
+        SetCompileTimeMacro("__WIN32__", win32Const, "int");
+        auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+        SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
     }
 
     if (!runtimeDir.empty())

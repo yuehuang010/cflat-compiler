@@ -1554,6 +1554,17 @@ public:
         interfaceParents[name] = parentNames;
     }
 
+    static bool IsPrimitiveTypeName(const std::string& name)
+    {
+        static const std::unordered_set<std::string> primitives = {
+            "int", "char", "short", "long", "bool", "void",
+            "float", "double",
+            "i8", "i16", "i32", "i64",
+            "u8", "u16", "u32", "u64",
+        };
+        return primitives.count(name) > 0;
+    }
+
     void RegisterTypeAlias(const std::string& alias, const std::string& target)
     {
         typeAliases[alias] = target;

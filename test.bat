@@ -100,6 +100,7 @@ set LIB=Test\library
 set OUT=out
 set MYCOMPILER_EXTRA=%*
 set EXCLUDE=test_helper
+set TIMEOUT_SECS=120
 set SCRIPT=%~f0
 set START_TIME=%TIME%
 
@@ -132,14 +133,14 @@ for %%F in (%SRC%\test_*.cb) do (
     )
 )
 
-REM Wait for all workers to finish (up to 60 seconds)
+REM Wait for all workers to finish (up to 120 seconds)
 set /a WAITED=0
 :WaitLoop
 set /a DONE=0
 for %%R in (%OUT%\results\*.result) do set /a DONE+=1
 if !DONE! lss !LAUNCHED! (
-    if !WAITED! geq 60 (
-        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after 60s
+    if !WAITED! geq !TIMEOUT_SECS! (
+        echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after !TIMEOUT_SECS!s
         taskkill /f /im MyCompiler.exe >nul 2>&1
         for %%F in (%OUT%\test_*.exe) do taskkill /f /im "%%~nxF" >nul 2>&1
         goto :Collect

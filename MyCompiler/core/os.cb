@@ -1,3 +1,3 @@
-if const (WIN64) {
+if const (__WINDOWS__) {
     import "os.windows.cb";
 }
