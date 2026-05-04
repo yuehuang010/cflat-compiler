@@ -1,11 +1,10 @@
 // JSON serialization/deserialization throughput benchmark.
 //
-// Three payload sizes (small / medium / large) x three operations
-// (write=toJson, read=fromJson, roundtrip=both) = 9 rows.
+// Four payload sizes (4 / 12 / 50 / 150 fields) x three operations
+// (write=toJson, read=fromJson, roundtrip=both) = 12 rows.
 //
-// Each row runs N iterations and reports elapsed time via PerfPrint (ns/op).
-// String allocation is included in the measurement — that is the realistic
-// workload since toJson always builds a fresh string.
+// Int fields use the 'n' prefix to avoid collision with sized-int type names
+// (i8, i16, i32, i64 are reserved in CFlat).
 
 import "json.cb";
 import "time.cb";
@@ -13,24 +12,16 @@ import "perf_framework.cb";
 
 // ── Payload structs ───────────────────────────────────────────────────────────
 
-// Small: 2 int fields → ~{"id":1,"value":42} (18 chars)
-struct SmallPayload {
-    int id    = 0;
-    int value = 0;
-};
-
-// Medium: 6 mixed fields → ~90 chars
-struct MediumPayload {
+// Tiny: 4 fields
+struct TinyPayload {
     int    id     = 0;
     string name   = default;
     bool   active = false;
     int    score  = 0;
-    float  ratio  = 0;
-    int    count  = 0;
 };
 
-// Large: 12 mixed fields → ~250 chars
-struct LargePayload {
+// Small: 12 fields
+struct SmallPayload {
     int    id        = 0;
     string name      = default;
     bool   active    = false;
@@ -45,163 +36,220 @@ struct LargePayload {
     int    level     = 0;
 };
 
-// ── Benchmark helpers ─────────────────────────────────────────────────────────
+// Medium: 50 fields (20 int, 10 string, 10 bool, 10 float)
+struct MediumPayload {
+    int    n0  = 0; int    n1  = 0; int    n2  = 0; int    n3  = 0; int    n4  = 0;
+    int    n5  = 0; int    n6  = 0; int    n7  = 0; int    n9  = 0; int    n10 = 0;
+    int    n11 = 0; int    n12 = 0; int    n13 = 0; int    n14 = 0; int    n15 = 0;
+    int    n17 = 0; int    n18 = 0; int    n19 = 0; int    n20 = 0; int    n21 = 0;
+    string s0  = default; string s1  = default; string s2  = default; string s3  = default; string s4  = default;
+    string s5  = default; string s6  = default; string s7  = default; string s9  = default; string s10 = default;
+    bool   b0  = false; bool   b1  = false; bool   b2  = false; bool   b3  = false; bool   b4  = false;
+    bool   b5  = false; bool   b6  = false; bool   b7  = false; bool   b9  = false; bool   b10 = false;
+    float  f0  = 0; float  f1  = 0; float  f2  = 0; float  f3  = 0; float  f4  = 0;
+    float  f5  = 0; float  f6  = 0; float  f7  = 0; float  f9  = 0; float  f10 = 0;
+};
 
-// Returns microseconds elapsed for N iterations of toJson on a SmallPayload.
-i64 bench_small_write(int N)
-{
-    SmallPayload p;
-    p.id    = 1;
-    p.value = 42;
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        string s = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
-}
+// Large: 150 fields (60 int, 30 string, 30 bool, 30 float)
+struct LargePayload {
+    int    n0  = 0; int    n1  = 0; int    n2  = 0; int    n3  = 0; int    n4  = 0;
+    int    n5  = 0; int    n6  = 0; int    n7  = 0; int    n9  = 0; int    n10 = 0;
+    int    n11 = 0; int    n12 = 0; int    n13 = 0; int    n14 = 0; int    n15 = 0;
+    int    n17 = 0; int    n18 = 0; int    n19 = 0; int    n20 = 0; int    n21 = 0;
+    int    n22 = 0; int    n23 = 0; int    n24 = 0; int    n25 = 0; int    n26 = 0;
+    int    n27 = 0; int    n28 = 0; int    n29 = 0; int    n30 = 0; int    n31 = 0;
+    int    n33 = 0; int    n34 = 0; int    n35 = 0; int    n36 = 0; int    n37 = 0;
+    int    n38 = 0; int    n39 = 0; int    n40 = 0; int    n41 = 0; int    n42 = 0;
+    int    n43 = 0; int    n44 = 0; int    n45 = 0; int    n46 = 0; int    n47 = 0;
+    int    n48 = 0; int    n49 = 0; int    n50 = 0; int    n51 = 0; int    n52 = 0;
+    int    n53 = 0; int    n54 = 0; int    n55 = 0; int    n56 = 0; int    n57 = 0;
+    int    n58 = 0; int    n59 = 0; int    n60 = 0; int    n61 = 0; int    n62 = 0;
+    string s0  = default; string s1  = default; string s2  = default; string s3  = default; string s4  = default;
+    string s5  = default; string s6  = default; string s7  = default; string s9  = default; string s10 = default;
+    string s11 = default; string s12 = default; string s13 = default; string s14 = default; string s15 = default;
+    string s17 = default; string s18 = default; string s19 = default; string s20 = default; string s21 = default;
+    string s22 = default; string s23 = default; string s24 = default; string s25 = default; string s26 = default;
+    string s27 = default; string s28 = default; string s29 = default; string s30 = default; string s31 = default;
+    bool   b0  = false; bool   b1  = false; bool   b2  = false; bool   b3  = false; bool   b4  = false;
+    bool   b5  = false; bool   b6  = false; bool   b7  = false; bool   b9  = false; bool   b10 = false;
+    bool   b11 = false; bool   b12 = false; bool   b13 = false; bool   b14 = false; bool   b15 = false;
+    bool   b17 = false; bool   b18 = false; bool   b19 = false; bool   b20 = false; bool   b21 = false;
+    bool   b22 = false; bool   b23 = false; bool   b24 = false; bool   b25 = false; bool   b26 = false;
+    bool   b27 = false; bool   b28 = false; bool   b29 = false; bool   b30 = false; bool   b31 = false;
+    float  f0  = 0; float  f1  = 0; float  f2  = 0; float  f3  = 0; float  f4  = 0;
+    float  f5  = 0; float  f6  = 0; float  f7  = 0; float  f9  = 0; float  f10 = 0;
+    float  f11 = 0; float  f12 = 0; float  f13 = 0; float  f14 = 0; float  f15 = 0;
+    float  f17 = 0; float  f18 = 0; float  f19 = 0; float  f20 = 0; float  f21 = 0;
+    float  f22 = 0; float  f23 = 0; float  f24 = 0; float  f25 = 0; float  f26 = 0;
+    float  f27 = 0; float  f28 = 0; float  f29 = 0; float  f30 = 0; float  f31 = 0;
+};
 
-i64 bench_medium_write(int N)
+// ── Payload initializers ──────────────────────────────────────────────────────
+
+void initTiny(TinyPayload* p)
 {
-    MediumPayload p;
-    p.id     = 7;
+    p.id     = 1;
     p.name   = "benchmark";
     p.active = true;
-    p.score  = 9900;
-    p.ratio  = 0.75f;
-    p.count  = 512;
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        string s = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    p.score  = 42;
 }
 
-i64 bench_large_write(int N)
+void initSmall(SmallPayload* p)
 {
-    LargePayload p;
     p.id       = 99;
-    p.name     = "large-benchmark-payload";
+    p.name     = "small-benchmark";
     p.active   = true;
     p.score    = 1234567;
     p.ratio    = 3.14f;
     p.count    = 8192;
-    p.tag      = "performance-test";
+    p.tag      = "perf-test";
     p.priority = 5;
     p.verified = false;
     p.offset   = -100;
     p.weight   = 1.618f;
     p.level    = 42;
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        string s = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+}
+
+void initMedium(MediumPayload* p)
+{
+    p.n0  = 0;  p.n1  = 1;  p.n2  = 2;  p.n3  = 3;  p.n4  = 4;
+    p.n5  = 5;  p.n6  = 6;  p.n7  = 7;  p.n9  = 9;  p.n10 = 10;
+    p.n11 = 11; p.n12 = 12; p.n13 = 13; p.n14 = 14; p.n15 = 15;
+    p.n17 = 17; p.n18 = 18; p.n19 = 19; p.n20 = 20; p.n21 = 21;
+    p.s0  = "alpha";   p.s1  = "bravo";   p.s2  = "charlie"; p.s3  = "delta";   p.s4  = "echo";
+    p.s5  = "foxtrot"; p.s6  = "golf";    p.s7  = "hotel";   p.s9  = "india";   p.s10 = "juliet";
+    p.b0  = true;  p.b1  = false; p.b2  = true;  p.b3  = false; p.b4  = true;
+    p.b5  = false; p.b6  = true;  p.b7  = false; p.b9  = true;  p.b10 = false;
+    p.f0  = 1.1f; p.f1  = 2.2f; p.f2  = 3.3f; p.f3  = 4.4f; p.f4  = 5.5f;
+    p.f5  = 6.6f; p.f6  = 7.7f; p.f7  = 0.1f; p.f9  = 9.9f; p.f10 = 0.5f;
+}
+
+void initLarge(LargePayload* p)
+{
+    p.n0  = 0;  p.n1  = 1;  p.n2  = 2;  p.n3  = 3;  p.n4  = 4;
+    p.n5  = 5;  p.n6  = 6;  p.n7  = 7;  p.n9  = 9;  p.n10 = 10;
+    p.n11 = 11; p.n12 = 12; p.n13 = 13; p.n14 = 14; p.n15 = 15;
+    p.n17 = 17; p.n18 = 18; p.n19 = 19; p.n20 = 20; p.n21 = 21;
+    p.n22 = 22; p.n23 = 23; p.n24 = 24; p.n25 = 25; p.n26 = 26;
+    p.n27 = 27; p.n28 = 28; p.n29 = 29; p.n30 = 30; p.n31 = 31;
+    p.n33 = 33; p.n34 = 34; p.n35 = 35; p.n36 = 36; p.n37 = 37;
+    p.n38 = 38; p.n39 = 39; p.n40 = 40; p.n41 = 41; p.n42 = 42;
+    p.n43 = 43; p.n44 = 44; p.n45 = 45; p.n46 = 46; p.n47 = 47;
+    p.n48 = 48; p.n49 = 49; p.n50 = 50; p.n51 = 51; p.n52 = 52;
+    p.n53 = 53; p.n54 = 54; p.n55 = 55; p.n56 = 56; p.n57 = 57;
+    p.n58 = 58; p.n59 = 59; p.n60 = 60; p.n61 = 61; p.n62 = 62;
+    p.s0  = "alpha";    p.s1  = "bravo";    p.s2  = "charlie";  p.s3  = "delta";    p.s4  = "echo";
+    p.s5  = "foxtrot";  p.s6  = "golf";     p.s7  = "hotel";    p.s9  = "india";    p.s10 = "juliet";
+    p.s11 = "kilo";     p.s12 = "lima";     p.s13 = "mike";     p.s14 = "november"; p.s15 = "oscar";
+    p.s17 = "papa";     p.s18 = "quebec";   p.s19 = "romeo";    p.s20 = "sierra";   p.s21 = "tango";
+    p.s22 = "uniform";  p.s23 = "victor";   p.s24 = "whiskey";  p.s25 = "xray";     p.s26 = "yankee";
+    p.s27 = "zulu";     p.s28 = "apple";    p.s29 = "banana";   p.s30 = "cherry";   p.s31 = "date";
+    p.b0  = true;  p.b1  = false; p.b2  = true;  p.b3  = false; p.b4  = true;
+    p.b5  = false; p.b6  = true;  p.b7  = false; p.b9  = true;  p.b10 = false;
+    p.b11 = true;  p.b12 = false; p.b13 = true;  p.b14 = false; p.b15 = true;
+    p.b17 = false; p.b18 = true;  p.b19 = false; p.b20 = true;  p.b21 = false;
+    p.b22 = true;  p.b23 = false; p.b24 = true;  p.b25 = false; p.b26 = true;
+    p.b27 = false; p.b28 = true;  p.b29 = false; p.b30 = true;  p.b31 = false;
+    p.f0  = 0.1f;  p.f1  = 1.1f;  p.f2  = 2.2f;  p.f3  = 3.3f;  p.f4  = 4.4f;
+    p.f5  = 5.5f;  p.f6  = 6.6f;  p.f7  = 7.7f;  p.f9  = 9.9f;  p.f10 = 10.1f;
+    p.f11 = 11.2f; p.f12 = 12.3f; p.f13 = 13.4f; p.f14 = 14.5f; p.f15 = 15.6f;
+    p.f17 = 17.8f; p.f18 = 18.9f; p.f19 = 19.0f; p.f20 = 20.1f; p.f21 = 21.2f;
+    p.f22 = 22.3f; p.f23 = 23.4f; p.f24 = 24.5f; p.f25 = 25.6f; p.f26 = 26.7f;
+    p.f27 = 27.8f; p.f28 = 28.9f; p.f29 = 29.0f; p.f30 = 30.1f; p.f31 = 31.2f;
+}
+
+// ── Write benchmarks ──────────────────────────────────────────────────────────
+
+i64 bench_write_tiny(int N)
+{
+    TinyPayload p; initTiny(&p);
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_write_small(int N)
+{
+    SmallPayload p; initSmall(&p);
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_write_medium(int N)
+{
+    MediumPayload p; initMedium(&p);
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_write_large(int N)
+{
+    LargePayload p; initLarge(&p);
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
 // ── Read benchmarks ───────────────────────────────────────────────────────────
 
-i64 bench_small_read(int N, string json)
+i64 bench_read_tiny(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { TinyPayload p = JsonBuilder.fromJson<TinyPayload>(json); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
-i64 bench_medium_read(int N, string json)
+i64 bench_read_small(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
-i64 bench_large_read(int N, string json)
+i64 bench_read_medium(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        LargePayload p = JsonBuilder.fromJson<LargePayload>(json);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_read_large(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { LargePayload p = JsonBuilder.fromJson<LargePayload>(json); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
 // ── Roundtrip benchmarks ──────────────────────────────────────────────────────
 
-i64 bench_small_roundtrip(int N, string json)
+i64 bench_rt_tiny(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json);
-        string out = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { TinyPayload p = JsonBuilder.fromJson<TinyPayload>(json); string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
-i64 bench_medium_roundtrip(int N, string json)
+i64 bench_rt_small(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json);
-        string out = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { SmallPayload p = JsonBuilder.fromJson<SmallPayload>(json); string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
-i64 bench_large_roundtrip(int N, string json)
+i64 bench_rt_medium(int N, string json)
 {
-    i64 freq = _timeGetQpcFreq();
-    i64 t0 = _qpcNow();
-    int i = 0;
-    while (i < N)
-    {
-        LargePayload p = JsonBuilder.fromJson<LargePayload>(json);
-        string out = JsonBuilder.toJson(p);
-        i++;
-    }
-    i64 t1 = _qpcNow();
-    return (t1 - t0) * (i64)1000000 / freq;
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { MediumPayload p = JsonBuilder.fromJson<MediumPayload>(json); string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
+}
+
+i64 bench_rt_large(int N, string json)
+{
+    i64 freq = _timeGetQpcFreq(); i64 t0 = _qpcNow();
+    int i = 0; while (i < N) { LargePayload p = JsonBuilder.fromJson<LargePayload>(json); string s = JsonBuilder.toJson(p); i++; }
+    return (_qpcNow() - t0) * (i64)1000000 / freq;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -210,56 +258,40 @@ extern int main()
 {
     int N = 50000;
 
-    // Pre-build canonical JSON strings for read/roundtrip tests.
-    SmallPayload sp;
-    sp.id    = 1;
-    sp.value = 42;
+    TinyPayload tp;   initTiny(&tp);
+    SmallPayload sp;  initSmall(&sp);
+    MediumPayload mp; initMedium(&mp);
+    LargePayload lp;  initLarge(&lp);
+
+    string tinyJson  = JsonBuilder.toJson(tp);
     string smallJson = JsonBuilder.toJson(sp);
-
-    MediumPayload mp;
-    mp.id     = 7;
-    mp.name   = "benchmark";
-    mp.active = true;
-    mp.score  = 9900;
-    mp.ratio  = 0.75f;
-    mp.count  = 512;
-    string medJson = JsonBuilder.toJson(mp);
-
-    LargePayload lp;
-    lp.id       = 99;
-    lp.name     = "large-benchmark-payload";
-    lp.active   = true;
-    lp.score    = 1234567;
-    lp.ratio    = 3.14f;
-    lp.count    = 8192;
-    lp.tag      = "performance-test";
-    lp.priority = 5;
-    lp.verified = false;
-    lp.offset   = -100;
-    lp.weight   = 1.618f;
-    lp.level    = 42;
+    string medJson   = JsonBuilder.toJson(mp);
     string largeJson = JsonBuilder.toJson(lp);
 
-    printf("JSON strings:\n");
-    printf("  small  (%d chars): %s\n", smallJson.length(), smallJson.data());
-    printf("  medium (%d chars): %s\n", medJson.length(),  medJson.data());
-    printf("  large  (%d chars): %s\n", largeJson.length(), largeJson.data());
+    printf("JSON payload sizes:\n");
+    printf("  tiny   (  4 fields, %d chars)\n",  tinyJson.length());
+    printf("  small  ( 12 fields, %d chars)\n",  smallJson.length());
+    printf("  medium ( 50 fields, %d chars)\n",  medJson.length());
+    printf("  large  (150 fields, %d chars)\n",  largeJson.length());
     printf("\n");
 
     PerfHeader("JSON Write — toJson (N=50000)");
-    PerfPrint("small  (2 fields)",  (i64)N, bench_small_write(N));
-    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_write(N));
-    PerfPrint("large  (12 fields)", (i64)N, bench_large_write(N));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_write_tiny(N));
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_write_small(N));
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_write_medium(N));
+    PerfPrint("large  (150 fields)", (i64)N, bench_write_large(N));
 
     PerfHeader("JSON Read — fromJson (N=50000)");
-    PerfPrint("small  (2 fields)",  (i64)N, bench_small_read(N, smallJson));
-    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_read(N, medJson));
-    PerfPrint("large  (12 fields)", (i64)N, bench_large_read(N, largeJson));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_read_tiny(N, tinyJson));
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_read_small(N, smallJson));
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_read_medium(N, medJson));
+    PerfPrint("large  (150 fields)", (i64)N, bench_read_large(N, largeJson));
 
     PerfHeader("JSON Roundtrip — fromJson + toJson (N=50000)");
-    PerfPrint("small  (2 fields)",  (i64)N, bench_small_roundtrip(N, smallJson));
-    PerfPrint("medium (6 fields)",  (i64)N, bench_medium_roundtrip(N, medJson));
-    PerfPrint("large  (12 fields)", (i64)N, bench_large_roundtrip(N, largeJson));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_rt_tiny(N, tinyJson));
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_rt_small(N, smallJson));
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_rt_medium(N, medJson));
+    PerfPrint("large  (150 fields)", (i64)N, bench_rt_large(N, largeJson));
 
     printf("\n");
     return 0;
