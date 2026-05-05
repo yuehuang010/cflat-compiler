@@ -11,15 +11,17 @@
     { "include": "#numbers" },
     { "include": "#keywords-control" },
     { "include": "#keywords-storage" },
-    { "include": "#keywords-type" },
-    { "include": "#keywords-qualifier" },
-    { "include": "#keywords-myc-extension" },
-    { "include": "#keywords-c11" },
-    { "include": "#constants" },
+    { "include": "#struct-declaration" },
     { "include": "#namespace-declaration" },
     { "include": "#using-alias" },
     { "include": "#interface-declaration" },
-    { "include": "#struct-declaration" },
+    { "include": "#keywords-type" },
+    { "include": "#keywords-qualifier" },
+    { "include": "#new-expression" },
+    { "include": "#keywords-myc-extension" },
+    { "include": "#keywords-c11" },
+    { "include": "#constants" },
+    { "include": "#type-in-declaration" },
     { "include": "#function-definition" },
     { "include": "#function-call" },
     { "include": "#named-parameter" },
@@ -142,7 +144,7 @@
         },
         {
           "name": "storage.type.struct.cflat",
-          "match": "\\b(struct|union|enum|class)\\b"
+          "match": "\\b(struct|union|enum|class|program)\\b"
         }
       ]
     },
@@ -162,7 +164,15 @@
         },
         {
           "name": "keyword.operator.expression.cflat",
-          "match": "\\b(nameof|typeof|sizeof)\\b"
+          "match": "\\b(nameof|typeof|sizeof|new|delete)\\b"
+        },
+        {
+          "name": "storage.modifier.ownership.cflat",
+          "match": "\\b(move|bond)\\b"
+        },
+        {
+          "name": "keyword.other.operator-overload.cflat",
+          "match": "\\boperator\\b"
         }
       ]
     },
@@ -213,10 +223,11 @@
         {
           "comment": "struct/class/union/enum keyword followed by a type name — covers declarations AND type-usage positions (variable declarations, casts, parameters)",
           "name": "meta.struct.cflat",
-          "match": "\\b(struct|class|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(struct|class|union|enum|program)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
           "captures": {
             "1": { "name": "storage.type.struct.cflat" },
-            "2": { "name": "entity.name.type.cflat" }
+            "2": { "name": "entity.name.type.cflat" },
+            "3": { "name": "entity.name.type.cflat" }
           }
         },
         {
@@ -229,6 +240,19 @@
           }
         }
       ]
+    },
+    "new-expression": {
+      "comment": "new TypeName — color the keyword and the type name separately",
+      "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.operator.expression.cflat" },
+        "2": { "name": "entity.name.type.cflat" }
+      }
+    },
+    "type-in-declaration": {
+      "comment": "User-defined type name in variable/parameter declaration: 'TypeName varName;' or 'TypeName* varName ='",
+      "name": "entity.name.type.cflat",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:<[^>]*>)?\\s*\\*?\\s+[A-Za-z_][A-Za-z0-9_]*\\s*[;=,\\[\\)\\{])"
     },
     "function-definition": {
       "comment": "Function definition: returnType funcName(...) {",

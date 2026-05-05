@@ -4912,6 +4912,7 @@ public:
     }
 
     std::string GetSourceFileName() const { return sourceFileName; }
+    std::string GetSourceFilePath() const { return currentSourceFilePath_; }
 
     std::string GetCurrentFunctionName() const
     {

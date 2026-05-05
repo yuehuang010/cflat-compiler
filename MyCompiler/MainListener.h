@@ -351,7 +351,7 @@ private:
                 if (!p.VariableName.empty()) sig += " " + p.VariableName;
             }
             sig += ")";
-            s->Register(SymbolKind::Function, name, compiler->GetSourceFileName(),
+            s->Register(SymbolKind::Function, name, compiler->GetSourceFilePath(),
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
 
             // Also register under "TypeName.method" for dot-completion prefix lookup.
@@ -359,7 +359,7 @@ private:
             if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
             {
                 std::string qualName = structName + "." + getFunctionName(func);
-                s->Register(SymbolKind::Function, qualName, compiler->GetSourceFileName(),
+                s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
                             (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
             }
         }
@@ -420,7 +420,7 @@ private:
             std::vector<std::string> memberNames;
             for (const auto& m : methods)
                 memberNames.push_back(m.Name);
-            s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFileName(),
+            s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                         sig, memberNames);
         }
@@ -445,13 +445,13 @@ private:
 
         if (auto* s = compiler->GetSymbolSink())
         {
-            s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFileName(),
+            s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                         "struct " + typeName);
             // Also register under the unqualified name so Lookup("Point") finds "Geometry.Point".
             size_t dot = typeName.rfind('.');
             if (dot != std::string::npos)
-                s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFileName(),
+                s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                             "struct " + typeName);
         }
@@ -1460,7 +1460,7 @@ public:
         {
             compiler->RegisterTypeAlias(alias, target);
             if (auto* s = compiler->GetSymbolSink())
-                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFileName(),
+                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                             "using " + alias + " = " + target);
         }
@@ -1651,13 +1651,13 @@ public:
 
         if (auto* s = compiler->GetSymbolSink())
         {
-            s->Register(SymbolKind::Namespace, namespaceName, compiler->GetSourceFileName(),
+            s->Register(SymbolKind::Namespace, namespaceName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                         "namespace " + namespaceName);
             // Also register under the unqualified name so Lookup("Inner") finds "Outer.Inner".
             size_t dot = namespaceName.rfind('.');
             if (dot != std::string::npos)
-                s->Register(SymbolKind::Namespace, namespaceName.substr(dot + 1), compiler->GetSourceFileName(),
+                s->Register(SymbolKind::Namespace, namespaceName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                             "namespace " + namespaceName);
         }
@@ -8403,7 +8403,7 @@ public:
                 if (field.Pointer) typeSig += "*";
                 if (field.ElemPointer) typeSig += "*";
                 s->Register(SymbolKind::Field, structName + "." + field.VariableName,
-                            compiler->GetSourceFileName(),
+                            compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
                             annSig + typeSig + " " + field.VariableName);
@@ -9526,7 +9526,7 @@ public:
                 if (field.Pointer) typeSig += "*";
                 if (field.ElemPointer) typeSig += "*";
                 s->Register(SymbolKind::Field, name + "." + field.VariableName,
-                            compiler->GetSourceFileName(),
+                            compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
                             annSig + typeSig + " " + field.VariableName);
