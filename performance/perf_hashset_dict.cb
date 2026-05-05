@@ -1,0 +1,279 @@
+// Benchmark: hashset<int> and dictionary<int,int> throughput.
+//
+// For each container, three operations are timed at three sizes (N = 10, 500,
+// 10000):
+//   add      — fill a pre-warmed (capacity pre-allocated, clear()ed) container
+//   contains — scan N lookups on a pre-filled container
+//   remove   — drain a pre-filled container; clear() + refill happen outside timer
+//
+// Note: add times exclude rehash cost because the container is pre-warmed via
+// a warm-up fill + clear().  Remove times are isolated via stopwatch pause/resume.
+
+import "list.cb";
+import "hashset.cb";
+import "dictionary.cb";
+import "time.cb";
+import "perf_framework.cb";
+
+// ── hashset benchmark ────────────────────────────────────────────────────────
+
+program BenchHashsetAdd
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<int> s;
+        // warm-up: trigger all rehashes so capacity is stable for timed passes
+        int i = 0;
+        while (i < n) { s.add(i); i++; }
+        s.clear();
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n) { s.add(i); i++; }
+            s.clear();
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchHashsetContains
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+    i64 found      = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<int> s;
+        int i = 0;
+        while (i < n) { s.add(i); i++; }
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n)
+            {
+                if (s.contains(i)) found++;
+                i++;
+            }
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchHashsetRemove
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<int> s;
+        int i = 0;
+        while (i < n) { s.add(i); i++; }
+
+        Stopwatch sw;
+        int r = 0;
+        while (r < repeats)
+        {
+            sw.start();
+            i = 0;
+            while (i < n) { s.remove(i); i++; }
+            sw.stop();
+            // reset with clear() to avoid tombstone buildup, then refill
+            s.clear();
+            i = 0;
+            while (i < n) { s.add(i); i++; }
+            r++;
+        }
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+// ── dictionary benchmark ─────────────────────────────────────────────────────
+
+program BenchDictAdd
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<int, int> d;
+        int i = 0;
+        while (i < n) { d.add(i, i * 2); i++; }
+        d.clear();
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n) { d.add(i, i * 2); i++; }
+            d.clear();
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchDictGet
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+    i64 sum        = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<int, int> d;
+        int i = 0;
+        while (i < n) { d.add(i, i * 2); i++; }
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n)
+            {
+                sum = sum + (i64)d.get(i);
+                i++;
+            }
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchDictRemove
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<int, int> d;
+        int i = 0;
+        while (i < n) { d.add(i, i * 2); i++; }
+
+        Stopwatch sw;
+        int r = 0;
+        while (r < repeats)
+        {
+            sw.start();
+            i = 0;
+            while (i < n) { d.remove(i); i++; }
+            sw.stop();
+            d.clear();
+            i = 0;
+            while (i < n) { d.add(i, i * 2); i++; }
+            r++;
+        }
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+void RunHashset(int n, int repeats)
+{
+    i64 totalOps = (i64)n * (i64)repeats;
+    list<string> emptyArgs;
+
+    BenchHashsetAdd ba;
+    ba.n = n; ba.repeats = repeats;
+    ba.run(emptyArgs); ba.WaitForExit();
+
+    BenchHashsetContains bc;
+    bc.n = n; bc.repeats = repeats;
+    bc.run(emptyArgs); bc.WaitForExit();
+
+    BenchHashsetRemove br;
+    br.n = n; br.repeats = repeats;
+    br.run(emptyArgs); br.WaitForExit();
+
+    i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
+    i64 cntUs = bc.measuredUs; if (cntUs == (i64)0) cntUs = (i64)1;
+    i64 remUs = br.measuredUs; if (remUs == (i64)0) remUs = (i64)1;
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  contains %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        addUs, (addUs * (i64)1000) / totalOps,
+        cntUs, (cntUs * (i64)1000) / totalOps,
+        remUs, (remUs * (i64)1000) / totalOps);
+}
+
+void RunDict(int n, int repeats)
+{
+    i64 totalOps = (i64)n * (i64)repeats;
+    list<string> emptyArgs;
+
+    BenchDictAdd ba;
+    ba.n = n; ba.repeats = repeats;
+    ba.run(emptyArgs); ba.WaitForExit();
+
+    BenchDictGet bg;
+    bg.n = n; bg.repeats = repeats;
+    bg.run(emptyArgs); bg.WaitForExit();
+
+    BenchDictRemove br;
+    br.n = n; br.repeats = repeats;
+    br.run(emptyArgs); br.WaitForExit();
+
+    i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
+    i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;
+    i64 remUs = br.measuredUs; if (remUs == (i64)0) remUs = (i64)1;
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  get %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        addUs, (addUs * (i64)1000) / totalOps,
+        getUs, (getUs * (i64)1000) / totalOps,
+        remUs, (remUs * (i64)1000) / totalOps);
+}
+
+// ── entry point ──────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    printf("\n--- hashset<int>: add / contains / remove ---\n");
+    RunHashset(10,    500000);
+    RunHashset(500,   5000);
+    RunHashset(10000, 250);
+
+    printf("\n--- dictionary<int,int>: add / get / remove ---\n");
+    RunDict(10,    500000);
+    RunDict(500,   5000);
+    RunDict(10000, 250);
+
+    return 0;
+}

@@ -333,6 +333,257 @@ int testFor()
     return passed;
 }
 
+// ── hashset: negative keys ───────────────────────────────────────────────────
+
+int testHashsetNegative()
+{
+    int passed = 0;
+
+    hashset<int> s;
+    passed += Test("hs-neg add -1",   s.add(-1),   true);
+    passed += Test("hs-neg add -10",  s.add(-10),  true);
+    passed += Test("hs-neg add -100", s.add(-100), true);
+    passed += Test("hs-neg count 3",  s.count(),   3);
+
+    passed += Test("hs-neg contains -1",   s.contains(-1),   true);
+    passed += Test("hs-neg contains -10",  s.contains(-10),  true);
+    passed += Test("hs-neg contains -100", s.contains(-100), true);
+    passed += Test("hs-neg missing -5",    s.contains(-5),   false);
+
+    passed += Test("hs-neg remove -10",         s.remove(-10),    true);
+    passed += Test("hs-neg -10 gone",           s.contains(-10),  false);
+    passed += Test("hs-neg -1 still present",   s.contains(-1),   true);
+    passed += Test("hs-neg -100 still present", s.contains(-100), true);
+
+    return passed;
+}
+
+// ── hashset: tombstone probing ────────────────────────────────────────────────
+// With initial capacity 8: Hash(1)%8=1, Hash(9)%8=1, Hash(17)%8=1.
+// Removing 1 leaves a tombstone; contains(9) must probe past it.
+
+int testHashsetTombstone()
+{
+    int passed = 0;
+
+    hashset<int> s;
+    s.add(1);
+    s.add(9);    // collides with 1 at slot 1, placed at slot 2
+    s.remove(1); // slot 1 becomes tombstone (status=2)
+
+    passed += Test("hs-tomb contains 9 past tombstone", s.contains(9),  true);
+    passed += Test("hs-tomb contains 1 gone",           s.contains(1),  false);
+
+    // 17 also hashes to slot 1; should reuse the tombstone
+    passed += Test("hs-tomb add 17",      s.add(17),      true);
+    passed += Test("hs-tomb contains 17", s.contains(17), true);
+    passed += Test("hs-tomb contains 9",  s.contains(9),  true);
+    passed += Test("hs-tomb count 2",     s.count(),      2);
+
+    s.remove(9);
+    passed += Test("hs-tomb 17 after removing 9", s.contains(17), true);
+
+    return passed;
+}
+
+// ── hashset<i64> ─────────────────────────────────────────────────────────────
+
+int testHashsetI64()
+{
+    int passed = 0;
+
+    hashset<i64> s;
+    passed += Test("hs-i64 add 1",    s.add((i64)1),             true);
+    passed += Test("hs-i64 add 2",    s.add((i64)2),             true);
+    passed += Test("hs-i64 add -1",   s.add((i64)-1),            true);
+    passed += Test("hs-i64 add big",  s.add((i64)1000000000000), true);
+    passed += Test("hs-i64 count 4",  s.count(), 4);
+
+    passed += Test("hs-i64 contains 1",   s.contains((i64)1),            true);
+    passed += Test("hs-i64 contains -1",  s.contains((i64)-1),           true);
+    passed += Test("hs-i64 contains big", s.contains((i64)1000000000000), true);
+    passed += Test("hs-i64 missing 3",    s.contains((i64)3),            false);
+
+    passed += Test("hs-i64 remove -1", s.remove((i64)-1),   true);
+    passed += Test("hs-i64 -1 gone",   s.contains((i64)-1), false);
+    passed += Test("hs-i64 1 still",   s.contains((i64)1),  true);
+
+    return passed;
+}
+
+// ── hashset<char> ────────────────────────────────────────────────────────────
+
+int testHashsetChar()
+{
+    int passed = 0;
+
+    hashset<char> s;
+    passed += Test("hs-char add 'a'", s.add('a'), true);
+    passed += Test("hs-char add 'z'", s.add('z'), true);
+    passed += Test("hs-char add '0'", s.add('0'), true);
+    passed += Test("hs-char count 3", s.count(),  3);
+
+    passed += Test("hs-char contains 'a'", s.contains('a'), true);
+    passed += Test("hs-char contains 'z'", s.contains('z'), true);
+    passed += Test("hs-char missing 'x'",  s.contains('x'), false);
+
+    passed += Test("hs-char dup 'a'",    s.add('a'),      false);
+    passed += Test("hs-char remove 'z'", s.remove('z'),   true);
+    passed += Test("hs-char 'z' gone",   s.contains('z'), false);
+    passed += Test("hs-char 'a' still",  s.contains('a'), true);
+
+    return passed;
+}
+
+// ── hashset: rehash stress ────────────────────────────────────────────────────
+
+int testHashsetRehash()
+{
+    int passed = 0;
+
+    hashset<int> s;
+    int i = 0;
+    while (i < 100) { s.add(i); i++; }
+    passed += Test("hs-rehash count 100",   s.count(),       100);
+    passed += Test("hs-rehash contains 0",  s.contains(0),   true);
+    passed += Test("hs-rehash contains 99", s.contains(99),  true);
+    passed += Test("hs-rehash missing 100", s.contains(100), false);
+
+    i = 0;
+    while (i < 100) { if (i % 2 == 0) s.remove(i); i++; }
+    passed += Test("hs-rehash count after rm", s.count(),       50);
+    passed += Test("hs-rehash odd 1 present",  s.contains(1),   true);
+    passed += Test("hs-rehash odd 99 present", s.contains(99),  true);
+    passed += Test("hs-rehash even 0 gone",    s.contains(0),   false);
+    passed += Test("hs-rehash even 98 gone",   s.contains(98),  false);
+
+    return passed;
+}
+
+// ── dictionary: negative keys ─────────────────────────────────────────────────
+
+int testDictNegative()
+{
+    int passed = 0;
+
+    dictionary<int, int> d;
+    passed += Test("d-neg add -1=>1",     d.add(-1,   1),   true);
+    passed += Test("d-neg add -10=>10",   d.add(-10,  10),  true);
+    passed += Test("d-neg add -100=>100", d.add(-100, 100), true);
+    passed += Test("d-neg count 3",       d.count(),        3);
+
+    passed += Test("d-neg get -1",    d.get(-1),   1);
+    passed += Test("d-neg get -10",   d.get(-10),  10);
+    passed += Test("d-neg get -100",  d.get(-100), 100);
+    passed += Test("d-neg missing -5",d.get(-5),   0);
+
+    d.set(-1, 999);
+    passed += Test("d-neg set -1",     d.get(-1),       999);
+    passed += Test("d-neg remove -10", d.remove(-10),   true);
+    passed += Test("d-neg -10 gone",   d.contains(-10), false);
+
+    return passed;
+}
+
+// ── dictionary: tombstone probing ─────────────────────────────────────────────
+// 1 and 9 collide at slot 1 in cap-8 table; remove 1 leaves tombstone.
+
+int testDictTombstone()
+{
+    int passed = 0;
+
+    dictionary<int, int> d;
+    d.add(1, 10);
+    d.add(9, 90);   // collides with 1
+    d.remove(1);    // slot 1 becomes tombstone
+
+    passed += Test("d-tomb get 9 past tombstone", d.get(9),      90);
+    passed += Test("d-tomb contains 9",           d.contains(9), true);
+    passed += Test("d-tomb 1 gone",               d.contains(1), false);
+
+    passed += Test("d-tomb add 17=>170",  d.add(17, 170), true);
+    passed += Test("d-tomb get 17",       d.get(17),      170);
+    passed += Test("d-tomb get 9 still",  d.get(9),       90);
+    passed += Test("d-tomb count 2",      d.count(),      2);
+
+    return passed;
+}
+
+// ── dictionary<i64,int> ───────────────────────────────────────────────────────
+
+int testDictI64()
+{
+    int passed = 0;
+
+    dictionary<i64, int> d;
+    passed += Test("d-i64 add 1=>1",    d.add((i64)1,             1),  true);
+    passed += Test("d-i64 add -1=>-1",  d.add((i64)-1,            -1), true);
+    passed += Test("d-i64 add big=>42", d.add((i64)1000000000000, 42), true);
+    passed += Test("d-i64 count 3",     d.count(), 3);
+
+    passed += Test("d-i64 get 1",   d.get((i64)1),             1);
+    passed += Test("d-i64 get -1",  d.get((i64)-1),            -1);
+    passed += Test("d-i64 get big", d.get((i64)1000000000000), 42);
+    passed += Test("d-i64 miss 2",  d.get((i64)2),             0);
+
+    d.set((i64)1, 999);
+    passed += Test("d-i64 set 1",     d.get((i64)1),       999);
+    passed += Test("d-i64 remove -1", d.remove((i64)-1),   true);
+    passed += Test("d-i64 -1 gone",   d.contains((i64)-1), false);
+
+    return passed;
+}
+
+// ── dictionary<char,int> ──────────────────────────────────────────────────────
+
+int testDictChar()
+{
+    int passed = 0;
+
+    dictionary<char, int> d;
+    passed += Test("d-char add 'a'", d.add('a', 1),  true);
+    passed += Test("d-char add 'b'", d.add('b', 2),  true);
+    passed += Test("d-char add 'z'", d.add('z', 26), true);
+    passed += Test("d-char count 3", d.count(), 3);
+
+    passed += Test("d-char get 'a'",  d.get('a'), 1);
+    passed += Test("d-char get 'z'",  d.get('z'), 26);
+    passed += Test("d-char miss 'x'", d.get('x'), 0);
+
+    d.set('a', 100);
+    passed += Test("d-char set 'a'",    d.get('a'),       100);
+    passed += Test("d-char remove 'b'", d.remove('b'),    true);
+    passed += Test("d-char 'b' gone",   d.contains('b'),  false);
+    passed += Test("d-char 'a' intact", d.get('a'),       100);
+
+    return passed;
+}
+
+// ── dictionary: rehash stress ─────────────────────────────────────────────────
+
+int testDictRehash()
+{
+    int passed = 0;
+
+    dictionary<int, int> d;
+    int i = 0;
+    while (i < 100) { d.add(i, i * 3); i++; }
+    passed += Test("d-rehash count 100",   d.count(),       100);
+    passed += Test("d-rehash get 0",       d.get(0),        0);
+    passed += Test("d-rehash get 99",      d.get(99),       297);
+    passed += Test("d-rehash missing 100", d.contains(100), false);
+
+    i = 0;
+    while (i < 100) { if (i % 2 == 0) d.set(i, i * -1); i++; }
+    passed += Test("d-rehash updated 0",  d.get(0),   0);
+    passed += Test("d-rehash updated 2",  d.get(2),   -2);
+    passed += Test("d-rehash updated 98", d.get(98),  -98);
+    passed += Test("d-rehash odd 1",      d.get(1),   3);
+    passed += Test("d-rehash odd 99",     d.get(99),  297);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -342,13 +593,23 @@ extern int main()
 
     int r;
 
-    r = testList();         passed += r; total += 15;
-    r = testHashset();      passed += r; total += 19;
-    r = testDictionary();   passed += r; total += 34;
-    r = testPair();         passed += r; total += 8;
-    r = testStack();        passed += r; total += 8;
-    r = testQueue();        passed += r; total += 8;
-    r = testFor();          passed += r; total += 7;
+    r = testList();             passed += r; total += 15;
+    r = testHashset();          passed += r; total += 19;
+    r = testHashsetNegative();  passed += r; total += 12;
+    r = testHashsetTombstone(); passed += r; total += 7;
+    r = testHashsetI64();       passed += r; total += 12;
+    r = testHashsetChar();      passed += r; total += 11;
+    r = testHashsetRehash();    passed += r; total += 9;
+    r = testDictionary();       passed += r; total += 34;
+    r = testDictNegative();     passed += r; total += 11;
+    r = testDictTombstone();    passed += r; total += 7;
+    r = testDictI64();          passed += r; total += 11;
+    r = testDictChar();         passed += r; total += 11;
+    r = testDictRehash();       passed += r; total += 9;
+    r = testPair();             passed += r; total += 8;
+    r = testStack();            passed += r; total += 8;
+    r = testQueue();            passed += r; total += 8;
+    r = testFor();              passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

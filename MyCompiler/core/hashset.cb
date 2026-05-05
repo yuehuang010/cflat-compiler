@@ -11,7 +11,11 @@ struct hashset<T>
 
     int _slot(T value)
     {
-        int h = (int)(value % _capacity);
+        int h = 0;
+        if const (is_primitive(T))
+            h = Hash(value) % _capacity;
+        else
+            h = value.hash() % _capacity;
         if (h < 0) h = h + _capacity;
         return h;
     }
@@ -106,6 +110,14 @@ struct hashset<T>
     int count()
     {
         return _count;
+    }
+
+    // Remove all elements without releasing the backing arrays.
+    void clear()
+    {
+        int i = 0;
+        while (i < _capacity) { _status[i] = 0; i++; }
+        _count = 0;
     }
 
     ~hashset()

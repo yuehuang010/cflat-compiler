@@ -28,6 +28,21 @@ interface IHashable
     int hash();
 };
 
+// Hash() overloads for primitive types — use with is_primitive(T) and if const
+// so generic data structures can call Hash(value) without knowing the concrete type.
+int Hash(i8  value) { return (int)value; }
+int Hash(i16 value) { return (int)value; }
+int Hash(i32 value) { return value; }
+int Hash(i64 value) { return (int)(value ^ (value >> 32)); }
+int Hash(u8  value) { return (int)value; }
+int Hash(u16 value) { return (int)value; }
+int Hash(u32 value) { return (int)value; }
+int Hash(u64 value) { return (int)(value ^ (value >> 32)); }
+int Hash(char value) { return (int)value; }
+int Hash(bool value) { return value ? 1 : 0; }
+int Hash(float value) { return (int)value; }
+int Hash(double value) { return (int)value; }
+
 interface IDictionary<K, V>
 {
     int  count();

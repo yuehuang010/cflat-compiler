@@ -1,7 +1,6 @@
 // dictionary<K,V> — open-addressed hash map built on the same storage scheme
 // as hashset<T> (parallel status/keys arrays with linear probing), extended
-// with a parallel values array.  K must support == and % (integer-like type,
-// same constraints as hashset<T>).
+// with a parallel values array.  K must be a primitive type or implement IHashable.
 
 import "hashset.cb";
 
@@ -16,7 +15,11 @@ struct dictionary<K, V>
 
     int _slot(K key)
     {
-        int h = (int)(key % _capacity);
+        int h = 0;
+        if const (is_primitive(K))
+            h = Hash(key) % _capacity;
+        else
+            h = key.hash() % _capacity;
         if (h < 0) h = h + _capacity;
         return h;
     }
@@ -157,6 +160,14 @@ struct dictionary<K, V>
     int count()
     {
         return _count;
+    }
+
+    // Remove all entries without releasing the backing arrays.
+    void clear()
+    {
+        int i = 0;
+        while (i < _capacity) { _status[i] = 0; i++; }
+        _count = 0;
     }
 
     // d[key] — same semantics as get(key): returns default(V) on miss.

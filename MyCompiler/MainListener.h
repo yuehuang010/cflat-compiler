@@ -6426,6 +6426,36 @@ public:
                             break;
                         }
 
+                        // Compile-time intrinsic: is_primitive(T) — returns 1 if T resolves to a primitive
+                        // type (integer, float, bool, void), 0 otherwise. Use with `if const` to branch
+                        // on primitive vs struct element types in generic data structures.
+                        if (functionName == "is_primitive")
+                        {
+                            static const std::unordered_set<std::string> kPrimitiveTypes = {
+                                "bool", "void",
+                                "char", "i8", "i16", "i32", "i64",
+                                "u8", "u16", "u32", "u64",
+                                "short", "int", "long",
+                                "float", "double",
+                            };
+                            bool isPrim = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                        isPrim = kPrimitiveTypes.count(substIt->second) > 0;
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(*Compiler(ctx)->context), isPrim ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Handle va_start / va_end — pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
@@ -7768,7 +7798,7 @@ public:
 
         // Compiler intrinsics handled at the call site — not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_primitive", "annotationof",
             "reflect", "reflect_set",
         };
         if (kIntrinsics.count(name))
