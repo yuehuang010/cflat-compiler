@@ -1,9 +1,10 @@
 // dictionary<K,V> — open-addressed hash map built on the same storage scheme
 // as hashset<T> (parallel status/keys arrays with linear probing), extended
-// with a parallel values array.  K must be a primitive type or implement IHashable.
-// When V is a pointer type, the dictionary owns the values: add()/set() take
-// ownership, set() frees the old value on overwrite, remove() and clear() free
-// values, and the destructor frees any remaining.
+// with a parallel values array.  K must be a primitive or pointer type, or
+// implement hash().  K is non-owning — the caller manages the lifetime of any
+// heap-allocated keys.  When V is a pointer type, the dictionary owns the
+// values: add()/set() take ownership, set() frees the old value on overwrite,
+// remove() and clear() free values, and the destructor frees any remaining.
 
 import "hashset.cb";
 
@@ -21,6 +22,8 @@ struct dictionary<K, V>
         int h = 0;
         if const (is_primitive(K))
             h = Hash(key) % _capacity;
+        else if const (is_pointer(K))
+            h = Hash((i64)key) % _capacity;
         else
             h = key.hash() % _capacity;
         if (h < 0) h = h + _capacity;

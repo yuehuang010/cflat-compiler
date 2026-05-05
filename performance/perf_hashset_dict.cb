@@ -9,10 +9,9 @@
 // String benchmarks use make_key(i) which produces 16-char keys ("bench_%010d"),
 // exceeding MSVC's 15-char SSO limit so both CFlat and C++ always heap-allocate.
 //
-// Two sets of keys are used in string benchmarks:
-//   set 1 — created inline via make_key(i) each add pass (keys are consumed by move)
-//   set 2 — pre-built list<string> used for contains/get/remove (no alloc in timed loop)
-// add() times include one malloc+sprintf per op; lookup/remove times do not.
+// The add benchmarks call make_key(i) inline so add times include one malloc+sprintf
+// per op.  All other benchmarks (contains/get/remove) pre-build a list<string> of
+// keys so the timed loop has no alloc cost.
 //
 // Note: add times exclude rehash cost because the container is pre-warmed via
 // a warm-up fill + clear().  Remove times are isolated via stopwatch pause/resume.
@@ -326,14 +325,14 @@ program BenchHashsetStrContains
 
     int main(move list<string> args)
     {
-        hashset<string> s;
-        int i = 0;
-        while (i < n) { s.add(make_key(i)); i++; }
-
-        // pre-build lookup keys so the timed loop has no alloc cost
+        // pre-build keys so neither fill nor timed loop allocates
         list<string> lookup_keys;
-        i = 0;
+        int i = 0;
         while (i < n) { lookup_keys.add(make_key(i)); i++; }
+
+        hashset<string> s;
+        i = 0;
+        while (i < n) { s.add(lookup_keys.get(i)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -362,14 +361,14 @@ program BenchHashsetStrRemove
 
     int main(move list<string> args)
     {
-        hashset<string> s;
-        int i = 0;
-        while (i < n) { s.add(make_key(i)); i++; }
-
-        // pre-build lookup keys so the timed remove loop has no alloc cost
+        // pre-build keys so neither fill, remove, nor refill allocates
         list<string> lookup_keys;
-        i = 0;
+        int i = 0;
         while (i < n) { lookup_keys.add(make_key(i)); i++; }
+
+        hashset<string> s;
+        i = 0;
+        while (i < n) { s.add(lookup_keys.get(i)); i++; }
 
         Stopwatch sw;
         int r = 0;
@@ -381,7 +380,7 @@ program BenchHashsetStrRemove
             sw.stop();
             s.clear();
             i = 0;
-            while (i < n) { s.add(make_key(i)); i++; }  // refill with fresh keys
+            while (i < n) { s.add(lookup_keys.get(i)); i++; }
             r++;
         }
         measuredUs = (i64)sw.elapsed().microseconds();
@@ -429,14 +428,14 @@ program BenchDictStrGet
 
     int main(move list<string> args)
     {
-        dictionary<string, string> d;
-        int i = 0;
-        while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
-
-        // pre-build lookup keys so the timed loop has no alloc cost
+        // pre-build keys so neither fill nor timed loop allocates
         list<string> lookup_keys;
-        i = 0;
+        int i = 0;
         while (i < n) { lookup_keys.add(make_key(i)); i++; }
+
+        dictionary<string, string> d;
+        i = 0;
+        while (i < n) { d.add(lookup_keys.get(i), make_key(i * 2)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -466,14 +465,14 @@ program BenchDictStrRemove
 
     int main(move list<string> args)
     {
-        dictionary<string, string> d;
-        int i = 0;
-        while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
-
-        // pre-build lookup keys so the timed remove loop has no alloc cost
+        // pre-build keys so neither fill, remove, nor refill allocates for keys
         list<string> lookup_keys;
-        i = 0;
+        int i = 0;
         while (i < n) { lookup_keys.add(make_key(i)); i++; }
+
+        dictionary<string, string> d;
+        i = 0;
+        while (i < n) { d.add(lookup_keys.get(i), make_key(i * 2)); i++; }
 
         Stopwatch sw;
         int r = 0;
@@ -485,7 +484,7 @@ program BenchDictStrRemove
             sw.stop();
             d.clear();
             i = 0;
-            while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }  // refill with fresh keys
+            while (i < n) { d.add(lookup_keys.get(i), make_key(i * 2)); i++; }
             r++;
         }
         measuredUs = (i64)sw.elapsed().microseconds();

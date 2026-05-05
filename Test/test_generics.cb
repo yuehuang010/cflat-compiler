@@ -698,36 +698,35 @@ bool testHashsetPointer()
 {
     bool result = true;
 
-    empDtorCount = 0;
-    {
-        hashset<Employee*> s;
-        Employee* e1 = new Employee; e1->id = 10;
-        Employee* e2 = new Employee; e2->id = 20;
-        Employee* e3 = new Employee; e3->id = 30;
-        // save addresses before move — callers' pointers are nulled by add()
-        Employee* e2_addr = e2;
-        s.add(e1);
-        s.add(e2);
-        s.add(e3);
-        result &= Test("hashset<ptr> count", s.count(), 3);
+    hashset<Employee*> s;
+    Employee* e1 = new Employee; e1->id = 10;
+    Employee* e2 = new Employee; e2->id = 20;
+    Employee* e3 = new Employee; e3->id = 30;
 
-        // remove() must free the element; look up by saved address
-        s.remove(e2_addr);
-        result &= Test("hashset<ptr> remove dtor",        empDtorCount, 1);
-        result &= Test("hashset<ptr> count after remove", s.count(),    2);
+    s.add(e1);
+    s.add(e2);
+    s.add(e3);
+    result &= Test("hashset<ptr> count",          s.count(),      3);
+    result &= Test("hashset<ptr> contains e1",    s.contains(e1), true);
+    result &= Test("hashset<ptr> contains e2",    s.contains(e2), true);
+    result &= Test("hashset<ptr> dup add",        s.add(e1),      false);
 
-        // clear() must free remaining elements (e1, e3)
-        s.clear();
-        result &= Test("hashset<ptr> clear dtor",  empDtorCount, 3);
-        result &= Test("hashset<ptr> clear count", s.count(),    0);
+    s.remove(e2);
+    delete e2;
+    result &= Test("hashset<ptr> count after remove", s.count(),      2);
+    result &= Test("hashset<ptr> contains after remove", s.contains(e2), false);
 
-        // add after clear — destructor must not double-free
-        Employee* e4 = new Employee; e4->id = 40;
-        s.add(e4);
-        result &= Test("hashset<ptr> add after clear count", s.count(), 1);
-        // ~hashset() frees e4 here
-    }
-    result &= Test("hashset<ptr> dtor after clear", empDtorCount, 4);
+    s.clear();
+    result &= Test("hashset<ptr> count after clear", s.count(), 0);
+
+    // caller owns e1 and e3 — delete them manually
+    delete e1;
+    delete e3;
+
+    Employee* e4 = new Employee; e4->id = 40;
+    s.add(e4);
+    result &= Test("hashset<ptr> add after clear", s.count(), 1);
+    delete e4;
 
     return result;
 }
