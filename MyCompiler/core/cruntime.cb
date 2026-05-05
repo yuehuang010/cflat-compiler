@@ -19,9 +19,10 @@ struct __ProgramTLS {
     char* stdin_line = nullptr;                          // field 6 — current line from hook
     int stdin_line_pos = 0;                              // field 7 — read cursor within stdin_line
     function<void(char*)> stdin_return_hook = default;   // field 8 — return buffer to pool (stream path)
-    void* cached_stdin = nullptr;                        // field 9 — cached stdin FILE*
+    void* cached_stdin = nullptr;                        // field 9 — cached stdin FILE* (pre-populated by trampoline)
     bool handle_tracker_enabled = false;                 // field 10 — FILE handle tracker on/off
     void* handle_tracker_head = nullptr;                 // field 11 — head of open-handle linked list
+    bool stdin_active = false;                           // field 12 — true iff hook installed and not in re-entrant call
 };
 thread_local __ProgramTLS __prog_tls = default;
 
@@ -140,9 +141,11 @@ int __stdin_next_char() {
                 free(__prog_tls.stdin_line);                          // free normally (user-hook path)
             __prog_tls.stdin_line = nullptr;
         }
+        __prog_tls.stdin_active = false;
         __prog_tls.stdin_in_hook = true;
         __prog_tls.stdin_line = __prog_tls.stdin_hook();
         __prog_tls.stdin_in_hook = false;
+        __prog_tls.stdin_active = true;
         __prog_tls.stdin_line_pos = 0;
         if (__prog_tls.stdin_line == nullptr) return -1;  // EOF
     }
@@ -154,13 +157,12 @@ int __stdin_next_char() {
 // fgets — when the stdin hook is active and the stream is stdin, serve bytes from
 // the hook line-buffer instead of blocking on the real console.
 extern char* fgets(char* buf, int count, void* stream) {
-    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __acrt_iob_func(0); }
-    if (__prog_tls.stdin_hook != nullptr && !__prog_tls.stdin_in_hook && stream == __prog_tls.cached_stdin) {
-        // Load both TLS fields once into locals — avoids re-reading TLS in the refill
-        // check, the scan loop, and the copy step.
+    // Fast path: stdin hook is active and this is a stdin read.
+    // cached_stdin is pre-populated by the program trampoline — no null check needed here.
+    if (__prog_tls.stdin_active && stream == __prog_tls.cached_stdin) {
         char* src = __prog_tls.stdin_line;
         int   pos = __prog_tls.stdin_line_pos;
-        // Refill the line buffer if exhausted.
+        // Refill when the current stream buffer is exhausted.
         if (src == nullptr || src[pos] == '\0') {
             if (src != nullptr) {
                 if (__prog_tls.stdin_return_hook != nullptr)
@@ -168,23 +170,25 @@ extern char* fgets(char* buf, int count, void* stream) {
                 else
                     free(src);
             }
+            __prog_tls.stdin_active = false;  // disable during hook call (re-entrancy guard)
             __prog_tls.stdin_in_hook = true;
             src = __prog_tls.stdin_hook();
             __prog_tls.stdin_in_hook = false;
+            __prog_tls.stdin_active = true;
             __prog_tls.stdin_line = src;
             pos = 0;
             __prog_tls.stdin_line_pos = 0;
             if (src == nullptr) return nullptr;  // EOF
         }
-        // Find the next '\n' and bulk-copy with memcpy — no TLS in the hot path.
+        // Find the next '\n' and bulk-copy — no extra TLS reads in the hot path.
         int end = pos;
         while (src[end] != '\0' && src[end] != '\n') { end++; }
-        if (src[end] == '\n') { end++; }   // include the '\n'
+        if (src[end] == '\n') { end++; }
         int line_len = end - pos;
         int copy_len = line_len < count - 1 ? line_len : count - 1;
         memcpy(buf, src + pos, (i64)copy_len);
         buf[copy_len] = '\0';
-        __prog_tls.stdin_line_pos = pos + copy_len;  // one TLS write
+        __prog_tls.stdin_line_pos = pos + copy_len;
         return copy_len > 0 ? buf : nullptr;
     }
     // Fallback: read character by character from the real stream.
@@ -208,7 +212,7 @@ extern char* fgets(char* buf, int count, void* stream) {
 extern int scanf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    if (__prog_tls.stdin_hook != nullptr && !__prog_tls.stdin_in_hook) {
+    if (__prog_tls.stdin_active) {
         // Refill the line buffer if exhausted.
         if (__prog_tls.stdin_line == nullptr || __prog_tls.stdin_line[__prog_tls.stdin_line_pos] == '\0') {
             if (__prog_tls.stdin_line != nullptr) {
@@ -218,9 +222,11 @@ extern int scanf(const char* fmt, ...) {
                     free(__prog_tls.stdin_line);                          // free normally (user-hook path)
                 __prog_tls.stdin_line = nullptr;
             }
+            __prog_tls.stdin_active = false;
             __prog_tls.stdin_in_hook = true;
             __prog_tls.stdin_line = __prog_tls.stdin_hook();
             __prog_tls.stdin_in_hook = false;
+            __prog_tls.stdin_active = true;
             __prog_tls.stdin_line_pos = 0;
             if (__prog_tls.stdin_line == nullptr) { va_end(ap); return -1; }  // EOF
         }

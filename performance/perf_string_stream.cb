@@ -1,0 +1,213 @@
+// Stream throughput benchmark across three line sizes: 10, 20, and 100 characters.
+// Tests how line length affects producer-consumer throughput over a double-buffered stream.
+//
+// Two variants per size:
+//   stream + raw Thread  — direct write_bytes / read_buf, no program overhead
+//   stream + program     — program actor overhead + fgets hook path
+//
+// Metric: lines/second (newlines counted by consumer).
+
+import "list.cb";
+import "time.cb";
+
+extern int  __atomic_i32_load(int* ptr);
+extern void __atomic_i32_store(int* ptr, int val);
+
+int BENCH_SECS = 5;
+
+void fmt_commas(i64 n, char* out) {
+    if (n == (i64)0) { out[0] = '0'; out[1] = '\0'; return; }
+    int digits = 0;
+    i64 t = n;
+    while (t > (i64)0) { digits++; t = t / (i64)10; }
+    int out_len = digits + (digits - 1) / 3;
+    out[out_len] = '\0';
+    int pos = out_len - 1;
+    int d = 0;
+    while (n > (i64)0) {
+        if (d > 0 && d % 3 == 0) { out[pos] = ','; pos--; }
+        out[pos] = (char)('0' + (int)(n % (i64)10));
+        pos--;
+        n = n / (i64)10;
+        d++;
+    }
+}
+
+// === Shared globals ============================================================
+
+stream*  g_stream   = nullptr;
+i64      g_count    = 0;
+int      g_stop     = 0;
+char*    g_word     = nullptr;
+int      g_word_len = 0;
+
+// === Raw Thread variant ========================================================
+
+int raw_producer(void* ctx)
+{
+    char* word = g_word;
+    int   len  = g_word_len;
+    while (__atomic_i32_load(&g_stop) == 0) { g_stream.write_bytes(word, len); }
+    g_stream.close();
+    return 0;
+}
+
+int raw_consumer(void* ctx)
+{
+    i64 count = (i64)0;
+    int len = 0;
+    char* buf = g_stream.read_buf(&len);
+    while (buf != nullptr)
+    {
+        int i = 0;
+        while (i < len) { if (buf[i] == '\n') { count = count + (i64)1; } i++; }
+        g_stream.return_buffer(buf);
+        buf = g_stream.read_buf(&len);
+    }
+    g_count = count;
+    return 0;
+}
+
+// === Program variant ===========================================================
+
+program StrProducer
+{
+    stop_token token = default;
+
+    int main(move list<string> args)
+    {
+        stream* out = _out;
+        char* word = g_word;
+        int   len  = g_word_len;
+        while (!token.stop_requested()) { out.write_bytes(word, len); }
+        return 0;
+    }
+};
+
+program StrConsumer
+{
+    i64 count = default;
+
+    int main(move list<string> args)
+    {
+        char* buf = (char*)malloc(256);
+        void* stdinStream = __acrt_iob_func(0);
+        while (fgets(buf, 256, stdinStream) != nullptr) { count = count + (i64)1; }
+        free(buf);
+        return 0;
+    }
+};
+
+// === Benchmark helpers =========================================================
+
+i64 bench_raw(char* word, int word_len, int dur_ms, i64 dur_s)
+{
+    g_word     = word;
+    g_word_len = word_len;
+    g_count    = (i64)0;
+
+    stream s;
+    s.bufferSize = 65536;
+    s.init();
+    g_stream = &s;
+
+    __atomic_i32_store(&g_stop, 0);
+    Thread tProd;
+    Thread tCons;
+    tProd.start(raw_producer, nullptr);
+    tCons.start(raw_consumer, nullptr);
+    tProd.setAffinity((u64)1);  // core 0
+    tCons.setAffinity((u64)2);  // core 1
+    sleep(dur_ms);
+    __atomic_i32_store(&g_stop, 1);
+    tProd.join();
+    tCons.join();
+
+    return g_count / dur_s;
+}
+
+i64 bench_program(char* word, int word_len, int dur_ms, i64 dur_s)
+{
+    g_word     = word;
+    g_word_len = word_len;
+
+    list<string> args;
+    stream s;
+    s.bufferSize = 65536;
+    s.init();
+
+    StrProducer prod;
+    StrConsumer cons;
+    stop_source src;
+    src.init();
+    prod.token = src.get_token();
+    prod >> s;
+    s >> cons;
+    prod.run(args);
+    cons.run(args);
+    prod._thread.setAffinity((u64)1);  // core 0
+    cons._thread.setAffinity((u64)2);  // core 1
+    sleep(dur_ms);
+    src.request_stop();
+    prod.WaitForExit();
+    s.close();
+    cons.WaitForExit();
+    src.dispose();
+
+    return cons.count / dur_s;
+}
+
+// === Main =====================================================================
+
+extern int main()
+{
+    int dur_ms = BENCH_SECS * 1000;
+    i64 dur_s  = (i64)BENCH_SECS;
+
+    // Line sizes: N-1 printable chars + '\n' = N bytes total
+    char* w10  = (char*)"123456789\n";
+    char* w20  = (char*)"1234567890123456789\n";
+    char* w100 = (char*)"123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\n";
+
+    printf("Stream throughput by line size (%d seconds each)\n\n", BENCH_SECS);
+
+    printf("[1/6] stream + raw Thread,  10-char lines\n");
+    i64 raw10 = bench_raw(w10, 10, dur_ms, dur_s);
+
+    printf("[2/6] stream + raw Thread,  20-char lines\n");
+    i64 raw20 = bench_raw(w20, 20, dur_ms, dur_s);
+
+    printf("[3/6] stream + raw Thread, 100-char lines\n");
+    i64 raw100 = bench_raw(w100, 100, dur_ms, dur_s);
+
+    printf("[4/6] stream + program,    10-char lines\n");
+    i64 prog10 = bench_program(w10, 10, dur_ms, dur_s);
+
+    printf("[5/6] stream + program,    20-char lines\n");
+    i64 prog20 = bench_program(w20, 20, dur_ms, dur_s);
+
+    printf("[6/6] stream + program,    100-char lines\n");
+    i64 prog100 = bench_program(w100, 100, dur_ms, dur_s);
+
+    printf("\n");
+    printf("%-22s %15s %12s\n", "Variant",   "lines/s", "MB chars/s");
+    printf("%-22s %15s %12s\n", "----------", "---------------", "----------");
+    char* buf = (char*)malloc(32);
+
+    printf("10-char lines:\n");
+    fmt_commas(raw10,  buf); printf("  %-20s %15s %12.1f\n", "raw Thread", buf, (double)(raw10  * (i64)10) / 1000000.0);
+    fmt_commas(prog10, buf); printf("  %-20s %15s %12.1f\n", "program",    buf, (double)(prog10 * (i64)10) / 1000000.0);
+
+    printf("20-char lines:\n");
+    fmt_commas(raw20,  buf); printf("  %-20s %15s %12.1f\n", "raw Thread", buf, (double)(raw20  * (i64)20) / 1000000.0);
+    fmt_commas(prog20, buf); printf("  %-20s %15s %12.1f\n", "program",    buf, (double)(prog20 * (i64)20) / 1000000.0);
+
+    printf("100-char lines:\n");
+    fmt_commas(raw100,  buf); printf("  %-20s %15s %12.1f\n", "raw Thread", buf, (double)(raw100  * (i64)100) / 1000000.0);
+    fmt_commas(prog100, buf); printf("  %-20s %15s %12.1f\n", "program",    buf, (double)(prog100 * (i64)100) / 1000000.0);
+
+    free((void*)buf);
+    printf("\n");
+
+    return 0;
+}

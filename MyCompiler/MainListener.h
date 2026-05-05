@@ -8589,8 +8589,10 @@ public:
         constexpr int kPTLS_stdout_hook            = 0;
         constexpr int kPTLS_stdin_hook             = 4;
         constexpr int kPTLS_stdin_return_hook      = 8;
+        constexpr int kPTLS_cached_stdin           = 9;
         constexpr int kPTLS_handle_tracker_enabled = 10;
         constexpr int kPTLS_handle_tracker_head    = 11;
+        constexpr int kPTLS_stdin_active           = 12;
 
         // Look up the single thread-local TLS struct (declared in cruntime.cb)
         llvm::GlobalVariable* progTlsGlobal = nullptr;
@@ -8736,6 +8738,23 @@ public:
                 compiler->builder->CreateStore(onStdinReturnVal, stdinReturnHookGEP);
             }
 
+            // Eagerly init cached_stdin and activate the stdin fast path.
+            // This pre-populates __prog_tls.cached_stdin so fgets avoids a lazy-init branch on every call,
+            // and sets stdin_active so fgets can use a single-field guard instead of three separate checks.
+            {
+                auto* ioFuncTy  = llvm::FunctionType::get(voidPtrType, {i32Type}, false);
+                auto* ioFuncFn  = compiler->module->getOrInsertFunction("__acrt_iob_func", ioFuncTy).getCallee();
+                auto* stdinPtr  = compiler->builder->CreateCall(
+                    llvm::cast<llvm::Function>(ioFuncFn)->getFunctionType(), ioFuncFn,
+                    {llvm::ConstantInt::get(i32Type, 0)}, "stdin_ptr");
+                auto* cachedStdinGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_cached_stdin, "cached_stdin_gep");
+                compiler->builder->CreateStore(stdinPtr, cachedStdinGEP);
+                auto* stdinActiveGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdin_active, "stdin_active_gep");
+                compiler->builder->CreateStore(llvm::ConstantInt::getTrue(*compiler->context), stdinActiveGEP);
+            }
+
             // Enable handle tracker: load self->trackHandles and store into __prog_tls.handle_tracker_enabled
             {
                 auto* trackGEP = compiler->builder->CreateStructGEP(
@@ -8809,6 +8828,10 @@ public:
                     progTlsType, progTlsGlobal, kPTLS_stdin_hook, "stdin_hook_gep");
                 compiler->builder->CreateStore(
                     llvm::Constant::getNullValue(stdinHookFnPtrType), stdinHookGEP);
+                auto* stdinActiveGEP = compiler->builder->CreateStructGEP(
+                    progTlsType, progTlsGlobal, kPTLS_stdin_active, "stdin_active_gep");
+                compiler->builder->CreateStore(
+                    llvm::ConstantInt::getFalse(*compiler->context), stdinActiveGEP);
             }
 
             // Handle tracker cleanup: disable tracker first (so fclose won't re-enter the list),
