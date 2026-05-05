@@ -6,9 +6,13 @@
 //   contains — scan N lookups on a pre-filled container
 //   remove   — drain a pre-filled container; clear() + refill happen outside timer
 //
-// String benchmarks use operator string(i) inline — add() takes ownership of the
-// new string, while contains()/remove() pass a temporary for comparison only.
-// This means add times include string allocation; contains/remove do not.
+// String benchmarks use make_key(i) which produces 16-char keys ("bench_%010d"),
+// exceeding MSVC's 15-char SSO limit so both CFlat and C++ always heap-allocate.
+//
+// Two sets of keys are used in string benchmarks:
+//   set 1 — created inline via make_key(i) each add pass (keys are consumed by move)
+//   set 2 — pre-built list<string> used for contains/get/remove (no alloc in timed loop)
+// add() times include one malloc+sprintf per op; lookup/remove times do not.
 //
 // Note: add times exclude rehash cost because the container is pre-warmed via
 // a warm-up fill + clear().  Remove times are isolated via stopwatch pause/resume.
@@ -18,6 +22,18 @@ import "hashset.cb";
 import "dictionary.cb";
 import "time.cb";
 import "perf_framework.cb";
+
+// Produces a 16-char heap-allocated string "bench_%010d" — longer than MSVC's
+// 15-char SSO limit so the C++ comparison benchmark also always heap-allocates.
+string make_key(int i)
+{
+    char* buf = malloc(32);
+    int len = sprintf(buf, "bench_%010d", i);
+    string result;
+    result._ptr = buf;
+    result._len = len;
+    return result;
+}
 
 // ── hashset<int> ─────────────────────────────────────────────────────────────
 
@@ -219,7 +235,7 @@ program BenchListStrAdd
     {
         list<string> lst;
         int i = 0;
-        while (i < n) { lst.add(operator string(i)); i++; }
+        while (i < n) { lst.add(make_key(i)); i++; }
         lst.clear();
 
         Stopwatch sw;
@@ -228,7 +244,7 @@ program BenchListStrAdd
         while (r < repeats)
         {
             i = 0;
-            while (i < n) { lst.add(operator string(i)); i++; }
+            while (i < n) { lst.add(make_key(i)); i++; }
             lst.clear();
             r++;
         }
@@ -249,7 +265,7 @@ program BenchListStrGet
     {
         list<string> lst;
         int i = 0;
-        while (i < n) { lst.add(operator string(i)); i++; }
+        while (i < n) { lst.add(make_key(i)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -282,7 +298,7 @@ program BenchHashsetStrAdd
     {
         hashset<string> s;
         int i = 0;
-        while (i < n) { s.add(operator string(i)); i++; }
+        while (i < n) { s.add(make_key(i)); i++; }
         s.clear();
 
         Stopwatch sw;
@@ -291,7 +307,7 @@ program BenchHashsetStrAdd
         while (r < repeats)
         {
             i = 0;
-            while (i < n) { s.add(operator string(i)); i++; }
+            while (i < n) { s.add(make_key(i)); i++; }
             s.clear();
             r++;
         }
@@ -312,7 +328,12 @@ program BenchHashsetStrContains
     {
         hashset<string> s;
         int i = 0;
-        while (i < n) { s.add(operator string(i)); i++; }
+        while (i < n) { s.add(make_key(i)); i++; }
+
+        // pre-build lookup keys so the timed loop has no alloc cost
+        list<string> lookup_keys;
+        i = 0;
+        while (i < n) { lookup_keys.add(make_key(i)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -322,7 +343,7 @@ program BenchHashsetStrContains
             i = 0;
             while (i < n)
             {
-                if (s.contains(operator string(i))) found++;
+                if (s.contains(lookup_keys.get(i))) found++;
                 i++;
             }
             r++;
@@ -343,7 +364,12 @@ program BenchHashsetStrRemove
     {
         hashset<string> s;
         int i = 0;
-        while (i < n) { s.add(operator string(i)); i++; }
+        while (i < n) { s.add(make_key(i)); i++; }
+
+        // pre-build lookup keys so the timed remove loop has no alloc cost
+        list<string> lookup_keys;
+        i = 0;
+        while (i < n) { lookup_keys.add(make_key(i)); i++; }
 
         Stopwatch sw;
         int r = 0;
@@ -351,11 +377,11 @@ program BenchHashsetStrRemove
         {
             sw.start();
             i = 0;
-            while (i < n) { s.remove(operator string(i)); i++; }
+            while (i < n) { s.remove(lookup_keys.get(i)); i++; }
             sw.stop();
             s.clear();
             i = 0;
-            while (i < n) { s.add(operator string(i)); i++; }
+            while (i < n) { s.add(make_key(i)); i++; }  // refill with fresh keys
             r++;
         }
         measuredUs = (i64)sw.elapsed().microseconds();
@@ -375,7 +401,7 @@ program BenchDictStrAdd
     {
         dictionary<string, string> d;
         int i = 0;
-        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+        while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
         d.clear();
 
         Stopwatch sw;
@@ -384,7 +410,7 @@ program BenchDictStrAdd
         while (r < repeats)
         {
             i = 0;
-            while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+            while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
             d.clear();
             r++;
         }
@@ -405,7 +431,12 @@ program BenchDictStrGet
     {
         dictionary<string, string> d;
         int i = 0;
-        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+        while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
+
+        // pre-build lookup keys so the timed loop has no alloc cost
+        list<string> lookup_keys;
+        i = 0;
+        while (i < n) { lookup_keys.add(make_key(i)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -415,7 +446,7 @@ program BenchDictStrGet
             i = 0;
             while (i < n)
             {
-                string v = d.get(operator string(i));
+                string v = d.get(lookup_keys.get(i));
                 sum = sum + (i64)v.length();
                 i++;
             }
@@ -437,7 +468,12 @@ program BenchDictStrRemove
     {
         dictionary<string, string> d;
         int i = 0;
-        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+        while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }
+
+        // pre-build lookup keys so the timed remove loop has no alloc cost
+        list<string> lookup_keys;
+        i = 0;
+        while (i < n) { lookup_keys.add(make_key(i)); i++; }
 
         Stopwatch sw;
         int r = 0;
@@ -445,11 +481,11 @@ program BenchDictStrRemove
         {
             sw.start();
             i = 0;
-            while (i < n) { d.remove(operator string(i)); i++; }
+            while (i < n) { d.remove(lookup_keys.get(i)); i++; }
             sw.stop();
             d.clear();
             i = 0;
-            while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+            while (i < n) { d.add(make_key(i), make_key(i * 2)); i++; }  // refill with fresh keys
             r++;
         }
         measuredUs = (i64)sw.elapsed().microseconds();
@@ -607,17 +643,17 @@ extern int main()
     RunDict(500,   5000);
     RunDict(10000, 250);
 
-    printf("\n--- list<string>: add / get (includes alloc) ---\n");
+    printf("\n--- list<string>: add / get (add includes alloc) ---\n");
     RunListStr(10,    500000);
     RunListStr(500,   5000);
     RunListStr(10000, 250);
 
-    printf("\n--- hashset<string>: add / contains / remove (add+remove include alloc) ---\n");
+    printf("\n--- hashset<string>: add / contains / remove (add includes alloc; lookup uses pre-built keys) ---\n");
     RunHashsetStr(10,    100000);
     RunHashsetStr(500,   2000);
     RunHashsetStr(10000, 100);
 
-    printf("\n--- dictionary<string,string>: add / get / remove (add+remove include alloc) ---\n");
+    printf("\n--- dictionary<string,string>: add / get / remove (add includes alloc; lookup uses pre-built keys) ---\n");
     RunDictStr(10,    100000);
     RunDictStr(500,   2000);
     RunDictStr(10000, 100);

@@ -147,6 +147,13 @@ static void bench_dict(int n, int repeats) {
         (long long)rem_us, (long long)(rem_us * 1000 / total_ops));
 }
 
+// Matches CFlat make_key(): always 16 chars, above MSVC SSO limit.
+static std::string make_key(int i) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "bench_%010d", i);
+    return buf;
+}
+
 // ── std::vector<std::string> ─────────────────────────────────────────────────
 
 static void bench_list_str(int n, int repeats) {
@@ -154,7 +161,7 @@ static void bench_list_str(int n, int repeats) {
 
     // pre-build keys
     std::vector<std::string> keys(n);
-    for (int i = 0; i < n; i++) keys[i] = std::to_string(i);
+    for (int i = 0; i < n; i++) keys[i] = make_key(i);
 
     // -- add (fill + clear) --
     int64_t add_us;
@@ -200,7 +207,7 @@ static void bench_hashset_str(int n, int repeats) {
     int64_t total_ops = (int64_t)n * repeats;
 
     std::vector<std::string> keys(n);
-    for (int i = 0; i < n; i++) keys[i] = std::to_string(i);
+    for (int i = 0; i < n; i++) keys[i] = make_key(i);
 
     // -- add --
     int64_t add_us;
@@ -264,7 +271,7 @@ static void bench_dict_str(int n, int repeats) {
     int64_t total_ops = (int64_t)n * repeats;
 
     std::vector<std::string> keys(n), vals(n);
-    for (int i = 0; i < n; i++) { keys[i] = std::to_string(i); vals[i] = std::to_string(i * 2); }
+    for (int i = 0; i < n; i++) { keys[i] = make_key(i); vals[i] = make_key(i * 2); }
 
     // -- add --
     int64_t add_us;
