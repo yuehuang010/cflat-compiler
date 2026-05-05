@@ -2752,12 +2752,7 @@ public:
             if (existing != dataStructures.end())
                 return existing->second.StructType;
 
-            // Reuse the existing named type from the LLVM context if present — it survives
-            // ResetForReanalysis() and would otherwise get renamed to "name.1" on re-analysis,
-            // breaking TypeName-based overload matching in the LSP.
-            llvm::StructType* opaqueStruct = llvm::StructType::getTypeByName(*context, name);
-            if (!opaqueStruct)
-                opaqueStruct = llvm::StructType::create(*context, name);
+            llvm::StructType* opaqueStruct = llvm::StructType::create(*context, name);
             dataStructures[name].StructType = opaqueStruct;
             dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
                 *module, builder->getInt8Ty(), true,

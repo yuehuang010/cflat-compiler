@@ -619,6 +619,18 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
 void LLVMBackend::ResetForReanalysis()
 {
+    // Reset the LLVM context so named struct types from a previous analysis do
+    // not survive into the next one.  Without this, two fixtures that define a
+    // struct with the same name but different field types (e.g. Point{int,int}
+    // then Point{float,float}) would share the stale type object, causing an
+    // LLVM assertion when inserting a float constant into an int-typed slot.
+    //
+    // Destroy module and builder BEFORE the context: both hold internal
+    // references to the context, and their destructors must not run against
+    // an already-freed context object.
+    module.reset();
+    builder.reset();
+    context = std::make_unique<llvm::LLVMContext>();
     module = std::make_unique<llvm::Module>("cflat", *context);
     builder = std::make_unique<llvm::IRBuilder<>>(*context);
 
