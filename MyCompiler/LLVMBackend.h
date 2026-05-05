@@ -925,6 +925,59 @@ private:
             functionTable["length"].push_back(sym);
         }
 
+        // Create string.hash(string self) -> i32  [FNV-1a over the bytes]
+        {
+            auto* i8Ty  = builder->getInt8Ty();
+            auto* ptrTy = i8Ty->getPointerTo();
+            auto* fnTy  = llvm::FunctionType::get(i32Ty, { strTy }, false);
+            auto* fn    = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.hash", *module);
+            fn->arg_begin()->setName("self");
+
+            auto* entryBB  = llvm::BasicBlock::Create(*context, "entry",  fn);
+            auto* loopBB   = llvm::BasicBlock::Create(*context, "loop",   fn);
+            auto* bodyBB   = llvm::BasicBlock::Create(*context, "body",   fn);
+            auto* exitBB   = llvm::BasicBlock::Create(*context, "exit",   fn);
+            llvm::IRBuilder<> b(entryBB);
+
+            auto* ptr = b.CreateExtractValue(&*fn->arg_begin(), { 0u }, "ptr");
+            auto* len = b.CreateExtractValue(&*fn->arg_begin(), { 1u }, "len");
+            auto* fnv_basis = b.getInt32(2166136261u);
+            auto* fnv_prime = b.getInt32(16777619u);
+            b.CreateBr(loopBB);
+
+            // loop: phi nodes for index and hash
+            b.SetInsertPoint(loopBB);
+            auto* idxPhi  = b.CreatePHI(i32Ty, 2, "idx");
+            auto* hashPhi = b.CreatePHI(i32Ty, 2, "h");
+            idxPhi->addIncoming(b.getInt32(0), entryBB);
+            hashPhi->addIncoming(fnv_basis, entryBB);
+            auto* cond = b.CreateICmpSLT(idxPhi, len);
+            b.CreateCondBr(cond, bodyBB, exitBB);
+
+            // body: h = (h ^ byte) * prime; idx++
+            b.SetInsertPoint(bodyBB);
+            auto* gep    = b.CreateGEP(i8Ty, ptr, idxPhi);
+            auto* byteVal = b.CreateLoad(i8Ty, gep, "byte");
+            auto* byteExt = b.CreateZExt(byteVal, i32Ty);
+            auto* xored  = b.CreateXor(hashPhi, byteExt);
+            auto* mulled = b.CreateMul(xored, fnv_prime);
+            auto* idxNext = b.CreateAdd(idxPhi, b.getInt32(1));
+            idxPhi->addIncoming(idxNext, bodyBB);
+            hashPhi->addIncoming(mulled, bodyBB);
+            b.CreateBr(loopBB);
+
+            b.SetInsertPoint(exitBB);
+            b.CreateRet(hashPhi);
+
+            TypeAndValue selfParam{ "string", "self", false };
+            FunctionSymbol sym;
+            sym.UniqueName = "string.hash";
+            sym.Function = fn;
+            sym.ReturnType = TypeAndValue{ "i32", "", false };
+            sym.Parameters = { selfParam };
+            functionTable["hash"].push_back(sym);
+        }
+
         // String destructor is registered lazily via EnsureStringDtorRegistered()
         // so that the C `free` function is available in the function table first.
     }
@@ -2699,7 +2752,12 @@ public:
             if (existing != dataStructures.end())
                 return existing->second.StructType;
 
-            llvm::StructType* opaqueStruct = llvm::StructType::create(*context, name);
+            // Reuse the existing named type from the LLVM context if present — it survives
+            // ResetForReanalysis() and would otherwise get renamed to "name.1" on re-analysis,
+            // breaking TypeName-based overload matching in the LSP.
+            llvm::StructType* opaqueStruct = llvm::StructType::getTypeByName(*context, name);
+            if (!opaqueStruct)
+                opaqueStruct = llvm::StructType::create(*context, name);
             dataStructures[name].StructType = opaqueStruct;
             dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
                 *module, builder->getInt8Ty(), true,
@@ -3485,7 +3543,7 @@ public:
         {
             if (!fn->empty())
             {
-                LogError(std::format("function already exists: '{}'", functionName));
+                if (verbose) std::cerr << "[verbose] skipping duplicate definition of '" << functionName << "'\n";
                 return fn;
             }
             // Pre-declared by ForwardRefScanner — reuse the declaration and attach a body.

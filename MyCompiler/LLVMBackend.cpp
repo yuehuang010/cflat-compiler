@@ -70,13 +70,12 @@ bool LLVMBackend::Compile(const ArgParser& args)
     sourceFileName = std::filesystem::path(filename).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
+    importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
         std::vector<std::string>& stack;
-        std::unordered_set<std::string>& done;
-        std::string key;
-        ~RootGuard() { stack.pop_back(); done.insert(key); }
-    } rootGuard{importStack, importedFiles, rootCanonical};
+        ~RootGuard() { stack.pop_back(); }
+    } rootGuard{importStack};
     auto exePath = args.getOption("output");
     auto lliPath = args.getOption("out-lli");
     auto bitcodePath = args.getOption("bitcode").value_or("");
@@ -343,11 +342,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         return false;
     }
     auto canonicalStr = canonical.string();
-    if (importedFiles.count(canonicalStr))
-    {
-        if (verbose) std::cout << "[verbose]   already imported: " << canonicalStr << "\n";
-        return true;
-    }
+    // Check circular import first (file currently being processed).
     auto cycleIt = std::find(importStack.begin(), importStack.end(), canonicalStr);
     if (cycleIt != importStack.end())
     {
@@ -358,13 +353,19 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         LogError(std::format("Circular import detected: {}", chain));
         return false;
     }
+    // Check dedup (file already fully processed or eagerly registered).
+    if (importedFiles.count(canonicalStr))
+    {
+        if (verbose) std::cout << "[verbose]   already imported: " << canonicalStr << "\n";
+        return true;
+    }
+    // Register eagerly so any re-entrant or duplicate import is caught above.
+    importedFiles.insert(canonicalStr);
     importStack.push_back(canonicalStr);
     struct ImportGuard {
         std::vector<std::string>& stack;
-        std::unordered_set<std::string>& done;
-        std::string key;
-        ~ImportGuard() { stack.pop_back(); done.insert(key); }
-    } importGuard{importStack, importedFiles, canonicalStr};
+        ~ImportGuard() { stack.pop_back(); }
+    } importGuard{importStack};
 
     if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
 
@@ -506,13 +507,12 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     sourceFileName = std::filesystem::path(filePath).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
+    importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
         std::vector<std::string>& stack;
-        std::unordered_set<std::string>& done;
-        std::string key;
-        ~RootGuard() { stack.pop_back(); done.insert(key); }
-    } rootGuard{importStack, importedFiles, rootCanonical};
+        ~RootGuard() { stack.pop_back(); }
+    } rootGuard{importStack};
     importSearchDir = importDir;
     runtimeDir = runtimeDirPath;
     verbose = false;
