@@ -1,0 +1,126 @@
+// page_arena.cb — self-contained bump-allocation region for zero-copy transfer.
+//
+// page_arena is the transferable unit used by arena_channel. The producer
+// allocates everything into a page_arena via alloc(); the arena is sent
+// to the consumer via arena_channel.send(); the consumer reads all pointers
+// directly — no copy needed, because every allocation lives within the arena.
+//
+// Ownership is unique: exactly one thread holds a page_arena at a time.
+// dealloc() and cleanup() are no-ops; use arena_channel.release_arena() to
+// recycle the arena back to the shared pool.
+
+import "cruntime.cb";
+
+// ── _pa_chunk ─────────────────────────────────────────────────────────────────
+// Header at the front of each malloc'd block. Data begins after the header
+// (sizeof(_pa_chunk) = 24 bytes on 64-bit). Blocks are chained as a linked list.
+
+struct _pa_chunk
+{
+    _pa_chunk* _next = nullptr;
+    i64        _size = 0;    // total bytes in this block including this header
+    i64        _used = 0;    // bytes consumed past the header
+};
+
+// ── page_arena ────────────────────────────────────────────────────────────────
+
+struct page_arena
+{
+    void*      _pool      = nullptr;   // reserved for future pool back-pointer
+    _pa_chunk* _head      = nullptr;
+    i64        _chunkSize = 65536;
+    i64        _id        = 0;
+    void*      _next      = nullptr;   // intrusive free-list link (used by block_pool)
+    void*      _root      = nullptr;   // producer sets this to the message root
+
+    // ── Bump allocation ───────────────────────────────────────────────────────
+
+    void _newChunk(i64 minSize)
+    {
+        i64 headerSz = (i64)sizeof(_pa_chunk);
+        i64 need     = ((headerSz + minSize + (i64)7) / (i64)8) * (i64)8;
+        i64 sz       = _chunkSize;
+        if (need > sz) sz = need;
+        _pa_chunk* c = (_pa_chunk*)malloc(sz);
+        c->_next     = _head;
+        c->_size     = sz;
+        c->_used     = 0;
+        _head        = c;
+    }
+
+    void* alloc(i64 size)
+    {
+        if (size <= (i64)0) return nullptr;
+        i64 aligned  = ((size + (i64)7) / (i64)8) * (i64)8;
+        i64 headerSz = (i64)sizeof(_pa_chunk);
+        if (_head == nullptr || _head->_used + aligned > _head->_size - headerSz)
+            _newChunk(aligned);
+        void* p      = (void*)((i8*)_head + headerSz + _head->_used);
+        _head->_used = _head->_used + aligned;
+        return p;
+    }
+
+    void* zalloc(i64 size)
+    {
+        void* p = alloc(size);
+        if (p != nullptr) memset(p, 0, size);
+        return p;
+    }
+
+    i64 usedBytes()
+    {
+        i64 total = 0;
+        _pa_chunk* c = _head;
+        while (c != nullptr) { total = total + c->_used; c = c->_next; }
+        return total;
+    }
+
+    i64 totalBytes()
+    {
+        i64 total = 0;
+        _pa_chunk* c = _head;
+        while (c != nullptr) { total = total + c->_size; c = c->_next; }
+        return total;
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    // Must be called immediately after 'new page_arena[1]' — CFlat's array-new
+    // uses malloc and does NOT run field initializers, so _head is garbage.
+    void init_fresh()
+    {
+        _pool      = nullptr;
+        _head      = nullptr;
+        _id        = 0;
+        _next      = nullptr;
+        _root      = nullptr;
+    }
+
+    // Reset all chunks for reuse (zero _used, clear _root and _id).
+    // Chunks are NOT freed — they are retained for the next use.
+    void reset()
+    {
+        _pa_chunk* c = _head;
+        while (c != nullptr) { c->_used = 0; c = c->_next; }
+        _root = nullptr;
+        _id   = 0;
+    }
+
+    // Free all chunk memory back to malloc. Called before the object is freed.
+    void free_chunks()
+    {
+        _pa_chunk* c = _head;
+        while (c != nullptr)
+        {
+            _pa_chunk* next = c->_next;
+            free((void*)c);
+            c = next;
+        }
+        _head = nullptr;
+    }
+
+    ~page_arena()
+    {
+        free_chunks();
+    }
+};

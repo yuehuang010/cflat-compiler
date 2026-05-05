@@ -12,6 +12,7 @@
 import "list.cb";
 import "time.cb";
 import "spsc_queue.cb";
+import "arena_channel.cb";
 
 extern int  __atomic_i32_load(int* ptr);
 extern void __atomic_i32_store(int* ptr, int val);
@@ -121,7 +122,57 @@ int raw_consumer(void* ctx)
     return 0;
 }
 
-// ── Variant 6: stream + raw Thread (no program construct) ────────────────────
+// ── Variant 6: arena_channel + raw Thread ────────────────────────────────────
+// Producer acquires an arena, bump-allocs a small payload, try_sends it.
+// If the ring is full the arena is released back (skipped); no blocking.
+// Consumer try_recvs; exits when producer sets g_ac_done and ring drains.
+// Measures the full zero-copy pipeline: acquire → alloc → send → recv → release.
+
+struct AcPayload { int _value = 0; };
+
+arena_channel* g_ac_perf    = nullptr;
+i64            g_ac_count   = 0;
+int            g_ac_done    = 0;
+
+int ac_perf_producer(void* ctx)
+{
+    int val = 0;
+    while (__atomic_i32_load(&g_raw_stop) == 0)
+    {
+        page_arena* pa = g_ac_perf->acquire_arena();
+        AcPayload*  msg = (AcPayload*)pa->alloc((i64)sizeof(AcPayload));
+        pa->_root = (void*)msg;
+        msg->_value = val;
+        if (g_ac_perf->try_send(pa))
+            val = val + 1;
+        else
+            g_ac_perf->release_arena(pa);   // ring full — skip this slot
+    }
+    __atomic_i32_store(&g_ac_done, 1);
+    return 0;
+}
+
+int ac_perf_consumer(void* ctx)
+{
+    i64 count = (i64)0;
+    while (true)
+    {
+        page_arena* pa = g_ac_perf->try_recv();
+        if (pa != nullptr)
+        {
+            g_ac_perf->release_arena(pa);
+            count = count + (i64)1;
+        }
+        else if (__atomic_i32_load(&g_ac_done) != 0)
+        {
+            break;
+        }
+    }
+    g_ac_count = count;
+    return 0;
+}
+
+// ── Variant 7: stream + raw Thread (no program construct) ────────────────────
 
 stream*  g_stream_raw       = nullptr;
 i64      g_stream_raw_count = 0;
@@ -192,7 +243,7 @@ extern int main()
     printf("Running each variant for %d seconds...\n\n", BENCH_SECS);
 
     // variant 1
-    printf("[1/6] channel   + program\n");
+    printf("[1/7] channel   + program\n");
     channel<int> ch;
     ch.init(4096);
     g_ch = &ch;
@@ -213,7 +264,7 @@ extern int main()
     ch.destroy();
 
     // variant 2
-    printf("[2/6] spsc_queue + program\n");
+    printf("[2/7] spsc_queue + program\n");
     spsc_queue<int> spsc;
     spsc.init(4096);
     g_spsc = &spsc;
@@ -234,7 +285,7 @@ extern int main()
     spsc.destroy();
 
     // variant 3
-    printf("[3/6] channel   + raw Thread\n");
+    printf("[3/7] channel   + raw Thread\n");
     channel<int> ch2;
     ch2.init(4096);
     g_ch2 = &ch2;
@@ -250,7 +301,7 @@ extern int main()
     ch2.destroy();
 
     // variant 4: stream + program (_out.write_bytes / _in.read_buf)
-    printf("[4/6] stream    + program\n");
+    printf("[4/7] stream    + program\n");
     stream s;
     s.bufferSize = 65536;
     s.init();
@@ -273,8 +324,26 @@ extern int main()
     streamSrc.dispose();
     i64 stream_tps = strCons.count / dur_s;
 
-    // variant 5: stream + raw Thread (direct write_bytes, no program overhead)
-    printf("[5/6] stream    + raw Thread\n");
+    // variant 6: arena_channel + raw Thread
+    printf("[6/7] arena_ch  + raw Thread\n");
+    arena_channel ac = default;
+    ac.init(4096, (i64)65536);
+    g_ac_perf = &ac;
+    __atomic_i32_store(&g_raw_stop, 0);
+    __atomic_i32_store(&g_ac_done, 0);
+    Thread tAcProd;
+    Thread tAcCons;
+    tAcProd.start(ac_perf_producer, nullptr);
+    tAcCons.start(ac_perf_consumer, nullptr);
+    sleep(dur_ms);
+    __atomic_i32_store(&g_raw_stop, 1);
+    tAcProd.join();
+    tAcCons.join();
+    i64 ac_tps = g_ac_count / dur_s;
+    ac.destroy();
+
+    // variant 7: stream + raw Thread (direct write_bytes, no program overhead)
+    printf("[7/7] stream    + raw Thread\n");
     stream sRaw;
     sRaw.bufferSize = 65536;
     sRaw.init();
@@ -292,10 +361,10 @@ extern int main()
     tStrCons.join();
     i64 stream_raw_tps = g_stream_raw_count / dur_s;
 
-    // variant 6: single-threaded tight loop — no queue, no threads
+    // variant 7: single-threaded tight loop — no queue, no threads
     // Check time every 65536 iterations (same cadence as the C++ reference) so the
     // loop body is just an increment — not a QueryPerformanceCounter + division.
-    printf("[6/6] single-threaded loop\n");
+    printf("[7/7] single-threaded loop\n");
     i64 st_freq  = _timeGetQpcFreq();
     i64 st_dur   = (i64)BENCH_SECS * st_freq;
     i64 st_t0    = _qpcNow();
@@ -316,6 +385,7 @@ extern int main()
     fmt_commas(spsc_tps,       buf); printf("%-32s %15s\n", "spsc_queue + program",  buf);
     fmt_commas(ch_tps,         buf); printf("%-32s %15s\n", "channel   + program",   buf);
     fmt_commas(raw_tps,        buf); printf("%-32s %15s\n", "channel   + raw Thread",buf);
+    fmt_commas(ac_tps,         buf); printf("%-32s %15s\n", "arena_ch  + raw Thread",buf);
     fmt_commas(stream_tps,     buf); printf("%-32s %15s\n", "stream    + program",   buf);
     fmt_commas(stream_raw_tps, buf); printf("%-32s %15s\n", "stream    + raw Thread",buf);
     free((void*)buf);

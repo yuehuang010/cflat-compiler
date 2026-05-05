@@ -1,0 +1,222 @@
+// arena_channel.cb — combined slab-backed allocator + zero-copy MPMC channel.
+//
+// Three main types:
+//
+//   block_pool    — program thread allocator (IAllocator) backed by SlabAllocator.
+//                   Also spawns transferable page_arena units via acquire_arena().
+//
+//   page_arena    — self-contained bump-allocation region (IAllocator).
+//                   Unique ownership: one thread at a time. All sub-allocations
+//                   live within the arena, so the receiver can use all pointers
+//                   immediately after recv() with no copy.
+//
+//   arena_channel — block_pool + channel<page_arena*>; zero-copy messaging.
+//
+// Pointer safety invariant: every allocation stored in a transferred message
+// must come from pa->alloc(). Enforced by convention, not at runtime.
+//
+// Usage:
+//   arena_channel ac;
+//   ac.init(64, 65536);
+//
+//   // Producer thread:
+//   page_arena* pa = ac.acquire_arena();
+//   MyMsg* msg = (MyMsg*)pa->alloc(sizeof(MyMsg));
+//   pa->_root = msg;
+//   msg->value = 42;
+//   ac.send(move pa);                  // zero-copy ownership transfer
+//
+//   // Consumer thread:
+//   page_arena* pa = ac.recv();
+//   MyMsg* msg = (MyMsg*)pa->_root;    // valid immediately
+//   ac.release_arena(pa);              // recycle to pool
+
+import "interfaces.cb";
+import "channel.cb";
+import "atomic.cb";
+import "slab_allocator.cb";
+import "page_arena.cb";
+
+// ── block_pool ────────────────────────────────────────────────────────────────
+// Program thread allocator. Normal alloc/dealloc delegates to the embedded slab.
+// acquire_arena() spawns a page_arena drawing chunks from the same slab.
+// Maintains a lock-free Treiber stack of recycled page_arena* for fast reuse.
+
+class block_pool
+{
+    SlabAllocator _slab      = default;
+
+    // ── cache line: free-list head ────────────────────────────────────────────
+    // _top packs: tag[63:47] | page_arena_ptr[46:0]  (one i64, CAS target)
+    // Tag increments on every push/pop; 17 bits prevents ABA within any
+    // realistic scheduling window. Windows x64 user pointers fit in 47 bits.
+    i64 _top = 0;
+    i64 _p0 = 0; i64 _p1 = 0; i64 _p2 = 0; i64 _p3 = 0;
+    i64 _p4 = 0; i64 _p5 = 0; i64 _p6 = 0;
+
+    i64 _chunkSize = 65536;
+
+    // ── tagged pointer helpers ────────────────────────────────────────────────
+
+    i64 _encode(i64 ptr, i64 tag)
+    {
+        return ((tag & (i64)0x1FFFF) << 47) | (ptr & (i64)0x00007FFFFFFFFFFF);
+    }
+
+    i64 _raw_ptr(i64 top)
+    {
+        return top & (i64)0x00007FFFFFFFFFFF;
+    }
+
+    i64 _raw_tag(i64 top)
+    {
+        return (top >> 47) & (i64)0x1FFFF;
+    }
+
+    // ── Treiber stack pop (lock-free) ─────────────────────────────────────────
+
+    page_arena* _pop()
+    {
+        i64 old = __atomic_i64_load(&_top);
+        while (true)
+        {
+            i64 ptr = _raw_ptr(old);
+            if (ptr == (i64)0) return nullptr;
+            page_arena* node = (page_arena*)ptr;
+            page_arena* next = (page_arena*)node->_next;   // _next is void*
+            i64 new_tag = (_raw_tag(old) + (i64)1) & (i64)0x1FFFF;
+            if (__atomic_i64_cas(&_top, old, _encode((i64)next, new_tag)))
+            {
+                node->_next = nullptr;
+                return node;
+            }
+            old = __atomic_i64_load(&_top);
+        }
+        return nullptr;
+    }
+
+    // ── Treiber stack push (lock-free) ────────────────────────────────────────
+
+    void _push(page_arena* node)
+    {
+        i64 old = __atomic_i64_load(&_top);
+        while (true)
+        {
+            node->_next = (void*)_raw_ptr(old);   // store as void*
+            i64 new_tag = (_raw_tag(old) + (i64)1) & (i64)0x1FFFF;
+            if (__atomic_i64_cas(&_top, old, _encode((i64)node, new_tag))) return;
+            old = __atomic_i64_load(&_top);
+        }
+    }
+
+    // ── IAllocator — day-to-day allocation, delegates to slab ─────────────────
+
+    void* alloc(i64 size)    { return _slab.alloc(size); }
+    void  dealloc(void* ptr) { _slab.dealloc(ptr); }
+    void  cleanup()          { _slab.cleanup(); }
+    i64   usedBytes()        { return _slab.usedBytes(); }
+    i64   totalBytes()       { return _slab.committedBytes(); }
+
+    // ── Arena lifecycle ───────────────────────────────────────────────────────
+
+    // Return a fresh or recycled page_arena ready for bump allocation.
+    page_arena* acquire_arena()
+    {
+        page_arena* pa = _pop();
+        if (pa == nullptr)
+        {
+            pa = new page_arena[1];
+            pa->init_fresh();   // new[n] uses malloc — no field initializers run
+        }
+        pa->_chunkSize = _chunkSize;
+        pa->reset();
+        return pa;
+    }
+
+    // Return a used arena to the free-list; chunks are retained for reuse.
+    void release_arena(page_arena* pa)
+    {
+        _push(pa);
+    }
+
+    // Destroy all arenas in the free-list. Call only after all arenas have been
+    // released and no thread is calling acquire_arena() concurrently.
+    void destroy_arenas()
+    {
+        i64 raw = __atomic_i64_load(&_top);
+        __atomic_i64_store(&_top, (i64)0);
+        page_arena* node = (page_arena*)_raw_ptr(raw);
+        while (node != nullptr)
+        {
+            page_arena* next = (page_arena*)node->_next;   // _next is void*
+            delete[] node;   // ~page_arena() calls free_chunks()
+            node = next;
+        }
+    }
+};
+
+// ── arena_channel ─────────────────────────────────────────────────────────────
+// Composes a block_pool (thread allocator + arena spawner) with a bounded MPMC
+// ring for zero-copy page_arena transfer between threads.
+
+class arena_channel
+{
+    block_pool     _pool   = default;
+    channel<i64>   _ring   = default;   // stores page_arena* cast to i64; avoids ptr-type channel issues
+    atomic_counter _nextId = default;
+
+    void init(int ringCap, i64 chunkSize)
+    {
+        _pool._top = 0;          // reset free-list head; safe on uninit'd instances
+        _pool._chunkSize = chunkSize;
+        _ring.init(ringCap);
+    }
+
+    void init()
+    {
+        init(1024, (i64)65536);
+    }
+
+    // Day-to-day allocation — forward to block_pool / slab.
+    void* alloc(i64 size)    { return _pool.alloc(size); }
+    void  dealloc(void* ptr) { _pool.dealloc(ptr); }
+
+    // Return a fresh (or recycled) page_arena ready for use.
+    page_arena* acquire_arena()
+    {
+        page_arena* pa = _pool.acquire_arena();
+        pa->_id = _nextId.increment();
+        return pa;
+    }
+
+    // Transfer ownership of pa to the consumer (blocks if ring is full).
+    void send(page_arena* pa)          { _ring.send((i64)pa); }
+
+    // Non-blocking send; returns false if ring is full. Caller retains pa.
+    bool try_send(page_arena* pa)      { return _ring.try_push((i64)pa); }
+
+    // Block until an arena is available; caller receives exclusive ownership.
+    page_arena* recv()                 { return (page_arena*)_ring.receive(); }
+
+    // Non-blocking receive; returns nullptr if ring is empty.
+    page_arena* try_recv()
+    {
+        i64 raw = 0;
+        if (_ring.try_receive(&raw)) return (page_arena*)raw;
+        return nullptr;
+    }
+
+    // Return a used arena to the pool for reuse.
+    void release_arena(page_arena* pa) { _pool.release_arena(pa); }
+
+    // Drain the ring, destroy all pooled arenas, and release slab memory.
+    // Call only after all producer threads have finished and the ring is drained.
+    void destroy()
+    {
+        i64 raw = 0;
+        while (_ring.try_receive(&raw)) { _pool.release_arena((page_arena*)raw); raw = 0; }
+        _ring.destroy();
+        _pool.destroy_arenas();
+        _pool.cleanup();
+    }
+};
