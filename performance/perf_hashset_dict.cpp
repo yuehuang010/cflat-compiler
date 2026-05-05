@@ -12,8 +12,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 using Clock    = std::chrono::steady_clock;
 using Micros   = std::chrono::microseconds;
@@ -145,6 +147,181 @@ static void bench_dict(int n, int repeats) {
         (long long)rem_us, (long long)(rem_us * 1000 / total_ops));
 }
 
+// ── std::vector<std::string> ─────────────────────────────────────────────────
+
+static void bench_list_str(int n, int repeats) {
+    int64_t total_ops = (int64_t)n * repeats;
+
+    // pre-build keys
+    std::vector<std::string> keys(n);
+    for (int i = 0; i < n; i++) keys[i] = std::to_string(i);
+
+    // -- add (fill + clear) --
+    int64_t add_us;
+    {
+        std::vector<std::string> v;
+        v.reserve(n);
+        for (int i = 0; i < n; i++) v.push_back(keys[i]);
+        v.clear();
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++) {
+            for (int i = 0; i < n; i++) v.push_back(keys[i]);
+            v.clear();
+        }
+        add_us = now_us() - t0;
+        if (add_us == 0) add_us = 1;
+    }
+
+    // -- get (index access, accumulate length to prevent elim) --
+    int64_t get_us;
+    volatile int64_t sum = 0;
+    {
+        std::vector<std::string> v;
+        for (int i = 0; i < n; i++) v.push_back(keys[i]);
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++)
+            for (int i = 0; i < n; i++)
+                sum += (int64_t)v[i].size();
+        get_us = now_us() - t0;
+        if (get_us == 0) get_us = 1;
+    }
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  get %8lld us (%5lld ns/op)\n",
+        n,
+        (long long)add_us, (long long)(add_us * 1000 / total_ops),
+        (long long)get_us, (long long)(get_us * 1000 / total_ops));
+}
+
+// ── std::unordered_set<std::string> ─────────────────────────────────────────
+
+static void bench_hashset_str(int n, int repeats) {
+    int64_t total_ops = (int64_t)n * repeats;
+
+    std::vector<std::string> keys(n);
+    for (int i = 0; i < n; i++) keys[i] = std::to_string(i);
+
+    // -- add --
+    int64_t add_us;
+    {
+        std::unordered_set<std::string> s;
+        s.reserve(n * 2);
+        for (int i = 0; i < n; i++) s.insert(keys[i]);
+        s.clear();
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++) {
+            for (int i = 0; i < n; i++) s.insert(keys[i]);
+            s.clear();
+        }
+        add_us = now_us() - t0;
+        if (add_us == 0) add_us = 1;
+    }
+
+    // -- contains --
+    int64_t cnt_us;
+    volatile int64_t found = 0;
+    {
+        std::unordered_set<std::string> s;
+        for (int i = 0; i < n; i++) s.insert(keys[i]);
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++)
+            for (int i = 0; i < n; i++)
+                if (s.count(keys[i])) found++;
+        cnt_us = now_us() - t0;
+        if (cnt_us == 0) cnt_us = 1;
+    }
+
+    // -- remove --
+    int64_t rem_us = 0;
+    {
+        std::unordered_set<std::string> s;
+        s.reserve(n * 2);
+        for (int i = 0; i < n; i++) s.insert(keys[i]);
+
+        for (int r = 0; r < repeats; r++) {
+            int64_t t0 = now_us();
+            for (int i = 0; i < n; i++) s.erase(keys[i]);
+            rem_us += now_us() - t0;
+            s.clear();
+            for (int i = 0; i < n; i++) s.insert(keys[i]);
+        }
+        if (rem_us == 0) rem_us = 1;
+    }
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  contains %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        (long long)add_us, (long long)(add_us * 1000 / total_ops),
+        (long long)cnt_us, (long long)(cnt_us * 1000 / total_ops),
+        (long long)rem_us, (long long)(rem_us * 1000 / total_ops));
+}
+
+// ── std::unordered_map<std::string,std::string> ──────────────────────────────
+
+static void bench_dict_str(int n, int repeats) {
+    int64_t total_ops = (int64_t)n * repeats;
+
+    std::vector<std::string> keys(n), vals(n);
+    for (int i = 0; i < n; i++) { keys[i] = std::to_string(i); vals[i] = std::to_string(i * 2); }
+
+    // -- add --
+    int64_t add_us;
+    {
+        std::unordered_map<std::string, std::string> d;
+        d.reserve(n * 2);
+        for (int i = 0; i < n; i++) d.emplace(keys[i], vals[i]);
+        d.clear();
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++) {
+            for (int i = 0; i < n; i++) d.emplace(keys[i], vals[i]);
+            d.clear();
+        }
+        add_us = now_us() - t0;
+        if (add_us == 0) add_us = 1;
+    }
+
+    // -- get --
+    int64_t get_us;
+    volatile int64_t sum = 0;
+    {
+        std::unordered_map<std::string, std::string> d;
+        for (int i = 0; i < n; i++) d.emplace(keys[i], vals[i]);
+
+        int64_t t0 = now_us();
+        for (int r = 0; r < repeats; r++)
+            for (int i = 0; i < n; i++)
+                sum += (int64_t)d.at(keys[i]).size();
+        get_us = now_us() - t0;
+        if (get_us == 0) get_us = 1;
+    }
+
+    // -- remove --
+    int64_t rem_us = 0;
+    {
+        std::unordered_map<std::string, std::string> d;
+        d.reserve(n * 2);
+        for (int i = 0; i < n; i++) d.emplace(keys[i], vals[i]);
+
+        for (int r = 0; r < repeats; r++) {
+            int64_t t0 = now_us();
+            for (int i = 0; i < n; i++) d.erase(keys[i]);
+            rem_us += now_us() - t0;
+            d.clear();
+            for (int i = 0; i < n; i++) d.emplace(keys[i], vals[i]);
+        }
+        if (rem_us == 0) rem_us = 1;
+    }
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  get %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        (long long)add_us, (long long)(add_us * 1000 / total_ops),
+        (long long)get_us, (long long)(get_us * 1000 / total_ops),
+        (long long)rem_us, (long long)(rem_us * 1000 / total_ops));
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -157,6 +334,21 @@ int main() {
     bench_dict(10,    500000);
     bench_dict(500,   5000);
     bench_dict(10000, 250);
+
+    printf("\n--- std::vector<std::string>: add / get ---\n");
+    bench_list_str(10,    500000);
+    bench_list_str(500,   5000);
+    bench_list_str(10000, 250);
+
+    printf("\n--- std::unordered_set<std::string>: add / contains / remove ---\n");
+    bench_hashset_str(10,    100000);
+    bench_hashset_str(500,   2000);
+    bench_hashset_str(10000, 100);
+
+    printf("\n--- std::unordered_map<std::string,std::string>: add / get / remove ---\n");
+    bench_dict_str(10,    100000);
+    bench_dict_str(500,   2000);
+    bench_dict_str(10000, 100);
 
     return 0;
 }

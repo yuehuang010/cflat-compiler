@@ -1,6 +1,8 @@
 // hashset<T> — unordered set using open addressing with linear probing.
 // T must support == for equality and must be usable as an integer for hashing
 // (i.e., integer primitive types: int, i32, i64, char, u8, u32, etc.).
+// When T is a pointer type, the set owns the elements: add() takes ownership,
+// remove() and clear() free elements, and the destructor frees any remaining.
 
 struct hashset<T>
 {
@@ -14,6 +16,8 @@ struct hashset<T>
         int h = 0;
         if const (is_primitive(T))
             h = Hash(value) % _capacity;
+        else if const (is_pointer(T))
+            h = Hash((i64)value) % _capacity;
         else
             h = value.hash() % _capacity;
         if (h < 0) h = h + _capacity;
@@ -54,7 +58,8 @@ struct hashset<T>
     }
 
     // Insert value. Returns true if added, false if already present.
-    bool add(T value)
+    // When T is a pointer type, ownership is transferred to the set.
+    bool add(move T value)
     {
         if (_capacity == 0) _init(8);
         if (_count * 4 >= _capacity * 3) _rehash();
@@ -89,6 +94,7 @@ struct hashset<T>
     }
 
     // Remove value. Returns true if removed, false if not found.
+    // When T is a pointer type, the element is freed.
     bool remove(T value)
     {
         if (_capacity == 0) return false;
@@ -97,6 +103,8 @@ struct hashset<T>
         {
             if (_status[slot] == 1 && _keys[slot] == value)
             {
+                if const (is_pointer(T))
+                    if (_keys[slot] != nullptr) delete _keys[slot];
                 _status[slot] = 2;
                 _count--;
                 return true;
@@ -112,9 +120,19 @@ struct hashset<T>
         return _count;
     }
 
-    // Remove all elements without releasing the backing arrays.
+    // Remove all elements. When T is a pointer type, frees each element.
+    // Backing arrays are kept — capacity is unchanged.
     void clear()
     {
+        if const (is_pointer(T))
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1 && _keys[i] != nullptr) delete _keys[i];
+                i++;
+            }
+        }
         int i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
@@ -122,6 +140,15 @@ struct hashset<T>
 
     ~hashset()
     {
+        if const (is_pointer(T))
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1 && _keys[i] != nullptr) delete _keys[i];
+                i++;
+            }
+        }
         if (_keys   != nullptr) delete[] _keys;
         if (_status != nullptr) delete[] _status;
     }

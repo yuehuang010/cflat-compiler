@@ -663,6 +663,120 @@ bool testListPointer()
     return result;
 }
 
+bool testListPointerClear()
+{
+    bool result = true;
+
+    empDtorCount = 0;
+    {
+        list<Employee*> employees;
+        Employee* e1 = new Employee; e1->id = 1;
+        Employee* e2 = new Employee; e2->id = 2;
+        Employee* e3 = new Employee; e3->id = 3;
+        employees.add(e1);
+        employees.add(e2);
+        employees.add(e3);
+
+        // clear() must free all 3 elements
+        employees.clear();
+        result &= Test("list<ptr> clear count",      employees.count(), 0);
+        result &= Test("list<ptr> clear dtor fires", empDtorCount,      3);
+
+        // add after clear — destructor must not double-free
+        Employee* e4 = new Employee; e4->id = 4;
+        employees.add(e4);
+        result &= Test("list<ptr> add after clear count", employees.count(), 1);
+        result &= Test("list<ptr> add after clear id",    employees.get(0)->id, 4);
+        // ~list() frees e4 here
+    }
+    result &= Test("list<ptr> dtor after clear", empDtorCount, 4);
+
+    return result;
+}
+
+bool testHashsetPointer()
+{
+    bool result = true;
+
+    empDtorCount = 0;
+    {
+        hashset<Employee*> s;
+        Employee* e1 = new Employee; e1->id = 10;
+        Employee* e2 = new Employee; e2->id = 20;
+        Employee* e3 = new Employee; e3->id = 30;
+        // save addresses before move — callers' pointers are nulled by add()
+        Employee* e2_addr = e2;
+        s.add(e1);
+        s.add(e2);
+        s.add(e3);
+        result &= Test("hashset<ptr> count", s.count(), 3);
+
+        // remove() must free the element; look up by saved address
+        s.remove(e2_addr);
+        result &= Test("hashset<ptr> remove dtor",        empDtorCount, 1);
+        result &= Test("hashset<ptr> count after remove", s.count(),    2);
+
+        // clear() must free remaining elements (e1, e3)
+        s.clear();
+        result &= Test("hashset<ptr> clear dtor",  empDtorCount, 3);
+        result &= Test("hashset<ptr> clear count", s.count(),    0);
+
+        // add after clear — destructor must not double-free
+        Employee* e4 = new Employee; e4->id = 40;
+        s.add(e4);
+        result &= Test("hashset<ptr> add after clear count", s.count(), 1);
+        // ~hashset() frees e4 here
+    }
+    result &= Test("hashset<ptr> dtor after clear", empDtorCount, 4);
+
+    return result;
+}
+
+bool testDictionaryPointer()
+{
+    bool result = true;
+
+    empDtorCount = 0;
+    {
+        dictionary<int, Employee*> d;
+        Employee* e1 = new Employee; e1->id = 1; e1->salary = 100;
+        Employee* e2 = new Employee; e2->id = 2; e2->salary = 200;
+        Employee* e3 = new Employee; e3->id = 3; e3->salary = 300;
+        d.add(1, e1);
+        d.add(2, e2);
+        d.add(3, e3);
+        result &= Test("dict<ptr> count",    d.count(), 3);
+        result &= Test("dict<ptr> get id",   d.get(1)->id, 1);
+
+        // remove() must free the value
+        d.remove(2);
+        result &= Test("dict<ptr> remove dtor",        empDtorCount, 1);
+        result &= Test("dict<ptr> count after remove", d.count(),    2);
+
+        // set() on existing key must free old value before storing new
+        Employee* e2b = new Employee; e2b->id = 99; e2b->salary = 999;
+        d.add(2, e2b);
+        Employee* e2c = new Employee; e2c->id = 77;
+        d.set(2, e2c);
+        result &= Test("dict<ptr> set overwrites and frees", empDtorCount, 2);
+        result &= Test("dict<ptr> get after set",            d.get(2)->id, 77);
+
+        // clear() must free remaining elements (e1, e2c, e3)
+        d.clear();
+        result &= Test("dict<ptr> clear dtor",  empDtorCount, 5);
+        result &= Test("dict<ptr> clear count", d.count(),    0);
+
+        // add after clear — destructor must not double-free
+        Employee* e4 = new Employee; e4->id = 4;
+        d.add(4, e4);
+        result &= Test("dict<ptr> add after clear count", d.count(), 1);
+        // ~dictionary() frees e4 here
+    }
+    result &= Test("dict<ptr> dtor after clear", empDtorCount, 6);
+
+    return result;
+}
+
 // =============================================================
 // Nested generic structures (generic fields with generic types)
 // =============================================================
@@ -1642,6 +1756,9 @@ extern int main()
     total++; passed += testDictionaryStruct()            ? 1 : 0;
     total++; passed += testForStruct()                   ? 1 : 0;
     total++; passed += testListPointer()                 ? 1 : 0;
+    total++; passed += testListPointerClear()            ? 1 : 0;
+    total++; passed += testHashsetPointer()              ? 1 : 0;
+    total++; passed += testDictionaryPointer()           ? 1 : 0;
     total++; passed += testDoubleNestedGeneric()         ? 1 : 0;
     total++; passed += testTripleNestedGeneric()         ? 1 : 0;
     total++; passed += testPairOfBoxes()                 ? 1 : 0;

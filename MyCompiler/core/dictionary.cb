@@ -1,6 +1,9 @@
 // dictionary<K,V> — open-addressed hash map built on the same storage scheme
 // as hashset<T> (parallel status/keys arrays with linear probing), extended
 // with a parallel values array.  K must be a primitive type or implement IHashable.
+// When V is a pointer type, the dictionary owns the values: add()/set() take
+// ownership, set() frees the old value on overwrite, remove() and clear() free
+// values, and the destructor frees any remaining.
 
 import "hashset.cb";
 
@@ -87,6 +90,7 @@ struct dictionary<K, V>
 
     // Insert or overwrite the value for key.
     // When V is a pointer type the dictionary takes ownership of the value.
+    // On overwrite, the old value is freed before the new one is stored.
     void set(K key, move V value)
     {
         if (_capacity == 0) _init(8);
@@ -94,22 +98,33 @@ struct dictionary<K, V>
 
         int slot = _slot(key);
         int firstDeleted = -1;
+        int updateSlot = -1;
+        bool overwrite = false;
         while (_status[slot] != 0)
         {
             if (_status[slot] == 1 && _keys[slot] == key)
             {
-                _values[slot] = value;
-                return;
+                updateSlot = slot;
+                overwrite = true;
+                break;
             }
             if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
             slot = (slot + 1) % _capacity;
         }
-        int insertSlot = slot;
-        if (firstDeleted != -1) insertSlot = firstDeleted;
-        _keys[insertSlot]   = key;
-        _values[insertSlot] = value;
-        _status[insertSlot] = 1;
-        _count++;
+        if (overwrite)
+        {
+            if const (is_pointer(V))
+                if (_values[updateSlot] != nullptr) delete _values[updateSlot];
+        }
+        else
+        {
+            updateSlot = slot;
+            if (firstDeleted != -1) updateSlot = firstDeleted;
+            _keys[updateSlot]   = key;
+            _status[updateSlot] = 1;
+            _count++;
+        }
+        _values[updateSlot] = value;
     }
 
     // Returns true if key is present.
@@ -139,6 +154,7 @@ struct dictionary<K, V>
     }
 
     // Remove an entry by key.  Returns true if removed, false if not found.
+    // When V is a pointer type, the value is freed.
     bool remove(K key)
     {
         if (_capacity == 0) return false;
@@ -147,6 +163,8 @@ struct dictionary<K, V>
         {
             if (_status[slot] == 1 && _keys[slot] == key)
             {
+                if const (is_pointer(V))
+                    if (_values[slot] != nullptr) delete _values[slot];
                 _status[slot] = 2;
                 _count--;
                 return true;
@@ -162,9 +180,19 @@ struct dictionary<K, V>
         return _count;
     }
 
-    // Remove all entries without releasing the backing arrays.
+    // Remove all entries. When V is a pointer type, frees each value.
+    // Backing arrays are kept — capacity is unchanged.
     void clear()
     {
+        if const (is_pointer(V))
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1 && _values[i] != nullptr) delete _values[i];
+                i++;
+            }
+        }
         int i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
@@ -178,6 +206,15 @@ struct dictionary<K, V>
 
     ~dictionary()
     {
+        if const (is_pointer(V))
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1 && _values[i] != nullptr) delete _values[i];
+                i++;
+            }
+        }
         if (_keys   != nullptr) delete[] _keys;
         if (_values != nullptr) delete[] _values;
         if (_status != nullptr) delete[] _status;

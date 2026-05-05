@@ -33,7 +33,7 @@ if not exist "%OUT%\results" mkdir "%OUT%\results"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
 
-set BENCH_FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle perf_yes_compare perf_string_stream perf_json perf_stringbuilder
+set BENCH_FILES=perf_alloc_throughput perf_peak_memory perf_container_stress perf_program_lifecycle perf_yes_compare perf_string_stream perf_json perf_stringbuilder perf_hashset_dict
 
 REM Launch all compilations in parallel
 set /a LAUNCHED=0
@@ -116,6 +116,21 @@ echo   perf_yes_compare.cpp
 
 echo.
 %CPP_EXE%
+
+set CPP_HD_SRC=performance\perf_hashset_dict.cpp
+set CPP_HD_EXE=out\perf\perf_hashset_dict_cpp.exe
+
+echo Compiling %CPP_HD_SRC%...
+cmd /c "%VCVARS% x64 > nul 2>&1 && cl /O2 /std:c++17 /EHsc /nologo %CPP_HD_SRC% /Fe%CPP_HD_EXE% /Fo%OUT%\ > %OUT%\results\perf_hashset_dict_cpp.log 2>&1"
+if !ERRORLEVEL! neq 0 (
+    echo ERROR: C++ compile failed:
+    type %OUT%\results\perf_hashset_dict_cpp.log
+    goto :Done
+)
+echo   perf_hashset_dict.cpp
+
+echo.
+%CPP_HD_EXE%
 
 :Done
 echo.

@@ -23,9 +23,7 @@ class list<T> : IEnumerable<T>, IList<T>
     }
 
     // Append a value to the end.  When T is a pointer type, the list takes
-    // ownership — the caller's pointer is nulled and the list frees it on clear
-    // or destruction (element-level cleanup requires removeAt to be called
-    // explicitly for early removal of owned pointers).
+    // ownership — add(), removeAt(), clear(), and the destructor all free elements.
     void add(move T value)
     {
         if (_size >= _capacity) _grow();
@@ -84,9 +82,19 @@ class list<T> : IEnumerable<T>, IList<T>
         return _size;
     }
 
-    // Reset the element count to zero without freeing the buffer.
+    // Remove all elements. When T is a pointer type, frees each element.
+    // Backing buffer is kept — capacity is unchanged.
     void clear()
     {
+        if const (is_pointer(T))
+        {
+            int i = 0;
+            while (i < _size)
+            {
+                if (_data[i] != nullptr) delete _data[i];
+                i++;
+            }
+        }
         _size = 0;
     }
 

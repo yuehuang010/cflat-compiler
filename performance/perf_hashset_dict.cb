@@ -1,10 +1,14 @@
-// Benchmark: hashset<int> and dictionary<int,int> throughput.
+// Benchmark: hashset<int>, dictionary<int,int>, list<string>, hashset<string>,
+// and dictionary<string,string> throughput.
 //
-// For each container, three operations are timed at three sizes (N = 10, 500,
-// 10000):
+// For each container, operations are timed at three sizes (N = 10, 500, 10000):
 //   add      — fill a pre-warmed (capacity pre-allocated, clear()ed) container
 //   contains — scan N lookups on a pre-filled container
 //   remove   — drain a pre-filled container; clear() + refill happen outside timer
+//
+// String benchmarks use operator string(i) inline — add() takes ownership of the
+// new string, while contains()/remove() pass a temporary for comparison only.
+// This means add times include string allocation; contains/remove do not.
 //
 // Note: add times exclude rehash cost because the container is pre-warmed via
 // a warm-up fill + clear().  Remove times are isolated via stopwatch pause/resume.
@@ -15,7 +19,7 @@ import "dictionary.cb";
 import "time.cb";
 import "perf_framework.cb";
 
-// ── hashset benchmark ────────────────────────────────────────────────────────
+// ── hashset<int> ─────────────────────────────────────────────────────────────
 
 program BenchHashsetAdd
 {
@@ -110,7 +114,7 @@ program BenchHashsetRemove
     }
 };
 
-// ── dictionary benchmark ─────────────────────────────────────────────────────
+// ── dictionary<int,int> ──────────────────────────────────────────────────────
 
 program BenchDictAdd
 {
@@ -203,6 +207,256 @@ program BenchDictRemove
     }
 };
 
+// ── list<string> ─────────────────────────────────────────────────────────────
+
+program BenchListStrAdd
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        list<string> lst;
+        int i = 0;
+        while (i < n) { lst.add(operator string(i)); i++; }
+        lst.clear();
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n) { lst.add(operator string(i)); i++; }
+            lst.clear();
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchListStrGet
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+    i64 sum        = 0;
+
+    int main(move list<string> args)
+    {
+        list<string> lst;
+        int i = 0;
+        while (i < n) { lst.add(operator string(i)); i++; }
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n)
+            {
+                sum = sum + (i64)lst.get(i).length();
+                i++;
+            }
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+// ── hashset<string> ──────────────────────────────────────────────────────────
+
+program BenchHashsetStrAdd
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<string> s;
+        int i = 0;
+        while (i < n) { s.add(operator string(i)); i++; }
+        s.clear();
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n) { s.add(operator string(i)); i++; }
+            s.clear();
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchHashsetStrContains
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+    i64 found      = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<string> s;
+        int i = 0;
+        while (i < n) { s.add(operator string(i)); i++; }
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n)
+            {
+                if (s.contains(operator string(i))) found++;
+                i++;
+            }
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchHashsetStrRemove
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        hashset<string> s;
+        int i = 0;
+        while (i < n) { s.add(operator string(i)); i++; }
+
+        Stopwatch sw;
+        int r = 0;
+        while (r < repeats)
+        {
+            sw.start();
+            i = 0;
+            while (i < n) { s.remove(operator string(i)); i++; }
+            sw.stop();
+            s.clear();
+            i = 0;
+            while (i < n) { s.add(operator string(i)); i++; }
+            r++;
+        }
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+// ── dictionary<string,string> ────────────────────────────────────────────────
+
+program BenchDictStrAdd
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<string, string> d;
+        int i = 0;
+        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+        d.clear();
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+            d.clear();
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchDictStrGet
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+    i64 sum        = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<string, string> d;
+        int i = 0;
+        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+
+        Stopwatch sw;
+        sw.start();
+        int r = 0;
+        while (r < repeats)
+        {
+            i = 0;
+            while (i < n)
+            {
+                string v = d.get(operator string(i));
+                sum = sum + (i64)v.length();
+                i++;
+            }
+            r++;
+        }
+        sw.stop();
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
+program BenchDictStrRemove
+{
+    int n       = 0;
+    int repeats = 0;
+    i64 measuredUs = 0;
+
+    int main(move list<string> args)
+    {
+        dictionary<string, string> d;
+        int i = 0;
+        while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+
+        Stopwatch sw;
+        int r = 0;
+        while (r < repeats)
+        {
+            sw.start();
+            i = 0;
+            while (i < n) { d.remove(operator string(i)); i++; }
+            sw.stop();
+            d.clear();
+            i = 0;
+            while (i < n) { d.add(operator string(i), operator string(i * 2)); i++; }
+            r++;
+        }
+        measuredUs = (i64)sw.elapsed().microseconds();
+        return 0;
+    }
+};
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 void RunHashset(int n, int repeats)
@@ -261,6 +515,84 @@ void RunDict(int n, int repeats)
         remUs, (remUs * (i64)1000) / totalOps);
 }
 
+void RunListStr(int n, int repeats)
+{
+    i64 totalOps = (i64)n * (i64)repeats;
+    list<string> emptyArgs;
+
+    BenchListStrAdd ba;
+    ba.n = n; ba.repeats = repeats;
+    ba.run(emptyArgs); ba.WaitForExit();
+
+    BenchListStrGet bg;
+    bg.n = n; bg.repeats = repeats;
+    bg.run(emptyArgs); bg.WaitForExit();
+
+    i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
+    i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  get %8lld us (%5lld ns/op)\n",
+        n,
+        addUs, (addUs * (i64)1000) / totalOps,
+        getUs, (getUs * (i64)1000) / totalOps);
+}
+
+void RunHashsetStr(int n, int repeats)
+{
+    i64 totalOps = (i64)n * (i64)repeats;
+    list<string> emptyArgs;
+
+    BenchHashsetStrAdd ba;
+    ba.n = n; ba.repeats = repeats;
+    ba.run(emptyArgs); ba.WaitForExit();
+
+    BenchHashsetStrContains bc;
+    bc.n = n; bc.repeats = repeats;
+    bc.run(emptyArgs); bc.WaitForExit();
+
+    BenchHashsetStrRemove br;
+    br.n = n; br.repeats = repeats;
+    br.run(emptyArgs); br.WaitForExit();
+
+    i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
+    i64 cntUs = bc.measuredUs; if (cntUs == (i64)0) cntUs = (i64)1;
+    i64 remUs = br.measuredUs; if (remUs == (i64)0) remUs = (i64)1;
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  contains %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        addUs, (addUs * (i64)1000) / totalOps,
+        cntUs, (cntUs * (i64)1000) / totalOps,
+        remUs, (remUs * (i64)1000) / totalOps);
+}
+
+void RunDictStr(int n, int repeats)
+{
+    i64 totalOps = (i64)n * (i64)repeats;
+    list<string> emptyArgs;
+
+    BenchDictStrAdd ba;
+    ba.n = n; ba.repeats = repeats;
+    ba.run(emptyArgs); ba.WaitForExit();
+
+    BenchDictStrGet bg;
+    bg.n = n; bg.repeats = repeats;
+    bg.run(emptyArgs); bg.WaitForExit();
+
+    BenchDictStrRemove br;
+    br.n = n; br.repeats = repeats;
+    br.run(emptyArgs); br.WaitForExit();
+
+    i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
+    i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;
+    i64 remUs = br.measuredUs; if (remUs == (i64)0) remUs = (i64)1;
+
+    printf("  N=%-6d  add %8lld us (%5lld ns/op)  get %8lld us (%5lld ns/op)  remove %8lld us (%5lld ns/op)\n",
+        n,
+        addUs, (addUs * (i64)1000) / totalOps,
+        getUs, (getUs * (i64)1000) / totalOps,
+        remUs, (remUs * (i64)1000) / totalOps);
+}
+
 // ── entry point ──────────────────────────────────────────────────────────────
 
 extern int main()
@@ -274,6 +606,21 @@ extern int main()
     RunDict(10,    500000);
     RunDict(500,   5000);
     RunDict(10000, 250);
+
+    printf("\n--- list<string>: add / get (includes alloc) ---\n");
+    RunListStr(10,    500000);
+    RunListStr(500,   5000);
+    RunListStr(10000, 250);
+
+    printf("\n--- hashset<string>: add / contains / remove (add+remove include alloc) ---\n");
+    RunHashsetStr(10,    100000);
+    RunHashsetStr(500,   2000);
+    RunHashsetStr(10000, 100);
+
+    printf("\n--- dictionary<string,string>: add / get / remove (add+remove include alloc) ---\n");
+    RunDictStr(10,    100000);
+    RunDictStr(500,   2000);
+    RunDictStr(10000, 100);
 
     return 0;
 }
