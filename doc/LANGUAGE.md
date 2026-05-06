@@ -807,6 +807,31 @@ int* arr  = new int[5];
 delete[] arr;
 ```
 
+**`delete[n]`** — call destructors on exactly `n` elements, then free. Use when the array was allocated without a cookie (e.g. raw `malloc`/`operator new`) and you know the count:
+
+```c
+Node* nodes = new Node[5];
+delete[5] nodes;    // calls ~Node() on each of the 5 elements, then frees
+```
+
+**`delete[_]`** — free the backing buffer *without* calling any destructors. Use after you have already destroyed elements manually (e.g. with `.~()`):
+
+```c
+Node* buf = new Node[3];
+buf[0].~();   // manual in-place destruction
+buf[1].~();
+buf[2].~();
+delete[_] buf;   // free only; destructors already ran
+```
+
+Summary of array-delete forms:
+
+| Form | Destructor calls | Count source |
+|------|-----------------|--------------|
+| `delete[] p` | all elements | hidden cookie |
+| `delete[n] p` | exactly `n` elements | explicit literal/variable |
+| `delete[_] p` | none | — |
+
 
 ### Custom Allocators (`operator new` / `operator delete`)
 
