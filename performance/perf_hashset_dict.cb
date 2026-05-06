@@ -34,6 +34,18 @@ string make_key(int i)
     return result;
 }
 
+// Produces a 64-char string — well beyond any SSO limit — for list<string>
+// benchmarks where we want to isolate list overhead from string-length effects.
+string make_large_key(int i)
+{
+    char* buf = malloc(80);
+    int len = sprintf(buf, "bench_%010d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", i);
+    string result;
+    result._ptr = buf;
+    result._len = len;
+    return result;
+}
+
 // ── hashset<int> ─────────────────────────────────────────────────────────────
 
 program BenchHashsetAdd
@@ -223,6 +235,7 @@ program BenchDictRemove
 };
 
 // ── list<string> ─────────────────────────────────────────────────────────────
+// Uses make_large_key (64 chars) — well above any SSO threshold.
 
 program BenchListStrAdd
 {
@@ -232,9 +245,13 @@ program BenchListStrAdd
 
     int main(move list<string> args)
     {
-        list<string> lst;
+        list<string> keys;
         int i = 0;
-        while (i < n) { lst.add(make_key(i)); i++; }
+        while (i < n) { keys.add(make_large_key(i)); i++; }
+
+        list<string> lst;
+        i = 0;
+        while (i < n) { lst.add(keys.get(i)); i++; }
         lst.clear();
 
         Stopwatch sw;
@@ -243,7 +260,7 @@ program BenchListStrAdd
         while (r < repeats)
         {
             i = 0;
-            while (i < n) { lst.add(make_key(i)); i++; }
+            while (i < n) { lst.add(keys.get(i)); i++; }
             lst.clear();
             r++;
         }
@@ -262,9 +279,13 @@ program BenchListStrGet
 
     int main(move list<string> args)
     {
-        list<string> lst;
+        list<string> keys;
         int i = 0;
-        while (i < n) { lst.add(make_key(i)); i++; }
+        while (i < n) { keys.add(make_large_key(i)); i++; }
+
+        list<string> lst;
+        i = 0;
+        while (i < n) { lst.add(keys.get(i)); i++; }
 
         Stopwatch sw;
         sw.start();
@@ -642,7 +663,7 @@ extern int main()
     RunDict(500,   5000);
     RunDict(10000, 250);
 
-    printf("\n--- list<string>: add / get (add includes alloc) ---\n");
+    printf("\n--- list<string>: add / get (64-char keys; add uses pre-built keys) ---\n");
     RunListStr(10,    500000);
     RunListStr(500,   5000);
     RunListStr(10000, 250);

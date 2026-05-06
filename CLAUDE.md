@@ -199,7 +199,7 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 - **Return-block functions**: `return { ... }` — body inlined at call site
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
 - **Range-based for**: `foreach (T x in collection)` — calls `count()` / `get(int)` on the collection
-- **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` — struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `BlockAllocator` (heap allocations in `main` are freed automatically on return), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
+- **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` — struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `MallocAllocator` by default (override by setting `p._allocator` before `p.run()`), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
 
 ### Ownership / Lifetime (`move` keyword)
 

@@ -154,14 +154,21 @@ static std::string make_key(int i) {
     return buf;
 }
 
+// Matches CFlat make_large_key(): always 64 chars, well above any SSO limit.
+static std::string make_large_key(int i) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "bench_%010d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", i);
+    return buf;
+}
+
 // ── std::vector<std::string> ─────────────────────────────────────────────────
 
 static void bench_list_str(int n, int repeats) {
     int64_t total_ops = (int64_t)n * repeats;
 
-    // pre-build keys
+    // pre-build keys (64-char, well above SSO)
     std::vector<std::string> keys(n);
-    for (int i = 0; i < n; i++) keys[i] = make_key(i);
+    for (int i = 0; i < n; i++) keys[i] = make_large_key(i);
 
     // -- add (fill + clear) --
     int64_t add_us;
