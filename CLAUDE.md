@@ -226,11 +226,6 @@ Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsFor
 - **`is_pointer(T)`**: Compile-time intrinsic that returns 1 if the type parameter T resolves to a pointer type in the current generic instantiation, 0 otherwise. Use with `if const` to branch on element ownership in generic code.
 - **Platform support**: `-p win64` (default) or `-p win32`; guard with `if const (__PLATFORM__ == 64) { ... }`
 
-### Known Limitations
-
-- **Null-conditional (`?.`)**: Works on any struct pointer — function arguments, local variables, and struct member fields
-- **Generic struct defaults**: `V x = default` in function locals and nested generic fields may not codegen correctly; field-level `= default` works
-
 ### Adding New Language Features
 
 | Goal | Where to change |

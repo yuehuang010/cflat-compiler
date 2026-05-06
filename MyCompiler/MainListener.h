@@ -5079,9 +5079,10 @@ public:
             return {};
         }
         llvm::Value* sizeVal = compiler->GetTypeSizeBytes(elemType);
+        llvm::Value* count = nullptr;
         if (isArray)
         {
-            llvm::Value* count = ParseAssignmentExpression(ctx->assignmentExpression());
+            count = ParseAssignmentExpression(ctx->assignmentExpression());
             count = compiler->Upconvert(count, compiler->builder->getInt64Ty());
             sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
         }
@@ -5109,6 +5110,36 @@ public:
         // Bitcast void* -> T*
         llvm::Type* ptrTy = elemType->getPointerTo();
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
+
+        // For array new of a class type: call default constructor for each element (like C++)
+        if (isArray && count && compiler->GetFunction(typeName))
+        {
+            auto* i64Ty = compiler->builder->getInt64Ty();
+            auto* indexAlloca = compiler->builder->CreateAlloca(i64Ty, nullptr, "init_i");
+            compiler->builder->CreateStore(compiler->builder->getInt64(0), indexAlloca);
+
+            auto* condBB = compiler->CreateBasicBlock("new_ctor_cond");
+            auto* bodyBB = compiler->CreateBasicBlock("new_ctor_body");
+            auto* afterBB = compiler->CreateBasicBlock("new_ctor_after");
+            compiler->builder->CreateBr(condBB);
+
+            compiler->builder->SetInsertPoint(condBB);
+            auto* idx = compiler->builder->CreateLoad(i64Ty, indexAlloca);
+            auto* cmp = compiler->builder->CreateICmpSLT(idx, count);
+            compiler->builder->CreateCondBr(cmp, bodyBB, afterBB);
+
+            compiler->builder->SetInsertPoint(bodyBB);
+            auto* idx2 = compiler->builder->CreateLoad(i64Ty, indexAlloca);
+            auto* elemPtr = compiler->builder->CreateGEP(elemType, typedPtr, idx2, "new_elem");
+            llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});
+            if (structVal)
+                compiler->builder->CreateStore(structVal, elemPtr);
+            auto* next = compiler->builder->CreateAdd(idx2, compiler->builder->getInt64(1));
+            compiler->builder->CreateStore(next, indexAlloca);
+            compiler->builder->CreateBr(condBB);
+
+            compiler->builder->SetInsertPoint(afterBB);
+        }
 
         // For non-array new of a class type: call constructor and store result
         if (!isArray && compiler->GetFunction(typeName))

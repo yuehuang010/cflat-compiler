@@ -126,7 +126,6 @@ class block_pool
         if (pa == nullptr)
         {
             pa = new page_arena[1];
-            pa->init_fresh();   // new[n] uses malloc — no field initializers run
         }
         pa->_chunkSize = _chunkSize;
         pa->reset();

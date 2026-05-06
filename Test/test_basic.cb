@@ -902,6 +902,21 @@ int testNewWithConstructor()
     return 123;
 }
 
+bool testNewArrayConstructor()
+{
+    bool result = true;
+
+    // new T[n] must call the default constructor for each element
+    MyStruct* arr = new MyStruct[3];
+    result &= Test("new_arr_ctor_0_num1", arr[0].num1, 1);
+    result &= Test("new_arr_ctor_0_num2", arr[0].num2, 2);
+    result &= Test("new_arr_ctor_1_num1", arr[1].num1, 1);
+    result &= Test("new_arr_ctor_2_num3", arr[2].num3, 3);
+    delete[] arr;
+
+    return result;
+}
+
 class Point : IString
 {
     i32 x = 0;
@@ -1570,6 +1585,7 @@ extern int main()
     total++; passed += Test("testNewDelete", testNewDelete(), 42);
     total++; passed += Test("testNewArray", testNewArray(), 99);
     total++; passed += Test("testNewWithConstructor", testNewWithConstructor(), 123);
+    total++; passed += testNewArrayConstructor()            ? 1 : 0;
     total++; passed += testStringType()                  ? 1 : 0;
     total++; passed += testStringLiteral()               ? 1 : 0;
     total++; passed += testFormatString()                ? 1 : 0;

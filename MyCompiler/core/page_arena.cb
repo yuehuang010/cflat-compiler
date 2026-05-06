@@ -85,17 +85,6 @@ struct page_arena
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    // Must be called immediately after 'new page_arena[1]' — CFlat's array-new
-    // uses malloc and does NOT run field initializers, so _head is garbage.
-    void init_fresh()
-    {
-        _pool      = nullptr;
-        _head      = nullptr;
-        _id        = 0;
-        _next      = nullptr;
-        _root      = nullptr;
-    }
-
     // Reset all chunks for reuse (zero _used, clear _root and _id).
     // Chunks are NOT freed — they are retained for the next use.
     void reset()
