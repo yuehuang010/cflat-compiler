@@ -642,8 +642,13 @@ moveExpression
     ;
 
 deleteExpression
-    : Delete '[' ']' expression
+    : Delete '[' deleteArraySize ']' expression
+    | Delete '[' ']' expression
     | Delete expression
+    ;
+
+deleteArraySize
+    : expression
     ;
 
 operatorFunctionId

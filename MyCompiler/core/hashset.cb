@@ -53,7 +53,7 @@ struct hashset<T>
             i++;
         }
 
-        delete[] oldKeys;
+        delete[_] oldKeys;
         delete[] oldStatus;
     }
 
@@ -126,7 +126,7 @@ struct hashset<T>
 
     ~hashset()
     {
-        if (_keys   != nullptr) delete[] _keys;
+        if (_keys   != nullptr) delete[_] _keys;
         if (_status != nullptr) delete[] _status;
     }
 };

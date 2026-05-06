@@ -15,7 +15,7 @@ class stack<T>
             newData[i] = _data[i];
             i++;
         }
-        if (_data != nullptr) delete[] _data;
+        if (_data != nullptr) delete[_] _data;
         _data = newData;
         _capacity = newCap;
     }
@@ -50,6 +50,6 @@ class stack<T>
 
     ~stack()
     {
-        if (_data != nullptr) delete[] _data;
+        if (_data != nullptr) delete[_] _data;
     }
 };

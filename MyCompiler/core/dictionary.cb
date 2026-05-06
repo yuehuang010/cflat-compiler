@@ -54,15 +54,26 @@ struct dictionary<K, V>
         _count = 0;
         _init(_capacity * 2);
 
+        // Direct insert — avoids calling add() (which has move V value) so the
+        // compiler's move tracker does not flag oldValues as consumed.
         int i = 0;
         while (i < oldCap)
         {
-            if (oldStatus[i] == 1) add(oldKeys[i], oldValues[i]);
+            if (oldStatus[i] == 1)
+            {
+                int slot = _slot(oldKeys[i]);
+                while (_status[slot] != 0)
+                    slot = (slot + 1) % _capacity;
+                _keys[slot]   = oldKeys[i];
+                _values[slot] = oldValues[i];
+                _status[slot] = 1;
+                _count++;
+            }
             i++;
         }
 
-        delete[] oldKeys;
-        delete[] oldValues;
+        delete[_] oldKeys;
+        delete[_] oldValues;
         delete[] oldStatus;
     }
 
@@ -218,8 +229,8 @@ struct dictionary<K, V>
                 i++;
             }
         }
-        if (_keys   != nullptr) delete[] _keys;
-        if (_values != nullptr) delete[] _values;
+        if (_keys   != nullptr) delete[_] _keys;
+        if (_values != nullptr) delete[_] _values;
         if (_status != nullptr) delete[] _status;
     }
 };

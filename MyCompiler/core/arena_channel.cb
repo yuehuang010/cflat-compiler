@@ -148,7 +148,7 @@ class block_pool
         while (node != nullptr)
         {
             page_arena* next = (page_arena*)node->_next;   // _next is void*
-            delete[] node;   // ~page_arena() calls free_chunks()
+            delete[1] node;   // ~page_arena() calls free_chunks()
             node = next;
         }
     }

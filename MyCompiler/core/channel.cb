@@ -234,7 +234,7 @@ class channel<T>
     }
 
     void destroy() {
-        if (_buf != nullptr) { delete[] _buf; _buf = nullptr; }
+        if (_buf != nullptr) { delete[_] _buf; _buf = nullptr; }
         if (_seq != nullptr) { free((void*)_seq); _seq = nullptr; }
     }
 

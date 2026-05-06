@@ -5107,7 +5107,6 @@ public:
             return {};
         }
 
-        // Bitcast void* -> T*
         llvm::Type* ptrTy = elemType->getPointerTo();
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
 
@@ -5179,19 +5178,29 @@ public:
     LLVMBackend::NamedVariable ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
-        bool isArray = ctx->LeftBracket() != nullptr;
+        bool isArray      = ctx->LeftBracket() != nullptr;
+        bool hasSizeExpr  = ctx->deleteArraySize() != nullptr;
+        // delete[_] ptr — free backing buffer only, no destructor calls.
+        bool isRawFree    = hasSizeExpr && ctx->deleteArraySize()->expression()->getText() == "_";
+        if (hasSizeExpr && ctx->deleteArraySize()->expression()->getText() == "0")
+        {
+            LogErrorContext(ctx, "'delete[0]' is not allowed — use 'delete[_]' to free a raw buffer without calling destructors");
+            return {};
+        }
 
         // Parse the pointer expression and determine the pointed-to struct type name.
         // getPointerElementType() is unavailable with LLVM opaque pointers; use the
         // AST-level type information from the unary expression instead.
         std::string typeName;
+        bool elemIsPtr = false;         // true when deleting array of pointers (e.g. list<T*> buffer)
         llvm::Value* ptrVal = nullptr;
         llvm::Value* srcAlloca = nullptr;
         llvm::Type* srcAllocaElemType = nullptr;
         if (auto* ue = tryGetUnaryExpression(ctx->expression()))
         {
             auto namedVar = ParseUnaryExpression(ue);
-            typeName = namedVar.TypeAndValue.TypeName;
+            typeName  = namedVar.TypeAndValue.TypeName;
+            elemIsPtr = namedVar.TypeAndValue.ElemPointer;
             if (namedVar.Storage)
             {
                 ptrVal = compiler->CreateLoad(namedVar.Storage);
@@ -5212,6 +5221,14 @@ public:
         }
         if (!ptrVal) return {};
 
+        // Error: bare delete[] on a named struct array — the caller must supply the count.
+        if (isArray && !hasSizeExpr && compiler->IsDataStructure(typeName) && !elemIsPtr)
+        {
+            LogErrorContext(ctx, std::format(
+                "'delete[]' is not allowed for struct type '{}' — use 'delete[n] ptr' to call destructors or 'delete[_] ptr' to free the raw buffer", typeName));
+            return {};
+        }
+
         // 1. Call destructor if it exists (non-array only)
         if (!isArray && !typeName.empty())
         {
@@ -5220,9 +5237,52 @@ public:
                 compiler->builder->CreateCall(structData.Destructor, { ptrVal });
         }
 
-        // 2. Convert to void*
+        // 1b. For delete[n]: call ~T() on each element using the caller-supplied count.
+        // elemIsPtr suppresses destructor calls for pointer-element arrays (e.g. list<T*> buffer).
+        llvm::Value* freeBase = ptrVal;
+        if (hasSizeExpr && !isRawFree && compiler->IsDataStructure(typeName) && !elemIsPtr)
+        {
+            auto structData = compiler->GetDataStructure(typeName);
+            if (structData.Destructor)
+            {
+                auto* i64Ty = compiler->builder->getInt64Ty();
+                llvm::Value* arrCount = ParseExpression(ctx->deleteArraySize()->expression());
+                arrCount = compiler->Upconvert(arrCount, i64Ty);
+
+                LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName };
+                llvm::Type* elemType = compiler->GetType(typeInfo);
+
+                auto* indexAlloca = compiler->builder->CreateAlloca(i64Ty, nullptr, "del_i");
+                compiler->builder->CreateStore(
+                    compiler->builder->CreateSub(arrCount, compiler->builder->getInt64(1), "del_start"),
+                    indexAlloca);
+
+                auto* condBB  = compiler->CreateBasicBlock("del_dtor_cond");
+                auto* bodyBB  = compiler->CreateBasicBlock("del_dtor_body");
+                auto* afterBB = compiler->CreateBasicBlock("del_dtor_after");
+                compiler->builder->CreateBr(condBB);
+
+                compiler->builder->SetInsertPoint(condBB);
+                auto* idx = compiler->builder->CreateLoad(i64Ty, indexAlloca);
+                compiler->builder->CreateCondBr(
+                    compiler->builder->CreateICmpSGE(idx, compiler->builder->getInt64(0)),
+                    bodyBB, afterBB);
+
+                compiler->builder->SetInsertPoint(bodyBB);
+                auto* idx2    = compiler->builder->CreateLoad(i64Ty, indexAlloca);
+                auto* elemPtr = compiler->builder->CreateGEP(elemType, ptrVal, idx2, "del_elem");
+                compiler->builder->CreateCall(structData.Destructor, { elemPtr });
+                compiler->builder->CreateStore(
+                    compiler->builder->CreateSub(idx2, compiler->builder->getInt64(1)), indexAlloca);
+                compiler->builder->CreateBr(condBB);
+
+                compiler->builder->SetInsertPoint(afterBB);
+            }
+        }
+
+        // 2. Convert free base to void*
         auto* voidPtrTy = compiler->builder->getInt8Ty()->getPointerTo();
-        llvm::Value* voidPtr = compiler->builder->CreateBitCast(ptrVal, voidPtrTy, "freeptr");
+        llvm::Value* voidPtr = compiler->builder->CreateBitCast(freeBase, voidPtrTy, "freeptr");
 
         // 3. Call operator delete: class-specific -> global
         std::string opDelName = typeName + ".operator delete";
@@ -5259,9 +5319,26 @@ public:
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
-        // move on a value type is a no-op — ownership semantics only apply to pointers.
+        // move on a named struct value type: capture the value, then zero the source storage
+        // to leave it in a "moved-from" (default) state — enables safe delete[n] on the source.
+        // Primitive value types (int, etc.) remain a no-op.
         if (!argNV.TypeAndValue.Pointer)
+        {
+            if (argNV.Storage && compiler->IsDataStructure(argNV.TypeAndValue.TypeName))
+            {
+                llvm::Type* structType = compiler->GetType(argNV.TypeAndValue);
+                if (structType)
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(structType), argNV.Storage);
+                LLVMBackend::NamedVariable result;
+                result.Primary      = ptrVal;       // original value captured before zeroing
+                result.Storage      = nullptr;      // prevent re-load from zeroed storage
+                result.BaseType     = argNV.BaseType;
+                result.TypeAndValue = argNV.TypeAndValue;
+                return result;
+            }
             return argNV;
+        }
 
         if (argNV.Storage == nullptr)
         {

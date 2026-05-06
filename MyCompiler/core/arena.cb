@@ -112,7 +112,7 @@ class Arena
         {
             _ArenaBlock* next = blk->_next;
             free(blk->_data);
-            delete[] blk;
+            delete[1] blk;
             blk = next;
         }
         _head = nullptr;

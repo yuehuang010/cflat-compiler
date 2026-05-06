@@ -16,7 +16,7 @@ class queue<T>
             newData[i] = _data[_front + i];
             i++;
         }
-        if (_data != nullptr) delete[] _data;
+        if (_data != nullptr) delete[_] _data;
         _data = newData;
         _capacity = newCap;
         _front = 0;
@@ -55,6 +55,6 @@ class queue<T>
 
     ~queue()
     {
-        if (_data != nullptr) delete[] _data;
+        if (_data != nullptr) delete[_] _data;
     }
 };

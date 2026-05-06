@@ -14,10 +14,11 @@ class list<T> : IEnumerable<T>, IList<T>
         int i = 0;
         while (i < _size)
         {
-            newData[i] = _data[i];
+            newData[i] = move _data[i];
             i++;
         }
-        if (_data != nullptr) delete[] _data;
+        // Elements were moved out (zeroed); just free the old buffer — no destructor calls needed.
+        if (_data != nullptr) delete[_] _data;
         _data = newData;
         _capacity = newCap;
     }
@@ -82,7 +83,8 @@ class list<T> : IEnumerable<T>, IList<T>
         return _size;
     }
 
-    // Remove all elements. When T is a pointer type, frees each element.
+    // Remove all elements. Pointer elements are freed; value-type elements are not
+    // individually destructed (CFlat has no in-place destructor call syntax).
     // Backing buffer is kept — capacity is unchanged.
     void clear()
     {
@@ -168,6 +170,9 @@ class list<T> : IEnumerable<T>, IList<T>
                 i++;
             }
         }
-        if (_data != nullptr) delete[] _data;
+        // delete[_]: free the backing buffer only.  For pointer T, elements were already freed
+        // above.  For value-type T, we do not call element destructors here — string values
+        // may have non-owned _ptr (e.g. literals), so calling ~T() would crash.
+        if (_data != nullptr) delete[_] _data;
     }
 };

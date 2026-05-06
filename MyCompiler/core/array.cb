@@ -1,0 +1,33 @@
+// array<T> — owning fixed-size heap array with destructor support.
+// Use init(size) to allocate; the destructor frees and calls ~T() on each element.
+// Stackable or heap-allocated: array<T> a; a.init(n);  or  array<T>* a = new array<T>;  a->init(n);
+
+struct array<T>
+{
+    T*  _ptr = nullptr;
+    int _len = 0;
+
+    void init(int size)
+    {
+        _ptr = new T[size];
+        _len = size;
+    }
+
+    ~array()
+    {
+        if (_ptr != nullptr)
+        {
+            delete[_len] _ptr;
+            _ptr = nullptr;
+            _len = 0;
+        }
+    }
+
+    int count() { return _len; }
+
+    T get(int index) { return _ptr[index]; }
+
+    void set(int index, T value) { _ptr[index] = value; }
+
+    T operator[](int index) { return _ptr[index]; }
+};

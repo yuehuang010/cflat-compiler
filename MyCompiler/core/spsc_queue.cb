@@ -117,7 +117,7 @@ class spsc_queue<T>
 
     // Free the ring buffer.
     void destroy() {
-        if (_buf != nullptr) { delete[] _buf; _buf = nullptr; }
+        if (_buf != nullptr) { delete[_] _buf; _buf = nullptr; }
     }
 
     ~spsc_queue() {

@@ -912,7 +912,7 @@ bool testNewArrayConstructor()
     result &= Test("new_arr_ctor_0_num2", arr[0].num2, 2);
     result &= Test("new_arr_ctor_1_num1", arr[1].num1, 1);
     result &= Test("new_arr_ctor_2_num3", arr[2].num3, 3);
-    delete[] arr;
+    delete[3] arr;
 
     return result;
 }
