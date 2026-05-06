@@ -8,7 +8,6 @@ Windows ABI gaps:
 
 
 Generics limitations:
-- hashset/dictionary only support integer keys — no generic hash trait
 - sort is O(n²) insertion sort
 
 Thread infrastructure:

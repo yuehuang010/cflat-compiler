@@ -482,8 +482,11 @@ lockStatement
 
 labeledStatement
     : Identifier ':' statement?
-    | 'case' constantExpression ':' statement
-    | 'default' ':' statement
+    | 'case' constantExpression ':' statement                          // C-style value case
+    | 'default' ':' statement                                          // C-style default
+    | 'case' typeSpecifier pointer Identifier? FatArrow statement      // arm-style type pointer case (e.g. case Quit* q =>)
+    | 'case' constantExpression FatArrow statement                     // arm-style value/type case
+    | 'default' FatArrow statement                                     // arm-style wildcard
     ;
 
 compoundStatement

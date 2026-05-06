@@ -1,0 +1,66 @@
+import "string.cb";
+import "interfaces.cb";
+
+interface IShape
+{
+    int area();
+};
+
+class Circle : IShape
+{
+    int radius = default;
+    int area() { return radius * radius * 3; }
+};
+
+class Rect : IShape
+{
+    int width = default;
+    int height = default;
+    int area() { return width * height; }
+};
+
+extern int printf(char* fmt, ...);
+
+extern int main()
+{
+    // Test 1: arm-style integer switch
+    int x = 2;
+    switch (x)
+    {
+        case 1 => { printf("one\n"); }
+        case 2 => { printf("two\n"); }
+        case 3 => { printf("three\n"); }
+        default => { printf("other\n"); }
+    }
+
+    // Test 2: arm-style string switch
+    string s = "hello";
+    switch (s)
+    {
+        case "hello" => { printf("got hello\n"); }
+        case "world" => { printf("got world\n"); }
+        default => { printf("got other\n"); }
+    }
+
+    // Test 3: arm-style type switch with bound variable
+    Circle c;
+    c.radius = 5;
+    IShape shape = c;
+
+    switch (shape)
+    {
+        case Circle* ci => { printf("Circle radius=%d area=%d\n", ci->radius, ci->area()); }
+        case Rect* r => { printf("Rect area=%d\n", r->area()); }
+    }
+
+    // Test 4: _ wildcard
+    int y = 99;
+    switch (y)
+    {
+        case 1 => { printf("one\n"); }
+        case _ => { printf("wildcard\n"); }
+    }
+
+    printf("done\n");
+    return 0;
+}

@@ -864,6 +864,8 @@ private:
         llvm::BasicBlock* block;
         bool isTypeCase = false;                  // non-null for type cases (struct or interface)
         std::string typeCaseName;                 // struct or interface name for type cases
+        std::string boundVarName;                 // optional bound variable for arm-style type pointer cases
+        bool isArmStyle = false;                  // true if this case uses => syntax
     };
 
     struct SwitchContext
@@ -873,6 +875,8 @@ private:
         llvm::BasicBlock* resumeBlock = nullptr;
         bool isStringSwitch = false;
         bool isTypeSwitch = false;                // true if this switch contains type cases
+        bool isArmStyle = false;                  // true if any case uses => syntax
+        llvm::Value* condValue = nullptr;         // switch condition value (needed for bound var extraction)
     };
 
     std::vector<SwitchContext> switchStack;
@@ -1800,9 +1804,35 @@ public:
         auto labeled = stmt->labeledStatement();
         if (!labeled) return;
 
+        bool hasArrow = labeled->FatArrow() != nullptr;
+
+        // Reject mixing C-style (:) and arm-style (=>) cases in the same switch.
+        if (hasArrow && !ctx.caseMap.empty() && !ctx.isArmStyle)
+            LogErrorContext(labeled, "cannot mix ':' and '=>' cases in the same switch");
+        if (!hasArrow && !ctx.caseMap.empty() && ctx.isArmStyle)
+            LogErrorContext(labeled, "cannot mix ':' and '=>' cases in the same switch");
+        if (hasArrow)
+            ctx.isArmStyle = true;
+
         if (labeled->Case())
         {
-            // Check if this is a type case (struct or interface name) before evaluating as constant
+            // Arm-style type pointer case: case TypeName* optVar => body
+            if (labeled->typeSpecifier() && labeled->pointer())
+            {
+                std::string typeName = labeled->typeSpecifier()->getText();
+                std::string boundVar = labeled->Identifier() ? labeled->Identifier()->getText() : "";
+                bool isStruct = compiler->dataStructures.count(typeName) > 0;
+                bool isInterface = compiler->interfaceTable.count(typeName) > 0;
+                if (!isStruct && !isInterface)
+                    LogErrorContext(labeled, std::format("'{}' is not a known struct or interface type", typeName));
+                if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
+                    LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
+                ctx.isTypeSwitch = true;
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, typeName, boundVar, true };
+                return;
+            }
+
+            // C-style or arm-style value/type case via constantExpression
             auto constExpr = labeled->constantExpression();
             if (!constExpr)
             {
@@ -1814,22 +1844,29 @@ public:
             bool isStruct = compiler->dataStructures.count(exprText) > 0;
             bool isInterface = compiler->interfaceTable.count(exprText) > 0;
 
+            // _ is a soft wildcard in arm-style switches — register as both default and caseMap entry
+            // so ParseStatement can locate this labeled node and emit the arm body with auto-jump.
+            if (hasArrow && exprText == "_")
+            {
+                ctx.defaultBlock = compiler->CreateBasicBlock("switchDefault");
+                ctx.caseMap[labeled] = { nullptr, nullptr, ctx.defaultBlock, false, "", "", true };
+                return;
+            }
+
             if (isStruct || isInterface)
             {
-                // Type case detected
                 if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
                     LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
                 ctx.isTypeSwitch = true;
-                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, exprText };
-                CollectCasesFromStatement(labeled->statement(), ctx);
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, exprText, "", hasArrow };
+                if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
             }
             else
             {
-                // Constant case (integer or string)
                 if (ctx.isTypeSwitch)
                     LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
 
-                llvm::Value* rawVal = ParseConditionalExpression(labeled->constantExpression()->conditionalExpression());
+                llvm::Value* rawVal = ParseConditionalExpression(constExpr->conditionalExpression());
                 auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
                 llvm::Constant* strLit = nullptr;
                 if (!val)
@@ -1840,14 +1877,14 @@ public:
                     else
                         LogErrorContext(labeled, "case value must be a constant integer or string literal");
                 }
-                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "" };
-                CollectCasesFromStatement(labeled->statement(), ctx);
+                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "", "", hasArrow };
+                if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
             }
         }
         else if (labeled->Default())
         {
             ctx.defaultBlock = compiler->CreateBasicBlock("switchDefault");
-            CollectCasesFromStatement(labeled->statement(), ctx);
+            if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
         }
     }
 
@@ -1884,6 +1921,42 @@ public:
             {
                 compiler->CreateJump(targetBlock);    // fallthrough if no terminator yet
                 compiler->SwitchToBlock(targetBlock);
+            }
+
+            // Arm-style: inject bound variable, execute body in its own scope, auto-jump to resume.
+            // `default =>` and `case _ =>` arms are detected via FatArrow token.
+            auto it = ctx.caseMap.find(labeledStatement);
+            bool isDefaultArm = labeledStatement->FatArrow() != nullptr
+                             && (labeledStatement->Default()
+                                 || (labeledStatement->Case()
+                                     && labeledStatement->constantExpression()
+                                     && labeledStatement->constantExpression()->getText() == "_"));
+            bool isArm = (it != ctx.caseMap.end() && it->second.isArmStyle) || isDefaultArm;
+            bool hasBound = isArm && it != ctx.caseMap.end() && it->second.isTypeCase && !it->second.boundVarName.empty();
+
+            if (isArm)
+            {
+                compiler->InitializeBlock(nullptr, true);
+
+                if (hasBound && ctx.condValue)
+                {
+                    // Extract the data pointer (field 1) from the interface fat ptr and bind it.
+                    auto* dataPtr = compiler->builder->CreateExtractValue(ctx.condValue, { 1u }, "typecase_data");
+                    auto* alloca = compiler->builder->CreateAlloca(dataPtr->getType(), nullptr, it->second.boundVarName);
+                    compiler->builder->CreateStore(dataPtr, alloca);
+
+                    LLVMBackend::NamedVariable nv;
+                    nv.Storage  = alloca;
+                    nv.Primary  = dataPtr;
+                    nv.TypeAndValue.TypeName = it->second.typeCaseName;
+                    nv.TypeAndValue.Pointer  = true;
+                    nv.IsOwning    = false;
+                    compiler->stackNamedVariable.back().namedVariable[it->second.boundVarName] = nv;
+                }
+
+                ParseStatement(labeledStatement->statement());
+                compiler->CreateBlockBreak(ctx.resumeBlock, true);
+                return;
             }
 
             ParseStatement(labeledStatement->statement());
@@ -2323,6 +2396,7 @@ public:
                 auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
 
                 auto condVal = ParseExpression(expression);
+                switchCtx.condValue = condVal;
 
                 if (switchCtx.isTypeSwitch)
                 {
@@ -2428,7 +2502,8 @@ public:
                 {
                     auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
                     for (auto& [labeledCtx, entry] : switchCtx.caseMap)
-                        switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                        if (entry.value)  // null value = wildcard (_) arm, handled via defaultBlock
+                            switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
                 }
 
                 // Push scope: break -> resumeBlock, no continue (propagates to outer loop)
@@ -3041,17 +3116,22 @@ public:
                     {
                         if (typeAndValue.IsInterface)
                         {
-                            // For interface (string) declarations, preserve NamedVariable type info
-                            // so we can do the struct->interface fat-struct upcast when needed.
+                            // For interface declarations, preserve NamedVariable type info
+                            // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             right = LoadNamedVariable(rightNV);
-                            // Classes that implement interfaces can be upcast. Structs cannot.
                             if (right && right->getType() != compiler->GetFatPtrType())
                             {
                                 std::string structName = rightNV.TypeAndValue.TypeName;
-                                if (!structName.empty() && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
+                                // Catch the case where the RHS is a known type that doesn't implement the interface.
+                                if (!structName.empty() && compiler->dataStructures.count(structName)
+                                    && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
-                                    // Only classes (not structs) can implement interfaces, so this is a class
+                                    LogErrorContext(assignmentExpression,
+                                        std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
+                                }
+                                else if (!structName.empty() && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
+                                {
                                     auto vtable = compiler->GetOrCreateVTable(structName, typeAndValue.TypeName);
                                     // BuildInterfaceFatValue needs a *pointer* to the struct data,
                                     // not the loaded struct value.
