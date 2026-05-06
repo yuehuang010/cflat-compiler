@@ -4256,6 +4256,34 @@ public:
                     bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
                     value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
                 }
+
+                // Non-owning string (literal or view) passed to a move parameter — heap-copy it
+                // so the callee receives an owned buffer it can safely free.
+                if (!inVariadicRange &&
+                    candParamItr->IsMove &&
+                    candParamItr->TypeName == "string" &&
+                    !arg.IsOwningString)
+                {
+                    auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+                    if (strTy && GetFunction("operator new"))
+                    {
+                        auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "litptr");
+                        auto* srcLen = builder->CreateExtractValue(value, { 1u }, "litlen");
+                        auto* allocSize = builder->CreateAdd(
+                            builder->CreateZExt(srcLen, builder->getInt64Ty()),
+                            builder->getInt64(1), "litbufsz");
+                        NamedVariable szArg;
+                        szArg.Primary  = allocSize;
+                        szArg.BaseType = builder->getInt64Ty();
+                        auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
+                        auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
+                        builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
+                        value = llvm::UndefValue::get(strTy);
+                        value = builder->CreateInsertValue(value, heapPtr, { 0u });
+                        value = builder->CreateInsertValue(value, srcLen,  { 1u });
+                    }
+                }
+
                 argList.push_back(value);
             }
             if (!inVariadicRange && candParamItr != candidate.Parameters.end() - 1)

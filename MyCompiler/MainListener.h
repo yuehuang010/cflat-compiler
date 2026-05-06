@@ -5478,6 +5478,47 @@ public:
                         }
                         break;
                     }
+                    case CFlatParser::Tilde:
+                    {
+                        // expr.~() — call destructor in place, no memory freed.
+                        if (prevToken == CFlatParser::Dot)
+                        {
+                            auto* compiler = Compiler(ctx);
+                            std::string typeName;
+                            llvm::Value* thisPtr = nullptr;
+
+                            if (!structVar.TypeAndValue.TypeName.empty() && structVar.Storage)
+                            {
+                                typeName = structVar.TypeAndValue.TypeName;
+                                thisPtr  = structVar.Storage;
+                            }
+                            else if (!namedVar.TypeAndValue.TypeName.empty())
+                            {
+                                typeName = namedVar.TypeAndValue.TypeName;
+                                thisPtr  = namedVar.TypeAndValue.Pointer
+                                               ? LoadNamedVariable(namedVar)
+                                               : namedVar.Storage;
+                            }
+
+                            if (typeName == "string")
+                                compiler->EnsureStringDtorRegistered();
+
+                            if (!typeName.empty() && thisPtr)
+                            {
+                                auto structData = compiler->GetDataStructure(typeName);
+                                // No destructor = no-op (primitive or struct with no cleanup needed).
+                                if (structData.Destructor)
+                                    compiler->builder->CreateCall(structData.Destructor, { thisPtr });
+                            }
+                            else
+                            {
+                                LogErrorContext(ctx, "'.~()' requires a named struct type");
+                            }
+                            namedVar = {};
+                            structVar = {};
+                        }
+                        break;
+                    }
                     case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
                     case CFlatParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
                     case CFlatParser::Identifier:
@@ -6529,7 +6570,7 @@ public:
                                 }
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(*Compiler(ctx)->context), isPtr ? 1 : 0);
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isPtr ? 1 : 0);
                             namedVar.TypeAndValue.TypeName = "int";
                             break;
                         }
@@ -6559,7 +6600,7 @@ public:
                                 }
                             }
                             namedVar.Primary = llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(*Compiler(ctx)->context), isPrim ? 1 : 0);
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isPrim ? 1 : 0);
                             namedVar.TypeAndValue.TypeName = "int";
                             break;
                         }

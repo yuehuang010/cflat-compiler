@@ -66,6 +66,7 @@ postfixExpression
         '[' expression ']'
         | '(' argumentExpressionList ')'
         | ('.' | '->' | QuestionDot) (Identifier | Move) genericTypeParameters?
+        | '.' Tilde '(' ')'
         | '++'
         | '--'
     )*

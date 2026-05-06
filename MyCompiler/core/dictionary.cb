@@ -129,6 +129,8 @@ struct dictionary<K, V>
         {
             if const (is_pointer(V))
                 if (_values[updateSlot] != nullptr) delete _values[updateSlot];
+            if const (!is_pointer(V))
+                _values[updateSlot].~();
         }
         else
         {
@@ -179,6 +181,8 @@ struct dictionary<K, V>
             {
                 if const (is_pointer(V))
                     if (_values[slot] != nullptr) delete _values[slot];
+                if const (!is_pointer(V))
+                    _values[slot].~();
                 _status[slot] = 2;
                 _count--;
                 return true;
@@ -198,16 +202,19 @@ struct dictionary<K, V>
     // Backing arrays are kept — capacity is unchanged.
     void clear()
     {
-        if const (is_pointer(V))
-        {
-            int i = 0;
-            while (i < _capacity)
-            {
-                if (_status[i] == 1 && _values[i] != nullptr) delete _values[i];
-                i++;
-            }
-        }
         int i = 0;
+        while (i < _capacity)
+        {
+            if (_status[i] == 1)
+            {
+                if const (is_pointer(V))
+                    if (_values[i] != nullptr) delete _values[i];
+                if const (!is_pointer(V))
+                    _values[i].~();
+            }
+            i++;
+        }
+        i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
     }
@@ -220,14 +227,17 @@ struct dictionary<K, V>
 
     ~dictionary()
     {
-        if const (is_pointer(V))
+        int i = 0;
+        while (i < _capacity)
         {
-            int i = 0;
-            while (i < _capacity)
+            if (_status[i] == 1)
             {
-                if (_status[i] == 1 && _values[i] != nullptr) delete _values[i];
-                i++;
+                if const (is_pointer(V))
+                    if (_values[i] != nullptr) delete _values[i];
+                if const (!is_pointer(V))
+                    _values[i].~();
             }
+            i++;
         }
         if (_keys   != nullptr) delete[_] _keys;
         if (_values != nullptr) delete[_] _values;

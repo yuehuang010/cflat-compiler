@@ -1,4 +1,4 @@
-// list<T> — mutable growable array (similar to vector<T>).
+// list<T> — mutable growable owning array (similar to vector<T>).
 // Supports any value type T.
 
 class list<T> : IEnumerable<T>, IList<T>
@@ -170,9 +170,8 @@ class list<T> : IEnumerable<T>, IList<T>
                 i++;
             }
         }
-        // delete[_]: free the backing buffer only.  For pointer T, elements were already freed
-        // above.  For value-type T, we do not call element destructors here — string values
-        // may have non-owned _ptr (e.g. literals), so calling ~T() would crash.
-        if (_data != nullptr) delete[_] _data;
+        // Value-type elements (including string): call destructor on each then free the buffer.
+        // String elements are guaranteed owned (heap-copied at the move call site) so dtor is safe.
+        if (_data != nullptr) delete[_size] _data;
     }
 };

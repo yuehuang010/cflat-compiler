@@ -1602,6 +1602,7 @@ extern int main()
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
     total++; passed += testNestedStructClass()           ? 1 : 0;
+    total++; passed += testInPlaceDtor()                 ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -1647,5 +1648,51 @@ bool testPointerArithmetic()
 
     delete[] arr;
     delete[] buf;
+    return result;
+}
+
+// =============================================================
+// In-place destructor (.~()) tests
+// =============================================================
+
+int g_inplace_dtor_count = 0;
+
+struct Destructible
+{
+    int value = 0;
+
+    ~Destructible()
+    {
+        g_inplace_dtor_count++;
+    }
+};
+
+bool testInPlaceDtor()
+{
+    bool result = true;
+
+    // Allocate a raw buffer large enough for 3 Destructible elements.
+    // Use .~() to destroy individual elements without freeing the buffer.
+    Destructible* buf = new Destructible[3];
+    buf[0].value = 10;
+    buf[1].value = 20;
+    buf[2].value = 30;
+
+    g_inplace_dtor_count = 0;
+
+    // Destroy element 1 in place — buffer must remain usable.
+    buf[1].~();
+    result &= Test(".~() dtor called once",  g_inplace_dtor_count, 1);
+    result &= Test(".~() buf[0] intact",     buf[0].value, 10);
+    result &= Test(".~() buf[2] intact",     buf[2].value, 30);
+
+    // Destroy the remaining two elements in place before freeing.
+    buf[0].~();
+    buf[2].~();
+    result &= Test(".~() all three called", g_inplace_dtor_count, 3);
+
+    // Free only the backing buffer — destructors already ran.
+    delete[_] buf;
+
     return result;
 }
