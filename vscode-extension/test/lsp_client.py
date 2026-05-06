@@ -1,6 +1,6 @@
 """
 Shared LSP client for MyCompiler LSP tests.
-Spawns MyCompiler.exe lsp and speaks JSON-RPC over its stdio.
+Spawns cflat.exe lsp and speaks JSON-RPC over its stdio.
 """
 
 import collections
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 class LspClient:
-    """Spawns MyCompiler.exe lsp and speaks LSP over its stdio."""
+    """Spawns cflat.exe lsp and speaks LSP over its stdio."""
 
     def __init__(self, exe: str, extra_args: list = ()):
         self._proc = subprocess.Popen(
@@ -125,14 +125,14 @@ class LspClient:
 
 
 def find_exe() -> str | None:
-    """Search standard build output locations for MyCompiler.exe."""
+    """Search standard build output locations for cflat.exe."""
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent.parent
     candidates = [
-        repo_root / "x64" / "Debug"   / "MyCompiler.exe",
-        repo_root / "x64" / "Release" / "MyCompiler.exe",
-        repo_root / "x86" / "Debug"   / "MyCompiler.exe",
-        repo_root / "x86" / "Release" / "MyCompiler.exe",
+        repo_root / "x64" / "Debug"   / "cflat.exe",
+        repo_root / "x64" / "Release" / "cflat.exe",
+        repo_root / "x86" / "Debug"   / "cflat.exe",
+        repo_root / "x86" / "Release" / "cflat.exe",
     ]
     for p in candidates:
         if p.exists():

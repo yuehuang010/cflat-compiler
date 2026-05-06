@@ -22,7 +22,7 @@
     <VCProjectVersion>18.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
     <ProjectGuid>{b1474897-ea2c-420d-84a5-c2b4b59cad24}</ProjectGuid>
-    <RootNamespace>MyCompiler</RootNamespace>
+    <RootNamespace>cflat</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

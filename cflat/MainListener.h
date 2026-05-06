@@ -1,6 +1,6 @@
 ﻿#pragma once
 // ============================================================
-// MainListener.h — CFlat front-end: ForwardRefScanner + MyListener
+// MainListener.h — CFlat front-end: ForwardRefScanner + MainListener
 // ============================================================
 // SECTION         LINE     DESCRIPTION
 // ───────────────────────────────────────────────────────────

@@ -1,11 +1,11 @@
-# Contributing to MyCompiler
+# Contributing to cflat
 
 ## Building the Compiler
 
 Requires Visual Studio 2022 and vcpkg (ANTLR4, LLVM):
 
 ```bash
-msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
+msbuild cflat/cflat.vcxproj /p:Configuration=Debug /p:Platform=x64
 ```
 
 > **Bash / Git Bash note**: Use **`-p`** (dash), not `/p` (slash). Git Bash path-converts arguments that start with `/letter:`, stripping the leading slash, which causes MSBuild to misparse the flags. Dashes are safe.
@@ -13,7 +13,7 @@ msbuild MyCompiler/MyCompiler.vcxproj /p:Configuration=Debug /p:Platform=x64
 Full msbuild path (if not on PATH):
 
 ```bash
-MSBuild.exe MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
+MSBuild.exe cflat.slnx -p:Configuration=Debug -p:Platform=x64
 ```
 
 ## Quick Development Loop

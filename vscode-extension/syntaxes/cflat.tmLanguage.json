@@ -18,7 +18,7 @@
     { "include": "#keywords-type" },
     { "include": "#keywords-qualifier" },
     { "include": "#new-expression" },
-    { "include": "#keywords-myc-extension" },
+    { "include": "#keywords-cflat-extension" },
     { "include": "#keywords-c11" },
     { "include": "#constants" },
     { "include": "#type-in-declaration" },
@@ -152,7 +152,7 @@
       "name": "storage.modifier.qualifier.cflat",
       "match": "\\b(const|volatile|restrict|_Atomic)\\b"
     },
-    "keywords-myc-extension": {
+    "keywords-cflat-extension": {
       "patterns": [
         {
           "name": "keyword.other.namespace.cflat",

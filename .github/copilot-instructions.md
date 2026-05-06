@@ -1,13 +1,13 @@
-# Copilot Instructions for MyCompiler
+# Copilot Instructions for cflat
 
 ## Project Overview
-MyCompiler is a C-dialect compiler for the CFlat language (`.cb` files), targeting LLVM IR. It's a Visual Studio 2022 C++ project using vcpkg (ANTLR4, LLVM).
+cflat is a C-dialect compiler for the CFlat language (`.cb` files), targeting LLVM IR. It's a Visual Studio 2022 C++ project using vcpkg (ANTLR4, LLVM).
 
 ## Build, Test, Run
 
 **Build** — always use the solution file (`.vcxproj` alone puts the exe in the wrong location for `test.bat`):
 ```
-msbuild MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
+msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
 ```
 In Git Bash use `-p:` (dash), not `/p:` (slash) — Git Bash mangles slash-prefixed flags.
 
@@ -24,7 +24,7 @@ Tests live in `Test/`. `.cb` tests are invoked with `-i Test\library`. Excluded 
 
 **Run a single test:**
 ```
-x64\Debug\MyCompiler.exe Test\test_operators.cb -o out\test_operators.exe --out-lli out\test_operators.ll
+x64\Debug\cflat.exe Test\test_operators.cb -o out\test_operators.exe --out-lli out\test_operators.ll
 out\test_operators.exe
 ```
 
@@ -36,15 +36,15 @@ out\test_operators.exe
 ```
 Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
     -> ForwardRefScanner (pre-pass)
-    -> MyListener (code generation)
+    -> MainListener (code generation)
     -> LLVM Module -> .ll / .bc -> native .exe
 ```
 
 ### Two-Pass Design
-`MyListener.h` contains **both** passes as separate classes:
+`MainListener.h` contains **both** passes as separate classes:
 
 1. **ForwardRefScanner** — pre-registers struct shells, function signatures, and generic instantiations. Enables forward references and monomorphizes generics (`Box<int>` -> mangled name `Box__int`, double-underscore separator). Also detects `move` parameters and `if const` blocks.
-2. **MyListener** — walks the AST and emits LLVM IR via `MyCompilerLLVM`.
+2. **MainListener** — walks the AST and emits LLVM IR via `LLVMBackend`.
 
 **Critical:** Both passes contain their own copy of `ParseDeclarationSpecifiers()`. Any type-parsing change must be made in **both** copies.
 
@@ -53,14 +53,14 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 | File | Role |
 |------|------|
 | `CFlat.g4` | ANTLR4 grammar (~1,200 lines) |
-| `MyCompilerLLVM.h/.cpp` | Type system, symbol tables, IR generation |
-| `MyListener.h` | Both AST passes (~4,100 lines) |
+| `LLVMBackend.h/.cpp` | Type system, symbol tables, IR generation |
+| `MainListener.h` | Both AST passes (~4,100 lines) |
 | `CompilerManager.h` | Crash handler: CRT assert hook, SIGABRT, LLVM fatal error — dumps state on crash |
 | `ArgParser.h` | CLI argument parsing |
-| `MyCompiler.cpp` | Entry point |
+| `main.cpp` | Entry point |
 | `core/` | Standard library — auto-compiled with every program |
 
-### Key Internal State (in `MyCompilerLLVM`)
+### Key Internal State (in `LLVMBackend`)
 - `stackNamedVariable` — deque of scopes for local variables
 - `dataStructures` — struct registry (fields, destructor, VTables)
 - `functionTable` — overload registry
@@ -75,10 +75,10 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 | Goal | Where |
 |------|-------|
 | New syntax | Edit `CFlat.g4` (rebuild regenerates ANTLR output) |
-| New type / IR op | Add to `MyCompilerLLVM.h` |
-| New statement / expression | Add `Parse*()`/`exit*()` handler in `MyListener.h` |
-| Forward-declare a construct | Add scan logic to `ForwardRefScanner` in `MyListener.h` |
-| New binary operator | `TryBinaryOperatorOverload()` in `MyListener.h` + `Operation` enum in `MyCompilerLLVM.h` |
+| New type / IR op | Add to `LLVMBackend.h` |
+| New statement / expression | Add `Parse*()`/`exit*()` handler in `MainListener.h` |
+| Forward-declare a construct | Add scan logic to `ForwardRefScanner` in `MainListener.h` |
+| New binary operator | `TryBinaryOperatorOverload()` in `MainListener.h` + `Operation` enum in `LLVMBackend.h` |
 | New soft keyword | Text-match in **both** `ParseDeclarationSpecifiers()` copies — do NOT add to the ANTLR lexer |
 
 ### Soft Keywords
@@ -88,7 +88,7 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 `move` on a parameter definition transfers ownership into the callee; the caller's pointer is automatically nulled after the call. For value types, `move` is a no-op. Implementation: `EmitOwningPtrCleanup()`, `EmitDestructorsForScope()`, `CreateOverloadedFunctionCall()`.
 
 ### Standard Library (`core/`)
-Auto-compiled with every program. To add a new module: add the `.cb` file to `core/` and add an auto-import in `MyListener.h` (follow the `interfaces.cb` import pattern).
+Auto-compiled with every program. To add a new module: add the `.cb` file to `core/` and add an auto-import in `MainListener.h` (follow the `interfaces.cb` import pattern).
 
 | File | Exports |
 |------|---------|

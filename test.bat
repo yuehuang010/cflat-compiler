@@ -7,15 +7,15 @@ REM ===========================================================================
 REM Worker mode: compile and run a single .c test, write result file
 REM All compiler/exe output goes to a log file; nothing printed to console.
 REM ===========================================================================
-if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
 
 if "%~1"=="--worker-c" (
     set NAME=%~2
-    set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
+    set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
     set SRC=Test
     set OUT=out
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -42,12 +42,12 @@ REM Worker mode: compile and run a single .cb test, write result file
 REM ===========================================================================
 if "%~1"=="--worker-cb" (
     set NAME=%~2
-    set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
+    set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
     set SRC=Test
     set LIB=Test\library
     set OUT=out
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !MYCOMPILER_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -96,11 +96,11 @@ if "%~1"=="--worker-err" (
 REM ===========================================================================
 REM Main: launch all tests in parallel, wait, collect results
 REM ===========================================================================
-set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
+set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library
 set OUT=out
-set MYCOMPILER_EXTRA=%*
+set CFLAT_EXTRA=%*
 set EXCLUDE=test_helper
 set TIMEOUT_SECS=120
 set SCRIPT=%~f0
@@ -143,7 +143,7 @@ for %%R in (%OUT%\results\*.result) do set /a DONE+=1
 if !DONE! lss !LAUNCHED! (
     if !WAITED! geq !TIMEOUT_SECS! (
         echo TIMEOUT: only !DONE! of !LAUNCHED! tests completed after !TIMEOUT_SECS!s
-        taskkill /f /im MyCompiler.exe >nul 2>&1
+        taskkill /f /im cflat.exe >nul 2>&1
         for %%F in (%OUT%\test_*.exe) do taskkill /f /im "%%~nxF" >nul 2>&1
         goto :Collect
     )

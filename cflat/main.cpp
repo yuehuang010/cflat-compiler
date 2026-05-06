@@ -1,4 +1,4 @@
-// MyCompiler.cpp : This file contains the 'main' function. Program execution begins and ends there.
+// main.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
 #include <iostream>
@@ -75,7 +75,7 @@ int main(int argc, char* argv[])
 
     bool ftimeTrace = args.hasFlag("ftime-trace");
     if (ftimeTrace)
-        llvm::timeTraceProfilerInitialize(500, "MyCompiler");
+        llvm::timeTraceProfilerInitialize(500, "cflat");
 
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);

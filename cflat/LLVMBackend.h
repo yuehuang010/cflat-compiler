@@ -1108,7 +1108,7 @@ private:
     void Init()
     {
         context = std::make_unique<llvm::LLVMContext>();
-        module = std::make_unique<llvm::Module>("MyCompiler", *context);
+        module = std::make_unique<llvm::Module>("cflat", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
 
         // Pre-register the built-in `string` value type { i8* _ptr, i32 _len }.
@@ -1356,7 +1356,7 @@ private:
                 llvm::SmallString<256> outFile;
                 llvm::sys::path::system_temp_directory(true, outFile);
                 int outFD;
-                if (!llvm::sys::fs::createTemporaryFile("mycompiler_vswhere", "txt", outFD, outFile))
+                if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
                 {
                     _close(outFD);
                     std::string outFileStr = outFile.str().str();
@@ -1522,7 +1522,7 @@ public:
         module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
         module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
         diFile = diBuilder->createFile(filename, directory);
-        compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "MyCompiler", false, "", 0);
+        compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "cflat", false, "", 0);
     }
 
     void FinalizeDebugInfo()
@@ -5140,7 +5140,7 @@ public:
     void ResetForReanalysis();
 };
 
-// Defined here so MyCompilerLLVM is fully declared before DumpState() is called.
+// Defined here so LLVMBackend is fully declared before DumpState() is called.
 inline void CompilerManager::DumpAllState() const
 {
     if (compilers_.empty())

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-MyCompiler is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
+cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
 
 ## Plan
 
@@ -23,7 +23,7 @@ Provide an Architecture overview before analyzing code changes.  Verify with the
 Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
-msbuild MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
+msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
 ```
 
 > **Bash / Git Bash note**: Use **`-p:`** (dash), not `/p:` (slash). Git Bash path-converts arguments that start with `/letter:`, stripping the leading slash, which causes MSBuild to misparse the flags. Dashes are safe.
@@ -31,10 +31,10 @@ msbuild MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64
 Full msbuild path (if not on PATH):
 
 ```bash
-"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" MyCompiler.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
+"/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" cflat.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
 ```
 
-**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `MyCompiler/Test/test_generics.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
+**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `cflat/Test/test_generics.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
 
 ```bash
 ./buildAndRun.bat
@@ -44,13 +44,13 @@ Full msbuild path (if not on PATH):
 
 ```bash
 # Compile to native executable
-x64/Debug/MyCompiler.exe input.cb -o out.exe
+x64/Debug/cflat.exe input.cb -o out.exe
 
 # Also dump LLVM IR
-x64/Debug/MyCompiler.exe input.cb -o out.exe --out-lli out.ll
+x64/Debug/cflat.exe input.cb -o out.exe --out-lli out.ll
 
 # Execute IR directly via lli
-x64/Debug/MyCompiler.exe input.cb --out-lli out.ll && lli.exe out.ll
+x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll
 ```
 
 The compiler automatically locates `runtime.cb` next to the executable. Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
@@ -90,7 +90,7 @@ LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`,
 To run a single test manually:
 
 ```bash
-x64/Debug/MyCompiler.exe Test/test_operators.cb -i Test/library -o out/test_operators.exe --out-lli out/test_operators.ll
+x64/Debug/cflat.exe Test/test_operators.cb -i Test/library -o out/test_operators.exe --out-lli out/test_operators.ll
 out\test_operators.exe
 ```
 
@@ -103,7 +103,7 @@ test.bat uses wildard `Test/*.*` to locate tests.  Remember to remove debug test
 Negative tests live in `Test/errors/` and use the `expect_error` compiler built-in. `test.bat` compiles each `err_*.cb` and expects exit code 0. To run one individually:
 
 ```bash
-x64/Debug/MyCompiler.exe Test/errors/err_missing_return.cb -i Test/library
+x64/Debug/cflat.exe Test/errors/err_missing_return.cb -i Test/library
 # prints: PASS: expected error received
 # exit code: 0
 ```
@@ -282,7 +282,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
 | `cruntime.cb` | Raw C runtime bindings (printf, memcpy, etc.) |
 
-To add a new core library: add the `.cb` file to `core/` and add an entry in MyCompiler.vcxproj with DeploymentContent.
+To add a new core library: add the `.cb` file to `core/` and add an entry in cflat.vcxproj with DeploymentContent.
 Use nullptr instead of null;
 Always assign "default" to fields.
 
@@ -311,7 +311,7 @@ Never compile benchmarks manually without `-O2`. Unoptimized numbers are mislead
 Manual compile (if needed):
 
 ```bash
-x64/Debug/MyCompiler.exe performance/perf_yes_compare.cb -i MyCompiler/core -o performance/perf_yes_compare.exe -O2
+x64/Debug/cflat.exe performance/perf_yes_compare.cb -i cflat/core -o performance/perf_yes_compare.exe -O2
 ```
 
 ### Benchmark files

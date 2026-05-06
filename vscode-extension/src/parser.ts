@@ -759,7 +759,7 @@ export function parseCompilerOutput(output: string, lineCount: number): Diagnost
                         end: { line: lineNum, character: colNum + 1 }
                     },
                     message,
-                    source: 'MyCompiler'
+                    source: 'cflat'
                 });
             }
             continue;
@@ -785,7 +785,7 @@ export function parseCompilerOutput(output: string, lineCount: number): Diagnost
                         end: { line: lineNum, character: colNum + 1 }
                     },
                     message,
-                    source: 'MyCompiler'
+                    source: 'cflat'
                 });
             }
             continue;
@@ -800,7 +800,7 @@ export function parseCompilerOutput(output: string, lineCount: number): Diagnost
                     end: { line: 0, character: 1 }
                 },
                 message: match[2].trim(),
-                source: 'MyCompiler'
+                source: 'cflat'
             });
         }
     }

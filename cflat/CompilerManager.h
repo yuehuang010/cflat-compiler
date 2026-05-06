@@ -8,7 +8,7 @@
 
 class LLVMBackend;
 
-// DumpAllState is defined after MyCompilerLLVM is fully declared (see bottom of MyCompilerLLVM.h).
+// DumpAllState is defined after LLVMBackend is fully declared (see bottom of LLVMBackend.h).
 // This header only holds the class layout and the hook installer.
 
 class CompilerManager
@@ -45,7 +45,7 @@ public:
         llvm::install_fatal_error_handler(&CompilerManager::LLVMFatalHandler, nullptr);
     }
 
-    void DumpAllState() const; // defined after MyCompilerLLVM is fully declared
+    void DumpAllState() const; // defined after LLVMBackend is fully declared
 
     CompilerManager(const CompilerManager&) = delete;
     CompilerManager& operator=(const CompilerManager&) = delete;

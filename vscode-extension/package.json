@@ -1,9 +1,9 @@
 {
-  "name": "mycompiler-language",
-  "displayName": "MyCompiler Language Support",
-  "description": "Syntax highlighting, diagnostics, and completions for MyCompiler C dialect",
+  "name": "cflat-language",
+  "displayName": "cflat Language Support",
+  "description": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
   "version": "0.1.0",
-  "publisher": "mycompiler",
+  "publisher": "cflat",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -37,19 +37,19 @@
     ],
     "configuration": {
       "type": "object",
-      "title": "MyCompiler",
+      "title": "cflat",
       "properties": {
-        "mycompiler.executablePath": {
+        "cflat.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to MyCompiler.exe. Leave blank to auto-detect from common build output locations relative to workspace."
+          "description": "Path to cflat.exe. Leave blank to auto-detect from common build output locations relative to workspace."
         },
-        "mycompiler.enableDiagnostics": {
+        "cflat.enableDiagnostics": {
           "type": "boolean",
           "default": true,
-          "description": "Run MyCompiler.exe on save and show errors/warnings inline."
+          "description": "Run cflat.exe on save and show errors/warnings inline."
         },
-        "mycompiler.diagnosticDelay": {
+        "cflat.diagnosticDelay": {
           "type": "number",
           "default": 500,
           "description": "Milliseconds to wait after a change before re-running diagnostics."

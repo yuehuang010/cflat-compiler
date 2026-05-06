@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo === MyCompiler VSCode Extension - Package and Install ===
+echo === cflat VSCode Extension - Package and Install ===
 echo.
 
 REM Check prerequisites
@@ -73,6 +73,6 @@ echo   Name   : %VSIX_FILE%
 echo   Reload VSCode (Ctrl+Shift+P -> "Developer: Reload Window") to activate.
 echo.
 echo TIP: After reloading, open a .cb file to activate the language server.
-echo      Set mycompiler.executablePath in Settings if auto-detect doesn't find your build.
+echo      Set cflat.executablePath in Settings if auto-detect doesn't find your build.
 echo.
 endlocal

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Smoke test for MyCompiler.exe lsp -- runs without VS Code.
+Smoke test for cflat.exe lsp -- runs without VS Code.
 
 Usage (from repo root):
     python vscode-extension/test/lsp_test.py
 
 Or pass the exe path explicitly:
-    python vscode-extension/test/lsp_test.py path/to/MyCompiler.exe
+    python vscode-extension/test/lsp_test.py path/to/cflat.exe
 
 Exit code: 0 = all passed, 1 = one or more failures.
 """
@@ -177,7 +177,7 @@ def main():
         exe = find_exe()
         if exe is None:
             print(
-                "error: MyCompiler.exe not found. Build the project first, or pass the path as an argument.",
+                "error: cflat.exe not found. Build the project first, or pass the path as an argument.",
                 file=sys.stderr,
             )
             sys.exit(1)

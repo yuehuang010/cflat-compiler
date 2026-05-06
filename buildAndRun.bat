@@ -1,13 +1,15 @@
 @echo off
 setlocal
 
-if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
+
+echo CFLAT_CONFIG=%CFLAT_CONFIG%
 
 set TESTFILE=%1
 if "%TESTFILE%"=="" set TESTFILE=test_basic.cb
 
-msbuild MyCompiler.slnx -p:Platform=x64 -p:Configuration=%MYCOMPILER_CONFIG% -v:minimal && (
-    C:\source\MyCompiler\x64\%MYCOMPILER_CONFIG%\MyCompiler.exe --nologo Test\%TESTFILE% -o out\myapp.exe --out-lli out.ll -p win64
+msbuild cflat.slnx -p:Platform=x64 -p:Configuration=%CFLAT_CONFIG% -v:minimal -nologo && (
+    C:\source\MyCompiler\x64\%CFLAT_CONFIG%\cflat.exe --nologo Test\%TESTFILE% -o out\myapp.exe --out-lli out.ll -p win64
     if not errorlevel 1 out\myapp.exe
 )
 

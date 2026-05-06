@@ -181,7 +181,7 @@ describe('parseCompilerOutput', () => {
         expect(diags[0].range.start.line).toBe(2);
         expect(diags[0].range.start.character).toBe(5);
         expect(diags[0].message).toBe('no viable alternative at input');
-        expect(diags[0].source).toBe('MyCompiler');
+        expect(diags[0].source).toBe('cflat');
     });
 
     it('parses GCC/LLVM error format', () => {

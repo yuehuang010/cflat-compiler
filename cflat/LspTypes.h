@@ -29,7 +29,7 @@ struct Diagnostic
     Range range;
     int severity = 1;  // 1=Error, 2=Warning, 3=Information, 4=Hint
     std::string message;
-    std::string source = "mycompiler";
+    std::string source = "cflat";
 };
 
 struct TextEdit

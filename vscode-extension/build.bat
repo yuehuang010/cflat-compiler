@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo === MyCompiler VSCode Extension Build ===
+echo === cflat VSCode Extension Build ===
 echo.
 
 REM Check for Node.js

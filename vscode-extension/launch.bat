@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo === MyCompiler VSCode Extension - Development Launch ===
+echo === cflat VSCode Extension - Development Launch ===
 echo.
 
 REM Check for VSCode
@@ -36,7 +36,7 @@ REM Strip trailing backslash from extension path (VSCode rejects it)
 set EXT_PATH=%~dp0
 if "%EXT_PATH:~-1%"=="\" set EXT_PATH=%EXT_PATH:~0,-1%
 
-REM Determine workspace folder to open (default to MyCompiler source root)
+REM Determine workspace folder to open (default to cflat source root)
 set WORKSPACE=%~dp0..
 if "%~1" neq "" set WORKSPACE=%~1
 
@@ -53,7 +53,7 @@ echo VSCode launched. A new window should appear momentarily.
 echo.
 echo Tips:
 echo   - Open a .cb file to activate the language server.
-echo   - View -> Output -> "MyCompiler Language Server" to see server logs.
+echo   - View -> Output -> "cflat Language Server" to see server logs.
 echo   - Press F5 inside the extension source to attach the debugger (port 6009).
 echo   - Run build.bat and restart VSCode to pick up code changes.
 echo.

@@ -12,17 +12,17 @@ let client: LanguageClient;
 
 function findCompilerExecutable(): string | undefined {
     // 1. Explicit setting always wins.
-    const configured = vscode.workspace.getConfiguration('mycompiler').get<string>('executablePath');
+    const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
     if (configured && configured.trim() !== '') {
         return configured.trim();
     }
 
     // 2. Scan common build-output locations relative to each workspace folder.
     const candidates = [
-        path.join('x64', 'Debug',   'MyCompiler.exe'),
-        path.join('x64', 'Release', 'MyCompiler.exe'),
-        path.join('x86', 'Debug',   'MyCompiler.exe'),
-        path.join('x86', 'Release', 'MyCompiler.exe'),
+        path.join('x64', 'Debug',   'cflat.exe'),
+        path.join('x64', 'Release', 'cflat.exe'),
+        path.join('x86', 'Debug',   'cflat.exe'),
+        path.join('x86', 'Release', 'cflat.exe'),
     ];
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
         for (const rel of candidates) {
@@ -37,10 +37,10 @@ function findCompilerExecutable(): string | undefined {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-    const outputChannel = vscode.window.createOutputChannel('MyCompiler Language Server');
+    const outputChannel = vscode.window.createOutputChannel('cflat Language Server');
     context.subscriptions.push(outputChannel);
 
-    outputChannel.appendLine('=== MyCompiler Extension Activating ===');
+    outputChannel.appendLine('=== cflat Extension Activating ===');
     outputChannel.appendLine(`Extension path : ${context.extensionPath}`);
     outputChannel.appendLine(`Log directory  : ${context.logUri.fsPath}`);
 
@@ -51,16 +51,16 @@ export function activate(context: vscode.ExtensionContext): void {
         workspaceFolders.forEach(f => outputChannel.appendLine(`Workspace folder: ${f.uri.fsPath}`));
     }
 
-    const configured = vscode.workspace.getConfiguration('mycompiler').get<string>('executablePath');
-    outputChannel.appendLine(`mycompiler.executablePath setting: "${configured ?? ''}"`);
+    const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
+    outputChannel.appendLine(`cflat.executablePath setting: "${configured ?? ''}"`);
 
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: MyCompiler.exe not found — checked x64/Debug, x64/Release, x86/Debug, x86/Release relative to each workspace folder.');
+        outputChannel.appendLine('ERROR: cflat.exe not found — checked x64/Debug, x64/Release, x86/Debug, x86/Release relative to each workspace folder.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
-            'MyCompiler: could not find MyCompiler.exe. ' +
-            'Set mycompiler.executablePath in settings or build the project first.'
+            'cflat: could not find cflat.exe. ' +
+            'Set cflat.executablePath in settings or build the project first.'
         );
         return;
     }
@@ -88,8 +88,8 @@ export function activate(context: vscode.ExtensionContext): void {
     };
 
     client = new LanguageClient(
-        'mycompilerLanguageServer',
-        'MyCompiler Language Server',
+        'cflatLanguageServer',
+        'cflat Language Server',
         serverOptions,
         clientOptions
     );
@@ -100,10 +100,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Command: manually trigger diagnostics on current file
     context.subscriptions.push(
-        vscode.commands.registerCommand('mycompiler.runDiagnostics', () => {
+        vscode.commands.registerCommand('cflat.runDiagnostics', () => {
             const editor = vscode.window.activeTextEditor;
             if (editor && editor.document.languageId === 'cflat') {
-                client.sendNotification('mycompiler/runDiagnostics', {
+                client.sendNotification('cflat/runDiagnostics', {
                     uri: editor.document.uri.toString()
                 });
             }
@@ -112,13 +112,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Command: show compiler output channel
     context.subscriptions.push(
-        vscode.commands.registerCommand('mycompiler.showOutput', () => {
+        vscode.commands.registerCommand('cflat.showOutput', () => {
             client.outputChannel.show();
         })
     );
 
     context.subscriptions.push(
-        vscode.window.setStatusBarMessage('MyCompiler Language Server started', 3000)
+        vscode.window.setStatusBarMessage('cflat Language Server started', 3000)
     );
 }
 

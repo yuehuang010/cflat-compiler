@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fixture-driven LSP tests for MyCompiler.exe lsp.
+Fixture-driven LSP tests for cflat.exe lsp.
 
 Each .cb file in Test/lsp/fixtures/ may contain directive comments:
     // $cursor line=N col=N        -- LSP position for hover/definition/completion
@@ -15,7 +15,7 @@ Directives are stripped before sending source to the LSP server, so the
 line/col in $cursor refers to positions in the stripped source.
 
 Usage:
-    python vscode-extension/test/lsp_fixture_test.py [path/to/MyCompiler.exe]
+    python vscode-extension/test/lsp_fixture_test.py [path/to/cflat.exe]
 
 Exit code: 0 = all passed, 1 = one or more failures.
 """
@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lsp_client import LspClient, find_exe, initialize, wait_diagnostics_for
 
 REPO_ROOT = Path(__file__).parent.parent.parent
-FIXTURE_DIR = REPO_ROOT / "MyCompiler" / "Test" / "lsp" / "fixtures"
+FIXTURE_DIR = REPO_ROOT / "cflat" / "Test" / "lsp" / "fixtures"
 
 # Virtual URI prefix — server analyzes via temp files internally, so these
 # paths don't need to exist on disk.
@@ -523,7 +523,7 @@ def main():
         exe = find_exe()
         if exe is None:
             print(
-                "error: MyCompiler.exe not found. Build first, or pass the path as an argument.",
+                "error: cflat.exe not found. Build first, or pass the path as an argument.",
                 file=sys.stderr,
             )
             sys.exit(1)

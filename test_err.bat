@@ -1,8 +1,8 @@
 @echo off
 setlocal
 
-if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
-set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
+set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library
 set GROUP=0

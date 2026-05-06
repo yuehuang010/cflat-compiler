@@ -1320,7 +1320,7 @@ string literal = "result: {{value}}";   // "result: {value}"
 Pass `-g` to emit DWARF debug information for use with debuggers:
 
 ```bash
-MyCompiler.exe app.cb -o app.ll -g
+cflat.exe app.cb -o app.ll -g
 ```
 
 ---
@@ -1328,7 +1328,7 @@ MyCompiler.exe app.cb -o app.ll -g
 ## Compiler CLI
 
 ```
-MyCompiler.exe <input.cb> [options]
+cflat.exe <input.cb> [options]
 ```
 
 | Flag | Description |

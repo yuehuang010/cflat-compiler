@@ -1,4 +1,4 @@
-// DEPRECATED: replaced by MyCompiler.exe lsp (stdio transport in extension.ts).
+// DEPRECATED: replaced by cflat.exe lsp (stdio transport in extension.ts).
 // Remove once the native LSP server is stable.
 import {
     createConnection,
@@ -110,7 +110,7 @@ function getDocumentSettings(resource: string): Promise<MycSettings> {
     if (!result) {
         result = connection.workspace.getConfiguration({
             scopeUri: resource,
-            section: 'mycompiler'
+            section: 'cflat'
         }) as Promise<MycSettings>;
         documentSettings.set(resource, result);
     }
@@ -164,21 +164,21 @@ function findCompilerExecutable(settings: MycSettings, folders: string[]): strin
     }
 
     const candidates = [
-        'x64\\Debug\\MyCompiler.exe',
-        'x64\\Release\\MyCompiler.exe',
-        'Win32\\Debug\\MyCompiler.exe',
-        'Win32\\Release\\MyCompiler.exe',
-        'Debug\\MyCompiler.exe',
-        'Release\\MyCompiler.exe',
-        'build\\MyCompiler.exe',
-        'MyCompiler.exe'
+        'x64\\Debug\\cflat.exe',
+        'x64\\Release\\cflat.exe',
+        'Win32\\Debug\\cflat.exe',
+        'Win32\\Release\\cflat.exe',
+        'Debug\\cflat.exe',
+        'Release\\cflat.exe',
+        'build\\cflat.exe',
+        'cflat.exe'
     ];
 
     for (const folder of folders) {
         for (const candidate of candidates) {
             const full = path.join(folder, candidate);
             if (fs.existsSync(full)) {
-                connection.console.log(`Found MyCompiler.exe at: ${full}`);
+                connection.console.log(`Found cflat.exe at: ${full}`);
                 return full;
             }
         }
@@ -202,7 +202,7 @@ async function validateDocument(document: TextDocument): Promise<void> {
     const exePath = findCompilerExecutable(settings, workspaceFolders);
     if (!exePath) {
         connection.console.warn(
-            'MyCompiler.exe not found. Set mycompiler.executablePath in settings, ' +
+            'cflat.exe not found. Set cflat.executablePath in settings, ' +
             'or build the project so the executable appears in a standard output directory.'
         );
         connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
@@ -240,7 +240,7 @@ function runCompiler(exePath: string, inputFile: string, lineCount: number) {
         proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
 
         proc.on('error', err => {
-            connection.console.error(`Failed to start MyCompiler.exe: ${err.message}`);
+            connection.console.error(`Failed to start cflat.exe: ${err.message}`);
             resolve([]);
         });
 
@@ -259,7 +259,7 @@ function runCompiler(exePath: string, inputFile: string, lineCount: number) {
 // Manual trigger notification
 // ---------------------------------------------------------------------------
 
-connection.onNotification('mycompiler/runDiagnostics', (params: { uri: string }) => {
+connection.onNotification('cflat/runDiagnostics', (params: { uri: string }) => {
     const doc = documents.get(params.uri);
     if (doc) validateDocument(doc);
 });

@@ -262,7 +262,7 @@ private:
             HandleDefinition(msg, id);
         else if (method == "textDocument/completion")
             HandleCompletion(msg, id);
-        else if (method == "mycompiler/runDiagnostics")
+        else if (method == "cflat/runDiagnostics")
             HandleRunDiagnostics(msg);
         else if (method == "shutdown")
         {
@@ -299,7 +299,7 @@ private:
                 }}
             }},
             {"serverInfo", {
-                {"name", "MyCompiler LSP"},
+                {"name", "cflat LSP"},
                 {"version", "1.0"}
             }}
         };
