@@ -1,7 +1,8 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-set COMPILER=x64\Debug\MyCompiler.exe
+if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
+set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
 set PERF_SRC=performance
 set OUT=out\perf
 set SCRIPT=%~f0

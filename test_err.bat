@@ -1,7 +1,8 @@
 @echo off
 setlocal
 
-set COMPILER=x64\Debug\MyCompiler.exe
+if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
+set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
 set SRC=Test
 set LIB=Test\library
 set GROUP=0

@@ -7,9 +7,11 @@ REM ===========================================================================
 REM Worker mode: compile and run a single .c test, write result file
 REM All compiler/exe output goes to a log file; nothing printed to console.
 REM ===========================================================================
+if "%MYCOMPILER_CONFIG%"=="" set MYCOMPILER_CONFIG=Debug
+
 if "%~1"=="--worker-c" (
     set NAME=%~2
-    set COMPILER=x64\Debug\MyCompiler.exe
+    set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
     set SRC=Test
     set OUT=out
     set T0=!TIME!
@@ -40,7 +42,7 @@ REM Worker mode: compile and run a single .cb test, write result file
 REM ===========================================================================
 if "%~1"=="--worker-cb" (
     set NAME=%~2
-    set COMPILER=x64\Debug\MyCompiler.exe
+    set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
     set SRC=Test
     set LIB=Test\library
     set OUT=out
@@ -94,7 +96,7 @@ if "%~1"=="--worker-err" (
 REM ===========================================================================
 REM Main: launch all tests in parallel, wait, collect results
 REM ===========================================================================
-set COMPILER=x64\Debug\MyCompiler.exe
+set COMPILER=x64\%MYCOMPILER_CONFIG%\MyCompiler.exe
 set SRC=Test
 set LIB=Test\library
 set OUT=out

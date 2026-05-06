@@ -10,6 +10,7 @@
 #include <llvm\Transforms\Scalar\SROA.h>
 #include <llvm\Transforms\InstCombine\InstCombine.h>
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
+#include <llvm\Support\TimeProfiler.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -68,6 +69,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
 {
     auto filename = args.getPositional(0).value_or("");
     sourceFileName = std::filesystem::path(filename).filename().string();
+    llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
     importedFiles.insert(rootCanonical);
@@ -159,6 +161,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
 
     if (!runtimeDir.empty() && !skipRuntimeImport)
     {
+        llvm::TimeTraceScope runtimeScope("RuntimeImport", "runtime.cb");
         auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
         if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
         if (std::filesystem::exists(runtimePath))
@@ -184,9 +187,12 @@ bool LLVMBackend::Compile(const ArgParser& args)
         parser.removeErrorListeners();
         parser.addErrorListener(&errorListener);
 
-        tokens.fill();
-
-        auto computeUnit = parser.compilationUnit();
+        CFlatParser::CompilationUnitContext* computeUnit;
+        {
+            llvm::TimeTraceScope parseScope("Parse", sourceFileName);
+            tokens.fill();
+            computeUnit = parser.compilationUnit();
+        }
         if (verbose) std::cout << "[verbose]   parse complete (" << tokens.getTokens().size() << " tokens)\n";
 
         if (errorListener.hasErrors())
@@ -197,14 +203,17 @@ bool LLVMBackend::Compile(const ArgParser& args)
 
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
-        if (auto* tu = computeUnit->translationUnit()) {
-            for (auto* decl : tu->externalDeclaration()) {
-                if (auto* imp = decl->importDeclaration()) {
-                    std::string raw = imp->StringLiteral()->getText();
-                    std::string importFilename = raw.substr(1, raw.size() - 2);
-                    if (verbose) std::cout << "[verbose] import requested: " << importFilename << "\n";
-                    if (!CompileImportedFile(filename, importFilename))
-                        return false;
+        {
+            llvm::TimeTraceScope importsScope("ProcessImports", sourceFileName);
+            if (auto* tu = computeUnit->translationUnit()) {
+                for (auto* decl : tu->externalDeclaration()) {
+                    if (auto* imp = decl->importDeclaration()) {
+                        std::string raw = imp->StringLiteral()->getText();
+                        std::string importFilename = raw.substr(1, raw.size() - 2);
+                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << "\n";
+                        if (!CompileImportedFile(filename, importFilename))
+                            return false;
+                    }
                 }
             }
         }
@@ -212,6 +221,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
         // Pre-scan: register all function signatures and struct type shells so
         // that forward references resolve during the main code-gen walk.
         {
+            llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
             if (verbose) std::cout << "[verbose] forward-ref scan (" << sourceFileName << ")\n";
             ForwardRefScanner scanner(this);
             // First pass: pre-declare opaque types and constructors for every
@@ -227,15 +237,21 @@ bool LLVMBackend::Compile(const ArgParser& args)
         }
 
         if (verbose) std::cout << "[verbose] code-gen walk (" << sourceFileName << ")\n";
-        auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
-        auto walker = antlr4::tree::ParseTreeWalker();
-        walker.walk(myListener.get(), computeUnit);
+        {
+            llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
+            auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            auto walker = antlr4::tree::ParseTreeWalker();
+            walker.walk(myListener.get(), computeUnit);
+        }
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
     }
 
-    if (verbose) std::cout << "[verbose] finalizing debug info\n";
-    FinalizeDebugInfo();
+    {
+        llvm::TimeTraceScope debugScope("FinalizeDebugInfo");
+        if (verbose) std::cout << "[verbose] finalizing debug info\n";
+        FinalizeDebugInfo();
+    }
 
     // validate that the stack is empty.
     if (stackNamedVariable.size() > 0)
@@ -256,6 +272,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
 
     if (lliPath)
     {
+        llvm::TimeTraceScope irScope("WriteIR", *lliPath);
         if (verbose) std::cout << "[verbose] writing IR to " << *lliPath << "\n";
         if (!SaveToFile(*lliPath))
         {
@@ -264,15 +281,19 @@ bool LLVMBackend::Compile(const ArgParser& args)
         }
     }
 
-    if (verbose) std::cout << "[verbose] verifying module\n";
-    if (!VerifyModule())
     {
-        std::cerr << "Error: module verification failed.\n";
-        return false;
+        llvm::TimeTraceScope verifyScope("VerifyModule");
+        if (verbose) std::cout << "[verbose] verifying module\n";
+        if (!VerifyModule())
+        {
+            std::cerr << "Error: module verification failed.\n";
+            return false;
+        }
     }
 
     if (!args.hasFlag("no-opt"))
     {
+        llvm::TimeTraceScope baselineScope("BaselinePasses");
         if (verbose) std::cout << "[verbose] running baseline passes (sroa, mem2reg, instcombine, simplifycfg)\n";
         RunBaselinePasses();
     }
@@ -280,6 +301,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     int optLevel = args.getOptimizationLevel();
     if (optLevel > 0)
     {
+        llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
         if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel << ")\n";
         OptimizeModule(optLevel);
     }
@@ -296,6 +318,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
 
     if (exePath)
     {
+        llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
         if (verbose) std::cout << "[verbose] emitting executable to " << *exePath << "\n";
         if (!EmitExecutable(*exePath, platformOption))
         {
@@ -368,6 +391,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     } importGuard{importStack};
 
     if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
+    llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
     // Persist parse state for the lifetime of the compiler — generic template
     // ctx pointers from imported files must remain valid when instantiated later
@@ -392,8 +416,12 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     state.parser->removeErrorListeners();
     state.parser->addErrorListener(&importErrorListener);
 
-    state.tokens->fill();
-    auto computeUnit = state.parser->compilationUnit();
+    CFlatParser::CompilationUnitContext* computeUnit;
+    {
+        llvm::TimeTraceScope parseScope("Parse", importFilename);
+        state.tokens->fill();
+        computeUnit = state.parser->compilationUnit();
+    }
     if (verbose) std::cout << "[verbose]   parse complete (" << state.tokens->getTokens().size() << " tokens)\n";
 
     if (importErrorListener.hasErrors())
@@ -429,6 +457,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
 
     // Forward-ref scan the imported file
     {
+        llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
         if (verbose) std::cout << "[verbose]   forward-ref scan: " << importFilename << "\n";
         ForwardRefScanner scanner(this);
         if (auto* tu = computeUnit->translationUnit())
@@ -438,8 +467,11 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
 
     // Code-gen walk the imported file
     if (verbose) std::cout << "[verbose]   code-gen walk: " << importFilename << "\n";
-    auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
-    antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
+    {
+        llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
+        auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
+        antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
+    }
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
 
     sourceFileName = savedSourceFileName;

@@ -5,6 +5,11 @@
 #include <filesystem>
 #include <stdlib.h>
 
+#pragma warning(push)
+#pragma warning(disable: 4244 4267)
+#include <llvm/Support/TimeProfiler.h>
+#pragma warning(pop)
+
 #include "LLVMBackend.h"
 #include "CompilerManager.h"
 #include "ArgParser.h"
@@ -40,6 +45,7 @@ int main(int argc, char* argv[])
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
     args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
     args.addFlag("nologo", 0, "Hide compiler version and completion messages");
+    args.addFlag("ftime-trace", 0, "Write compilation time trace to <input>.time-trace.json");
 
     if (!args.parse(argc, argv))
         return 1;
@@ -67,11 +73,27 @@ int main(int argc, char* argv[])
     _get_pgmptr(&pgmptr);
     std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
 
+    bool ftimeTrace = args.hasFlag("ftime-trace");
+    if (ftimeTrace)
+        llvm::timeTraceProfilerInitialize(500, "MyCompiler");
+
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
-    if (!compiler.Compile(args))
+    bool ok = compiler.Compile(args);
+
+    if (ftimeTrace)
+    {
+        auto tracePath = std::filesystem::path(*filename).stem().string() + ".time-trace.json";
+        if (auto err = llvm::timeTraceProfilerWrite(tracePath, ""))
+            llvm::consumeError(std::move(err));
+        else if (showLogo)
+            std::cout << "Time trace written to " << tracePath << "\n";
+        llvm::timeTraceProfilerCleanup();
+    }
+
+    if (!ok)
     {
         std::cerr << "Compilation failed.\n";
         return 1;
