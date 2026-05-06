@@ -66,6 +66,13 @@
     <None Include="core\spsc_queue.cb" />
     <None Include="core\json.cb" />
     <None Include="core\arena.cb" />
+    <None Include="core\array.cb" />
+    <None Include="core\memory.cb" />
+    <None Include="core\os.cb" />
+    <None Include="core\os.windows.cb" />
+    <None Include="core\page_arena.cb" />
+    <None Include="core\arena_channel.cb" />
+    <None Include="core\stream.cb" />
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="CFlat.g4" />
