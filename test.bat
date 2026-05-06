@@ -152,6 +152,7 @@ if !DONE! lss !LAUNCHED! (
 
 :Collect
 set /a ERRORS=0
+set FAILED_NAMES=
 for %%R in (%OUT%\results\*.result) do (
     set /p RESULT=<"%%R"
     if /I "!RESULT:~0,4!" neq "PASS" (
@@ -160,6 +161,14 @@ for %%R in (%OUT%\results\*.result) do (
         type "%%~dpnR.log"
         echo !RESULT!
         set /a ERRORS+=1
+        if !ERRORS! leq 3 (
+            if defined FAILED_NAMES (
+                set FAILED_NAMES=!FAILED_NAMES!, %%~nR
+            ) else (
+                set FAILED_NAMES=%%~nR
+            )
+        )
+        if !ERRORS! equ 4 set FAILED_NAMES=!FAILED_NAMES!, ...
     ) else (
         set ELAPSED=!RESULT:~5!
         echo PASSED: %%~nR  [!ELAPSED!]
@@ -172,7 +181,7 @@ if %ERRORS% EQU 0 (
     echo All tests passed.
     exit /b 0
 ) else (
-    echo %ERRORS% tests failed.
+    echo %ERRORS% tests failed. [!FAILED_NAMES!]
     exit /b 1
 )
 
