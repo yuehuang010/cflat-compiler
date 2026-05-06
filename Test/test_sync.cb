@@ -226,6 +226,67 @@ bool testLockStatement() {
     return result;
 }
 
+bool testLockBreak() {
+    bool result = true;
+    mutex m;
+    int i = 0;
+    while (i < 3) {
+        lock (m) {
+            if (i == 1) break;
+        }
+        i++;
+    }
+    // If break didn't release, acquire() would deadlock.
+    m.acquire();
+    m.release();
+    result &= Test("lock break releases mutex", i, 1);
+    m.destroy();
+    return result;
+}
+
+bool testLockContinue() {
+    bool result = true;
+    mutex m;
+    int count = 0;
+    int i = 0;
+    while (i < 5) {
+        i++;
+        lock (m) {
+            if (i % 2 == 0) continue;
+            count++;
+        }
+    }
+    // If continue didn't release, acquire() would deadlock.
+    m.acquire();
+    m.release();
+    result &= Test("lock continue releases mutex", count, 3);
+    m.destroy();
+    return result;
+}
+
+bool testNestedLockBreak() {
+    bool result = true;
+    mutex m1;
+    mutex m2;
+    int i = 0;
+    while (i < 3) {
+        lock (m1) {
+            lock (m2) {
+                if (i == 1) break;
+            }
+        }
+        i++;
+    }
+    m1.acquire();
+    m1.release();
+    m2.acquire();
+    m2.release();
+    result &= Test("nested lock break releases both mutexes", i, 1);
+    m1.destroy();
+    m2.destroy();
+    return result;
+}
+
 bool testMutexWithThreads() {
     bool result = true;
     mutex m;
@@ -902,6 +963,9 @@ extern int main() {
     // Mutex / atomic tests
     total++; passed += testMutexManual()              ? 1 : 0;
     total++; passed += testLockStatement()            ? 1 : 0;
+    total++; passed += testLockBreak()                ? 1 : 0;
+    total++; passed += testLockContinue()             ? 1 : 0;
+    total++; passed += testNestedLockBreak()          ? 1 : 0;
     total++; passed += testMutexWithThreads()         ? 1 : 0;
     total++; passed += testAtomicCounterIncrement()   ? 1 : 0;
     total++; passed += testAtomicCounterDecrement()   ? 1 : 0;

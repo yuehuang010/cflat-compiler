@@ -4932,16 +4932,15 @@ public:
 
     void CreateBreakCall()
     {
-        // check if break has already been inserted.
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
-        for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+        for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
-            auto resumeBlock = stackFrame.resumeBlock;
-            if (resumeBlock)
+            EmitDestructorsForScope(stackFrame);
+            if (stackFrame.resumeBlock)
             {
-                auto result = builder->CreateBr(resumeBlock);
+                builder->CreateBr(stackFrame.resumeBlock);
                 break;
             }
         }
@@ -4949,18 +4948,17 @@ public:
 
     void CreateContinueCall()
     {
-        // check if break has already been inserted.
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
-        for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+        for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
-            auto continueBlock = stackFrame.continueBlock;
-            if (continueBlock)
+            if (stackFrame.continueBlock)
             {
-                auto result = builder->CreateBr(continueBlock);
+                builder->CreateBr(stackFrame.continueBlock);
                 break;
             }
+            EmitDestructorsForScope(stackFrame);
         }
     }
 

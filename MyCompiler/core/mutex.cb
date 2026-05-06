@@ -11,9 +11,6 @@
 //   m.sleep_cv(cv);         // atomically sleep on a condition variable, releasing the lock
 //   m.destroy();            // no-op for SRW; present for symmetry with older code
 //
-// NOTE: break / continue that escape a lock {} block will NOT call unlock.
-// Avoid breaking out of a lock block.
-//
 // NOTE: SRW locks are NOT recursive. A thread that calls acquire() twice without
 // an intervening release() will deadlock. Use a CRITICAL_SECTION if you need recursion.
 
