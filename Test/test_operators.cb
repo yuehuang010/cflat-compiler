@@ -12,6 +12,23 @@ struct Vec2
     Vec2 operator/(float s)    { Vec2 r; r.x = x / s;       r.y = y / s;       return r; }
     bool operator==(Vec2 other) { return x == other.x && y == other.y; }
     bool operator!=(Vec2 other) { return x != other.x || y != other.y; }
+    Vec2 operator-()  { Vec2 r; r.x = -x;  r.y = -y;  return r; }
+};
+
+// ── BoolBox: logical NOT overload ────────────────────────────────────────────
+
+struct BoolBox
+{
+    bool value = false;
+    bool operator!() { return !value; }
+};
+
+// ── Bits: bitwise NOT overload ───────────────────────────────────────────────
+
+struct Bits
+{
+    int value = 0;
+    int operator~() { return ~value; }
 };
 
 // ── Fraction: rational number with arithmetic ────────────────────────────────
@@ -139,5 +156,32 @@ extern int main()
     Vec2 chain = a + b + c;    // (1+3+1, 2+4+2) = (5, 8)
     Test("Vec2 chain + x", chain.x, 5.0f);
     Test("Vec2 chain + y", chain.y, 8.0f);
+
+    // ── Unary operator overloads ──────────────────────────────────────────────
+
+    // operator-(): unary negation on Vec2
+    Vec2 neg = -a;             // -(1,2) = (-1,-2)
+    Test("Vec2 unary- x", neg.x, -1.0f);
+    Test("Vec2 unary- y", neg.y, -2.0f);
+
+    // Ensure binary operator- still works alongside unary
+    Vec2 bsub = b - a;         // (3,4)-(1,2) = (2,2)
+    Test("Vec2 binary- after unary- x", bsub.x, 2.0f);
+    Test("Vec2 binary- after unary- y", bsub.y, 2.0f);
+
+    // operator!(): logical NOT on BoolBox
+    BoolBox bt; bt.value = true;
+    BoolBox bf; bf.value = false;
+    Test("BoolBox !true",  !bt, false);
+    Test("BoolBox !false", !bf, true);
+
+    // operator~(): bitwise NOT on Bits
+    Bits bits; bits.value = 0xFF;
+    int flipped = ~bits;
+    Test("Bits ~ 0xFF", flipped, ~0xFF);
+
+    Bits zero; zero.value = 0;
+    Test("Bits ~ 0", ~zero, ~0);
+
     return 0;
 }

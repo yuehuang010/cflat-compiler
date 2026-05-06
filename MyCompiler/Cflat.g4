@@ -656,7 +656,8 @@ operatorFunctionId
     : Operator (New | Delete | String
                | Plus | Minus | Star | Div | Mod
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
-               | LeftBracket RightBracket)
+               | LeftBracket RightBracket
+               | Not | Tilde)
     ;
 
 interfaceDefinition

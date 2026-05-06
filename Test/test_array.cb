@@ -62,6 +62,47 @@ extern int main()
     }
     result &= Test("array<Tracked> dtor count", g_dtor_count, 3);
 
+    // ---- foreach over array<int> ----
+
+    array<int> af;
+    af.init(5);
+    af.set(0, 1);
+    af.set(1, 2);
+    af.set(2, 3);
+    af.set(3, 4);
+    af.set(4, 5);
+
+    int sum = 0;
+    for (int v in af)
+        sum += v;
+    result &= Test("foreach sum", sum, 15);
+
+    int fcount = 0;
+    for (int v in af)
+        fcount++;
+    result &= Test("foreach count", fcount, 5);
+
+    // ---- heap-allocated array<int> ----
+
+    array<int>* ha = new array<int>;
+    ha->init(3);
+    ha->set(0, 100);
+    ha->set(1, 200);
+    ha->set(2, 300);
+    result &= Test("heap array count", ha->count(), 3);
+    result &= Test("heap array get(1)", ha->get(1), 200);
+    delete ha;
+
+    // ---- array<Tracked>: destructor fires when heap array is deleted ----
+
+    g_dtor_count = 0;
+    {
+        array<Tracked>* ht = new array<Tracked>;
+        ht->init(4);
+        delete ht;
+    }
+    result &= Test("heap array<Tracked> dtor count", g_dtor_count, 4);
+
     if (result) { printf("test_array: PASS\n"); return 0; }
     return 1;
 }

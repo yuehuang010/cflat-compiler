@@ -67,6 +67,8 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->Greater())      return "operator>";
     if (opId->GreaterEqual()) return "operator>=";
     if (opId->LeftBracket())  return "operator[]";
+    if (opId->Not())          return "operator!";
+    if (opId->Tilde())        return "operator~";
     return "";
 }
 
@@ -4387,6 +4389,68 @@ public:
 
     // If lvalue is a struct type with a user-defined operator, dispatch to it.
     // Returns the result Value*, or nullptr to fall back to built-in CreateOperation.
+    // Returns a non-null value if a user-defined operator overload was found and called,
+    // nullptr if the operand type has no matching operator (fall back to primitive handling).
+    llvm::Value* TryUnaryOperatorOverload(
+        llvm::Value* operand, const std::string& op,
+        antlr4::ParserRuleContext* ctx)
+    {
+        if (!operand) return nullptr;
+        auto* compiler = Compiler(ctx);
+
+        auto* ty = operand->getType();
+        if (!ty->isStructTy()) return nullptr;
+        auto* structTy = llvm::cast<llvm::StructType>(ty);
+        if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
+        std::string typeName = structTy->getName().str();
+        if (typeName == "__iface_fat_ptr") return nullptr;
+
+        std::string opName = "operator" + op;
+        if (!compiler->GetFunction(opName)) return nullptr;
+
+        // Determine whether to pass the operand by pointer or by value.
+        bool usePointer = false;
+        {
+            auto funcSym = compiler->functionTable.find(opName);
+            if (funcSym != compiler->functionTable.end())
+            {
+                for (const auto& candidate : funcSym->second)
+                {
+                    if (!candidate.Parameters.empty()
+                        && candidate.Parameters[0].TypeName == typeName
+                        && candidate.Parameters[0].Pointer)
+                    {
+                        usePointer = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (usePointer)
+        {
+            auto* tempAlloca = compiler->CreateAlloca(structTy);
+            compiler->CreateAssignment(operand, tempAlloca);
+
+            LLVMBackend::NamedVariable thisNV;
+            thisNV.TypeAndValue.TypeName = typeName;
+            thisNV.TypeAndValue.Pointer  = true;
+            thisNV.Primary = tempAlloca;
+
+            return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
+        }
+        else
+        {
+            LLVMBackend::NamedVariable thisNV;
+            thisNV.TypeAndValue.TypeName = typeName;
+            thisNV.TypeAndValue.Pointer  = false;
+            thisNV.Primary  = operand;
+            thisNV.BaseType = structTy;
+
+            return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
+        }
+    }
+
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx)
@@ -4774,42 +4838,76 @@ public:
             else if (opText == "!")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compiler->CreateNot(newValue);
+                if (auto* overload = TryUnaryOperatorOverload(newValue, "!", ctx))
+                {
+                    namedVar.Primary = overload;
+                    namedVar.TypeAndValue = compiler->lastCallReturnType;
+                }
+                else
+                {
+                    namedVar.Primary = compiler->CreateNot(newValue);
+                }
                 namedVar.Storage = nullptr;
             }
             else if (opText == "-")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                // Fold negation of integer constants into the smallest fitting type.
-                // e.g. 32768 is i32, but -32768 fits in i16 (INT16_MIN).
-                if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
+                if (auto* overload = TryUnaryOperatorOverload(newValue, "-", ctx))
                 {
-                    int64_t neg = -(int64_t)ci->getSExtValue();
-                    if (neg >= std::numeric_limits<int8_t>::min() && neg <= std::numeric_limits<int8_t>::max())
-                        namedVar.Primary = compiler->builder->getInt8((int8_t)neg);
-                    else if (neg >= std::numeric_limits<int16_t>::min() && neg <= std::numeric_limits<int16_t>::max())
-                        namedVar.Primary = compiler->builder->getInt16((int16_t)neg);
-                    else if (neg >= (int64_t)std::numeric_limits<int32_t>::min() && neg <= (int64_t)std::numeric_limits<int32_t>::max())
-                        namedVar.Primary = compiler->builder->getInt32((int32_t)neg);
-                    else
-                        namedVar.Primary = compiler->builder->getInt64(neg);
+                    namedVar.Primary = overload;
+                    namedVar.TypeAndValue = compiler->lastCallReturnType;
+                    namedVar.Storage = nullptr;
                 }
                 else
                 {
-                    namedVar.Primary = compiler->CreateNeg(newValue);
+                    // Fold negation of integer constants into the smallest fitting type.
+                    // e.g. 32768 is i32, but -32768 fits in i16 (INT16_MIN).
+                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
+                    {
+                        int64_t neg = -(int64_t)ci->getSExtValue();
+                        if (neg >= std::numeric_limits<int8_t>::min() && neg <= std::numeric_limits<int8_t>::max())
+                            namedVar.Primary = compiler->builder->getInt8((int8_t)neg);
+                        else if (neg >= std::numeric_limits<int16_t>::min() && neg <= std::numeric_limits<int16_t>::max())
+                            namedVar.Primary = compiler->builder->getInt16((int16_t)neg);
+                        else if (neg >= (int64_t)std::numeric_limits<int32_t>::min() && neg <= (int64_t)std::numeric_limits<int32_t>::max())
+                            namedVar.Primary = compiler->builder->getInt32((int32_t)neg);
+                        else
+                            namedVar.Primary = compiler->builder->getInt64(neg);
+                    }
+                    else
+                    {
+                        namedVar.Primary = compiler->CreateNeg(newValue);
+                    }
+                    namedVar.Storage = nullptr;
                 }
-                namedVar.Storage = nullptr;
             }
             else if (opText == "+")
             {
-                // unary + is a no-op: just load the value
-                namedVar.Primary = this->LoadNamedVariable(namedVar);
+                auto newValue = this->LoadNamedVariable(namedVar);
+                if (auto* overload = TryUnaryOperatorOverload(newValue, "+", ctx))
+                {
+                    namedVar.Primary = overload;
+                    namedVar.TypeAndValue = compiler->lastCallReturnType;
+                }
+                else
+                {
+                    // unary + is a no-op: just load the value
+                    namedVar.Primary = newValue;
+                }
                 namedVar.Storage = nullptr;
             }
             else if (opText == "~")
             {
                 auto newValue = this->LoadNamedVariable(namedVar);
-                namedVar.Primary = compiler->CreateNot(newValue);
+                if (auto* overload = TryUnaryOperatorOverload(newValue, "~", ctx))
+                {
+                    namedVar.Primary = overload;
+                    namedVar.TypeAndValue = compiler->lastCallReturnType;
+                }
+                else
+                {
+                    namedVar.Primary = compiler->CreateNot(newValue);
+                }
                 namedVar.Storage = nullptr;
             }
             else
@@ -4818,7 +4916,6 @@ public:
                 return namedVar;
             }
 
-            // TODO, unaryOperator
             return namedVar;
         }
         else if (auto* typeNameCtx = ctx->typeName())
