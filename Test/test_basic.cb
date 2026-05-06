@@ -1495,6 +1495,28 @@ bool testNestedStructClass()
 }
 
 // =============================================================
+// Variadic function tests
+// =============================================================
+
+bool testVariadic()
+{
+    bool result = true;
+    char* buf = (char*)malloc(64);
+
+    // Positional: all args by position — regression for the original call path.
+    snprintf(buf, 64, "%d + %d = %d", 3, 4, 7);
+    result &= Test("variadic_positional", (const char*)buf, "3 + 4 = 7");
+
+    // Named fixed parameter with variadic tail: fmt: names the third param of snprintf
+    // while buf and 64 remain positional and 6, 7, 42 are variadic.
+    snprintf(buf, 64, fmt: "%d * %d = %d", 6, 7, 42);
+    result &= Test("variadic_named_fmt", (const char*)buf, "6 * 7 = 42");
+
+    free(buf);
+    return result;
+}
+
+// =============================================================
 // Primitive type alias tests (using Alias = primitiveType)
 // =============================================================
 
@@ -1603,6 +1625,7 @@ extern int main()
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
     total++; passed += testNestedStructClass()           ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
+    total++; passed += testVariadic()                    ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

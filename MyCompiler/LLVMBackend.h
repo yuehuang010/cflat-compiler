@@ -3696,8 +3696,9 @@ public:
 
             if (candidate.Variadic)
             {
-                // TODO: Support overload for variadic.
-                return pair;
+                // Variadic is a fallback: prefer any exact non-variadic match over it.
+                possibleResult = pair;
+                continue;
             }
 
             bool perfectMatch = true;
@@ -3833,19 +3834,24 @@ public:
         return possibleResult;
     }
 
-    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments)
+    std::vector<LLVMBackend::NamedVariable> MatchFunction(const std::vector<LLVMBackend::NamedVariable>& inputArguments, const std::vector<LLVMBackend::TypeAndValue>& targetArguments, bool isVariadic = false)
     {
         // Two pass match.
-        // 1) Align named arguments
-        // 2) Fill remaining argument fills in the blank.
+        // 1) Align named arguments to fixed parameters by name.
+        // 2) Fill remaining unnamed arguments into the next available fixed-param slot;
+        //    for variadic functions, overflow args are assigned to trailing variadic positions.
 
         const size_t inputSize = inputArguments.size();
-        if (inputSize != targetArguments.size())
+        const size_t paramSize = targetArguments.size();
+
+        if (isVariadic ? inputSize < paramSize : inputSize != paramSize)
             return {};
 
-        // A map from input to target Argument
+        // posMap[i] = destination index in the result vector for inputArguments[i].
+        // Fixed-param slots: 0..paramSize-1; variadic slots: paramSize, paramSize+1, ...
         std::vector<int64_t> posMap(inputSize, -1);
 
+        // Pass 1: named arguments — resolve to their fixed-param position by name.
         int posIndex = 0;
         for (const auto& input : inputArguments)
         {
@@ -3870,44 +3876,48 @@ public:
             posIndex++;
         }
 
-        // Create a used map for the target parameters
-        std::vector<bool> usedTargetMap(inputSize);
+        // Mark fixed-param slots claimed by named arguments so pass 2 skips them.
+        std::vector<bool> usedTargetMap(paramSize);
         for (int64_t pos : posMap)
         {
             if (pos >= 0)
-            {
                 usedTargetMap[pos] = true;
-            }
         }
 
-        // iterate through non-named variables and assign to the next available posMap.
+        // Pass 2: unnamed arguments — assign to the next free fixed-param slot; for
+        // variadic functions, arguments that overflow the fixed params go to trailing slots.
         bool successful = true;
         posIndex = 0;
-        int inputIndex = 0;
         int targetIndex = 0;
+        size_t nextVariadicIdx = paramSize;
 
         for (const auto& input : inputArguments)
         {
-            if (posIndex >= inputSize)
-            {
-                // run out of possible positions
-                // TODO: handle variadic arguments.
-                successful = false;
-                break;
-            }
-
             if (input.TypeAndValue.VariableName == "")
             {
-                // search for next empty pos
-                while (targetIndex < inputSize)
+                bool assigned = false;
+                while (targetIndex < (int)paramSize)
                 {
                     if (!usedTargetMap[targetIndex])
                     {
                         posMap[posIndex] = targetIndex;
+                        usedTargetMap[targetIndex] = true;
                         targetIndex++;
+                        assigned = true;
                         break;
                     }
                     targetIndex++;
+                }
+
+                if (!assigned)
+                {
+                    if (isVariadic)
+                        posMap[posIndex] = (int64_t)nextVariadicIdx++;
+                    else
+                    {
+                        successful = false;
+                        break;
+                    }
                 }
             }
 
@@ -3924,9 +3934,9 @@ public:
             return {};
         }
 
-        // recombine
+        // Reconstruct arguments in matched order.
         std::vector<LLVMBackend::NamedVariable> result(inputSize);
-        for (int i = 0; i < inputSize; i++)
+        for (int i = 0; i < (int)inputSize; i++)
         {
             result[posMap[i]] = inputArguments[i];
         }
@@ -4036,9 +4046,18 @@ public:
 
         for (const auto& candidate : candidates)
         {
-            if (candidate.Variadic || (arguments.size() == 0 && candidate.Parameters.size() == 0))
+            if (candidate.Variadic)
             {
-                // TODO: support named parameters variadic
+                // Route through MatchFunction so named fixed params are reordered correctly.
+                auto matched = MatchFunction(arguments, candidate.Parameters, true);
+                if (matched.size() > 0)
+                {
+                    resolvedCandidate.emplace_back(matched, candidate);
+                    break;
+                }
+            }
+            else if (arguments.size() == 0 && candidate.Parameters.size() == 0)
+            {
                 resolvedCandidate.emplace_back(arguments, candidate);
                 break;
             }
