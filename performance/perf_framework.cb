@@ -13,3 +13,9 @@ void PerfPrint(char* allocName, i64 ops, i64 us)
     i64 nsPerOp = (safeUs * (i64)1000) / ops;
     printf("  %-18s  %10lld  %12lld  %8lld\n", allocName, ops, safeUs, nsPerOp);
 }
+
+void PerfCheckLeak(char* allocName, i64 usedBytes)
+{
+    if (usedBytes != (i64)0)
+        printf("  [LEAK] %s: usedBytes=%lld after exit\n", allocName, usedBytes);
+}

@@ -308,6 +308,7 @@ extern i64 imaxabs(i64 n);
 extern void exit(int status);
 extern void abort();
 extern int atexit(void* func);
+extern int fflush(void* stream);
 
 // === Other Utilities ===
 extern int rand();

@@ -195,16 +195,14 @@ class SlabAllocator : IAllocator
         return (void*)(base + hdrSize);
     }
 
+    // Scan the large-alloc list to find and free ptr.
+    // Falls back to CRT free() for foreign (non-slab, non-large) pointers —
+    // e.g. args allocated in the caller's thread before this allocator was set up.
     void _freeLarge(void* ptr)
     {
-        i64 hdrSize       = (i64)sizeof(_SA_LargeHdr);
-        i8* base          = (i8*)ptr - hdrSize;
-        _SA_LargeHdr* hdr = (_SA_LargeHdr*)base;
+        i64 hdrSize = (i64)sizeof(_SA_LargeHdr);
+        i8* base    = (i8*)ptr - hdrSize;
 
-        _largeBytes = _largeBytes - hdr->_userSize;
-        _largeCount = _largeCount - 1;
-
-        // Unlink from large list.
         i8* prev = nullptr;
         i8* cur  = _largeHead;
         while (cur != nullptr)
@@ -212,6 +210,8 @@ class SlabAllocator : IAllocator
             _SA_LargeHdr* ch = (_SA_LargeHdr*)cur;
             if (cur == base)
             {
+                _largeBytes = _largeBytes - ch->_userSize;
+                _largeCount = _largeCount - 1;
                 if (prev == nullptr)
                     _largeHead = ch->_next;
                 else
@@ -219,12 +219,14 @@ class SlabAllocator : IAllocator
                     _SA_LargeHdr* ph = (_SA_LargeHdr*)prev;
                     ph->_next = ch->_next;
                 }
-                break;
+                vmem_free((void*)base);
+                return;
             }
             prev = cur;
             cur  = ch->_next;
         }
-        vmem_free((void*)base);
+        // Not one of our large allocs — must be a foreign (CRT-heap) allocation.
+        free(ptr);
     }
 
     // -----------------------------------------------------------------------
@@ -247,21 +249,25 @@ class SlabAllocator : IAllocator
         return (void*)ptr;
     }
 
-    // O(1): slab index derived from pointer offset — no header read, no scan.
+    // Slab dealloc: O(1) via pointer arithmetic. Foreign/large ptrs fall back to _freeLarge.
     void dealloc(void* ptr)
     {
-        if (ptr == nullptr || _base == nullptr) return;
+        if (ptr == nullptr) return;
 
-        i64 offset = (i64)ptr - (i64)_base;
-        if (offset < (i64)0 || offset >= (i64)8 * _regionSize)
+        if (_base != nullptr)
         {
-            _freeLarge(ptr);
-            return;
+            i64 offset = (i64)ptr - (i64)_base;
+            if (offset >= (i64)0 && offset < (i64)8 * _regionSize)
+            {
+                int cls = (int)(offset >> (int)_regionShift);
+                _pushFree(cls, (i8*)ptr);
+                _slabs[cls]._allocCount = _slabs[cls]._allocCount - 1;
+                return;
+            }
         }
 
-        int cls = (int)(offset >> (int)_regionShift);
-        _pushFree(cls, (i8*)ptr);
-        _slabs[cls]._allocCount = _slabs[cls]._allocCount - 1;
+        // Outside slab region (or slab not yet initialized) — large alloc or foreign ptr.
+        _freeLarge(ptr);
     }
 
     // -----------------------------------------------------------------------

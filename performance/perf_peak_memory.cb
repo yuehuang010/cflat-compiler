@@ -71,6 +71,7 @@ extern int main()
     bs.run(emptyArgs);
     bs.WaitForExit();
     PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
+    PerfCheckLeak("SlabAllocator", bs._allocator.usedBytes());
 
     BenchPeakMemory bf;
     bf.count = N;
@@ -78,6 +79,7 @@ extern int main()
     bf.run(emptyArgs);
     bf.WaitForExit();
     PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+    PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
 
     return 0;
 }

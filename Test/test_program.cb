@@ -22,7 +22,7 @@ program Counter {
         int* heap = new int;
         *heap = startFrom + args.count();
         int result = *heap;
-        // heap is freed by BlockAllocator on run() exit
+        // heap is freed by SlabAllocator on run() exit
         return result;
     }
 };
@@ -163,6 +163,7 @@ bool testProgramBasicArgsAndField() {
     c.run(args);
     c.WaitForExit();
     result &= Test("basic counter", c.exitCode, 12);
+    result &= Test("basic counter usedBytes", c._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -242,6 +243,7 @@ bool testProgramHeapAllocationsFreed() {
     h.WaitForExit();
     // sum of 1+2+...+10 = 55
     result &= Test("heap stress sum 10", h.exitCode, 55);
+    result &= Test("heap stress 10 usedBytes", h._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -331,6 +333,7 @@ bool testProgramHeapStressLarge() {
     h.WaitForExit();
     // sum of 1+2+...+50 = 1275
     result &= Test("heap stress sum 50", h.exitCode, 1275);
+    result &= Test("heap stress 50 usedBytes", h._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -374,7 +377,7 @@ bool testAllocatorUsedBlocksLeaked() {
     h.run(args);
     h.WaitForExit();
     result &= Test("heap stress sum 5", h.exitCode, 15);
-    result &= Test("totalBytes allocated", h._allocator.totalBytes(), (i64)20);
+    result &= Test("usedBytes no leak after exit", h._allocator.usedBytes(), (i64)0);
     return result;
 }
 
@@ -918,30 +921,30 @@ extern int main() {
     total++; passed += testProgramArgsAndFieldCombined() ? 1 : 0;
     total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
     total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
-    total++; passed += testListStringNoLeaks()              ? 1 : 0;
-    total++; passed += testListOwnershipNoLeaks()           ? 1 : 0;
-    total++; passed += testWaitForExitWithToken()          ? 1 : 0;
-    total++; passed += testWaitForExitCancelled()          ? 1 : 0;
-    total++; passed += testAllocatorNonNullAfterRun()      ? 1 : 0;
-    total++; passed += testAllocatorNullBeforeRun()        ? 1 : 0;
-    total++; passed += testAllocatorUsedBlocksCleanExit()  ? 1 : 0;
-    total++; passed += testAllocatorUsedBlocksLeaked()     ? 1 : 0;
-    total++; passed += testOnStdoutNamedCallback()          ? 1 : 0;
-    total++; passed += testOnStdoutSecondCallback()          ? 1 : 0;
-    total++; passed += testOnStdoutNullByDefault()          ? 1 : 0;
-    total++; passed += testOnStdinFgets()                   ? 1 : 0;
-    total++; passed += testOnStdinScanf()                   ? 1 : 0;
-    total++; passed += testOnStdinNullByDefault()           ? 1 : 0;
-    total++; passed += testInboxSingleMessage()              ? 1 : 0;
-    total++; passed += testInboxMultipleMessages()           ? 1 : 0;
-    total++; passed += testInboxSumMessages()                ? 1 : 0;
-    total++; passed += testInboxPolymorphicMessages()        ? 1 : 0;
-    total++; passed += testProgramCrashRecovery()           ? 1 : 0;
-    total++; passed += testRequestStop()                    ? 1 : 0;
-    total++; passed += testWaitForExitTimeoutFast()         ? 1 : 0;
-    total++; passed += testKillInfiniteLoop()               ? 1 : 0;
-    total++; passed += testSupervisorSpawnsChildren()        ? 1 : 0;
-    total++; passed += testTrackHandles()                   ? 1 : 0;
+    total++; passed += testListStringNoLeaks()           ? 1 : 0;
+    total++; passed += testListOwnershipNoLeaks()        ? 1 : 0;
+    total++; passed += testWaitForExitWithToken()        ? 1 : 0;
+    total++; passed += testWaitForExitCancelled()        ? 1 : 0;
+    total++; passed += testAllocatorNonNullAfterRun()    ? 1 : 0;
+    total++; passed += testAllocatorNullBeforeRun()      ? 1 : 0;
+    total++; passed += testAllocatorUsedBlocksCleanExit() ? 1 : 0;
+    total++; passed += testAllocatorUsedBlocksLeaked()   ? 1 : 0;
+    total++; passed += testOnStdoutNamedCallback()       ? 1 : 0;
+    total++; passed += testOnStdoutSecondCallback()      ? 1 : 0;
+    total++; passed += testOnStdoutNullByDefault()       ? 1 : 0;
+    total++; passed += testOnStdinFgets()                ? 1 : 0;
+    total++; passed += testOnStdinScanf()                ? 1 : 0;
+    total++; passed += testOnStdinNullByDefault()        ? 1 : 0;
+    total++; passed += testInboxSingleMessage()          ? 1 : 0;
+    total++; passed += testInboxMultipleMessages()       ? 1 : 0;
+    total++; passed += testInboxSumMessages()            ? 1 : 0;
+    total++; passed += testInboxPolymorphicMessages()    ? 1 : 0;
+    total++; passed += testProgramCrashRecovery()        ? 1 : 0;
+    total++; passed += testRequestStop()                 ? 1 : 0;
+    total++; passed += testWaitForExitTimeoutFast()      ? 1 : 0;
+    total++; passed += testKillInfiniteLoop()            ? 1 : 0;
+    total++; passed += testSupervisorSpawnsChildren()    ? 1 : 0;
+    total++; passed += testTrackHandles()                ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -592,8 +592,8 @@ private:
         if (it != dataStructures.end() && it->second.Destructor != nullptr)
             builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { ptrVal });
 
-        // Call operator delete (global)
-        auto* opDel = module->getFunction("operator delete");
+        // Call operator delete (allocator-aware) to free the pointer.
+        auto* opDel = GetFunction("operator delete");
         if (opDel)
         {
             auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
@@ -1132,9 +1132,12 @@ private:
         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
         if (!strTy) return;
 
-        // Look up free() — compiled from cruntime.cb, must already be in the module.
-        auto* freeFn = module->getFunction("free");
-        if (!freeFn) return;   // free not yet available; destructor cannot be created yet
+        // Prefer operator delete (allocator-aware) over raw free.
+        // operator delete is defined in memory.cb which is imported before string.cb,
+        // so it should be available by the time the first string dtor is needed.
+        auto* freeFn  = GetFunction("operator delete");
+        if (!freeFn) freeFn = module->getFunction("free");
+        if (!freeFn) return;   // neither available yet; destructor cannot be created
 
         auto* voidTy   = llvm::Type::getVoidTy(*context);
         auto* ptrTy    = builder->getInt8Ty()->getPointerTo();

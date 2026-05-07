@@ -78,6 +78,7 @@ extern int main()
     }
     swb.stop();
     PerfPrint("BlockAllocator", (i64)K, (i64)swb.elapsed().microseconds());
+    PerfCheckLeak("BlockAllocator", pb._allocator.usedBytes());
 
     WorkUnit ps;
     ps.workItems  = M;
@@ -93,6 +94,7 @@ extern int main()
     }
     sws.stop();
     PerfPrint("SlabAllocator", (i64)K, (i64)sws.elapsed().microseconds());
+    PerfCheckLeak("SlabAllocator", ps._allocator.usedBytes());
 
     WorkUnit pf;
     pf.workItems  = M;
@@ -108,6 +110,7 @@ extern int main()
     }
     swf.stop();
     PerfPrint("FitAllocator", (i64)K, (i64)swf.elapsed().microseconds());
+    PerfCheckLeak("FitAllocator", pf._allocator.usedBytes());
 
     return 0;
 }

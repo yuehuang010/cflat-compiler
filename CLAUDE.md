@@ -18,6 +18,9 @@ Provide an Architecture overview before analyzing code changes.  Verify with the
 
 - Before editing, state the hypothesized root cause and verify against the codebase. Avoid speculative edits based on a single guess (e.g., do not assume lexer token conflicts before checking parser/grammar paths).
 
+- After finding the root cause of the issue, consider writing a regression test.
+- When encountering a LLVM assert, after identifying the root cause, then write an proper error message in the compiler to avoid that case.
+
 ## Building
 
 Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:

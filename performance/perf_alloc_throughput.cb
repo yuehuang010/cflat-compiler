@@ -61,6 +61,7 @@ extern int main()
     bb.run(emptyArgs);
     bb.WaitForExit();
     PerfPrint("BlockAllocator", (i64)N, bb.measuredUs);
+    PerfCheckLeak("BlockAllocator", bb._allocator.usedBytes());
 
     BenchThroughput bs;
     bs.iters = N;
@@ -68,6 +69,7 @@ extern int main()
     bs.run(emptyArgs);
     bs.WaitForExit();
     PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
+    PerfCheckLeak("SlabAllocator", bs._allocator.usedBytes());
 
     BenchThroughput bf;
     bf.iters = N;
@@ -75,6 +77,7 @@ extern int main()
     bf.run(emptyArgs);
     bf.WaitForExit();
     PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+    PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
 
     return 0;
 }

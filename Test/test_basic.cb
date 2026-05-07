@@ -917,6 +917,39 @@ bool testNewArrayConstructor()
     return result;
 }
 
+// Regression: when 'p = new T' is an assignment statement (not a declaration),
+// lastOwningResult must not leak into the next declaration in scope.
+// Previously the next declared pointer variable was incorrectly marked owning
+// and freed at scope exit, causing a double-free with the allocator.
+bool testNewAssignNoOwnershipLeak()
+{
+    bool result = true;
+
+    // p declared before loop (assignment, not declaration, inside loop)
+    int* p = nullptr;
+    int sum = 0;
+    int i = 0;
+    while (i < 3)
+    {
+        p = new int;   // assignment — must NOT set lastOwningResult for next decl
+        *p = i + 1;
+        sum += *p;
+        delete p;
+        p = nullptr;
+        i++;
+    }
+    result &= Test("new_assign_sum", sum, 6);
+
+    // q declared AFTER the loop that used 'p = new int'.
+    // If lastOwningResult leaked, q would be marked owning and freed at scope
+    // exit even though it holds a stack address — causing heap corruption.
+    int local = 99;
+    int* q = &local;   // NOT a heap allocation; must not be freed at scope exit
+    result &= Test("new_assign_no_leak", *q, 99);
+
+    return result;
+}
+
 class Point : IString
 {
     i32 x = 0;
@@ -1663,6 +1696,7 @@ extern int main()
     total++; passed += Test("testNewArray", testNewArray(), 99);
     total++; passed += Test("testNewWithConstructor", testNewWithConstructor(), 123);
     total++; passed += testNewArrayConstructor()            ? 1 : 0;
+    total++; passed += testNewAssignNoOwnershipLeak()       ? 1 : 0;
     total++; passed += testStringType()                  ? 1 : 0;
     total++; passed += testStringLiteral()               ? 1 : 0;
     total++; passed += testFormatString()                ? 1 : 0;
