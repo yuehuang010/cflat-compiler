@@ -1,0 +1,115 @@
+// core/network/http_client.cb — Simple synchronous HTTP/1.1 client.
+//
+// Usage:
+//   import "network/http_client.cb";
+//   HttpClient c;
+//   HttpClientResponse* resp = c.get(host, port, "/path");
+//   if (resp != nullptr && resp->valid) { ... }
+//   delete resp;
+
+import "string.cb";
+import "network/socket.cb";
+import "network/http_parser.cb";
+
+// Write null-terminated string s into buf at offset pos; return new pos.
+int _hc_puts(i8* buf, int pos, const char* s)
+{
+    int i = 0;
+    while (s[i] != 0) { buf[pos] = s[i]; pos++; i++; }
+    return pos;
+}
+
+// Write decimal integer val into buf at offset pos; return new pos.
+int _hc_puti(i8* buf, int pos, int val)
+{
+    i8* tmp = new i8[16];
+    int len = sprintf(tmp, "%d", val);
+    int i = 0;
+    while (i < len) { buf[pos] = tmp[i]; pos++; i++; }
+    delete tmp;
+    return pos;
+}
+
+class HttpClient {
+
+    // Send an HTTP request and return the parsed response.
+    // method: "GET", "POST", "PUT", "DELETE", etc.
+    // body / bodyLen: request body bytes (pass nullptr / 0 for requests without a body).
+    // Returns nullptr if the connection failed; caller owns the returned pointer.
+    HttpClientResponse* request(string host, int port, const char* method,
+                                const char* path, const char* body, int bodyLen)
+    {
+        Socket* s = new Socket;
+        if (!s->createTcp())    { delete s; return nullptr; }
+        if (!s->connect(host, port)) { delete s; return nullptr; }
+        s->setNoDelay(true);
+
+        // Build the complete request (headers + body) in one buffer so it goes
+        // out in a single send() — avoids the server seeing only headers in its
+        // first recv() when Nagle is disabled.
+        i8* reqbuf = new i8[8192];
+        int pos = 0;
+        pos = _hc_puts(reqbuf, pos, method);
+        pos = _hc_puts(reqbuf, pos, " ");
+        pos = _hc_puts(reqbuf, pos, path);
+        pos = _hc_puts(reqbuf, pos, " HTTP/1.1\r\nHost: ");
+        pos = _hc_puts(reqbuf, pos, host.data());
+        pos = _hc_puts(reqbuf, pos, "\r\nConnection: close\r\n");
+        if (bodyLen > 0 && body != nullptr)
+        {
+            pos = _hc_puts(reqbuf, pos, "Content-Length: ");
+            pos = _hc_puti(reqbuf, pos, bodyLen);
+            pos = _hc_puts(reqbuf, pos, "\r\n");
+        }
+        pos = _hc_puts(reqbuf, pos, "\r\n");
+        if (bodyLen > 0 && body != nullptr)
+        {
+            int j = 0;
+            while (j < bodyLen && pos < 8191) { reqbuf[pos] = body[j]; pos++; j++; }
+        }
+        s->send(reqbuf, pos);
+        delete reqbuf;
+
+        // Read the full response.  Use &respbuf[total] for offset (no pointer
+        // arithmetic) and keep going until the connection closes or the buffer
+        // is full.
+        i8* respbuf = new i8[65536];
+        int total = 0;
+        bool done = false;
+        while (!done && total < 65535)
+        {
+            int n = s->recv(&respbuf[total], 65535 - total);
+            if (n <= 0) done = true;
+            else total = total + n;
+        }
+        delete s;
+
+        if (total == 0) { delete respbuf; return nullptr; }
+        respbuf[total] = 0;
+        HttpClientResponse* resp = parseHttpResponse(respbuf, total);
+        delete respbuf;
+        return resp;
+    }
+
+    HttpClientResponse* get(string host, int port, const char* path)
+    {
+        return request(host, port, "GET", path, nullptr, 0);
+    }
+
+    HttpClientResponse* post(string host, int port, const char* path,
+                             const char* body, int bodyLen)
+    {
+        return request(host, port, "POST", path, body, bodyLen);
+    }
+
+    HttpClientResponse* put(string host, int port, const char* path,
+                            const char* body, int bodyLen)
+    {
+        return request(host, port, "PUT", path, body, bodyLen);
+    }
+
+    HttpClientResponse* del(string host, int port, const char* path)
+    {
+        return request(host, port, "DELETE", path, nullptr, 0);
+    }
+};

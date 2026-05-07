@@ -1,0 +1,234 @@
+import "list.cb";
+import "thread.cb";
+import "stop_token.cb";
+import "test_helper.cb";
+import "network/http_server.cb";
+import "network/http_client.cb";
+
+int g_srv_port = 17899;
+
+// ---------------------------------------------------------------------------
+// Request handler shared by all tests
+// ---------------------------------------------------------------------------
+
+HttpResponse* testHandler(HttpRequest* req)
+{
+    // GET /hello -> 200 "Hello, World!"
+    if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/hello") == 0)
+        return HttpResponse.ok("Hello, World!");
+
+    // POST /echo -> 200 <body>
+    if (strcmp(req->method, "POST") == 0 && strcmp(req->path, "/echo") == 0)
+    {
+        if (req->body != nullptr && req->bodyLen > 0)
+            return HttpResponse.ok(req->body);
+        return HttpResponse.ok("(no body)");
+    }
+
+    // PUT /replace -> 200 "replaced"
+    if (strcmp(req->method, "PUT") == 0 && strcmp(req->path, "/replace") == 0)
+        return HttpResponse.ok("replaced");
+
+    // DELETE /item -> 200 "deleted"
+    if (strcmp(req->method, "DELETE") == 0 && strcmp(req->path, "/item") == 0)
+        return HttpResponse.ok("deleted");
+
+    // GET /json -> 200 application/json
+    if (strcmp(req->method, "GET") == 0 && strcmp(req->path, "/json") == 0)
+        return HttpResponse.okJson("\{\"key\":\"value\"\}");
+
+    return HttpResponse.notFound();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Returns true if null-terminated string needle appears in buf[0..blen).
+bool _hst_contains(i8* buf, int blen, const char* needle)
+{
+    int nlen = strlen(needle);
+    if (nlen > blen) return false;
+    int i = 0;
+    while (i <= blen - nlen)
+    {
+        bool match = true;
+        int j = 0;
+        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
+        if (match) return true;
+        i++;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+bool testGetHello(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    HttpClientResponse* resp = client->get(host, g_srv_port, "/hello");
+
+    result &= Test("GET /hello not null",   resp != nullptr,        true);
+    if (resp != nullptr)
+    {
+        result &= Test("GET /hello valid",      resp->valid,            true);
+        result &= Test("GET /hello status",     resp->statusCode,       200);
+        result &= Test("GET /hello body match", resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "Hello, World!"), true);
+        delete resp;
+    }
+    return result;
+}
+
+bool testGetNotFound(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    HttpClientResponse* resp = client->get(host, g_srv_port, "/missing");
+
+    result &= Test("GET /missing not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("GET /missing status", resp->statusCode, 404);
+        delete resp;
+    }
+    return result;
+}
+
+bool testPostEcho(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    const char* body = "ping";
+    HttpClientResponse* resp = client->post(host, g_srv_port, "/echo", body, 4);
+
+    result &= Test("POST /echo not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("POST /echo valid",  resp->valid,       true);
+        result &= Test("POST /echo status", resp->statusCode,  200);
+        result &= Test("POST /echo body",   resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "ping"), true);
+        delete resp;
+    }
+    return result;
+}
+
+bool testPutReplace(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    HttpClientResponse* resp = client->put(host, g_srv_port, "/replace", "data", 4);
+
+    result &= Test("PUT /replace not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("PUT /replace status", resp->statusCode, 200);
+        result &= Test("PUT /replace body",   resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "replaced"), true);
+        delete resp;
+    }
+    return result;
+}
+
+bool testDeleteItem(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    HttpClientResponse* resp = client->del(host, g_srv_port, "/item");
+
+    result &= Test("DELETE /item not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("DELETE /item status", resp->statusCode, 200);
+        result &= Test("DELETE /item body",   resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "deleted"), true);
+        delete resp;
+    }
+    return result;
+}
+
+bool testGetJson(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    HttpClientResponse* resp = client->get(host, g_srv_port, "/json");
+
+    result &= Test("GET /json not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("GET /json status", resp->statusCode, 200);
+        i8* ct = resp->getHeader("Content-Type");
+        result &= Test("GET /json content-type", ct != nullptr &&
+                       strcmp(ct, "application/json") == 0, true);
+        result &= Test("GET /json body", resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "\"key\""), true);
+        delete resp;
+    }
+    return result;
+}
+
+bool testPostEmptyBody(HttpClient* client)
+{
+    bool result = true;
+    string host = "127.0.0.1";
+    // POST /echo with no body -> "(no body)"
+    HttpClientResponse* resp = client->post(host, g_srv_port, "/echo", nullptr, 0);
+
+    result &= Test("POST /echo empty not null", resp != nullptr, true);
+    if (resp != nullptr)
+    {
+        result &= Test("POST /echo empty status", resp->statusCode, 200);
+        result &= Test("POST /echo empty body",   resp->bodyLen > 0 &&
+                       _hst_contains(resp->body, resp->bodyLen, "(no body)"), true);
+        delete resp;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+
+extern int main()
+{
+    if (!Socket.initNetwork())
+    {
+        printf("FAIL: initNetwork\n");
+        return 1;
+    }
+
+    stop_source src;
+    src.init();
+
+    HttpServer srv;
+    srv.port      = g_srv_port;
+    srv.stopToken = src.get_token();
+    srv.handler   = testHandler;
+
+    list<string> srvArgs;
+    srv.run(srvArgs);
+    Sleep(50);   // give the server thread time to start listening
+
+    HttpClient client;
+    bool ok = true;
+
+    ok &= testGetHello(&client);
+    ok &= testGetNotFound(&client);
+    ok &= testPostEcho(&client);
+    ok &= testPutReplace(&client);
+    ok &= testDeleteItem(&client);
+    ok &= testGetJson(&client);
+    ok &= testPostEmptyBody(&client);
+
+    src.request_stop();
+    srv.WaitForExit();
+    src.dispose();
+
+    Socket.shutdownNetwork();
+
+    if (ok) printf("HTTP server/client tests: all passed.\n");
+    else    printf("HTTP server/client tests: FAILED.\n");
+    return ok ? 0 : 1;
+}

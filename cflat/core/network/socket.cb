@@ -30,6 +30,7 @@ int _SOCK_KEEPALIVE  = 8;
 int _TCP_NODELAY     = 1;
 int _IPPROTO_TCP     = 6;
 int _SOMAXCONN       = 2147483647;  // 0x7fffffff
+int _SOCK_FIONBIO    = -2147195266; // 0x8004667E — ioctlsocket non-blocking mode
 
 class Socket
 {
@@ -208,6 +209,18 @@ class Socket
         if const (__WINDOWS__) {
             i32 val = enable ? 1 : 0;
             setsockopt(_handle, _IPPROTO_TCP, _TCP_NODELAY, (const char*)&val, 4);
+        }
+    }
+
+    // Put the socket in non-blocking mode (true) or blocking mode (false).
+    // In non-blocking mode, accept() / recv() return immediately if no data
+    // is available; the caller must poll.
+    void setNonBlocking(bool enable)
+    {
+        if (_handle == nullptr) return;
+        if const (__WINDOWS__) {
+            u32 mode = enable ? 1 : 0;
+            _wsa_ioctlsocket(_handle, (i32)_SOCK_FIONBIO, &mode);
         }
     }
 

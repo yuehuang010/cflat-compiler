@@ -1,0 +1,15 @@
+// Regression-test library: a `program` defined in an imported file.
+// Bug: CompileImportedFile did not run ScanGenericTypeUses before
+// ScanExternalDeclaration, so list__string had no opaque shell when
+// ScanProgramDefinition tried to pre-declare run(LibProgram*, list__string).
+import "list.cb";
+
+program LibProgram {
+    int result = 0;
+
+    int main(move list<string> args)
+    {
+        result = 42;
+        return 0;
+    }
+};

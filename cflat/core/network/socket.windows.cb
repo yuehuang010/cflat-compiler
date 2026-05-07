@@ -57,6 +57,7 @@ extern stdcall i32   recv(void* sock, i8* buf, i32 len, i32 flags);
 
 // Options
 extern stdcall i32   setsockopt(void* sock, i32 level, i32 optname, const char* optval, i32 optlen);
+extern stdcall i32   ioctlsocket(void* sock, i32 cmd, u32* argp);
 
 // Address helpers
 extern stdcall u16   htons(u16 hostshort);
@@ -69,6 +70,7 @@ extern stdcall void freeaddrinfo(_AddrInfo* ai);
 
 // Wrappers with _wsa_ prefix so Socket methods can call them without triggering
 // method-resolution (unqualified calls inside a method prepend 'this').
+i32   _wsa_ioctlsocket(void* sock, i32 cmd, u32* argp)      { return ioctlsocket(sock, cmd, argp); }
 i32   _wsa_bind(void* sock, _SockAddrIn* addr, i32 addrlen) { return bind(sock, addr, addrlen); }
 i32   _wsa_listen(void* sock, i32 backlog)                  { return listen(sock, backlog); }
 void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len)  { return accept(sock, addr, len); }

@@ -485,6 +485,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
         if (verbose) std::cout << "[verbose]   forward-ref scan: " << importFilename << "\n";
         ForwardRefScanner scanner(this);
+        // Pre-declare opaque types for all generic instantiations found in the file
+        // (including inside function/program bodies) before scanning declarations.
+        // Without this pass, program definitions that pre-declare run(Name*, list__string)
+        // fail because the opaque shell for list__string hasn't been created yet.
+        if (auto* tu = computeUnit->translationUnit())
+            for (auto* decl : tu->externalDeclaration())
+                scanner.ScanGenericTypeUses(decl);
         if (auto* tu = computeUnit->translationUnit())
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanExternalDeclaration(decl);
