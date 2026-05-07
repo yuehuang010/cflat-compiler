@@ -8,6 +8,108 @@ import "pair.cb";
 import "stack.cb";
 import "queue.cb";
 import "interfaces.cb";
+import "array.cb";
+
+// ── array<T> ─────────────────────────────────────────────────────────────────
+
+int g_dtor_count = 0;
+
+struct Tracked
+{
+    int _val = 0;
+
+    ~Tracked()
+    {
+        g_dtor_count++;
+    }
+};
+
+struct FixedBuf
+{
+    char data[4];
+    int length = 0;
+};
+
+int testArray()
+{
+    int passed = 0;
+
+    // delete[n] destructor invocation
+    g_dtor_count = 0;
+    Tracked* arr = new Tracked[5];
+    delete[5] arr;
+    passed += Test("delete[5] 5 elements", g_dtor_count, 5);
+
+    g_dtor_count = 0;
+    Tracked* one = new Tracked[1];
+    delete[1] one;
+    passed += Test("delete[1] 1 element", g_dtor_count, 1);
+
+    g_dtor_count = 0;
+    Tracked* zero = new Tracked[0];
+    delete[_] zero;
+    passed += Test("delete[_] 0 elements", g_dtor_count, 0);
+
+    // Primitive array — no cookie, no destructor (must not crash)
+    int* ints = new int[10];
+    ints[0] = 42;
+    delete[] ints;
+
+    // array<int>
+    array<int> ai;
+    ai.init(4);
+    ai.set(0, 10);
+    ai.set(1, 20);
+    ai.set(2, 30);
+    ai.set(3, 40);
+    passed += Test("array<int> count",  ai.count(), 4);
+    passed += Test("array<int> get(0)", ai.get(0),  10);
+    passed += Test("array<int> get(3)", ai.get(3),  40);
+    passed += Test("array<int> [1]",    ai[1],      20);
+    passed += Test("array<int> [2]",    ai[2],      30);
+
+    // array<Tracked>: destructor fires on scope exit
+    g_dtor_count = 0;
+    {
+        array<Tracked> at;
+        at.init(3);
+    }
+    passed += Test("array<Tracked> dtor count", g_dtor_count, 3);
+
+    // foreach over array<int>
+    array<int> af;
+    af.init(5);
+    af.set(0, 1); af.set(1, 2); af.set(2, 3); af.set(3, 4); af.set(4, 5);
+
+    int sum = 0;
+    for (int v in af)
+        sum += v;
+    passed += Test("array foreach sum",   sum,   15);
+
+    int fcount = 0;
+    for (int v in af)
+        fcount++;
+    passed += Test("array foreach count", fcount, 5);
+
+    // heap-allocated array<int>
+    array<int>* ha = new array<int>;
+    ha->init(3);
+    ha->set(0, 100); ha->set(1, 200); ha->set(2, 300);
+    passed += Test("heap array count",    ha->count(),   3);
+    passed += Test("heap array get(1)",   ha->get(1),    200);
+    delete ha;
+
+    // destructor fires when heap array is deleted
+    g_dtor_count = 0;
+    {
+        array<Tracked>* ht = new array<Tracked>;
+        ht->init(4);
+        delete ht;
+    }
+    passed += Test("heap array<Tracked> dtor count", g_dtor_count, 4);
+
+    return passed;
+}
 
 // ── list<int> ────────────────────────────────────────────────────────────────
 
@@ -333,6 +435,30 @@ int testFor()
         ieSum += x;
     passed += Test("for IEnumerable sum", ieSum, 60);
 
+    // Inline fixed array (local)
+    int nums[5];
+    nums[0] = 10; nums[1] = 20; nums[2] = 30; nums[3] = 40; nums[4] = 50;
+    int fixedSum = 0;
+    for (int x in nums)
+        fixedSum += x;
+    passed += Test("for int[5] sum", fixedSum, 150);
+
+    char cbuf[4];
+    cbuf[0] = 'a'; cbuf[1] = 'b'; cbuf[2] = 'c'; cbuf[3] = 'd';
+    int charCount = 0;
+    for (char c in cbuf)
+        if (c >= 'a' && c <= 'd') charCount++;
+    passed += Test("for char[4] count", charCount, 4);
+
+    // Inline fixed array (struct field)
+    FixedBuf fb;
+    fb.data[0] = (char)10; fb.data[1] = (char)20;
+    fb.data[2] = (char)30; fb.data[3] = (char)40;
+    int fieldSum = 0;
+    for (char b in fb.data)
+        fieldSum += (int)b;
+    passed += Test("for struct field char[4] sum", fieldSum, 100);
+
     return passed;
 }
 
@@ -596,6 +722,7 @@ extern int main()
 
     int r;
 
+    r = testArray();            passed += r; total += 14;
     r = testList();             passed += r; total += 15;
     r = testHashset();          passed += r; total += 19;
     r = testHashsetNegative();  passed += r; total += 12;
@@ -612,7 +739,7 @@ extern int main()
     r = testPair();             passed += r; total += 8;
     r = testStack();            passed += r; total += 8;
     r = testQueue();            passed += r; total += 8;
-    r = testFor();              passed += r; total += 7;
+    r = testFor();              passed += r; total += 10;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

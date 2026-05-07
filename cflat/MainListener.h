@@ -2229,12 +2229,18 @@ public:
                         collNV.Primary = nullptr;
                     }
 
-                    bool isFaceType = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
+                    bool isFaceType   = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
+                    bool isFixedArray = collNV.BaseType && llvm::isa<llvm::ArrayType>(collNV.BaseType);
 
                     // Call count() once and cache it
                     llvm::Value* countVal = nullptr;
                     llvm::Value* ifacePtr = nullptr;
-                    if (isFaceType)
+                    if (isFixedArray)
+                    {
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
+                        countVal = compiler->builder->getInt32((uint32_t)arrTy->getNumElements());
+                    }
+                    else if (isFaceType)
                     {
                         ifacePtr = collNV.Storage;
                         if (!ifacePtr)
@@ -2283,7 +2289,17 @@ public:
                     indexNV.TypeAndValue.TypeName = "int";
 
                     llvm::Value* elemVal = nullptr;
-                    if (isFaceType)
+                    if (isFixedArray)
+                    {
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
+                        llvm::Value* zero   = compiler->builder->getInt64(0);
+                        llvm::Value* idxI64 = compiler->builder->CreateZExt(
+                            compiler->CreateLoad(indexAlloca), compiler->builder->getInt64Ty(), "idxi64");
+                        auto* elemPtr = compiler->builder->CreateGEP(
+                            arrTy, collNV.Storage, {zero, idxI64}, "arrayelemptr");
+                        elemVal = compiler->builder->CreateLoad(arrTy->getElementType(), elemPtr, "arrayelem");
+                    }
+                    else if (isFaceType)
                     {
                         elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV });
                     }
@@ -5912,6 +5928,12 @@ public:
                         {
                             structVar = namedVar;
                             interfaceVar = {};
+                        }
+                        else if (namedVar.BaseType && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                        {
+                            // Fixed-array field: clear structVar so the subscript handler does not
+                            // mistake the parent struct as the operator[] target.
+                            structVar = {};
                         }
 
                         break;

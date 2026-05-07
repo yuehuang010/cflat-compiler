@@ -6,6 +6,7 @@
   - [Primitives](#primitives)
   - [Explicit-Width Integers](#explicit-width-integers)
   - [`string`](#string)
+    - [String interpolation](#string-interpolation)
   - [Structs](#structs)
   - [Enums](#enums)
   - [`= default` Initialization](#-default-initialization)
@@ -135,6 +136,41 @@ string result = "hello " + g;     // "hello world"
 For incremental building, use `stringbuilder` — a mutable, growable buffer with `append`, `appendCStr`, `appendChar`, `clear`, and `toString`.
 
 Define `operator string(T)` to convert arbitrary types to `string`; the core library provides conversions from `char*`, `i32`, and any `IString`.
+
+#### String interpolation
+
+Any string literal containing `{expr}` is automatically treated as an interpolated string — no prefix required. Each `{expr}` segment is converted to `string` via `operator string` and the segments are concatenated at runtime:
+
+```c
+string name = "World";
+string greeting = "Hello {name}!";   // "Hello World!"
+
+int n = 42;
+string msg = "n={n}";               // "n=42"
+
+string a = "foo";
+string b = "bar";
+string both = "{a} and {b}";        // "foo and bar"
+```
+
+Any type with `operator string` (including `IString` implementors) works inside `{}`:
+
+```c
+struct Point : IString
+{
+    int x = 0; int y = 0;
+    string ToString() { return "{x}, {y}"; }   // nested interpolation
+};
+
+Point p; p.x = 10; p.y = 20;
+string s = "Point is {p}.";   // "Point is 10, 20."
+```
+
+**Brace escaping** — use `{{` or `\{` for a literal `{`, and `}}` or `\}` for a literal `}`:
+
+```c
+string s = "value is {{x}} = {x}";   // "value is {x} = 42"  (x == 42)
+```
 
 ### Structs
 
@@ -1065,7 +1101,7 @@ reflect(p, visitor);    // prints: x=3 y=7
 
 ## Range-Based For
 
-Iterate over any type that provides `count()` and `get(int)` methods (including `list<T>`):
+Iterate over any type that provides `count()` and `get(int)` methods (including `list<T>`, `array<T>`), or directly over C-style fixed arrays:
 
 ```c
 import "list.cb";
@@ -1077,6 +1113,29 @@ nums.add(30);
 
 for (int x in nums)
     printf("%d\n", x);
+```
+
+C-style fixed arrays work directly — no helper methods needed:
+
+```c
+int buf[4];
+buf[0] = 10; buf[1] = 20; buf[2] = 30; buf[3] = 40;
+
+for (int x in buf)
+    printf("%d\n", x);
+```
+
+`array<T>` (heap-allocated, fixed-size) also works:
+
+```c
+import "array.cb";
+
+array<int> arr;
+arr.init(3);
+arr.set(0, 100); arr.set(1, 200); arr.set(2, 300);
+
+for (int v in arr)
+    printf("%d\n", v);
 ```
 
 ---

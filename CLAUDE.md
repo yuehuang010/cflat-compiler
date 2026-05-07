@@ -266,6 +266,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort — **auto-imported** |
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` — requires `import "interfaces.cb"` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation — requires `import "string.cb"` |
+| `array.cb` | `array<T>` — fixed-size heap array; `init(n)`, `get(i)`, `set(i, v)`, `operator[]`; iterable with `for` |
 | `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
 | `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` — hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
