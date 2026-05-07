@@ -603,7 +603,7 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import StringLiteral ';'
+    : Import StringLiteral (As Identifier)? ';'
     ;
 
 namespaceDefinition

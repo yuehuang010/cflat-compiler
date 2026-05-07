@@ -1,0 +1,21 @@
+import "ns_math.cb" as MyMath;
+
+extern int main()
+{
+    int s = MyMath.square(5);
+    if (s != 25) { printf("square FAILED: expected 25 got %d\n", s); return 1; }
+
+    int a = MyMath.add(3, 4);
+    if (a != 7) { printf("add FAILED: expected 7 got %d\n", a); return 1; }
+
+    MyMath.Point p;
+    p.x = 10;
+    p.y = 20;
+    if (p.x != 10 || p.y != 20) { printf("Point fields FAILED\n"); return 1; }
+
+    int ps = MyMath.point_sum(&p);
+    if (ps != 30) { printf("point_sum FAILED: expected 30 got %d\n", ps); return 1; }
+
+    printf("import as: OK\n");
+    return 0;
+}

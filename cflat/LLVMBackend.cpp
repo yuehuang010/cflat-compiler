@@ -220,8 +220,9 @@ bool LLVMBackend::Compile(const ArgParser& args)
                     if (auto* imp = decl->importDeclaration()) {
                         std::string raw = imp->StringLiteral()->getText();
                         std::string importFilename = raw.substr(1, raw.size() - 2);
-                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << "\n";
-                        if (!CompileImportedFile(filename, importFilename))
+                        std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << "\n";
+                        if (!CompileImportedFile(filename, importFilename, ns))
                             return false;
                     }
                 }
@@ -340,7 +341,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     return true;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -453,11 +454,25 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             {
                 std::string raw = imp->StringLiteral()->getText();
                 std::string nested = raw.substr(1, raw.size() - 2);
-                if (verbose) std::cout << "[verbose]   nested import: " << nested << "\n";
-                if (!CompileImportedFile(canonicalStr, nested))
+                std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
+                if (verbose) std::cout << "[verbose]   nested import: " << nested << (nestedNs.empty() ? "" : " as " + nestedNs) << "\n";
+                if (!CompileImportedFile(canonicalStr, nested, nestedNs))
                     return false;
             }
         }
+    }
+
+    // Snapshot tables after nested imports but before this file's scan+codegen.
+    // The diff after codegen identifies symbols this file (and only this file) contributed.
+    // Track functions by unique mangled name so that a new overload of an existing call-name
+    // (e.g. "add") is still detected as new even if a different overload already existed.
+    std::unordered_set<std::string> funcUniqBefore, structsBefore, ifacesBefore, nsBefore;
+    if (!namespaceName.empty())
+    {
+        for (auto& [_, syms] : functionTable) for (auto& s : syms) funcUniqBefore.insert(s.UniqueName);
+        for (auto& [n, _] : dataStructures) structsBefore.insert(n);
+        for (auto& [n, _] : interfaceTable) ifacesBefore.insert(n);
+        nsBefore = namespaceTable;
     }
 
     auto savedSourceFileName = sourceFileName;
@@ -483,6 +498,22 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
     }
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
+
+    // Register the file-scoped import alias.  The "$global$:<alias>" sentinel tells
+    // ResolveQualifiedName and ParsePostfixExpression to resolve Alias.X → X only
+    // when X was contributed by this file (membership-checked via importAliasMembers).
+    if (!namespaceName.empty())
+    {
+        std::unordered_set<std::string> members;
+        for (auto& [callName, syms] : functionTable)
+            for (auto& s : syms)
+                if (!funcUniqBefore.count(s.UniqueName)) { members.insert(callName); break; }
+        for (auto& [n, _] : dataStructures) if (!structsBefore.count(n)) members.insert(n);
+        for (auto& [n, _] : interfaceTable) if (!ifacesBefore.count(n)) members.insert(n);
+        for (auto& n : namespaceTable)      if (!nsBefore.count(n))      members.insert(n);
+        importAliasMembers[namespaceName] = std::move(members);
+        RegisterNamespaceAlias(namespaceName, "$global$:" + namespaceName);
+    }
 
     sourceFileName = savedSourceFileName;
     currentSourceFilePath_ = savedSourceFilePath;
@@ -630,7 +661,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 if (auto* imp = decl->importDeclaration()) {
                     std::string raw = imp->StringLiteral()->getText();
                     std::string importFilename = raw.substr(1, raw.size() - 2);
-                    if (!CompileImportedFile(filePath, importFilename))
+                    std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                    if (!CompileImportedFile(filePath, importFilename, ns))
                         return false;
                 }
             }

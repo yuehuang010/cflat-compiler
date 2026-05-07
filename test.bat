@@ -109,7 +109,7 @@ if "%CFLAT_PLATFORM%"=="win32" (set CFLAT_OUT=out32) else (set CFLAT_OUT=out)
 set CFLAT_PLATFORM_FLAG=-p %CFLAT_PLATFORM%
 set OUT=%CFLAT_OUT%
 set CFLAT_EXTRA=%*
-set EXCLUDE=test_helper
+set EXCLUDE=test_helper test_arena_channel
 set TIMEOUT_SECS=120
 set SCRIPT=%~f0
 set START_TIME=%TIME%

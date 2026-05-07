@@ -790,6 +790,21 @@ import "math/vector.cb";
 
 Imported functions, structs, and namespaces are available immediately after the import.
 
+#### Import alias (`as`)
+
+Give an imported file a local alias so its symbols are accessible under a qualified name:
+
+```c
+import "ns_math.cb" as Math;
+
+int s = Math.square(5);   // calls square() from ns_math.cb
+Math.Point p;             // uses Point struct from ns_math.cb
+```
+
+`import "file.cb" as Alias` is a caller-side alias, not a namespace boundary. The file's symbols are compiled as-is (unqualified names in the file continue to work), and `Alias.X` resolves to `X` only if `X` was declared in that file. Accessing a name not contributed by the file is a compile error.
+
+If two imported files both declare a symbol with the same name and signature, that is a collision — the author should put the conflicting declarations inside a `namespace` block to make them distinct.
+
 ---
 
 

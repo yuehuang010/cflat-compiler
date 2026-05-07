@@ -796,6 +796,7 @@ private:
     CFlatParser* parser;
     LLVMBackend* compilerLLVM;
     std::string sourceFileName;
+    std::string importNamespace_;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx)
     {
@@ -1204,6 +1205,8 @@ public:
         this->compilerLLVM = compilerLLVM;
         this->sourceFileName = filename;
     }
+
+    void SetImportNamespace(const std::string& ns) { importNamespace_ = ns; }
 
     static void ClearGenericCaches()
     {
@@ -1643,7 +1646,8 @@ public:
             {
                 std::string raw = imp->StringLiteral()->getText();
                 std::string importFilename = raw.substr(1, raw.size() - 2);
-                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename);
+                std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns);
             }
         }
 
@@ -5735,7 +5739,22 @@ public:
                     {
                         if (!namespaceContext.empty())
                         {
-                            std::string qualifiedName = namespaceContext + "." + terminal->getText();
+                            // "$global$:<alias>" sentinel: file-scoped import alias.
+                            // Resolve Alias.Symbol → Symbol only if Symbol is a member of that alias.
+                            bool isFileAlias = namespaceContext.starts_with("$global$:");
+                            std::string memberName = terminal->getText();
+                            std::string qualifiedName;
+                            if (isFileAlias)
+                            {
+                                std::string aliasName = namespaceContext.substr(9);
+                                qualifiedName = Compiler(ctx)->IsImportAliasMember(aliasName, memberName)
+                                    ? memberName
+                                    : namespaceContext + "." + memberName;  // will fail → error
+                            }
+                            else
+                            {
+                                qualifiedName = namespaceContext + "." + memberName;
+                            }
                             if (Compiler(ctx)->IsNamespace(qualifiedName))
                             {
                                 namespaceContext = Compiler(ctx)->ResolveNamespace(qualifiedName);

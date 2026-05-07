@@ -477,6 +477,9 @@ public:
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
+    // Maps import alias name → set of unqualified symbol names the file contributed.
+    // Populated by CompileImportedFile when namespaceName is non-empty.
+    std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
     std::unordered_set<std::string> importedFiles;
     std::vector<std::string> importStack;  // DFS stack for circular import detection
     std::string importSearchDir;
@@ -5072,6 +5075,12 @@ public:
             if (frame.namespaceAliases.count(name)) return true;
         return namespaceTable.count(name) > 0 || namespaceAliasTable.count(name) > 0;
     }
+    bool IsImportAlias(const std::string& name) const { return importAliasMembers.count(name) > 0; }
+    bool IsImportAliasMember(const std::string& alias, const std::string& member) const
+    {
+        auto it = importAliasMembers.find(alias);
+        return it != importAliasMembers.end() && it->second.count(member) > 0;
+    }
     bool IsDataStructure(const std::string& name) const { return dataStructures.count(name) > 0; }
     std::string ResolveNamespace(const std::string& name) const
     {
@@ -5106,6 +5115,16 @@ public:
             std::string resolvedFirst = ResolveNamespace(firstComp);
             if (resolvedFirst != firstComp)
                 nsPrefix = restComp.empty() ? resolvedFirst : resolvedFirst + "." + restComp;
+        }
+
+        // "$global$:<alias>" sentinel: file-scoped import alias (import "x.cb" as Alias).
+        // Resolve to unqualified lastName only if it was contributed by that file.
+        if (nsPrefix.starts_with("$global$:"))
+        {
+            std::string aliasName = nsPrefix.substr(9);
+            if (IsImportAliasMember(aliasName, lastName))
+                return lastName;
+            return name;
         }
 
         // Walk up from the (possibly expanded) prefix toward the root
@@ -5153,7 +5172,7 @@ public:
                            const std::vector<std::string>& sourceLines);
 
     bool Compile(const ArgParser& args);
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {});
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 };
