@@ -2936,6 +2936,7 @@ public:
 
                     auto* directDecl = declarator->directDeclarator();
                     std::string name = getDirectDeclName(directDecl);
+                    typeAndValue.ConstArraySize = 0;  // reset per-declarator
                     if (directDecl->assignmentExpression())
                     {
                         // C-style fixed-size array field: char buf[N]
@@ -3105,9 +3106,16 @@ public:
             {
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
-                // C-style array local: char buf[N] — override arraySize for this declarator
+                // C-style fixed-size array local: char buf[N] — use [N x T] alloca representation
+                typeAndValue.ConstArraySize = 0;  // reset per-declarator
                 if (direct->assignmentExpression() && typeAndValue.ArraySize == nullptr)
-                    arraySize = ParseAssignmentExpression(direct->assignmentExpression());
+                {
+                    auto* sizeVal = ParseAssignmentExpression(direct->assignmentExpression());
+                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
+                        typeAndValue.ConstArraySize = ci->getZExtValue();
+                    else
+                        LogErrorContext(direct, "array size must be a compile-time constant");
+                }
                 typeAndValue.VariableName = name;
 
                 if (identList != nullptr)
@@ -4462,6 +4470,13 @@ public:
 
             if (namedVar.Storage != nullptr)
             {
+                // Array-to-pointer decay: fixed-size array used as a value decays to pointer to first element
+                if (namedVar.BaseType && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                {
+                    auto* arrTy = llvm::cast<llvm::ArrayType>(namedVar.BaseType);
+                    auto* zero = compiler->builder->getInt64(0);
+                    return compiler->builder->CreateGEP(arrTy, namedVar.Storage, {zero, zero}, "arrptr");
+                }
                 // For through-pointer dereferences (Storage is a raw loaded ptr, not an alloca/gep/global),
                 // use BaseType to emit the correctly-typed load (opaque pointers carry no type info).
                 if (namedVar.BaseType

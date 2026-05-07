@@ -46,9 +46,41 @@ extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, 
 extern stdcall void     WakeConditionVariable(void* cv);
 extern stdcall void     WakeAllConditionVariable(void* cv);
 
+// Win32 SYSTEM_INFO — pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
+// x64: 48 bytes (pointers = 8 bytes); x86: 36 bytes (pointers = 4 bytes).
+struct _SystemInfo
+{
+    u32 _oemId            = default;  //  0 — dwOemId union
+    u32 _pageSize         = default;  //  4 — dwPageSize
+    i8* _minAddr          = default;  //  8 — lpMinimumApplicationAddress (pointer-sized)
+    i8* _maxAddr          = default;  // 16/12 — lpMaximumApplicationAddress (pointer-sized)
+    i8* _procMask         = default;  // 24/16 — dwActiveProcessorMask (ULONG_PTR, pointer-sized)
+    u32 _numProc          = default;  // 32/20 — dwNumberOfProcessors
+    u32 _procType         = default;  // 36/24 — dwProcessorType
+    u32 _allocGranularity = default;  // 40/28 — dwAllocationGranularity (VirtualAlloc page size)
+    u16 _procLevel        = default;  // 44/32
+    u16 _procRevision     = default;  // 46/34
+};
+
+// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION — pointer-sized ProcessorMask.
+// x64: 32 bytes; x86: 24 bytes. The union at offset 8/4 is interpreted as
+// CACHE_DESCRIPTOR when _relationship == RelationCache (2).
+struct _SysLogicalProcInfo
+{
+    i8* _processorMask = default;  //  0 — ULONG_PTR ProcessorMask (pointer-sized)
+    u32 _relationship  = default;  //  8/4 — LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
+    u32 _pad           = default;  // 12/8 — padding before union
+    u8  _cacheLevel    = default;  // 16/12 — CACHE_DESCRIPTOR.Level
+    u8  _cacheAssoc    = default;  // 17/13 — CACHE_DESCRIPTOR.Associativity
+    u16 _cacheLineSize = default;  // 18/14 — CACHE_DESCRIPTOR.LineSize
+    u32 _cacheSize     = default;  // 20/16 — CACHE_DESCRIPTOR.Size
+    u32 _cacheType     = default;  // 24/20 — PROCESSOR_CACHE_TYPE
+    u32 _pad2          = default;  // 28/24 — trailing pad
+};
+
 // Win32 Virtual Memory — dwSize is SIZE_T (win_size).
-extern stdcall void     GetSystemInfo(void* lpSystemInfo);
-extern stdcall void     GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
+extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
+extern stdcall void     GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
 extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
 extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
 
@@ -61,6 +93,26 @@ if const (__PLATFORM__ == 32) {
         return VirtualFree(lpAddress, (i32)dwSize, dwFreeType);
     }
 }
+
+// WIN32_FIND_DATAA — mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
+// FILETIME is two consecutive DWORDs; keeping them as i32 pairs avoids padding
+// that would appear if we used i64 (since ftCreationTime starts at byte offset 4).
+struct _WIN32_FIND_DATAA
+{
+    i32 dwFileAttributes = 0;
+    i32 ftCreationTime_lo = 0;
+    i32 ftCreationTime_hi = 0;
+    i32 ftLastAccessTime_lo = 0;
+    i32 ftLastAccessTime_hi = 0;
+    i32 ftLastWriteTime_lo = 0;
+    i32 ftLastWriteTime_hi = 0;
+    i32 nFileSizeHigh = 0;
+    i32 nFileSizeLow = 0;
+    i32 dwReserved0 = 0;
+    i32 dwReserved1 = 0;
+    i8 cFileName[260] = default;
+    i8 cAlternateFileName[14] = default;
+};
 
 // Win32 Filesystem
 extern void*    fopen(const char* path, const char* mode);
@@ -79,8 +131,8 @@ extern win_int  _rmdir(const char* path);
 extern i8*      _getcwd(i8* buf, win_int size);
 extern win_int  _chdir(const char* path);
 // HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
-extern stdcall void*    FindFirstFileA(const char* pattern, i8* findData);
-extern stdcall win_int  FindNextFileA(void* handle, i8* findData);
+extern stdcall void*    FindFirstFileA(const char* pattern, _WIN32_FIND_DATAA* findData);
+extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData);
 extern stdcall win_int  FindClose(void* handle);
 extern stdcall win_int  GetFileAttributesA(const char* path);
 

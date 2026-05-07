@@ -2,10 +2,39 @@ claude --dangerously-skip-permissions
 
   ---
 Windows ABI gaps:
-- WIN32\_FIND\_DATAA is a raw i8\[600] blob with magic offset 44 for cFileName — no header includes
+- ~~WIN32\_FIND\_DATAA is a raw i8\[600] blob with magic offset 44 for cFileName~~ — FIXED: properly mirrored as `_WIN32_FIND_DATAA` struct in `os.windows.cb` using fixed-size array fields (`i8 cFileName[260]`)
 - FindFirstFileA handle typed as i64 to enable -1 comparison against INVALID\_HANDLE\_VALUE
 - \_SystemInfo is a hand-mirrored struct; new \_SystemInfo\[1] used as a stack-emulation workaround
 
+
+Here's the honest breakdown of fixability for each:
+
+  ---
+  1. WIN32_FIND_DATAA as i8[600] + magic offset 44                                                                      
+  Partially fixable now, but not cleanly. The root obstacle is that cFileName is a 260-byte inline array field — CFlat    structs don't support fixed-size array fields, so you can't mirror the struct completely the way _SystemInfo was. You
+  could define a partial struct for the fields before offset 44, but you'd still need raw arithmetic to reach cFileName.
+   The cleanest fix requires a compiler feature: fixed-size array fields in structs (i8 _cFileName[260]). Without that,
+  the best you can do is name the magic constant and reduce the 600-byte allocation to the actual 320-byte struct size.
+
+  2. FindFirstFileA handle comparison to INVALID_HANDLE_VALUE
+
+  Already functionally correct — (void*)(i64)-1 is the right value. The only remaining rough edge is the expression is
+  duplicated inline. Fixable now with a named helper or constant, but requires checking whether CFlat supports
+  global-scope function definitions (it does — os.windows.cb already has those VirtualAlloc wrapper functions). A
+  one-liner like:
+
+  bool IsInvalidHandle(void* h) { return h == (void*)(i64)-1; }
+
+  in os.windows.cb would clean it up.
+
+  3. _SystemInfo hand-mirrored struct + malloc workaround
+
+  Two separable problems:
+  - Triplication (_SystemInfo, _FA_SysInfo, _SA_SysInfo are three identical copies): Fixable now — consolidate into one
+  definition in os.windows.cb and have all allocators import os.windows.cb.
+  - malloc workaround: The reason for malloc instead of a stack local is that CFlat has no address-of operator (&local),
+   so you can't write _SystemInfo si; GetSystemInfo(&si). Fixing this requires a compiler enhancement (address-of for
+  local variables). Until then, malloc/free is the right workaround.
 
 Generics limitations:
 - sort is O(n²) insertion sort

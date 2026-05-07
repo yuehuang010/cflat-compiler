@@ -1560,6 +1560,61 @@ bool testPrimitiveTypeAlias()
     return result;
 }
 
+// =============================================================
+// Fixed-size inline array tests (local variables and struct fields)
+// =============================================================
+
+struct ArrayHolder
+{
+    i8 label[8] = default;
+    i32 count = 0;
+    i8 data[16] = default;
+};
+
+int sumFixedBuf(i8* buf, int len)
+{
+    int sum = 0;
+    int i = 0;
+    while (i < len) { sum = sum + (int)buf[i]; i++; }
+    return sum;
+}
+
+bool testFixedArrays()
+{
+    bool result = true;
+
+    // Local fixed-size array: write, read back
+    i8 buf[8] = default;
+    buf[0] = (i8)10; buf[1] = (i8)20; buf[2] = (i8)30;
+    result &= Test("fixed_local_elem0", (int)buf[0], 10);
+    result &= Test("fixed_local_elem1", (int)buf[1], 20);
+    result &= Test("fixed_local_elem2", (int)buf[2], 30);
+
+    // Array decays to pointer when passed to a function
+    result &= Test("fixed_local_decay", sumFixedBuf(buf, 3), 60);
+
+    // No ConstArraySize carryover to the next declarator
+    int plain = 42;
+    result &= Test("fixed_no_carryover", plain, 42);
+
+    // Struct with multiple inline array fields
+    ArrayHolder h = default;
+    h.label[0] = (i8)'O'; h.label[1] = (i8)'K'; h.label[2] = (i8)0;
+    h.count = 7;
+    h.data[0] = (i8)1; h.data[1] = (i8)2; h.data[2] = (i8)3;
+    result &= Test("fixed_struct_label0", (int)h.label[0], (int)'O');
+    result &= Test("fixed_struct_label1", (int)h.label[1], (int)'K');
+    result &= Test("fixed_struct_count",  h.count, 7);
+    result &= Test("fixed_struct_data_sum", sumFixedBuf(h.data, 3), 6);
+
+    // Struct pointer access
+    ArrayHolder* ph = &h;
+    result &= Test("fixed_struct_ptr_label0", (int)ph->label[0], (int)'O');
+    result &= Test("fixed_struct_ptr_count",  ph->count, 7);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1626,6 +1681,7 @@ extern int main()
     total++; passed += testNestedStructClass()           ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
     total++; passed += testVariadic()                    ? 1 : 0;
+    total++; passed += testFixedArrays()                 ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

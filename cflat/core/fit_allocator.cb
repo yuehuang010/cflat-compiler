@@ -25,19 +25,6 @@
 // Requests > half the segment size go directly to the large path.
 
 
-struct _FA_SysInfo
-{
-    u32 _oemId            = default;
-    u32 _pageSize         = default;
-    i8* _minAddr          = default;
-    i8* _maxAddr          = default;
-    i8* _procMask         = default;  // ULONG_PTR — pointer-sized (4 on x86, 8 on x64)
-    u32 _numProc          = default;
-    u32 _procType         = default;
-    u32 _allocGranularity = default;
-    u16 _procLevel        = default;
-    u16 _procRevision     = default;
-};
 
 // 8-byte header at ptr[-8] for every allocation.
 struct _FA_Header
@@ -90,8 +77,8 @@ class FitAllocator : IAllocator
 
     void _init()
     {
-        _FA_SysInfo* si = (_FA_SysInfo*)malloc((i64)sizeof(_FA_SysInfo));
-        GetSystemInfo((void*)si);
+        _SystemInfo* si = (_SystemInfo*)malloc((i64)sizeof(_SystemInfo));
+        GetSystemInfo(si);
         _pageSize = (i64)si->_pageSize;
         free((void*)si);
 

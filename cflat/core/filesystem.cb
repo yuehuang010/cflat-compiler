@@ -285,37 +285,28 @@ class Directory
         {
             // Windows implementation
             string pattern = path + "\\*";
-            i8* findData = new i8[600];
+            _WIN32_FIND_DATAA* findData = new _WIN32_FIND_DATAA;
             void* handle = FindFirstFileA(pattern.data(), findData);
             if (handle == (void*)(i64)-1)
             {
-                delete[] findData;
+                delete findData;
                 return result;
             }
             do {
-                i8* nameBuf = new i8[260];
-                int k = 0;
-                while (k < 260)
+                i8* name = findData->cFileName;
+                if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0)
                 {
-                    i8 c = findData[44 + k];
-                    nameBuf[k] = c;
-                    k++;
-                    if (c == 0) break;
-                }
-                if (strcmp(nameBuf, ".") != 0 && strcmp(nameBuf, "..") != 0)
-                {
+                    int len = strlen(name);
+                    i8* nameBuf = new i8[len + 1];
+                    memcpy(nameBuf, name, len + 1);
                     string entry;
                     entry._ptr = nameBuf;
-                    entry._len = strlen(nameBuf);
+                    entry._len = len;
                     result->add(entry);
-                }
-                else
-                {
-                    delete[] nameBuf;
                 }
             } while (FindNextFileA(handle, findData) != 0);
             FindClose(handle);
-            delete[] findData;
+            delete findData;
         }
 
         return result;
