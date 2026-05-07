@@ -1,7 +1,9 @@
+import "vmem.cb";
+
 // block_allocator.cb — fixed-block-size page allocator.
 //
-// Each page is a VirtualAlloc'd buffer (MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE).
-// VirtualAlloc guarantees OS-aligned, zero-initialized pages — no memset needed.
+// Each page is a vmem_alloc'd buffer (MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE).
+// vmem_alloc guarantees OS-aligned, zero-initialized pages — no memset needed.
 //
 // Page layout: [bitmap | padding | data blocks]
 //   bitmap    — one byte per block (0 = free, 1 = used)
@@ -88,9 +90,8 @@ class BlockAllocator : IAllocator
         i64 bitmapSize = (rawCount + _blockSize - 1) / _blockSize * _blockSize;  // round up to cache line
         i64 blockCount = (_pageSize - bitmapSize) / _blockSize;
 
-        // MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_READWRITE = 0x04
-        // VirtualAlloc zero-initializes committed pages — bitmap is already cleared.
-        i8* data = (i8*)VirtualAlloc(nullptr, _pageSize, 0x3000u, 0x04u);
+        // vmem_alloc zero-initializes committed pages — bitmap is already cleared.
+        i8* data = (i8*)vmem_alloc(_pageSize);
 
         if (_pageCount == _pageCapacity) _growPages();
 
@@ -204,7 +205,7 @@ class BlockAllocator : IAllocator
         int i = 0;
         while (i < _pageCount)
         {
-            VirtualFree(_pages[i]._data, 0, 0x8000u);  // MEM_RELEASE; dwSize must be 0
+            vmem_free(_pages[i]._data);
             i = i + 1;
         }
         if (_pages != nullptr) free((void*)_pages);
@@ -219,7 +220,7 @@ class BlockAllocator : IAllocator
         int i = 0;
         while (i < _pageCount)
         {
-            VirtualFree(_pages[i]._data, 0, 0x8000u);  // MEM_RELEASE; dwSize must be 0
+            vmem_free(_pages[i]._data);
             i = i + 1;
         }
         if (_pages != nullptr) free((void*)_pages);

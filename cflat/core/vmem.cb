@@ -1,0 +1,37 @@
+// vmem.cb — OS virtual memory abstraction
+//
+// Wraps platform page-allocation primitives behind four named functions so
+// allocators are not littered with Windows-specific magic constants.
+//
+// Windows mapping:
+//   vmem_reserve  -> VirtualAlloc MEM_RESERVE  (address space only, no physical pages)
+//   vmem_commit   -> VirtualAlloc MEM_COMMIT   (commit pages inside a reserved region)
+//   vmem_alloc    -> VirtualAlloc MEM_RESERVE|MEM_COMMIT  (one-shot reserve + commit)
+//   vmem_free     -> VirtualFree  MEM_RELEASE
+//
+// Linux (future): mmap(PROT_NONE) / mprotect / mmap(PROT_RW) / munmap
+
+// Reserve address space without committing physical pages.
+// Use with vmem_commit to implement demand-paging (e.g. slab pre-reservation).
+void* vmem_reserve(i64 size)
+{
+    return VirtualAlloc(nullptr, size, 0x2000u, 0x04u);
+}
+
+// Commit physical pages inside a previously-reserved region.
+void* vmem_commit(void* ptr, i64 size)
+{
+    return VirtualAlloc(ptr, size, 0x1000u, 0x04u);
+}
+
+// Reserve and commit in one call. Returns zeroed memory.
+void* vmem_alloc(i64 size)
+{
+    return VirtualAlloc(nullptr, size, 0x3000u, 0x04u);
+}
+
+// Release the entire region back to the OS. size must be 0 for MEM_RELEASE.
+void vmem_free(void* ptr)
+{
+    VirtualFree(ptr, 0, 0x8000u);
+}

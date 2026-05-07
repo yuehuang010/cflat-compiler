@@ -1,3 +1,5 @@
+import "vmem.cb";
+
 // slab_allocator.cb — segregated-fit slab allocator with O(1) alloc and dealloc.
 //
 // Reserves one contiguous address region (8 × _regionSize bytes) at init.
@@ -6,8 +8,8 @@
 //
 //   slabIdx = (ptr - _base) >> _regionShift
 //
-// Physical memory is committed in 4K increments (MEM_COMMIT on demand within
-// the reserved region). This avoids committing a full 64K VirtualAlloc chunk
+// Physical memory is committed in 4K increments (vmem_commit on demand within
+// the reserved region). This avoids committing a full 64K vmem_alloc chunk
 // when only a handful of blocks are needed.
 //
 // Freed blocks are recycled via a per-slab external free stack (a compact
@@ -17,7 +19,7 @@
 // in v1. Physical memory grows until cleanup() is called.
 //
 // Size classes: 8, 16, 32, 64, 128, 256, 512, 1024 bytes.
-// Requests > 1024 bytes go directly to VirtualAlloc (large-alloc path).
+// Requests > 1024 bytes go directly to vmem_alloc (large-alloc path).
 //
 // Usage:
 //   SlabAllocator sa;
@@ -30,11 +32,11 @@
 // One slot in the per-slab free stack. Wrapping i8* avoids double-pointer syntax.
 struct _SA_Entry { i8* _ptr = nullptr; };
 
-// Header prepended to every large-alloc VirtualAlloc region.
+// Header prepended to every large-alloc vmem_alloc region.
 struct _SA_LargeHdr
 {
     i64 _userSize   = 0;        // bytes requested by caller
-    i64 _regionSize = 0;        // total VirtualAlloc'd bytes (for VirtualFree)
+    i64 _regionSize = 0;        // total vmem_alloc'd bytes (for vmem_free)
     i8* _next       = nullptr;  // intrusive linked list of live large allocs
 };
 
@@ -74,10 +76,10 @@ class SlabAllocator : IAllocator
         free((void*)si);
 
         // Each slab owns 16 MB (2^24). Total reservation: 8 × 16 MB = 128 MB.
-        // MEM_RESERVE (0x2000) only — no physical pages committed yet.
+        // Reserve only — physical pages are committed on demand in _addPage.
         _regionShift = (i64)24;
         _regionSize  = (i64)1 << (int)_regionShift;
-        _base = (i8*)VirtualAlloc(nullptr, (i64)8 * _regionSize, 0x2000u, 0x04u);
+        _base = (i8*)vmem_reserve((i64)8 * _regionSize);
 
         _slabs = (_SA_Slab*)malloc((i64)8 * (i64)sizeof(_SA_Slab));
         memset((void*)_slabs, 0, (i64)8 * (i64)sizeof(_SA_Slab));
@@ -153,8 +155,7 @@ class SlabAllocator : IAllocator
         if (_slabs[cls]._commitEnd + _pageSize > _regionSize) return;  // region exhausted
 
         i8* page = _slabs[cls]._base + _slabs[cls]._commitEnd;
-        // MEM_COMMIT (0x1000) within the already-reserved region.
-        VirtualAlloc((void*)page, _pageSize, 0x1000u, 0x04u);
+        vmem_commit((void*)page, _pageSize);
         _slabs[cls]._commitEnd   = _slabs[cls]._commitEnd   + _pageSize;
         _slabs[cls]._commitPages = _slabs[cls]._commitPages + 1;
 
@@ -177,10 +178,10 @@ class SlabAllocator : IAllocator
     void* _allocLarge(i64 size)
     {
         i64 hdrSize = (i64)sizeof(_SA_LargeHdr);
-        i64 gran    = (i64)0x10000;  // 64K VirtualAlloc granularity
+        i64 gran    = (i64)0x10000;  // 64K allocation granularity (OS page rounding)
         i64 total   = (hdrSize + size + gran - (i64)1) / gran * gran;
 
-        i8* base = (i8*)VirtualAlloc(nullptr, total, 0x3000u, 0x04u);
+        i8* base = (i8*)vmem_alloc(total);
         if (base == nullptr) return nullptr;
 
         _SA_LargeHdr* hdr = (_SA_LargeHdr*)base;
@@ -223,7 +224,7 @@ class SlabAllocator : IAllocator
             prev = cur;
             cur  = ch->_next;
         }
-        VirtualFree((void*)base, 0, 0x8000u);
+        vmem_free((void*)base);
     }
 
     // -----------------------------------------------------------------------
@@ -330,7 +331,7 @@ class SlabAllocator : IAllocator
         }
         if (_base != nullptr)
         {
-            VirtualFree((void*)_base, 0, 0x8000u);
+            vmem_free((void*)_base);
             _base = nullptr;
         }
         i8* cur = _largeHead;
@@ -338,7 +339,7 @@ class SlabAllocator : IAllocator
         {
             _SA_LargeHdr* h = (_SA_LargeHdr*)cur;
             i8* next = h->_next;
-            VirtualFree((void*)cur, 0, 0x8000u);
+            vmem_free((void*)cur);
             cur = next;
         }
         _largeHead  = nullptr;

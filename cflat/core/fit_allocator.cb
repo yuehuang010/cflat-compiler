@@ -1,15 +1,17 @@
+import "vmem.cb";
+
 // fit_allocator.cb — first-fit allocator with coalescing free list.
 //
-// Memory is sourced from VirtualAlloc segments (MEM_COMMIT|MEM_RESERVE).
+// Memory is sourced from vmem_alloc segments (MEM_COMMIT|MEM_RESERVE).
 // Every allocation (slab and large) carries an 8-byte _FA_Header directly
 // before the user pointer. dealloc always backs up 8 bytes to find the
 // header; the sign of _size distinguishes the two paths:
 //
 //   _size > 0  → slab allocation  (free block via coalescing free list)
-//   _size < 0  → large allocation (free via VirtualFree)
+//   _size < 0  → large allocation (free via vmem_free)
 //
-// Large-alloc VirtualAlloc layout:
-//   [base + 0]  _FA_LargePrefix._totalSize (8 bytes — VirtualAlloc size)
+// Large-alloc vmem_alloc layout:
+//   [base + 0]  _FA_LargePrefix._totalSize (8 bytes — vmem_alloc size)
 //   [base + 8]  _FA_LargePrefix._next      (8 bytes — linked list)
 //   [base + 16] _FA_Header._size           (8 bytes — stored as -userSize)
 //   [base + 24] user data                  ← returned pointer
@@ -21,7 +23,7 @@
 // The free list is a sorted doubly-linked list of free blocks ordered by
 // address. Adjacent free blocks are coalesced on dealloc (O(1)).
 //
-// Allocation: O(n) first-fit scan. Segment growth: new VirtualAlloc on miss.
+// Allocation: O(n) first-fit scan. Segment growth: new vmem_alloc on miss.
 // Requests > half the segment size go directly to the large path.
 
 
@@ -40,15 +42,15 @@ struct _FA_FreeBlock
     _FA_FreeBlock* _next = nullptr;
 };
 
-// Prefix stored at VirtualAlloc base for large allocations (16 bytes).
+// Prefix stored at vmem_alloc base for large allocations (16 bytes).
 // Followed immediately by an _FA_Header, then user data.
 struct _FA_LargePrefix
 {
-    i64 _totalSize = 0;        // VirtualAlloc'd bytes
+    i64 _totalSize = 0;        // vmem_alloc'd bytes
     i8* _next      = nullptr;  // intrusive list of live large allocs
 };
 
-// One VirtualAlloc'd segment for slab allocations.
+// One vmem_alloc'd segment for slab allocations.
 struct _FA_Segment
 {
     i8*          _base = nullptr;
@@ -95,7 +97,7 @@ class FitAllocator : IAllocator
         seg->_next = _segments;
         _segments  = seg;
 
-        i8* base = (i8*)VirtualAlloc(nullptr, aligned, 0x3000u, 0x04u);
+        i8* base = (i8*)vmem_alloc(aligned);
         seg->_base = base;
 
         // Entire segment is one free block.
@@ -198,7 +200,7 @@ class FitAllocator : IAllocator
         i64 gran    = (i64)0x10000;
         i64 total   = (pfxSize + hdrSize + size + gran - (i64)1) / gran * gran;
 
-        i8* base = (i8*)VirtualAlloc(nullptr, total, 0x3000u, 0x04u);
+        i8* base = (i8*)vmem_alloc(total);
         if (base == nullptr) return nullptr;
 
         _FA_LargePrefix* pfx = (_FA_LargePrefix*)base;
@@ -249,7 +251,7 @@ class FitAllocator : IAllocator
             prev = cur;
             cur  = cp->_next;
         }
-        VirtualFree((void*)base, 0, 0x8000u);
+        vmem_free((void*)base);
     }
 
     // -----------------------------------------------------------------------
@@ -359,7 +361,7 @@ class FitAllocator : IAllocator
         while (s != nullptr)
         {
             _FA_Segment* next = s->_next;
-            VirtualFree((void*)s->_base, 0, 0x8000u);
+            vmem_free((void*)s->_base);
             free((void*)s);
             s = next;
         }
@@ -371,7 +373,7 @@ class FitAllocator : IAllocator
         {
             _FA_LargePrefix* p = (_FA_LargePrefix*)cur;
             i8* next = p->_next;
-            VirtualFree((void*)cur, 0, 0x8000u);
+            vmem_free((void*)cur);
             cur = next;
         }
         _largeHead  = nullptr;
