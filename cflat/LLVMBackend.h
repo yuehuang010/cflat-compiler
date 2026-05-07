@@ -1436,6 +1436,7 @@ private:
         linkArgStrs.push_back("ucrt.lib");
         linkArgStrs.push_back("vcruntime.lib");
         linkArgStrs.push_back("kernel32.lib");
+        linkArgStrs.push_back("ws2_32.lib");
         linkArgStrs.push_back(objPath);
 
         std::vector<llvm::StringRef> linkArgs;

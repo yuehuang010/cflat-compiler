@@ -1,0 +1,88 @@
+import "network/socket.cb";
+import "thread.cb";
+
+int g_port = 19876;
+
+int serverThread(void* arg)
+{
+    Socket* listener = new Socket;
+    listener->createTcp();
+    listener->setReuseAddr(true);
+    string host = "127.0.0.1";
+    listener->bind(host, g_port);
+    listener->listenOn(5);
+
+    Socket* client = listener->accept();
+    if (client == nullptr)
+    {
+        printf("server: accept failed\n");
+        delete listener;
+        return 1;
+    }
+
+    i8* buf = new i8[256];
+    int n = client->recv(buf, 255);
+    if (n > 0)
+    {
+        buf[n] = 0;
+        client->send(buf, n);
+    }
+    delete buf;
+    delete client;
+    delete listener;
+    return 0;
+}
+
+extern int main()
+{
+    if (!Socket.initNetwork())
+    {
+        printf("FAIL: initNetwork\n");
+        return 1;
+    }
+
+    Thread* srv = new Thread;
+    srv->start(serverThread, nullptr);
+
+    Sleep(50);
+
+    Socket* c = new Socket;
+    if (!c->createTcp())
+    {
+        printf("FAIL: createTcp\n");
+        delete c;
+        delete srv;
+        Socket.shutdownNetwork();
+        return 1;
+    }
+
+    string host = "127.0.0.1";
+    if (!c->connect(host, g_port))
+    {
+        printf("FAIL: connect\n");
+        delete c;
+        delete srv;
+        Socket.shutdownNetwork();
+        return 1;
+    }
+
+    string msg = "hello";
+    c->send(msg.data(), msg.length());
+
+    i8* reply = new i8[256];
+    int n = c->recv(reply, 255);
+    reply[n] = 0;
+
+    bool ok = strcmp(reply, "hello") == 0;
+    delete reply;
+    delete c;
+
+    srv->join();
+    delete srv;
+
+    Socket.shutdownNetwork();
+
+    if (ok) { printf("PASS: socket echo test\n"); }
+    else    { printf("FAIL: echo mismatch\n"); }
+    return ok ? 0 : 1;
+}

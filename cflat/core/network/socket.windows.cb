@@ -1,0 +1,77 @@
+// Winsock2 raw bindings — imported only on Windows by socket.cb.
+
+// Pointer-sized integer for fields that are size_t in the Win32 API.
+if const (__PLATFORM__ == 64) {
+    using _net_size = i64;
+} else {
+    using _net_size = i32;
+}
+
+// WSADATA — opaque; 408 bytes covers both Win32 and Win64 layouts.
+struct _WsaData {
+    i8 _data[408] = default;
+};
+
+// sockaddr_in — IPv4 socket address (16 bytes).
+struct _SockAddrIn {
+    i16 sin_family = 0;
+    u16 sin_port   = 0;
+    u32 sin_addr   = 0;
+    i8  sin_zero[8] = default;
+};
+
+// ADDRINFOA — getaddrinfo result node.
+// ai_addrlen is size_t (pointer-wide); all pointer fields are i8* (naturally pointer-sized).
+struct _AddrInfo {
+    i32        ai_flags     = 0;
+    i32        ai_family    = 0;
+    i32        ai_socktype  = 0;
+    i32        ai_protocol  = 0;
+    _net_size  ai_addrlen   = 0;
+    i8*        ai_canonname = nullptr;
+    i8*        ai_addr      = nullptr;  // sockaddr* — cast to _SockAddrIn* for IPv4
+    _AddrInfo* ai_next      = nullptr;
+};
+
+// Lifecycle
+extern stdcall i32  WSAStartup(u16 version, _WsaData* data);
+extern stdcall i32  WSACleanup();
+extern stdcall i32  WSAGetLastError();
+
+// Socket creation / destruction
+// SOCKET is UINT_PTR; we use void* — INVALID_SOCKET == (void*)(i64)-1
+extern stdcall void* socket(i32 af, i32 type, i32 protocol);
+extern stdcall i32   closesocket(void* sock);
+
+// Server
+extern stdcall i32   bind(void* sock, _SockAddrIn* addr, i32 addrlen);
+extern stdcall i32   listen(void* sock, i32 backlog);
+extern stdcall void* accept(void* sock, _SockAddrIn* addr, i32* addrlen);
+
+// Client
+extern stdcall i32   connect(void* sock, _SockAddrIn* addr, i32 addrlen);
+
+// I/O
+extern stdcall i32   send(void* sock, const char* buf, i32 len, i32 flags);
+extern stdcall i32   recv(void* sock, i8* buf, i32 len, i32 flags);
+
+// Options
+extern stdcall i32   setsockopt(void* sock, i32 level, i32 optname, const char* optval, i32 optlen);
+
+// Address helpers
+extern stdcall u16   htons(u16 hostshort);
+extern stdcall u16   ntohs(u16 netshort);
+extern stdcall u32   inet_addr(const char* cp);
+
+// Name resolution — handles both hostnames and IP strings.
+extern stdcall i32  getaddrinfo(const char* hostname, const char* service, _AddrInfo* hints, _AddrInfo** result);
+extern stdcall void freeaddrinfo(_AddrInfo* ai);
+
+// Wrappers with _wsa_ prefix so Socket methods can call them without triggering
+// method-resolution (unqualified calls inside a method prepend 'this').
+i32   _wsa_bind(void* sock, _SockAddrIn* addr, i32 addrlen) { return bind(sock, addr, addrlen); }
+i32   _wsa_listen(void* sock, i32 backlog)                  { return listen(sock, backlog); }
+void* _wsa_accept(void* sock, _SockAddrIn* addr, i32* len)  { return accept(sock, addr, len); }
+i32   _wsa_connect(void* sock, _SockAddrIn* addr, i32 len)  { return connect(sock, addr, len); }
+i32   _wsa_send(void* sock, const char* buf, i32 len, i32 flags) { return send(sock, buf, len, flags); }
+i32   _wsa_recv(void* sock, i8* buf, i32 len, i32 flags)    { return recv(sock, buf, len, flags); }
