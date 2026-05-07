@@ -18,34 +18,36 @@
 //   ba.dealloc(p);
 //   ba.PrintUsage();
 
-// Win32 SYSTEM_INFO — matches the x64 struct layout exactly (48 bytes).
+// Win32 SYSTEM_INFO — pointer-sized fields use i8* so layout is correct on both x86 and x64.
+// x64: 48 bytes (pointers = 8); x86: 36 bytes (pointers = 4).
 struct _SystemInfo
 {
     u32 _oemId            = default;  //  0 — dwOemId union
     u32 _pageSize         = default;  //  4 — dwPageSize
-    i8* _minAddr          = default;  //  8 — lpMinimumApplicationAddress
-    i8* _maxAddr          = default;  // 16 — lpMaximumApplicationAddress
-    i64 _procMask         = default;  // 24 — dwActiveProcessorMask
-    u32 _numProc          = default;  // 32 — dwNumberOfProcessors
-    u32 _procType         = default;  // 36 — dwProcessorType
-    u32 _allocGranularity = default;  // 40 — dwAllocationGranularity (VirtualAlloc page size)
-    u16 _procLevel        = default;  // 44
-    u16 _procRevision     = default;  // 46
+    i8* _minAddr          = default;  //  8 — lpMinimumApplicationAddress (pointer-sized)
+    i8* _maxAddr          = default;  // 16/12 — lpMaximumApplicationAddress (pointer-sized)
+    i8* _procMask         = default;  // 24/16 — dwActiveProcessorMask (ULONG_PTR, pointer-sized)
+    u32 _numProc          = default;  // 32/20 — dwNumberOfProcessors
+    u32 _procType         = default;  // 36/24 — dwProcessorType
+    u32 _allocGranularity = default;  // 40/28 — dwAllocationGranularity (VirtualAlloc page size)
+    u16 _procLevel        = default;  // 44/32
+    u16 _procRevision     = default;  // 46/34
 };
 
-// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION — 32 bytes on x64.
-// The union at offset 16 is interpreted as CACHE_DESCRIPTOR when _relationship == 2.
+// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION — pointer-sized ProcessorMask.
+// x64: 32 bytes; x86: 24 bytes. The union at offset 8/12 is interpreted as
+// CACHE_DESCRIPTOR when _relationship == RelationCache (2).
 struct _SysLogicalProcInfo
 {
-    i64 _processorMask = default;  //  0 — ULONG_PTR ProcessorMask
-    u32 _relationship  = default;  //  8 — LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
-    u32 _pad           = default;  // 12 — padding before union
-    u8  _cacheLevel    = default;  // 16 — CACHE_DESCRIPTOR.Level
-    u8  _cacheAssoc    = default;  // 17 — CACHE_DESCRIPTOR.Associativity
-    u16 _cacheLineSize = default;  // 18 — CACHE_DESCRIPTOR.LineSize
-    u32 _cacheSize     = default;  // 20 — CACHE_DESCRIPTOR.Size
-    u32 _cacheType     = default;  // 24 — PROCESSOR_CACHE_TYPE
-    u32 _pad2          = default;  // 28 — trailing pad to reach 32 bytes
+    i8* _processorMask = default;  //  0 — ULONG_PTR ProcessorMask (pointer-sized)
+    u32 _relationship  = default;  //  8/4 — LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
+    u32 _pad           = default;  // 12/8 — padding before union
+    u8  _cacheLevel    = default;  // 16/12 — CACHE_DESCRIPTOR.Level
+    u8  _cacheAssoc    = default;  // 17/13 — CACHE_DESCRIPTOR.Associativity
+    u16 _cacheLineSize = default;  // 18/14 — CACHE_DESCRIPTOR.LineSize
+    u32 _cacheSize     = default;  // 20/16 — CACHE_DESCRIPTOR.Size
+    u32 _cacheType     = default;  // 24/20 — PROCESSOR_CACHE_TYPE
+    u32 _pad2          = default;  // 28/24 — trailing pad
 };
 
 

@@ -142,7 +142,7 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
-                    // 'move' and 'bond' are soft keywords — recognized as parameter ownership qualifiers
+                    // 'move' and 'bond' are soft keywords parsed as Identifiers in typeSpecifier context
                     if (typeSpec->getText() == "move")
                     {
                         declType.IsMove = true;
@@ -252,6 +252,11 @@ private:
                 declType.external = storageSpec->Extern() != nullptr;
                 declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
             }
+            else if (auto funcSpec = declSpec->functionSpecifier())
+            {
+                if (funcSpec->getText() == "stdcall")
+                    declType.IsStdcall = true;
+            }
         }
         return declType;
     }
@@ -335,7 +340,7 @@ private:
             returnsOwned = true;
         }
 
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned);
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.IsStdcall);
 
         if (auto* s = compiler->GetSymbolSink())
         {
@@ -634,7 +639,7 @@ public:
             ctxParam.TypeName = "void";
             ctxParam.VariableName = "ctx";
             ctxParam.Pointer = true;
-            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam });
+            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false, false);
         }
 
         // Pre-declare run(Name* this, list__string args) -> bool
@@ -935,7 +940,7 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
-                // 'move' and 'bond' are soft keywords — recognized as parameter ownership qualifiers
+                // 'move' and 'bond' are soft keywords parsed as Identifiers in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
@@ -1141,6 +1146,11 @@ private:
             {
                 declType.external = storageSpec->Extern() != nullptr;
                 declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
+            }
+            else if (auto funcSpec = declSpec->functionSpecifier())
+            {
+                if (funcSpec->getText() == "stdcall")
+                    declType.IsStdcall = true;
             }
         }
 
@@ -2798,7 +2808,7 @@ public:
             ProcessPendingInstantiations();
         }
 
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty());
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall);
 
         compiler->InitializeBlock(&fn->front(), false);
 
@@ -3077,7 +3087,7 @@ public:
                 std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
-                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis);
+                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall);
 
                 // Declare overloads for each suffix of omitted default parameters
                 int firstDefault = -1;
@@ -3088,7 +3098,7 @@ public:
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
                     std::vector<LLVMBackend::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
-                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false);
+                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall);
                 }
             }
             else if (direct != nullptr)
@@ -5287,8 +5297,11 @@ public:
         llvm::Type* ptrTy = elemType->getPointerTo();
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
 
-        // For array new of a class type: call default constructor for each element (like C++)
-        if (isArray && count && compiler->GetFunction(typeName))
+        // For array new of a class type: call default constructor for each element (like C++).
+        // Skip when typeIsPtr — the element is a pointer (e.g. Point*), not a struct; calling
+        // the struct ctor would store sizeof(Point)=8 bytes into a sizeof(ptr)=4-byte slot on
+        // Win32, corrupting the heap (on Win64 they happen to be equal so the bug is silent).
+        if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName))
         {
             auto* i64Ty = compiler->builder->getInt64Ty();
             auto* indexAlloca = compiler->builder->CreateAlloca(i64Ty, nullptr, "init_i");
@@ -8995,19 +9008,25 @@ public:
             LLVMBackend::DeclTypeAndValue ctxParam;
             ctxParam.TypeName = "void";  ctxParam.VariableName = "ctx";  ctxParam.Pointer = true;
             auto* trampolineFn = compiler->CreateFunctionDefinition(
-                "__program_run_" + name, intReturn, {ctxParam});
+                "__program_run_" + name, intReturn, {ctxParam}, false, false, 0, false, false, false);
             compiler->programTable[name].TrampolineFunction = trampolineFn;
 
             // Install Windows SEH personality so hardware faults in main() are caught.
-            llvm::Function* cshFn = compiler->module->getFunction("__C_specific_handler");
-            if (!cshFn)
+            // Win32 does NOT set a personality: LLVM's x86 backend drops the catch handler
+            // body when using _except_handler3 + catchpad/catchret, leaving broken EH tables.
+            // Win32 crash recovery is skipped in the test (guarded with if const __PLATFORM__).
+            if (compiler->platformValue == 64)
             {
-                auto* cshTy = llvm::FunctionType::get(i32Type, /*isVarArg=*/true);
-                cshFn = llvm::cast<llvm::Function>(
-                    compiler->module->getOrInsertFunction("__C_specific_handler", cshTy).getCallee());
-                cshFn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+                llvm::Function* cshFn = compiler->module->getFunction("__C_specific_handler");
+                if (!cshFn)
+                {
+                    auto* cshTy = llvm::FunctionType::get(i32Type, /*isVarArg=*/true);
+                    cshFn = llvm::cast<llvm::Function>(
+                        compiler->module->getOrInsertFunction("__C_specific_handler", cshTy).getCallee());
+                    cshFn->setDLLStorageClass(llvm::GlobalValue::DLLImportStorageClass);
+                }
+                trampolineFn->setPersonalityFn(cshFn);
             }
-            trampolineFn->setPersonalityFn(cshFn);
 
             auto* ctxArg = trampolineFn->getArg(0);
 
@@ -9127,50 +9146,63 @@ public:
                 compiler->builder->CreateStore(trackI1, enabledGEP);
             }
 
-            // SEH basic blocks — four-way split replacing the old linear sequence.
-            auto* normalBB   = llvm::BasicBlock::Create(*compiler->context, "main_normal",  trampolineFn);
-            auto* dispatchBB = llvm::BasicBlock::Create(*compiler->context, "seh_dispatch", trampolineFn);
-            auto* catchBB    = llvm::BasicBlock::Create(*compiler->context, "seh_catch",    trampolineFn);
-            auto* cleanupBB  = llvm::BasicBlock::Create(*compiler->context, "seh_cleanup",  trampolineFn);
+            auto* cleanupBB = llvm::BasicBlock::Create(*compiler->context, "seh_cleanup", trampolineFn);
 
             // Load list__string args by value from the packet
             auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
-            // exitCodeGEP must dominate both the normal and catch paths — compute before invoke.
+            // exitCodeGEP must dominate all paths — compute in the entry block.
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(
                 progType, self, exitCodeIdx, "exit_code_gep");
 
-            // noinline: prevents the optimizer from inlining main() into this trampoline.
-            // If main() were inlined, null-dereference faults would move out of the invoke's
-            // protected region and Windows SEH would not route them to dispatchBB.
-            mainFn->addFnAttr(llvm::Attribute::NoInline);
+            if (compiler->platformValue == 64)
+            {
+                // Win64: use SEH (invoke + catchswitch + catchpad) to catch hardware faults.
+                auto* normalBB   = llvm::BasicBlock::Create(*compiler->context, "main_normal",  trampolineFn);
+                auto* dispatchBB = llvm::BasicBlock::Create(*compiler->context, "seh_dispatch", trampolineFn);
+                auto* catchBB    = llvm::BasicBlock::Create(*compiler->context, "seh_catch",    trampolineFn);
 
-            // Invoke main() — normal return lands in normalBB, any fault unwinds to dispatchBB.
-            auto* invokeInst = compiler->builder->CreateInvoke(
-                mainFn->getFunctionType(), mainFn,
-                normalBB, dispatchBB,
-                {self, argsVal}, "main_result");
+                // noinline: prevents the optimizer from inlining main() into this trampoline,
+                // which would move null-dereference faults outside the invoke's protected region.
+                mainFn->addFnAttr(llvm::Attribute::NoInline);
 
-            // normalBB: main returned cleanly — store the real exit code and fall through to cleanup.
-            compiler->builder->SetInsertPoint(normalBB);
-            compiler->builder->CreateStore(invokeInst, exitCodeGEP);
-            compiler->builder->CreateBr(cleanupBB);
+                // Invoke main() — normal return lands in normalBB, any fault unwinds to dispatchBB.
+                auto* invokeInst = compiler->builder->CreateInvoke(
+                    mainFn->getFunctionType(), mainFn,
+                    normalBB, dispatchBB,
+                    {self, argsVal}, "main_result");
 
-            // dispatchBB: top-level catchswitch — routes all exceptions to catchBB.
-            compiler->builder->SetInsertPoint(dispatchBB);
-            auto* catchSwitch = compiler->builder->CreateCatchSwitch(
-                llvm::ConstantTokenNone::get(*compiler->context),
-                nullptr, 1, "cs");
-            catchSwitch->addHandler(catchBB);
+                // normalBB: main returned cleanly — store exit code, fall through to cleanup.
+                compiler->builder->SetInsertPoint(normalBB);
+                compiler->builder->CreateStore(invokeInst, exitCodeGEP);
+                compiler->builder->CreateBr(cleanupBB);
 
-            // catchBB: catch everything (filter returns 1), store sentinel -1, rejoin cleanup.
-            compiler->builder->SetInsertPoint(catchBB);
-            auto* catchPad = compiler->builder->CreateCatchPad(
-                catchSwitch, {static_cast<llvm::Value*>(sehFilterFn)}, "cp");
-            compiler->builder->CreateStore(
-                llvm::ConstantInt::get(i32Type, static_cast<uint64_t>(-1), /*isSigned=*/true),
-                exitCodeGEP);
-            compiler->builder->CreateCatchRet(catchPad, cleanupBB);
+                // dispatchBB: catchswitch routes all exceptions to catchBB.
+                compiler->builder->SetInsertPoint(dispatchBB);
+                auto* catchSwitch = compiler->builder->CreateCatchSwitch(
+                    llvm::ConstantTokenNone::get(*compiler->context),
+                    nullptr, 1, "cs");
+                catchSwitch->addHandler(catchBB);
+
+                // catchBB: catch everything (filter returns 1), store sentinel -1, rejoin cleanup.
+                compiler->builder->SetInsertPoint(catchBB);
+                auto* catchPad = compiler->builder->CreateCatchPad(
+                    catchSwitch, {static_cast<llvm::Value*>(sehFilterFn)}, "cp");
+                compiler->builder->CreateStore(
+                    llvm::ConstantInt::get(i32Type, static_cast<uint64_t>(-1), /*isSigned=*/true),
+                    exitCodeGEP);
+                compiler->builder->CreateCatchRet(catchPad, cleanupBB);
+            }
+            else
+            {
+                // Win32: LLVM's x86 backend drops the catch-handler body when using
+                // _except_handler3 + catchpad/catchret, producing broken EH tables.
+                // Fall back to a plain call — crash recovery is not supported on Win32.
+                auto* callResult = compiler->builder->CreateCall(
+                    mainFn->getFunctionType(), mainFn, {self, argsVal}, "main_result");
+                compiler->builder->CreateStore(callResult, exitCodeGEP);
+                compiler->builder->CreateBr(cleanupBB);
+            }
 
             // cleanupBB: shared teardown — both normal and exception paths converge here.
             compiler->builder->SetInsertPoint(cleanupBB);

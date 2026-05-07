@@ -114,6 +114,7 @@ public:
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
         bool IsBond = false;     // parameter declared with 'bond' — return value borrows from this parameter; return must not outlive it
+        bool IsStdcall = false;  // function declared with 'stdcall' — uses __stdcall calling convention on Win32
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
@@ -992,9 +993,15 @@ private:
         auto* i64Ty    = builder->getInt64Ty();
         auto* strTy    = llvm::StructType::getTypeByName(*context, "string");
 
-        auto* mallocTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
-        auto* mallocFn = llvm::dyn_cast<llvm::Function>(
-            module->getOrInsertFunction("malloc", mallocTy).getCallee());
+        // Use the function-table overload of malloc so that on Win32 we get the
+        // i64-wrapper (_malloc_U8Ptr_i64_) rather than the raw extern malloc(i32).
+        auto* mallocFn = GetFunction("malloc");
+        if (!mallocFn)
+        {
+            auto* mallocTy = llvm::FunctionType::get(ptrTy, { i64Ty }, false);
+            mallocFn = llvm::dyn_cast<llvm::Function>(
+                module->getOrInsertFunction("malloc", mallocTy).getCallee());
+        }
 
         auto* fnTy = llvm::FunctionType::get(strTy, { ptrPtrTy, i32PtrTy, i32Ty }, false);
         auto* fn   = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "__strconcat", *module);
@@ -3440,7 +3447,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false)
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs, external);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -3453,6 +3460,9 @@ public:
 
         if (llvm::Function* fn = llvm::dyn_cast<llvm::Function>(calleeValue))
         {
+            if (isStdcall && platformValue == 32)
+                fn->setCallingConv(llvm::CallingConv::X86_StdCall);
+
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,
@@ -3520,7 +3530,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -3552,6 +3562,9 @@ public:
         // CFlat treats null pointer dereferences as defined behavior (hardware fault → SEH).
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
+
+        if (isStdcall && platformValue == 32)
+            fn->setCallingConv(llvm::CallingConv::X86_StdCall);
 
         createFunctionBlock(fn, functionName, arguments, returnsOwned);
 
@@ -4828,7 +4841,9 @@ public:
             arg = newArg;
         }
 
-        return builder->CreateCall(func, arg);
+        auto* ci = builder->CreateCall(func, arg);
+        ci->setCallingConv(func->getCallingConv());
+        return ci;
     }
 
     // Returns true if value is a load from an owning alloca in any live scope.

@@ -286,8 +286,8 @@ class Directory
             // Windows implementation
             string pattern = path + "\\*";
             i8* findData = new i8[600];
-            i64 handle = FindFirstFileA(pattern.data(), findData);
-            if (handle < 0)
+            void* handle = FindFirstFileA(pattern.data(), findData);
+            if (handle == (void*)(i64)-1)
             {
                 delete[] findData;
                 return result;

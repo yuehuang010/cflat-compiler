@@ -4,44 +4,63 @@
 // Win32 int is always 32-bit regardless of host pointer width.
 using win_int = i32;
 
-// Win32 Threading
-extern void*    CreateThread(void* attr, i64 stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
-extern i32      WaitForSingleObject(void* handle, i32 ms);
-extern i32      GetExitCodeThread(void* handle, i32* code);
-extern void     CloseHandle(void* handle);
-extern bool     TerminateThread(void* handle, i32 exitCode);
-extern u64      SetThreadAffinityMask(void* handle, u64 mask);
+// Platform-sized types: pointer-wide on Win64, 32-bit on Win32.
+if const (__PLATFORM__ == 64) {
+    using win_size    = i64;  // SIZE_T / DWORD_PTR
+    using win_usize   = u64;
+} else {
+    using win_size    = i32;
+    using win_usize   = u32;
+}
+
+// Win32 Threading — all Win32 API functions use __stdcall calling convention.
+extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
+extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
+extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
+extern stdcall i32       GetExitCodeThread(void* handle, i32* code);
+extern stdcall void      CloseHandle(void* handle);
+extern stdcall bool      TerminateThread(void* handle, i32 exitCode);
 
 // Win32 Timing
-extern win_int  QueryPerformanceCounter(i64* count);
-extern win_int  QueryPerformanceFrequency(i64* freq);
-extern void     GetSystemTimeAsFileTime(i64* fileTime);
-extern void     Sleep(i32 ms);
+extern stdcall win_int  QueryPerformanceCounter(i64* count);
+extern stdcall win_int  QueryPerformanceFrequency(i64* freq);
+extern stdcall void     GetSystemTimeAsFileTime(i64* fileTime);
+extern stdcall void     Sleep(i32 ms);
 
 // Win32 Synchronization
-extern void     InitializeCriticalSection(void* cs);
-extern void     DeleteCriticalSection(void* cs);
-extern void     EnterCriticalSection(void* cs);
-extern void     LeaveCriticalSection(void* cs);
-extern void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
-extern void     ReleaseSemaphore(void* handle, i32 count, i32* prev);
-extern void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
-extern i32      SetEvent(void* handle);
-extern void     AcquireSRWLockExclusive(void** srw);
-extern void     ReleaseSRWLockExclusive(void** srw);
-extern void     AcquireSRWLockShared(void** srw);
-extern void     ReleaseSRWLockShared(void** srw);
-extern void     InitializeConditionVariable(void* cv);
-extern i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
-extern i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
-extern void     WakeConditionVariable(void* cv);
-extern void     WakeAllConditionVariable(void* cv);
+extern stdcall void     InitializeCriticalSection(void* cs);
+extern stdcall void     DeleteCriticalSection(void* cs);
+extern stdcall void     EnterCriticalSection(void* cs);
+extern stdcall void     LeaveCriticalSection(void* cs);
+extern stdcall void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
+extern stdcall void     ReleaseSemaphore(void* handle, i32 count, i32* prev);
+extern stdcall void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
+extern stdcall i32      SetEvent(void* handle);
+extern stdcall void     AcquireSRWLockExclusive(void** srw);
+extern stdcall void     ReleaseSRWLockExclusive(void** srw);
+extern stdcall void     AcquireSRWLockShared(void** srw);
+extern stdcall void     ReleaseSRWLockShared(void** srw);
+extern stdcall void     InitializeConditionVariable(void* cv);
+extern stdcall i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
+extern stdcall void     WakeConditionVariable(void* cv);
+extern stdcall void     WakeAllConditionVariable(void* cv);
 
-// Win32 Virtual Memory
-extern void     GetSystemInfo(void* lpSystemInfo);
-extern void*    VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect);
-extern win_int  VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType);
-extern void     GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
+// Win32 Virtual Memory — dwSize is SIZE_T (win_size).
+extern stdcall void     GetSystemInfo(void* lpSystemInfo);
+extern stdcall void     GetLogicalProcessorInformation(void* Buffer, u32* ReturnLength);
+extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
+extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
+
+// Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
+if const (__PLATFORM__ == 32) {
+    void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect) {
+        return VirtualAlloc(lpAddress, (i32)dwSize, flAllocationType, flProtect);
+    }
+    win_int VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType) {
+        return VirtualFree(lpAddress, (i32)dwSize, dwFreeType);
+    }
+}
 
 // Win32 Filesystem
 extern void*    fopen(const char* path, const char* mode);
@@ -53,18 +72,20 @@ extern win_int  feof(void* stream);
 extern win_int  fseek(void* stream, win_int offset, win_int origin);
 extern win_int  ftell(void* stream);
 extern win_int  _unlink(const char* path);
-extern win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
+extern stdcall win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
 extern win_int  _access(const char* path, win_int mode);
 extern win_int  _mkdir(const char* path);
 extern win_int  _rmdir(const char* path);
 extern i8*      _getcwd(i8* buf, win_int size);
 extern win_int  _chdir(const char* path);
-extern i64      FindFirstFileA(const char* pattern, i8* findData);
-extern win_int  FindNextFileA(i64 handle, i8* findData);
-extern win_int  FindClose(i64 handle);
-extern win_int  GetFileAttributesA(const char* path);
+// HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
+extern stdcall void*    FindFirstFileA(const char* pattern, i8* findData);
+extern stdcall win_int  FindNextFileA(void* handle, i8* findData);
+extern stdcall win_int  FindClose(void* handle);
+extern stdcall win_int  GetFileAttributesA(const char* path);
 
-// MSVC CRT
+// MSVC CRT — cdecl (no stdcall). bufSize is SIZE_T (win_size).
 extern void*    __acrt_iob_func(win_int fd);
 extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern win_int  __stdio_common_vsprintf(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
+extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);

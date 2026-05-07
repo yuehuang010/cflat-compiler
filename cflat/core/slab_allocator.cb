@@ -32,7 +32,7 @@ struct _SA_SysInfo
     u32 _pageSize         = default;  //  4 — dwPageSize (4096 typically)
     i8* _minAddr          = default;  //  8
     i8* _maxAddr          = default;  // 16
-    i64 _procMask         = default;  // 24
+    i8* _procMask         = default;  // ULONG_PTR — pointer-sized (4 on x86, 8 on x64)
     u32 _numProc          = default;  // 32
     u32 _procType         = default;  // 36
     u32 _allocGranularity = default;  // 40 — dwAllocationGranularity (65536 typically)

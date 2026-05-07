@@ -132,6 +132,16 @@ bool LLVMBackend::Compile(const ArgParser& args)
     platformValue = (platformOption == "win32") ? 32 : 64;
     if (verbose) std::cout << "[verbose] __PLATFORM__ = " << platformValue << "\n";
 
+    // Set the module data layout now so sizeof/alignof produce correct sizes during
+    // codegen (the final target-machine layout is set again in EmitExecutable).
+    {
+        // Win32: 32-bit pointers; Win64: 64-bit pointers. Both little-endian MSVC.
+        const char* dl = (platformValue == 32)
+            ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
+            : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+        module->setDataLayout(llvm::DataLayout(dl));
+    }
+
     // Pre-populate compile-time macros (constants throughout compilation)
     {
         // __FILE__: source filename (create global string directly without BasicBlock)

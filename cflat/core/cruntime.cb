@@ -1,10 +1,18 @@
 // C runtime bindings — extern declarations and wrappers for standard C library functions
 
 // === Memory Functions ===
-extern void* malloc(i64 size);
+// size_t is pointer-sized (win_size: i64 on Win64, i32 on Win32).
+extern void* malloc(win_size size);
 extern void  free(void* ptr);
-extern void* calloc(i64 count, i64 size);
-extern void* realloc(void* ptr, i64 size);
+extern void* calloc(win_size count, win_size size);
+extern void* realloc(void* ptr, win_size size);
+
+// Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
+if const (__PLATFORM__ == 32) {
+    void* malloc(i64 bytes)          { return malloc((win_size)bytes); }
+    void* calloc(i64 cnt, i64 sz)   { return calloc((win_size)cnt, (win_size)sz); }
+    void* realloc(void* p, i64 sz)  { return realloc(p, (win_size)sz); }
+}
 
 // Per-thread state for the 'program' construct: stdout/stdin hooks, format buffer,
 // and the FILE handle tracker.  All fields zero-initialize to "inactive".
@@ -26,6 +34,15 @@ struct __ProgramTLS {
 };
 thread_local __ProgramTLS __prog_tls = default;
 
+// Callers pass i64 for bufSize; cast to win_size (truncates to i32 on Win32).
+win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
+    return __stdio_common_vsprintf(options, buf, (win_size)bufSize, fmt, locale, ap);
+}
+
+win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
+    return __stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+}
+
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
@@ -45,12 +62,12 @@ extern void printf(const char* fmt, ...) {
                 __prog_tls.stdout_tls_buf = (char*)malloc(4096);
                 __prog_tls.stdout_tls_cap = 4096;
             }
-            int needed = __stdio_common_vsprintf(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+            int needed = __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             if (needed >= __prog_tls.stdout_tls_cap) {
                 free(__prog_tls.stdout_tls_buf);
                 __prog_tls.stdout_tls_buf = (char*)malloc((i64)needed + 1);
                 __prog_tls.stdout_tls_cap = needed + 1;
-                __stdio_common_vsprintf(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+                __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             }
             __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
         }
@@ -65,7 +82,7 @@ extern void printf(const char* fmt, ...) {
 extern i32 sprintf(char* buf, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    i32 result = __stdio_common_vsprintf(0, buf, 2147483647, fmt, nullptr, ap);
+    i32 result = __vsprintf_safe(0, buf, 2147483647, fmt, nullptr, ap);
     va_end(ap);
     return result;
 }
@@ -73,7 +90,7 @@ extern i32 sprintf(char* buf, const char* fmt, ...) {
 extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    int result = __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
+    int result = __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
     va_end(ap);
     return result;
 }
@@ -95,12 +112,12 @@ extern int vprintf(const char* fmt, va_list ap) {
                 __prog_tls.stdout_tls_buf = (char*)malloc(4096);
                 __prog_tls.stdout_tls_cap = 4096;
             }
-            int needed = __stdio_common_vsprintf(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+            int needed = __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             if (needed >= __prog_tls.stdout_tls_cap) {
                 free(__prog_tls.stdout_tls_buf);
                 __prog_tls.stdout_tls_buf = (char*)malloc((i64)needed + 1);
                 __prog_tls.stdout_tls_cap = needed + 1;
-                __stdio_common_vsprintf(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+                __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             }
             __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
             len = needed;
@@ -113,18 +130,17 @@ extern int vprintf(const char* fmt, va_list ap) {
 }
 
 extern int vsprintf(char* buf, const char* fmt, va_list ap) {
-    return __stdio_common_vsprintf(0, buf, 2147483647, fmt, nullptr, ap);
+    return __vsprintf_safe(0, buf, 2147483647, fmt, nullptr, ap);
 }
 
 extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
-    return __stdio_common_vsprintf(0, buf, bufSize, fmt, nullptr, ap);
+    return __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
 }
 
 // === Stdin hook support ===
 
-// Windows CRT internals for the scanf fallback and hooked sscanf path.
+// Windows CRT internal for the scanf fallback path (no size parameter — not in os.windows.cb).
 extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern int __stdio_common_vsscanf(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap);
 
 // Used by the fgets fallback to read one character from any stream.
 extern int fgetc(void* stream);
@@ -237,7 +253,7 @@ extern int scanf(const char* fmt, ...) {
         int si = __prog_tls.stdin_line_pos;
         while (ti < 4095 && __prog_tls.stdin_line[si] != '\0') { tmp[ti] = __prog_tls.stdin_line[si]; ti++; si++; }
         tmp[ti] = '\0';
-        int result = __stdio_common_vsscanf(0, tmp, (i64)ti, fmt, nullptr, ap);
+        int result = __vsscanf_safe(0, tmp, (i64)ti, fmt, nullptr, ap);
         free(tmp);
         // Advance the line cursor to end of line (and past the newline) so the
         // next call sees a fresh line rather than stalling on the trailing '\n'.

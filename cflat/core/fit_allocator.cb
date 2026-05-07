@@ -31,7 +31,7 @@ struct _FA_SysInfo
     u32 _pageSize         = default;
     i8* _minAddr          = default;
     i8* _maxAddr          = default;
-    i64 _procMask         = default;
+    i8* _procMask         = default;  // ULONG_PTR — pointer-sized (4 on x86, 8 on x64)
     u32 _numProc          = default;
     u32 _procType         = default;
     u32 _allocGranularity = default;

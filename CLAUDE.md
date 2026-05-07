@@ -77,6 +77,15 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 test.bat
 ```
 
+`test.bat` picks the compiler binary via `CFLAT_CONFIG` (defaults to `Debug`). Set it to `Release` to test the optimized build:
+
+```bash
+set CFLAT_CONFIG=Release   # cmd
+$env:CFLAT_CONFIG="Release" # PowerShell
+```
+
+> **Pitfall**: If `CFLAT_CONFIG` is set in the shell that invokes `test.bat`, all spawned worker processes inherit it. After rebuilding with a different configuration, clear or update `CFLAT_CONFIG` so tests run against the intended binary.
+
 ### LSP Tests
 
 Run the LSP test suite (smoke tests + fixture/scenario tests) with:

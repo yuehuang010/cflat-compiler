@@ -13,9 +13,11 @@ if "%~1"=="--worker-c" (
     set NAME=%~2
     set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
     set SRC=Test
-    set OUT=out
+    if not defined CFLAT_OUT set CFLAT_OUT=out
+    set OUT=%CFLAT_OUT%
+    if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -45,9 +47,11 @@ if "%~1"=="--worker-cb" (
     set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
     set SRC=Test
     set LIB=Test\library
-    set OUT=out
+    if not defined CFLAT_OUT set CFLAT_OUT=out
+    set OUT=%CFLAT_OUT%
+    if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -74,7 +78,8 @@ REM Worker mode: run one group of error tests via test_err.bat --group N
 REM ===========================================================================
 if "%~1"=="--worker-err" (
     set GRP=%~2
-    set OUT=out
+    if not defined CFLAT_OUT set CFLAT_OUT=out
+    set OUT=%CFLAT_OUT%
     set T0=!TIME!
     call "%~dp0test_err.bat" --group !GRP! > "!OUT!\results\test_err_!GRP!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
@@ -99,7 +104,10 @@ REM ===========================================================================
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library
-set OUT=out
+if not defined CFLAT_PLATFORM set CFLAT_PLATFORM=win64
+if "%CFLAT_PLATFORM%"=="win32" (set CFLAT_OUT=out32) else (set CFLAT_OUT=out)
+set CFLAT_PLATFORM_FLAG=-p %CFLAT_PLATFORM%
+set OUT=%CFLAT_OUT%
 set CFLAT_EXTRA=%*
 set EXCLUDE=test_helper
 set TIMEOUT_SECS=120

@@ -369,3 +369,4 @@ FodyWeavers.xsd
 /MyCompiler/out.ll
 *.exe
 *.ll
+/out32/results
