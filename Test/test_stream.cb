@@ -372,6 +372,75 @@ bool testStreamMixedTypes() {
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional stdio test — "?" / "Y" handshake across two programs
+// ---------------------------------------------------------------------------
+
+// Sends "?\n" to stdout, then reads one reply line from stdin.
+program Questioner {
+    int gotAnswer = 0;
+
+    int main(move list<string> args) {
+        printf("?\n");
+        char* buf = (char*)malloc(256);
+        void* stdinStream = __acrt_iob_func(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
+            gotAnswer = strcmp(buf, "Y\n") == 0 ? 1 : 0;
+        }
+        free(buf);
+        return gotAnswer;
+    }
+};
+
+// Reads one line from stdin; if it is "?\n", replies "Y\n" to stdout.
+program Responder {
+    int main(move list<string> args) {
+        char* buf = (char*)malloc(256);
+        void* stdinStream = __acrt_iob_func(0);
+        if (fgets(buf, 256, stdinStream) != nullptr) {
+            if (strcmp(buf, "?\n") == 0) {
+                printf("Y\n");
+            }
+        }
+        free(buf);
+        return 0;
+    }
+};
+
+bool testBidirectionalStdio() {
+    bool result = true;
+
+    // Two unidirectional streams form a bidirectional pipe.
+    // bufferSize=1 means every write is published immediately so neither
+    // program deadlocks while waiting for the other to respond.
+    stream s1;   // Questioner stdout -> Responder stdin
+    stream s2;   // Responder  stdout -> Questioner stdin
+    s1.bufferSize = 1;
+    s2.bufferSize = 1;
+    s1.init();
+    s2.init();
+
+    Questioner q;
+    Responder  r;
+
+    q >> s1;
+    s1 >> r;
+    r >> s2;
+    s2 >> q;
+
+    list<string> args;
+    q.run(args);
+    r.run(args);
+
+    q.WaitForExit();
+    r.WaitForExit();
+
+    result &= Test("bidirectional questioner got Y", q.gotAnswer, 1);
+    result &= Test("bidirectional questioner exit",  q.exitCode, 1);
+    result &= Test("bidirectional responder exit",   r.exitCode, 0);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 
 extern int main() {
     int passed = 0;
@@ -383,6 +452,7 @@ extern int main() {
     total++; passed += testStreamStringType()   ? 1 : 0;
     total++; passed += testStreamCharPtr()      ? 1 : 0;
     total++; passed += testStreamMixedTypes()   ? 1 : 0;
+    total++; passed += testBidirectionalStdio() ? 1 : 0;
 
     printf("Stream tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
