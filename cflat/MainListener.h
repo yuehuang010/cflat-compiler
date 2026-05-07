@@ -256,6 +256,8 @@ private:
             {
                 if (funcSpec->getText() == "stdcall")
                     declType.IsStdcall = true;
+                else if (funcSpec->getText() == "cdecl")
+                    declType.IsCdecl = true;
             }
         }
         return declType;
@@ -340,7 +342,7 @@ private:
             returnsOwned = true;
         }
 
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.IsStdcall);
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.IsStdcall, returnType.IsCdecl);
 
         if (auto* s = compiler->GetSymbolSink())
         {
@@ -1152,6 +1154,8 @@ private:
             {
                 if (funcSpec->getText() == "stdcall")
                     declType.IsStdcall = true;
+                else if (funcSpec->getText() == "cdecl")
+                    declType.IsCdecl = true;
             }
         }
 
@@ -2828,7 +2832,7 @@ public:
             ProcessPendingInstantiations();
         }
 
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall);
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl);
 
         compiler->InitializeBlock(&fn->front(), false);
 
@@ -3108,7 +3112,7 @@ public:
                 std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
-                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall);
+                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl);
 
                 // Declare overloads for each suffix of omitted default parameters
                 int firstDefault = -1;
@@ -3119,7 +3123,7 @@ public:
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
                     std::vector<LLVMBackend::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
-                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall);
+                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl);
                 }
             }
             else if (direct != nullptr)
@@ -4930,7 +4934,20 @@ public:
             /* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
 
             std::string opText = unaryOperator->getText();
+
+            // For '!', suspend any active short-circuit else-block before
+            // evaluating the operand.  Without this, !(A && B) in a while
+            // condition would short-circuit the inner && directly to the
+            // loop-exit block when A is false — bypassing the negation —
+            // instead of continuing the loop as !(false && B) == true demands.
+            llvm::BasicBlock* savedElse = nullptr;
+            if (opText == "!")
+                savedElse = compiler->ExchangeElseBlock(nullptr);
+
             auto namedVar = ParseCastExpression(castExpCtx);
+
+            if (opText == "!")
+                compiler->ExchangeElseBlock(savedElse);
 
             if (opText == "&")
             {

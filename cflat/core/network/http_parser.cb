@@ -1,0 +1,172 @@
+// core/network/http_parser.cb — Parse raw HTTP/1.x request bytes into HttpRequest.
+//
+// Usage:
+//   import "network/http_parser.cb";
+//   HttpRequest* req = parseHttpRequest(buf, len);
+//   if (req->valid) { ... }
+//   delete req;
+
+import "string.cb";
+
+extern cdecl int atoi(const char* s);
+
+int HTTP_MAX_HEADERS = 64;
+
+struct HttpHeader {
+    i8* name  = nullptr;
+    i8* value = nullptr;
+};
+
+// Parsed HTTP request. The caller owns the returned pointer and must delete it.
+class HttpRequest {
+    i8*         method      = nullptr;
+    i8*         path        = nullptr;
+    i8*         version     = nullptr;
+    HttpHeader* headers     = nullptr;
+    int         headerCount = 0;
+    i8*         body        = nullptr;
+    int         bodyLen     = 0;
+    bool        valid       = false;
+
+    // Case-sensitive header lookup. Returns nullptr if not found.
+    i8* getHeader(const char* name)
+    {
+        int i = 0;
+        while (i < headerCount)
+        {
+            if (strcmp(headers[i].name, name) == 0) return headers[i].value;
+            i++;
+        }
+        return nullptr;
+    }
+
+    // Returns the value of Content-Length, or 0 if absent.
+    int contentLength()
+    {
+        i8* val = getHeader("Content-Length");
+        if (val == nullptr) return 0;
+        return atoi(val);
+    }
+
+    ~HttpRequest()
+    {
+        if (method  != nullptr) { delete method;  method  = nullptr; }
+        if (path    != nullptr) { delete path;    path    = nullptr; }
+        if (version != nullptr) { delete version; version = nullptr; }
+        if (body    != nullptr) { delete body;    body    = nullptr; }
+        if (headers != nullptr)
+        {
+            int i = 0;
+            while (i < headerCount)
+            {
+                if (headers[i].name  != nullptr) delete headers[i].name;
+                if (headers[i].value != nullptr) delete headers[i].value;
+                i++;
+            }
+            delete[_] headers;
+            headers = nullptr;
+        }
+    }
+};
+
+// Copy buf[start .. start+len) into a new null-terminated heap string.
+i8* _http_substr(i8* buf, int start, int len)
+{
+    i8* result = new i8[len + 1];
+    int i = 0;
+    while (i < len) { result[i] = buf[start + i]; i++; }
+    result[len] = 0;
+    return result;
+}
+
+// Copy buf[start .. start+len), stripping leading/trailing ASCII whitespace and CR.
+i8* _http_trim(i8* buf, int start, int len)
+{
+    while (len > 0 && (buf[start] == ' ' || buf[start] == '\t'))
+        { start++; len--; }
+    while (len > 0 && (buf[start + len - 1] == ' ' || buf[start + len - 1] == '\t' || buf[start + len - 1] == '\r'))
+        { len--; }
+    return _http_substr(buf, start, len);
+}
+
+// Parse raw bytes into an HttpRequest.  Returns a request with valid=false on
+// malformed input.  The caller owns the returned pointer and must delete it.
+HttpRequest* parseHttpRequest(i8* buf, int len)
+{
+    HttpRequest* req = new HttpRequest;
+    req->headers = new HttpHeader[HTTP_MAX_HEADERS];
+
+    // Find the end of the request line (\r\n).
+    int lineEnd = -1;
+    int i = 0;
+    while (i < len - 1)
+    {
+        if (buf[i] == '\r' && buf[i + 1] == '\n') { lineEnd = i; i = len; }
+        else i++;
+    }
+    if (lineEnd < 0) return req;
+
+    // Method — bytes before the first space.
+    int methodEnd = 0;
+    while (methodEnd < lineEnd && buf[methodEnd] != ' ') methodEnd++;
+    req->method = _http_substr(buf, 0, methodEnd);
+
+    // Path — between first and second space.
+    int pathStart = methodEnd + 1;
+    int pathEnd = pathStart;
+    while (pathEnd < lineEnd && buf[pathEnd] != ' ') pathEnd++;
+    req->path = _http_substr(buf, pathStart, pathEnd - pathStart);
+
+    // Version — remainder of the request line.
+    int verStart = pathEnd + 1;
+    req->version = _http_substr(buf, verStart, lineEnd - verStart);
+
+    // Headers — one per line until the blank line (\r\n\r\n).
+    int pos = lineEnd + 2;
+    bool headersEnd = false;
+    while (pos < len - 1 && !headersEnd)
+    {
+        if (buf[pos] == '\r' && buf[pos + 1] == '\n')
+        {
+            pos = pos + 2;
+            headersEnd = true;
+        }
+        else
+        {
+            // Find the end of this header line.
+            int hEnd = pos;
+            bool atCRLF = false;
+            while (hEnd < len - 1 && !atCRLF)
+            {
+                if (buf[hEnd] == '\r' && buf[hEnd + 1] == '\n') atCRLF = true;
+                else hEnd++;
+            }
+
+            // Split on the first colon.
+            int colon = pos;
+            while (colon < hEnd && buf[colon] != ':') colon++;
+
+            if (colon < hEnd && req->headerCount < HTTP_MAX_HEADERS)
+            {
+                req->headers[req->headerCount].name  = _http_trim(buf, pos, colon - pos);
+                req->headers[req->headerCount].value = _http_trim(buf, colon + 1, hEnd - colon - 1);
+                req->headerCount++;
+            }
+            pos = hEnd + 2;
+        }
+    }
+
+    // Body — everything after the blank line.
+    if (pos < len)
+    {
+        int blen = len - pos;
+        req->body = new i8[blen + 1];
+        int j = 0;
+        while (j < blen) { req->body[j] = buf[pos + j]; j++; }
+        req->body[blen] = 0;
+        req->bodyLen = blen;
+    }
+
+    req->valid = true;
+    return req;
+}

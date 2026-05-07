@@ -115,6 +115,7 @@ public:
         bool IsMove = false;     // parameter declared with 'move' — function takes ownership
         bool IsBond = false;     // parameter declared with 'bond' — return value borrows from this parameter; return must not outlive it
         bool IsStdcall = false;  // function declared with 'stdcall' — uses __stdcall calling convention on Win32
+        bool IsCdecl = false;   // function declared with 'cdecl'   — explicit C calling convention (default; recognized for clarity)
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
@@ -3454,7 +3455,7 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false)
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false)
     {
         auto functionType = GetFunctionType(returnType, arguments, varargs, external);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
@@ -3469,6 +3470,8 @@ public:
         {
             if (isStdcall && platformValue == 32)
                 fn->setCallingConv(llvm::CallingConv::X86_StdCall);
+            else if (isCdecl)
+                fn->setCallingConv(llvm::CallingConv::C);
 
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
@@ -3537,7 +3540,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -3572,6 +3575,8 @@ public:
 
         if (isStdcall && platformValue == 32)
             fn->setCallingConv(llvm::CallingConv::X86_StdCall);
+        else if (isCdecl)
+            fn->setCallingConv(llvm::CallingConv::C);
 
         createFunctionBlock(fn, functionName, arguments, returnsOwned);
 
@@ -4991,6 +4996,24 @@ public:
             }
         }
 
+        return nullptr;
+    }
+
+    // Swap the elseBlock in the innermost frame that owns one.
+    // Returns the previous value so the caller can restore it.
+    // Used by the '!' operator to prevent inner && from short-circuiting
+    // directly to the outer false-branch (which would bypass the negation).
+    llvm::BasicBlock* ExchangeElseBlock(llvm::BasicBlock* newBlock)
+    {
+        for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (stackFrame.elseBlock || stackFrame.isFunction)
+            {
+                auto old = stackFrame.elseBlock;
+                stackFrame.elseBlock = newBlock;
+                return old;
+            }
+        }
         return nullptr;
     }
 

@@ -1,0 +1,166 @@
+// core/network/http_response.cb — Build HTTP/1.1 responses.
+//
+// Usage:
+//   import "network/http_response.cb";
+//   HttpResponse* r = HttpResponse.ok("hello");
+//   int len = 0;
+//   i8* buf = r->build(&len);
+//   socket->send(buf, len);
+//   delete buf;
+//   delete r;
+
+import "string.cb";
+import "list.cb";
+
+// Write null-terminated string s into buf at offset pos; return new pos.
+int _http_puts(i8* buf, int pos, const char* s)
+{
+    int i = 0;
+    while (s[i] != 0) { buf[pos] = s[i]; pos++; i++; }
+    return pos;
+}
+
+// Write decimal integer val into buf at offset pos; return new pos.
+int _http_puti(i8* buf, int pos, int val)
+{
+    i8* tmp = new i8[16];
+    int len = sprintf(tmp, "%d", val);
+    int i = 0;
+    while (i < len) { buf[pos] = tmp[i]; pos++; i++; }
+    delete tmp;
+    return pos;
+}
+
+class HttpResponse {
+    int       _status     = 200;
+    i8*       _statusText = nullptr;   // points to a string literal — not owned
+    list<i8*> _headerNames  = default; // owns the heap strings it stores
+    list<i8*> _headerValues = default;
+    i8*       _body       = nullptr;
+    int       _bodyLen    = 0;
+
+    void setStatus(int code, const char* text)
+    {
+        _status = code;
+        _statusText = (i8*)text;
+    }
+
+    void addHeader(const char* name, const char* value)
+    {
+        int nlen = strlen(name);
+        i8* nheap = new i8[nlen + 1];
+        int i = 0;
+        while (i <= nlen) { nheap[i] = name[i]; i++; }
+
+        int vlen = strlen(value);
+        i8* vheap = new i8[vlen + 1];
+        i = 0;
+        while (i <= vlen) { vheap[i] = value[i]; i++; }
+
+        _headerNames.add(nheap);
+        _headerValues.add(vheap);
+    }
+
+    void setBody(i8* data, int len)
+    {
+        if (_body != nullptr) { delete _body; _body = nullptr; }
+        _body = new i8[len + 1];
+        int i = 0;
+        while (i < len) { _body[i] = data[i]; i++; }
+        _body[len] = 0;
+        _bodyLen = len;
+    }
+
+    void setTextBody(const char* text)
+    {
+        setBody((i8*)text, strlen(text));
+    }
+
+    // Build the complete HTTP response into a heap buffer.  Sets *outLen to the
+    // byte count.  The caller owns the returned buffer and must delete it.
+    i8* build(int* outLen)
+    {
+        i8* buf = new i8[65536];
+        int pos = 0;
+
+        pos = _http_puts(buf, pos, "HTTP/1.1 ");
+        pos = _http_puti(buf, pos, _status);
+        pos = _http_puts(buf, pos, " ");
+        pos = _http_puts(buf, pos, _statusText != nullptr ? _statusText : (i8*)"OK");
+        pos = _http_puts(buf, pos, "\r\n");
+
+        if (_bodyLen > 0)
+        {
+            pos = _http_puts(buf, pos, "Content-Length: ");
+            pos = _http_puti(buf, pos, _bodyLen);
+            pos = _http_puts(buf, pos, "\r\n");
+        }
+
+        int i = 0;
+        while (i < _headerNames.count())
+        {
+            pos = _http_puts(buf, pos, _headerNames.get(i));
+            pos = _http_puts(buf, pos, ": ");
+            pos = _http_puts(buf, pos, _headerValues.get(i));
+            pos = _http_puts(buf, pos, "\r\n");
+            i++;
+        }
+
+        pos = _http_puts(buf, pos, "\r\n");
+
+        int j = 0;
+        while (j < _bodyLen) { buf[pos] = _body[j]; pos++; j++; }
+
+        buf[pos] = 0;
+        *outLen = pos;
+        return buf;
+    }
+
+    ~HttpResponse()
+    {
+        if (_body != nullptr) { delete _body; _body = nullptr; }
+        // _headerNames and _headerValues own their i8* elements and free them on destruction.
+    }
+
+    // ── Static factories ──────────────────────────────────────────────────────
+
+    static HttpResponse* ok(const char* body)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 200;
+        r->_statusText = "OK";
+        r->addHeader("Content-Type", "text/plain");
+        if (body != nullptr) r->setTextBody(body);
+        return r;
+    }
+
+    static HttpResponse* okJson(const char* json)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 200;
+        r->_statusText = "OK";
+        r->addHeader("Content-Type", "application/json");
+        if (json != nullptr) r->setTextBody(json);
+        return r;
+    }
+
+    static HttpResponse* notFound()
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 404;
+        r->_statusText = "Not Found";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody("Not Found");
+        return r;
+    }
+
+    static HttpResponse* serverError(const char* msg)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 500;
+        r->_statusText = "Internal Server Error";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody(msg != nullptr ? msg : "Internal Server Error");
+        return r;
+    }
+};

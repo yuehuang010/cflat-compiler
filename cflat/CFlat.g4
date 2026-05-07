@@ -391,6 +391,7 @@ typeQualifier
 functionSpecifier
     : 'inline'
     | 'stdcall'
+    | 'cdecl'
     | 'declspec' '(' Identifier ')'
     ;
 
