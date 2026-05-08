@@ -146,8 +146,11 @@ class channel<T>
     }
 
     // Blocking send — spins until a slot is available.
+    // Yields the CPU after 1024 failed iterations to prevent starvation under
+    // parallel process load (e.g. test.bat running 20+ concurrent test processes).
     void send(move T item) {
-        i64 pos = __atomic_i64_load(&_head);
+        i64 pos   = __atomic_i64_load(&_head);
+        i64 spins = (i64)0;
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
@@ -160,13 +163,17 @@ class channel<T>
                     return;
                 }
             }
-            pos = __atomic_i64_load(&_head);
+            pos   = __atomic_i64_load(&_head);
+            spins = spins + (i64)1;
+            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
         }
     }
 
     // Blocking receive — spins until an item is available.
+    // Yields the CPU after 1024 failed iterations (same rationale as send).
     T receive() {
-        i64 pos = __atomic_i64_load(&_tail);
+        i64 pos   = __atomic_i64_load(&_tail);
+        i64 spins = (i64)0;
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
@@ -179,14 +186,17 @@ class channel<T>
                     return value;
                 }
             }
-            pos = __atomic_i64_load(&_tail);
+            pos   = __atomic_i64_load(&_tail);
+            spins = spins + (i64)1;
+            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;
     }
 
     void push(move T item) {
-        i64 pos = __atomic_i64_load(&_head);
+        i64 pos   = __atomic_i64_load(&_head);
+        i64 spins = (i64)0;
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
@@ -199,12 +209,15 @@ class channel<T>
                     return;
                 }
             }
-            pos = __atomic_i64_load(&_head);
+            pos   = __atomic_i64_load(&_head);
+            spins = spins + (i64)1;
+            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
         }
     }
 
     T pop() {
-        i64 pos = __atomic_i64_load(&_tail);
+        i64 pos   = __atomic_i64_load(&_tail);
+        i64 spins = (i64)0;
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
@@ -217,7 +230,9 @@ class channel<T>
                     return value;
                 }
             }
-            pos = __atomic_i64_load(&_tail);
+            pos   = __atomic_i64_load(&_tail);
+            spins = spins + (i64)1;
+            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;
