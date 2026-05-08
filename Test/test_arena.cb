@@ -1,0 +1,203 @@
+import "thread.cb";
+import "arena_channel.cb";
+
+struct ChannelPayload
+{
+    int   _value = 0;
+    int*  _data  = nullptr;
+    int   _count = 0;
+};
+
+struct ProgramPayload
+{
+    int _value = 0;
+};
+
+// ---- Test 1: raw thread producer/consumer ----
+
+arena_channel g_ac_chan = default;
+int g_chan_errors = 0;
+
+int producer(void* unused)
+{
+    int i = 0;
+    while (i < 1000)
+    {
+        page_arena* pa = g_ac_chan.acquire_arena();
+
+        ChannelPayload* msg = (ChannelPayload*)pa->alloc((i64)sizeof(ChannelPayload));
+        pa->_root       = (void*)msg;
+        msg->_value     = i;
+        msg->_count     = 10;
+        msg->_data      = (int*)pa->alloc((i64)10 * (i64)sizeof(int));
+
+        int j = 0;
+        while (j < 10)
+        {
+            msg->_data[j] = i * 10 + j;
+            j = j + 1;
+        }
+
+        g_ac_chan.send(pa);
+        i = i + 1;
+    }
+    g_ac_chan.send(nullptr);
+    return 0;
+}
+
+int consumer(void* unused)
+{
+    while (true)
+    {
+        page_arena* pa = g_ac_chan.recv();
+        if (pa == nullptr) break;
+
+        ChannelPayload* msg = (ChannelPayload*)pa->_root;
+
+        int j = 0;
+        while (j < msg->_count)
+        {
+            int expected = msg->_value * 10 + j;
+            if (msg->_data[j] != expected)
+            {
+                printf("ERROR: arena %lld msg[%d][%d]: expected %d got %d\n",
+                    pa->_id, msg->_value, j, expected, msg->_data[j]);
+                g_chan_errors = g_chan_errors + 1;
+            }
+            j = j + 1;
+        }
+
+        g_ac_chan.release_arena(pa);
+    }
+    return 0;
+}
+
+bool testArenaChannel()
+{
+    g_ac_chan.init(128, (i64)65536);
+
+    Thread prod = default;
+    Thread cons = default;
+
+    prod.start(producer, nullptr);
+    cons.start(consumer, nullptr);
+
+    prod.join();
+    cons.join();
+
+    g_ac_chan.destroy();
+    return g_chan_errors == 0;
+}
+
+// ---- Test 2: program with global arena_channel ----
+// arena_channel is a global — the natural pattern (field) is covered by test 3.
+
+arena_channel g_ac_prog = default;
+
+program ArenaConsumerGlobal
+{
+    int total = 0;
+
+    int main(move list<string> args)
+    {
+        while (true)
+        {
+            page_arena* pa = g_ac_prog.recv();
+            if (pa == nullptr) break;
+
+            ProgramPayload* msg = (ProgramPayload*)pa->_root;
+            total = total + msg->_value;
+            g_ac_prog.release_arena(pa);
+        }
+        return total;
+    }
+};
+
+bool testArenaProgram()
+{
+    g_ac_prog.init(128, (i64)65536);
+
+    ArenaConsumerGlobal w;
+    list<string> args;
+    w.run(args);
+
+    int i = 0;
+    while (i < 100)
+    {
+        page_arena* pa = g_ac_prog.acquire_arena();
+
+        ProgramPayload* msg = (ProgramPayload*)pa->alloc((i64)sizeof(ProgramPayload));
+        pa->_root   = (void*)msg;
+        msg->_value = i + 1;
+
+        g_ac_prog.send(pa);
+        i = i + 1;
+    }
+    g_ac_prog.send(nullptr);
+
+    w.WaitForExit();
+    g_ac_prog.destroy();
+
+    return w.exitCode == 5050;   // 1 + 2 + ... + 100
+}
+
+// ---- Test 3: program with arena_channel as an embedded field ----
+
+program ArenaConsumerField
+{
+    arena_channel ac = default;
+    int total = 0;
+
+    int main(move list<string> args)
+    {
+        while (true)
+        {
+            page_arena* pa = ac.recv();
+            if (pa == nullptr) break;
+
+            ProgramPayload* msg = (ProgramPayload*)pa->_root;
+            total = total + msg->_value;
+            ac.release_arena(pa);
+        }
+        return total;
+    }
+};
+
+bool testArenaProgramField()
+{
+    ArenaConsumerField w;
+    w.ac.init(128, (i64)65536);
+
+    list<string> args;
+    w.run(args);
+
+    int i = 0;
+    while (i < 100)
+    {
+        page_arena* pa = w.ac.acquire_arena();
+
+        ProgramPayload* msg = (ProgramPayload*)pa->alloc((i64)sizeof(ProgramPayload));
+        pa->_root   = (void*)msg;
+        msg->_value = i + 1;
+
+        w.ac.send(pa);
+        i = i + 1;
+    }
+    w.ac.send(nullptr);
+
+    w.WaitForExit();
+    w.ac.destroy();
+
+    return w.exitCode == 5050;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+    total++; passed += testArenaChannel()      ? 1 : 0;
+    total++; passed += testArenaProgram()      ? 1 : 0;
+    total++; passed += testArenaProgramField() ? 1 : 0;
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

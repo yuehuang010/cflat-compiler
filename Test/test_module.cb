@@ -1,5 +1,11 @@
 import "testmodule.c";
 import "test_helper.cb";
+import "list.cb";
+import "thread.cb";
+import "prog_lib.cb";
+import "ns_math.cb" as MyMath;
+
+// ---- C module interop ----
 
 bool testImportedFunctions()
 {
@@ -15,8 +21,8 @@ bool testImportedStruct()
     ModulePoint p = ModulePoint();
     p.x = 10;
     p.y = 20;
-    result &= Test("ModulePoint.Sum",    p.Sum(),     30);
-    result &= Test("ModulePoint.Scale2", p.Scale(2),  60);
+    result &= Test("ModulePoint.Sum",    p.Sum(),    30);
+    result &= Test("ModulePoint.Scale2", p.Scale(2), 60);
     return result;
 }
 
@@ -28,13 +34,47 @@ bool testImportedNamespace()
     return result;
 }
 
+// ---- import "file" as Alias ----
+
+bool testImportAs()
+{
+    bool result = true;
+    result &= Test("MyMath.square",    MyMath.square(5),     25);
+    result &= Test("MyMath.add",       MyMath.add(3, 4),      7);
+    MyMath.Point p;
+    p.x = 10;
+    p.y = 20;
+    result &= Test("MyMath.Point.x",   p.x,                  10);
+    result &= Test("MyMath.Point.y",   p.y,                  20);
+    result &= Test("MyMath.point_sum", MyMath.point_sum(&p), 30);
+    return result;
+}
+
+// ---- program defined in an imported library file ----
+// Regression: CompileImportedFile must run ScanGenericTypeUses before
+// ScanExternalDeclaration so the opaque shell for list__string is present
+// when ScanProgramDefinition pre-declares run().
+
+bool testProgramImport()
+{
+    list<string> args;
+    LibProgram p;
+    p.run(args);
+    p.WaitForExit();
+    bool result = true;
+    result &= Test("program in imported file: result", p.result, 42);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
-    total++; passed += testImportedFunctions()  ? 1 : 0;
-    total++; passed += testImportedStruct()     ? 1 : 0;
-    total++; passed += testImportedNamespace()  ? 1 : 0;
+    total++; passed += testImportedFunctions() ? 1 : 0;
+    total++; passed += testImportedStruct()    ? 1 : 0;
+    total++; passed += testImportedNamespace() ? 1 : 0;
+    total++; passed += testImportAs()          ? 1 : 0;
+    total++; passed += testProgramImport()     ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

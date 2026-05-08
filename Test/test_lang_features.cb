@@ -1,0 +1,76 @@
+import "string.cb";
+
+// =============================================================
+// Field initializer syntax
+// =============================================================
+
+struct Point  { int x = 0; int y = 0; };
+struct Person { int age = 0; int score = 0; };
+
+int sumPoint(Point p = { x=1, y=2 }) { return p.x + p.y; }
+
+bool testFieldInit()
+{
+    Point p = { x=10, y=20 };
+    if (p.x != 10 || p.y != 20) return false;
+
+    // Partial initializer — unmentioned field keeps default
+    Point q = { x=5 };
+    if (q.x != 5 || q.y != 0) return false;
+
+    // Trailing comma
+    Person person = { age=30, score=100, };
+    if (person.age != 30 || person.score != 100) return false;
+
+    // Heap allocation with field initializer
+    Point* hp = new Point { x=7, y=8 };
+    if (hp->x != 7 || hp->y != 8) { delete hp; return false; }
+    delete hp;
+
+    // Default parameter with field initializer
+    if (sumPoint() != 3) return false;             // {x=1, y=2}
+
+    // Inline field initializer as positional argument
+    if (sumPoint({ x=3, y=4 }) != 7) return false;
+
+    // Inline field initializer as named-parameter argument
+    if (sumPoint(p: { x=5, y=6 }) != 11) return false;
+
+    return true;
+}
+
+// =============================================================
+// C-style fixed arrays (local and struct field)
+// =============================================================
+
+struct Packet { char data[64]; int length = 0; };
+
+bool testFixedArrays()
+{
+    char buf[8];
+    buf[0] = (char)10;
+    buf[1] = (char)20;
+    buf[2] = (char)30;
+    int s = (int)buf[0] + (int)buf[1] + (int)buf[2];
+    if (s != 60) return false;
+
+    Packet pkt;
+    pkt.data[0] = (char)'H';
+    pkt.data[1] = (char)'i';
+    pkt.data[2] = (char)0;
+    pkt.length = 2;
+    if ((int)pkt.data[0] != (int)'H') return false;
+    if ((int)pkt.data[1] != (int)'i') return false;
+
+    return true;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+    total++; passed += testFieldInit()   ? 1 : 0;
+    total++; passed += testFixedArrays() ? 1 : 0;
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
