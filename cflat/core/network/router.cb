@@ -1,0 +1,208 @@
+// core/network/router.cb — HTTP request router.
+//
+// Routes are matched first by exact (method, path) equality, then by
+// parameterized patterns like /users/:id. Exact routes always take priority.
+//
+// Usage:
+//   import "network/router.cb";
+//
+//   HttpRouter router;
+//   router.add("GET",  "/hello",     helloHandler);
+//   router.add("GET",  "/users/:id", userHandler);   // path param
+//
+//   HttpResponse* resp = router.dispatch(req);  // caller owns resp
+//   // In userHandler: req->getParam("id") returns the captured value.
+//   // Returns HttpResponse.notFound() on miss.
+
+import "network/http_parser.cb";
+import "network/http_response.cb";
+
+// One registered route.
+struct _RouteEntry {
+    i8* method   = nullptr;
+    i8* path     = nullptr;
+    function<HttpResponse*(HttpRequest*)> handler = nullptr;
+    bool hasParams = false;  // true if path contains a ':' segment
+};
+
+int _ROUTER_MAX_ROUTES = 64;
+
+// Copy a null-terminated C string to a new heap allocation.
+i8* _router_strdup(const char* s)
+{
+    int len = strlen(s);
+    i8* copy = new i8[len + 1];
+    int i = 0;
+    while (i <= len) { copy[i] = s[i]; i++; }
+    return copy;
+}
+
+// Returns true if path contains a ':' character (indicating a param segment).
+bool _router_hasParams(const char* path)
+{
+    int i = 0;
+    while (path[i] != 0) { if (path[i] == ':') return true; i++; }
+    return false;
+}
+
+// Compare pattern against req->path segment-by-segment.
+// Captures ':name' segments into req->_paramNames/_paramValues.
+// Returns true on a full match; false otherwise.
+// Resets _paramCount to 0 on each call so failed matches don't leave stale params.
+bool _router_matchParams(const char* pattern, HttpRequest* req)
+{
+    const char* reqPath = req->path;
+
+    int plen = strlen(pattern);
+    int rlen = strlen(reqPath);
+    int pi = 0;
+    int ri = 0;
+
+    // Skip leading slashes
+    if (pi < plen && pattern[pi] == '/') pi++;
+    if (ri < rlen && reqPath[ri] == '/') ri++;
+
+    // Reset param count from any previous failed match attempt
+    if (req->_routeParams != nullptr)
+    {
+        int qi = 0;
+        while (qi < req->_paramCount)
+        {
+            if (req->_routeParams[qi].name  != nullptr) { delete req->_routeParams[qi].name;  req->_routeParams[qi].name  = nullptr; }
+            if (req->_routeParams[qi].value != nullptr) { delete req->_routeParams[qi].value; req->_routeParams[qi].value = nullptr; }
+            qi++;
+        }
+    }
+    req->_paramCount = 0;
+
+    while (pi <= plen && ri <= rlen)
+    {
+        // find end of current pattern segment
+        int pseg = pi;
+        while (pseg < plen && pattern[pseg] != '/') pseg++;
+
+        // find end of current request segment
+        int rseg = ri;
+        while (rseg < rlen && reqPath[rseg] != '/') rseg++;
+
+        int plen_seg = pseg - pi;
+        int rlen_seg = rseg - ri;
+
+        if (plen_seg == 0 && rlen_seg == 0) return true;  // both exhausted
+        if (plen_seg == 0 || rlen_seg == 0) return false;  // count mismatch
+
+        if (pattern[pi] == ':')
+        {
+            // Capture: allocate route param array on first match
+            if (req->_routeParams == nullptr)
+            {
+                req->_routeParams = new HttpHeader[HTTP_MAX_PARAMS];
+                int qi = 0;
+                while (qi < HTTP_MAX_PARAMS)
+                {
+                    req->_routeParams[qi].name  = nullptr;
+                    req->_routeParams[qi].value = nullptr;
+                    qi++;
+                }
+            }
+            if (req->_paramCount < HTTP_MAX_PARAMS)
+            {
+                req->_routeParams[req->_paramCount].name  = _http_substr((i8*)pattern, pi + 1, plen_seg - 1);
+                req->_routeParams[req->_paramCount].value = _http_substr((i8*)reqPath,  ri,     rlen_seg);
+                req->_paramCount++;
+            }
+        }
+        else
+        {
+            // Literal segment — must match exactly
+            if (plen_seg != rlen_seg) return false;
+            int k = 0;
+            while (k < plen_seg)
+            {
+                if (pattern[pi + k] != reqPath[ri + k]) return false;
+                k++;
+            }
+        }
+
+        pi = pseg;
+        ri = rseg;
+        if (pi < plen && pattern[pi] == '/') pi++;
+        if (ri < rlen && reqPath[ri] == '/') ri++;
+    }
+
+    return pi >= plen && ri >= rlen;
+}
+
+class HttpRouter {
+    _RouteEntry* _routes = nullptr;
+    int          _count  = 0;
+
+    void _alloc()
+    {
+        if (_routes == nullptr)
+            _routes = new _RouteEntry[_ROUTER_MAX_ROUTES];
+    }
+
+    // Register an exact or parameterized (method, path) route.
+    // Routes with ':' segments are matched after all exact routes.
+    void add(const char* method, const char* path,
+             function<HttpResponse*(HttpRequest*)> handler)
+    {
+        _alloc();
+        if (_count >= _ROUTER_MAX_ROUTES) return;
+        _routes[_count].method    = _router_strdup(method);
+        _routes[_count].path      = _router_strdup(path);
+        _routes[_count].handler   = handler;
+        _routes[_count].hasParams = _router_hasParams(path);
+        _count++;
+    }
+
+    // Dispatch req to the first matching route.
+    // Pass 1: exact match (fast, no allocation).
+    // Pass 2: parameterized match (extracts params into req).
+    // Returns HttpResponse.notFound() on miss. Caller owns the result.
+    HttpResponse* dispatch(HttpRequest* req)
+    {
+        if (_routes == nullptr) return HttpResponse.notFound();
+
+        // Pass 1: exact match
+        int i = 0;
+        while (i < _count)
+        {
+            if (!_routes[i].hasParams &&
+                strcmp(_routes[i].method, req->method) == 0 &&
+                strcmp(_routes[i].path,   req->path)   == 0)
+                return _routes[i].handler(req);
+            i++;
+        }
+
+        // Pass 2: parameterized match
+        i = 0;
+        while (i < _count)
+        {
+            if (_routes[i].hasParams &&
+                strcmp(_routes[i].method, req->method) == 0 &&
+                _router_matchParams(_routes[i].path, req))
+                return _routes[i].handler(req);
+            i++;
+        }
+
+        return HttpResponse.notFound();
+    }
+
+    ~HttpRouter()
+    {
+        if (_routes != nullptr)
+        {
+            int i = 0;
+            while (i < _count)
+            {
+                if (_routes[i].method != nullptr) { delete _routes[i].method; _routes[i].method = nullptr; }
+                if (_routes[i].path   != nullptr) { delete _routes[i].path;   _routes[i].path   = nullptr; }
+                i++;
+            }
+            delete[_] _routes;
+            _routes = nullptr;
+        }
+    }
+};

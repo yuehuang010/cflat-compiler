@@ -3,7 +3,10 @@
 // Request usage:
 //   import "network/http_parser.cb";
 //   HttpRequest* req = parseHttpRequest(buf, len);
-//   if (req->valid) { ... }
+//   if (req->valid) {
+//       // path params (set by router dispatch):  req->getParam("id")
+//       // query params (parsed from URL):        req->getQuery("q")
+//   }
 //   delete req;
 //
 // Response usage:
@@ -16,6 +19,8 @@ import "string.cb";
 extern cdecl int atoi(const char* s);
 
 int HTTP_MAX_HEADERS = 64;
+int HTTP_MAX_QUERY   = 16;
+int HTTP_MAX_PARAMS  = 8;
 
 struct HttpHeader {
     i8* name  = nullptr;
@@ -25,13 +30,23 @@ struct HttpHeader {
 // Parsed HTTP request. The caller owns the returned pointer and must delete it.
 class HttpRequest {
     i8*         method      = nullptr;
-    i8*         path        = nullptr;
+    i8*         path        = nullptr;  // path only, no query string
     i8*         version     = nullptr;
     HttpHeader* headers     = nullptr;
     int         headerCount = 0;
     i8*         body        = nullptr;
     int         bodyLen     = 0;
     bool        valid       = false;
+
+    // Query string parameters parsed from the URL (e.g. /search?q=foo&page=2).
+    // Reuses HttpHeader{name, value} as a key-value pair struct.
+    HttpHeader* _queryParams = nullptr;
+    int         _queryCount  = 0;
+
+    // Path parameters populated by the router when a parameterized route matches
+    // (e.g. /users/:id). Not set by parseHttpRequest — set by the router.
+    HttpHeader* _routeParams = nullptr;
+    int         _paramCount  = 0;
 
     // Case-sensitive header lookup. Returns nullptr if not found.
     i8* getHeader(const char* name)
@@ -40,6 +55,33 @@ class HttpRequest {
         while (i < headerCount)
         {
             if (strcmp(headers[i].name, name) == 0) return headers[i].value;
+            i++;
+        }
+        return nullptr;
+    }
+
+    // Query parameter lookup (key from URL query string). Returns nullptr if absent.
+    i8* getQuery(const char* name)
+    {
+        if (_queryParams == nullptr) return nullptr;
+        int i = 0;
+        while (i < _queryCount)
+        {
+            if (strcmp(_queryParams[i].name, name) == 0) return _queryParams[i].value;
+            i++;
+        }
+        return nullptr;
+    }
+
+    // Path parameter lookup (set by the router for parameterized routes like /users/:id).
+    // Returns nullptr if not set or name not found.
+    i8* getParam(const char* name)
+    {
+        if (_routeParams == nullptr) return nullptr;
+        int i = 0;
+        while (i < _paramCount)
+        {
+            if (strcmp(_routeParams[i].name, name) == 0) return _routeParams[i].value;
             i++;
         }
         return nullptr;
@@ -70,6 +112,30 @@ class HttpRequest {
             }
             delete[_] headers;
             headers = nullptr;
+        }
+        if (_queryParams != nullptr)
+        {
+            int i = 0;
+            while (i < _queryCount)
+            {
+                if (_queryParams[i].name  != nullptr) delete _queryParams[i].name;
+                if (_queryParams[i].value != nullptr) delete _queryParams[i].value;
+                i++;
+            }
+            delete[_] _queryParams;
+            _queryParams = nullptr;
+        }
+        if (_routeParams != nullptr)
+        {
+            int i = 0;
+            while (i < _paramCount)
+            {
+                if (_routeParams[i].name  != nullptr) delete _routeParams[i].name;
+                if (_routeParams[i].value != nullptr) delete _routeParams[i].value;
+                i++;
+            }
+            delete[_] _routeParams;
+            _routeParams = nullptr;
         }
     }
 };
@@ -124,6 +190,8 @@ class HttpClientResponse {
     }
 };
 
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
 // Copy buf[start .. start+len) into a new null-terminated heap string.
 i8* _http_substr(i8* buf, int start, int len)
 {
@@ -144,12 +212,99 @@ i8* _http_trim(i8* buf, int start, int len)
     return _http_substr(buf, start, len);
 }
 
+// Return the numeric value of a single hex digit (0-9, A-F, a-f).
+int _http_hexval(i8 c)
+{
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    return 0;
+}
+
+// URL-decode buf[start..start+len) into a new heap string.
+// Decodes %XX percent-encoding and + as space.
+i8* _http_urldecode(i8* buf, int start, int len)
+{
+    i8* result = new i8[len + 1];
+    int ri = 0;
+    int i = start;
+    int end = start + len;
+    while (i < end)
+    {
+        if (buf[i] == '+')
+        {
+            result[ri] = ' ';
+            ri++;
+            i++;
+        }
+        else if (buf[i] == '%' && i + 2 < end)
+        {
+            int val = _http_hexval(buf[i + 1]) * 16 + _http_hexval(buf[i + 2]);
+            result[ri] = (i8)val;
+            ri++;
+            i = i + 3;
+        }
+        else
+        {
+            result[ri] = buf[i];
+            ri++;
+            i++;
+        }
+    }
+    result[ri] = 0;
+    return result;
+}
+
+// Parse a query string buf[start..start+len) into req->_queryParams.
+// Expects req->_queryParams to already be allocated.
+void _http_parseQuery(HttpRequest* req, i8* buf, int start, int len)
+{
+    int i = start;
+    int end = start + len;
+
+    while (i < end && req->_queryCount < HTTP_MAX_QUERY)
+    {
+        // Find '=' separator for this key
+        int keyEnd = i;
+        while (keyEnd < end && buf[keyEnd] != '=' && buf[keyEnd] != '&') keyEnd++;
+
+        if (keyEnd >= end || buf[keyEnd] != '=')
+        {
+            // No '=' — malformed pair, skip to next '&'
+            while (i < end && buf[i] != '&') i++;
+            if (i < end) i++;
+            continue;
+        }
+
+        int valStart = keyEnd + 1;
+        int valEnd = valStart;
+        while (valEnd < end && buf[valEnd] != '&') valEnd++;
+
+        req->_queryParams[req->_queryCount].name  = _http_urldecode(buf, i,        keyEnd - i);
+        req->_queryParams[req->_queryCount].value = _http_urldecode(buf, valStart, valEnd - valStart);
+        req->_queryCount++;
+
+        i = valEnd;
+        if (i < end) i++;  // skip '&'
+    }
+}
+
+// ── Request parser ────────────────────────────────────────────────────────────
+
 // Parse raw bytes into an HttpRequest.  Returns a request with valid=false on
 // malformed input.  The caller owns the returned pointer and must delete it.
 HttpRequest* parseHttpRequest(i8* buf, int len)
 {
     HttpRequest* req = new HttpRequest;
-    req->headers = new HttpHeader[HTTP_MAX_HEADERS];
+    req->headers      = new HttpHeader[HTTP_MAX_HEADERS];
+    req->_queryParams = new HttpHeader[HTTP_MAX_QUERY];
+    int qi = 0;
+    while (qi < HTTP_MAX_QUERY)
+    {
+        req->_queryParams[qi].name  = nullptr;
+        req->_queryParams[qi].value = nullptr;
+        qi++;
+    }
 
     // Find the end of the request line (\r\n).
     int lineEnd = -1;
@@ -166,14 +321,22 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
     while (methodEnd < lineEnd && buf[methodEnd] != ' ') methodEnd++;
     req->method = _http_substr(buf, 0, methodEnd);
 
-    // Path — between first and second space.
+    // Raw path — between first and second space (may include ?query).
     int pathStart = methodEnd + 1;
-    int pathEnd = pathStart;
-    while (pathEnd < lineEnd && buf[pathEnd] != ' ') pathEnd++;
-    req->path = _http_substr(buf, pathStart, pathEnd - pathStart);
+    int rawPathEnd = pathStart;
+    while (rawPathEnd < lineEnd && buf[rawPathEnd] != ' ') rawPathEnd++;
+
+    // Split path at '?': store only the path part; parse query string separately.
+    int qpos = pathStart;
+    while (qpos < rawPathEnd && buf[qpos] != '?') qpos++;
+
+    req->path = _http_substr(buf, pathStart, qpos - pathStart);
+
+    if (qpos < rawPathEnd)
+        _http_parseQuery(req, buf, qpos + 1, rawPathEnd - qpos - 1);
 
     // Version — remainder of the request line.
-    int verStart = pathEnd + 1;
+    int verStart = rawPathEnd + 1;
     req->version = _http_substr(buf, verStart, lineEnd - verStart);
 
     // Headers — one per line until the blank line (\r\n\r\n).
@@ -225,6 +388,8 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
     req->valid = true;
     return req;
 }
+
+// ── Response parser ───────────────────────────────────────────────────────────
 
 // Parse raw HTTP response bytes.  Returns a response with valid=false on
 // malformed input.  The caller owns the returned pointer and must delete it.

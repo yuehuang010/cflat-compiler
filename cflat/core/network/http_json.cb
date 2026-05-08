@@ -1,0 +1,42 @@
+// core/network/http_json.cb — JSON body helpers for HTTP request handlers.
+//
+// Usage:
+//   import "network/http_json.cb";
+//
+//   // Parse request body as JSON into struct T.
+//   // T must have fields that are reflectable (int, string, bool, float).
+//   MyStruct val = HttpJson.parse<MyStruct>(req);
+//
+//   // Serialize and respond with application/json.
+//   return HttpJson.respond<MyStruct>(val);
+
+import "json.cb";
+import "network/http_parser.cb";
+import "network/http_response.cb";
+
+// Non-generic helper so generic methods avoid a string local variable.
+// (string locals in generic static methods can cause LLVM dominance errors.)
+HttpResponse* _httpJsonBuildOkResponse(const char* jsonCStr)
+{
+    return HttpResponse.okJson(jsonCStr);
+}
+
+class HttpJson {
+    // Deserialize the request body as JSON into struct T.
+    // Returns a default-initialized T if body is null or empty.
+    // req->body (i8*) is implicitly converted to string at the call site.
+    static T parse<T>(HttpRequest* req)
+    {
+        T result;
+        if (req->body != nullptr && req->bodyLen > 0)
+            result = JsonBuilder.fromJsonRaw<T>(req->body, req->bodyLen);
+        return result;
+    }
+
+    // Serialize val as JSON and return a 200 application/json response.
+    static HttpResponse* respond<T>(T val)
+    {
+        string json = JsonBuilder.toJson<T>(val);
+        return _httpJsonBuildOkResponse(json.data());
+    }
+};

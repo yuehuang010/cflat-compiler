@@ -8971,8 +8971,8 @@ public:
 
         // Resolve types — all must be concrete by this point (ProcessPendingInstantiations ran)
         auto* progType        = compiler->dataStructures[name].StructType;
-        auto* defAllocType    = compiler->dataStructures.count("SlabAllocator")
-                                ? compiler->dataStructures["SlabAllocator"].StructType : nullptr;
+        auto* defAllocType    = compiler->dataStructures.count("MallocAllocator")
+                                ? compiler->dataStructures["MallocAllocator"].StructType : nullptr;
         auto* listStringType  = compiler->dataStructures.count("list__string")
                                 ? compiler->dataStructures["list__string"].StructType : nullptr;
         auto* threadType      = compiler->dataStructures.count("Thread")
@@ -8982,7 +8982,7 @@ public:
         if (!progType || !defAllocType || !listStringType || !threadType)
         {
             compiler->LogError(std::format(
-                "program '{}': missing required type (SlabAllocator={}, list__string={}, Thread={})",
+                "program '{}': missing required type (MallocAllocator={}, list__string={}, Thread={})",
                 name,
                 defAllocType  ? "ok" : "missing",
                 listStringType ? "ok" : "missing",
@@ -9004,7 +9004,7 @@ public:
         // Look up helper functions
         auto* mallocFn         = compiler->GetFunction("malloc");
         auto* freeFn           = compiler->GetFunction("free");
-        auto* defAllocCtorFn   = compiler->GetFunction("SlabAllocator");
+        auto* defAllocCtorFn   = compiler->GetFunction("MallocAllocator");
         auto* threadCtorFn     = compiler->GetFunction("Thread");
         auto* threadStartFn    = FindMethodOf("start", "Thread");
         auto* threadJoinFn     = FindMethodOf("join", "Thread");
@@ -9135,7 +9135,9 @@ public:
             auto* useBlock     = llvm::BasicBlock::Create(*compiler->context, "alloc_use",     trampolineFn);
             compiler->builder->CreateCondBr(isNull, defaultBlock, useBlock);
 
-            // Default path: create a SlabAllocator on the heap and build its IAllocator fat-ptr.
+            // Default path: create a MallocAllocator on the heap and build its IAllocator fat-ptr.
+            // MallocAllocator wraps CRT malloc/free, which is thread-safe and handles cross-thread
+            // ownership correctly (objects allocated by one thread can be freed by another).
             compiler->builder->SetInsertPoint(defaultBlock);
             auto* defAllocSize = compiler->GetTypeSizeBytes(defAllocType);
             auto* defAllocRaw  = compiler->builder->CreateCall(
@@ -9144,7 +9146,7 @@ public:
             auto* defAllocInit = compiler->builder->CreateCall(
                 defAllocCtorFn->getFunctionType(), defAllocCtorFn, {}, "def_alloc_init");
             compiler->builder->CreateStore(defAllocInit, defAllocPtr);
-            auto* defVtable    = compiler->GetOrCreateVTable("SlabAllocator", "IAllocator");
+            auto* defVtable    = compiler->GetOrCreateVTable("MallocAllocator", "IAllocator");
             auto* defFatPtr    = compiler->BuildInterfaceFatValue(defVtable, defAllocPtr);
             compiler->builder->CreateStore(defFatPtr, allocFieldGEP);
             compiler->builder->CreateBr(useBlock);

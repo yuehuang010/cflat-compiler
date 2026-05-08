@@ -1,0 +1,167 @@
+import "list.cb";
+import "thread.cb";
+import "stop_token.cb";
+import "test_helper.cb";
+import "network/rest_server.cb";
+import "network/http_client.cb";
+
+int g_rest_port = 17900;
+
+HttpResponse* restHelloHandler(HttpRequest* req)
+{
+    return HttpResponse.ok("Hello from REST!");
+}
+
+HttpResponse* restEchoHandler(HttpRequest* req)
+{
+    if (req->body != nullptr && req->bodyLen > 0)
+        return HttpResponse.ok(req->body);
+    return HttpResponse.ok("(no body)");
+}
+
+HttpResponse* restUpdateHandler(HttpRequest* req)
+{
+    return HttpResponse.ok("updated");
+}
+
+HttpResponse* restDeleteHandler(HttpRequest* req)
+{
+    return HttpResponse.ok("deleted");
+}
+
+HttpResponse* restJsonHandler(HttpRequest* req)
+{
+    return HttpResponse.okJson("\{\"status\":\"ok\"\}");
+}
+
+bool _rst_contains(i8* buf, int blen, const char* needle)
+{
+    int nlen = strlen(needle);
+    if (nlen > blen) return false;
+    int i = 0;
+    while (i <= blen - nlen)
+    {
+        bool match = true;
+        int j = 0;
+        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
+        if (match) return true;
+        i++;
+    }
+    return false;
+}
+
+extern int main()
+{
+    if (!Socket.initNetwork())
+    {
+        printf("FAIL: initNetwork\n");
+        return 1;
+    }
+
+    stop_source src;
+    src.init();
+
+    RestServer srv;
+    srv.port      = g_rest_port;
+    srv.stopToken = src.get_token();
+    srv.get("/hello",   restHelloHandler);
+    srv.post("/echo",   restEchoHandler);
+    srv.put("/update",  restUpdateHandler);
+    srv.del("/item",    restDeleteHandler);
+    srv.get("/json",    restJsonHandler);
+
+    list<string> srvArgs;
+    srv.run(srvArgs);
+    Sleep(50);
+
+    HttpClient client;
+    bool ok = true;
+    string host = "127.0.0.1";
+
+    // GET /hello
+    {
+        HttpClientResponse* resp = client.get(host, g_rest_port, "/hello");
+        ok &= Test("GET /hello not null",  resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("GET /hello status", resp->statusCode, 200);
+            ok &= Test("GET /hello body",   resp->bodyLen > 0 &&
+                       _rst_contains(resp->body, resp->bodyLen, "Hello from REST!"), true);
+            delete resp;
+        }
+    }
+
+    // POST /echo
+    {
+        HttpClientResponse* resp = client.post(host, g_rest_port, "/echo", "ping", 4);
+        ok &= Test("POST /echo not null",  resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("POST /echo status", resp->statusCode, 200);
+            ok &= Test("POST /echo body",   resp->bodyLen > 0 &&
+                       _rst_contains(resp->body, resp->bodyLen, "ping"), true);
+            delete resp;
+        }
+    }
+
+    // PUT /update
+    {
+        HttpClientResponse* resp = client.put(host, g_rest_port, "/update", "x", 1);
+        ok &= Test("PUT /update not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("PUT /update status", resp->statusCode, 200);
+            ok &= Test("PUT /update body",   resp->bodyLen > 0 &&
+                       _rst_contains(resp->body, resp->bodyLen, "updated"), true);
+            delete resp;
+        }
+    }
+
+    // DELETE /item
+    {
+        HttpClientResponse* resp = client.del(host, g_rest_port, "/item");
+        ok &= Test("DELETE /item not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("DELETE /item status", resp->statusCode, 200);
+            ok &= Test("DELETE /item body",   resp->bodyLen > 0 &&
+                       _rst_contains(resp->body, resp->bodyLen, "deleted"), true);
+            delete resp;
+        }
+    }
+
+    // GET /json
+    {
+        HttpClientResponse* resp = client.get(host, g_rest_port, "/json");
+        ok &= Test("GET /json not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("GET /json status", resp->statusCode, 200);
+            i8* ct = resp->getHeader("Content-Type");
+            ok &= Test("GET /json content-type", ct != nullptr &&
+                       strcmp(ct, "application/json") == 0, true);
+            delete resp;
+        }
+    }
+
+    // GET /missing -> 404
+    {
+        HttpClientResponse* resp = client.get(host, g_rest_port, "/missing");
+        ok &= Test("GET /missing not null",  resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("GET /missing status", resp->statusCode, 404);
+            delete resp;
+        }
+    }
+
+    src.request_stop();
+    srv.WaitForExit();
+    src.dispose();
+
+    Socket.shutdownNetwork();
+
+    if (ok) printf("test_rest_server: all passed.\n");
+    else    printf("test_rest_server: FAILED.\n");
+    return ok ? 0 : 1;
+}

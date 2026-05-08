@@ -138,6 +138,31 @@ class JsonBuilder : IReflector
         }
         return result;
     }
+
+    // Parse JSON from a raw byte pointer + length. Avoids a string copy at the
+    // call site — useful when the caller already holds an i8* buffer.
+    static T fromJsonRaw<T>(i8* data, int len)
+    {
+        Arena arena;
+        arena.setBlockSize(4096);
+        JsonParser p;
+        p._src = data;
+        p._len = len;
+        p._pos = 0;
+        p._arena = &arena;
+        p._skipWs();
+        T result;
+        if (p._peek() == '{')
+        {
+            JsonNode* root = p._parseObject();
+            if (root != nullptr)
+            {
+                IJSON src = root;
+                reflect_set(result, src);
+            }
+        }
+        return result;
+    }
 };
 
 // ── JsonNode ─────────────────────────────────────────────────────────────────

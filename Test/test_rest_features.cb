@@ -1,0 +1,306 @@
+import "list.cb";
+import "thread.cb";
+import "stop_token.cb";
+import "test_helper.cb";
+import "json.cb";
+import "network/rest_server.cb";
+import "network/http_client.cb";
+import "network/http_json.cb";
+
+int g_feat_port = 17901;
+
+// ── Request handlers ──────────────────────────────────────────────────────────
+
+HttpResponse* featHelloHandler(HttpRequest* req)
+{
+    return HttpResponse.ok("hello");
+}
+
+HttpResponse* featUserHandler(HttpRequest* req)
+{
+    i8* id = req->getParam("id");
+    if (id == nullptr) return HttpResponse.badRequest("missing id");
+    return HttpResponse.ok(id);
+}
+
+HttpResponse* featOrgRepoHandler(HttpRequest* req)
+{
+    i8* org  = req->getParam("org");
+    i8* repo = req->getParam("repo");
+    if (org == nullptr || repo == nullptr) return HttpResponse.badRequest("missing param");
+    // combine org/repo into response body
+    i8* buf = new i8[256];
+    int pos = 0;
+    int i = 0;
+    while (org[i] != 0)  { buf[pos] = org[i];  pos++; i++; }
+    buf[pos] = '/'; pos++;
+    i = 0;
+    while (repo[i] != 0) { buf[pos] = repo[i]; pos++; i++; }
+    buf[pos] = 0;
+    HttpResponse* r = HttpResponse.ok(buf);
+    delete buf;
+    return r;
+}
+
+HttpResponse* featMeHandler(HttpRequest* req)
+{
+    return HttpResponse.ok("me-exact");
+}
+
+HttpResponse* featSearchHandler(HttpRequest* req)
+{
+    i8* q    = req->getQuery("q");
+    i8* page = req->getQuery("page");
+    if (q == nullptr) return HttpResponse.badRequest("missing q");
+    i8* buf = new i8[512];
+    int pos = 0;
+    int i = 0;
+    while (q[i] != 0) { buf[pos] = q[i]; pos++; i++; }
+    if (page != nullptr)
+    {
+        buf[pos] = ':'; pos++;
+        i = 0;
+        while (page[i] != 0) { buf[pos] = page[i]; pos++; i++; }
+    }
+    buf[pos] = 0;
+    HttpResponse* r = HttpResponse.ok(buf);
+    delete buf;
+    return r;
+}
+
+// Status code handlers
+HttpResponse* featCreatedHandler(HttpRequest* req) { return HttpResponse.created("born"); }
+HttpResponse* featNoContentHandler(HttpRequest* req) { return HttpResponse.noContent(); }
+HttpResponse* featBadRequestHandler(HttpRequest* req) { return HttpResponse.badRequest("nope"); }
+HttpResponse* featUnauthorizedHandler(HttpRequest* req) { return HttpResponse.unauthorized("denied"); }
+HttpResponse* featForbiddenHandler(HttpRequest* req) { return HttpResponse.forbidden("forbidden"); }
+HttpResponse* featMethodHandler(HttpRequest* req) { return HttpResponse.methodNotAllowed(); }
+
+// JSON handler
+struct FeatureItem {
+    int id = 0;
+};
+
+HttpResponse* featJsonEchoHandler(HttpRequest* req)
+{
+    FeatureItem item = HttpJson.parse<FeatureItem>(req);
+    return HttpJson.respond<FeatureItem>(item);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+bool _feat_contains(i8* buf, int blen, const char* needle)
+{
+    int nlen = strlen(needle);
+    if (nlen > blen) return false;
+    int i = 0;
+    while (i <= blen - nlen)
+    {
+        bool match = true;
+        int j = 0;
+        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
+        if (match) return true;
+        i++;
+    }
+    return false;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    if (!Socket.initNetwork()) { printf("FAIL: initNetwork\n"); return 1; }
+
+    stop_source src;
+    src.init();
+
+    RestServer srv;
+    srv.port      = g_feat_port;
+    srv.stopToken = src.get_token();
+
+    // Path params
+    srv.get("/hello",              featHelloHandler);
+    srv.get("/users/me",           featMeHandler);        // exact — takes priority over :id
+    srv.get("/users/:id",          featUserHandler);
+    srv.get("/orgs/:org/repos/:repo", featOrgRepoHandler);
+
+    // Query string
+    srv.get("/search",             featSearchHandler);
+
+    // Status codes
+    srv.post("/status/created",    featCreatedHandler);
+    srv.get("/status/nocontent",   featNoContentHandler);
+    srv.get("/status/badrequest",  featBadRequestHandler);
+    srv.get("/status/unauthorized",featUnauthorizedHandler);
+    srv.get("/status/forbidden",   featForbiddenHandler);
+    srv.get("/status/notallowed",  featMethodHandler);
+
+    // JSON body
+    srv.post("/json/echo",         featJsonEchoHandler);
+
+    list<string> srvArgs;
+    srv.run(srvArgs);
+    Sleep(50);
+
+    HttpClient client;
+    bool ok = true;
+    string host = "127.0.0.1";
+
+    // ── Path parameters ───────────────────────────────────────────────────────
+
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/users/42");
+        ok &= Test("param /users/:id not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("param /users/:id status", resp->statusCode, 200);
+            ok &= Test("param /users/:id body",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "42"), true);
+            delete resp;
+        }
+    }
+
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/orgs/acme/repos/widget");
+        ok &= Test("param /orgs/:org/repos/:repo not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("param two-param status", resp->statusCode, 200);
+            ok &= Test("param two-param body",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "acme/widget"), true);
+            delete resp;
+        }
+    }
+
+    {
+        // Exact route /users/me must win over parameterized /users/:id
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/users/me");
+        ok &= Test("exact beats param not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("exact beats param status", resp->statusCode, 200);
+            ok &= Test("exact beats param body",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "me-exact"), true);
+            delete resp;
+        }
+    }
+
+    // ── Query string ──────────────────────────────────────────────────────────
+
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/search?q=hello&page=2");
+        ok &= Test("query multi-param not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("query multi-param status", resp->statusCode, 200);
+            ok &= Test("query multi-param body q",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "hello"), true);
+            ok &= Test("query multi-param body page",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "2"), true);
+            delete resp;
+        }
+    }
+
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/search?q=hello%20world");
+        ok &= Test("query url-decode not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("query url-decode status", resp->statusCode, 200);
+            ok &= Test("query url-decode body",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "hello world"), true);
+            delete resp;
+        }
+    }
+
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/search?q=a+b");
+        ok &= Test("query plus-space not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("query plus-space status", resp->statusCode, 200);
+            ok &= Test("query plus-space body",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "a b"), true);
+            delete resp;
+        }
+    }
+
+    // ── Status codes ─────────────────────────────────────────────────────────
+
+    {
+        HttpClientResponse* resp = client.post(host, g_feat_port, "/status/created", nullptr, 0);
+        ok &= Test("201 created not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("201 created status", resp->statusCode, 201); delete resp; }
+    }
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/status/nocontent");
+        ok &= Test("204 nocontent not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("204 nocontent status", resp->statusCode, 204); delete resp; }
+    }
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/status/badrequest");
+        ok &= Test("400 bad request not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("400 bad request status", resp->statusCode, 400); delete resp; }
+    }
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/status/unauthorized");
+        ok &= Test("401 unauthorized not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("401 unauthorized status", resp->statusCode, 401); delete resp; }
+    }
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/status/forbidden");
+        ok &= Test("403 forbidden not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("403 forbidden status", resp->statusCode, 403); delete resp; }
+    }
+    {
+        HttpClientResponse* resp = client.get(host, g_feat_port, "/status/notallowed");
+        ok &= Test("405 method not allowed not null", resp != nullptr, true);
+        if (resp != nullptr) { ok &= Test("405 method not allowed status", resp->statusCode, 405); delete resp; }
+    }
+
+    // ── JSON body (HttpJson) ──────────────────────────────────────────────────
+
+    {
+        const char* body = "\{\"id\":99\}";
+        HttpClientResponse* resp = client.post(host, g_feat_port, "/json/echo", body, strlen(body));
+        ok &= Test("json echo not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("json echo status", resp->statusCode, 200);
+            i8* ct = resp->getHeader("Content-Type");
+            ok &= Test("json echo content-type",
+                       ct != nullptr && strcmp(ct, "application/json") == 0, true);
+            ok &= Test("json echo body has 99",
+                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "99"), true);
+            delete resp;
+        }
+    }
+
+    // ── Concurrent connections ────────────────────────────────────────────────
+    // Send several sequential requests after the threading refactor to verify
+    // the server correctly handles multiple connections.
+
+    {
+        bool concOk = true;
+        int ci = 0;
+        while (ci < 5)
+        {
+            HttpClientResponse* resp = client.get(host, g_feat_port, "/hello");
+            if (resp == nullptr || resp->statusCode != 200)
+                concOk = false;
+            if (resp != nullptr) delete resp;
+            ci++;
+        }
+        ok &= Test("concurrent 5x GET /hello", concOk, true);
+    }
+
+    src.request_stop();
+    srv.WaitForExit();
+    src.dispose();
+
+    Socket.shutdownNetwork();
+
+    if (ok) printf("test_rest_features: all passed.\n");
+    else    printf("test_rest_features: FAILED.\n");
+    return ok ? 0 : 1;
+}

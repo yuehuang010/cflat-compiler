@@ -1,4 +1,4 @@
-// core/network/http_server.cb — Single-threaded HTTP/1.1 server using the
+// core/network/http_server.cb — Single-handler HTTP/1.1 server using the
 // `program` construct for lifecycle management.
 //
 // Usage:
@@ -30,8 +30,8 @@ import "network/http_parser.cb";
 import "network/http_response.cb";
 
 // Handle one accepted connection: receive request, call handler, send response.
-// Defined as a top-level function to avoid method-resolution surprises when
-// called from inside a program's main().
+// Defined as a top-level function so it can be shared by both HttpServer and
+// the per-connection _HttpConn program.
 void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
 {
     i8* buf = new i8[8192];
@@ -59,9 +59,23 @@ void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
     delete conn;
 }
 
-// HTTP server program.  Set port / handler / stopToken before calling run().
-// The server accepts connections in a polling loop so it can honour the stop
-// token without a blocking accept() call (which has no portable timeout).
+// Per-connection program: receives one request and exits.
+// The program construct installs a per-thread MallocAllocator automatically.
+program _HttpConn {
+    Socket* conn    = nullptr;
+    function<HttpResponse*(HttpRequest*)> handler = nullptr;
+
+    int main(move list<string> args)
+    {
+        Socket* c = conn;
+        conn = nullptr;   // prevent destructor double-free after _httpServeConn deletes c
+        _httpServeConn(c, handler);
+        return 0;
+    }
+};
+
+// HTTP server program. Set port / handler / stopToken before calling run().
+// Each accepted connection is handled in its own _HttpConn program thread.
 program HttpServer {
     int        port      = 8080;
     int        backlog   = 16;
@@ -80,6 +94,8 @@ program HttpServer {
         if (!listener->bind(any, port))      { delete listener; return 1; }
         if (!listener->listenOn(backlog))    { delete listener; return 1; }
 
+        list<_HttpConn*> conns;
+
         while (!stopToken.stop_requested())
         {
             Socket* conn = listener->accept();
@@ -88,7 +104,20 @@ program HttpServer {
                 Sleep(5);
                 continue;
             }
-            _httpServeConn(conn, handler);
+
+            _HttpConn* c = new _HttpConn;
+            c->conn    = conn;
+            c->handler = handler;
+            list<string> connArgs;
+            c->run(connArgs);
+            conns.add(c);
+        }
+
+        // Drain: wait for all in-flight connection programs to finish.
+        while (conns.count() > 0)
+        {
+            conns.get(0)->WaitForExit();
+            conns.removeAt(0);
         }
 
         delete listener;

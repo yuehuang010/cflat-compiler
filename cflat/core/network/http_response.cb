@@ -163,4 +163,62 @@ class HttpResponse {
         r->setTextBody(msg != nullptr ? msg : "Internal Server Error");
         return r;
     }
+
+    static HttpResponse* created(const char* body)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 201;
+        r->_statusText = "Created";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody(body != nullptr ? body : "Created");
+        return r;
+    }
+
+    static HttpResponse* noContent()
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 204;
+        r->_statusText = "No Content";
+        return r;
+    }
+
+    static HttpResponse* badRequest(const char* msg)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 400;
+        r->_statusText = "Bad Request";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody(msg != nullptr ? msg : "Bad Request");
+        return r;
+    }
+
+    static HttpResponse* unauthorized(const char* msg)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 401;
+        r->_statusText = "Unauthorized";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody(msg != nullptr ? msg : "Unauthorized");
+        return r;
+    }
+
+    static HttpResponse* forbidden(const char* msg)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 403;
+        r->_statusText = "Forbidden";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody(msg != nullptr ? msg : "Forbidden");
+        return r;
+    }
+
+    static HttpResponse* methodNotAllowed()
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status = 405;
+        r->_statusText = "Method Not Allowed";
+        r->addHeader("Content-Type", "text/plain");
+        r->setTextBody("Method Not Allowed");
+        return r;
+    }
 };

@@ -127,9 +127,11 @@ extern int main()
     i8* raw8 = "DELETE /res/42?cascade=true HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
     HttpRequest* req8 = parseHttpRequest(raw8, strlen(raw8));
 
-    if (!req8->valid)                                     { printf("FAIL 8: not valid\n");  ok = false; }
-    if (strcmp(req8->method, "DELETE") != 0)              { printf("FAIL 8: method\n");     ok = false; }
-    if (strcmp(req8->path,   "/res/42?cascade=true") != 0){ printf("FAIL 8: path\n");      ok = false; }
+    if (!req8->valid)                                  { printf("FAIL 8: not valid\n");  ok = false; }
+    if (strcmp(req8->method, "DELETE") != 0)           { printf("FAIL 8: method\n");     ok = false; }
+    if (strcmp(req8->path,   "/res/42") != 0)          { printf("FAIL 8: path\n");       ok = false; }
+    if (req8->_queryCount != 1)                         { printf("FAIL 8: queryCount\n"); ok = false; }
+    if (strcmp(req8->getQuery("cascade"), "true") != 0) { printf("FAIL 8: query\n");      ok = false; }
 
     delete req8;
 
