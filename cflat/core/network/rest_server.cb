@@ -28,13 +28,17 @@ import "network/http_response.cb";
 import "network/router.cb";
 
 // Per-connection program: dispatches one request through the shared router and exits.
-// The program construct installs a per-thread MallocAllocator automatically.
+// Accepts the OS socket handle (void*) rather than a Socket* to avoid passing
+// a cross-program pointer — each program owns its own allocator.
 program _RestConn {
-    Socket*     conn   = nullptr;
+    void*       handle = nullptr;
     HttpRouter* router = nullptr;
 
     int main(move list<string> args)
     {
+        Socket* conn = new Socket;
+        conn->_handle = handle;
+
         i8* buf = new i8[8192];
         int n = conn->recv(buf, 8191);
         HttpResponse* resp = nullptr;
@@ -57,8 +61,7 @@ program _RestConn {
         conn->send(rbuf, rlen);
         delete rbuf;
         delete resp;
-        delete conn;
-        conn = nullptr;   // prevent destructor double-free
+        // conn is not deleted here — local Socket* is cleaned up at scope exit.
         return 0;
     }
 };
@@ -100,8 +103,10 @@ program RestServer {
             if (conn == nullptr) { Sleep(5); continue; }
 
             _RestConn* c = new _RestConn;
-            c->conn   = conn;
+            c->handle = conn->_handle;
             c->router = &router;
+            conn->_handle = nullptr;  // transfer OS handle; Socket shell freed here
+            delete conn;
             list<string> connArgs;
             c->run(connArgs);
             conns.add(c);

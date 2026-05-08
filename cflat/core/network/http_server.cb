@@ -56,20 +56,21 @@ void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
     conn->send(rbuf, rlen);
     delete rbuf;
     delete resp;
-    delete conn;
+    // conn is not deleted here — caller owns the Socket and cleans it up at scope exit.
 }
 
 // Per-connection program: receives one request and exits.
-// The program construct installs a per-thread MallocAllocator automatically.
+// Accepts the OS socket handle (void*) rather than a Socket* to avoid passing
+// a cross-program pointer — each program owns its own allocator.
 program _HttpConn {
-    Socket* conn    = nullptr;
+    void* handle  = nullptr;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
 
     int main(move list<string> args)
     {
-        Socket* c = conn;
-        conn = nullptr;   // prevent destructor double-free after _httpServeConn deletes c
-        _httpServeConn(c, handler);
+        Socket* conn = new Socket;
+        conn->_handle = handle;
+        _httpServeConn(conn, handler);
         return 0;
     }
 };
@@ -106,8 +107,10 @@ program HttpServer {
             }
 
             _HttpConn* c = new _HttpConn;
-            c->conn    = conn;
+            c->handle  = conn->_handle;
             c->handler = handler;
+            conn->_handle = nullptr;  // transfer OS handle; Socket shell freed here
+            delete conn;
             list<string> connArgs;
             c->run(connArgs);
             conns.add(c);
