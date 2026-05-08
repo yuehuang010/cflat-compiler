@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lsp_client import LspClient, find_exe, initialize, wait_diagnostics_for
 
 REPO_ROOT = Path(__file__).parent.parent.parent
-FIXTURE_DIR = REPO_ROOT / "cflat" / "Test" / "lsp" / "fixtures"
+FIXTURE_DIR = REPO_ROOT / "cflat" / "test_lsp" / "fixtures"
 
 # Virtual URI prefix — server analyzes via temp files internally, so these
 # paths don't need to exist on disk.
