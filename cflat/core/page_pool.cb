@@ -1,0 +1,158 @@
+// page_pool.cb — process-global pool of 64 KB pages for slab/arena backing.
+//
+// One singleton instance, `g_page_pool`. Multi-threaded acquire/release.
+//
+// Backing: each page comes from `vmem_alloc(64K)` (own VirtualAlloc reserve+commit;
+// no upfront giant reservation). Released pages are zeroed and pushed onto a
+// lock-free Treiber stack for reuse. When the stack exceeds `_CAP` pages, further
+// releases bypass the cache and `vmem_free` immediately. Cleanup at shutdown
+// drains the stack.
+//
+// Cap = 256 pages = 16 MB cached. This bounds working-set memory at the price of
+// occasional vmem round-trips during release bursts; the exact decay algorithm
+// can be revisited later (time-decay, hysteresis, etc.).
+//
+// Pointer invariant: callers must release pages of exactly `_PAGE_SIZE` bytes
+// originally returned by `acquire()`. Mixing in foreign pointers will corrupt
+// the free stack.
+//
+// Free-list link: each free page stores its successor pointer in the first 8
+// bytes (intrusive). Acquire pops the page, then clears those 8 bytes so the
+// caller sees a fully-zeroed 64 KB region.
+
+import "vmem.cb";
+import "cruntime.cb";
+import "atomic.cb";
+
+// Free pages chain through their first 8 bytes; cast to this struct to access.
+struct _PP_Link { void* _next = nullptr; };
+
+class page_pool
+{
+    // Tagged-pointer Treiber stack head: tag[63:47] | page_ptr[46:0].
+    // Tag increments on every push/pop; 17 bits prevents ABA within any
+    // realistic scheduling window. Windows x64 user pointers fit in 47 bits.
+    i64 _top = 0;
+
+    // Pad to a separate cache line so producer/consumer don't false-share with _depth.
+    i64 _p0 = 0; i64 _p1 = 0; i64 _p2 = 0; i64 _p3 = 0;
+    i64 _p4 = 0; i64 _p5 = 0; i64 _p6 = 0;
+
+    // Approximate count of pages currently in the free stack.
+    // Used only to gate the soft cap; not relied on for correctness.
+    i64 _depth = 0;
+
+    // ── tagged pointer helpers ────────────────────────────────────────────────
+
+    i64 _encode(i64 ptr, i64 tag)
+    {
+        return ((tag & (i64)0x1FFFF) << 47) | (ptr & (i64)0x00007FFFFFFFFFFF);
+    }
+
+    i64 _raw_ptr(i64 top)
+    {
+        return top & (i64)0x00007FFFFFFFFFFF;
+    }
+
+    i64 _raw_tag(i64 top)
+    {
+        return (top >> 47) & (i64)0x1FFFF;
+    }
+
+    // ── public API ────────────────────────────────────────────────────────────
+
+    // Acquire a 64 KB page. Thread-safe.
+    // Returned page is fully zeroed.
+    void* acquire()
+    {
+        i64 old = __atomic_i64_load(&_top);
+        while (true)
+        {
+            i64 ptr = _raw_ptr(old);
+            if (ptr == (i64)0) break;
+
+            void* page = (void*)ptr;
+            // _next link is stored in the first 8 bytes of the free page.
+            _PP_Link* head = (_PP_Link*)page;
+            void* next = head->_next;
+
+            i64 new_tag = (_raw_tag(old) + (i64)1) & (i64)0x1FFFF;
+            i64 new_top = _encode((i64)next, new_tag);
+            if (__atomic_i64_cas(&_top, old, new_top))
+            {
+                __atomic_counter_decrement(&_depth);
+                // Clear the link slot so the page is fully zeroed for the caller.
+                head->_next = nullptr;
+                return page;
+            }
+            old = __atomic_i64_load(&_top);
+        }
+
+        // Free stack empty — allocate a fresh page direct from vmem.
+        // vmem_alloc returns zeroed memory.
+        return vmem_alloc((i64)65536);
+    }
+
+    // Release a 64 KB page. Thread-safe.
+    // Page is zeroed before being pushed; over-cap releases immediately vmem_free.
+    void release(void* page)
+    {
+        if (page == nullptr) return;
+
+        // Soft-cap check: approximate read of depth, may slip a few over under
+        // contention but bounds the cache to roughly _CAP pages.
+        i64 depth = __atomic_counter_read(&_depth);
+        if (depth >= (i64)256)
+        {
+            vmem_free(page);
+            return;
+        }
+
+        // Zero the entire page before recycling.
+        memset(page, 0, (i64)65536);
+
+        // Push onto Treiber stack: store the current head into page[0..7], CAS _top = page.
+        _PP_Link* link = (_PP_Link*)page;
+        i64 old = __atomic_i64_load(&_top);
+        while (true)
+        {
+            i64 old_ptr = _raw_ptr(old);
+            link->_next = (void*)old_ptr;
+
+            i64 new_tag = (_raw_tag(old) + (i64)1) & (i64)0x1FFFF;
+            i64 new_top = _encode((i64)page, new_tag);
+            if (__atomic_i64_cas(&_top, old, new_top))
+            {
+                __atomic_counter_increment(&_depth);
+                return;
+            }
+            old = __atomic_i64_load(&_top);
+        }
+    }
+
+    // Drain the free stack and vmem_free every cached page.
+    // Call at process shutdown after all producers/consumers have stopped.
+    void cleanup()
+    {
+        i64 raw = __atomic_i64_load(&_top);
+        __atomic_i64_store(&_top, (i64)0);
+        __atomic_i64_store(&_depth, (i64)0);
+
+        void* page = (void*)_raw_ptr(raw);
+        while (page != nullptr)
+        {
+            _PP_Link* link = (_PP_Link*)page;
+            void* next = link->_next;
+            vmem_free(page);
+            page = next;
+        }
+    }
+
+    // ── stats / diagnostics ───────────────────────────────────────────────────
+
+    i64 cachedPages() { return __atomic_counter_read(&_depth); }
+    i64 cachedBytes() { return cachedPages() * (i64)65536; }
+};
+
+// Process-global singleton. All slabs and arena chunks draw from this pool.
+page_pool g_page_pool = default;

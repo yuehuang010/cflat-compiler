@@ -1,0 +1,352 @@
+import "vmem.cb";
+import "page_pool.cb";
+
+// bucket_allocator.cb — segregated free-list allocator backed by g_page_pool.
+//
+// Eight size classes (8, 16, 32, 64, 128, 256, 512, 1024 bytes). Each class
+// holds a linked list of 64 KB pages from g_page_pool, subdivided into fixed-
+// size blocks. A free block stores the next-free pointer in its first 8 bytes
+// (intrusive LIFO list).
+//
+// Page header (first 32 bytes of every page) carries a magic + size class so
+// dealloc can identify the page from the user pointer:
+//
+//   _BA_PAGE_MAGIC = 0xBA63E001
+//   page_addr      = ptr & ~0xFFFF
+//   header.magic   == 0xBA63E001 → owned by some BucketAllocator
+//   header.class   ∈ [0, 7]      → push block onto _buckets[class]._free
+//
+// Pointers that don't carry our magic fall through to _freeLarge (large-alloc
+// linked list, then HeapValidate-guarded CRT free for foreign pointers).
+//
+// Requests > 1024 bytes go directly to vmem_alloc (large-alloc path), tracked
+// in _largeHead so cleanup can vmem_free them.
+//
+// NOTE: pages stay with the bucket until cleanup() — empty-page release back
+// to the pool is a follow-up optimization.
+//
+// Usage:
+//   BucketAllocator ba;
+//   void* p = ba.alloc(48);    // returns a 64-byte block from class 3
+//   ba.dealloc(p);
+//   ba.cleanup();
+
+
+// Page header at offset 0 of every bucket-owned 64 KB page.
+struct _BA_PageHdr
+{
+    u32 _magic     = 0;        // 0xBA63E001 when owned by a BucketAllocator
+    i32 _class     = 0;        // size class index 0..7
+    i8* _next_page = nullptr;  // next page in this bucket's _page list
+    i8* _pad0      = nullptr;  // pad to 32 bytes for cache alignment
+    i8* _pad1      = nullptr;
+};
+
+// Intrusive free-block link — overlays the first 8 bytes of any free block.
+struct _BA_FreeBlock { i8* _next = nullptr; };
+
+// Per-size-class state held inline inside BucketAllocator.
+struct _BA_Bucket
+{
+    i8* _free       = nullptr;  // intrusive LIFO of free blocks (across all pages)
+    i8* _page       = nullptr;  // head of this class's page list (intrusive)
+    i64 _block_size = 0;
+    i64 _alloc_count = 0;       // live user allocations
+};
+
+// Header prepended to every large-alloc vmem_alloc region.
+struct _BA_LargeHdr
+{
+    i64 _userSize   = 0;
+    i64 _regionSize = 0;
+    i8* _next       = nullptr;
+};
+
+class BucketAllocator : IAllocator
+{
+    _BA_Bucket _buckets[8] = default;
+
+    i8* _largeHead   = nullptr;
+    i64 _largeBytes  = 0;
+    i64 _largeCount  = 0;
+    bool _initialized = false;
+
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    void _init()
+    {
+        int i = 0;
+        while (i < 8) { _buckets[i]._block_size = _blockSizeFor(i); i = i + 1; }
+        _initialized = true;
+    }
+
+    i64 _blockSizeFor(int cls)
+    {
+        if (cls == 0) return (i64)8;
+        if (cls == 1) return (i64)16;
+        if (cls == 2) return (i64)32;
+        if (cls == 3) return (i64)64;
+        if (cls == 4) return (i64)128;
+        if (cls == 5) return (i64)256;
+        if (cls == 6) return (i64)512;
+        return (i64)1024;
+    }
+
+    int _classFor(i64 size)
+    {
+        if (size <= (i64)8)    return 0;
+        if (size <= (i64)16)   return 1;
+        if (size <= (i64)32)   return 2;
+        if (size <= (i64)64)   return 3;
+        if (size <= (i64)128)  return 4;
+        if (size <= (i64)256)  return 5;
+        if (size <= (i64)512)  return 6;
+        if (size <= (i64)1024) return 7;
+        return -1;
+    }
+
+    // First block offset within a page — past the header, aligned to block size.
+    i64 _dataOffsetFor(i64 blockSize)
+    {
+        i64 hdrSize = (i64)sizeof(_BA_PageHdr);
+        // Round hdrSize up to a multiple of blockSize.
+        return ((hdrSize + blockSize - (i64)1) / blockSize) * blockSize;
+    }
+
+    // -----------------------------------------------------------------------
+    // Page management
+    // -----------------------------------------------------------------------
+
+    // Acquire a fresh 64 KB page from g_page_pool, install it as a bucket page,
+    // and push every block onto _free.
+    void _addPage(int cls)
+    {
+        i8* page = (i8*)g_page_pool.acquire();
+        if (page == nullptr) return;
+
+        _BA_PageHdr* hdr = (_BA_PageHdr*)page;
+        hdr->_magic     = (u32)0xBA63E001;
+        hdr->_class     = (i32)cls;
+        hdr->_next_page = _buckets[cls]._page;
+        _buckets[cls]._page = page;
+
+        i64 blockSize  = _buckets[cls]._block_size;
+        i64 dataOff    = _dataOffsetFor(blockSize);
+        i64 blockCount = ((i64)65536 - dataOff) / blockSize;
+
+        // Push in reverse so the lowest block address ends up on top → returned first.
+        i64 k = blockCount - (i64)1;
+        while (k >= (i64)0)
+        {
+            i8* block = page + dataOff + k * blockSize;
+            _BA_FreeBlock* fb = (_BA_FreeBlock*)block;
+            fb->_next = _buckets[cls]._free;
+            _buckets[cls]._free = block;
+            k = k - (i64)1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-allocation path (> 1024 bytes)
+    // -----------------------------------------------------------------------
+
+    void* _allocLarge(i64 size)
+    {
+        i64 hdrSize = (i64)sizeof(_BA_LargeHdr);
+        i64 gran    = (i64)0x10000;  // 64K allocation granularity
+        i64 total   = (hdrSize + size + gran - (i64)1) / gran * gran;
+
+        i8* base = (i8*)vmem_alloc(total);
+        if (base == nullptr) return nullptr;
+
+        _BA_LargeHdr* hdr = (_BA_LargeHdr*)base;
+        hdr->_userSize   = size;
+        hdr->_regionSize = total;
+        hdr->_next       = _largeHead;
+        _largeHead       = base;
+        _largeBytes      = _largeBytes + size;
+        _largeCount      = _largeCount + 1;
+
+        return (void*)(base + hdrSize);
+    }
+
+    // Search the large-alloc list to find and free ptr; fall back to CRT free
+    // (HeapValidate-guarded) only if ptr is on the CRT heap.
+    void _freeLarge(void* ptr)
+    {
+        i64 hdrSize = (i64)sizeof(_BA_LargeHdr);
+        i8* base    = (i8*)ptr - hdrSize;
+
+        i8* prev = nullptr;
+        i8* cur  = _largeHead;
+        while (cur != nullptr)
+        {
+            _BA_LargeHdr* ch = (_BA_LargeHdr*)cur;
+            if (cur == base)
+            {
+                _largeBytes = _largeBytes - ch->_userSize;
+                _largeCount = _largeCount - 1;
+                if (prev == nullptr)
+                    _largeHead = ch->_next;
+                else
+                {
+                    _BA_LargeHdr* ph = (_BA_LargeHdr*)prev;
+                    ph->_next = ch->_next;
+                }
+                vmem_free((void*)base);
+                return;
+            }
+            prev = cur;
+            cur  = ch->_next;
+        }
+
+        // Foreign pointer — only free if it's on the CRT heap. HeapValidate
+        // guards against vmem-backed blocks from other allocators that would
+        // corrupt the CRT heap.
+        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+            free(ptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // IAllocator
+    // -----------------------------------------------------------------------
+
+    void* alloc(i64 size)
+    {
+        if (size <= (i64)0) return nullptr;
+        if (!_initialized) _init();
+
+        int cls = _classFor(size);
+        if (cls < 0) return _allocLarge(size);
+
+        if (_buckets[cls]._free == nullptr) _addPage(cls);
+        if (_buckets[cls]._free == nullptr) return nullptr;
+
+        i8* block = _buckets[cls]._free;
+        _BA_FreeBlock* fb = (_BA_FreeBlock*)block;
+        _buckets[cls]._free        = fb->_next;
+        _buckets[cls]._alloc_count = _buckets[cls]._alloc_count + (i64)1;
+        return (void*)block;
+    }
+
+    void dealloc(void* ptr)
+    {
+        if (ptr == nullptr) return;
+
+        // Page-aligned address of the candidate header (64K alignment).
+        i64 page_addr = ((i64)ptr) & ~(i64)0xFFFF;
+        if (page_addr == (i64)0) { _freeLarge(ptr); return; }
+
+        _BA_PageHdr* hdr = (_BA_PageHdr*)page_addr;
+        if (hdr->_magic != (u32)0xBA63E001) { _freeLarge(ptr); return; }
+
+        int cls = (int)hdr->_class;
+        if (cls < 0 || cls >= 8) { _freeLarge(ptr); return; }
+
+        i8* block = (i8*)ptr;
+        _BA_FreeBlock* fb = (_BA_FreeBlock*)block;
+        fb->_next = _buckets[cls]._free;
+        _buckets[cls]._free        = block;
+        _buckets[cls]._alloc_count = _buckets[cls]._alloc_count - (i64)1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats / diagnostics
+    // -----------------------------------------------------------------------
+
+    i64 usedBytes()
+    {
+        if (!_initialized) return (i64)0;
+        i64 total = _largeBytes;
+        int i = 0;
+        while (i < 8)
+        {
+            total = total + _buckets[i]._alloc_count * _buckets[i]._block_size;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    i64 totalBytes() { return (i64)0; }
+
+    i64 committedBytes()
+    {
+        // Approximate: each owned page is 64 KB.
+        if (!_initialized) return (i64)0;
+        i64 total = (i64)0;
+        int i = 0;
+        while (i < 8)
+        {
+            i8* p = _buckets[i]._page;
+            while (p != nullptr)
+            {
+                total = total + (i64)65536;
+                _BA_PageHdr* hdr = (_BA_PageHdr*)p;
+                p = hdr->_next_page;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+
+    void printUsage()
+    {
+        if (!_initialized) { printf("BucketAllocator: not initialized\n"); return; }
+        printf("BucketAllocator (page-pool backed):\n");
+        int i = 0;
+        while (i < 8)
+        {
+            i64 pageCount = (i64)0;
+            i8* p = _buckets[i]._page;
+            while (p != nullptr) { pageCount = pageCount + (i64)1; _BA_PageHdr* hdr = (_BA_PageHdr*)p; p = hdr->_next_page; }
+            printf("  bucket[%d] block=%4lld  pages=%lld  live=%lld\n",
+                i, _buckets[i]._block_size, pageCount, _buckets[i]._alloc_count);
+            i = i + 1;
+        }
+        printf("  large: count=%lld  bytes=%lld\n", _largeCount, _largeBytes);
+        printf("  total: used=%lld\n", usedBytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+
+    void cleanup()
+    {
+        // Return every bucket page to the global pool.
+        int i = 0;
+        while (i < 8)
+        {
+            i8* p = _buckets[i]._page;
+            while (p != nullptr)
+            {
+                _BA_PageHdr* hdr = (_BA_PageHdr*)p;
+                i8* next = hdr->_next_page;
+                g_page_pool.release((void*)p);
+                p = next;
+            }
+            _buckets[i]._free        = nullptr;
+            _buckets[i]._page        = nullptr;
+            _buckets[i]._alloc_count = (i64)0;
+            i = i + 1;
+        }
+
+        // Vmem-free every large allocation.
+        i8* cur = _largeHead;
+        while (cur != nullptr)
+        {
+            _BA_LargeHdr* h = (_BA_LargeHdr*)cur;
+            i8* next = h->_next;
+            vmem_free((void*)cur);
+            cur = next;
+        }
+        _largeHead   = nullptr;
+        _largeBytes  = (i64)0;
+        _largeCount  = (i64)0;
+        _initialized = false;
+    }
+
+    ~BucketAllocator() { cleanup(); }
+};

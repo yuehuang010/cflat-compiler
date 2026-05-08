@@ -55,7 +55,8 @@
     <None Include="core\tuple.cb" />
     <None Include="core\time.cb" />
     <None Include="core\random.cb" />
-    <None Include="core\slab_allocator.cb" />
+    <None Include="core\bucket_allocator.cb" />
+    <None Include="core\page_pool.cb" />
     <None Include="core\fit_allocator.cb" />
     <None Include="core\mutex.cb" />
     <None Include="core\atomic.cb" />

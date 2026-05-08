@@ -14,7 +14,7 @@ import "interfaces.cb";
 import "time.cb";
 import "malloc_allocator.cb";
 import "block_allocator.cb";
-import "slab_allocator.cb";
+import "bucket_allocator.cb";
 import "fit_allocator.cb";
 import "perf_framework.cb";
 
@@ -82,7 +82,7 @@ extern int main()
 
     WorkUnit ps;
     ps.workItems  = M;
-    ps._allocator = new SlabAllocator;
+    ps._allocator = new BucketAllocator;
     Stopwatch sws;
     sws.start();
     k = 0;
@@ -93,8 +93,8 @@ extern int main()
         k++;
     }
     sws.stop();
-    PerfPrint("SlabAllocator", (i64)K, (i64)sws.elapsed().microseconds());
-    PerfCheckLeak("SlabAllocator", ps._allocator.usedBytes());
+    PerfPrint("BucketAllocator", (i64)K, (i64)sws.elapsed().microseconds());
+    PerfCheckLeak("BucketAllocator", ps._allocator.usedBytes());
 
     WorkUnit pf;
     pf.workItems  = M;

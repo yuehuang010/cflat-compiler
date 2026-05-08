@@ -1,4 +1,4 @@
-import "slab_allocator.cb";
+import "bucket_allocator.cb";
 
 // =============================================================
 // Basic alloc/dealloc
@@ -6,27 +6,27 @@ import "slab_allocator.cb";
 
 bool testBasic()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    void* p1 = sa.alloc(64);
+    void* p1 = ba.alloc(64);
     if (p1 == nullptr) return false;
 
-    void* p2 = sa.alloc(64);
+    void* p2 = ba.alloc(64);
     if (p2 == nullptr) return false;
     if (p1 == p2)      return false;
 
-    if (sa.usedBytes() != 128) return false;
+    if (ba.usedBytes() != 128) return false;
 
-    sa.dealloc(p1);
-    if (sa.usedBytes() != 64) return false;
+    ba.dealloc(p1);
+    if (ba.usedBytes() != 64) return false;
 
     // LIFO: next alloc should reuse p1
-    void* p3 = sa.alloc(64);
+    void* p3 = ba.alloc(64);
     if (p3 != p1) return false;
 
-    sa.dealloc(p3);
-    sa.dealloc(p2);
-    if (sa.usedBytes() != 0) return false;
+    ba.dealloc(p3);
+    ba.dealloc(p2);
+    if (ba.usedBytes() != 0) return false;
 
     return true;
 }
@@ -37,16 +37,16 @@ bool testBasic()
 
 bool testSizeClasses()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    void* p8    = sa.alloc(8);
-    void* p16   = sa.alloc(16);
-    void* p32   = sa.alloc(32);
-    void* p64   = sa.alloc(64);
-    void* p128  = sa.alloc(128);
-    void* p256  = sa.alloc(256);
-    void* p512  = sa.alloc(512);
-    void* p1024 = sa.alloc(1024);
+    void* p8    = ba.alloc(8);
+    void* p16   = ba.alloc(16);
+    void* p32   = ba.alloc(32);
+    void* p64   = ba.alloc(64);
+    void* p128  = ba.alloc(128);
+    void* p256  = ba.alloc(256);
+    void* p512  = ba.alloc(512);
+    void* p1024 = ba.alloc(1024);
 
     if (p8    == nullptr) return false;
     if (p16   == nullptr) return false;
@@ -67,17 +67,17 @@ bool testSizeClasses()
     if (p512 == p1024) return false;
 
     i64 expected = 8 + 16 + 32 + 64 + 128 + 256 + 512 + 1024;
-    if (sa.usedBytes() != expected) return false;
+    if (ba.usedBytes() != expected) return false;
 
-    sa.dealloc(p8);
-    sa.dealloc(p16);
-    sa.dealloc(p32);
-    sa.dealloc(p64);
-    sa.dealloc(p128);
-    sa.dealloc(p256);
-    sa.dealloc(p512);
-    sa.dealloc(p1024);
-    if (sa.usedBytes() != 0) return false;
+    ba.dealloc(p8);
+    ba.dealloc(p16);
+    ba.dealloc(p32);
+    ba.dealloc(p64);
+    ba.dealloc(p128);
+    ba.dealloc(p256);
+    ba.dealloc(p512);
+    ba.dealloc(p1024);
+    if (ba.usedBytes() != 0) return false;
 
     return true;
 }
@@ -88,11 +88,11 @@ bool testSizeClasses()
 
 bool testLargeAlloc()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    void* p = sa.alloc(4096);
+    void* p = ba.alloc(4096);
     if (p == nullptr) return false;
-    if (sa.usedBytes() != 4096) return false;
+    if (ba.usedBytes() != 4096) return false;
 
     // write and read back
     i32* arr = (i32*)p;
@@ -103,8 +103,8 @@ bool testLargeAlloc()
     if (arr[1] != 222) return false;
     if (arr[2] != 333) return false;
 
-    sa.dealloc(p);
-    if (sa.usedBytes() != 0) return false;
+    ba.dealloc(p);
+    if (ba.usedBytes() != 0) return false;
 
     return true;
 }
@@ -115,22 +115,22 @@ bool testLargeAlloc()
 
 bool testMultipleLargeAllocs()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    void* a = sa.alloc(2048);
-    void* b = sa.alloc(8192);
-    void* c = sa.alloc(65536);
+    void* a = ba.alloc(2048);
+    void* b = ba.alloc(8192);
+    void* c = ba.alloc(65536);
     if (a == nullptr) return false;
     if (b == nullptr) return false;
     if (c == nullptr) return false;
-    if (sa.usedBytes() != 2048 + 8192 + 65536) return false;
+    if (ba.usedBytes() != 2048 + 8192 + 65536) return false;
 
-    sa.dealloc(b);  // free middle
-    if (sa.usedBytes() != 2048 + 65536) return false;
+    ba.dealloc(b);  // free middle
+    if (ba.usedBytes() != 2048 + 65536) return false;
 
-    sa.dealloc(a);
-    sa.dealloc(c);
-    if (sa.usedBytes() != 0) return false;
+    ba.dealloc(a);
+    ba.dealloc(c);
+    if (ba.usedBytes() != 0) return false;
 
     return true;
 }
@@ -141,19 +141,19 @@ bool testMultipleLargeAllocs()
 
 bool testPageCommit()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
     // 64-byte blocks fit 64 per page. Allocate 65 to force a second page commit.
     int N = 65;
     int i = 0;
     while (i < N)
     {
-        void* p = sa.alloc(64);
+        void* p = ba.alloc(64);
         if (p == nullptr) return false;
         i = i + 1;
     }
-    if (sa.committedBytes() < (i64)2 * 4096) return false;
-    if (sa.usedBytes() != (i64)N * 64) return false;
+    if (ba.committedBytes() < (i64)2 * 4096) return false;
+    if (ba.usedBytes() != (i64)N * 64) return false;
 
     return true;
 }
@@ -164,9 +164,9 @@ bool testPageCommit()
 
 bool testWriteRead()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    i32* nums = (i32*)sa.alloc(32);
+    i32* nums = (i32*)ba.alloc(32);
     if (nums == nullptr) return false;
     nums[0] = 10; nums[1] = 20; nums[2] = 30; nums[3] = 40;
     if (nums[0] != 10) return false;
@@ -174,7 +174,7 @@ bool testWriteRead()
     if (nums[2] != 30) return false;
     if (nums[3] != 40) return false;
 
-    sa.dealloc((void*)nums);
+    ba.dealloc((void*)nums);
     return true;
 }
 
@@ -184,12 +184,12 @@ bool testWriteRead()
 
 bool testEdgeCases()
 {
-    SlabAllocator sa;
+    BucketAllocator ba;
 
-    void* p = sa.alloc(0);
+    void* p = ba.alloc(0);
     if (p != nullptr) return false;
 
-    sa.dealloc(nullptr);  // must not crash
+    ba.dealloc(nullptr);  // must not crash
 
     return true;
 }
@@ -200,11 +200,11 @@ bool testEdgeCases()
 
 bool testPrintUsage()
 {
-    SlabAllocator sa;
-    sa.alloc(8);
-    sa.alloc(1024);
-    sa.alloc(2048);
-    sa.printUsage();
+    BucketAllocator ba;
+    ba.alloc(8);
+    ba.alloc(1024);
+    ba.alloc(2048);
+    ba.printUsage();
     return true;
 }
 

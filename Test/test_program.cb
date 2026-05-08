@@ -22,7 +22,7 @@ program Counter {
         int* heap = new int;
         *heap = startFrom + args.count();
         int result = *heap;
-        // heap is freed by SlabAllocator on run() exit
+        // heap is freed by BucketAllocator on run() exit
         return result;
     }
 };

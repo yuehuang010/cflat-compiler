@@ -8989,8 +8989,8 @@ public:
 
         // Resolve types — all must be concrete by this point (ProcessPendingInstantiations ran)
         auto* progType        = compiler->dataStructures[name].StructType;
-        auto* defAllocType    = compiler->dataStructures.count("MallocAllocator")
-                                ? compiler->dataStructures["MallocAllocator"].StructType : nullptr;
+        auto* defAllocType    = compiler->dataStructures.count("BucketAllocator")
+                                ? compiler->dataStructures["BucketAllocator"].StructType : nullptr;
         auto* listStringType  = compiler->dataStructures.count("list__string")
                                 ? compiler->dataStructures["list__string"].StructType : nullptr;
         auto* threadType      = compiler->dataStructures.count("Thread")
@@ -9000,7 +9000,7 @@ public:
         if (!progType || !defAllocType || !listStringType || !threadType)
         {
             compiler->LogError(std::format(
-                "program '{}': missing required type (MallocAllocator={}, list__string={}, Thread={})",
+                "program '{}': missing required type (BucketAllocator={}, list__string={}, Thread={})",
                 name,
                 defAllocType  ? "ok" : "missing",
                 listStringType ? "ok" : "missing",
@@ -9022,7 +9022,7 @@ public:
         // Look up helper functions
         auto* mallocFn         = compiler->GetFunction("malloc");
         auto* freeFn           = compiler->GetFunction("free");
-        auto* defAllocCtorFn   = compiler->GetFunction("MallocAllocator");
+        auto* defAllocCtorFn   = compiler->GetFunction("BucketAllocator");
         auto* threadCtorFn     = compiler->GetFunction("Thread");
         auto* threadStartFn    = FindMethodOf("start", "Thread");
         auto* threadJoinFn     = FindMethodOf("join", "Thread");
@@ -9153,9 +9153,7 @@ public:
             auto* useBlock     = llvm::BasicBlock::Create(*compiler->context, "alloc_use",     trampolineFn);
             compiler->builder->CreateCondBr(isNull, defaultBlock, useBlock);
 
-            // Default path: create a MallocAllocator on the heap and build its IAllocator fat-ptr.
-            // MallocAllocator wraps CRT malloc/free, which is thread-safe and handles cross-thread
-            // ownership correctly (objects allocated by one thread can be freed by another).
+            // Default path: create a BucketAllocator on the heap and build its IAllocator fat-ptr.
             compiler->builder->SetInsertPoint(defaultBlock);
             auto* defAllocSize = compiler->GetTypeSizeBytes(defAllocType);
             auto* defAllocRaw  = compiler->builder->CreateCall(
@@ -9164,7 +9162,7 @@ public:
             auto* defAllocInit = compiler->builder->CreateCall(
                 defAllocCtorFn->getFunctionType(), defAllocCtorFn, {}, "def_alloc_init");
             compiler->builder->CreateStore(defAllocInit, defAllocPtr);
-            auto* defVtable    = compiler->GetOrCreateVTable("MallocAllocator", "IAllocator");
+            auto* defVtable    = compiler->GetOrCreateVTable("BucketAllocator", "IAllocator");
             auto* defFatPtr    = compiler->BuildInterfaceFatValue(defVtable, defAllocPtr);
             compiler->builder->CreateStore(defFatPtr, allocFieldGEP);
             compiler->builder->CreateBr(useBlock);
@@ -10693,9 +10691,11 @@ public:
         bool hasF = suffix.find('f') != std::string::npos;
         bool hasD = suffix.find('d') != std::string::npos;
 
+        // For hex literals, 'e'/'E' are valid hex digits, not exponent markers.
+        // Only treat e/E as a float indicator for decimal/non-hex numbers.
         bool looksFloat = (numberPart.find('.') != std::string::npos) ||
-            (numberPart.find('e') != std::string::npos) ||
-            (numberPart.find('E') != std::string::npos);
+            (!isHex && numberPart.find('e') != std::string::npos) ||
+            (!isHex && numberPart.find('E') != std::string::npos);
 
         // Floating point handling
         if (hasF || hasD || looksFloat)
@@ -10752,6 +10752,9 @@ public:
         {
             if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
                 return static_cast<int>(uval);
+            // u suffix on hex/value fitting in u32: reinterpret bits as i32 (same bit pattern).
+            if (uval <= 0xFFFFFFFFull)
+                return static_cast<int>(static_cast<uint32_t>(uval));
             return static_cast<int64_t>(uval);
         }
 
@@ -10761,6 +10764,11 @@ public:
             return static_cast<short>(uval);
         if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
             return static_cast<int>(uval);
+        // C++ rule: hex literals that exceed i32 positive range but fit in u32 are typed as
+        // unsigned int. Since ConstantVariant has no uint32_t, reinterpret bits as i32.
+        // This preserves the bit pattern: 0xBA63E001 → i32(-1168474111) with correct bits.
+        if (isHex && uval <= 0xFFFFFFFFull)
+            return static_cast<int>(static_cast<uint32_t>(uval));
         return static_cast<int64_t>(uval);
     }
 

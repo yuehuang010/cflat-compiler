@@ -1,8 +1,8 @@
-// arena_channel.cb — combined slab-backed allocator + zero-copy MPMC channel.
+// arena_channel.cb — combined bucket-backed allocator + zero-copy MPMC channel.
 //
 // Three main types:
 //
-//   block_pool    — program thread allocator (IAllocator) backed by SlabAllocator.
+//   block_pool    — program thread allocator (IAllocator) backed by BucketAllocator.
 //                   Also spawns transferable page_arena units via acquire_arena().
 //
 //   page_arena    — self-contained bump-allocation region (IAllocator).
@@ -34,17 +34,17 @@
 import "interfaces.cb";
 import "channel.cb";
 import "atomic.cb";
-import "slab_allocator.cb";
+import "bucket_allocator.cb";
 import "page_arena.cb";
 
 // ── block_pool ────────────────────────────────────────────────────────────────
-// Program thread allocator. Normal alloc/dealloc delegates to the embedded slab.
-// acquire_arena() spawns a page_arena drawing chunks from the same slab.
+// Program thread allocator. Normal alloc/dealloc delegates to the embedded bucket.
+// acquire_arena() spawns a page_arena drawing chunks from the same bucket.
 // Maintains a lock-free Treiber stack of recycled page_arena* for fast reuse.
 
 class block_pool
 {
-    SlabAllocator _slab      = default;
+    BucketAllocator _bucket    = default;
 
     // ── cache line: free-list head ────────────────────────────────────────────
     // _top packs: tag[63:47] | page_arena_ptr[46:0]  (one i64, CAS target)
@@ -109,13 +109,13 @@ class block_pool
         }
     }
 
-    // ── IAllocator — day-to-day allocation, delegates to slab ─────────────────
+    // ── IAllocator — day-to-day allocation, delegates to bucket ───────────────
 
-    void* alloc(i64 size)    { return _slab.alloc(size); }
-    void  dealloc(void* ptr) { _slab.dealloc(ptr); }
-    void  cleanup()          { _slab.cleanup(); }
-    i64   usedBytes()        { return _slab.usedBytes(); }
-    i64   totalBytes()       { return _slab.committedBytes(); }
+    void* alloc(i64 size)    { return _bucket.alloc(size); }
+    void  dealloc(void* ptr) { _bucket.dealloc(ptr); }
+    void  cleanup()          { _bucket.cleanup(); }
+    i64   usedBytes()        { return _bucket.usedBytes(); }
+    i64   totalBytes()       { return _bucket.committedBytes(); }
 
     // ── Arena lifecycle ───────────────────────────────────────────────────────
 

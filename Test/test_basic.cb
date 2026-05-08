@@ -544,6 +544,16 @@ bool testExplicitIntTypes()
     int x = 10;
     result &= Test("int_to_i32_param", sumI32(x, 5), 15);
 
+    // Hex literals with high bit set (contain hex digit 'E' — must not be parsed as float)
+    // C++ rule: hex literals that exceed i32 positive range type as unsigned int (same 32-bit pattern).
+    u32 magic = 0xBA63E001;             // contains 'E' — previously mistaken as float exponent
+    u32 magic2 = (u32)0xBA63E001;
+    result &= Test("hex_high_bit_direct", magic,  (u32)0xBA63E001);
+    result &= Test("hex_high_bit_cast",   magic2, (u32)0xBA63E001);
+    result &= Test("hex_with_E_digit",    (u32)0xDEADBEEF, (u32)0xDEADBEEF);
+    result &= Test("hex_all_ones",        (u32)0xFFFFFFFF, (u32)0xFFFFFFFF);
+    result &= Test("hex_int_min",         (u32)0x80000000, (u32)0x80000000);
+
     return result;
 }
 

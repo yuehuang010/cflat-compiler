@@ -1,0 +1,79 @@
+// Stepping stone for arena_channel + program integration.
+//
+// Scenario A: main is the producer, a program worker is the consumer.
+// arena_channel is a global (g_ac) — arena_channel can't yet be embedded
+// as a program field (LLVM "unsized type" assertion during program
+// constructor codegen; revisit later).
+//
+// Allocator paths exercised here:
+//   - main thread (no _active_allocator) → page_arena headers via malloc;
+//     chunks via raw malloc in _newChunk
+//   - worker thread (slab via program._allocator) → only recv/release_arena,
+//     which never allocate (release_arena just pushes onto the Treiber stack)
+//   - main calls g_ac.destroy() → frees page_arena headers via free()
+//
+// Since main owns both the alloc and free side here, no cross-allocator
+// path is hit. This validates basic integration end-to-end.
+
+import "arena_channel.cb";
+
+struct Payload
+{
+    int _value = 0;
+};
+
+arena_channel g_ac = default;
+
+program ArenaConsumer
+{
+    int total = 0;
+
+    int main(move list<string> args)
+    {
+        while (true)
+        {
+            page_arena* pa = g_ac.recv();
+            if (pa == nullptr) break;
+
+            Payload* msg = (Payload*)pa->_root;
+            total = total + msg->_value;
+            g_ac.release_arena(pa);
+        }
+        return total;
+    }
+};
+
+extern int main()
+{
+    g_ac.init(128, (i64)65536);
+
+    ArenaConsumer w;
+    list<string> args;
+    w.run(args);
+
+    int i = 0;
+    while (i < 100)
+    {
+        page_arena* pa = g_ac.acquire_arena();
+
+        Payload* msg = (Payload*)pa->alloc((i64)sizeof(Payload));
+        pa->_root    = (void*)msg;
+        msg->_value  = i + 1;
+
+        g_ac.send(pa);
+        i = i + 1;
+    }
+    g_ac.send(nullptr);   // sentinel: tell worker to exit
+
+    w.WaitForExit();
+    g_ac.destroy();
+
+    int expected = 5050;   // 1 + 2 + ... + 100
+    if (w.exitCode == expected)
+    {
+        printf("PASS: arena_program test\n");
+        return 0;
+    }
+    printf("FAIL: expected %d got %d\n", expected, w.exitCode);
+    return 1;
+}

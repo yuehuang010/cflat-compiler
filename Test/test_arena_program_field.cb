@@ -1,0 +1,67 @@
+// arena_channel as an embedded program field.
+//
+// Builds on test_arena_program.cb. There the arena_channel was a global
+// (g_ac) workaround. Here it lives as a field on the program struct, which
+// is the natural mailbox pattern.
+
+import "arena_channel.cb";
+
+struct Payload
+{
+    int _value = 0;
+};
+
+program ArenaConsumer
+{
+    arena_channel ac = default;
+    int total = 0;
+
+    int main(move list<string> args)
+    {
+        while (true)
+        {
+            page_arena* pa = ac.recv();
+            if (pa == nullptr) break;
+
+            Payload* msg = (Payload*)pa->_root;
+            total = total + msg->_value;
+            ac.release_arena(pa);
+        }
+        return total;
+    }
+};
+
+extern int main()
+{
+    ArenaConsumer w;
+    w.ac.init(128, (i64)65536);
+
+    list<string> args;
+    w.run(args);
+
+    int i = 0;
+    while (i < 100)
+    {
+        page_arena* pa = w.ac.acquire_arena();
+
+        Payload* msg = (Payload*)pa->alloc((i64)sizeof(Payload));
+        pa->_root    = (void*)msg;
+        msg->_value  = i + 1;
+
+        w.ac.send(pa);
+        i = i + 1;
+    }
+    w.ac.send(nullptr);   // sentinel: tell worker to exit
+
+    w.WaitForExit();
+    w.ac.destroy();
+
+    int expected = 5050;
+    if (w.exitCode == expected)
+    {
+        printf("PASS: arena_program_field test\n");
+        return 0;
+    }
+    printf("FAIL: expected %d got %d\n", expected, w.exitCode);
+    return 1;
+}

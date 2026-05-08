@@ -8,8 +8,14 @@
 // Ownership is unique: exactly one thread holds a page_arena at a time.
 // dealloc() and cleanup() are no-ops; use arena_channel.release_arena() to
 // recycle the arena back to the shared pool.
+//
+// Chunks come from the process-global g_page_pool when they fit in one 64 KB
+// page; oversize requests fall back to vmem_alloc rounded to 64 KB granularity.
+// free_chunks() dispatches based on chunk size: page-sized chunks return to
+// the pool, oversize chunks vmem_free directly.
 
 import "cruntime.cb";
+import "page_pool.cb";
 
 // ── _pa_chunk ─────────────────────────────────────────────────────────────────
 // Header at the front of each malloc'd block. Data begins after the header
@@ -39,13 +45,25 @@ struct page_arena
     {
         i64 headerSz = (i64)sizeof(_pa_chunk);
         i64 need     = ((headerSz + minSize + (i64)7) / (i64)8) * (i64)8;
-        i64 sz       = _chunkSize;
-        if (need > sz) sz = need;
-        _pa_chunk* c = (_pa_chunk*)malloc(sz);
-        c->_next     = _head;
-        c->_size     = sz;
-        c->_used     = 0;
-        _head        = c;
+
+        _pa_chunk* c = nullptr;
+        i64 sz       = (i64)65536;
+        if (need <= sz)
+        {
+            // Standard 64 KB page from the process-global pool.
+            c = (_pa_chunk*)g_page_pool.acquire();
+        }
+        else
+        {
+            // Oversize chunk — vmem_alloc directly, rounded up to 64 KB granularity.
+            sz = ((need + (i64)65535) / (i64)65536) * (i64)65536;
+            c  = (_pa_chunk*)vmem_alloc(sz);
+        }
+
+        c->_next = _head;
+        c->_size = sz;
+        c->_used = 0;
+        _head    = c;
     }
 
     void* alloc(i64 size)
@@ -95,14 +113,18 @@ struct page_arena
         _id   = 0;
     }
 
-    // Free all chunk memory back to malloc. Called before the object is freed.
+    // Return all chunks: page-sized chunks go back to g_page_pool; oversize
+    // chunks vmem_free directly. Called before the page_arena object is freed.
     void free_chunks()
     {
         _pa_chunk* c = _head;
         while (c != nullptr)
         {
             _pa_chunk* next = c->_next;
-            free((void*)c);
+            if (c->_size == (i64)65536)
+                g_page_pool.release((void*)c);
+            else
+                vmem_free((void*)c);
             c = next;
         }
         _head = nullptr;

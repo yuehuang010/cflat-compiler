@@ -6,10 +6,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
 
-## Plan
-
-Provide an Architecture overview before analyzing code changes.
-
 ## Git
 Do not commit to git.  Stash is allowed.  
 
@@ -26,7 +22,7 @@ Do not commit to git.  Stash is allowed.
 
 ## Building
 
-Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
+Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core/*.cb libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
 msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
@@ -109,7 +105,7 @@ x64/Debug/cflat.exe Test/test_operators.cb -i Test/library -o out/test_operators
 out\test_operators.exe
 ```
 
-Current tests (all in `Test/`, all CFlat with `-i Test\library`): `test_allocators`, `test_basic`, `test_core`, `test_core_string`, `test_field_init`, `test_filesystem`, `test_fit_allocator`, `test_function_ptr`, `test_generics`, `test_interface`, `test_json`, `test_library_string`, `test_math`, `test_module`, `test_move`, `test_operators`, `test_program`, `test_random`, `test_reflect`, `test_sizeof`, `test_slab_allocator`, `test_sync`, `test_time`. (`test_helper.cb` is a shared helper, not run directly.)
+Current tests (all in `Test/`, all CFlat with `-i Test\library`): `test_allocators`, `test_basic`, `test_core`, `test_core_string`, `test_field_init`, `test_filesystem`, `test_fit_allocator`, `test_function_ptr`, `test_generics`, `test_interface`, `test_json`, `test_library_string`, `test_math`, `test_module`, `test_move`, `test_operators`, `test_program`, `test_random`, `test_reflect`, `test_sizeof`, `test_bucket_allocator`, `test_page_pool`, `test_sync`, `test_time`. (`test_helper.cb` is a shared helper, not run directly.)
 
 test.bat uses wildard `Test/*.*` to locate tests.  Remember to remove debug test or else it would be picked up by the wildcard expansion.
 
@@ -294,7 +290,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `block_allocator.cb` | Block-based pooled allocator (used by `program` thread startup) |
 | `malloc_allocator.cb` | Thin wrapper around system malloc/free |
 | `fit_allocator.cb` | Fit allocation strategy |
-| `slab_allocator.cb` | Slab allocator for fixed-size objects |
+| `bucket_allocator.cb` | Segregated free-list allocator (size-class buckets) |
 | `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
 | `cruntime.cb` | Raw C runtime bindings (printf, memcpy, etc.) |
 

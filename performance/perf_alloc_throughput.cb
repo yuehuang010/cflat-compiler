@@ -14,7 +14,7 @@ import "interfaces.cb";
 import "time.cb";
 import "malloc_allocator.cb";
 import "block_allocator.cb";
-import "slab_allocator.cb";
+import "bucket_allocator.cb";
 import "fit_allocator.cb";
 import "perf_framework.cb";
 
@@ -65,11 +65,11 @@ extern int main()
 
     BenchThroughput bs;
     bs.iters = N;
-    bs._allocator = new SlabAllocator;
+    bs._allocator = new BucketAllocator;
     bs.run(emptyArgs);
     bs.WaitForExit();
-    PerfPrint("SlabAllocator", (i64)N, bs.measuredUs);
-    PerfCheckLeak("SlabAllocator", bs._allocator.usedBytes());
+    PerfPrint("BucketAllocator", (i64)N, bs.measuredUs);
+    PerfCheckLeak("BucketAllocator", bs._allocator.usedBytes());
 
     BenchThroughput bf;
     bf.iters = N;
