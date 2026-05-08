@@ -132,23 +132,23 @@ struct string_view
 };
 
 // Return a view of the entire string, bonded to the source.
-string_view* view(bond string* self)
+string_view* view(bond string* this)
 {
     string_view* sv = new string_view;
-    sv->_ptr = self->_ptr;
-    sv->_len = self->_len;
+    sv->_ptr = this->_ptr;
+    sv->_len = this->_len;
     return sv;
 }
 
 // Return a view of bytes [start, end), bonded to the source.  Indices are clamped.
-string_view* span(bond string* self, i32 start, i32 end)
+string_view* span(bond string* this, i32 start, i32 end)
 {
-    i32 len = self->_len;
+    i32 len = this->_len;
     if (start < 0) start = 0;
     if (end > len) end = len;
     if (start > end) start = end;
     string_view* sv = new string_view;
-    sv->_ptr = self->_ptr + start;
+    sv->_ptr = this->_ptr + start;
     sv->_len = end - start;
     return sv;
 }
