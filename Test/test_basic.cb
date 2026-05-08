@@ -1658,6 +1658,59 @@ bool testFixedArrays()
     return result;
 }
 
+// =============================================================
+// Regression: Bug 1 — cast result chained with -> member access
+// CFlat previously required a named variable to hold the cast
+// result before accessing a field (e.g. ((Struct*)ptr)->field).
+// =============================================================
+
+struct CastMemberPoint { int x = 0; int y = 0; };
+
+bool testCastMemberAccess()
+{
+    bool result = true;
+
+    CastMemberPoint pt = CastMemberPoint();
+    pt.x = 7;
+    pt.y = 13;
+
+    void* vp = (void*)&pt;
+
+    // Direct cast-then-arrow without a named intermediate
+    int x = ((CastMemberPoint*)vp)->x;
+    result &= Test("cast->field x", x, 7);
+
+    // Outer cast applied to a cast->arrow expression
+    int y = (int)((CastMemberPoint*)vp)->y;
+    result &= Test("(int)(cast->field y)", y, 13);
+
+    return result;
+}
+
+// =============================================================
+// Regression: Bug 2 — returning int from a bool function
+// The compiler previously emitted ret i32 inside an i1 function,
+// which fails LLVM module verification. The fix emits ICmpNE to
+// convert any nonzero int to true (matching bool assignment semantics).
+// =============================================================
+
+int intTwo() { return 2; }
+
+bool boolFromIntReturn()
+{
+    return intTwo();
+}
+
+bool testReturnBoolFromInt()
+{
+    bool result = true;
+
+    // intTwo() returns 2; value 2 truncated to i1 is 0 (wrong), ICmpNE gives 1 (right).
+    result &= Test("bool from int=2", (int)boolFromIntReturn(), 1);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1726,6 +1779,8 @@ extern int main()
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
     total++; passed += testVariadic()                    ? 1 : 0;
     total++; passed += testFixedArrays()                 ? 1 : 0;
+    total++; passed += testCastMemberAccess()            ? 1 : 0;
+    total++; passed += testReturnBoolFromInt()           ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

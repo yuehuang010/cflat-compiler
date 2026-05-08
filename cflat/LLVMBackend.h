@@ -450,6 +450,11 @@ public:
         exit(1);
     }
 
+    void LogWarning(std::string message) const
+    {
+        std::cout << std::format("{}({},{}): warning: {}\n", sourceFileName, currentLine, currentColumn, message);
+    }
+
     friend class MainListener;
     friend class ForwardRefScanner;
 
@@ -4980,6 +4985,13 @@ public:
                 }
             }
             value = Upconvert(value, retTy);
+            // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).
+            // Warn: CFlat requires explicit narrowing — write "return expr != 0;" instead.
+            if (retTy == builder->getInt1Ty() && value->getType()->isIntegerTy() && value->getType() != retTy)
+            {
+                LogWarning("implicit int-to-bool conversion on return — use '!= 0' to make narrowing explicit");
+                value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
+            }
             builder->CreateRet(value);
         }
     }

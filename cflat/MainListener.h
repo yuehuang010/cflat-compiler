@@ -816,6 +816,11 @@ private:
     LLVMBackend::TypeAndValue lambdaExpectedType;
     LLVMBackend::TypeAndValue lastLambdaType;
 
+    // Side-channel from ParsePrimaryExpression to ParsePostfixExpression:
+    // carries the cast TypeAndValue when the primary is a parenthesized cast expression,
+    // enabling ((Struct*)ptr)->field member access without a named intermediate variable.
+    LLVMBackend::TypeAndValue lastParenExprType;
+
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
 
@@ -6045,6 +6050,11 @@ public:
                         {
                             namedVar.Primary = ParsePrimaryExpression(prevPrimary);
                             namedVar.Storage = nullptr;
+                            // If the primary is a parenthesized cast expression, propagate its type
+                            // so that chained member access (e.g. ((Struct*)ptr)->field) works.
+                            if (prevPrimary->expression() != nullptr && !lastParenExprType.TypeName.empty())
+                                namedVar.TypeAndValue = lastParenExprType;
+                            lastParenExprType = {};
                         }
 
                         // If the primary was a lambda, propagate its function-pointer type.
@@ -8106,7 +8116,12 @@ public:
         }
         else if (expressionCtx != nullptr)
         {
-            return ParseExpression(expressionCtx);
+            // Use ParseAssignmentExpressionNamed to preserve TypeAndValue (e.g. cast type)
+            // for ((Struct*)ptr)->field member-access chains that follow this primary.
+            auto nv = ParseAssignmentExpressionNamed(expressionCtx->assignmentExpression());
+            ProcessPlusPlus();
+            lastParenExprType = nv.TypeAndValue;
+            return LoadNamedVariable(nv);
         }
         else if (stringLiteral.size() > 0)
         {
