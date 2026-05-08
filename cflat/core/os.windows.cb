@@ -83,6 +83,8 @@ extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
 extern stdcall void     GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
 extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
 extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
+extern stdcall void*    GetProcessHeap();
+extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
 
 // Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
 if const (__PLATFORM__ == 32) {

@@ -196,8 +196,9 @@ class SlabAllocator : IAllocator
     }
 
     // Scan the large-alloc list to find and free ptr.
-    // Falls back to CRT free() for foreign (non-slab, non-large) pointers —
-    // e.g. args allocated in the caller's thread before this allocator was set up.
+    // Falls back to CRT free() only if ptr is confirmed to be a CRT-heap allocation.
+    // Slab blocks allocated by a different SlabAllocator (e.g. from another thread) must
+    // NOT be passed to CRT free() — they are vmem-backed and not on the CRT heap.
     void _freeLarge(void* ptr)
     {
         i64 hdrSize = (i64)sizeof(_SA_LargeHdr);
@@ -225,8 +226,12 @@ class SlabAllocator : IAllocator
             prev = cur;
             cur  = ch->_next;
         }
-        // Not one of our large allocs — must be a foreign (CRT-heap) allocation.
-        free(ptr);
+        // Not in our large-alloc list. Only call free() if ptr is actually on the CRT heap.
+        // HeapValidate guards against calling free() on vmem-backed slab blocks from a
+        // different allocator instance (e.g. an object allocated by another thread's SlabAllocator
+        // and freed here), which would corrupt the CRT heap.
+        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+            free(ptr);
     }
 
     // -----------------------------------------------------------------------
