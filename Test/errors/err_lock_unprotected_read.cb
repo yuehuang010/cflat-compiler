@@ -1,0 +1,17 @@
+// Accessing a guarded field without holding the required lock.
+
+import "mutex.cb";
+
+struct Counter {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+    }
+};
+
+expect_error("Field 'value' is guarded by 'mtx'") {
+    void test() {
+        Counter c;
+        int v = c.value;
+    }
+}

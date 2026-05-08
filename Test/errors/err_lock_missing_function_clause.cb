@@ -1,0 +1,17 @@
+// Accessing a guarded field outside any lock — error expected.
+
+import "mutex.cb";
+
+struct Account {
+    mutex mtx = default;
+    lock(mtx) {
+        int balance = default;
+    }
+};
+
+expect_error("Field 'balance' is guarded by 'mtx'") {
+    void test() {
+        Account a;
+        int v = a.balance;
+    }
+}

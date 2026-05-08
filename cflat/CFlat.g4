@@ -478,7 +478,15 @@ statement
     ;
 
 lockStatement
-    : 'lock' '(' expression ')' compoundStatement
+    : lockClause compoundStatement
+    ;
+
+lockClause
+    : 'lock' '(' lockArgList ')'
+    ;
+
+lockArgList
+    : expression (',' expression)*
     ;
 
 labeledStatement
@@ -612,16 +620,20 @@ namespaceDefinition
     ;
 
 functionDefinition
-    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' whereClause? compoundStatement
+    : declarationSpecifiers? (directDeclarator | operatorFunctionId) genericTypeParameters? '(' parameterTypeList? ')' whereClause? lockClause? compoundStatement
     ;
 
 structDefinition
-    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
-    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
+    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
     ;
 
 classDefinition
-    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition)* '}' ';'
+    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    ;
+
+lockFieldGroup
+    : lockClause '{' declaration+ '}'
     ;
 
 programDefinition

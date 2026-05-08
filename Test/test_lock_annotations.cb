@@ -1,0 +1,58 @@
+// Positive tests for lock-set analysis.
+// Verifies that guarded fields can be accessed when the lock is held.
+
+import "mutex.cb";
+import "rwlock.cb";
+
+struct Counter {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+    }
+};
+
+struct RwData {
+    rwlock rw = default;
+    lock(rw) {
+        int data = default;
+    }
+};
+
+// Function with lock clause — caller must hold a.mtx.
+void increment(Counter* a, int n) lock(a.mtx) {
+    a.value = a.value + n;
+}
+
+extern int main() {
+    Counter c;
+
+    // Access guarded field inside lock statement.
+    lock(c.mtx) {
+        c.value = 42;
+        int v = c.value;
+        printf("c.value = %d\n", v);
+    }
+
+    // Function clause: hold the lock before calling.
+    lock(c.mtx) {
+        increment(&c, 10);
+    }
+
+    // Multiple locks acquired together.
+    Counter c2;
+    lock(c.mtx, c2.mtx) {
+        c.value = c.value + c2.value;
+    }
+
+    RwData rd;
+    lock(rd.rw) {
+        rd.data = 100;
+    }
+    lock(rd.rw) {
+        int v = rd.data;
+        printf("rd.data = %d\n", v);
+    }
+
+    printf("All lock annotation tests passed.\n");
+    return 0;
+}

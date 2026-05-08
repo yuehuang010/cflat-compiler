@@ -126,6 +126,9 @@ public:
 
         uint64_t ConstArraySize = 0; // non-zero for C-style fixed arrays: char buf[N] in struct fields
 
+        // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
+        std::string GuardedBy;
+
         bool IsPrimitive() const
         {
             return IsInteger() != -1 || IsUnsignedInteger() != -1 || IsFloatingPoint() != -1
@@ -385,6 +388,7 @@ public:
         bool Variadic = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) — caller must free
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
+        std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
     };
 
     struct InterfaceMethod
@@ -3495,6 +3499,14 @@ public:
 
             symList.push_back(funcSym);
         }
+    }
+
+    // Set RequiredLocks on the most-recently registered overload of functionName.
+    void SetFunctionRequiredLocks(const std::string& functionName, std::vector<std::string> locks)
+    {
+        auto it = functionTable.find(functionName);
+        if (it != functionTable.end() && !it->second.empty())
+            it->second.back().RequiredLocks = std::move(locks);
     }
 
     // Returns the C-compatible LLVM type: for IsFunctionPointer, bare fn ptr (not fat struct).
