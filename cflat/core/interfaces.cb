@@ -60,6 +60,7 @@ interface IAllocator
     void  cleanup();
     i64   usedBytes();
     i64   totalBytes();
+    i64   peakReserve();
 };
 
 interface IQueue<T>

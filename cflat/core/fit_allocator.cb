@@ -60,14 +60,16 @@ struct _FA_Segment
 
 class FitAllocator : IAllocator
 {
-    _FA_Segment*   _segments   = nullptr;
-    _FA_FreeBlock* _freeHead   = nullptr;
-    i8*            _largeHead  = nullptr;
-    i64            _segSize    = 0;
-    i64            _pageSize   = 0;
-    i64            _usedBytes  = 0;   // live slab bytes
-    i64            _largeBytes = 0;   // live large bytes
-    i64            _largeCount = 0;
+    _FA_Segment*   _segments      = nullptr;
+    _FA_FreeBlock* _freeHead      = nullptr;
+    i8*            _largeHead     = nullptr;
+    i64            _segSize       = 0;
+    i64            _pageSize      = 0;
+    i64            _usedBytes     = 0;   // live slab bytes
+    i64            _largeBytes    = 0;   // live large bytes
+    i64            _largeCount    = 0;
+    i64            _reservedNow   = 0;
+    i64            _peakReserved  = 0;
 
     i64 _hdrSize()        { return (i64)sizeof(_FA_Header); }
     i64 _freeHdrSize()    { return (i64)sizeof(_FA_FreeBlock); }
@@ -99,6 +101,8 @@ class FitAllocator : IAllocator
 
         i8* base = (i8*)vmem_alloc(aligned);
         seg->_base = base;
+        _reservedNow = _reservedNow + aligned;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
 
         // Entire segment is one free block.
         i64 userSpace = aligned - _hdrSize();
@@ -212,8 +216,10 @@ class FitAllocator : IAllocator
         _FA_Header* hdr = (_FA_Header*)(base + pfxSize);
         hdr->_size = -size;  // negative → large allocation
 
-        _largeBytes = _largeBytes + size;
-        _largeCount = _largeCount + 1;
+        _largeBytes  = _largeBytes + size;
+        _largeCount  = _largeCount + 1;
+        _reservedNow = _reservedNow + total;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
 
         return (void*)(base + pfxSize + hdrSize);
     }
@@ -251,6 +257,7 @@ class FitAllocator : IAllocator
             prev = cur;
             cur  = cp->_next;
         }
+        _reservedNow = _reservedNow - pfx->_totalSize;
         vmem_free((void*)base);
     }
 
@@ -328,8 +335,9 @@ class FitAllocator : IAllocator
     // Stats / diagnostics
     // -----------------------------------------------------------------------
 
-    i64 usedBytes()  { return _usedBytes + _largeBytes; }
-    i64 totalBytes() { return (i64)0; }
+    i64 usedBytes()   { return _usedBytes + _largeBytes; }
+    i64 totalBytes()  { return (i64)0; }
+    i64 peakReserve() { return _peakReserved; }
 
     i64 freeBytes()
     {
@@ -376,10 +384,11 @@ class FitAllocator : IAllocator
             vmem_free((void*)cur);
             cur = next;
         }
-        _largeHead  = nullptr;
-        _largeBytes = 0;
-        _largeCount = 0;
-        _usedBytes  = 0;
+        _largeHead   = nullptr;
+        _largeBytes  = 0;
+        _largeCount  = 0;
+        _usedBytes   = 0;
+        _reservedNow = 0;
     }
 
     ~FitAllocator() { cleanup(); }

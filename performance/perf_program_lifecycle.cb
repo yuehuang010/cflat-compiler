@@ -3,7 +3,7 @@
 // Runs the same program K=100 times sequentially.  Each run spawns a thread,
 // installs the allocator, performs M=1000 small allocs, and joins.  The outer
 // Stopwatch measures total wall-clock time including all thread and allocator
-// setup/teardown.  BlockAllocator is included because sizeof(int)=4 bytes fits.
+// setup/teardown.
 //
 // The allocator is created once (directly into _allocator) and reused across
 // all K runs; _allocator is preserved between run()+WaitForExit() calls.
@@ -16,6 +16,7 @@ import "malloc_allocator.cb";
 import "block_allocator.cb";
 import "bucket_allocator.cb";
 import "fit_allocator.cb";
+import "entry_allocator.cb";
 import "perf_framework.cb";
 
 program WorkUnit
@@ -62,7 +63,7 @@ extern int main()
         k++;
     }
     swm.stop();
-    PerfPrint("MallocAllocator", (i64)K, (i64)swm.elapsed().microseconds());
+    PerfPrint("MallocAllocator", (i64)K, (i64)swm.elapsed().microseconds(), pm._allocator.peakReserve());
 
     WorkUnit pb;
     pb.workItems  = M;
@@ -77,7 +78,7 @@ extern int main()
         k++;
     }
     swb.stop();
-    PerfPrint("BlockAllocator", (i64)K, (i64)swb.elapsed().microseconds());
+    PerfPrint("BlockAllocator", (i64)K, (i64)swb.elapsed().microseconds(), pb._allocator.peakReserve());
     PerfCheckLeak("BlockAllocator", pb._allocator.usedBytes());
 
     WorkUnit ps;
@@ -93,7 +94,7 @@ extern int main()
         k++;
     }
     sws.stop();
-    PerfPrint("BucketAllocator", (i64)K, (i64)sws.elapsed().microseconds());
+    PerfPrint("BucketAllocator", (i64)K, (i64)sws.elapsed().microseconds(), ps._allocator.peakReserve());
     PerfCheckLeak("BucketAllocator", ps._allocator.usedBytes());
 
     WorkUnit pf;
@@ -109,8 +110,24 @@ extern int main()
         k++;
     }
     swf.stop();
-    PerfPrint("FitAllocator", (i64)K, (i64)swf.elapsed().microseconds());
+    PerfPrint("FitAllocator", (i64)K, (i64)swf.elapsed().microseconds(), pf._allocator.peakReserve());
     PerfCheckLeak("FitAllocator", pf._allocator.usedBytes());
+
+    WorkUnit pe;
+    pe.workItems  = M;
+    pe._allocator = new EntryAllocator;
+    Stopwatch swe;
+    swe.start();
+    k = 0;
+    while (k < K)
+    {
+        pe.run(emptyArgs);
+        pe.WaitForExit();
+        k++;
+    }
+    swe.stop();
+    PerfPrint("EntryAllocator", (i64)K, (i64)swe.elapsed().microseconds(), pe._allocator.peakReserve());
+    PerfCheckLeak("EntryAllocator", pe._allocator.usedBytes());
 
     return 0;
 }

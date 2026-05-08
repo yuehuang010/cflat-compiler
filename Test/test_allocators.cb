@@ -1,5 +1,6 @@
 import "arena.cb";
 import "block_allocator.cb";
+import "entry_allocator.cb";
 
 // =============================================================
 // Arena bump allocator tests
@@ -120,12 +121,157 @@ bool testBlockAllocator()
     return true;
 }
 
+// =============================================================
+// EntryAllocator tests
+// =============================================================
+
+bool testEntryAllocatorBasic()
+{
+    EntryAllocator ea;
+
+    if (ea.alloc(0) != nullptr) return false;  // zero-size → null
+    ea.dealloc(nullptr);                        // no-op — must not crash
+
+    void* p1 = ea.alloc(4);
+    if (p1 == nullptr) return false;
+    if (ea.usedBytes() != 4) return false;
+
+    void* p2 = ea.alloc(4);
+    if (p2 == nullptr) return false;
+    if (p1 == p2) return false;
+    if (ea.usedBytes() != 8) return false;
+
+    ea.dealloc(p1);
+    if (ea.usedBytes() != 4) return false;
+
+    ea.dealloc(p2);
+    if (ea.usedBytes() != 0) return false;
+
+    return true;
+}
+
+bool testEntryAllocatorWriteRead()
+{
+    EntryAllocator ea;
+
+    i32* arr = (i32*)ea.alloc(16);
+    if (arr == nullptr) return false;
+    arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+    if (arr[0] != 10) return false;
+    if (arr[1] != 20) return false;
+    if (arr[2] != 30) return false;
+    if (arr[3] != 40) return false;
+
+    ea.dealloc((void*)arr);
+    return true;
+}
+
+bool testEntryAllocatorLargeAlloc()
+{
+    EntryAllocator ea;
+
+    // 131072 bytes exceeds the page data area (~61 KB), so it falls through
+    // to system malloc.  usedBytes() does not track large allocs.
+    void* p = ea.alloc(131072);
+    if (p == nullptr) return false;
+
+    i32* arr = (i32*)p;
+    arr[0] = 111; arr[1] = 222; arr[2] = 333;
+    if (arr[0] != 111) return false;
+    if (arr[1] != 222) return false;
+    if (arr[2] != 333) return false;
+
+    ea.dealloc(p);
+    if (ea.usedBytes() != 0) return false;
+
+    return true;
+}
+
+bool testEntryAllocatorEntryTableFull()
+{
+    EntryAllocator ea;
+
+    // Each leaf holds up to 1024 entry-table slots.  1025 simultaneous live
+    // allocs must spill onto a second vmem page.  Pointers are not stored —
+    // the destructor reclaims all vmem pages on scope exit.
+    int i = 0;
+    while (i < 1025)
+    {
+        void* p = ea.alloc(4);
+        if (p == nullptr) return false;
+        i = i + 1;
+    }
+    if (ea.usedBytes() != (i64)1025 * 4) return false;
+    // Windows allocation granularity is 65536, so two pages = at least 131072.
+    if (ea.totalBytes() < (i64)131072) return false;
+
+    return true;
+}
+
+bool testEntryAllocatorGarbageCollect()
+{
+    EntryAllocator ea;
+
+    void* p = ea.alloc(4);
+    if (p == nullptr) return false;
+
+    // GC on a single page is a no-op (current page is always kept).
+    ea.garbageCollect();
+    if (ea.usedBytes() != 4) return false;
+
+    ea.dealloc(p);
+    ea.garbageCollect();
+    if (ea.usedBytes() != 0) return false;
+    // Current page is kept even when empty — at least one page remains.
+    if (ea.totalBytes() < (i64)65536) return false;
+
+    return true;
+}
+
+bool testEntryAllocatorPeakReserve()
+{
+    EntryAllocator ea;
+
+    void* p1 = ea.alloc(64);
+    i64 peak1 = ea.peakReserve();
+    if (peak1 <= 0) return false;
+
+    void* p2 = ea.alloc(64);
+    i64 peak2 = ea.peakReserve();
+    if (peak2 < peak1) return false;
+
+    ea.dealloc(p1);
+    ea.dealloc(p2);
+    // Dealloc must not reduce peakReserve.
+    if (ea.peakReserve() != peak2) return false;
+    // Peak must be >= current committed bytes.
+    if (ea.peakReserve() < ea.totalBytes()) return false;
+
+    return true;
+}
+
+bool testEntryAllocatorPrintUsage()
+{
+    EntryAllocator ea;
+    ea.alloc(64);
+    ea.alloc(131072);  // one in-page, one large-alloc fallback
+    ea.printUsage();
+    return true;
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
-    total++; passed += testArena()          ? 1 : 0;
-    total++; passed += testBlockAllocator() ? 1 : 0;
+    total++; passed += testArena()                      ? 1 : 0;
+    total++; passed += testBlockAllocator()             ? 1 : 0;
+    total++; passed += testEntryAllocatorBasic()        ? 1 : 0;
+    total++; passed += testEntryAllocatorWriteRead()    ? 1 : 0;
+    total++; passed += testEntryAllocatorLargeAlloc()   ? 1 : 0;
+    total++; passed += testEntryAllocatorEntryTableFull() ? 1 : 0;
+    total++; passed += testEntryAllocatorGarbageCollect() ? 1 : 0;
+    total++; passed += testEntryAllocatorPeakReserve()  ? 1 : 0;
+    total++; passed += testEntryAllocatorPrintUsage()   ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

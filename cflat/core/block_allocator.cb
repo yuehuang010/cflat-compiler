@@ -36,6 +36,8 @@ class BlockAllocator : IAllocator
     int         _pageCapacity = 0;
     i64         _pageSize     = 0;   // 0 until first allocation; filled from GetSystemInfo
     i64         _blockSize    = 64;  // overridden at init from L3 cache line; 64 is the fallback
+    i64         _reservedNow  = 0;
+    i64         _peakReserved = 0;
 
     void _init()
     {
@@ -98,7 +100,9 @@ class BlockAllocator : IAllocator
         _pages[_pageCount]._data       = data;
         _pages[_pageCount]._blockCount = blockCount;
         _pages[_pageCount]._usedCount  = 0;
-        _pageCount = _pageCount + 1;
+        _pageCount    = _pageCount + 1;
+        _reservedNow  = _reservedNow + _pageSize;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
     }
 
     // Returns a pointer to a free block, or nullptr if size exceeds blockSize.
@@ -173,8 +177,9 @@ class BlockAllocator : IAllocator
         return total;
     }
 
-    i64 usedBytes()  { return usedBlocks() * _blockSize; }
-    i64 totalBytes() { return (i64)0; }
+    i64 usedBytes()    { return usedBlocks() * _blockSize; }
+    i64 totalBytes()   { return (i64)0; }
+    i64 peakReserve()  { return _peakReserved; }
 
     // Total block capacity across all pages.
     i64 totalBlocks()
@@ -213,6 +218,7 @@ class BlockAllocator : IAllocator
         _pageCount    = 0;
         _pageCapacity = 0;
         _pageSize     = 0;
+        _reservedNow  = 0;
     }
 
     ~BlockAllocator()

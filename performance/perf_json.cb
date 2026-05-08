@@ -276,22 +276,22 @@ extern int main()
     printf("\n");
 
     PerfHeader("JSON Write — toJson (N=50000)");
-    PerfPrint("tiny   (  4 fields)", (i64)N, bench_write_tiny(N));
-    PerfPrint("small  ( 12 fields)", (i64)N, bench_write_small(N));
-    PerfPrint("medium ( 50 fields)", (i64)N, bench_write_medium(N));
-    PerfPrint("large  (150 fields)", (i64)N, bench_write_large(N));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_write_tiny(N), (i64)0);
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_write_small(N), (i64)0);
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_write_medium(N), (i64)0);
+    PerfPrint("large  (150 fields)", (i64)N, bench_write_large(N), (i64)0);
 
     PerfHeader("JSON Read — fromJson (N=50000)");
-    PerfPrint("tiny   (  4 fields)", (i64)N, bench_read_tiny(N, tinyJson));
-    PerfPrint("small  ( 12 fields)", (i64)N, bench_read_small(N, smallJson));
-    PerfPrint("medium ( 50 fields)", (i64)N, bench_read_medium(N, medJson));
-    PerfPrint("large  (150 fields)", (i64)N, bench_read_large(N, largeJson));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_read_tiny(N, tinyJson), (i64)0);
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_read_small(N, smallJson), (i64)0);
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_read_medium(N, medJson), (i64)0);
+    PerfPrint("large  (150 fields)", (i64)N, bench_read_large(N, largeJson), (i64)0);
 
     PerfHeader("JSON Roundtrip — fromJson + toJson (N=50000)");
-    PerfPrint("tiny   (  4 fields)", (i64)N, bench_rt_tiny(N, tinyJson));
-    PerfPrint("small  ( 12 fields)", (i64)N, bench_rt_small(N, smallJson));
-    PerfPrint("medium ( 50 fields)", (i64)N, bench_rt_medium(N, medJson));
-    PerfPrint("large  (150 fields)", (i64)N, bench_rt_large(N, largeJson));
+    PerfPrint("tiny   (  4 fields)", (i64)N, bench_rt_tiny(N, tinyJson), (i64)0);
+    PerfPrint("small  ( 12 fields)", (i64)N, bench_rt_small(N, smallJson), (i64)0);
+    PerfPrint("medium ( 50 fields)", (i64)N, bench_rt_medium(N, medJson), (i64)0);
+    PerfPrint("large  (150 fields)", (i64)N, bench_rt_large(N, largeJson), (i64)0);
 
     printf("\n");
     return 0;

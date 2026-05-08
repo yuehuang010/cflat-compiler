@@ -1,0 +1,288 @@
+import "vmem.cb";
+
+// entry_allocator.cb — variable-size bump-pointer allocator with per-page entry tables.
+//
+// Port of BlockAllocator.h (C++).  Each OS page (vmem_alloc'd,
+// MEM_RESERVE|MEM_COMMIT) begins with an _EntryLeaf header that tracks up to
+// 1024 live allocations via parallel offset/size arrays (u16 each).
+//
+// Page layout:
+//   [_EntryLeaf header (~4 KB)] [bump-pointer data area]
+//
+// New allocations advance _freeOffset.  free() locates the entry by a linear
+// scan, subtracts its size from _totalUsage, and left-shifts the remaining
+// entries to keep the array compact.
+//
+// Sizes that exceed (pageSize - sizeof(_EntryLeaf)) fall through to the
+// system allocator (malloc / free).
+//
+// Usage:
+//   EntryAllocator ea;
+//   void* p = ea.alloc(64);
+//   ea.dealloc(p);
+//   ea.garbageCollect();   // optional: reclaim empty pages
+//   ea.cleanup();          // required: release all vmem pages
+
+// Header placed at byte 0 of every vmem page.
+// Data begins at offset sizeof(_EntryLeaf) within the same page.
+struct _EntryLeaf
+{
+    u32 _reservedSize       = 0;
+    u32 _freeOffset         = 0;
+    u32 _totalUsage         = 0;
+    u32 _lastEntryPos       = 0;
+    u16 _entryOffset[1024]  = default;
+    u16 _entrySize[1024]    = default;
+};
+
+// Per-slot in the allocator's page array.
+struct _EAPageSlot { i8* _data = nullptr; };
+
+class EntryAllocator : IAllocator
+{
+    i8*          _currentPage  = nullptr;
+    _EAPageSlot* _pages        = nullptr;
+    int          _pageCount    = 0;
+    int          _pageCapacity = 0;
+    i64          _pageSize     = 0;
+    i64          _pageMask     = 0;
+    i64          _reservedNow  = 0;
+    i64          _peakReserved = 0;
+
+    // -----------------------------------------------------------------------
+    // Init / page management
+    // -----------------------------------------------------------------------
+
+    void _initPageSize()
+    {
+        _SystemInfo* si = (_SystemInfo*)malloc((i64)sizeof(_SystemInfo));
+        GetSystemInfo(si);
+        _pageSize = (i64)si->_allocGranularity;
+        free((void*)si);
+        _pageMask = ~(_pageSize - (i64)1);
+    }
+
+    void _growPageArray()
+    {
+        int newCap = _pageCapacity == 0 ? 4 : _pageCapacity * 2;
+        _EAPageSlot* np = (_EAPageSlot*)malloc((i64)newCap * (i64)sizeof(_EAPageSlot));
+        int i = 0;
+        while (i < _pageCount) { np[i] = _pages[i]; i = i + 1; }
+        if (_pages != nullptr) free((void*)_pages);
+        _pages        = np;
+        _pageCapacity = newCap;
+    }
+
+    i8* _newPage()
+    {
+        i8* data = (i8*)vmem_alloc(_pageSize);
+        if (data == nullptr) return nullptr;
+
+        // vmem_alloc returns zeroed memory, so entry arrays are already 0.
+        _EntryLeaf* leaf    = (_EntryLeaf*)data;
+        leaf->_reservedSize = (u32)_pageSize;
+        leaf->_freeOffset   = (u32)sizeof(_EntryLeaf);  // data starts after header
+        leaf->_totalUsage   = 0;
+        leaf->_lastEntryPos = 0;
+
+        if (_pageCount == _pageCapacity) _growPageArray();
+        _pages[_pageCount]._data = data;
+        _pageCount   = _pageCount + 1;
+        _reservedNow = _reservedNow + _pageSize;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
+        return data;
+    }
+
+    // -----------------------------------------------------------------------
+    // Leaf-level alloc / free
+    // -----------------------------------------------------------------------
+
+    // Try to bump-allocate `size` bytes from leaf.  Returns nullptr on failure.
+    i8* _leafTryAlloc(_EntryLeaf* leaf, u16 size)
+    {
+        if ((u32)leaf->_freeOffset + (u32)size > leaf->_reservedSize) return nullptr;
+        if (leaf->_lastEntryPos >= (u32)1024) return nullptr;
+
+        u16 idx                  = (u16)leaf->_lastEntryPos;
+        leaf->_entryOffset[idx]  = (u16)leaf->_freeOffset;
+        leaf->_entrySize[idx]    = size;
+        leaf->_freeOffset        = leaf->_freeOffset + (u32)size;
+        leaf->_totalUsage        = leaf->_totalUsage + (u32)size;
+        leaf->_lastEntryPos      = leaf->_lastEntryPos + (u32)1;
+        return (i8*)leaf + (i64)leaf->_entryOffset[idx];
+    }
+
+    // Mark the block at ptr as free.  Left-shifts remaining entries.
+    void _leafFree(_EntryLeaf* leaf, i8* ptr)
+    {
+        u16 offset = (u16)((i64)ptr - (i64)leaf);
+
+        int found = -1;
+        int i     = 0;
+        while (i < (int)leaf->_lastEntryPos)
+        {
+            if (leaf->_entryOffset[i] == offset) { found = i; break; }
+            i = i + 1;
+        }
+        if (found < 0) return;
+
+        leaf->_totalUsage = leaf->_totalUsage - (u32)leaf->_entrySize[found];
+
+        int j = found;
+        while (j < (int)leaf->_lastEntryPos - 1)
+        {
+            leaf->_entryOffset[j] = leaf->_entryOffset[j + 1];
+            leaf->_entrySize[j]   = leaf->_entrySize[j + 1];
+            j = j + 1;
+        }
+        leaf->_lastEntryPos = leaf->_lastEntryPos - 1;
+    }
+
+    bool _leafIsValid(_EntryLeaf* leaf, i8* ptr)
+    {
+        return (i64)ptr > (i64)leaf && (i64)ptr < (i64)leaf + (i64)leaf->_reservedSize;
+    }
+
+    // Locate which leaf owns ptr.  Returns nullptr for foreign (large) pointers.
+    _EntryLeaf* _findLeaf(i8* ptr)
+    {
+        // Fast path: check current page first.
+        if (_currentPage != nullptr && _leafIsValid((_EntryLeaf*)_currentPage, ptr))
+            return (_EntryLeaf*)_currentPage;
+
+        // Mid path: page-align ptr and compare against page base addresses.
+        i64 base = _pageMask & (i64)ptr;
+        int i    = 0;
+        while (i < _pageCount)
+        {
+            if ((i64)_pages[i]._data == base)
+                return (_EntryLeaf*)_pages[i]._data;
+            i = i + 1;
+        }
+
+        // Slow path: full scan (catches allocations that cross granularity boundaries).
+        i = 0;
+        while (i < _pageCount)
+        {
+            _EntryLeaf* leaf = (_EntryLeaf*)_pages[i]._data;
+            if (_leafIsValid(leaf, ptr)) return leaf;
+            i = i + 1;
+        }
+        return nullptr;
+    }
+
+    // -----------------------------------------------------------------------
+    // IAllocator
+    // -----------------------------------------------------------------------
+
+    void* alloc(i64 size)
+    {
+        if (size <= 0) return nullptr;
+        if (_pageSize == 0) _initPageSize();
+
+        // Sizes that won't fit in a page's data area fall back to system malloc.
+        i64 maxInPage = _pageSize - (i64)sizeof(_EntryLeaf);
+        if (size > maxInPage) return malloc(size);
+
+        // Try the current page first.
+        if (_currentPage != nullptr)
+        {
+            i8* ptr = _leafTryAlloc((_EntryLeaf*)_currentPage, (u16)size);
+            if (ptr != nullptr) return (void*)ptr;
+        }
+
+        // Current page full — open a new one and make it current.
+        _currentPage = _newPage();
+        if (_currentPage == nullptr) return nullptr;
+        return (void*)_leafTryAlloc((_EntryLeaf*)_currentPage, (u16)size);
+    }
+
+    void dealloc(void* ptr)
+    {
+        if (ptr == nullptr) return;
+
+        _EntryLeaf* leaf = _findLeaf((i8*)ptr);
+        if (leaf != nullptr) { _leafFree(leaf, (i8*)ptr); return; }
+
+        // Not in any owned page — must be a large (system malloc) allocation.
+        free(ptr);
+    }
+
+    // -----------------------------------------------------------------------
+    // Garbage collection: vmem-free pages whose total_usage hit zero.
+    // The current page is never freed even if empty (it stays as the next page).
+    // -----------------------------------------------------------------------
+
+    void garbageCollect()
+    {
+        if (_pageCount <= 1) return;
+
+        int write = 0;
+        int i     = 0;
+        while (i < _pageCount)
+        {
+            _EntryLeaf* leaf = (_EntryLeaf*)_pages[i]._data;
+            if (_pages[i]._data != _currentPage && leaf->_totalUsage == 0)
+            {
+                _reservedNow = _reservedNow - _pageSize;
+                vmem_free((void*)_pages[i]._data);
+            }
+            else
+            {
+                _pages[write] = _pages[i];
+                write = write + 1;
+            }
+            i = i + 1;
+        }
+        _pageCount = write;
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats
+    // -----------------------------------------------------------------------
+
+    i64 usedBytes()
+    {
+        i64 total = 0;
+        int i     = 0;
+        while (i < _pageCount)
+        {
+            _EntryLeaf* leaf = (_EntryLeaf*)_pages[i]._data;
+            total = total + (i64)leaf->_totalUsage;
+            i = i + 1;
+        }
+        return total;
+    }
+
+    i64 totalBytes()   { return (i64)_pageCount * _pageSize; }
+    i64 peakReserve()  { return _peakReserved; }
+
+    void printUsage()
+    {
+        printf("EntryAllocator: %d pages, used=%lld / committed=%lld bytes\n",
+            _pageCount, usedBytes(), totalBytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup — must be called before the allocator goes out of scope.
+    // -----------------------------------------------------------------------
+
+    void cleanup()
+    {
+        int i = 0;
+        while (i < _pageCount)
+        {
+            vmem_free((void*)_pages[i]._data);
+            i = i + 1;
+        }
+        if (_pages != nullptr) free((void*)_pages);
+        _pages        = nullptr;
+        _pageCount    = 0;
+        _pageCapacity = 0;
+        _currentPage  = nullptr;
+        _pageSize     = 0;
+        _reservedNow  = 0;
+    }
+
+    ~EntryAllocator() { cleanup(); }
+};

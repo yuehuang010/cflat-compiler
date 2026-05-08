@@ -16,6 +16,7 @@ import "malloc_allocator.cb";
 import "block_allocator.cb";
 import "bucket_allocator.cb";
 import "fit_allocator.cb";
+import "entry_allocator.cb";
 import "perf_framework.cb";
 
 program BenchThroughput
@@ -53,14 +54,14 @@ extern int main()
     bm._allocator = new MallocAllocator;
     bm.run(emptyArgs);
     bm.WaitForExit();
-    PerfPrint("MallocAllocator", (i64)N, bm.measuredUs);
+    PerfPrint("MallocAllocator", (i64)N, bm.measuredUs, bm._allocator.peakReserve());
 
     BenchThroughput bb;
     bb.iters = N;
     bb._allocator = new BlockAllocator;
     bb.run(emptyArgs);
     bb.WaitForExit();
-    PerfPrint("BlockAllocator", (i64)N, bb.measuredUs);
+    PerfPrint("BlockAllocator", (i64)N, bb.measuredUs, bb._allocator.peakReserve());
     PerfCheckLeak("BlockAllocator", bb._allocator.usedBytes());
 
     BenchThroughput bs;
@@ -68,7 +69,7 @@ extern int main()
     bs._allocator = new BucketAllocator;
     bs.run(emptyArgs);
     bs.WaitForExit();
-    PerfPrint("BucketAllocator", (i64)N, bs.measuredUs);
+    PerfPrint("BucketAllocator", (i64)N, bs.measuredUs, bs._allocator.peakReserve());
     PerfCheckLeak("BucketAllocator", bs._allocator.usedBytes());
 
     BenchThroughput bf;
@@ -76,8 +77,16 @@ extern int main()
     bf._allocator = new FitAllocator;
     bf.run(emptyArgs);
     bf.WaitForExit();
-    PerfPrint("FitAllocator", (i64)N, bf.measuredUs);
+    PerfPrint("FitAllocator", (i64)N, bf.measuredUs, bf._allocator.peakReserve());
     PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
+
+    BenchThroughput be;
+    be.iters = N;
+    be._allocator = new EntryAllocator;
+    be.run(emptyArgs);
+    be.WaitForExit();
+    PerfPrint("EntryAllocator", (i64)N, be.measuredUs, be._allocator.peakReserve());
+    PerfCheckLeak("EntryAllocator", be._allocator.usedBytes());
 
     return 0;
 }

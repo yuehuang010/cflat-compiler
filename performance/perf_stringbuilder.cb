@@ -150,33 +150,33 @@ extern int main()
         s10.length(), s50.length(), s100.length(), s1000.length());
 
     PerfHeader("append(string) — N=500000");
-    PerfPrint("len=10",   (i64)N, bench_append_str(N, s10));
-    PerfPrint("len=50",   (i64)N, bench_append_str(N, s50));
-    PerfPrint("len=100",  (i64)N, bench_append_str(N, s100));
-    PerfPrint("len=1000", (i64)N, bench_append_str(N, s1000));
+    PerfPrint("len=10",   (i64)N, bench_append_str(N, s10),   (i64)0);
+    PerfPrint("len=50",   (i64)N, bench_append_str(N, s50),   (i64)0);
+    PerfPrint("len=100",  (i64)N, bench_append_str(N, s100),  (i64)0);
+    PerfPrint("len=1000", (i64)N, bench_append_str(N, s1000), (i64)0);
 
     PerfHeader("append(const char*) — N=500000");
-    PerfPrint("len=10",  (i64)N, bench_append_cstr10(N));
-    PerfPrint("len=50",  (i64)N, bench_append_cstr50(N));
-    PerfPrint("len=100", (i64)N, bench_append_cstr100(N));
+    PerfPrint("len=10",  (i64)N, bench_append_cstr10(N),  (i64)0);
+    PerfPrint("len=50",  (i64)N, bench_append_cstr50(N),  (i64)0);
+    PerfPrint("len=100", (i64)N, bench_append_cstr100(N), (i64)0);
 
     PerfHeader("appendLine(string) — N=500000");
-    PerfPrint("len=10",   (i64)N, bench_appendline_str(N, s10));
-    PerfPrint("len=50",   (i64)N, bench_appendline_str(N, s50));
-    PerfPrint("len=100",  (i64)N, bench_appendline_str(N, s100));
-    PerfPrint("len=1000", (i64)N, bench_appendline_str(N, s1000));
+    PerfPrint("len=10",   (i64)N, bench_appendline_str(N, s10),   (i64)0);
+    PerfPrint("len=50",   (i64)N, bench_appendline_str(N, s50),   (i64)0);
+    PerfPrint("len=100",  (i64)N, bench_appendline_str(N, s100),  (i64)0);
+    PerfPrint("len=1000", (i64)N, bench_appendline_str(N, s1000), (i64)0);
 
     PerfHeader("appendLine(const char*) — N=500000");
-    PerfPrint("len=10", (i64)N, bench_appendline_cstr10(N));
+    PerfPrint("len=10", (i64)N, bench_appendline_cstr10(N), (i64)0);
 
     PerfHeader("append(i32) — N=500000");
-    PerfPrint("value=42", (i64)N, bench_append_int(N));
+    PerfPrint("value=42", (i64)N, bench_append_int(N), (i64)0);
 
     PerfHeader("append(bool) — N=500000");
-    PerfPrint("value=true", (i64)N, bench_append_bool(N));
+    PerfPrint("value=true", (i64)N, bench_append_bool(N), (i64)0);
 
     PerfHeader("appendChar(i8) — N=500000");
-    PerfPrint("char='x'", (i64)N, bench_append_char(N));
+    PerfPrint("char='x'", (i64)N, bench_append_char(N), (i64)0);
 
     printf("\n");
     return 0;

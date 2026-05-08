@@ -66,10 +66,12 @@ class BucketAllocator : IAllocator
 {
     _BA_Bucket _buckets[8] = default;
 
-    i8* _largeHead   = nullptr;
-    i64 _largeBytes  = 0;
-    i64 _largeCount  = 0;
+    i8* _largeHead    = nullptr;
+    i64 _largeBytes   = 0;
+    i64 _largeCount   = 0;
     bool _initialized = false;
+    i64 _reservedNow  = 0;
+    i64 _peakReserved = 0;
 
     // -----------------------------------------------------------------------
     // Initialization
@@ -131,6 +133,8 @@ class BucketAllocator : IAllocator
         hdr->_class     = (i32)cls;
         hdr->_next_page = _buckets[cls]._page;
         _buckets[cls]._page = page;
+        _reservedNow = _reservedNow + (i64)65536;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
 
         i64 blockSize  = _buckets[cls]._block_size;
         i64 dataOff    = _dataOffsetFor(blockSize);
@@ -166,8 +170,10 @@ class BucketAllocator : IAllocator
         hdr->_regionSize = total;
         hdr->_next       = _largeHead;
         _largeHead       = base;
-        _largeBytes      = _largeBytes + size;
-        _largeCount      = _largeCount + 1;
+        _largeBytes  = _largeBytes + size;
+        _largeCount  = _largeCount + 1;
+        _reservedNow = _reservedNow + total;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
 
         return (void*)(base + hdrSize);
     }
@@ -186,8 +192,9 @@ class BucketAllocator : IAllocator
             _BA_LargeHdr* ch = (_BA_LargeHdr*)cur;
             if (cur == base)
             {
-                _largeBytes = _largeBytes - ch->_userSize;
-                _largeCount = _largeCount - 1;
+                _largeBytes  = _largeBytes - ch->_userSize;
+                _largeCount  = _largeCount - 1;
+                _reservedNow = _reservedNow - ch->_regionSize;
                 if (prev == nullptr)
                     _largeHead = ch->_next;
                 else
@@ -269,7 +276,8 @@ class BucketAllocator : IAllocator
         return total;
     }
 
-    i64 totalBytes() { return (i64)0; }
+    i64 totalBytes()   { return (i64)0; }
+    i64 peakReserve()  { return _peakReserved; }
 
     i64 committedBytes()
     {
@@ -346,6 +354,7 @@ class BucketAllocator : IAllocator
         _largeBytes  = (i64)0;
         _largeCount  = (i64)0;
         _initialized = false;
+        _reservedNow = (i64)0;
     }
 
     ~BucketAllocator() { cleanup(); }

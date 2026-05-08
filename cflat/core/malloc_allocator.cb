@@ -10,4 +10,6 @@ class MallocAllocator : IAllocator
     void  cleanup()         { }
     i64   usedBytes()       { return (i64)0; }
     i64   totalBytes()      { return _totalBytes; }
+    // dealloc has no size, so we track cumulative alloc as a conservative upper bound.
+    i64   peakReserve()     { return _totalBytes; }
 };
