@@ -5448,6 +5448,24 @@ public:
             auto namedVar = ParseUnaryExpression(ue);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
+
+            // Error: deleting a borrowed (non-move) parameter directly. If the caller owns the
+            // pointer, it will be freed again when the caller's scope exits — double-free.
+            // Restrict to direct alloca storage (simple variable reference, not field access)
+            // so 'delete param->field' is still allowed.
+            if (!namedVar.CallerName.empty()
+                && !namedVar.IsOwning
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                && compiler->IsFunctionParameter(namedVar.CallerName))
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot delete borrowed parameter '{}' — caller may own this pointer and "
+                    "will free it on scope exit. Declare the parameter 'move {}' to take ownership.",
+                    namedVar.CallerName, namedVar.CallerName));
+                return {};
+            }
+
             if (namedVar.Storage)
             {
                 ptrVal = compiler->CreateLoad(namedVar.Storage);

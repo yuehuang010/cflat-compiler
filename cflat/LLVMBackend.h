@@ -4477,6 +4477,15 @@ public:
         return {};
     }
 
+    bool IsFunctionParameter(const std::string& name) const
+    {
+        if (name.empty()) return false;
+        for (const auto& frame : stackNamedVariable)
+            if (frame.functionArgument.find(name) != frame.functionArgument.end())
+                return true;
+        return false;
+    }
+
     /// <summary>
     /// Get the member variable from a member function.
     /// </summary>

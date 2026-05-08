@@ -8,7 +8,10 @@ cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) â
 
 ## Plan
 
-Provide an Architecture overview before analyzing code changes.  Verify with the user first before continuing with the Phases.
+Provide an Architecture overview before analyzing code changes.
+
+## Git
+Do not commit to git.  Stash is allowed.  
 
 ## Logging Conventions
 
