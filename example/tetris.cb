@@ -1,19 +1,22 @@
-// tetris.cb — self-playing Tetris demo for terminal.cb
+// tetris.cb — Tetris demo for terminal.cb
 //
 // Build:
 //   x64/Debug/cflat.exe example/tetris.cb -i cflat/core -o out/tetris.exe
-// Run:
+// Run (player controls):
 //   out\tetris.exe
+// Run (auto-play AI):
+//   out\tetris.exe --auto
 //
-// Uses TerminalDriver.injectKey to auto-play badly: random left/right/rotate
-// moves without strategy so the stack fills up and the game ends on its own.
-// A human watching can also press arrow keys, Space (hard drop), or ESC.
+// Default: human player uses arrow keys, Space (hard drop), ESC to quit.
+// --auto: injects random left/right/rotate moves so the stack fills naturally.
 // The board is centered in the terminal and re-centers on resize.
 
 import "terminal.cb";
 import "random.cb";
 import "time.cb";
 import "array.cb";
+
+extern stdcall char* GetCommandLineA();
 
 // ── Board constants ───────────────────────────────────────────────────────────
 
@@ -56,7 +59,9 @@ void computeLayout(Terminal* term)
 
 // ── Global game state ─────────────────────────────────────────────────────────
 
-array<int> g_board;   // BOARD_W * BOARD_H; 0 = empty, 1..7 = locked piece type
+bool g_autoPlay = false;  // set by --auto flag; injects random AI moves each frame
+
+array<int> g_board = default;   // BOARD_W * BOARD_H; 0 = empty, 1..7 = locked piece type
 int g_piece = 0;
 int g_rot   = 0;
 int g_row   = 0;
@@ -308,8 +313,13 @@ void drawHUD(Terminal* term)
         r++;
     }
 
-    term->moveTo(hr + 14, hc); printf("arrows:move");
-    term->moveTo(hr + 15, hc); printf("up:rotate  ");
+    if (g_autoPlay) {
+        term->moveTo(hr + 14, hc); printf("MODE:AUTO  ");
+        term->moveTo(hr + 15, hc); printf("           ");
+    } else {
+        term->moveTo(hr + 14, hc); printf("arrows:move");
+        term->moveTo(hr + 15, hc); printf("up:rotate  ");
+    }
     term->moveTo(hr + 16, hc); printf("spc:drop   ");
     term->moveTo(hr + 17, hc); printf("esc:quit   ");
 }
@@ -318,6 +328,8 @@ void drawHUD(Terminal* term)
 
 extern int main()
 {
+    g_autoPlay = strstr(GetCommandLineA(), "--auto") != nullptr;
+
     Terminal term;
     if (!term.init()) {
         printf("terminal not available -- run from a real console\n");
@@ -364,7 +376,7 @@ extern int main()
         }
 
         // ── Autoplayer: inject a random move every 3 frames (~48 ms) ─────────
-        if (frame % 3 == 0) {
+        if (g_autoPlay && frame % 3 == 0) {
             int pick = rng.nextInt(0, 4);
             if      (pick == 0) driver.injectKey((i16)VK_LEFT,  '\0');
             else if (pick == 1) driver.injectKey((i16)VK_RIGHT, '\0');
