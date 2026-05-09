@@ -30,7 +30,7 @@ echo =========================================================================
 echo TESTS [%CFG%]: test.bat
 echo =========================================================================
 set CFLAT_CONFIG=%CFG%
-call test.bat
+call "%~dp0test.bat"
 if errorlevel 1 (
     echo TESTS FAILED: %CFG% test.bat
     set /a OVERALL_ERRORS+=1
@@ -41,7 +41,7 @@ echo =========================================================================
 echo TESTS [%CFG%]: test_lsp.bat
 echo =========================================================================
 set CFLAT_CONFIG=%CFG%
-call test_lsp.bat
+call "%~dp0test_lsp.bat"
 if errorlevel 1 (
     echo TESTS FAILED: %CFG% test_lsp.bat
     set /a OVERALL_ERRORS+=1
@@ -56,11 +56,11 @@ call :RunConfig Release
 echo.
 echo =========================================================================
 call :ElapsedTime "%START_TIME%" "%TIME%"
-if %OVERALL_ERRORS% EQU 0 (
+if !OVERALL_ERRORS! EQU 0 (
     echo CI PASSED.
     exit /b 0
 ) else (
-    echo CI FAILED: %OVERALL_ERRORS% stage(s) failed.
+    echo CI FAILED: !OVERALL_ERRORS! stages failed.
     exit /b 1
 )
 
