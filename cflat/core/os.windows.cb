@@ -184,6 +184,7 @@ extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURS
 extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
 extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);
 extern stdcall win_int  ReadConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+extern stdcall win_int  PeekConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
 extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
 extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
 
