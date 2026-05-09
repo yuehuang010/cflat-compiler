@@ -22,12 +22,22 @@ struct ContainerWithUnion
     int tag = default;
 };
 
+// Minimal integer range collection for range-based for tests.
+struct IntRange
+{
+    int lo = default;
+    int hi = default;
+
+    int count() { return hi - lo; }
+    int get(int i) { return lo + i; }
+};
+
 bool testBuiltinIdentifiers()
 {
     bool result = true;
     result &= Test("__FILE__", __FILE__, "test_basic.cb");
     result &= Test("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 30); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 40); // Remember to adjust if shifted.
     return result;
 }
 
@@ -1804,6 +1814,7 @@ extern int main()
     total++; passed += testCastMemberAccess()            ? 1 : 0;
     total++; passed += testReturnBoolFromInt()           ? 1 : 0;
     total++; passed += testUnion()                       ? 1 : 0;
+    total++; passed += testBreakContinue()               ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -1966,6 +1977,74 @@ bool testUnion()
     UnionByteView bv;
     bv.value = 0x000000FF;
     result &= Test("union aliasing low byte", (int)bv.byte0, -1);
+
+    return result;
+}
+
+// =============================================================
+// break / continue tests
+// =============================================================
+
+bool testBreakContinue()
+{
+    bool result = true;
+
+    // --- while: break exits on sentinel ---
+    int i = 0;
+    while (i < 100)
+    {
+        if (i == 5) break;
+        i++;
+    }
+    result &= Test("while break at 5", i, 5);
+
+    // --- while: continue skips iterations ---
+    int sum = 0;
+    int k = 0;
+    while (k < 6)
+    {
+        k++;
+        if (k % 2 == 0) continue;
+        sum += k;   // sum odd numbers 1+3+5 = 9
+    }
+    result &= Test("while continue odd sum", sum, 9);
+
+    // --- for: break exits early ---
+    int found = -1;
+    for (int j = 0; j < 10; j++)
+    {
+        if (j == 7) { found = j; break; }
+    }
+    result &= Test("for break at 7", found, 7);
+
+    // --- for: continue skips body ---
+    int evenSum = 0;
+    for (int n = 0; n < 10; n++)
+    {
+        if (n % 2 != 0) continue;
+        evenSum += n;   // 0+2+4+6+8 = 20
+    }
+    result &= Test("for continue even sum", evenSum, 20);
+
+    // --- for-in (range-based): break and continue ---
+    // IntRange is a minimal collection supporting for (int v in r) syntax.
+    IntRange r;
+    r.lo = 0; r.hi = 10;   // values 0..9
+
+    int firstOver5 = -1;
+    for (int v in r)
+    {
+        if (v > 5) { firstOver5 = v; break; }
+    }
+    result &= Test("for-in break first>5", firstOver5, 6);
+
+    int oddSum = 0;
+    for (int v in r)
+    {
+        if (v % 2 == 0) continue;
+        oddSum += v;    // 1+3+5+7+9 = 25
+    }
+    result &= Test("for-in continue odd sum", oddSum, 25);
 
     return result;
 }

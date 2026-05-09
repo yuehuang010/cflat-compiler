@@ -83,13 +83,6 @@ struct KeyEvent {
 // ── MouseEvent ────────────────────────────────────────────────────────────────
 //
 // Filled by Terminal.pollMouse() and Terminal.pollEvent().
-//
-// Win32 MOUSE_EVENT_RECORD union layout (shares _INPUT_RECORD union at offset 4):
-//   offset  4: COORD dwMousePosition  — X in low i16 of keyDown, Y in high i16
-//   offset  8: DWORD dwButtonState    — low i16 in repeatCount, high i16 in vkCode
-//   offset 12: DWORD dwControlKeyState
-//   offset 16: DWORD dwEventFlags     — in controlKeyState field
-//
 // eventFlags values: 0=button press/release, MOUSE_MOVED=1, MOUSE_WHEELED=4.
 // buttonState bits:  MOUSE_BTN_LEFT=1, MOUSE_BTN_RIGHT=2, MOUSE_BTN_MIDDLE=4.
 
@@ -275,7 +268,7 @@ struct Terminal {
         return false;
     }
 
-    // Extract mouse fields from the KEY_EVENT union overlap (see MouseEvent comment).
+    // Extract mouse fields from the flat _INPUT_RECORD (key/mouse union aliasing).
     void _fillMouse(MouseEvent* out, _INPUT_RECORD* rec) {
         out->x           = (i16)(rec->keyDown & 0xFFFF);
         out->y           = (i16)((rec->keyDown >> 16) & 0xFFFF);
@@ -403,13 +396,13 @@ struct TerminalDriver {
     // bitmask (e.g. 0x04 = LEFT_CTRL_PRESSED). Pass 0 for a plain keystroke.
     void injectKey(i16 vkCode, char ch, i32 controlState) {
         _INPUT_RECORD rec;
-        rec.eventType       = 1;   // KEY_EVENT
-        rec._pad            = 0;
-        rec.keyDown         = 1;
-        rec.repeatCount     = 1;
-        rec.vkCode          = vkCode;
-        rec.vkScan          = 0;
-        rec.uChar           = (i16)ch;
+        rec.eventType                = 1;   // KEY_EVENT
+        rec._pad                     = 0;
+        rec.keyDown        = 1;
+        rec.repeatCount    = 1;
+        rec.vkCode         = vkCode;
+        rec.vkScan         = 0;
+        rec.uChar          = (i16)ch;
         rec.controlKeyState = controlState;
         i32 written = 0;
         WriteConsoleInputA(_hIn, &rec, 1, &written);

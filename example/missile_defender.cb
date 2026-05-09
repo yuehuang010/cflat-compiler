@@ -38,49 +38,54 @@ void computeLayout(Terminal* term)
 int toScreenCol(int bc) { return g_originCol + bc; }
 int toScreenRow(int br) { return g_originRow + br; }
 
-// Returns board column for a 1-based screen column, or -1 if outside board.
 int toBoardCol(int sc) {
     int bc = sc - g_originCol;
     if (bc < 0 || bc >= BOARD_W) return -1;
     return bc;
 }
-// Returns board row for a 1-based screen row, or -1 if outside board.
 int toBoardRow(int sr) {
     int br = sr - g_originRow;
     if (br < 0 || br >= BOARD_H) return -1;
     return br;
 }
 
-// ── Entity data (parallel arrays for alive/position fields) ───────────────────
-//
-// Using parallel int arrays avoids the array<struct>.get() copy issue:
-// each field is an independent array<int>.
+// ── Entity structs ────────────────────────────────────────────────────────────
+
+// Missiles fall from a random column at the top toward the ground.
+struct Missile {
+    bool alive = false;
+    int  col   = 0;
+    int  row   = 0;
+};
+
+// Interceptors travel from the launcher to the click target (fixed-point *16).
+struct Interceptor {
+    bool alive  = false;
+    int  col    = 0;   // current col *16
+    int  row    = 0;   // current row *16
+    int  dstCol = 0;
+    int  dstRow = 0;
+    int  dcol   = 0;   // delta per frame *16
+    int  drow   = 0;
+};
+
+// Explosions expand outward, killing missiles they touch.
+struct Explosion {
+    bool alive     = false;
+    int  col       = 0;
+    int  row       = 0;
+    int  radius    = 0;
+    int  maxRadius = 0;
+    int  timer     = 0;
+};
 
 int MAX_MISSILES     = 32;
 int MAX_INTERCEPTORS = 16;
 int MAX_EXPLOSIONS   = 16;
 
-// Missiles: fall from random column at top toward the ground.
-array<int> g_mAlive  = default;  // 0=dead 1=alive
-array<int> g_mCol    = default;  // board col
-array<int> g_mRow    = default;  // board row (advances each gravity tick)
-
-// Interceptors: travel toward click target at fixed speed (fixed-point *16).
-array<int> g_pAlive  = default;
-array<int> g_pCol    = default;   // col *16
-array<int> g_pRow    = default;   // row *16
-array<int> g_pDstCol = default;   // target col
-array<int> g_pDstRow = default;   // target row
-array<int> g_pDcol   = default;   // delta col per frame *16
-array<int> g_pDrow   = default;   // delta row per frame *16
-
-// Explosions: expanding ring; kills missiles it touches.
-array<int> g_eAlive  = default;
-array<int> g_eCol    = default;
-array<int> g_eRow    = default;
-array<int> g_eRadius = default;
-array<int> g_eMax    = default;   // max radius before disappearing
-array<int> g_eTimer  = default;   // frames until radius expands
+array<Missile>     g_missiles     = default;
+array<Interceptor> g_interceptors = default;
+array<Explosion>   g_explosions   = default;
 
 // ── Game state ────────────────────────────────────────────────────────────────
 
@@ -91,30 +96,9 @@ int  g_wave         = 1;
 int  g_missilesLeft = 0;
 bool g_running      = false;
 
-int INTERC_SPEED = 24;   // interceptor speed in fixed-point units/frame (1.5 cells)
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
+int INTERC_SPEED = 24;   // fixed-point units/frame (1.5 cells)
 
 int absVal(int x) { if (x < 0) return -x; return x; }
-
-// ── Initialise all pools ──────────────────────────────────────────────────────
-
-void initPools()
-{
-    g_mAlive.init(MAX_MISSILES);  g_mCol.init(MAX_MISSILES);  g_mRow.init(MAX_MISSILES);
-    g_pAlive.init(MAX_INTERCEPTORS); g_pCol.init(MAX_INTERCEPTORS); g_pRow.init(MAX_INTERCEPTORS);
-    g_pDstCol.init(MAX_INTERCEPTORS); g_pDstRow.init(MAX_INTERCEPTORS);
-    g_pDcol.init(MAX_INTERCEPTORS);   g_pDrow.init(MAX_INTERCEPTORS);
-    g_eAlive.init(MAX_EXPLOSIONS); g_eCol.init(MAX_EXPLOSIONS); g_eRow.init(MAX_EXPLOSIONS);
-    g_eRadius.init(MAX_EXPLOSIONS); g_eMax.init(MAX_EXPLOSIONS); g_eTimer.init(MAX_EXPLOSIONS);
-
-    int i = 0;
-    while (i < MAX_MISSILES)     { g_mAlive.set(i, 0); i++; }
-    i = 0;
-    while (i < MAX_INTERCEPTORS) { g_pAlive.set(i, 0); i++; }
-    i = 0;
-    while (i < MAX_EXPLOSIONS)   { g_eAlive.set(i, 0); i++; }
-}
 
 // ── Spawning ──────────────────────────────────────────────────────────────────
 
@@ -122,10 +106,11 @@ void spawnMissile(Random* rng)
 {
     int i = 0;
     while (i < MAX_MISSILES) {
-        if (g_mAlive.get(i) == 0) {
-            g_mAlive.set(i, 1);
-            g_mCol.set(i, rng->nextInt(1, BOARD_W - 2));
-            g_mRow.set(i, 0);
+        Missile* m = g_missiles.getPtr(i);
+        if (!m->alive) {
+            m->alive = true;
+            m->col   = rng->nextInt(1, BOARD_W - 2);
+            m->row   = 0;
             g_missilesLeft--;
             return;
         }
@@ -137,19 +122,19 @@ void fireInterceptor(int dstCol, int dstRow)
 {
     int i = 0;
     while (i < MAX_INTERCEPTORS) {
-        if (g_pAlive.get(i) == 0) {
-            g_pAlive.set(i, 1);
-            g_pCol.set(i, g_launcherCol * 16);
-            g_pRow.set(i, g_launcherRow * 16);
-            g_pDstCol.set(i, dstCol);
-            g_pDstRow.set(i, dstRow);
+        Interceptor* p = g_interceptors.getPtr(i);
+        if (!p->alive) {
+            p->alive  = true;
+            p->col    = g_launcherCol * 16;
+            p->row    = g_launcherRow * 16;
+            p->dstCol = dstCol;
+            p->dstRow = dstRow;
             int dx = dstCol - g_launcherCol;
             int dy = dstRow - g_launcherRow;
-            int adx = absVal(dx); int ady = absVal(dy);
-            int len = adx > ady ? adx : ady;
+            int len = absVal(dx) > absVal(dy) ? absVal(dx) : absVal(dy);
             if (len == 0) len = 1;
-            g_pDcol.set(i, dx * INTERC_SPEED / len);
-            g_pDrow.set(i, dy * INTERC_SPEED / len);
+            p->dcol = dx * INTERC_SPEED / len;
+            p->drow = dy * INTERC_SPEED / len;
             return;
         }
         i++;
@@ -160,13 +145,14 @@ void triggerExplosion(int col, int row)
 {
     int i = 0;
     while (i < MAX_EXPLOSIONS) {
-        if (g_eAlive.get(i) == 0) {
-            g_eAlive.set(i, 1);
-            g_eCol.set(i, col);
-            g_eRow.set(i, row);
-            g_eRadius.set(i, 0);
-            g_eMax.set(i, 3 + g_wave / 3);
-            g_eTimer.set(i, 2);
+        Explosion* e = g_explosions.getPtr(i);
+        if (!e->alive) {
+            e->alive     = true;
+            e->col       = col;
+            e->row       = row;
+            e->radius    = 0;
+            e->maxRadius = 3 + g_wave / 3;
+            e->timer     = 2;
             return;
         }
         i++;
@@ -179,9 +165,9 @@ bool inExplosion(int mc, int mr)
 {
     int i = 0;
     while (i < MAX_EXPLOSIONS) {
-        if (g_eAlive.get(i) != 0) {
-            int r = g_eRadius.get(i);
-            if (absVal(g_eRow.get(i) - mr) <= r && absVal(g_eCol.get(i) - mc) <= r * 2)
+        Explosion* e = g_explosions.getPtr(i);
+        if (e->alive) {
+            if (absVal(e->row - mr) <= e->radius && absVal(e->col - mc) <= e->radius * 2)
                 return true;
         }
         i++;
@@ -189,16 +175,16 @@ bool inExplosion(int mc, int mr)
     return false;
 }
 
-// Returns false when a missile reaches the ground (game over).
 bool updateMissiles()
 {
     int i = 0;
     while (i < MAX_MISSILES) {
-        if (g_mAlive.get(i) != 0) {
-            if (inExplosion(g_mCol.get(i), g_mRow.get(i))) {
-                g_mAlive.set(i, 0);
-                g_score = g_score + 10 * g_wave;
-            } else if (g_mRow.get(i) >= BOARD_H - 2) {
+        Missile* m = g_missiles.getPtr(i);
+        if (m->alive) {
+            if (inExplosion(m->col, m->row)) {
+                m->alive = false;
+                g_score  = g_score + 10 * g_wave;
+            } else if (m->row >= BOARD_H - 2) {
                 return false;
             }
         }
@@ -211,8 +197,8 @@ void advanceMissiles()
 {
     int i = 0;
     while (i < MAX_MISSILES) {
-        if (g_mAlive.get(i) != 0)
-            g_mRow.set(i, g_mRow.get(i) + 1);
+        Missile* m = g_missiles.getPtr(i);
+        if (m->alive) m->row++;
         i++;
     }
 }
@@ -221,15 +207,15 @@ void updateInterceptors()
 {
     int i = 0;
     while (i < MAX_INTERCEPTORS) {
-        if (g_pAlive.get(i) != 0) {
-            int nc = g_pCol.get(i) + g_pDcol.get(i);
-            int nr = g_pRow.get(i) + g_pDrow.get(i);
-            g_pCol.set(i, nc);
-            g_pRow.set(i, nr);
-            int bc = nc / 16; int br = nr / 16;
-            if (absVal(g_pDstCol.get(i) - bc) <= 1 && absVal(g_pDstRow.get(i) - br) <= 1) {
-                triggerExplosion(g_pDstCol.get(i), g_pDstRow.get(i));
-                g_pAlive.set(i, 0);
+        Interceptor* p = g_interceptors.getPtr(i);
+        if (p->alive) {
+            p->col = p->col + p->dcol;
+            p->row = p->row + p->drow;
+            int bc = p->col / 16;
+            int br = p->row / 16;
+            if (absVal(p->dstCol - bc) <= 1 && absVal(p->dstRow - br) <= 1) {
+                triggerExplosion(p->dstCol, p->dstRow);
+                p->alive = false;
             }
         }
         i++;
@@ -240,14 +226,13 @@ void updateExplosions()
 {
     int i = 0;
     while (i < MAX_EXPLOSIONS) {
-        if (g_eAlive.get(i) != 0) {
-            int t = g_eTimer.get(i) - 1;
-            g_eTimer.set(i, t);
-            if (t <= 0) {
-                int r = g_eRadius.get(i) + 1;
-                g_eRadius.set(i, r);
-                g_eTimer.set(i, 2);
-                if (r > g_eMax.get(i)) g_eAlive.set(i, 0);
+        Explosion* e = g_explosions.getPtr(i);
+        if (e->alive) {
+            e->timer--;
+            if (e->timer <= 0) {
+                e->radius++;
+                e->timer = 2;
+                if (e->radius > e->maxRadius) e->alive = false;
             }
         }
         i++;
@@ -270,7 +255,7 @@ void drawBorder(Terminal* term)
 
     int r = 0;
     while (r < BOARD_H) {
-        term->moveTo(toScreenRow(r), toScreenCol(-1));  printf("|");
+        term->moveTo(toScreenRow(r), toScreenCol(-1));     printf("|");
         term->moveTo(toScreenRow(r), toScreenCol(BOARD_W)); printf("|");
         r++;
     }
@@ -304,8 +289,9 @@ void drawMissiles(Terminal* term)
 {
     int i = 0;
     while (i < MAX_MISSILES) {
-        if (g_mAlive.get(i) != 0) {
-            term->moveTo(toScreenRow(g_mRow.get(i)), toScreenCol(g_mCol.get(i)));
+        Missile* m = g_missiles.getPtr(i);
+        if (m->alive) {
+            term->moveTo(toScreenRow(m->row), toScreenCol(m->col));
             termFg(196); printf("v"); termReset();
         }
         i++;
@@ -316,9 +302,10 @@ void drawInterceptors(Terminal* term)
 {
     int i = 0;
     while (i < MAX_INTERCEPTORS) {
-        if (g_pAlive.get(i) != 0) {
-            int bc = g_pCol.get(i) / 16;
-            int br = g_pRow.get(i) / 16;
+        Interceptor* p = g_interceptors.getPtr(i);
+        if (p->alive) {
+            int bc = p->col / 16;
+            int br = p->row / 16;
             if (bc >= 0 && bc < BOARD_W && br >= 0 && br < BOARD_H) {
                 term->moveTo(toScreenRow(br), toScreenCol(bc));
                 termFg(51); printf("*"); termReset();
@@ -332,18 +319,16 @@ void drawExplosions(Terminal* term)
 {
     int i = 0;
     while (i < MAX_EXPLOSIONS) {
-        if (g_eAlive.get(i) != 0) {
-            int ec = g_eCol.get(i);
-            int er = g_eRow.get(i);
-            int rad = g_eRadius.get(i);
+        Explosion* e = g_explosions.getPtr(i);
+        if (e->alive) {
+            int ec = e->col; int er = e->row; int rad = e->radius;
             termFg(226);
             int dr = -rad;
             while (dr <= rad) {
                 int dc = -rad * 2;
                 while (dc <= rad * 2) {
                     if (absVal(dr) + absVal(dc / 2) == rad || rad == 0) {
-                        int br = er + dr;
-                        int bc = ec + dc;
+                        int br = er + dr; int bc = ec + dc;
                         if (br >= 0 && br < BOARD_H - 1 && bc >= 0 && bc < BOARD_W) {
                             term->moveTo(toScreenRow(br), toScreenCol(bc));
                             printf("o");
@@ -372,7 +357,7 @@ bool waveComplete()
 {
     if (g_missilesLeft > 0) return false;
     int i = 0;
-    while (i < MAX_MISSILES) { if (g_mAlive.get(i) != 0) return false; i++; }
+    while (i < MAX_MISSILES) { if (g_missiles.getPtr(i)->alive) return false; i++; }
     return true;
 }
 
@@ -395,9 +380,11 @@ extern int main()
     Random rng;
     rng.seedFromTime();
 
-    initPools();
-    computeLayout(&term);
+    g_missiles.init(MAX_MISSILES);
+    g_interceptors.init(MAX_INTERCEPTORS);
+    g_explosions.init(MAX_EXPLOSIONS);
 
+    computeLayout(&term);
     g_launcherCol  = BOARD_W / 2;
     g_launcherRow  = BOARD_H - 2;
     g_missilesLeft = 8;
@@ -414,7 +401,6 @@ extern int main()
     drawBorder(&term);
 
     while (g_running) {
-        // Resize detection
         int curW = 0; int curH = 0;
         term.getSize(&curW, &curH);
         if (curW != g_termW || curH != g_termH) {
@@ -423,7 +409,6 @@ extern int main()
             drawBorder(&term);
         }
 
-        // Spawn missiles on timer
         if (missileTimer.isExpired() && g_missilesLeft > 0) {
             spawnMissile(&rng);
             int interval = 1800 - g_wave * 60;
@@ -431,7 +416,6 @@ extern int main()
             missileTimer.start(interval);
         }
 
-        // Input: unified key + mouse event poll
         i32 evType = 0;
         KeyEvent   key   = default;
         MouseEvent mouse = default;
@@ -439,7 +423,6 @@ extern int main()
             if (evType == 1) {
                 if (key.vkCode == (i16)VK_ESCAPE) g_running = false;
             } else if (evType == 2) {
-                // mouse.x and mouse.y are 0-based screen coords
                 if (mouse.isPress() && mouse.leftButton()) {
                     int bc = toBoardCol((int)mouse.x + 1);
                     int br = toBoardRow((int)mouse.y + 1);
@@ -449,7 +432,6 @@ extern int main()
             }
         }
 
-        // Gravity
         if (gravityTimer.isExpired()) {
             int interval = 600 - g_wave * 20;
             if (interval < 200) interval = 200;
@@ -463,7 +445,6 @@ extern int main()
 
         if (waveComplete()) startWave();
 
-        // Render
         clearBoard(&term);
         drawGround(&term);
         drawMissiles(&term);
