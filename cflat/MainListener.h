@@ -8446,6 +8446,17 @@ public:
                 hex += *itr++;
             return static_cast<char>(std::stoi(hex, nullptr, 16));
         }
+        // Octal escape: 1–3 octal digits (\0, \033, \177, etc.).
+        if (esc >= '0' && esc <= '7')
+        {
+            int val = esc - '0';
+            for (int i = 0; i < 2 && itr != end && *itr >= '0' && *itr <= '7'; i++)
+            {
+                val = val * 8 + (*itr - '0');
+                ++itr;
+            }
+            return static_cast<char>(val);
+        }
         switch (esc)
         {
         case 'n':  return '\n';
@@ -8454,7 +8465,6 @@ public:
         case '\\': return '\\';
         case '\'': return '\'';
         case '"':  return '"';
-        case '0':  return '\0';
         case 'a':  return '\a';
         case 'b':  return '\b';
         case 'f':  return '\f';

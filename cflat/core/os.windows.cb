@@ -177,6 +177,7 @@ struct _INPUT_RECORD {
 };
 
 extern stdcall void*    GetStdHandle(i32 nStdHandle);
+extern stdcall win_int  WriteFile(void* hFile, const char* lpBuffer, i32 nNumberOfBytesToWrite, i32* lpNumberOfBytesWritten, void* lpOverlapped);
 extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
 extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
 extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);

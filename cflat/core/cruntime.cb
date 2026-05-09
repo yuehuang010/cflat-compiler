@@ -73,8 +73,33 @@ extern void printf(const char* fmt, ...) {
         }
         __prog_tls.stdout_in_hook = false;
     } else {
-        void* stdout_stream = __acrt_iob_func(1);
-        __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+        // Format into a buffer then write via WriteFile so that VT escape sequences
+        // reach the VT state machine. In Windows Terminal (ConPTY), WriteConsoleW
+        // sends Unicode text directly to the renderer and bypasses VT processing;
+        // WriteFile sends raw bytes that ConPTY feeds through the VT parser.
+        int len = 0;
+        bool has_format = false;
+        while (fmt[len] != '\0') {
+            if (fmt[len] == '%') { has_format = true; break; }
+            len++;
+        }
+        void* hOut = GetStdHandle(-11);
+        int written = 0;
+        if (!has_format) {
+            WriteFile(hOut, fmt, len, &written, nullptr);
+        } else {
+            char* buf = (char*)malloc(4096);
+            int cap = 4096;
+            int needed = __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
+            if (needed >= cap) {
+                free(buf);
+                cap = needed + 1;
+                buf = (char*)malloc((i64)cap);
+                __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
+            }
+            WriteFile(hOut, buf, needed, &written, nullptr);
+            free(buf);
+        }
     }
     va_end(ap);
 }
@@ -125,8 +150,30 @@ extern int vprintf(const char* fmt, va_list ap) {
         __prog_tls.stdout_in_hook = false;
         return len;
     }
-    void* stdout_stream = __acrt_iob_func(1);
-    return __stdio_common_vfprintf(0, stdout_stream, fmt, nullptr, ap);
+    int len = 0;
+    bool has_format = false;
+    while (fmt[len] != '\0') {
+        if (fmt[len] == '%') { has_format = true; break; }
+        len++;
+    }
+    void* hOut = GetStdHandle(-11);
+    int written = 0;
+    if (!has_format) {
+        WriteFile(hOut, fmt, len, &written, nullptr);
+        return len;
+    }
+    char* buf = (char*)malloc(4096);
+    int cap = 4096;
+    int needed = __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
+    if (needed >= cap) {
+        free(buf);
+        cap = needed + 1;
+        buf = (char*)malloc((i64)cap);
+        __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
+    }
+    WriteFile(hOut, buf, needed, &written, nullptr);
+    free(buf);
+    return needed;
 }
 
 extern int vsprintf(char* buf, const char* fmt, va_list ap) {
