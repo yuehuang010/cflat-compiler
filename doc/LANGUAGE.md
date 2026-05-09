@@ -42,9 +42,6 @@
   - [Namespaces](#namespaces)
   - [`using` Aliases](#using-aliases)
   - [Module Imports](#module-imports)
-- [Memory Management](#memory-management)
-  - [`new` and `delete`](#new-and-delete)
-  - [Custom Allocators](#custom-allocators-operator-new--operator-delete)
 - [Type Casting](#type-casting)
 - [Null-Safety](#null-safety)
   - [Null-Conditional Access (`?.`)](#null-conditional-access-)
@@ -64,17 +61,12 @@
   - [Numeric Literals](#numeric-literals)
   - [Built-in Identifiers](#built-in-identifiers)
   - [Compile-Time Conditionals (`if const`)](#compile-time-conditionals-if-const)
-- [Concurrency](#concurrency)
-  - [Threads](#threads-corethread.cb)
-  - [Cancellation](#cancellation-corestop_tokencb)
-  - [Mutex](#mutex-coremutexcb)
-  - [Atomic](#atomic-coreatomic.cb)
-  - [Other Synchronization Primitives](#other-synchronization-primitives)
 - [`program` Keyword](#program-keyword)
 - [JSON](#json-libjsoncb)
 - [Debug Info](#debug-info-work-in-progress)
 - [Compiler CLI](#compiler-cli)
 - [Standard Library](#standard-library)
+- [Threading & Memory Management](threading.md)
 
 ---
 
@@ -843,61 +835,6 @@ If two imported files both declare a symbol with the same name and signature, th
 
 ---
 
-
-## Memory Management
-
-### `new` and `delete`
-
-```c
-class Node { int value = 0; };
-
-Node* n   = new Node();
-delete n;
-
-int* arr  = new int[5];
-delete[] arr;
-```
-
-**`delete[n]`** — call destructors on exactly `n` elements, then free. Use when the array was allocated without a cookie (e.g. raw `malloc`/`operator new`) and you know the count:
-
-```c
-Node* nodes = new Node[5];
-delete[5] nodes;    // calls ~Node() on each of the 5 elements, then frees
-```
-
-**`delete[_]`** — free the backing buffer *without* calling any destructors. Use after you have already destroyed elements manually (e.g. with `.~()`):
-
-```c
-Node* buf = new Node[3];
-buf[0].~();   // manual in-place destruction
-buf[1].~();
-buf[2].~();
-delete[_] buf;   // free only; destructors already ran
-```
-
-Summary of array-delete forms:
-
-| Form | Destructor calls | Count source |
-|------|-----------------|--------------|
-| `delete[] p` | all elements | hidden cookie |
-| `delete[n] p` | exactly `n` elements | explicit literal/variable |
-| `delete[_] p` | none | — |
-
-
-### Custom Allocators (`operator new` / `operator delete`)
-
-Override the global allocator by defining these operators:
-
-```c
-extern void* malloc(i64 size);
-extern void  free(void* ptr);
-
-void* operator new(long long size) { return malloc(size); }
-void  operator delete(void* ptr)   { free(ptr); }
-```
-
----
-
 ## Type Casting
 
 C-style casts truncate or sign-extend between numeric types:
@@ -1214,96 +1151,6 @@ else
 
 ---
 
-## Concurrency
-
-### Threads (`core/thread.cb`)
-
-```c
-import "thread.cb";
-
-int worker(void* ctx)
-{
-    int* p = (int*)ctx;
-    *p = 99;
-    return 0;
-}
-
-int value = 0;
-Thread t;
-t.start(worker, &value);
-t.join();
-// value == 99
-```
-
-Pass lambdas directly to `start`:
-
-```c
-Thread t;
-t.start((void* ctx) => { return 42; }, nullptr);
-i32 code = t.join();   // 42
-```
-
-### Cancellation (`core/stop_token.cb`)
-
-```c
-import "stop_token.cb";
-
-StopSource src;
-StopToken token = src.token();
-
-// In another thread: check token.isCancellationRequested()
-src.cancel();
-```
-
-### Mutex (`core/mutex.cb`)
-
-```c
-import "mutex.cb";
-
-Mutex m;
-m.acquire();
-// critical section
-m.release();
-```
-
-Use the `lock` statement for scoped acquisition:
-
-```c
-lock (m)
-{
-    // automatically released at end of block
-}
-```
-
-### Atomic (`core/atomic.cb`)
-
-```c
-import "atomic.cb";
-
-Atomic<int> counter;
-counter.store(0);
-counter.fetchAdd(1);
-int v = counter.load();
-```
-
-### Other Synchronization Primitives
-
-- `core/semaphore.cb` — `Semaphore` with `acquire`/`release`
-- `core/latch.cb` — `Latch` countdown; `countDown`, `wait`
-- `core/rwlock.cb` — `RwLock`; `acquireRead`/`releaseRead`, `acquireWrite`/`releaseWrite`
-- `core/channel.cb` — `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
-- `core/spsc_queue.cb` — `spsc_queue<T>` wait-free single-producer/single-consumer ring
-
-```c
-import "channel.cb";
-
-channel<int> ch;
-ch.send(42);
-int v = ch.recv();   // 42
-```
-
----
-
 ## `program` Keyword
 
 `program` defines a struct-like construct with a managed entry point. The compiler auto-generates a `run(list<string>)` method that spawns a dedicated thread, installs a per-thread `BlockAllocator` (all heap allocations inside `main` are freed automatically on return), calls `main`, and joins the thread.
@@ -1450,3 +1297,5 @@ cflat.exe <input.cb> [options]
 | `stop_token.cb` | `StopSource` / `StopToken` — cooperative cancellation |
 | `arena.cb` | `Arena` — bump allocator |
 | `json.cb` | `JsonBuilder.toJson<T>`, `fromJson<T>` — JSON serialization/deserialization |
+
+---

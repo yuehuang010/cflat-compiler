@@ -633,7 +633,7 @@ classDefinition
     ;
 
 lockFieldGroup
-    : lockClause '{' declaration+ '}'
+    : lockClause '{' (declaration | functionDefinition)+ '}'
     ;
 
 programDefinition

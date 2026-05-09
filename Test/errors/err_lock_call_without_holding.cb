@@ -1,0 +1,21 @@
+// Calling a function whose lock clause requires a lock the caller does not hold.
+
+import "mutex.cb";
+
+struct Counter {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+    }
+};
+
+void increment(Counter* a, int n) lock(a.mtx) {
+    a.value = a.value + n;
+}
+
+expect_error("must hold 'c.mtx' before calling this function") {
+    void test() {
+        Counter c;
+        increment(&c, 1);   // no lock held — error
+    }
+}

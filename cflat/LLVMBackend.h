@@ -424,6 +424,8 @@ public:
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
+    std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
+    std::vector<std::string> lastCallParameterNames; // VariableName of each parameter of the last resolved overload
 
     private:
 
@@ -3501,6 +3503,16 @@ public:
         }
     }
 
+    // Return the FunctionSymbol whose LLVM function pointer matches fn, or nullptr.
+    const FunctionSymbol* GetFunctionSymbol(llvm::Function* fn) const
+    {
+        for (const auto& [key, syms] : functionTable)
+            for (const auto& sym : syms)
+                if (sym.Function == fn)
+                    return &sym;
+        return nullptr;
+    }
+
     // Set RequiredLocks on the most-recently registered overload of functionName.
     void SetFunctionRequiredLocks(const std::string& functionName, std::vector<std::string> locks)
     {
@@ -4376,6 +4388,12 @@ public:
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnsOwned = candidate.ReturnsOwned;
+
+        // Populate lock-check side-channels for call-site RequiredLocks verification.
+        lastCallRequiredLocks = candidate.RequiredLocks;
+        lastCallParameterNames.clear();
+        for (const auto& p : candidate.Parameters)
+            lastCallParameterNames.push_back(p.VariableName);
 
         // Populate bond side-channel: collect source variable names for bond parameters.
         lastCallIsBonded = false;

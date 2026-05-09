@@ -284,7 +284,7 @@ private:
         return params;
     }
 
-    void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {})
+    void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::vector<std::string>& extraRequiredLocks = {})
     {
         auto* compiler = Compiler(func);
         // Return-block functions are inlined at call sites — no LLVM proto needed.
@@ -344,13 +344,19 @@ private:
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.IsStdcall, returnType.IsCdecl);
 
-        // Populate RequiredLocks from the function's lock clause.
-        if (auto* lockClauseCtx = func->lockClause())
+        // Populate RequiredLocks from the function's lock clause and any extra locks
+        // inherited from a positional lock group (extraRequiredLocks).
         {
             std::vector<std::string> locks;
-            for (auto* exprCtx : lockClauseCtx->lockArgList()->expression())
-                locks.push_back(exprCtx->getText());  // raw canonical text (incl. .read/.write)
-            compiler->SetFunctionRequiredLocks(name, std::move(locks));
+            if (auto* lockClauseCtx = func->lockClause())
+            {
+                for (auto* exprCtx : lockClauseCtx->lockArgList()->expression())
+                    locks.push_back(exprCtx->getText());
+            }
+            for (const auto& extra : extraRequiredLocks)
+                locks.push_back(extra);
+            if (!locks.empty())
+                compiler->SetFunctionRequiredLocks(name, std::move(locks));
         }
 
         if (auto* s = compiler->GetSymbolSink())
@@ -511,6 +517,25 @@ private:
             ScanStructDefinition(nestedStruct, typeName);
         for (auto* nestedClass : ctx->classDefinition())
             ScanClassDefinition(nestedClass, typeName);
+
+        // Pre-declare functions inside positional lock groups and mark their RequiredLocks.
+        for (auto* lfg : ctx->lockFieldGroup())
+        {
+            auto groupArgs = lfg->lockClause()->lockArgList()->expression();
+            if (groupArgs.empty()) continue;
+            std::string guardianName = groupArgs[0]->getText();
+            // Strip .read/.write rwlock suffix (same logic as GetLockArgCanonical in MainListener).
+            if (guardianName.size() > 5 && guardianName.substr(guardianName.size()-5) == ".read")
+                guardianName = guardianName.substr(0, guardianName.size()-5);
+            else if (guardianName.size() > 6 && guardianName.substr(guardianName.size()-6) == ".write")
+                guardianName = guardianName.substr(0, guardianName.size()-6);
+            // Qualify bare names to "this.<name>" so call-site substitution works.
+            std::string qualifiedLock = (guardianName.find('.') == std::string::npos)
+                                        ? ("this." + guardianName) : guardianName;
+            std::vector<std::string> groupLocks = { qualifiedLock };
+            for (auto* func : lfg->functionDefinition())
+                ScanFunctionDefinition(func, typeName, {}, groupLocks);
+        }
     }
 
     void ScanStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& namespaceName = {})
@@ -2921,12 +2946,19 @@ public:
 
         currentFunctionIsVariadic = varargs;
 
-        // Seed the lock-set from the function's lock clause (required locks at entry).
+        // Seed the lock-set from the function's RequiredLocks (covers both lock clauses and
+        // positional group membership). For this.X entries, also insert the bare form X so
+        // self-access checks (which use the guardian bare name) pass inside the method body.
         currentLockSet.clear();
-        if (auto* lockClauseCtx = func->lockClause())
+        if (const auto* sym = compiler->GetFunctionSymbol(fn))
         {
-            for (auto* exprCtx : lockClauseCtx->lockArgList()->expression())
-                currentLockSet.insert(GetLockArgCanonical(exprCtx));
+            for (const auto& rawLock : sym->RequiredLocks)
+            {
+                std::string canonical = StripLockModeSuffix(rawLock);
+                currentLockSet.insert(canonical);
+                if (canonical.size() > 5 && canonical.substr(0, 5) == "this.")
+                    currentLockSet.insert(canonical.substr(5));
+            }
         }
 
         // Record stack depth after createFunctionBlock pushed the function's frame.
@@ -7453,6 +7485,16 @@ public:
                                 // insert point is now accessBlock
 
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
+                                {
+                                    std::string rcvr = structVar.TypeAndValue.VariableName;
+                                    if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
+                                    {
+                                        const auto& fp = compilerLLVM->lastCallParameterNames[0];
+                                        if (fp.size() >= 2 && fp.substr(fp.size() - 2) == "__")
+                                            rcvr = "this";
+                                    }
+                                    CheckCallSiteLocks(ctx, rcvr, arguments);
+                                }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
 
@@ -7507,6 +7549,16 @@ public:
                                     }
                                 }
                                 namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
+                                {
+                                    std::string rcvr = structVar.TypeAndValue.VariableName;
+                                    if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
+                                    {
+                                        const auto& fp = compilerLLVM->lastCallParameterNames[0];
+                                        if (fp.size() >= 2 && fp.substr(fp.size() - 2) == "__")
+                                            rcvr = "this";
+                                    }
+                                    CheckCallSiteLocks(primaryCtx, rcvr, arguments);
+                                }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                 // Populate TypeAndValue from the resolved overload's return type
@@ -8847,7 +8899,8 @@ public:
             activeTypeSubstitutions = savedPackItemSubst;
         }
 
-        // Process lock field groups: each group annotates its fields with GuardedBy.
+        // Process lock field groups: each group annotates its fields with GuardedBy,
+        // and registers member functions with the group's lock as a RequiredLock.
         for (auto* lfg : ctx->lockFieldGroup())
         {
             // Also queue generic types used inside the group.
@@ -9103,6 +9156,20 @@ public:
             global_scope = savedScope;
         }
 
+        // Parse functions declared inside positional lock groups.
+        {
+            bool savedScope = global_scope;
+            for (auto* lfg : ctx->lockFieldGroup())
+            {
+                for (auto* func : lfg->functionDefinition())
+                {
+                    global_scope = false;
+                    ParseFunctionDefinition(func, structName);
+                }
+            }
+            global_scope = savedScope;
+        }
+
         // Parse destructor
         {
             bool savedScope = global_scope;
@@ -9143,6 +9210,76 @@ public:
         if (text.size() > 6 && text.substr(text.size() - 6) == ".write")
             return "write";
         return "";
+    }
+
+    // Strip ".read" / ".write" rwlock mode suffix from a raw lock string.
+    static std::string StripLockModeSuffix(const std::string& text)
+    {
+        if (text.size() > 5 && text.substr(text.size() - 5) == ".read")
+            return text.substr(0, text.size() - 5);
+        if (text.size() > 6 && text.substr(text.size() - 6) == ".write")
+            return text.substr(0, text.size() - 6);
+        return text;
+    }
+
+    // Verify that the current lock-set satisfies the RequiredLocks of the function just called.
+    // Called immediately after CreateOverloadedFunctionCall; reads lastCallRequiredLocks and
+    // lastCallParameterNames from the side-channel populated by that call.
+    // receiverText: the name of the receiver object ("acct"), "this" for bare method calls, or "".
+    // arguments: the NamedVariable vector passed to the call (includes implicit this at index 0 when present).
+    void CheckCallSiteLocks(antlr4::ParserRuleContext* ctx,
+                            const std::string& receiverText,
+                            const std::vector<LLVMBackend::NamedVariable>& arguments)
+    {
+        const auto& requiredLocks = compilerLLVM->lastCallRequiredLocks;
+        if (requiredLocks.empty()) return;
+
+        const auto& paramNames = compilerLLVM->lastCallParameterNames;
+
+        for (const auto& rawLock : requiredLocks)
+        {
+            std::string lock = StripLockModeSuffix(rawLock);
+
+            // Split on the first '.' to get head (owner) and rest (field path).
+            size_t dot = lock.find('.');
+            std::string head = (dot == std::string::npos) ? lock : lock.substr(0, dot);
+            std::string rest = (dot == std::string::npos) ? "" : lock.substr(dot + 1);
+
+            std::string canonical;
+            if (head == "this")
+            {
+                // this-relative lock: substitute with the receiver variable name.
+                if (receiverText.empty()) continue; // no known receiver — skip
+                canonical = rest.empty() ? receiverText : receiverText + "." + rest;
+            }
+            else
+            {
+                // Try to match head to a formal parameter name.
+                bool found = false;
+                for (size_t pi = 0; pi < paramNames.size(); pi++)
+                {
+                    if (paramNames[pi] != head) continue;
+                    // arguments[pi] corresponds to paramNames[pi] (both include implicit this at index 0).
+                    if (pi < arguments.size())
+                    {
+                        const std::string& argName = arguments[pi].CallerName;
+                        if (argName.empty()) found = true; // complex expression — can't check
+                        else
+                            canonical = rest.empty() ? argName : argName + "." + rest;
+                    }
+                    found = true;
+                    break;
+                }
+                if (!found)
+                    canonical = lock; // global lock — no substitution
+            }
+
+            if (!canonical.empty() && currentLockSet.find(canonical) == currentLockSet.end())
+            {
+                LogErrorContext(ctx, std::format(
+                    "must hold '{}' before calling this function.", canonical));
+            }
+        }
     }
 
     // Find the first registered overload of `methodName` whose first parameter type is `firstParamType`.
@@ -10577,6 +10714,20 @@ public:
                 }
                 else
                     ParseFunctionDefinition(func, structName);
+            }
+            global_scope = savedScope;
+        }
+
+        // Parse functions declared inside positional lock groups.
+        {
+            bool savedScope = global_scope;
+            for (auto* lfg : ctx->lockFieldGroup())
+            {
+                for (auto* func : lfg->functionDefinition())
+                {
+                    global_scope = false;
+                    ParseFunctionDefinition(func, structName);
+                }
             }
             global_scope = savedScope;
         }

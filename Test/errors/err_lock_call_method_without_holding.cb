@@ -1,0 +1,21 @@
+// Calling a positional-group method without holding the receiver's lock.
+
+import "mutex.cb";
+
+struct Account {
+    mutex mtx = default;
+    lock(mtx) {
+        int balance = default;
+
+        void deposit(int n) {
+            balance = balance + n;
+        }
+    }
+};
+
+expect_error("must hold 'acct.mtx' before calling this function") {
+    void test() {
+        Account acct;
+        acct.deposit(50);   // acct.mtx not held — error
+    }
+}
