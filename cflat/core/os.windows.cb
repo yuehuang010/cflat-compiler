@@ -139,6 +139,72 @@ extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData)
 extern stdcall win_int  FindClose(void* handle);
 extern stdcall win_int  GetFileAttributesA(const char* path);
 
+// Win32 Console
+// _CONSOLE_CURSOR_INFO — 8 bytes (dwSize + bVisible).
+struct _CONSOLE_CURSOR_INFO {
+    i32 size    = default;  // 0 — dwSize: cursor fill percentage (1-100)
+    i32 visible = default;  // 4 — bVisible: BOOL
+};
+
+// _CONSOLE_SCREEN_BUFFER_INFO — 22 bytes.
+// All SHORT fields (i16); no padding needed since all fields are 2-byte aligned.
+struct _CONSOLE_SCREEN_BUFFER_INFO {
+    i16 sizeX      = default;  //  0 — dwSize.X
+    i16 sizeY      = default;  //  2 — dwSize.Y
+    i16 cursorX    = default;  //  4 — dwCursorPosition.X
+    i16 cursorY    = default;  //  6 — dwCursorPosition.Y
+    i16 attributes = default;  //  8 — wAttributes
+    i16 winLeft    = default;  // 10 — srWindow.Left
+    i16 winTop     = default;  // 12 — srWindow.Top
+    i16 winRight   = default;  // 14 — srWindow.Right
+    i16 winBottom  = default;  // 16 — srWindow.Bottom
+    i16 maxX       = default;  // 18 — dwMaximumWindowSize.X
+    i16 maxY       = default;  // 20 — dwMaximumWindowSize.Y
+};
+
+// _INPUT_RECORD — 20 bytes.
+// EventType (WORD, 2 bytes) + 2 bytes alignment pad + KEY_EVENT_RECORD (16 bytes).
+// Only KEY_EVENT fields are mapped; mouse/window-size events share the same union space.
+struct _INPUT_RECORD {
+    i16 eventType       = default;  //  0 — WORD EventType (1=KEY, 2=MOUSE, 4=WINDOW_BUFFER_SIZE)
+    i16 _pad            = default;  //  2 — alignment pad before union
+    i32 keyDown         = default;  //  4 — BOOL bKeyDown
+    i16 repeatCount     = default;  //  8 — WORD wRepeatCount
+    i16 vkCode          = default;  // 10 — WORD wVirtualKeyCode
+    i16 vkScan          = default;  // 12 — WORD wVirtualScanCode
+    i16 uChar           = default;  // 14 — WCHAR/CHAR union (low byte = ASCII)
+    i32 controlKeyState = default;  // 16 — DWORD dwControlKeyState
+};
+
+extern stdcall void*    GetStdHandle(i32 nStdHandle);
+extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
+extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
+extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);
+extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
+extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);
+extern stdcall win_int  ReadConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
+extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
+
+// _CHAR_INFO — 4 bytes per console screen buffer cell.
+struct _CHAR_INFO {
+    i16 ch   = default;  // 0 — WCHAR/CHAR union (low byte = ASCII)
+    i16 attr = default;  // 2 — WORD color attributes
+};
+
+// _SMALL_RECT — 8 bytes, used by ReadConsoleOutputA.
+struct _SMALL_RECT {
+    i16 left   = default;
+    i16 top    = default;
+    i16 right  = default;
+    i16 bottom = default;
+};
+
+// dwBufferSize and dwBufferCoord are COORD values packed into i32
+// (X in low 16 bits, Y in high 16 bits). lpReadRegion is updated on
+// return to reflect the actual region read.
+extern stdcall win_int  ReadConsoleOutputA(void* hConsoleOutput, _CHAR_INFO* lpBuffer, i32 dwBufferSize, i32 dwBufferCoord, _SMALL_RECT* lpReadRegion);
+
 // MSVC CRT — cdecl (no stdcall). bufSize is SIZE_T (win_size).
 extern void*    __acrt_iob_func(win_int fd);
 extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);

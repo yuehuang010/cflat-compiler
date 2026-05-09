@@ -1,0 +1,88 @@
+import "terminal.cb";
+
+extern int main()
+{
+    Terminal term;
+    bool ok = term.init();
+
+    int w = 0;
+    int h = 0;
+    term.getSize(&w, &h);
+
+    // Basic output helpers — harmless even when redirected
+    term.hideCursor();
+    term.moveTo(1, 1);
+    termColor(32, 40);
+    printf("terminal: init=%d size=%dx%d\n", (int)ok, w, h);
+    termReset();
+    term.showCursor();
+    term.clearLine();
+    term.flush();
+
+    TerminalDriver driver;
+    driver.init(&term);
+
+    if (ok) {
+        // ── inject + poll roundtrip ───────────────────────────────────────────
+        driver.injectKey((i16)VK_LEFT, '\0', 0);
+        KeyEvent key;
+        bool got = term.pollKey(&key);
+        if (!got || key.vkCode != (i16)VK_LEFT) {
+            printf("FAIL: inject+poll roundtrip\n");
+            term.restore();
+            return 1;
+        }
+
+        // Ctrl+C inject
+        driver.injectKey(0x43, '\x03', 0x04);
+        KeyEvent ctrl;
+        bool gotCtrl = term.pollKey(&ctrl);
+        if (!gotCtrl || ctrl.vkCode != 0x43 || !ctrl.isCtrl()) {
+            printf("FAIL: ctrl+key inject\n");
+            term.restore();
+            return 1;
+        }
+
+        // injectText — drain each character back out
+        driver.injectText("Hi");
+        KeyEvent k1;
+        KeyEvent k2;
+        bool g1 = term.pollKey(&k1);
+        bool g2 = term.pollKey(&k2);
+        if (!g1 || k1.ch != 'H' || !g2 || k2.ch != 'i') {
+            printf("FAIL: injectText roundtrip\n");
+            term.restore();
+            return 1;
+        }
+
+        // ── snapshot ─────────────────────────────────────────────────────────
+        term.moveTo(3, 1);
+        printf("SNAP_MARKER");
+        term.flush();
+
+        TerminalSnapshot snap;
+        bool snapped = driver.snapshot(&snap);
+        if (snapped) {
+            if (!snap.contains("SNAP_MARKER")) {
+                printf("FAIL: snapshot does not contain SNAP_MARKER\n");
+                term.restore();
+                return 1;
+            }
+            // getChar spot-check: row 3 col 1 should be 'S'
+            char c = snap.getChar(3, 1);
+            if (c != 'S') {
+                printf("FAIL: getChar(3,1) expected 'S' got '%c'\n", c);
+                term.restore();
+                return 1;
+            }
+        }
+        // If snapped==false the output is redirected — skip snapshot assertions
+    }
+
+    term.restore();
+    // Verify restore is idempotent
+    term.restore();
+
+    printf("PASS\n");
+    return 0;
+}
