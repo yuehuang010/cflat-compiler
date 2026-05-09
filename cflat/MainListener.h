@@ -7303,6 +7303,14 @@ public:
                             std::vector<LLVMBackend::NamedVariable> arguments;
                             if (structVar.BaseType)
                             {
+                                // Use-after-move check for the method receiver.
+                                // LoadNamedVariable is not called for receivers, so check IsMoved here.
+                                if (structVar.IsMoved && structVar.IdentifierLine > 0)
+                                {
+                                    Compiler(ctx)->currentLine = structVar.IdentifierLine;
+                                    Compiler(ctx)->currentColumn = structVar.IdentifierColumn;
+                                    Compiler(ctx)->LogError(std::format("use of moved variable '{}'", structVar.CallerName));
+                                }
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 arguments.push_back(argumentNamedVar);

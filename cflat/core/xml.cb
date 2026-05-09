@@ -1,0 +1,555 @@
+import "arena.cb";
+import "list.cb";
+
+// XmlBuilder — serializes a struct to XML using the reflect intrinsic.
+// Honors [JsonName] (field rename) and [Private] (field skip) annotations,
+// the same as JsonBuilder, because both use the reflect/reflect_set intrinsics.
+class XmlBuilder : IReflector
+{
+    stringbuilder sb      = default;
+    string        _rootTag = default;
+    list<string>  _tags   = default;
+
+    void _openTag(string tag)
+    {
+        sb.appendChar('<');
+        sb.append(tag);
+        sb.appendChar('>');
+    }
+
+    void _closeTag(string tag)
+    {
+        sb.append("</");
+        sb.append(tag);
+        sb.appendChar('>');
+    }
+
+    void beginObject(string name)
+    {
+        string tag = name;
+        if (tag.length() == 0)
+        {
+            if (_tags.count() == 0) tag = _rootTag;
+            else tag = "item";
+        }
+        _openTag(tag);
+        _tags.add(tag);
+    }
+
+    void endObject()
+    {
+        int last = _tags.count() - 1;
+        string tag = _tags.get(last);
+        _tags.removeAt(last);
+        _closeTag(tag);
+    }
+
+    void beginArray(string name)
+    {
+        _openTag(name);
+        _tags.add(name);
+    }
+
+    void endArray()
+    {
+        int last = _tags.count() - 1;
+        string tag = _tags.get(last);
+        _tags.removeAt(last);
+        _closeTag(tag);
+    }
+
+    void visitInt(string name, int value)
+    {
+        string tag = name;
+        if (tag.length() == 0) tag = "item";
+        _openTag(tag);
+        sb.append(value);
+        _closeTag(tag);
+    }
+
+    void visitBool(string name, bool value)
+    {
+        string tag = name;
+        if (tag.length() == 0) tag = "item";
+        _openTag(tag);
+        if (value) sb.append("true"); else sb.append("false");
+        _closeTag(tag);
+    }
+
+    void visitFloat(string name, float value)
+    {
+        string tag = name;
+        if (tag.length() == 0) tag = "item";
+        _openTag(tag);
+        int ival = (int)value;
+        if ((float)ival == value)
+        {
+            sb.append(ival);
+        }
+        else
+        {
+            char[32] buf;
+            i32 len = sprintf(&buf[0], "%g", value);
+            buf[len] = 0;
+            sb.appendCStr(&buf[0]);
+        }
+        _closeTag(tag);
+    }
+
+    void visitString(string name, string value)
+    {
+        string tag = name;
+        if (tag.length() == 0) tag = "item";
+        _openTag(tag);
+        i8* ptr = value.data();
+        int vlen = value.length();
+        int i = 0;
+        while (i < vlen)
+        {
+            i8 c = ptr[i];
+            if      (c == '&') sb.append("&amp;");
+            else if (c == '<') sb.append("&lt;");
+            else if (c == '>') sb.append("&gt;");
+            else               sb.appendChar(c);
+            i++;
+        }
+        _closeTag(tag);
+    }
+
+    void visitNull(string name)
+    {
+        string tag = name;
+        if (tag.length() == 0) tag = "item";
+        sb.appendChar('<');
+        sb.append(tag);
+        sb.append(" />");
+    }
+
+    string toString() { return sb.toString(); }
+
+    static string toXml<T>(T obj, const char* rootTag)
+    {
+        XmlBuilder b;
+        string rt;
+        rt._ptr = (i8*)rootTag;
+        rt._len = strlen(rootTag);
+        b._rootTag = rt;
+        IReflector visitor = b;
+        reflect(obj, visitor);
+        return b.toString();
+    }
+
+    static T fromXml<T>(string xml)
+    {
+        Arena arena;
+        arena.setBlockSize(4096);
+        XmlParser p;
+        p._src = xml.data();
+        p._len = xml.length();
+        p._pos = 0;
+        p._arena = &arena;
+        p._skipWs();
+        T result;
+        XmlNode* root = p._parseElement();
+        if (root != nullptr)
+        {
+            IJSON src = root;
+            reflect_set(result, src);
+        }
+        return result;
+    }
+
+    // Parse XML from a raw byte pointer + length — avoids a string copy at the call site.
+    static T fromXmlRaw<T>(i8* data, int len)
+    {
+        Arena arena;
+        arena.setBlockSize(4096);
+        XmlParser p;
+        p._src = data;
+        p._len = len;
+        p._pos = 0;
+        p._arena = &arena;
+        p._skipWs();
+        T result;
+        XmlNode* root = p._parseElement();
+        if (root != nullptr)
+        {
+            IJSON src = root;
+            reflect_set(result, src);
+        }
+        return result;
+    }
+};
+
+// ── XmlNode ───────────────────────────────────────────────────────────────────
+// Tree node for a parsed XML element. Implements IJSON so reflect_set can walk
+// struct fields by looking up child elements by tag name, and IJSONArray so
+// array fields work by iterating children.
+//
+// Children are a singly-linked list via _nextSibling. Leaf elements store their
+// text content in _text; container elements store children and leave _text empty.
+class XmlNode : IJSON, IJSONArray
+{
+    string   _tag         = default;
+    string   _text        = default;
+    XmlNode* _firstChild  = nullptr;
+    XmlNode* _lastChild   = nullptr;
+    XmlNode* _nextSibling = nullptr;
+    int      _childCount  = 0;
+
+    ~XmlNode()
+    {
+        XmlNode* child = _firstChild;
+        while (child != nullptr)
+        {
+            XmlNode* sib = child._nextSibling;
+            delete child;
+            child = sib;
+        }
+    }
+
+    void _appendChild(move XmlNode* child)
+    {
+        child._nextSibling = nullptr;
+        if (_firstChild == nullptr)
+        {
+            _firstChild = child;
+            _lastChild = _firstChild;
+        }
+        else
+        {
+            _lastChild._nextSibling = child;
+            _lastChild = _lastChild._nextSibling;
+        }
+        _childCount++;
+    }
+
+    XmlNode* _findTag(string tag)
+    {
+        XmlNode* child = _firstChild;
+        while (child != nullptr)
+        {
+            if (child._tag == tag) return child;
+            child = child._nextSibling;
+        }
+        return nullptr;
+    }
+
+    XmlNode* _getIndex(int index)
+    {
+        XmlNode* child = _firstChild;
+        int i = 0;
+        while (child != nullptr && i < index) { child = child._nextSibling; i++; }
+        return child;
+    }
+
+    int _textToInt(string text)
+    {
+        i8* p = text.data();
+        int len = text.length();
+        int i = 0;
+        bool neg = false;
+        if (i < len && p[i] == '-') { neg = true; i++; }
+        int acc = 0;
+        while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc * 10 + (p[i] - '0'); i++; }
+        return neg ? -acc : acc;
+    }
+
+    float _textToFloat(string text)
+    {
+        i8* p = text.data();
+        int len = text.length();
+        int i = 0;
+        bool neg = false;
+        if (i < len && p[i] == '-') { neg = true; i++; }
+        float acc = 0;
+        while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc * 10.0f + (float)(p[i] - '0'); i++; }
+        if (i < len && p[i] == '.')
+        {
+            i++;
+            float frac = 0.1f;
+            while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc + (float)(p[i] - '0') * frac; frac = frac * 0.1f; i++; }
+        }
+        return neg ? -acc : acc;
+    }
+
+    // ── IJSON ─────────────────────────────────────────────────────────────────
+
+    bool hasField(string key) { return _findTag(key) != nullptr; }
+
+    int getInt(string key)
+    {
+        XmlNode* n = _findTag(key);
+        if (n == nullptr) return 0;
+        return _textToInt(n._text);
+    }
+
+    bool getBool(string key)
+    {
+        XmlNode* n = _findTag(key);
+        if (n == nullptr) return false;
+        return n._text == "true";
+    }
+
+    float getFloat(string key)
+    {
+        XmlNode* n = _findTag(key);
+        if (n == nullptr) return 0;
+        return _textToFloat(n._text);
+    }
+
+    string getString(string key)
+    {
+        XmlNode* n = _findTag(key);
+        if (n == nullptr) return "";
+        return n._text;
+    }
+
+    IJSON getObject(string key)
+    {
+        XmlNode* n = _findTag(key);
+        IJSON result = default;
+        if (n != nullptr && n._childCount > 0)
+            result = n;
+        return result;
+    }
+
+    IJSONArray getArray(string key)
+    {
+        XmlNode* n = _findTag(key);
+        IJSONArray result = default;
+        if (n != nullptr)
+            result = n;
+        return result;
+    }
+
+    // ── IJSONArray ────────────────────────────────────────────────────────────
+
+    int count() { return _childCount; }
+
+    int getInt(int index)
+    {
+        XmlNode* n = _getIndex(index);
+        if (n == nullptr) return 0;
+        return _textToInt(n._text);
+    }
+
+    bool getBool(int index)
+    {
+        XmlNode* n = _getIndex(index);
+        if (n == nullptr) return false;
+        return n._text == "true";
+    }
+
+    float getFloat(int index)
+    {
+        XmlNode* n = _getIndex(index);
+        if (n == nullptr) return 0;
+        return _textToFloat(n._text);
+    }
+
+    string getString(int index)
+    {
+        XmlNode* n = _getIndex(index);
+        if (n == nullptr) return "";
+        return n._text;
+    }
+
+    IJSON getObject(int index)
+    {
+        XmlNode* n = _getIndex(index);
+        IJSON result = default;
+        if (n != nullptr && n._childCount > 0)
+            result = n;
+        return result;
+    }
+};
+
+// ── XmlParser ─────────────────────────────────────────────────────────────────
+// Recursive-descent XML parser. Builds an XmlNode tree.
+// Nodes are bump-allocated from _arena when set; strings are heap-allocated.
+// Supports: elements, text content, XML declarations (<?...?>), comments.
+// Attributes are skipped — field values are carried by child elements only.
+struct XmlParser
+{
+    i8*    _src   = nullptr;
+    int    _pos   = 0;
+    int    _len   = 0;
+    Arena* _arena = nullptr;
+
+    XmlNode* _allocNode()
+    {
+        if (_arena != nullptr)
+            return (XmlNode*)_arena.zalloc((i64)sizeof(XmlNode));
+        return new XmlNode;
+    }
+
+    i8 _peek() { if (_pos >= _len) return 0; return _src[_pos]; }
+
+    i8 _consume()
+    {
+        if (_pos >= _len) return 0;
+        i8 c = _src[_pos];
+        _pos++;
+        return c;
+    }
+
+    void _skipWs()
+    {
+        while (_pos < _len)
+        {
+            i8 c = _src[_pos];
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+            _pos++;
+        }
+    }
+
+    // Parse an XML name (tag), stopping at whitespace, '>', '/', or '='.
+    string _parseName()
+    {
+        int start = _pos;
+        while (_pos < _len)
+        {
+            i8 c = _src[_pos];
+            if (c == '>' || c == '/' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '=') break;
+            _pos++;
+        }
+        int nameLen = _pos - start;
+        i8* buf = new i8[nameLen + 1];
+        int i = 0;
+        while (i < nameLen) { buf[i] = _src[start + i]; i++; }
+        buf[nameLen] = 0;
+        string result;
+        result._ptr = buf;
+        result._len = nameLen;
+        return result;
+    }
+
+    // Skip any attributes in the opening tag, leaving _pos at '>' or '/'.
+    void _skipAttributes()
+    {
+        while (_pos < _len)
+        {
+            i8 c = _src[_pos];
+            if (c == '>') break;
+            if (c == '/' && _pos + 1 < _len && _src[_pos + 1] == '>') break;
+            _pos++;
+        }
+    }
+
+    // Read text content up to the next '<', unescaping XML entities.
+    string _parseText()
+    {
+        stringbuilder sb;
+        while (_pos < _len && _src[_pos] != '<')
+        {
+            i8 c = _consume();
+            if (c == '&')
+            {
+                if (_pos + 3 < _len && _src[_pos] == 'a' && _src[_pos+1] == 'm' && _src[_pos+2] == 'p' && _src[_pos+3] == ';')
+                    { sb.appendChar('&'); _pos += 4; }
+                else if (_pos + 2 < _len && _src[_pos] == 'l' && _src[_pos+1] == 't' && _src[_pos+2] == ';')
+                    { sb.appendChar('<'); _pos += 3; }
+                else if (_pos + 2 < _len && _src[_pos] == 'g' && _src[_pos+1] == 't' && _src[_pos+2] == ';')
+                    { sb.appendChar('>'); _pos += 3; }
+                else
+                    sb.appendChar(c);
+            }
+            else
+                sb.appendChar(c);
+        }
+        return sb.toString();
+    }
+
+    // Skip <?...?> declarations, <!-- --> comments, and <!...> doctypes.
+    void _skipDeclarationOrComment()
+    {
+        if (_pos < _len && _src[_pos] == '?')
+        {
+            while (_pos + 1 < _len && !(_src[_pos] == '?' && _src[_pos+1] == '>')) _pos++;
+            _pos += 2;
+            return;
+        }
+        if (_pos + 2 < _len && _src[_pos] == '!' && _src[_pos+1] == '-' && _src[_pos+2] == '-')
+        {
+            _pos += 3;
+            while (_pos + 2 < _len && !(_src[_pos] == '-' && _src[_pos+1] == '-' && _src[_pos+2] == '>')) _pos++;
+            _pos += 3;
+            return;
+        }
+        // <!DOCTYPE or similar — skip to >
+        while (_pos < _len && _src[_pos] != '>') _pos++;
+        if (_pos < _len) _pos++;
+    }
+
+    // Parse one element and return its node, or nullptr if at a closing tag or EOF.
+    XmlNode* _parseElement()
+    {
+        _skipWs();
+        if (_pos >= _len || _src[_pos] != '<') return nullptr;
+        _consume(); // <
+
+        if (_pos < _len && (_src[_pos] == '?' || _src[_pos] == '!'))
+        {
+            _skipDeclarationOrComment();
+            return _parseElement();
+        }
+
+        if (_pos < _len && _src[_pos] == '/') return nullptr; // closing tag
+
+        string tag = _parseName();
+        _skipAttributes();
+
+        // Self-closing: />
+        if (_pos < _len && _src[_pos] == '/')
+        {
+            _pos++;
+            if (_pos < _len && _src[_pos] == '>') _pos++;
+            XmlNode* node = _allocNode();
+            node._tag = tag;
+            return node;
+        }
+
+        if (_pos < _len && _src[_pos] == '>') _pos++;
+
+        XmlNode* node = _allocNode();
+        node._tag = tag;
+
+        _skipWs();
+        if (_pos < _len && _src[_pos] != '<')
+        {
+            // Leaf element — text content
+            node._text = _parseText();
+            _skipWs();
+        }
+        else
+        {
+            // Container element — child elements
+            while (_pos < _len)
+            {
+                _skipWs();
+                if (_pos >= _len || _src[_pos] != '<') break;
+                if (_pos + 1 < _len && _src[_pos+1] == '/') break;
+                if (_pos + 1 < _len && (_src[_pos+1] == '?' || _src[_pos+1] == '!'))
+                {
+                    _consume(); // <
+                    _skipDeclarationOrComment();
+                    continue;
+                }
+                XmlNode* child = _parseElement();
+                if (child != nullptr)
+                    node._appendChild(child);
+            }
+        }
+
+        // Consume closing tag </tag>
+        if (_pos + 1 < _len && _src[_pos] == '<' && _src[_pos+1] == '/')
+        {
+            _pos += 2;
+            while (_pos < _len && _src[_pos] != '>') _pos++;
+            if (_pos < _len) _pos++;
+        }
+
+        return node;
+    }
+};

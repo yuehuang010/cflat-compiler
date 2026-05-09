@@ -1,0 +1,11 @@
+import "string.cb";
+
+void consume(move string s) {}
+
+extern int main()
+{
+    expect_error("use of moved variable 'tag'");
+    string tag = "hello";
+    consume(tag);
+    int len = tag.length();
+}

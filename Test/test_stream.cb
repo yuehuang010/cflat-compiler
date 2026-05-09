@@ -51,9 +51,10 @@ bool testStreamBasicPipe() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -81,9 +82,10 @@ bool testStreamSmallBuffer() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -137,9 +139,10 @@ bool testStreamPrimitives() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -207,9 +210,10 @@ bool testStreamStringType() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -275,9 +279,10 @@ bool testStreamCharPtr() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -354,9 +359,10 @@ bool testStreamMixedTypes() {
     p1 >> s;
     s >> p2;
 
-    list<string> args;
-    p1.run(args);
-    p2.run(args);
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
 
     p1.WaitForExit();
     s.close();
@@ -427,9 +433,10 @@ bool testBidirectionalStdio() {
     r >> s2;
     s2 >> q;
 
-    list<string> args;
-    q.run(args);
-    r.run(args);
+    list<string> args1;
+    list<string> args2;
+    q.run(args1);
+    r.run(args2);
 
     q.WaitForExit();
     r.WaitForExit();

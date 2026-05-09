@@ -225,7 +225,7 @@ void borrow(Resource* r)        { ... }  // caller still owns r
 
 - **Call site is silent** — no annotation needed; the caller's pointer is automatically nulled after a `move` call.
 - `move` is a **soft keyword** — detected via text matching in `ParseDeclarationSpecifiers()`, not as an ANTLR lexer token (avoids breaking identifiers/methods named `move`).
-- For value types (int, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true`.
+- For primitive value types (int, float, bool, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true` **or** the value is an owning `string`. `string` owns a heap buffer (`_ptr` field) and is zeroed on move even though it is not a pointer type; use-after-move of `string` is a compile error like any pointer type.
 - `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; `list::removeAt()` auto-frees pointer elements (destructor + delete); `dictionary::remove()` does not.
 
 Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.

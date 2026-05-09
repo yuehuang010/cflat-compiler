@@ -1,0 +1,27 @@
+import "xml.cb";
+
+struct Point { int x = 0; int y = 0; };
+
+class DebugReflector : IReflector
+{
+    void beginObject(string name) { printf("beginObject name='%s' len=%d\n", name.data(), name.length()); }
+    void endObject()              { printf("endObject\n"); }
+    void beginArray(string name)  { printf("beginArray name='%s'\n", name.data()); }
+    void endArray()               { printf("endArray\n"); }
+    void visitInt(string name, int value)     { printf("visitInt name='%s' val=%d\n", name.data(), value); }
+    void visitBool(string name, bool value)   { printf("visitBool name='%s'\n", name.data()); }
+    void visitFloat(string name, float value) { printf("visitFloat name='%s'\n", name.data()); }
+    void visitString(string name, string value){ printf("visitString name='%s'\n", name.data()); }
+    void visitNull(string name)               { printf("visitNull name='%s'\n", name.data()); }
+};
+
+extern int main()
+{
+    Point p;
+    p.x = 3;
+    p.y = 7;
+    DebugReflector dr;
+    IReflector vis = dr;
+    reflect(p, vis);
+    return 0;
+}

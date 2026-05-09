@@ -4440,11 +4440,16 @@ public:
                     }
                 }
                 // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
-                // Only applies to pointer types — move is a no-op for value types (int, etc.).
-                if (!matched[i].CallerName.empty() &&
-                    matched[i].BaseType != nullptr &&
-                    llvm::isa<llvm::PointerType>(matched[i].BaseType))
-                    MarkVariableMoved(matched[i].CallerName);
+                // Covers pointer, owning-string, and struct move params — all cases where caller storage was zeroed.
+                if (!matched[i].CallerName.empty() && matched[i].Storage != nullptr &&
+                    !isInterfaceBorrow && matched[i].BaseType != nullptr)
+                {
+                    bool isPtr = llvm::isa<llvm::PointerType>(matched[i].BaseType);
+                    bool isOwningStr = candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString;
+                    bool isStruct = llvm::isa<llvm::StructType>(matched[i].BaseType);
+                    if (isPtr || isOwningStr || isStruct)
+                        MarkVariableMoved(matched[i].CallerName);
+                }
             }
         }
 

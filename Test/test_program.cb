@@ -134,10 +134,12 @@ program Supervisor {
         w1.workload = 5;   // sum(1..5)  = 15
         w2.workload = 10;  // sum(1..10) = 55
 
-        list<string> empty;
-        w0.run(empty);
-        w1.run(empty);
-        w2.run(empty);
+        list<string> args0;
+        list<string> args1;
+        list<string> args2;
+        w0.run(args0);
+        w1.run(args1);
+        w2.run(args2);
 
         w0.WaitForExit();
         w1.WaitForExit();
