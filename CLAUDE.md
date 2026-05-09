@@ -204,6 +204,8 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
 - **Null-safe access**: `ptr?.field` — works on any struct pointer (local variables, function arguments, struct member fields)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
+- **Ternary operator**: `condition ? trueValue : falseValue` — compact conditional expression; both branches must be compatible types
+- **`break` / `continue`**: exit or advance the nearest enclosing `while`, `for`, `foreach` loop
 - **Operator overloading**: `operator+`, `operator==`, `operator new`, `operator delete`
 - **Function overloads** with type-based resolution and default parameters
 - **Named parameters**: `func(x: 1, y: 2)` — args matched by name, any order

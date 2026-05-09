@@ -55,6 +55,10 @@
   - [`IReflector` Interface](#ireflector-interface)
   - [`reflect(value, visitor)`](#reflectvalue-visitor)
 - [Range-Based For](#range-based-for)
+- [Control Flow](#control-flow)
+  - [Ternary Operator (`? :`)](#ternary-operator--)
+  - [`break` and `continue`](#break-and-continue)
+  - [Pointer Arithmetic](#pointer-arithmetic)
 - [Other Features](#other-features)
   - [Operator Overloading](#operator-overloading)
   - [Bitwise and Shift Operators](#bitwise-and-shift-operators)
@@ -1073,6 +1077,95 @@ arr.set(0, 100); arr.set(1, 200); arr.set(2, 300);
 
 for (int v in arr)
     printf("%d\n", v);
+```
+
+---
+
+## Control Flow
+
+### Ternary Operator (`? :`)
+
+`condition ? trueValue : falseValue` — a compact conditional expression that evaluates to one of two values:
+
+```c
+int x = 10;
+int abs_x = (x >= 0) ? x : -x;    // abs_x = 10
+
+bool flag = true;
+string label = flag ? "yes" : "no"; // label = "yes"
+```
+
+Both branches must produce compatible types. The ternary is an expression, so it can appear anywhere a value is expected:
+
+```c
+printf("sign: %s\n", (n > 0) ? "pos" : (n < 0) ? "neg" : "zero");
+```
+
+### `break` and `continue`
+
+`break` exits the nearest enclosing `while`, `for`, or `foreach` loop immediately. `continue` jumps to the loop's next iteration:
+
+```c
+// break — exit when sentinel found
+int i = 0;
+while (i < 100)
+{
+    if (i == 5) break;
+    i++;
+}
+// i == 5
+
+// continue — skip even numbers
+for (int k = 0; k < 10; k++)
+{
+    if (k % 2 == 0) continue;
+    printf("%d\n", k);   // prints 1 3 5 7 9
+}
+```
+
+Both also work inside `foreach` and `do...while` loops.
+
+### Pointer Arithmetic
+
+CFlat follows C semantics: arithmetic on a typed pointer steps by **element size**, not by bytes.
+
+```c
+int* arr = new int[4];
+arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40;
+
+// ptr + int / ptr - int
+int* p = arr + 1;      // points to arr[1]  (advance 4 bytes)
+int* q = arr + 3;
+int* r = q - 1;        // points to arr[2]
+
+// Subscript on raw pointer
+printf("%d\n", p[0]);  // 20
+printf("%d\n", p[1]);  // 30
+
+// p++ / p-- advance by sizeof(*p) elements
+p = arr;
+p++;                   // now points to arr[1]
+p++;                   // now points to arr[2]
+p--;                   // back to arr[1]
+
+// p += n / p -= n
+p = arr;
+p += 3;                // points to arr[3]
+p -= 2;                // points to arr[1]
+
+// ptr - ptr → element count (C ptrdiff_t)
+int* start = arr;
+int* end   = arr + 4;
+int diff = (int)(end - start);   // 4  (not 16 bytes)
+```
+
+`i8*` (byte pointer) obeys the same rules — since `sizeof(i8) == 1`, `p++` and `p += n` advance by exactly one byte, as expected:
+
+```c
+i8* buf = (i8*)new i8[8];
+i8* cursor = buf;
+cursor++;              // advance 1 byte
+cursor += 3;           // advance 3 more bytes
 ```
 
 ---

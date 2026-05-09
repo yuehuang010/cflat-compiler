@@ -2455,15 +2455,17 @@ public:
         stackNamedVariable.back().functionArgument["this"] = thisVar;
     }
 
-    llvm::Value* CreateIncrement(llvm::Value* destination, int amount)
+    llvm::Value* CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType = nullptr)
     {
         llvm::LoadInst* loadInst = CreateLoad(destination);
 
         if (loadInst->getType()->isPointerTy())
         {
-            // Pointer increment/decrement: byte arithmetic via i8 GEP.
+            // Pointer increment/decrement: step by elemType-sized strides (C semantics).
+            // Fall back to i8 (byte stride) only when element type is unknown.
+            auto* stepTy = elemType ? elemType : builder->getInt8Ty();
             auto* step = llvm::ConstantInt::get(builder->getInt64Ty(), amount);
-            auto* newPtr = builder->CreateGEP(builder->getInt8Ty(), loadInst, step, "ptrinc");
+            auto* newPtr = builder->CreateGEP(stepTy, loadInst, step, "ptrinc");
             return builder->CreateStore(newPtr, destination);
         }
 

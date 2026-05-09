@@ -1834,7 +1834,33 @@ bool testPointerArithmetic()
     int* p4 = arr + 1 + 1;
     result &= Test("ptr+1+1 elem", p4[0], 30);
 
-    // i8* arithmetic
+    // p++ increments by sizeof(int)
+    int* p = arr;
+    p++;
+    result &= Test("int* p++ elem", *p, 20);
+    p++;
+    result &= Test("int* p++ again", *p, 30);
+
+    // p-- decrements by sizeof(int)
+    p--;
+    result &= Test("int* p-- elem", *p, 20);
+
+    // p += n
+    int* q = arr;
+    q += 3;
+    result &= Test("int* p+=3 elem", *q, 40);
+
+    // p -= n
+    q -= 2;
+    result &= Test("int* p-=2 elem", *q, 20);
+
+    // ptr - ptr → element count
+    int* start = arr;
+    int* end = arr + 4;
+    int diff = (int)(end - start);
+    result &= Test("ptr-ptr elem count", diff, 4);
+
+    // i8* arithmetic (byte-sized: p++ still correct)
     i8* buf = (i8*)new i8[4];
     buf[0] = 65; buf[1] = 66; buf[2] = 67; buf[3] = 0;
 
@@ -1846,6 +1872,19 @@ bool testPointerArithmetic()
 
     i8* b3 = b2 - 2;
     result &= Test("i8*-2", (int)b3[0], 65);
+
+    // i8* cursor walk with ++
+    i8* cursor = buf;
+    cursor++;
+    result &= Test("i8* cursor++", (int)*cursor, 66);
+    cursor++;
+    result &= Test("i8* cursor++ again", (int)*cursor, 67);
+
+    // i8* ptr - ptr → byte count
+    i8* bstart = buf;
+    i8* bend = buf + 4;
+    int bdiff = (int)(bend - bstart);
+    result &= Test("i8* ptr-ptr byte count", bdiff, 4);
 
     delete[] arr;
     delete[] buf;

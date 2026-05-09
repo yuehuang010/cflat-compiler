@@ -842,7 +842,7 @@ private:
     }
     inline LLVMBackend* Compiler() { return compilerLLVM; }
 
-    std::unordered_map<llvm::Value*, int> PlusPlus;
+    std::unordered_map<llvm::Value*, std::pair<int, llvm::Type*>> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
     // Lambda state: expected type (set by ParseDeclaration before evaluating RHS)
@@ -3753,7 +3753,24 @@ public:
             {
                 auto left = derefLoad();
                 bool lhsUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
-                right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
+
+                // Pointer compound arithmetic: use element-typed GEP (C semantics).
+                if (namedVar.TypeAndValue.Pointer
+                    && (operatorText == "+=" || operatorText == "-=")
+                    && right && right->getType()->isIntegerTy())
+                {
+                    auto elemTV = namedVar.TypeAndValue;
+                    elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
+                    auto* et = compiler->GetType(elemTV);
+                    auto* idx = compiler->Upconvert(right, compiler->builder->getInt64Ty());
+                    if (operatorText == "-=")
+                        idx = compiler->builder->CreateNeg(idx, "neg");
+                    right = compiler->CreateGEP(et, left, idx, "ptrarith");
+                }
+                else
+                {
+                    right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
+                }
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
@@ -4584,12 +4601,21 @@ public:
 
                 if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
                 {
-                    // ptr - ptr → i64 byte difference
+                    // ptr - ptr → element count (C ptrdiff_t semantics)
                     auto* i64Ty = Compiler(ctx)->builder->getInt64Ty();
-                    lvalue = Compiler(ctx)->builder->CreateSub(
+                    auto* byteDiff = Compiler(ctx)->builder->CreateSub(
                         Compiler(ctx)->builder->CreatePtrToInt(lvalue, i64Ty),
                         Compiler(ctx)->builder->CreatePtrToInt(rvalue, i64Ty),
                         "ptrdiff");
+                    if (elemType)
+                    {
+                        auto* elemSize = Compiler(ctx)->GetTypeSizeBytes(elemType);
+                        lvalue = Compiler(ctx)->builder->CreateSDiv(byteDiff, elemSize, "ptrdiff_elem");
+                    }
+                    else
+                    {
+                        lvalue = byteDiff;
+                    }
                     elemType = nullptr;
                 }
                 else if (elemType && lvalue->getType()->isPointerTy()
@@ -5944,8 +5970,38 @@ public:
                         }
                         break;
                     }
-                    case CFlatParser::PlusPlus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]++; } break; }
-                    case CFlatParser::MinusMinus: { if (namedVar.Storage) { PlusPlus[namedVar.Storage]--; } break; }
+                    case CFlatParser::PlusPlus:
+                    {
+                        if (namedVar.Storage)
+                        {
+                            llvm::Type* et = nullptr;
+                            if (namedVar.TypeAndValue.Pointer)
+                            {
+                                auto elemTV = namedVar.TypeAndValue;
+                                elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
+                                et = Compiler(ctx)->GetType(elemTV);
+                            }
+                            PlusPlus[namedVar.Storage].first++;
+                            PlusPlus[namedVar.Storage].second = et;
+                        }
+                        break;
+                    }
+                    case CFlatParser::MinusMinus:
+                    {
+                        if (namedVar.Storage)
+                        {
+                            llvm::Type* et = nullptr;
+                            if (namedVar.TypeAndValue.Pointer)
+                            {
+                                auto elemTV = namedVar.TypeAndValue;
+                                elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
+                                et = Compiler(ctx)->GetType(elemTV);
+                            }
+                            PlusPlus[namedVar.Storage].first--;
+                            PlusPlus[namedVar.Storage].second = et;
+                        }
+                        break;
+                    }
                     case CFlatParser::Identifier:
                     {
                         if (!namespaceContext.empty())
@@ -8642,13 +8698,8 @@ public:
     {
         if (PlusPlus.size() > 0)
         {
-            for (auto increment : PlusPlus)
-            {
-                auto destination = increment.first;
-                auto amount = increment.second;
-
-                Compiler()->CreateIncrement(destination, amount);
-            }
+            for (auto& [destination, amountAndElem] : PlusPlus)
+                Compiler()->CreateIncrement(destination, amountAndElem.first, amountAndElem.second);
 
             PlusPlus.clear();
         }
