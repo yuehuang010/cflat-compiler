@@ -2729,6 +2729,14 @@ public:
         if (srcType->isPointerTy() && destType->isPointerTy())
             return builder->CreateBitCast(value, destType);
 
+        // Struct -> Pointer: invalid; caller should have emitted an error already.
+        // Return the value unchanged rather than letting LLVM assert.
+        if (srcType->isStructTy() && destType->isPointerTy())
+        {
+            LogError("cannot assign a struct value to a pointer variable - use getPtr() or take the address with '&'");
+            return value;
+        }
+
         // Fallback: BitCast for same-size reinterpretation
         return builder->CreateBitCast(value, destType);
     }

@@ -3386,6 +3386,17 @@ public:
                                     right = compiler->WrapBareValueAsFatStruct(fn);
                             }
 
+                            // Pointer variable assigned a struct value: catch the mismatch here
+                            // with a clear message rather than letting LLVM assert inside CreateCast.
+                            if (right && typeAndValue.Pointer && !typeAndValue.IsFunctionPointer
+                                && right->getType()->isStructTy())
+                            {
+                                LogErrorContext(assignmentExpression, std::format(
+                                    "cannot initialize pointer '{}' with a value of type '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
+                                    name, typeAndValue.TypeName));
+                                right = nullptr;
+                            }
+
                         }
                     }
                     else if (initializer->Default() != nullptr)
@@ -3718,6 +3729,17 @@ public:
                     }
                     right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
                 }
+            }
+
+            // Pointer variable assigned a struct value: catch the mismatch here
+            // with a clear message rather than letting LLVM assert inside CreateCast.
+            if (operatorText == "=" && right && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsFunctionPointer
+                && right->getType()->isStructTy())
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot assign a value of type '{}' to pointer variable '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
+                    rightNV.TypeAndValue.TypeName, namedVar.CallerName));
+                return right;
             }
 
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;

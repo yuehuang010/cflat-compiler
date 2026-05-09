@@ -1,0 +1,14 @@
+import "array.cb";
+
+struct Point { int x = 0; int y = 0; };
+
+extern int main()
+{
+    array<Point> arr;
+    arr.init(4);
+
+    expect_error("cannot initialize pointer") {
+        Point* p = arr.get(0);
+    }
+    return 0;
+}

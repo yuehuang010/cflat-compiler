@@ -27,6 +27,8 @@ struct array<T>
 
     T get(int index) { return _ptr[index]; }
 
+    T* getPtr(int index) { return _ptr + index; }
+
     void set(int index, T value) { _ptr[index] = value; }
 
     T operator[](int index) { return _ptr[index]; }
