@@ -3606,6 +3606,8 @@ public:
 
             // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)
             // and BaseType holds the pointee type. All loads/stores through `destination` must use it.
+            // UnionFieldType is set for union field access — it overrides the load/store type so that
+            // reinterpret semantics work correctly even with LLVM opaque pointers.
             auto isDerefStorage = [&]() {
                 return namedVar.BaseType
                     && !llvm::isa<llvm::AllocaInst>(destination)
@@ -3613,11 +3615,15 @@ public:
                     && !llvm::isa<llvm::GetElementPtrInst>(destination);
             };
             auto derefLoad = [&]() -> llvm::Value* {
+                if (namedVar.UnionFieldType)
+                    return compiler->CreateLoad(namedVar.UnionFieldType, destination);
                 return isDerefStorage()
                     ? compiler->CreateLoad(namedVar.BaseType, destination)
                     : compiler->CreateLoad(destination);
             };
             auto derefAssign = [&](llvm::Value* val, bool isUnsigned) {
+                if (namedVar.UnionFieldType)
+                    return compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType);
                 return isDerefStorage()
                     ? compiler->CreateAssignment(val, destination, isUnsigned, namedVar.BaseType)
                     : compiler->CreateAssignment(val, destination, isUnsigned);
@@ -5438,8 +5444,17 @@ public:
                 }
             }
 
-            auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
-            compiler->builder->CreateStore(val, gep);
+            if (sd.IsUnion)
+            {
+                // Union: all fields alias at offset 0. Store through the raw pointer with the explicit field type.
+                auto* fieldLLVMType = compiler->GetType(fieldType);
+                compiler->CreateAssignment(val, structPtr, false, fieldLLVMType);
+            }
+            else
+            {
+                auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
+                compiler->builder->CreateStore(val, gep);
+            }
         }
     }
 
@@ -6035,8 +6050,14 @@ public:
                                     Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
                                     // insert point is now accessBlock
 
-                                    auto* fieldGEP = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
-                                    auto* fieldVal = Compiler(ctx)->CreateLoad(fieldGEP);
+                                    llvm::Value* fieldGEP;
+                                    if (dataStructure.IsUnion)
+                                        fieldGEP = structVar.Storage;  // union: all fields at offset 0
+                                    else
+                                        fieldGEP = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                    auto* fieldVal = dataStructure.IsUnion
+                                        ? Compiler(ctx)->CreateLoad(fieldLLVMType, fieldGEP)
+                                        : Compiler(ctx)->CreateLoad(fieldGEP);
                                     Compiler(ctx)->CreateAssignment(fieldVal, resultAlloca);
                                     Compiler(ctx)->CreateJump(resumeBlock);
 
@@ -6057,25 +6078,47 @@ public:
                                 {
                                     if (structVar.Storage)
                                     {
-                                        namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
                                         auto* fieldLLVMType = Compiler(ctx)->GetType(fieldType);
-                                        if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                        if (dataStructure.IsUnion)
                                         {
-                                            // Array field: keep GEP pointer; don't load the whole array
-                                            namedVar.Primary = nullptr;
-                                            namedVar.BaseType = fieldLLVMType;
+                                            // Union: all fields alias at offset 0. Store raw alloca pointer
+                                            // and record the field type so derefLoad/derefAssign use it.
+                                            namedVar.Storage = structVar.Storage;
+                                            namedVar.UnionFieldType = fieldLLVMType;
+                                            if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                            {
+                                                namedVar.Primary = nullptr;
+                                                namedVar.BaseType = fieldLLVMType;
+                                            }
+                                            else
+                                            {
+                                                namedVar.Primary = Compiler(ctx)->CreateLoad(fieldLLVMType, namedVar.Storage);
+                                                namedVar.BaseType = namedVar.Primary->getType();
+                                            }
                                         }
                                         else
                                         {
-                                            namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
-                                            namedVar.BaseType = namedVar.Primary->getType();
+                                            namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
+                                            if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
+                                            {
+                                                // Array field: keep GEP pointer; don't load the whole array
+                                                namedVar.Primary = nullptr;
+                                                namedVar.BaseType = fieldLLVMType;
+                                            }
+                                            else
+                                            {
+                                                namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                                                namedVar.BaseType = namedVar.Primary->getType();
+                                            }
                                         }
                                     }
                                     else if (structVar.Primary)
                                     {
                                         namedVar.Storage = nullptr;
-                                        namedVar.Primary = Compiler(ctx)->CreateExtractValue(structVar.Primary, fieldIndex);
-                                        namedVar.BaseType = namedVar.Primary->getType();
+                                        // Unions with no backing storage can't reinterpret inline values.
+                                        if (!dataStructure.IsUnion)
+                                            namedVar.Primary = Compiler(ctx)->CreateExtractValue(structVar.Primary, fieldIndex);
+                                        namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                 }
@@ -6494,11 +6537,21 @@ public:
                                 LogErrorContext(ctx, std::format("reflect: cannot find struct '{}'", structTypeName));
                                 break;
                             }
+                            if (structData.IsUnion)
+                            {
+                                LogErrorContext(ctx, std::format("reflect is not supported on union type '{}'", structTypeName));
+                                break;
+                            }
 
                             // Define recursive lambda to emit fields for any struct
                             std::function<void(const LLVMBackend::StructData&, llvm::Value*)> emitFields;
                             emitFields = [&](const LLVMBackend::StructData& sd, llvm::Value* objPtr)
                             {
+                                if (sd.IsUnion)
+                                {
+                                    compiler->LogError(std::format("JSON serialization is not supported on union type '{}'", sd.StructType->getName().str()));
+                                    return;
+                                }
                                 LLVMBackend::NamedVariable intNV, boolNV, floatNV, strNV;
                                 for (size_t i = 0; i < sd.StructFields.size(); i++)
                                 {
@@ -6793,6 +6846,11 @@ public:
                             std::function<void(const LLVMBackend::StructData&, llvm::Value*, llvm::Value*)> emitFieldSets;
                             emitFieldSets = [&](const LLVMBackend::StructData& sd, llvm::Value* objPtr, llvm::Value* srcA)
                             {
+                                if (sd.IsUnion)
+                                {
+                                    compiler->LogError(std::format("JSON deserialization is not supported on union type '{}'", sd.StructType->getName().str()));
+                                    return;
+                                }
                                 auto* fatTy = compiler->GetFatPtrType();
 
                                 for (size_t i = 0; i < sd.StructFields.size(); i++)
@@ -8968,13 +9026,23 @@ public:
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
+        bool isUnion = (ctx->Union() != nullptr);
+
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
-        auto structType = compiler->CreateStructType(structName, declList);
-        // A struct with zero fields still needs a sized (non-opaque) type
-        // so that alloca/sizeof work correctly (e.g. when passed via interface).
-        if (structType->isOpaque())
-            structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        llvm::StructType* structType;
+        if (isUnion)
+        {
+            structType = compiler->CreateUnionType(structName, declList);
+        }
+        else
+        {
+            structType = compiler->CreateStructType(structName, declList);
+            // A struct with zero fields still needs a sized (non-opaque) type
+            // so that alloca/sizeof work correctly (e.g. when passed via interface).
+            if (structType->isOpaque())
+                structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        }
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
         LLVMBackend::TypeAndValue returnType{
@@ -8991,74 +9059,84 @@ public:
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
-            std::vector<llvm::Value*> initializers;
-            for (auto& typeValue : declList)
+            if (isUnion)
             {
-                auto initializer = typeValue.Initializer;
-                llvm::Value* rvalue = nullptr;
-                if (initializer != nullptr)
+                // Union: zero-initialize all storage. Fields share the same memory, so we
+                // can't insert individual field values — just return a zeroed union value.
+                compiler->CreateReturnCall(llvm::Constant::getNullValue(structType));
+            }
+            else
+            {
+                std::vector<llvm::Value*> initializers;
+                for (auto& typeValue : declList)
                 {
-                    auto assignmentExpression = initializer->assignmentExpression();
-                    if (assignmentExpression != nullptr)
+                    auto initializer = typeValue.Initializer;
+                    llvm::Value* rvalue = nullptr;
+                    if (initializer != nullptr)
                     {
-                        rvalue = ParseAssignmentExpression(assignmentExpression);
-                        if (typeValue.TypeName == "auto")
+                        auto assignmentExpression = initializer->assignmentExpression();
+                        if (assignmentExpression != nullptr)
                         {
-                            typeValue.TypeName = rvalue->getType()->getStructName();
-                            // Re-finalise the struct body now that the auto field type is known.
-                            structType = compiler->CreateStructType(structName, declList);
+                            rvalue = ParseAssignmentExpression(assignmentExpression);
+                            if (typeValue.TypeName == "auto")
+                            {
+                                typeValue.TypeName = rvalue->getType()->getStructName();
+                                // Re-finalise the struct body now that the auto field type is known.
+                                structType = compiler->CreateStructType(structName, declList);
+                            }
+                        }
+                        else if (initializer->Default() != nullptr)
+                        {
+                            rvalue = GenerateDefaultValue(typeValue);
                         }
                     }
-                    else if (initializer->Default() != nullptr)
-                    {
-                        rvalue = GenerateDefaultValue(typeValue);
-                    }
+                    initializers.push_back(rvalue);
                 }
-                initializers.push_back(rvalue);
-            }
 
-            llvm::Value* structVal = llvm::UndefValue::get(structType);
+                llvm::Value* structVal = llvm::UndefValue::get(structType);
 
-            LLVMBackend::TypeAndValue myStruct;
-            myStruct.TypeName = structName;
-            myStruct.VariableName = "_" + structName;
+                LLVMBackend::TypeAndValue myStruct;
+                myStruct.TypeName = structName;
+                myStruct.VariableName = "_" + structName;
 
-            unsigned int structIndex = 0;
+                unsigned int structIndex = 0;
 
-            for (auto rvalue : initializers)
-            {
-                auto* destType = structType->getTypeAtIndex(structIndex);
-                // No explicit initializer on a struct-typed field — call its default ctor.
-                if (rvalue == nullptr && destType->isStructTy())
+                for (auto rvalue : initializers)
                 {
-                    std::string fieldTypeName = declList[structIndex].TypeName;
-                    if (compiler->GetFunction(fieldTypeName))
-                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
-                    else
-                        rvalue = llvm::Constant::getNullValue(destType);
-                }
-                if (rvalue != nullptr)
-                {
-                    rvalue = compiler->Upconvert(rvalue, destType);
-                    if (rvalue->getType() != destType && destType->isStructTy())
+                    auto* destType = structType->getTypeAtIndex(structIndex);
+                    // No explicit initializer on a struct-typed field — call its default ctor.
+                    if (rvalue == nullptr && destType->isStructTy())
                     {
-                        // Initializer type doesn't match struct field type (e.g. integer 0 used for
-                        // a struct-typed generic field).  Call the field's default constructor when
-                        // one is available; otherwise zero-initialize the aggregate.
                         std::string fieldTypeName = declList[structIndex].TypeName;
                         if (compiler->GetFunction(fieldTypeName))
                             rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
                     }
-                    structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
+                    if (rvalue != nullptr)
+                    {
+                        rvalue = compiler->Upconvert(rvalue, destType);
+                        if (rvalue->getType() != destType && destType->isStructTy())
+                        {
+                            // Initializer type doesn't match struct field type (e.g. integer 0 used for
+                            // a struct-typed generic field).  Call the field's default constructor when
+                            // one is available; otherwise zero-initialize the aggregate.
+                            std::string fieldTypeName = declList[structIndex].TypeName;
+                            if (compiler->GetFunction(fieldTypeName))
+                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            else
+                                rvalue = llvm::Constant::getNullValue(destType);
+                        }
+                        structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
+                    }
+
+                    structIndex++;
                 }
 
-                structIndex++;
+                // close constructor.
+                compiler->CreateReturnCall(structVal);
             }
 
-            // close constructor.
-            compiler->CreateReturnCall(structVal);
             // Pop the stack
             compiler->CreateBlockBreak(nullptr, true);
         }

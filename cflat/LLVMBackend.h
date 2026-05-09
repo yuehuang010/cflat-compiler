@@ -280,6 +280,7 @@ public:
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
+        llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer — freed on scope exit
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals — enables refcount on field escape (cleared on null-source transfer)
         bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
@@ -325,6 +326,7 @@ public:
         std::vector<std::string> Interfaces;      // Only used by classes (structs have empty list)
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
+        bool IsUnion = false;
     };
 
     struct ProgramData
@@ -2123,6 +2125,11 @@ public:
             LogError(std::format("reflect: struct '{}' has no LLVM type", structName));
             return nullptr;
         }
+        if (sd.IsUnion)
+        {
+            LogError(std::format("reflect is not supported on union type '{}'", structName));
+            return nullptr;
+        }
 
         // Save builder state (includes currentFunction, currentSubprogram)
         auto savedState = compiler->SaveBuilderState();
@@ -2794,6 +2801,63 @@ public:
                 builder->getInt8(0), name + "_typedesc");
             return opaqueStruct;
         }
+    }
+
+    // Creates a union type as a struct with a single [N x alignTy] body, where N and alignTy
+    // are chosen to match the size and alignment of the largest/most-aligned member.
+    // StructFields is preserved for metadata (field name lookup, type info).
+    llvm::StructType* CreateUnionType(std::string name, std::vector<DeclTypeAndValue> typeAndValues)
+    {
+        uint64_t maxSize = 1;
+        llvm::Align maxAlign(1);
+        for (const auto& tv : typeAndValues)
+        {
+            auto* t = GetType(tv);
+            uint64_t sz = module->getDataLayout().getTypeAllocSize(t);
+            llvm::Align al = module->getDataLayout().getABITypeAlign(t);
+            if (sz > maxSize) maxSize = sz;
+            if (al > maxAlign) maxAlign = al;
+        }
+
+        // Pick an integer element type that satisfies maxAlign so the LLVM struct
+        // inherits the correct ABI alignment (LLVM sets struct align = max(element aligns)).
+        llvm::Type* alignTy;
+        switch (maxAlign.value())
+        {
+            case 8:  alignTy = builder->getInt64Ty(); break;
+            case 4:  alignTy = builder->getInt32Ty(); break;
+            case 2:  alignTy = builder->getInt16Ty(); break;
+            default: alignTy = builder->getInt8Ty();  break;
+        }
+        uint64_t elemSize = module->getDataLayout().getTypeAllocSize(alignTy);
+        uint64_t numElems = (maxSize + elemSize - 1) / elemSize;
+        auto* bodyTy = llvm::ArrayType::get(alignTy, numElems);
+
+        auto it = dataStructures.find(name);
+        llvm::StructType* unionTy;
+        if (it != dataStructures.end() && it->second.StructType != nullptr)
+        {
+            unionTy = it->second.StructType;
+            if (unionTy->isOpaque())
+                unionTy->setBody({bodyTy});
+        }
+        else
+        {
+            unionTy = llvm::StructType::create(*context, {bodyTy}, name);
+        }
+
+        auto& sd = dataStructures[name];
+        sd.StructType = unionTy;
+        sd.StructFields = typeAndValues;
+        sd.IsUnion = true;
+        if (sd.typeDescriptor == nullptr)
+        {
+            sd.typeDescriptor = new llvm::GlobalVariable(
+                *module, builder->getInt8Ty(), true,
+                llvm::GlobalValue::InternalLinkage,
+                builder->getInt8(0), name + "_typedesc");
+        }
+        return unionTy;
     }
 
     llvm::Value* CreateConstant(ConstantVariant constantVariant)
@@ -4575,13 +4639,25 @@ public:
                 if (findResult != dataStructures.end())
                 {
                     int count = 0;
-                    for (const auto& structField : findResult->second.StructFields)
+                    const auto& sd = findResult->second;
+                    for (const auto& structField : sd.StructFields)
                     {
                         if (structField.VariableName == name)
                         {
                             NamedVariable namedVar;
-                            namedVar.Storage = CreateStructGEP(findResult->second.StructType, memberStructInstance, count);
-                            namedVar.Primary = CreateLoad(namedVar.Storage);
+                            auto* fieldLLVMType = GetType(structField);
+                            if (sd.IsUnion)
+                            {
+                                // Union: all fields alias at offset 0; load with explicit field type.
+                                namedVar.Storage = memberStructInstance;
+                                namedVar.UnionFieldType = fieldLLVMType;
+                                namedVar.Primary = CreateLoad(fieldLLVMType, memberStructInstance);
+                            }
+                            else
+                            {
+                                namedVar.Storage = CreateStructGEP(sd.StructType, memberStructInstance, count);
+                                namedVar.Primary = CreateLoad(namedVar.Storage);
+                            }
                             namedVar.BaseType = namedVar.Primary->getType();
                             namedVar.TypeAndValue = structField;
                             return namedVar;

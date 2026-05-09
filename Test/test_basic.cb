@@ -1,11 +1,33 @@
 import "test_helper.cb";
 
+// =============================================================
+// Union types
+// =============================================================
+
+union UnionIntFloat
+{
+    int i = default;
+    float f = default;
+};
+
+union UnionByteView
+{
+    int value = default;
+    i8 byte0 = default;
+};
+
+struct ContainerWithUnion
+{
+    UnionIntFloat data = default;
+    int tag = default;
+};
+
 bool testBuiltinIdentifiers()
 {
     bool result = true;
     result &= Test("__FILE__", __FILE__, "test_basic.cb");
     result &= Test("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 8); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 30); // Remember to adjust if shifted.
     return result;
 }
 
@@ -1781,6 +1803,7 @@ extern int main()
     total++; passed += testFixedArrays()                 ? 1 : 0;
     total++; passed += testCastMemberAccess()            ? 1 : 0;
     total++; passed += testReturnBoolFromInt()           ? 1 : 0;
+    total++; passed += testUnion()                       ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -1871,6 +1894,39 @@ bool testInPlaceDtor()
 
     // Free only the backing buffer — destructors already ran.
     delete[_] buf;
+
+    return result;
+}
+
+// =============================================================
+// Union tests
+// =============================================================
+
+bool testUnion()
+{
+    bool result = true;
+
+    UnionIntFloat u;
+    u.i = 42;
+    result &= Test("union write/read int", u.i, 42);
+
+    u.i = 0;
+    result &= Test("union zero int", u.i, 0);
+
+    u.f = 1.5f;
+    result &= Test("union write/read float", u.f, 1.5f);
+
+    result &= Test("sizeof union == sizeof largest", (int)sizeof(UnionIntFloat), 4);
+
+    ContainerWithUnion c;
+    c.data.i = 99;
+    c.tag = 1;
+    result &= Test("union as struct field", c.data.i, 99);
+    result &= Test("struct field tag intact", c.tag, 1);
+
+    UnionByteView bv;
+    bv.value = 0x000000FF;
+    result &= Test("union aliasing low byte", (int)bv.byte0, -1);
 
     return result;
 }
