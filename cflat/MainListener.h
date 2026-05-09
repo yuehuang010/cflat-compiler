@@ -10567,6 +10567,31 @@ public:
             compiler->CreateBlockBreak(nullptr, true);
         }
 
+        // Register class fields in LSP index for dot-completion
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            auto sd = compiler->GetDataStructure(structName);
+            for (const auto& field : sd.StructFields)
+            {
+                if (field.VariableName.empty()) continue;
+                std::string annSig;
+                for (const auto& ann : field.Annotations)
+                {
+                    annSig += "[" + ann.Name;
+                    if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
+                    annSig += "] ";
+                }
+                std::string typeSig = field.TypeName;
+                if (field.Pointer) typeSig += "*";
+                if (field.ElemPointer) typeSig += "*";
+                s->Register(SymbolKind::Field, structName + "." + field.VariableName,
+                            compiler->GetSourceFilePath(),
+                            (int)ctx->getStart()->getLine(),
+                            (int)ctx->getStart()->getCharPositionInLine(),
+                            annSig + typeSig + " " + field.VariableName);
+            }
+        }
+
         // Parse member functions
         auto functionList = ctx->functionDefinition();
 

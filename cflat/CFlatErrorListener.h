@@ -72,6 +72,28 @@ private:
                           antlr4::Token* offendingSymbol,
                           std::exception_ptr /*e*/)
     {
+        // Check for struct-implements-interface before walking the context chain.
+        // The parse error fires from ExternalDeclarationContext with the offending
+        // token being the interface name (not ':'). Detect by checking whether the
+        // source line starts with 'struct' and contains ':' before the error column.
+        if (offendingSymbol)
+        {
+            int lineIdx = static_cast<int>(offendingSymbol->getLine()) - 1;
+            int col     = static_cast<int>(offendingSymbol->getCharPositionInLine());
+            if (lineIdx >= 0 && lineIdx < static_cast<int>(sourceLines_.size()))
+            {
+                const std::string& srcLine = sourceLines_[lineIdx];
+                size_t firstNonSpace = srcLine.find_first_not_of(" \t");
+                if (firstNonSpace != std::string::npos &&
+                    srcLine.substr(firstNonSpace, 6) == "struct")
+                {
+                    std::string before = srcLine.substr(0, std::min(col, static_cast<int>(srcLine.size())));
+                    if (before.find(':') != std::string::npos)
+                        return "structs cannot implement interfaces; use 'class' instead";
+                }
+            }
+        }
+
         // Walk the rule context chain looking for known grammar rules.
         auto* parser = dynamic_cast<antlr4::Parser*>(recognizer);
         if (!parser) return {};

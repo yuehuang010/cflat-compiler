@@ -1,0 +1,5 @@
+// $cursor line=2 col=38
+// $expect completion includes="x"
+interface IMovable { void move(); };
+class Point : IMovable { int x = 0; int y = 0; void move() {} };
+extern int main() { Point p; return p.x; }
