@@ -200,7 +200,8 @@ struct Terminal {
             if (count == 0) return false;
             if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
             if (rec.eventType == 2) {
-                _fillMouse(out, &rec);
+                _fillMouse(out, &rec._event.mouse);
+                _adjustMouseCoords(out);
                 return true;
             }
         }
@@ -220,20 +221,23 @@ struct Terminal {
             GetNumberOfConsoleInputEvents(_hIn, &count);
             if (count == 0) return false;
             if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
-            if (rec.eventType == 1 && rec.keyDown != 0) {
+            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 *eventType = 1;
                 if (key != nullptr) {
                     key->keyDown      = true;
-                    key->vkCode       = rec.vkCode;
-                    key->scanCode     = rec.vkScan;
-                    key->ch           = (char)(rec.uChar & 0xFF);
-                    key->controlState = rec.controlKeyState;
+                    key->vkCode       = rec._event.key.vkCode;
+                    key->scanCode     = rec._event.key.vkScan;
+                    key->ch           = (char)(rec._event.key.uChar & 0xFF);
+                    key->controlState = rec._event.key.controlKeyState;
                 }
                 return true;
             }
             if (rec.eventType == 2) {
                 *eventType = 2;
-                if (mouse != nullptr) _fillMouse(mouse, &rec);
+                if (mouse != nullptr) {
+                    _fillMouse(mouse, &rec._event.mouse);
+                    _adjustMouseCoords(mouse);
+                }
                 return true;
             }
         }
@@ -256,24 +260,35 @@ struct Terminal {
             }
             if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
             // eventType == 1 is KEY_EVENT; keyDown != 0 filters out key-release events.
-            if (rec.eventType == 1 && rec.keyDown != 0) {
+            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 out->keyDown      = true;
-                out->vkCode       = rec.vkCode;
-                out->scanCode     = rec.vkScan;
-                out->ch           = (char)(rec.uChar & 0xFF);
-                out->controlState = rec.controlKeyState;
+                out->vkCode       = rec._event.key.vkCode;
+                out->scanCode     = rec._event.key.vkScan;
+                out->ch           = (char)(rec._event.key.uChar & 0xFF);
+                out->controlState = rec._event.key.controlKeyState;
                 return true;
             }
         }
         return false;
     }
 
-    // Extract mouse fields from the flat _INPUT_RECORD (key/mouse union aliasing).
-    void _fillMouse(MouseEvent* out, _INPUT_RECORD* rec) {
-        out->x           = (i16)(rec->keyDown & 0xFFFF);
-        out->y           = (i16)((rec->keyDown >> 16) & 0xFFFF);
-        out->buttonState = (i32)(rec->repeatCount & 0xFFFF) | ((i32)rec->vkCode << 16);
-        out->eventFlags  = rec->controlKeyState;
+    void _fillMouse(MouseEvent* out, _MouseEventRecord* rec) {
+        out->x           = rec->mouseX;
+        out->y           = rec->mouseY;
+        out->buttonState = rec->buttonState;
+        out->eventFlags  = rec->eventFlags;
+    }
+
+    // Win32 reports mouse position in screen buffer coordinates (0-based from the
+    // buffer top). Subtract the visible window's top-left corner to get
+    // window-relative coordinates that match the ANSI cursor positions used by
+    // moveTo() and the board layout code.
+    void _adjustMouseCoords(MouseEvent* out) {
+        if (_hOut == nullptr) return;
+        _CONSOLE_SCREEN_BUFFER_INFO info;
+        if (GetConsoleScreenBufferInfo(_hOut, &info) == 0) return;
+        out->x = (i16)(out->x - info.winLeft);
+        out->y = (i16)(out->y - info.winTop);
     }
 };
 
@@ -396,14 +411,14 @@ struct TerminalDriver {
     // bitmask (e.g. 0x04 = LEFT_CTRL_PRESSED). Pass 0 for a plain keystroke.
     void injectKey(i16 vkCode, char ch, i32 controlState) {
         _INPUT_RECORD rec;
-        rec.eventType                = 1;   // KEY_EVENT
-        rec._pad                     = 0;
-        rec.keyDown        = 1;
-        rec.repeatCount    = 1;
-        rec.vkCode         = vkCode;
-        rec.vkScan         = 0;
-        rec.uChar          = (i16)ch;
-        rec.controlKeyState = controlState;
+        rec.eventType                        = 1;   // KEY_EVENT
+        rec._pad                             = 0;
+        rec._event.key.keyDown               = 1;
+        rec._event.key.repeatCount           = 1;
+        rec._event.key.vkCode                = vkCode;
+        rec._event.key.vkScan                = 0;
+        rec._event.key.uChar                 = (i16)ch;
+        rec._event.key.controlKeyState       = controlState;
         i32 written = 0;
         WriteConsoleInputA(_hIn, &rec, 1, &written);
     }

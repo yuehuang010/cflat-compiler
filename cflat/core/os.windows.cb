@@ -162,21 +162,36 @@ struct _CONSOLE_SCREEN_BUFFER_INFO {
     i16 maxY       = default;  // 20 — dwMaximumWindowSize.Y
 };
 
-// _INPUT_RECORD — 20 bytes.
-// EventType (2) + pad (2) + 16-byte union of KEY_EVENT_RECORD / MOUSE_EVENT_RECORD.
-// Fields are named after KEY_EVENT_RECORD; for MOUSE_EVENT_RECORD the overlap is:
-//   mouseX/mouseY packed as low/high i16 of keyDown
-//   buttonState   = repeatCount (low i16) | vkCode (high i16)
-//   eventFlags    = controlKeyState
+// KEY_EVENT_RECORD — 16 bytes at offset 4 inside INPUT_RECORD.
+struct _KeyEventRecord {
+    i32 keyDown         = default;  //  0 — BOOL bKeyDown
+    i16 repeatCount     = default;  //  4 — wRepeatCount
+    i16 vkCode          = default;  //  6 — wVirtualKeyCode
+    i16 vkScan          = default;  //  8 — wVirtualScanCode
+    i16 uChar           = default;  // 10 — WCHAR/CHAR (low byte = ASCII)
+    i32 controlKeyState = default;  // 12 — dwControlKeyState
+};
+
+// MOUSE_EVENT_RECORD — 16 bytes at offset 4 inside INPUT_RECORD.
+struct _MouseEventRecord {
+    i16 mouseX          = default;  //  0 — dwMousePosition.X
+    i16 mouseY          = default;  //  2 — dwMousePosition.Y
+    i32 buttonState     = default;  //  4 — dwButtonState
+    i32 controlKeyState = default;  //  8 — dwControlKeyState
+    i32 eventFlags      = default;  // 12 — dwEventFlags
+};
+
+// Union of the two event record types.
+union _InputEvent {
+    _KeyEventRecord   key   = default;
+    _MouseEventRecord mouse = default;
+};
+
+// _INPUT_RECORD — 20 bytes: eventType (2) + pad (2) + 16-byte event union.
 struct _INPUT_RECORD {
-    i16 eventType       = default;  //  0 — 1=KEY_EVENT, 2=MOUSE_EVENT
-    i16 _pad            = default;  //  2 — alignment pad before union
-    i32 keyDown         = default;  //  4 — BOOL bKeyDown  |  COORD.X(i16)+COORD.Y(i16)
-    i16 repeatCount     = default;  //  8 — wRepeatCount   |  buttonState low i16
-    i16 vkCode          = default;  // 10 — wVirtualKeyCode|  buttonState high i16
-    i16 vkScan          = default;  // 12 — wVirtualScanCode
-    i16 uChar           = default;  // 14 — WCHAR/CHAR (low byte = ASCII)
-    i32 controlKeyState = default;  // 16 — dwControlKeyState | dwEventFlags
+    i16         eventType = default;  //  0 — 1=KEY_EVENT, 2=MOUSE_EVENT
+    i16         _pad      = default;  //  2 — alignment pad before union
+    _InputEvent _event    = default;  //  4 — KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
 };
 
 extern stdcall void*    GetStdHandle(i32 nStdHandle);

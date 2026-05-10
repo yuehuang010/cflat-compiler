@@ -41,6 +41,21 @@ bool testBuiltinIdentifiers()
     return result;
 }
 
+struct UnionPoint { int x = default; int y = default; };
+struct UnionColor { int r = default; int g = default; int b = default; };
+
+union UnionWithStructs
+{
+    UnionPoint pt = default;
+    UnionColor col = default;
+};
+
+void writeUnionStructViaPtr(UnionWithStructs* s, int x, int y)
+{
+    s->pt.x = x;
+    s->pt.y = y;
+}
+
 int testArray()
 {
     int arraySize = 30;
@@ -1977,6 +1992,23 @@ bool testUnion()
     UnionByteView bv;
     bv.value = 0x000000FF;
     result &= Test("union aliasing low byte", (int)bv.byte0, -1);
+
+    // Union with struct members: write and read sub-fields
+    UnionWithStructs s;
+    s.pt.x = 10;
+    s.pt.y = 20;
+    result &= Test("union struct member write/read x", s.pt.x, 10);
+    result &= Test("union struct member write/read y", s.pt.y, 20);
+
+    s.col.r = 255;
+    s.col.g = 128;
+    result &= Test("union struct member aliasing", s.col.r, 255);
+
+    // Write via pointer
+    UnionWithStructs s2;
+    writeUnionStructViaPtr(&s2, 42, 99);
+    result &= Test("union struct member write via ptr x", s2.pt.x, 42);
+    result &= Test("union struct member write via ptr y", s2.pt.y, 99);
 
     return result;
 }

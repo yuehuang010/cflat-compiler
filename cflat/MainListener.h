@@ -6154,6 +6154,9 @@ public:
                                         }
                                         else
                                         {
+                                            // Not a union field: clear any inherited UnionFieldType from a parent
+                                            // union access in the chain (e.g. union.structField.subField).
+                                            namedVar.UnionFieldType = nullptr;
                                             namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, fieldIndex);
                                             if (llvm::isa<llvm::ArrayType>(fieldLLVMType))
                                             {
@@ -6171,6 +6174,7 @@ public:
                                     else if (structVar.Primary)
                                     {
                                         namedVar.Storage = nullptr;
+                                        namedVar.UnionFieldType = nullptr;
                                         // Unions with no backing storage can't reinterpret inline values.
                                         if (!dataStructure.IsUnion)
                                             namedVar.Primary = Compiler(ctx)->CreateExtractValue(structVar.Primary, fieldIndex);
