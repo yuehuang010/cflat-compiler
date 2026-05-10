@@ -1,7 +1,11 @@
-// core/filesystem.cb — File and Directory classes for CFlat
+// core/filesystem.cb — File, Path, and Directory classes for CFlat
 //
 // Wraps UCRT file I/O (fopen/fread/fwrite/…) and Win32 directory APIs.
 // Paths are null-terminated via string.data().
+//
+// String ownership: methods returning list<string>* transfer list ownership to
+// the caller. String buffers inside the list are heap-allocated and are NOT
+// freed when the list is deleted (CFlat does not call free on string values).
 
 import "string.cb";
 import "list.cb";
@@ -57,32 +61,34 @@ class File
     bool isOpen() { return _handle != nullptr; }
     bool atEnd()  { return _handle != nullptr && feof(_handle) != 0; }
 
-    // Read one line (strips trailing \r and \n). Returns empty string at EOF.
+    // Read one line, stripping trailing \r and \n. Returns "" at EOF.
+    // Uses fgetc so there is no line-length limit.
     string readLine()
     {
         if (_handle == nullptr) return "";
-        i8* buf = new i8[4096];
-        i8* result = fgets(buf, 4096, _handle);
-        if (result == nullptr)
+        int c = fgetc(_handle);
+        if (c == -1) return "";
+        stringbuilder sb;
+        while (c != -1 && c != '\n')
         {
-            delete[] buf;
-            return "";
+            if (c != '\r') sb.appendChar((i8)c);
+            c = fgetc(_handle);
         }
-        i32 len = strlen(buf);
-        if (len > 0 && buf[len - 1] == '\n')
+        return sb.toString();
+    }
+
+    // Read all lines. Caller owns the returned list and each string buffer inside it.
+    list<string>* readLines()
+    {
+        list<string>* lines = new list<string>;
+        if (_handle == nullptr) return lines;
+        while (true)
         {
-            buf[len - 1] = 0;
-            len--;
+            string line = readLine();
+            if (line.length() == 0 && atEnd()) break;
+            lines->add(line);
         }
-        if (len > 0 && buf[len - 1] == '\r')
-        {
-            buf[len - 1] = 0;
-            len--;
-        }
-        string s;
-        s._ptr = buf;
-        s._len = len;
-        return s;
+        return lines;
     }
 
     // Read the entire file and return its contents as a string.
@@ -99,6 +105,13 @@ class File
         s._ptr = buf;
         s._len = isz;
         return s;
+    }
+
+    // Read up to count bytes into buf. Returns number of bytes actually read.
+    int readBytes(i8* buf, int count)
+    {
+        if (_handle == nullptr) return 0;
+        return fread(buf, 1, count, _handle);
     }
 
     // Write a string to the file. Returns true if all bytes were written.
@@ -119,6 +132,34 @@ class File
         return write(nl);
     }
 
+    // Write count bytes from buf. Returns number of bytes actually written.
+    int writeBytes(i8* buf, int count)
+    {
+        if (_handle == nullptr) return 0;
+        return fwrite(buf, 1, count, _handle);
+    }
+
+    // Flush write buffers to the OS. Returns true on success.
+    bool flush()
+    {
+        if (_handle == nullptr) return false;
+        return fflush(_handle) == 0;
+    }
+
+    // Seek to a position. origin: 0=begin, 1=current, 2=end.
+    bool seek(int offset, int origin)
+    {
+        if (_handle == nullptr) return false;
+        return fseek(_handle, offset, origin) == 0;
+    }
+
+    // Return the current file position, or -1 if the handle is closed.
+    int tell()
+    {
+        if (_handle == nullptr) return -1;
+        return ftell(_handle);
+    }
+
     // Return the total file size in bytes without changing the read position.
     int size()
     {
@@ -135,6 +176,22 @@ class File
         return _access(path.data(), 0) == 0;
     }
 
+    // Return true if path names an existing regular file (not a directory).
+    static bool isFile(string path)
+    {
+        win_int attrs = GetFileAttributesA(path.data());
+        if (attrs == (i32)-1) return false;
+        return (attrs & 16) == 0;
+    }
+
+    // Return true if path names an existing directory.
+    static bool isDirectory(string path)
+    {
+        win_int attrs = GetFileAttributesA(path.data());
+        if (attrs == (i32)-1) return false;
+        return (attrs & 16) != 0;
+    }
+
     static bool remove(string path)
     {
         return _unlink(path.data()) == 0;
@@ -142,8 +199,13 @@ class File
 
     static bool move(string src, string dst)
     {
-        // MOVEFILE_REPLACE_EXISTING = 1
-        return MoveFileExA(src.data(), dst.data(), 1) != 0;
+        return MoveFileExA(src.data(), dst.data(), 1) != 0;  // MOVEFILE_REPLACE_EXISTING
+    }
+
+    // Copy src to dst, overwriting dst if it exists.
+    static bool copy(string src, string dst)
+    {
+        return CopyFileA(src.data(), dst.data(), 0) != 0;
     }
 
     // Read the entire file at path in one call.
@@ -214,6 +276,174 @@ class File
     }
 };
 
+// ── Path ─────────────────────────────────────────────────────────────────────
+
+class Path
+{
+    // Join two path segments with a backslash separator if a does not already end with one.
+    static string combine(string a, string b)
+    {
+        if (a.length() == 0) return b;
+        if (b.length() == 0) return a;
+        i8 last = a.data()[a.length() - 1];
+        bool needsSep = (last != '\\' && last != '/');
+        stringbuilder sb;
+        sb.append(a);
+        if (needsSep) sb.appendChar('\\');
+        sb.append(b);
+        return sb.toString();
+    }
+
+    // Return the filename component (everything after the last separator).
+    static string getFileName(string path)
+    {
+        i8* p = path.data();
+        i32 len = path.length();
+        i32 lastSep = -1;
+        i32 i = 0;
+        while (i < len)
+        {
+            if (p[i] == '\\' || p[i] == '/') lastSep = i;
+            i++;
+        }
+        i32 start = lastSep + 1;
+        i32 nameLen = len - start;
+        i8* buf = new i8[nameLen + 1];
+        memcpy(buf, p + start, nameLen + 1);
+        string s;
+        s._ptr = buf;
+        s._len = nameLen;
+        return s;
+    }
+
+    // Return the directory component (everything before the last separator).
+    // Returns "" if path contains no separator.
+    static string getDirectory(string path)
+    {
+        i8* p = path.data();
+        i32 len = path.length();
+        i32 lastSep = -1;
+        i32 i = 0;
+        while (i < len)
+        {
+            if (p[i] == '\\' || p[i] == '/') lastSep = i;
+            i++;
+        }
+        if (lastSep < 0) return "";
+        i32 dirLen = lastSep == 0 ? 1 : lastSep;
+        i8* buf = new i8[dirLen + 1];
+        memcpy(buf, p, dirLen);
+        buf[dirLen] = 0;
+        string s;
+        s._ptr = buf;
+        s._len = dirLen;
+        return s;
+    }
+
+    // Return the extension including the leading dot (e.g. ".txt"), or "" if none.
+    static string getExtension(string path)
+    {
+        i8* p = path.data();
+        i32 len = path.length();
+        i32 lastDot = -1;
+        i32 i = 0;
+        while (i < len)
+        {
+            if (p[i] == '\\' || p[i] == '/') lastDot = -1;
+            else if (p[i] == '.') lastDot = i;
+            i++;
+        }
+        if (lastDot < 0) return "";
+        i32 extLen = len - lastDot;
+        i8* buf = new i8[extLen + 1];
+        memcpy(buf, p + lastDot, extLen + 1);
+        string s;
+        s._ptr = buf;
+        s._len = extLen;
+        return s;
+    }
+
+    // Return true if path has a non-empty extension.
+    static bool hasExtension(string path)
+    {
+        return Path.getExtension(path).length() > 0;
+    }
+
+    // Return path with its extension replaced by ext.
+    // If ext is non-empty and does not start with '.', one is prepended automatically.
+    // Pass ext="" to strip the extension.
+    static string changeExtension(string path, string ext)
+    {
+        i8* p = path.data();
+        i32 len = path.length();
+        i32 lastDot = -1;
+        i32 i = 0;
+        while (i < len)
+        {
+            if (p[i] == '\\' || p[i] == '/') lastDot = -1;
+            else if (p[i] == '.') lastDot = i;
+            i++;
+        }
+        i32 baseLen = lastDot >= 0 ? lastDot : len;
+        i32 extLen = ext.length();
+        bool needDot = extLen > 0 && ext.data()[0] != '.';
+        i32 totalLen = baseLen + (needDot ? 1 : 0) + extLen;
+        i8* buf = new i8[totalLen + 1];
+        memcpy(buf, p, baseLen);
+        i32 pos = baseLen;
+        if (needDot) { buf[pos] = '.'; pos++; }
+        if (extLen > 0) memcpy(buf + pos, ext.data(), extLen);
+        buf[totalLen] = 0;
+        string s;
+        s._ptr = buf;
+        s._len = totalLen;
+        return s;
+    }
+
+    // Resolve path to an absolute path. Returns path unchanged on failure.
+    static string getAbsolute(string path)
+    {
+        i8* buf = new i8[4096];
+        win_int len = GetFullPathNameA(path.data(), 4096, buf, nullptr);
+        if (len == 0 || len >= 4096) { delete[] buf; return path; }
+        string s;
+        s._ptr = buf;
+        s._len = len;
+        return s;
+    }
+
+    // Return the system temporary directory path (no trailing backslash).
+    static string getTempPath()
+    {
+        i8* buf = new i8[260];
+        win_int len = GetTempPathA(260, buf);
+        if (len == 0) { delete[] buf; return ""; }
+        if (len > 0 && buf[len - 1] == '\\') { buf[len - 1] = 0; len--; }
+        string s;
+        s._ptr = buf;
+        s._len = len;
+        return s;
+    }
+
+    // Create a uniquely named temporary file in the system temp directory.
+    // prefix is up to 3 characters used at the start of the filename.
+    // Returns the full path, or "" on failure. Caller must delete the file when done.
+    static string getTempFile(string prefix)
+    {
+        i8* tmpDir = new i8[260];
+        win_int tlen = GetTempPathA(260, tmpDir);
+        if (tlen == 0) { delete[] tmpDir; return ""; }
+        i8* buf = new i8[260];
+        win_int ok = GetTempFileNameA(tmpDir, prefix.data(), 0, buf);
+        delete[] tmpDir;
+        if (ok == 0) { delete[] buf; return ""; }
+        string s;
+        s._ptr = buf;
+        s._len = strlen(buf);
+        return s;
+    }
+};
+
 // ── Directory ─────────────────────────────────────────────────────────────────
 
 class Directory
@@ -222,10 +452,15 @@ class Directory
     i32 _pathLen = 0;
 
     // Set the directory path this instance operates on.
+    // Allocates a private copy; safe to call multiple times.
     void init(string path)
     {
-        _pathPtr = path.data();
-        _pathLen = path.length();
+        if (_pathPtr != nullptr) delete[] _pathPtr;
+        i32 len = path.length();
+        i8* buf = new i8[len + 1];
+        memcpy(buf, path.data(), len + 1);
+        _pathPtr = buf;
+        _pathLen = len;
     }
 
     string path()
@@ -236,13 +471,20 @@ class Directory
         return s;
     }
 
-    bool exists()
-    {
-        return _access(_pathPtr, 0) == 0;
-    }
+    bool exists()  { return _access(_pathPtr, 0) == 0; }
+    bool create()  { return _mkdir(_pathPtr) == 0; }
+    bool remove()  { return _rmdir(_pathPtr) == 0; }
 
-    bool create() { return _mkdir(_pathPtr) == 0; }
-    bool remove() { return _rmdir(_pathPtr) == 0; }
+    list<string>* list()          { return Directory.list(path()); }
+    list<string>* listFiles()     { return Directory.listFiles(path()); }
+    list<string>* listDirs()      { return Directory.listDirs(path()); }
+    list<string>* listRecursive() { return Directory.listRecursive(path()); }
+    bool createAll()              { return Directory.createAll(path()); }
+
+    ~Directory()
+    {
+        if (_pathPtr != nullptr) delete[] _pathPtr;
+    }
 
     static bool exists(string path)
     {
@@ -273,42 +515,133 @@ class Directory
         return _chdir(path.data()) == 0;
     }
 
-    // List all entries (files and subdirs) in a directory.
-    // Win32 implementation: uses FindFirstFileA/FindNextFileA.
-    // WIN32_FIND_DATAA: 600 bytes; cFileName[260] is at byte offset 44.
-    // Caller is responsible for deleting the returned list.
+    // List all entries (files and subdirs) in path, excluding . and ..
     static list<string>* list(string path)
     {
-        list<string>* result = new list<string>;
+        return Directory._listFiltered(path, 0);
+    }
 
-        if const (__PLATFORM__ >= 32)
+    // List only regular files (not subdirectories) in path.
+    static list<string>* listFiles(string path)
+    {
+        return Directory._listFiltered(path, 1);
+    }
+
+    // List only subdirectories (not regular files) in path.
+    static list<string>* listDirs(string path)
+    {
+        return Directory._listFiltered(path, 2);
+    }
+
+    // List all entries under path recursively. Returns full paths.
+    static list<string>* listRecursive(string path)
+    {
+        list<string>* result = new list<string>;
+        Directory._collectRecursive(path, result);
+        return result;
+    }
+
+    // Create path and all missing parent directories.
+    // Returns true if path exists after the call.
+    static bool createAll(string path)
+    {
+        if (_mkdir(path.data()) == 0) return true;
+        if (_access(path.data(), 0) == 0) return true;
+
+        i32 len = path.length();
+        i8* buf = new i8[len + 1];
+        memcpy(buf, path.data(), len + 1);
+
+        int i = 0;
+        if (len >= 2 && buf[1] == ':') i = 3;  // skip past "C:\"
+
+        while (i <= len)
         {
-            // Windows implementation
-            string pattern = path + "\\*";
-            _WIN32_FIND_DATAA* findData = new _WIN32_FIND_DATAA;
-            void* handle = FindFirstFileA(pattern.data(), findData);
-            if (handle == (void*)(i64)-1)
+            if (i == len || buf[i] == '\\' || buf[i] == '/')
             {
-                delete findData;
-                return result;
-            }
-            do {
-                i8* name = findData->cFileName;
-                if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0)
+                if (i > 0)
                 {
-                    int len = strlen(name);
-                    i8* nameBuf = new i8[len + 1];
-                    memcpy(nameBuf, name, len + 1);
-                    string entry;
-                    entry._ptr = nameBuf;
-                    entry._len = len;
-                    result->add(entry);
+                    i8 saved = buf[i];
+                    buf[i] = 0;
+                    _mkdir(buf);
+                    buf[i] = saved;
                 }
-            } while (FindNextFileA(handle, findData) != 0);
-            FindClose(handle);
-            delete findData;
+            }
+            i++;
         }
 
+        delete[] buf;
+        return _access(path.data(), 0) == 0;
+    }
+
+    // Return the system temporary directory path (no trailing backslash).
+    static string getTemp()
+    {
+        return Path.getTempPath();
+    }
+
+    // ── private helpers ────────────────────────────────────────────────────────
+
+    // filter: 0=all entries, 1=files only, 2=dirs only.
+    // FILE_ATTRIBUTE_DIRECTORY = 0x10 = 16.
+    // Uses more=true/while to process the FindFirstFileA result before
+    // calling FindNextFileA (CFlat do-while compiles as while, skipping
+    // the first entry).
+    static list<string>* _listFiltered(string path, int filter)
+    {
+        list<string>* result = new list<string>;
+        string pattern = path + "\\*";
+        _WIN32_FIND_DATAA* findData = new _WIN32_FIND_DATAA;
+        void* handle = FindFirstFileA(pattern.data(), findData);
+        if (handle == (void*)(i64)-1)
+        {
+            delete findData;
+            return result;
+        }
+        bool more = true;
+        while (more)
+        {
+            i8* name = findData->cFileName;
+            bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+            bool isDir = (findData->dwFileAttributes & 16) != 0;
+            bool include = false;
+            if (!isDot)
+            {
+                if (filter == 0) include = true;
+                else if (filter == 1) { if (!isDir) include = true; }
+                else if (filter == 2) { if (isDir) include = true; }
+            }
+            if (include)
+            {
+                int len = strlen(name);
+                i8* nameBuf = new i8[len + 1];
+                memcpy(nameBuf, name, len + 1);
+                string entry;
+                entry._ptr = nameBuf;
+                entry._len = len;
+                result->add(entry);
+            }
+            more = FindNextFileA(handle, findData) != 0;
+        }
+        FindClose(handle);
+        delete findData;
         return result;
+    }
+
+    static void _collectRecursive(string path, list<string>* result)
+    {
+        list<string>* entries = Directory._listFiltered(path, 0);
+        int i = 0;
+        while (i < entries->count())
+        {
+            string name = entries->get(i);
+            string fullPath = Path.combine(path, name);
+            win_int attrs = GetFileAttributesA(fullPath.data());
+            bool isDir = attrs != (i32)-1 && (attrs & 16) != 0;
+            if (isDir) Directory._collectRecursive(fullPath, result);
+            result->add(fullPath);
+            i++;
+        }
+        delete entries;
     }
 };

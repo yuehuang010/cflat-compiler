@@ -141,6 +141,213 @@ int testDirectoryClass()
     return passed;
 }
 
+// ── File.isFile / isDirectory / copy ─────────────────────────────────────────
+
+int testFileStaticHelpers()
+{
+    int passed = 0;
+    string fpath   = "test_fs_helpers.txt";
+    string dpath   = "test_fs_helpers_dir";
+    string missing = "test_fs_no_such.txt";
+
+    File.writeAllText(fpath, "hello");
+    Directory.create(dpath);
+
+    passed += Test("isFile on file",      File.isFile(fpath),      true);
+    passed += Test("isDir on file",       File.isDirectory(fpath), false);
+    passed += Test("isDir on directory",  File.isDirectory(dpath), true);
+    passed += Test("isFile on directory", File.isFile(dpath),      false);
+    passed += Test("isFile on missing",   File.isFile(missing),    false);
+
+    string csrc = "test_fs_copy_src.txt";
+    string cdst = "test_fs_copy_dst.txt";
+    File.writeAllText(csrc, "copy me");
+    passed += Test("File.copy ok",      File.copy(csrc, cdst), true);
+    string copied = File.readAllText(cdst);
+    passed += Test("File.copy content", copied.data(), "copy me");
+
+    File.remove(fpath);
+    File.remove(csrc);
+    File.remove(cdst);
+    Directory.remove(dpath);
+    return passed;
+}
+
+// ── File instance: readBytes / writeBytes / seek / tell / flush / readLines ──
+
+int testFileInstanceMethods()
+{
+    int passed = 0;
+
+    // writeBytes / readBytes / seek / tell
+    string bpath = "test_fs_bytes.bin";
+    File* f = new File;
+    f->openWrite(bpath);
+    i8* wbuf = new i8[4];
+    wbuf[0] = 10; wbuf[1] = 20; wbuf[2] = 30; wbuf[3] = 40;
+    int written = f->writeBytes(wbuf, 4);
+    f->flush();
+    delete f;
+    delete[] wbuf;
+
+    passed += Test("writeBytes count", written, 4);
+
+    f = new File;
+    f->openRead(bpath);
+    passed += Test("size after writeBytes", f->size(), 4);
+
+    i8* rbuf = new i8[4];
+    int nread = f->readBytes(rbuf, 4);
+    passed += Test("readBytes count", nread, 4);
+    passed += Test("readBytes[0]", (int)rbuf[0], 10);
+    passed += Test("readBytes[3]", (int)rbuf[3], 40);
+
+    f->seek(1, 0);
+    passed += Test("tell after seek", f->tell(), 1);
+    delete f;
+    delete[] rbuf;
+    File.remove(bpath);
+
+    // readLines
+    string lpath = "test_fs_lines.txt";
+    File.writeAllText(lpath, "alpha\nbeta\ngamma\n");
+    f = new File;
+    f->openRead(lpath);
+    list<string>* lines = f->readLines();
+    passed += Test("readLines count", lines->count(), 3);
+    string line0 = lines->get(0);
+    string line2 = lines->get(2);
+    passed += Test("readLines[0]", line0.data(), "alpha");
+    passed += Test("readLines[2]", line2.data(), "gamma");
+    delete lines;
+    delete f;
+    File.remove(lpath);
+
+    return passed;
+}
+
+// ── Path class ───────────────────────────────────────────────────────────────
+
+int testPathClass()
+{
+    int passed = 0;
+    string r;
+
+    // combine
+    string cfoo    = "C:\\foo";
+    string cfoosl  = "C:\\foo\\";
+    string bar     = "bar";
+    string empty   = "";
+    string foo     = "foo";
+    r = Path.combine(cfoo, bar);
+    passed += Test("combine adds sep",      r.data(), "C:\\foo\\bar");
+    r = Path.combine(cfoosl, bar);
+    passed += Test("combine no double sep", r.data(), "C:\\foo\\bar");
+    r = Path.combine(empty, bar);
+    passed += Test("combine empty a",       r.data(), "bar");
+    r = Path.combine(foo, empty);
+    passed += Test("combine empty b",       r.data(), "foo");
+
+    // getFileName
+    string dirfile = "C:\\dir\\file.txt";
+    string filetxt = "file.txt";
+    r = Path.getFileName(dirfile);
+    passed += Test("getFileName",        r.data(), "file.txt");
+    r = Path.getFileName(filetxt);
+    passed += Test("getFileName no sep", r.data(), "file.txt");
+
+    // getDirectory
+    r = Path.getDirectory(dirfile);
+    passed += Test("getDirectory",        r.data(), "C:\\dir");
+    r = Path.getDirectory(filetxt);
+    passed += Test("getDirectory no sep", r.data(), "");
+
+    // getExtension / hasExtension
+    string fileonly = "file";
+    r = Path.getExtension(filetxt);
+    passed += Test("getExtension",       r.data(), ".txt");
+    r = Path.getExtension(fileonly);
+    passed += Test("getExtension none",  r.data(), "");
+    passed += Test("hasExtension true",  Path.hasExtension(filetxt),   true);
+    passed += Test("hasExtension false", Path.hasExtension(fileonly),   false);
+
+    // changeExtension
+    string dotmd  = ".md";
+    string md     = "md";
+    r = Path.changeExtension(filetxt, dotmd);
+    passed += Test("changeExtension",        r.data(), "file.md");
+    r = Path.changeExtension(filetxt, md);
+    passed += Test("changeExtension no dot", r.data(), "file.md");
+    r = Path.changeExtension(filetxt, empty);
+    passed += Test("changeExtension strip",  r.data(), "file");
+
+    // getAbsolute / getTempPath
+    string dot = ".";
+    string abs = Path.getAbsolute(dot);
+    passed += Test("getAbsolute not empty", abs.length() > 0, true);
+
+    string tmp = Path.getTempPath();
+    passed += Test("getTempPath not empty", tmp.length() > 0, true);
+
+    return passed;
+}
+
+// ── Directory: listFiles / listDirs / listRecursive / createAll / getTemp ────
+
+int testDirectoryExtended()
+{
+    int passed = 0;
+    string base    = "test_fs_dxt";
+    string sub     = "test_fs_dxt\\sub";
+    string afile   = "test_fs_dxt\\a.txt";
+    string bfile   = "test_fs_dxt\\sub\\b.txt";
+    string deepdir  = "test_fs_dxt\\deep\\nested";
+    string deepbase = "test_fs_dxt\\deep";
+
+    // Setup
+    Directory.create(base);
+    Directory.create(sub);
+    File.writeAllText(afile, "a");
+    File.writeAllText(bfile, "b");
+
+    // listFiles
+    list<string>* files = Directory.listFiles(base);
+    passed += Test("listFiles count", files->count(), 1);
+    string fname = files->get(0);
+    passed += Test("listFiles[0]",    fname.data(), "a.txt");
+    delete files;
+
+    // listDirs
+    list<string>* dirs = Directory.listDirs(base);
+    passed += Test("listDirs count", dirs->count(), 1);
+    string dname = dirs->get(0);
+    passed += Test("listDirs[0]",    dname.data(), "sub");
+    delete dirs;
+
+    // listRecursive: a.txt + sub + sub\b.txt = 3 entries
+    list<string>* all = Directory.listRecursive(base);
+    passed += Test("listRecursive count", all->count(), 3);
+    delete all;
+
+    // createAll
+    passed += Test("createAll",        Directory.createAll(deepdir), true);
+    passed += Test("createAll exists", Directory.exists(deepdir),    true);
+
+    // getTemp
+    string tmp = Directory.getTemp();
+    passed += Test("getTemp not empty", tmp.length() > 0, true);
+
+    // Cleanup
+    File.remove(afile);
+    File.remove(bfile);
+    Directory.remove(sub);
+    Directory.remove(deepdir);
+    Directory.remove(deepbase);
+    Directory.remove(base);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -150,11 +357,15 @@ extern int main()
 
     int r;
 
-    r = testFileReadWrite();      passed += r; total += 9;
-    r = testFileClass();          passed += r; total += 10;
-    r = testFileMove();           passed += r; total += 4;
-    r = testDirectoryFunctions(); passed += r; total += 6;
-    r = testDirectoryClass();     passed += r; total += 4;
+    r = testFileReadWrite();        passed += r; total += 9;
+    r = testFileClass();            passed += r; total += 10;
+    r = testFileMove();             passed += r; total += 4;
+    r = testDirectoryFunctions();   passed += r; total += 6;
+    r = testDirectoryClass();       passed += r; total += 4;
+    r = testFileStaticHelpers();    passed += r; total += 7;
+    r = testFileInstanceMethods();  passed += r; total += 9;
+    r = testPathClass();            passed += r; total += 17;
+    r = testDirectoryExtended();    passed += r; total += 8;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

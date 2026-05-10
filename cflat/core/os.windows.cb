@@ -138,6 +138,10 @@ extern stdcall void*    FindFirstFileA(const char* pattern, _WIN32_FIND_DATAA* f
 extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData);
 extern stdcall win_int  FindClose(void* handle);
 extern stdcall win_int  GetFileAttributesA(const char* path);
+extern stdcall win_int  CopyFileA(const char* existing, const char* newPath, win_int failIfExists);
+extern stdcall win_int  GetTempPathA(win_int bufLen, i8* buf);
+extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, i8* tmpFileName);
+extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
 
 // Win32 Console
 // _CONSOLE_CURSOR_INFO — 8 bytes (dwSize + bVisible).
