@@ -393,6 +393,29 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (verbose) std::cout << "[verbose]   already imported: " << canonicalStr << "\n";
         return true;
     }
+    // Cross-path dedup: the same filename may resolve to different canonical paths
+    // depending on which search directory finds it first (e.g. runtimeDir/core vs -i dir).
+    // Check all alternate search directories so duplicates are caught across paths.
+    {
+        auto tryAlt = [&](const std::filesystem::path& dir) -> std::string {
+            std::error_code altEc;
+            auto alt = std::filesystem::canonical((dir / importFilename).lexically_normal(), altEc);
+            return altEc ? "" : alt.string();
+        };
+        std::string altPaths[] = {
+            importSearchDir.empty() ? "" : tryAlt(importSearchDir),
+            runtimeDir.empty()      ? "" : tryAlt(std::filesystem::path(runtimeDir) / "core"),
+        };
+        for (auto& alt : altPaths)
+        {
+            if (!alt.empty() && alt != canonicalStr && importedFiles.count(alt))
+            {
+                if (verbose) std::cout << "[verbose]   already imported (alt path): " << canonicalStr << "\n";
+                importedFiles.insert(canonicalStr);
+                return true;
+            }
+        }
+    }
     // Register eagerly so any re-entrant or duplicate import is caught above.
     importedFiles.insert(canonicalStr);
     importStack.push_back(canonicalStr);

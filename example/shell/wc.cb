@@ -1,0 +1,80 @@
+// wc.cb — count lines, words, and characters in text files.
+//
+// Build:
+//   x64/Debug/cflat.exe example/shell/wc.cb -o out/wc.exe
+// Run:
+//   out\wc.exe file1.txt [file2.txt ...]
+//
+// Output format (matches POSIX wc):
+//   <lines> <words> <chars> <filename>
+// When multiple files are given, a totals line is appended.
+
+import "filesystem.cb";
+
+extern int isspace(int c);
+
+struct Counts {
+    int lines = 0;
+    int words = 0;
+    int chars = 0;
+};
+
+Counts countFile(char* path) {
+    Counts result;
+    File* f = new File;
+    if (!f->openRead((string)path)) {
+        delete f;
+        printf("wc: %s: No such file or directory\n", path);
+        return result;
+    }
+    while (!f->atEnd()) {
+        string line = f->readLine();
+        if (line.length() == 0 && f->atEnd()) break;
+        result.lines++;
+        result.chars += line.length() + 1;  // +1 for the newline
+
+        i8* p = line.data();
+        int len = line.length();
+        bool inWord = false;
+        int j = 0;
+        while (j < len) {
+            if (isspace((int)(u8)p[j]) != 0) {
+                inWord = false;
+            } else {
+                if (!inWord) { result.words++; }
+                inWord = true;
+            }
+            j++;
+        }
+    }
+    delete f;
+    return result;
+}
+
+void printCounts(Counts c, char* label) {
+    printf("%7d %7d %7d %s\n", c.lines, c.words, c.chars, label);
+}
+
+extern int main(int argc, char** argv) {
+    if (argc < 2) {
+        printf("Usage: wc file1 [file2 ...]\n");
+        return 1;
+    }
+
+    Counts total;
+    int i = 1;
+    while (i < argc) {
+        Counts c = countFile(argv[i]);
+        printCounts(c, argv[i]);
+        total.lines += c.lines;
+        total.words += c.words;
+        total.chars += c.chars;
+        i++;
+    }
+
+    if (argc > 2) {
+        printCounts(total, "total");
+    }
+
+    return 0;
+}

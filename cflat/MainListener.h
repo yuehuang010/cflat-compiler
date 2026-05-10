@@ -224,7 +224,11 @@ private:
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
                 }
-                declType.Pointer = declSpec->pointer() != nullptr;
+                if (declSpec->pointer() != nullptr) {
+                    declType.Pointer = true;
+                    if (declSpec->pointer()->Star().size() >= 2)
+                        declType.ElemPointer = true;
+                }
                 declType.ArraySize = declSpec->assignmentExpression();
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
@@ -1159,10 +1163,10 @@ private:
                     if (substPointer) declType.Pointer = true;
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
+                bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
-                // When the substituted type is already a pointer AND there is an explicit '*',
-                // the result is pointer-to-pointer (e.g. T* where T=Employee* -> Employee**).
-                if (declType.Pointer && hasExplicitPointer)
+                // Pointer-to-pointer: explicit ** OR (substituted type is a pointer AND explicit *)
+                if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
                     declType.ElemPointer = true;
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
                 declType.ArraySize = declSpec->assignmentExpression();
@@ -4911,6 +4915,26 @@ public:
             auto namedVar = ParseCastExpression(castExp);
             auto destTypeName = ParseTypeName(typeName);
             auto type = compiler->GetType(destTypeName);
+
+            // If the destination is a struct type and an operator overload exists,
+            // call it (e.g. (string)charPtr calls operator string(char*)).
+            std::string opName = "operator " + destTypeName.TypeName;
+            if (compiler->GetFunction(opName) != nullptr)
+            {
+                auto argNV = namedVar;
+                argNV.TypeAndValue.VariableName = "";  // clear name so positional matching is used
+                if (argNV.Primary == nullptr && argNV.Storage != nullptr)
+                {
+                    auto srcType = compiler->GetType(argNV.TypeAndValue);
+                    argNV.Primary = compiler->CreateLoad(srcType, argNV.Storage);
+                    argNV.Storage = nullptr;
+                }
+                auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
+                namedVar.Primary = result;
+                namedVar.Storage = nullptr;
+                namedVar.TypeAndValue = destTypeName;
+                return namedVar;
+            }
 
             // Load with the source type first so we read the correct number of bytes,
             // then cast to the destination type. The old code loaded directly with the
