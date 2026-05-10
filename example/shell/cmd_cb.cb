@@ -1,0 +1,414 @@
+// cmd_cb.cb - CFlat interactive shell
+//
+// Supported commands:
+//   cd [path]         - show or change current directory
+//   dir [path]        - list directory contents
+//   set [VAR[=VAL]]   - show / set environment variables
+//   echo [text]       - print text
+//   type <file>       - print file contents
+//   copy <src> <dst>  - copy a file
+//   move <src> <dst>  - move a file
+//   del <file> ...    - delete one or more files
+//   mkdir <path>      - create a directory
+//   rmdir <path>      - remove an empty directory
+//   ren <old> <new>   - rename a file or directory
+//   cls               - clear the screen
+//   help              - list commands
+//   exit              - quit
+//
+// Build:
+//   x64/Debug/cflat.exe example/shell/cmd_cb.cb -i cflat/core -o out/cmd_cb.exe
+// Run:
+//   out\cmd_cb.exe
+
+import "string.cb";
+import "filesystem.cb";
+import "list.cb";
+
+extern stdcall i32  GetEnvironmentVariableA(const char* name, char* buf, i32 size);
+extern stdcall i32  SetEnvironmentVariableA(const char* name, const char* value);
+extern stdcall i8*  GetEnvironmentStringsA();
+extern stdcall i32  FreeEnvironmentStringsA(i8* env);
+
+// ── I/O helpers ───────────────────────────────────────────────────────────────
+
+// Read one line from stdin (blocking), stripping trailing CR/LF.
+// Returns "" on EOF.
+string readLine()
+{
+    void* stdinHandle = __acrt_iob_func(0);
+    stringbuilder sb;
+    while (true)
+    {
+        int c = fgetc(stdinHandle);
+        if (c == -1 || c == '\n') break;
+        if (c != '\r') sb.appendChar((i8)c);
+    }
+    return sb.toString();
+}
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+// Return a copy of s[start, end).
+string substr(string s, int start, int end)
+{
+    int len = end - start;
+    if (len <= 0) return "";
+    i8* buf = new i8[len + 1];
+    i8* src = s.data();
+    int i = 0;
+    while (i < len) { buf[i] = src[start + i]; i++; }
+    buf[len] = 0;
+    string result;
+    result._ptr = buf;
+    result._len = len;
+    return result;
+}
+
+// Return the index of the first '=' in s, or -1.
+int indexOfEquals(string s)
+{
+    i8* p = s.data();
+    int len = s.length();
+    int i = 0;
+    while (i < len) { if (p[i] == '=') return i; i++; }
+    return -1;
+}
+
+// Case-insensitive comparison of a CFlat string against a C literal.
+bool eqCI(string a, const char* b)
+{
+    int alen = a.length();
+    int blen = strlen(b);
+    if (alen != blen) return false;
+    i8* ap = a.data();
+    int i = 0;
+    while (i < alen)
+    {
+        if (tolower((int)(u8)ap[i]) != tolower((int)(u8)b[i])) return false;
+        i++;
+    }
+    return true;
+}
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+// Splits on whitespace; double-quoted spans become single tokens.
+
+list<string>* tokenize(string line)
+{
+    list<string>* tokens = new list<string>;
+    i8* p = line.data();
+    int len = line.length();
+    int i = 0;
+    while (i < len)
+    {
+        while (i < len && isspace((int)(u8)p[i]) != 0) i++;
+        if (i >= len) break;
+
+        stringbuilder tok;
+        if (p[i] == '"')
+        {
+            i++;
+            while (i < len && p[i] != '"') { tok.appendChar(p[i]); i++; }
+            if (i < len) i++;  // closing quote
+        }
+        else
+        {
+            while (i < len && isspace((int)(u8)p[i]) == 0) { tok.appendChar(p[i]); i++; }
+        }
+        if (tok.length() > 0) tokens->add(tok.toString());
+    }
+    return tokens;
+}
+
+// ── Prompt ───────────────────────────────────────────────────────────────────
+
+void printPrompt()
+{
+    string cwd = Directory.getCurrent();
+    printf("%s> ", cwd.data());
+}
+
+// ── cd ────────────────────────────────────────────────────────────────────────
+
+void cmdCd(list<string>* args)
+{
+    if (args->count() < 2)
+    {
+        string cwd = Directory.getCurrent();
+        printf("%s\n", cwd.data());
+        return;
+    }
+    string target = args->get(1);
+    if (!Directory.setCurrent(target))
+        printf("The system cannot find the path specified: %s\n", target.data());
+}
+
+// ── dir ───────────────────────────────────────────────────────────────────────
+
+void cmdDir(list<string>* args)
+{
+    string path = args->count() >= 2 ? args->get(1) : Directory.getCurrent();
+    string absPath = Path.getAbsolute(path);
+
+    string pattern = absPath + "\\*";
+    _WIN32_FIND_DATAA* fd = new _WIN32_FIND_DATAA;
+    void* handle = FindFirstFileA(pattern.data(), fd);
+    if (handle == (void*)(i64)-1)
+    {
+        printf("File Not Found\n");
+        delete fd;
+        return;
+    }
+
+    printf(" Directory of %s\n\n", absPath.data());
+
+    int fileCount = 0;
+    int dirCount  = 0;
+    i64 totalBytes = 0;
+
+    do {
+        i8* name  = fd->cFileName;
+        bool isDir = (fd->dwFileAttributes & 16) != 0;
+        bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+
+        if (isDot) { }
+        else if (isDir)
+        {
+            printf("%-40s <DIR>\n", name);
+            dirCount++;
+        }
+        else
+        {
+            i64 size = ((i64)(u32)fd->nFileSizeHigh << 32) | (i64)(u32)fd->nFileSizeLow;
+            printf("%-40s %12lld\n", name, size);
+            totalBytes += size;
+            fileCount++;
+        }
+    } while (FindNextFileA(handle, fd) != 0);
+
+    FindClose(handle);
+    delete fd;
+
+    printf("\n  %d file(s)   %lld bytes\n", fileCount, totalBytes);
+    printf("  %d dir(s)\n", dirCount);
+}
+
+// ── set ───────────────────────────────────────────────────────────────────────
+
+void cmdSet(list<string>* args)
+{
+    if (args->count() < 2)
+    {
+        // Print all environment variables.
+        i8* envBlock = GetEnvironmentStringsA();
+        if (envBlock == nullptr) return;
+        int pos = 0;
+        while (envBlock[pos] != 0)
+        {
+            // Skip Windows-internal entries that start with '='.
+            if (envBlock[pos] != '=')
+                printf("%s\n", envBlock + pos);
+            while (envBlock[pos] != 0) pos++;
+            pos++;
+        }
+        FreeEnvironmentStringsA(envBlock);
+        return;
+    }
+
+    string arg = args->get(1);
+    int eq = indexOfEquals(arg);
+
+    if (eq < 0)
+    {
+        // set NAME — display current value.
+        i8* buf = new i8[4096];
+        i32 len = GetEnvironmentVariableA(arg.data(), buf, 4096);
+        if (len == 0)
+            printf("Environment variable %s is not defined.\n", arg.data());
+        else
+            printf("%s=%s\n", arg.data(), buf);
+        delete[] buf;
+        return;
+    }
+
+    // set NAME=VALUE  (empty value unsets the variable)
+    string name  = substr(arg, 0, eq);
+    string value = substr(arg, eq + 1, arg.length());
+    if (value.length() == 0)
+        SetEnvironmentVariableA(name.data(), nullptr);
+    else
+        SetEnvironmentVariableA(name.data(), value.data());
+}
+
+// ── echo ──────────────────────────────────────────────────────────────────────
+
+// rawLine is the full input line; we skip the "echo" token and print the rest.
+void cmdEcho(string rawLine)
+{
+    i8* p = rawLine.data();
+    int len = rawLine.length();
+    int i = 0;
+    while (i < len && isspace((int)(u8)p[i]) == 0) i++;  // skip command word
+    while (i < len && isspace((int)(u8)p[i]) != 0) i++;  // skip separating spaces
+    if (i < len)
+        printf("%s\n", p + i);
+    else
+        printf("\n");
+}
+
+// ── type ──────────────────────────────────────────────────────────────────────
+
+void cmdType(list<string>* args)
+{
+    if (args->count() < 2) { printf("Usage: type <file>\n"); return; }
+    string path = args->get(1);
+    if (!File.exists(path))
+    {
+        printf("The system cannot find the file specified: %s\n", path.data());
+        return;
+    }
+    string content = File.readAllText(path);
+    printf("%s", content.data());
+    if (content.length() == 0 || content.data()[content.length() - 1] != '\n')
+        printf("\n");
+}
+
+// ── copy ──────────────────────────────────────────────────────────────────────
+
+void cmdCopy(list<string>* args)
+{
+    if (args->count() < 3) { printf("Usage: copy <src> <dst>\n"); return; }
+    string src = args->get(1);
+    string dst = args->get(2);
+    if (!File.copy(src, dst))
+        printf("Failed to copy '%s' to '%s'\n", src.data(), dst.data());
+    else
+        printf("        1 file(s) copied.\n");
+}
+
+// ── move ──────────────────────────────────────────────────────────────────────
+
+void cmdMove(list<string>* args)
+{
+    if (args->count() < 3) { printf("Usage: move <src> <dst>\n"); return; }
+    string src = args->get(1);
+    string dst = args->get(2);
+    if (!File.move(src, dst))
+        printf("Failed to move '%s' to '%s'\n", src.data(), dst.data());
+}
+
+// ── del ───────────────────────────────────────────────────────────────────────
+
+void cmdDel(list<string>* args)
+{
+    if (args->count() < 2) { printf("Usage: del <file> [file2 ...]\n"); return; }
+    int i = 1;
+    while (i < args->count())
+    {
+        string path = args->get(i);
+        if (!File.remove(path))
+            printf("Could not find '%s'\n", path.data());
+        i++;
+    }
+}
+
+// ── mkdir ─────────────────────────────────────────────────────────────────────
+
+void cmdMkdir(list<string>* args)
+{
+    if (args->count() < 2) { printf("Usage: mkdir <path>\n"); return; }
+    string path = args->get(1);
+    if (!Directory.create(path))
+        printf("A subdirectory or file '%s' already exists.\n", path.data());
+}
+
+// ── rmdir ─────────────────────────────────────────────────────────────────────
+
+void cmdRmdir(list<string>* args)
+{
+    if (args->count() < 2) { printf("Usage: rmdir <path>\n"); return; }
+    string path = args->get(1);
+    if (!Directory.remove(path))
+        printf("The directory is not empty or does not exist: '%s'\n", path.data());
+}
+
+// ── ren ───────────────────────────────────────────────────────────────────────
+
+void cmdRen(list<string>* args)
+{
+    if (args->count() < 3) { printf("Usage: ren <old> <new>\n"); return; }
+    string oldName = args->get(1);
+    string newName = args->get(2);
+    if (!File.move(oldName, newName))
+        printf("Failed to rename '%s' to '%s'\n", oldName.data(), newName.data());
+}
+
+// ── cls ───────────────────────────────────────────────────────────────────────
+
+void cmdCls()
+{
+    printf("\033[2J\033[H");
+}
+
+// ── help ──────────────────────────────────────────────────────────────────────
+
+void cmdHelp()
+{
+    printf("CFlat Shell - built-in commands:\n\n");
+    printf("  cd [path]          Show or change the current directory\n");
+    printf("  dir [path]         List directory contents\n");
+    printf("  set [VAR[=VALUE]]  Show or set environment variables\n");
+    printf("  echo [text]        Print text to the screen\n");
+    printf("  type <file>        Display a file's contents\n");
+    printf("  copy <src> <dst>   Copy a file\n");
+    printf("  move <src> <dst>   Move a file\n");
+    printf("  del <file> ...     Delete one or more files\n");
+    printf("  mkdir <path>       Create a directory\n");
+    printf("  rmdir <path>       Remove an empty directory\n");
+    printf("  ren <old> <new>    Rename a file or directory\n");
+    printf("  cls                Clear the screen\n");
+    printf("  help               Show this list\n");
+    printf("  exit               Quit the shell\n");
+}
+
+// ── REPL ──────────────────────────────────────────────────────────────────────
+
+extern int main(int argc, char** argv)
+{
+    printf("CFlat Shell  (type 'help' for commands, 'exit' to quit)\n\n");
+
+    bool running = true;
+    while (running)
+    {
+        printPrompt();
+        string line = readLine();
+
+        if (line.length() == 0) break;  // EOF (Ctrl+Z on Windows)
+
+        list<string>* tokens = tokenize(line);
+        if (tokens->count() == 0) { delete tokens; continue; }
+
+        string cmd = tokens->get(0);
+
+        if      (eqCI(cmd, "exit"))                        running = false;
+        else if (eqCI(cmd, "cd"))                          cmdCd(tokens);
+        else if (eqCI(cmd, "dir"))                         cmdDir(tokens);
+        else if (eqCI(cmd, "set"))                         cmdSet(tokens);
+        else if (eqCI(cmd, "echo"))                        cmdEcho(line);
+        else if (eqCI(cmd, "type"))                        cmdType(tokens);
+        else if (eqCI(cmd, "copy"))                        cmdCopy(tokens);
+        else if (eqCI(cmd, "move"))                        cmdMove(tokens);
+        else if (eqCI(cmd, "del") || eqCI(cmd, "erase"))  cmdDel(tokens);
+        else if (eqCI(cmd, "mkdir") || eqCI(cmd, "md"))   cmdMkdir(tokens);
+        else if (eqCI(cmd, "rmdir") || eqCI(cmd, "rd"))   cmdRmdir(tokens);
+        else if (eqCI(cmd, "ren") || eqCI(cmd, "rename")) cmdRen(tokens);
+        else if (eqCI(cmd, "cls") || eqCI(cmd, "clear"))  cmdCls();
+        else if (eqCI(cmd, "help") || eqCI(cmd, "/?"))    cmdHelp();
+        else printf("'%s' is not recognized as a command. Type 'help'.\n", cmd.data());
+
+        delete tokens;
+    }
+
+    return 0;
+}
