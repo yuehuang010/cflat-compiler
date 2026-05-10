@@ -2008,7 +2008,7 @@ public:
                 {
                     // Extract the data pointer (field 1) from the interface fat ptr and bind it.
                     auto* dataPtr = compiler->builder->CreateExtractValue(ctx.condValue, { 1u }, "typecase_data");
-                    auto* alloca = compiler->builder->CreateAlloca(dataPtr->getType(), nullptr, it->second.boundVarName);
+                    auto* alloca = compiler->AllocaAtEntry(dataPtr->getType(), nullptr, it->second.boundVarName);
                     compiler->builder->CreateStore(dataPtr, alloca);
 
                     LLVMBackend::NamedVariable nv;
@@ -3281,6 +3281,23 @@ public:
                 llvm::Value* right = nullptr;
                 bool srcIsUnsigned = false;
                 auto initializer = initDecl->initializer();
+
+                // At global scope, any RHS evaluation emits IR into whatever block the builder
+                // currently points at (the tail of the last generated function), corrupting it.
+                // Guard against this by redirecting into a throwaway block; if the result isn't
+                // a compile-time constant we emit an error and discard the temp IR.
+                llvm::Function* globalInitTempFn = nullptr;
+                LLVMBackend::BuilderState globalInitSavedState;
+                if (global_scope && initializer != nullptr && initializer->assignmentExpression() != nullptr)
+                {
+                    globalInitSavedState = compiler->SaveBuilderState();
+                    auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+                    globalInitTempFn = llvm::Function::Create(
+                        voidTy, llvm::Function::PrivateLinkage, "__global_init_tmp", compiler->module.get());
+                    auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", globalInitTempFn);
+                    compiler->builder->SetInsertPoint(tmpBB);
+                }
+
                 if (initializer != nullptr)
                 {
                     auto assignmentExpression = initializer->assignmentExpression();
@@ -3416,6 +3433,21 @@ public:
                         // Initialize with the default constructor first, then override named fields.
                         right = GenerateDefaultValue(typeAndValue);
                     }
+                }
+
+                if (globalInitTempFn != nullptr)
+                {
+                    // Check that the initializer reduced to a compile-time constant.
+                    if (right != nullptr && llvm::dyn_cast_or_null<llvm::Constant>(right) == nullptr)
+                    {
+                        LogErrorContext(initializer->assignmentExpression(),
+                            "global variable initializer must be a compile-time constant");
+                        right = nullptr;
+                    }
+                    // Discard the temp function (and all IR emitted into it) then restore the builder.
+                    globalInitTempFn->eraseFromParent();
+                    globalInitTempFn = nullptr;
+                    compiler->RestoreBuilderState(globalInitSavedState);
                 }
 
                 if (right == nullptr && typeAndValue.IsNullable)
@@ -4548,7 +4580,7 @@ public:
                     {
                         // Spill loaded value (chain case: `(p1 >> s) >> p2` produces a loaded stream)
                         auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                        streamPtr = compiler->builder->CreateAlloca(streamTy, nullptr, "stream_spill");
+                        streamPtr = compiler->AllocaAtEntry(streamTy, nullptr, "stream_spill");
                         compiler->builder->CreateStore(lv.value, streamPtr);
                     }
                     EmitStreamToProgramWire(streamPtr, rhsType, rhsStorage, ctx);

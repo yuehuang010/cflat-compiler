@@ -107,6 +107,7 @@ struct Terminal {
     void* _hIn      = nullptr;
     i32   _savedOut = 0;
     i32   _savedIn  = 0;
+    i32   _savedCP  = 0;
     bool  _active   = false;
 
     // Enable ANSI processing on stdout and switch stdin to raw (no echo, no
@@ -125,6 +126,11 @@ struct Terminal {
         // Add ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x04) to existing output flags.
         SetConsoleMode(_hOut, _savedOut | 0x04);
 
+        // Switch to UTF-8 output so Unicode characters (e.g. ▀ for image rendering)
+        // are encoded correctly. Saved and restored in restore().
+        _savedCP = GetConsoleOutputCP();
+        SetConsoleOutputCP(65001);
+
         // ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_MOUSE_INPUT (0x10).
         // Clears ENABLE_QUICK_EDIT_MODE (required for mouse events to arrive),
         // disables echo/line-buffering, and enables mouse event delivery.
@@ -140,7 +146,128 @@ struct Terminal {
         if (_active) {
             SetConsoleMode(_hOut, _savedOut);
             SetConsoleMode(_hIn,  _savedIn);
+            SetConsoleOutputCP(_savedCP);
             _active = false;
+        }
+    }
+
+    // Query Sixel graphics support via DA1 (Primary Device Attributes).
+    // Sends ESC[c and waits up to 150 ms for the terminal's ESC[?Ps;...c reply.
+    // Returns true if parameter 4 (Sixel) appears in that reply.
+    // Must be called after init().
+    bool supportsSixel() {
+        if (!_active) return false;
+
+        FlushConsoleInputBuffer(_hIn);
+        printf("\033[c");
+        fflush(nullptr);
+
+        Sleep(150);
+
+        char resp[128];
+        int  rlen = 0;
+
+        i32 count = 0;
+        GetNumberOfConsoleInputEvents(_hIn, &count);
+        while (count > 0 && rlen < 127) {
+            _INPUT_RECORD rec;
+            i32 read = 0;
+            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                char c = (char)(rec._event.key.uChar & 0xFF);
+                if (c != '\0') { resp[rlen] = c; rlen++; }
+            }
+            GetNumberOfConsoleInputEvents(_hIn, &count);
+        }
+        resp[rlen] = '\0';
+
+        // Scan for ESC[? and parse the semicolon-separated parameter list.
+        int i = 0;
+        while (i + 2 < rlen) {
+            if (resp[i] == '\x1b' && resp[i+1] == '[' && resp[i+2] == '?') {
+                i = i + 3;
+                while (i < rlen && resp[i] != 'c') {
+                    int num = 0;
+                    while (i < rlen && resp[i] >= '0' && resp[i] <= '9') {
+                        num = num * 10 + (int)(resp[i] - '0');
+                        i++;
+                    }
+                    if (num == 4) return true;
+                    if (i < rlen && resp[i] == ';') i++;
+                }
+                return false;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    // Query the pixel dimensions of one character cell via CSI 16 t.
+    // The terminal responds with ESC[6;<cellH>;<cellW>t.
+    // Falls back to common defaults (8×16) if the query is not answered.
+    // Must be called after init().
+    void getCellSize(int* cellW, int* cellH) {
+        *cellW = 8;
+        *cellH = 16;
+        if (!_active) return;
+
+        FlushConsoleInputBuffer(_hIn);
+        printf("\033[16t");
+        fflush(nullptr);
+
+        Sleep(150);
+
+        char resp[128];
+        int  rlen = 0;
+
+        i32 count = 0;
+        GetNumberOfConsoleInputEvents(_hIn, &count);
+        while (count > 0 && rlen < 127) {
+            _INPUT_RECORD rec;
+            i32 read = 0;
+            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+            if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
+                char c = (char)(rec._event.key.uChar & 0xFF);
+                if (c != '\0') { resp[rlen] = c; rlen++; }
+            }
+            GetNumberOfConsoleInputEvents(_hIn, &count);
+        }
+        resp[rlen] = '\0';
+
+        // Parse ESC[6;<h>;<w>t
+        int i = 0;
+        while (i + 2 < rlen) {
+            if (resp[i] == '\x1b' && resp[i+1] == '[') {
+                i = i + 2;
+                // read first param
+                int p1 = 0;
+                while (i < rlen && resp[i] >= '0' && resp[i] <= '9') {
+                    p1 = p1 * 10 + (int)(resp[i] - '0');
+                    i++;
+                }
+                if (p1 != 6 || i >= rlen || resp[i] != ';') { i++; continue; }
+                i++;  // skip ';'
+                // second param: cell height
+                int h = 0;
+                while (i < rlen && resp[i] >= '0' && resp[i] <= '9') {
+                    h = h * 10 + (int)(resp[i] - '0');
+                    i++;
+                }
+                if (i >= rlen || resp[i] != ';') { i++; continue; }
+                i++;  // skip ';'
+                // third param: cell width
+                int w = 0;
+                while (i < rlen && resp[i] >= '0' && resp[i] <= '9') {
+                    w = w * 10 + (int)(resp[i] - '0');
+                    i++;
+                }
+                if (i < rlen && resp[i] == 't' && w > 0 && h > 0) {
+                    *cellW = w;
+                    *cellH = h;
+                }
+                return;
+            }
+            i++;
         }
     }
 
@@ -311,6 +438,18 @@ void termReverse()                { printf("\033[7m"); }
 void termColor256(int fg, int bg) { printf("\033[38;5;%d;48;5;%dm", fg, bg); }
 void termFg256(int fg)            { printf("\033[38;5;%dm", fg); }
 void termBg256(int bg)            { printf("\033[48;5;%dm", bg); }
+
+// Truecolor (24-bit) helpers — require Terminal.init() for UTF-8 and VT support.
+void termFgRgb(int r, int g, int b)                         { printf("\033[38;2;%d;%d;%dm", r, g, b); }
+void termBgRgb(int r, int g, int b)                         { printf("\033[48;2;%d;%d;%dm", r, g, b); }
+void termColorRgb(int fr, int fg, int fb, int br, int bg, int bb) { printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm", fr, fg, fb, br, bg, bb); }
+
+// Render two vertically-stacked pixels in one character cell using the UTF-8
+// upper-half-block character (▀). Top pixel maps to foreground, bottom to background.
+// Requires Terminal.init() (UTF-8 + VT processing). Call termReset() after the row.
+void termPixel(int tr, int tg, int tb, int br, int bg, int bb) {
+    printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm\xe2\x96\x80", tr, tg, tb, br, bg, bb);
+}
 
 // ── TerminalSnapshot ─────────────────────────────────────────────────────────
 //

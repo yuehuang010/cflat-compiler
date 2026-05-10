@@ -1,0 +1,393 @@
+// minesweeper.cb — Minesweeper demo for terminal.cb
+//
+// Build:
+//   x64/Debug/cflat.exe example/minesweeper.cb -i cflat/core -o out/minesweeper.exe
+// Run:
+//   out\minesweeper.exe
+//
+// Left-click to reveal, right-click to flag, R to restart, ESC to quit.
+// First click is always safe — mines are placed after the first reveal.
+
+import "terminal.cb";
+import "random.cb";
+import "time.cb";
+import "array.cb";
+
+// ── Board constants ───────────────────────────────────────────────────────────
+
+int BOARD_W    = 16;
+int BOARD_H    = 16;
+int MINE_COUNT = 40;
+int CELL_W     = 2;   // terminal chars per cell column
+
+// ── Layout (recomputed on resize) ─────────────────────────────────────────────
+//
+// Visual structure (rows):
+//   g_headerRow          — title + mine count + timer
+//   g_headerRow + 1      — blank separator
+//   g_boardRow .. +H-1   — the 16×16 grid
+//   g_boardRow + H       — blank separator
+//   g_footerRow          — controls hint
+
+int g_headerRow = 1;
+int g_boardRow  = 1;
+int g_boardCol  = 1;
+int g_footerRow = 1;
+int g_termW     = 0;
+int g_termH     = 0;
+
+void computeLayout(Terminal* term)
+{
+    int w = 0;
+    int h = 0;
+    if (!term->getSize(&w, &h)) { w = 80; h = 24; }
+    g_termW = w;
+    g_termH = h;
+
+    int totalW = BOARD_W * CELL_W;
+    int totalH = BOARD_H + 4;   // header + blank + board + blank + footer
+
+    g_boardCol = (w - totalW) / 2 + 1;
+    if (g_boardCol < 1) g_boardCol = 1;
+
+    int top = (h - totalH) / 2 + 1;
+    if (top < 1) top = 1;
+
+    g_headerRow = top;
+    g_boardRow  = top + 2;
+    g_footerRow = g_boardRow + BOARD_H + 1;
+}
+
+// ── Game state ────────────────────────────────────────────────────────────────
+//
+// Three flat arrays indexed by (row * BOARD_W + col):
+//   g_state  — 0=hidden, 1=revealed, 2=flagged
+//   g_mines  — 0=safe,   1=mine
+//   g_counts — neighbor mine count 0-8
+
+array<int> g_state  = default;
+array<int> g_mines  = default;
+array<int> g_counts = default;
+
+int       g_flagsLeft  = 0;
+int       g_revealed   = 0;
+bool      g_gameOver   = false;
+bool      g_won        = false;
+bool      g_firstClick = true;
+Stopwatch g_timer      = default;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+int idx(int col, int row)
+{
+    return row * BOARD_W + col;
+}
+
+bool inBounds(int col, int row)
+{
+    return col >= 0 && col < BOARD_W && row >= 0 && row < BOARD_H;
+}
+
+// ── Mine placement ────────────────────────────────────────────────────────────
+
+void placeMines(int safeCol, int safeRow, Random* rng)
+{
+    int placed = 0;
+    while (placed < MINE_COUNT) {
+        int c = rng->nextInt(0, BOARD_W - 1);
+        int r = rng->nextInt(0, BOARD_H - 1);
+        // Skip the 3×3 safe zone around the first click.
+        if (c >= safeCol - 1 && c <= safeCol + 1 &&
+            r >= safeRow - 1 && r <= safeRow + 1) continue;
+        if (g_mines.get(idx(c, r)) != 0) continue;
+        g_mines.set(idx(c, r), 1);
+        placed++;
+    }
+    // Compute neighbor counts for every cell.
+    int row = 0;
+    while (row < BOARD_H) {
+        int col = 0;
+        while (col < BOARD_W) {
+            int count = 0;
+            int dr = -1;
+            while (dr <= 1) {
+                int dc = -1;
+                while (dc <= 1) {
+                    if ((dr != 0 || dc != 0) &&
+                        inBounds(col + dc, row + dr) &&
+                        g_mines.get(idx(col + dc, row + dr)) != 0)
+                        count++;
+                    dc++;
+                }
+                dr++;
+            }
+            g_counts.set(idx(col, row), count);
+            col++;
+        }
+        row++;
+    }
+}
+
+// ── Flood reveal ──────────────────────────────────────────────────────────────
+
+void floodReveal(int col, int row)
+{
+    if (!inBounds(col, row)) return;
+    if (g_state.get(idx(col, row)) != 0) return;  // already revealed or flagged
+    g_state.set(idx(col, row), 1);
+    g_revealed++;
+    if (g_counts.get(idx(col, row)) != 0) return;  // stop at numbered cells
+    int dr = -1;
+    while (dr <= 1) {
+        int dc = -1;
+        while (dc <= 1) {
+            if (dr != 0 || dc != 0)
+                floodReveal(col + dc, row + dr);
+            dc++;
+        }
+        dr++;
+    }
+}
+
+void reveal(int col, int row, Random* rng)
+{
+    if (!inBounds(col, row)) return;
+    if (g_state.get(idx(col, row)) != 0) return;  // flagged or already revealed
+
+    if (g_firstClick) {
+        g_firstClick = false;
+        placeMines(col, row, rng);
+        g_timer.restart();
+    }
+
+    if (g_mines.get(idx(col, row)) != 0) {
+        g_state.set(idx(col, row), 1);
+        g_gameOver = true;
+        g_timer.stop();
+        return;
+    }
+
+    floodReveal(col, row);
+
+    if (g_revealed == BOARD_W * BOARD_H - MINE_COUNT) {
+        g_won      = true;
+        g_gameOver = true;
+        g_timer.stop();
+    }
+}
+
+void toggleFlag(int col, int row)
+{
+    if (!inBounds(col, row)) return;
+    int s = g_state.get(idx(col, row));
+    if (s == 1) return;   // already revealed — can't flag
+    if (s == 2) {
+        g_state.set(idx(col, row), 0);
+        g_flagsLeft++;
+    } else {
+        g_state.set(idx(col, row), 2);
+        g_flagsLeft--;
+    }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+// Classic Minesweeper number colors (truecolor).
+void setNumberColor(int n)
+{
+    if      (n == 1) termFgRgb(  0,   0, 255);
+    else if (n == 2) termFgRgb(  0, 130,   0);
+    else if (n == 3) termFgRgb(220,   0,   0);
+    else if (n == 4) termFgRgb(  0,   0, 128);
+    else if (n == 5) termFgRgb(128,   0,   0);
+    else if (n == 6) termFgRgb(  0, 128, 128);
+    else if (n == 7) termFgRgb( 30,  30,  30);
+    else             termFgRgb(128, 128, 128);
+}
+
+void drawCell(Terminal* term, int col, int row, bool showMines)
+{
+    int s     = g_state.get(idx(col, row));
+    int mine  = g_mines.get(idx(col, row));
+    int count = g_counts.get(idx(col, row));
+
+    term->moveTo(g_boardRow + row, g_boardCol + col * CELL_W);
+
+    if (s == 1) {
+        if (mine != 0) {
+            // Hit mine — red background.
+            termBgRgb(180,  40,  40);
+            termFgRgb(255, 255, 255);
+            printf("* ");
+        } else if (count == 0) {
+            // Empty revealed cell.
+            termBgRgb(200, 200, 200);
+            printf("  ");
+        } else {
+            // Numbered cell.
+            termBgRgb(200, 200, 200);
+            setNumberColor(count);
+            printf("%d ", count);
+        }
+        termReset();
+    } else if (s == 2) {
+        // Flagged.
+        termBgRgb( 80,  80,  80);
+        termFgRgb(255, 200,   0);
+        printf("! ");
+        termReset();
+    } else {
+        // Hidden.
+        if (showMines && mine != 0) {
+            // Reveal unflagged mines after game over.
+            termBgRgb(120,  50,  50);
+            termFgRgb(200, 200, 200);
+            printf("* ");
+        } else {
+            termBgRgb(80, 80, 80);
+            printf("  ");
+        }
+        termReset();
+    }
+}
+
+void drawBoard(Terminal* term, bool showMines)
+{
+    int row = 0;
+    while (row < BOARD_H) {
+        int col = 0;
+        while (col < BOARD_W) {
+            drawCell(term, col, row, showMines);
+            col++;
+        }
+        row++;
+    }
+}
+
+void drawHeader(Terminal* term)
+{
+    // Clear the header line so varying-length state strings don't leave stale chars.
+    term->moveTo(g_headerRow, 1);
+    term->clearLine();
+
+    // Left side: game state label.
+    term->moveTo(g_headerRow, g_boardCol);
+    if (g_won) {
+        termFgRgb(0, 220, 0);
+        printf("** YOU WIN! **");
+        termReset();
+    } else if (g_gameOver) {
+        termFgRgb(220, 0, 0);
+        printf("** GAME OVER **");
+        termReset();
+    } else {
+        printf("MINESWEEPER");
+    }
+
+    // Right side: mine count + elapsed seconds, right-aligned to board edge.
+    // "Mines:000  000s" = 15 chars; offset from board left = board_width - 15.
+    int elapsedSecs = (int)g_timer.elapsed().seconds();
+    term->moveTo(g_headerRow, g_boardCol + BOARD_W * CELL_W - 15);
+    printf("Mines:%3d  %3ds", g_flagsLeft, elapsedSecs);
+}
+
+void drawFooter(Terminal* term)
+{
+    term->moveTo(g_footerRow, g_boardCol);
+    termFgRgb(120, 120, 120);
+    printf("Left:reveal  Right:flag  R:restart  ESC:quit");
+    termReset();
+}
+
+// ── Game reset ────────────────────────────────────────────────────────────────
+
+void resetGame()
+{
+    int total = BOARD_W * BOARD_H;
+    int i = 0;
+    while (i < total) {
+        g_state.set(i, 0);
+        g_mines.set(i, 0);
+        g_counts.set(i, 0);
+        i++;
+    }
+    g_flagsLeft  = MINE_COUNT;
+    g_revealed   = 0;
+    g_gameOver   = false;
+    g_won        = false;
+    g_firstClick = true;
+    g_timer.reset();
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    Terminal term;
+    if (!term.init()) {
+        printf("terminal not available -- run from a real console\n");
+        return 1;
+    }
+
+    Random rng;
+    rng.seedFromTime();
+
+    g_state.init(BOARD_W * BOARD_H);
+    g_mines.init(BOARD_W * BOARD_H);
+    g_counts.init(BOARD_W * BOARD_H);
+
+    resetGame();
+    computeLayout(&term);
+    term.hideCursor();
+    term.clear();
+
+    bool running = true;
+
+    while (running) {
+        // Resize detection — recompute layout and redraw on size change.
+        int curW = 0;
+        int curH = 0;
+        term.getSize(&curW, &curH);
+        if (curW != g_termW || curH != g_termH) {
+            computeLayout(&term);
+            term.clear();
+        }
+
+        // Input — process all queued events.
+        i32        eventType = 0;
+        KeyEvent   key;
+        MouseEvent mouse;
+        while (term.pollEvent(&eventType, &key, &mouse)) {
+            if (eventType == 1) {
+                if (key.vkCode == (i16)VK_ESCAPE) {
+                    running = false;
+                } else if (key.ch == 'r' || key.ch == 'R') {
+                    resetGame();
+                    term.clear();
+                }
+            } else if (eventType == 2 && !g_gameOver) {
+                // Map 0-based mouse coords to cell grid coords.
+                int cellCol = (mouse.x - (g_boardCol - 1)) / CELL_W;
+                int cellRow =  mouse.y - (g_boardRow - 1);
+                if (inBounds(cellCol, cellRow)) {
+                    if (mouse.isPress() && mouse.leftButton())
+                        reveal(cellCol, cellRow, &rng);
+                    else if (mouse.isPress() && mouse.rightButton())
+                        toggleFlag(cellCol, cellRow);
+                }
+            }
+        }
+
+        drawHeader(&term);
+        drawBoard(&term, g_gameOver);
+        drawFooter(&term);
+        term.flush();
+        sleep(16);
+    }
+
+    term.showCursor();
+    term.moveTo(g_footerRow + 2, 1);
+    term.restore();
+    printf("Thanks for playing!\n");
+    return 0;
+}

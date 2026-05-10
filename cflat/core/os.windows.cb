@@ -202,6 +202,8 @@ extern stdcall void*    GetStdHandle(i32 nStdHandle);
 extern stdcall win_int  WriteFile(void* hFile, const char* lpBuffer, i32 nNumberOfBytesToWrite, i32* lpNumberOfBytesWritten, void* lpOverlapped);
 extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
 extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
+extern stdcall i32      GetConsoleOutputCP();
+extern stdcall win_int  SetConsoleOutputCP(i32 wCodePageID);
 extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);
 extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
 extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);

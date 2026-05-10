@@ -1,0 +1,8 @@
+// Global variable initializers must be compile-time constants.
+// Initializing a global from another global variable is not allowed.
+
+int g_a = 5;
+
+expect_error("global variable initializer must be a compile-time constant") {
+    int g_b = g_a;
+}

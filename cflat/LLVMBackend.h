@@ -1957,7 +1957,7 @@ public:
                 else
                 {
                     auto structTy = nv.BaseType ? nv.BaseType : GetType(nv.TypeAndValue);
-                    auto tempAlloca = builder->CreateAlloca(structTy);
+                    auto tempAlloca = AllocaAtEntry(structTy, nullptr);
                     builder->CreateStore(nv.Primary, tempAlloca);
                     argDataPtr = tempAlloca;
                 }
@@ -2385,10 +2385,25 @@ public:
         return gVar;
     }
 
+    // Emit an alloca in the function entry block so that loop-body declarations
+    // don't grow the stack unboundedly across iterations.  VLAs (non-null arraySize)
+    // must stay at the current point because their size is computed dynamically.
+    llvm::AllocaInst* AllocaAtEntry(llvm::Type* type, llvm::Value* arraySize, const llvm::Twine& name = "")
+    {
+        if (arraySize != nullptr)
+            return builder->CreateAlloca(type, arraySize, name);
+        auto* currentBlock = builder->GetInsertBlock();
+        auto* entryBlock = &currentBlock->getParent()->getEntryBlock();
+        if (currentBlock == entryBlock)
+            return builder->CreateAlloca(type, nullptr, name);
+        llvm::IRBuilder<> eb(entryBlock, entryBlock->begin());
+        return eb.CreateAlloca(type, nullptr, name);
+    }
+
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0)
     {
         auto type = GetType(typeValue, autoType);
-        auto alloc = builder->CreateAlloca(type, arraySize, typeValue.VariableName);
+        auto alloc = AllocaAtEntry(type, arraySize, typeValue.VariableName);
         auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
@@ -2425,7 +2440,7 @@ public:
 
     llvm::AllocaInst* CreateAlloca(llvm::Type* type)
     {
-        return builder->CreateAlloca(type, nullptr);
+        return AllocaAtEntry(type, nullptr);
     }
 
     // Register an alloca of struct type as the implicit 'this' pointer in the current scope.
@@ -4301,7 +4316,7 @@ public:
                 {
                     // Materialize a pointer to the struct value
                     auto structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
-                    auto tempAlloca = builder->CreateAlloca(structTy);
+                    auto tempAlloca = AllocaAtEntry(structTy, nullptr);
                     builder->CreateStore(arg.Primary, tempAlloca);
                     dataPtr = tempAlloca;
                 }
@@ -4329,7 +4344,7 @@ public:
                 {
                     // By-value struct parameter passed to a pointer parameter (e.g. args.count()
                     // where args is a list<T> value param). Materialize on the stack first.
-                    auto* tempAlloca = builder->CreateAlloca(arg.Primary->getType());
+                    auto* tempAlloca = AllocaAtEntry(arg.Primary->getType(), nullptr);
                     builder->CreateStore(arg.Primary, tempAlloca);
                     argList.push_back(tempAlloca);
                 }
