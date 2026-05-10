@@ -2129,7 +2129,35 @@ public:
                 ;
             */
 
-            if (iterationStatement->While())
+            // Check Do before While: do-while contains the 'while' keyword, so While() returns
+            // non-null for both rules. Do() is unambiguous and must be tested first.
+            if (iterationStatement->Do())
+            {
+                auto expression = iterationStatement->expression();
+                auto innerStatement = iterationStatement->statement();
+
+                auto blockInner = compiler->CreateBasicBlock("doWhileInner");
+                auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
+                auto blockResume = compiler->CreateBasicBlock("doWhileResume");
+
+                compiler->CreateBlockBreak(blockInner, false);
+
+                compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
+                ParseStatement(innerStatement);
+                compiler->CreateContinueCall();
+
+                compiler->InitializeBlock(blockCondition, false);
+                auto condition = ParseExpression(expression);
+                compiler->CreateConditionJump(condition, blockInner, blockResume);
+
+                // resume
+                compiler->InitializeBlock(blockResume, false);
+
+                // pop the stack
+                compiler->CreateBlockBreak(nullptr, true);
+                return;
+            }
+            else if (iterationStatement->While())
             {
                 auto expression = iterationStatement->expression();
                 auto innerStatement = iterationStatement->statement();
@@ -2155,31 +2183,6 @@ public:
                 compiler->CreateBlockBreak(nullptr, true);
 
                 return;
-            }
-            else if (iterationStatement->Do())
-            {
-                auto expression = iterationStatement->expression();
-                auto innerStatement = iterationStatement->statement();
-
-                auto blockInner = compiler->CreateBasicBlock("doWhileInner");
-                auto blockCondition = compiler->CreateBasicBlock("doWhileCondition");
-                auto blockResume = compiler->CreateBasicBlock("doWhileResume");
-
-                compiler->CreateBlockBreak(blockInner, false);
-
-                compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
-                ParseStatement(innerStatement);
-                compiler->CreateContinueCall();
-
-                compiler->InitializeBlock(blockCondition, false);
-                auto condition = ParseExpression(expression);
-                compiler->CreateConditionJump(condition, blockInner, blockResume);
-
-                // resume
-                compiler->InitializeBlock(blockResume, false);
-
-                // pop the stack
-                compiler->CreateBlockBreak(nullptr, true);
             }
             else if (iterationStatement->For())
             {
@@ -3989,58 +3992,38 @@ public:
         else if (inclusiveCtxs.size() > 1)
         {
             llvm::Value* left = nullptr;
-            auto elseBlock = compiler->GetElseBlock();
 
-            if (elseBlock)
+            // Always use resultStorage path. The elseBlock optimization was broken:
+            // in non-condition contexts (e.g. bool x = a && b inside a loop body) the
+            // elseBlock from an enclosing scope (loop exit) was incorrectly used as the
+            // false-branch target, causing the loop to exit instead of continuing.
+            LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
+            auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
+            auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
+
+            for (const auto& inclusiveCtx : inclusiveCtxs)
             {
-                for (const auto& inclusiveCtx : inclusiveCtxs)
+                if (left == nullptr)
                 {
-                    if (left == nullptr)
-                    {
-                        left = ParseInclusiveOrExpression(inclusiveCtx);
-                    }
-                    else
-                    {
-                        auto trueBlock = compiler->CreateBasicBlock("trueAND");
-                        auto branch = compiler->CreateConditionJump(left, trueBlock, compiler->GetElseBlock());
+                    left = ParseInclusiveOrExpression(inclusiveCtx);
+                    compiler->CreateAssignment(left, resultStorage);
+                }
+                else
+                {
+                    auto trueBlock = compiler->CreateBasicBlock("trueAND");
+                    auto branch = compiler->CreateConditionJump(left, trueBlock, resumeBlock);
 
-                        compiler->InitializeBlock(trueBlock, false);
-                        llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
-                    }
+                    compiler->InitializeBlock(trueBlock, false);
+                    llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
+                    left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
+                    compiler->CreateAssignment(left, resultStorage);
                 }
             }
-            else
-            {
-                LLVMBackend::TypeAndValue boolValue = { .TypeName = "bool",.VariableName = "", .Pointer = false };
-                auto resultStorage = compiler->CreateAlloca(compiler->GetType(boolValue));
-                auto resumeBlock = compiler->CreateBasicBlock("resumeAND");
 
-                for (const auto& inclusiveCtx : inclusiveCtxs)
-                {
-                    if (left == nullptr)
-                    {
-                        left = ParseInclusiveOrExpression(inclusiveCtx);
-                        compiler->CreateAssignment(left, resultStorage);
-                    }
-                    else
-                    {
-                        auto trueBlock = compiler->CreateBasicBlock("trueAND");
-                        auto branch = compiler->CreateConditionJump(left, trueBlock, resumeBlock);
+            compiler->CreateBlockBreak(resumeBlock, false);
 
-                        compiler->InitializeBlock(trueBlock, false);
-                        llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
-                        left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
-                        compiler->CreateAssignment(left, resultStorage);
-                    }
-                }
-
-                compiler->CreateBlockBreak(resumeBlock, false);
-
-                compiler->InitializeBlock(resumeBlock, false);
-                return { compiler->CreateLoad(resultStorage), false };
-            }
-            return { left, false };  // && produces bool
+            compiler->InitializeBlock(resumeBlock, false);
+            return { compiler->CreateLoad(resultStorage), false };
         }
 
         LogErrorContext(ctx, "Logical-AND expression has no operands.");
