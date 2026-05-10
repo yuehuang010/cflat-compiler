@@ -584,9 +584,6 @@ class Directory
 
     // filter: 0=all entries, 1=files only, 2=dirs only.
     // FILE_ATTRIBUTE_DIRECTORY = 0x10 = 16.
-    // Uses more=true/while to process the FindFirstFileA result before
-    // calling FindNextFileA (CFlat do-while compiles as while, skipping
-    // the first entry).
     static list<string>* _listFiltered(string path, int filter)
     {
         list<string>* result = new list<string>;
@@ -598,19 +595,11 @@ class Directory
             delete findData;
             return result;
         }
-        bool more = true;
-        while (more)
-        {
+        do {
             i8* name = findData->cFileName;
             bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
             bool isDir = (findData->dwFileAttributes & 16) != 0;
-            bool include = false;
-            if (!isDot)
-            {
-                if (filter == 0) include = true;
-                else if (filter == 1) { if (!isDir) include = true; }
-                else if (filter == 2) { if (isDir) include = true; }
-            }
+            bool include = !isDot && (filter == 0 || (filter == 1 && !isDir) || (filter == 2 && isDir));
             if (include)
             {
                 int len = strlen(name);
@@ -621,8 +610,7 @@ class Directory
                 entry._len = len;
                 result->add(entry);
             }
-            more = FindNextFileA(handle, findData) != 0;
-        }
+        } while (FindNextFileA(handle, findData) != 0);
         FindClose(handle);
         delete findData;
         return result;

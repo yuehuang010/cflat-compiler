@@ -121,11 +121,12 @@ del /q "%OUT%\results\*.log" 2>nul
 
 set /a LAUNCHED=0
 
-REM Launch error tests as 3 parallel groups — each group runs its subset sequentially
-set /a LAUNCHED+=3
+REM Launch error tests as 4 parallel groups — files distributed round-robin by test_err.bat
+set /a LAUNCHED+=4
 start "" /b cmd /c "%SCRIPT% --worker-err 1"
 start "" /b cmd /c "%SCRIPT% --worker-err 2"
 start "" /b cmd /c "%SCRIPT% --worker-err 3"
+start "" /b cmd /c "%SCRIPT% --worker-err 4"
 
 for %%F in (%SRC%\test_*.c) do (
     call :IsExcluded %%~nF

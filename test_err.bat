@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 
 if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
@@ -11,17 +11,18 @@ if "%~1"=="--group" set GROUP=%~2
 
 set ERRORS=0
 
-REM Group 1: statements, constraints, types, typeswitch, vararg, annotations
 if "%GROUP%"=="0" goto :RunAll
 if "%GROUP%"=="1" goto :Group1
 if "%GROUP%"=="2" goto :Group2
 if "%GROUP%"=="3" goto :Group3
+if "%GROUP%"=="4" goto :Group4
 goto :RunAll
 
 :RunAll
 call :Group1Tests
 call :Group2Tests
 call :Group3Tests
+call :Group4Tests
 goto :Done
 
 :Group1
@@ -36,32 +37,41 @@ goto :Done
 call :Group3Tests
 goto :Done
 
+:Group4
+call :Group4Tests
+goto :Done
+
+REM Files are distributed round-robin across 4 groups by index modulo 4.
+REM Adding a new err_*.cb is self-maintaining — no list updates needed.
+
 :Group1Tests
-call :RunErrorTest err_statements.cb
-call :RunErrorTest err_constraints.cb
-call :RunErrorTest err_types.cb
-call :RunErrorTest err_typeswitch_mixed.cb
-call :RunErrorTest err_vararg_forward_not_variadic.cb
-call :RunErrorTest err_annotations.cb
+call :RunModuloGroup 0 4
 exit /b
 
 :Group2Tests
-call :RunErrorTest err_reflect.cb
-call :RunErrorTest err_move.cb
-call :RunErrorTest err_interface_pointer.cb
-call :RunErrorTest err_declarations.cb
-call :RunErrorTest err_variadic_not_last.cb
-call :RunErrorTest err_move_return.cb
+call :RunModuloGroup 1 4
 exit /b
 
 :Group3Tests
-call :RunErrorTest err_field_init_unknown.cb
-call :RunErrorTest err_field_init_duplicate.cb
-call :RunErrorTest err_field_init_arg_no_struct.cb
-call :RunErrorTest err_field_init_arg_ambiguous.cb
-call :RunErrorTest err_bond_lambda_escape.cb
+call :RunModuloGroup 2 4
 for %%F in (%SRC%\errors\circular\entry_*.cb) do (
     call :RunCircularTest %%~nxF
+)
+exit /b
+
+:Group4Tests
+call :RunModuloGroup 3 4
+exit /b
+
+:RunModuloGroup
+REM Runs every err_*.cb whose index mod %~2 == %~1
+set /a MOD_REM=%~1
+set /a MOD_DIV=%~2
+set /a CTR=0
+for %%F in (%SRC%\errors\err_*.cb) do (
+    set /a MOD=CTR %% MOD_DIV
+    if !MOD!==!MOD_REM! call :RunErrorTest %%~nxF
+    set /a CTR+=1
 )
 exit /b
 
