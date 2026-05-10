@@ -1,0 +1,360 @@
+// core/graphic/bitmap.cb — BMP (Windows Bitmap) file parser and writer
+//
+// Supports 1, 4, 8, 16, 24, and 32 bpp uncompressed BMP files (BI_RGB and BI_BITFIELDS).
+// Pixel data is stored as RGBA, top-to-bottom, left-to-right.
+// Save always writes a 24 bpp uncompressed BMP.
+//
+// Usage:
+//   import "graphic/bitmap.cb";
+//   Bitmap* bmp = new Bitmap;
+//   if (bmp->load("image.bmp")) { ... }
+//   delete bmp;
+
+import "filesystem.cb";
+
+// ── BitmapPixel ───────────────────────────────────────────────────────────────
+
+struct BitmapPixel
+{
+    u8 r = (u8)0;
+    u8 g = (u8)0;
+    u8 b = (u8)0;
+    u8 a = (u8)255;
+};
+
+// ── Bitmap ────────────────────────────────────────────────────────────────────
+
+class Bitmap
+{
+    int          _width  = 0;
+    int          _height = 0;
+    int          _bpp    = 0;
+    BitmapPixel* _pixels = nullptr;
+
+    int  width()        { return _width; }
+    int  height()       { return _height; }
+    int  bitsPerPixel() { return _bpp; }
+    bool isLoaded()     { return _pixels != nullptr; }
+
+    // Get the pixel at (x, y). Returns a zeroed pixel if out of bounds.
+    BitmapPixel get(int x, int y)
+    {
+        BitmapPixel empty;
+        if (_pixels == nullptr || x < 0 || x >= _width || y < 0 || y >= _height)
+            return empty;
+        return _pixels[y * _width + x];
+    }
+
+    void set(int x, int y, BitmapPixel px)
+    {
+        if (_pixels == nullptr || x < 0 || x >= _width || y < 0 || y >= _height)
+            return;
+        _pixels[y * _width + x] = px;
+    }
+
+    // Allocate a blank (black, fully opaque) bitmap.
+    void create(int w, int h)
+    {
+        if (_pixels != nullptr) delete[_] _pixels;
+        _width  = w;
+        _height = h;
+        _bpp    = 24;
+        _pixels = new BitmapPixel[w * h];
+        int n = w * h;
+        int i = 0;
+        while (i < n)
+        {
+            _pixels[i].r = 0;
+            _pixels[i].g = 0;
+            _pixels[i].b = 0;
+            _pixels[i].a = 255;
+            i++;
+        }
+    }
+
+    // Load a BMP file by path. Returns true on success.
+    bool load(string path)
+    {
+        File* f = new File;
+        bool ok = f->openRead(path) && _parse(f);
+        delete f;
+        return ok;
+    }
+
+    // Save as a 24 bpp BMP file. Returns true on success.
+    bool save(string path)
+    {
+        File* f = new File;
+        bool ok = f->openWrite(path) && _write(f);
+        delete f;
+        return ok;
+    }
+
+    ~Bitmap()
+    {
+        if (_pixels != nullptr) delete[_] _pixels;
+    }
+
+    // ── private: load ─────────────────────────────────────────────────────────
+
+    bool _parse(File* f)
+    {
+        // File header (14 bytes): signature, file size, reserved, pixel data offset
+        i8* fhdr = new i8[14];
+        if (f->readBytes(fhdr, 14) != 14) { delete[] fhdr; return false; }
+        bool isBmp = fhdr[0] == 'B' && fhdr[1] == 'M';
+        int pixelOffset = Bitmap._readI32(fhdr, 10);
+        delete[] fhdr;
+        if (!isBmp) return false;
+
+        // DIB header: read size field first, then read the rest
+        i8* szbuf = new i8[4];
+        if (f->readBytes(szbuf, 4) != 4) { delete[] szbuf; return false; }
+        int dibSize = Bitmap._readI32(szbuf, 0);
+        delete[] szbuf;
+        if (dibSize < 40) return false;
+
+        i8* dib = new i8[dibSize - 4];
+        if (f->readBytes(dib, dibSize - 4) != dibSize - 4) { delete[] dib; return false; }
+
+        // Offsets are relative to start of DIB header; we already consumed 4 bytes.
+        int width       = Bitmap._readI32(dib, 0);   // DIB offset 4
+        int height      = Bitmap._readI32(dib, 4);   // DIB offset 8
+        int bpp         = Bitmap._readI16(dib, 10);  // DIB offset 14
+        int compression = Bitmap._readI32(dib, 12);  // DIB offset 16
+        int colorsUsed  = Bitmap._readI32(dib, 28);  // DIB offset 32
+        delete[] dib;
+
+        // Only uncompressed (BI_RGB=0) and BI_BITFIELDS=3
+        if (compression != 0 && compression != 3) return false;
+        if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
+            return false;
+
+        bool flipY = height > 0;  // positive height = bottom-up storage
+        if (height < 0) height = -height;
+        if (width <= 0 || height <= 0) return false;
+
+        // Color table for indexed formats
+        BitmapPixel* palette = nullptr;
+        int paletteCount = 0;
+        if (bpp <= 8)
+        {
+            paletteCount = colorsUsed > 0 ? colorsUsed : (1 << bpp);
+            palette = new BitmapPixel[paletteCount];
+            i8* palbuf = new i8[paletteCount * 4];
+            if (f->readBytes(palbuf, paletteCount * 4) != paletteCount * 4)
+            {
+                delete[] palbuf;
+                delete[_] palette;
+                return false;
+            }
+            int i = 0;
+            while (i < paletteCount)
+            {
+                // Palette entries are RGBQUAD: blue, green, red, reserved
+                palette[i].b = (u8)palbuf[i * 4];
+                palette[i].g = (u8)palbuf[i * 4 + 1];
+                palette[i].r = (u8)palbuf[i * 4 + 2];
+                palette[i].a = 255;
+                i++;
+            }
+            delete[] palbuf;
+        }
+
+        // Seek to pixel data (absolute offset from file start)
+        f->seek(pixelOffset, 0);
+
+        // Row stride is padded to a 4-byte boundary
+        int bytesPerRow = (width * bpp + 7) / 8;
+        int stride = (bytesPerRow + 3) / 4 * 4;
+        i8* rowBuf = new i8[stride];
+        BitmapPixel* pixels = new BitmapPixel[width * height];
+
+        bool ok = true;
+        int row = 0;
+        while (row < height)
+        {
+            if (f->readBytes(rowBuf, stride) != stride) { ok = false; break; }
+            int destRow = flipY ? (height - 1 - row) : row;
+            Bitmap._decodeRow(rowBuf, pixels + destRow * width, width, bpp, palette);
+            row++;
+        }
+
+        delete[] rowBuf;
+        if (palette != nullptr) delete[_] palette;
+
+        if (!ok)
+        {
+            delete[_] pixels;
+            return false;
+        }
+
+        if (_pixels != nullptr) delete[_] _pixels;
+        _width  = width;
+        _height = height;
+        _bpp    = bpp;
+        _pixels = pixels;
+        return true;
+    }
+
+    // Decode one row of packed BMP pixel data into RGBA pixels.
+    static void _decodeRow(i8* src, BitmapPixel* dst, int width, int bpp, BitmapPixel* palette)
+    {
+        if (bpp == 24)
+        {
+            int i = 0;
+            while (i < width)
+            {
+                dst[i].b = (u8)src[i * 3];
+                dst[i].g = (u8)src[i * 3 + 1];
+                dst[i].r = (u8)src[i * 3 + 2];
+                dst[i].a = 255;
+                i++;
+            }
+        }
+        else if (bpp == 32)
+        {
+            int i = 0;
+            while (i < width)
+            {
+                dst[i].b = (u8)src[i * 4];
+                dst[i].g = (u8)src[i * 4 + 1];
+                dst[i].r = (u8)src[i * 4 + 2];
+                dst[i].a = (u8)src[i * 4 + 3];
+                i++;
+            }
+        }
+        else if (bpp == 8)
+        {
+            int i = 0;
+            while (i < width)
+            {
+                int idx = (int)(u8)src[i];
+                dst[i] = palette[idx];
+                i++;
+            }
+        }
+        else if (bpp == 4)
+        {
+            int i = 0;
+            while (i < width)
+            {
+                int byteIdx = i / 2;
+                int b = (int)(u8)src[byteIdx];
+                int nibble = (i & 1) == 0 ? (b >> 4) : (b & 0xF);
+                dst[i] = palette[nibble];
+                i++;
+            }
+        }
+        else if (bpp == 1)
+        {
+            int i = 0;
+            while (i < width)
+            {
+                int byteIdx = i / 8;
+                int bitIdx  = 7 - (i & 7);
+                int bit = ((int)(u8)src[byteIdx] >> bitIdx) & 1;
+                dst[i] = palette[bit];
+                i++;
+            }
+        }
+        else if (bpp == 16)
+        {
+            // 5-5-5 RGB (default BI_RGB layout for 16 bpp)
+            int i = 0;
+            while (i < width)
+            {
+                int val = Bitmap._readI16(src, i * 2);
+                dst[i].b = (u8)((val & 0x1F) << 3);
+                dst[i].g = (u8)(((val >> 5) & 0x1F) << 3);
+                dst[i].r = (u8)(((val >> 10) & 0x1F) << 3);
+                dst[i].a = 255;
+                i++;
+            }
+        }
+    }
+
+    // ── private: save ─────────────────────────────────────────────────────────
+
+    bool _write(File* f)
+    {
+        if (_pixels == nullptr || _width <= 0 || _height <= 0) return false;
+
+        int stride       = (_width * 3 + 3) / 4 * 4;
+        int pixelDataSz  = stride * _height;
+        int fileSize     = 54 + pixelDataSz;  // 14 file header + 40 DIB header + pixels
+
+        i8* hdr = new i8[54];
+        int i = 0;
+        while (i < 54) { hdr[i] = 0; i++; }
+
+        // File header
+        hdr[0] = 'B';
+        hdr[1] = 'M';
+        Bitmap._writeI32(hdr, 2,  fileSize);
+        Bitmap._writeI32(hdr, 10, 54);  // pixel data starts right after headers
+
+        // BITMAPINFOHEADER
+        Bitmap._writeI32(hdr, 14, 40);        // header size
+        Bitmap._writeI32(hdr, 18, _width);
+        Bitmap._writeI32(hdr, 22, _height);   // positive = bottom-up
+        Bitmap._writeI16(hdr, 26, 1);          // color planes
+        Bitmap._writeI16(hdr, 28, 24);         // bits per pixel
+        // compression=0 (BI_RGB), remaining fields stay 0
+
+        f->writeBytes(hdr, 54);
+        delete[] hdr;
+
+        // Write rows bottom-to-top (standard BMP orientation)
+        i8* row = new i8[stride];
+        int r = _height - 1;
+        while (r >= 0)
+        {
+            int j = 0;
+            while (j < stride) { row[j] = 0; j++; }
+            int col = 0;
+            while (col < _width)
+            {
+                BitmapPixel px = _pixels[r * _width + col];
+                row[col * 3]     = (i8)px.b;
+                row[col * 3 + 1] = (i8)px.g;
+                row[col * 3 + 2] = (i8)px.r;
+                col++;
+            }
+            f->writeBytes(row, stride);
+            r--;
+        }
+        delete[] row;
+        return true;
+    }
+
+    // ── private: little-endian I/O helpers ────────────────────────────────────
+
+    static int _readI16(i8* buf, int off)
+    {
+        return (int)(u8)buf[off]
+             | (((int)(u8)buf[off + 1]) << 8);
+    }
+
+    static int _readI32(i8* buf, int off)
+    {
+        return (int)(u8)buf[off]
+             | (((int)(u8)buf[off + 1]) << 8)
+             | (((int)(u8)buf[off + 2]) << 16)
+             | (((int)(u8)buf[off + 3]) << 24);
+    }
+
+    static void _writeI16(i8* buf, int off, int val)
+    {
+        buf[off]     = (i8)(val & 0xFF);
+        buf[off + 1] = (i8)((val >> 8) & 0xFF);
+    }
+
+    static void _writeI32(i8* buf, int off, int val)
+    {
+        buf[off]     = (i8)(val & 0xFF);
+        buf[off + 1] = (i8)((val >> 8)  & 0xFF);
+        buf[off + 2] = (i8)((val >> 16) & 0xFF);
+        buf[off + 3] = (i8)((val >> 24) & 0xFF);
+    }
+};

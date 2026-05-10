@@ -1,0 +1,114 @@
+import "graphic/bitmap.cb";
+import "test_helper.cb";
+
+// ── round-trip: create → save → load → verify ────────────────────────────────
+
+int testRoundTrip()
+{
+    int passed = 0;
+    string path = "test_bitmap_tmp.bmp";
+
+    Bitmap* bmp = new Bitmap;
+    bmp->create(4, 4);
+
+    // Set a few distinct pixels
+    BitmapPixel red;   red.r   = 255; red.g = 0;   red.b = 0;   red.a   = 255;
+    BitmapPixel green; green.r = 0;   green.g = 255; green.b = 0; green.a = 255;
+    BitmapPixel blue;  blue.r  = 0;   blue.g = 0;  blue.b = 255; blue.a  = 255;
+    BitmapPixel white; white.r = 255; white.g = 255; white.b = 255; white.a = 255;
+
+    bmp->set(0, 0, red);
+    bmp->set(1, 0, green);
+    bmp->set(2, 0, blue);
+    bmp->set(3, 3, white);
+
+    passed += Test("save 4x4 BMP", bmp->save(path), true);
+    delete bmp;
+
+    Bitmap* loaded = new Bitmap;
+    passed += Test("load 4x4 BMP", loaded->load(path), true);
+    passed += Test("width",  loaded->width(),  4);
+    passed += Test("height", loaded->height(), 4);
+
+    BitmapPixel p00 = loaded->get(0, 0);
+    BitmapPixel p10 = loaded->get(1, 0);
+    BitmapPixel p20 = loaded->get(2, 0);
+    BitmapPixel p33 = loaded->get(3, 3);
+
+    passed += Test("pixel(0,0).r", (int)p00.r, 255);
+    passed += Test("pixel(0,0).g", (int)p00.g, 0);
+    passed += Test("pixel(0,0).b", (int)p00.b, 0);
+
+    passed += Test("pixel(1,0).r", (int)p10.r, 0);
+    passed += Test("pixel(1,0).g", (int)p10.g, 255);
+    passed += Test("pixel(1,0).b", (int)p10.b, 0);
+
+    passed += Test("pixel(2,0).r", (int)p20.r, 0);
+    passed += Test("pixel(2,0).g", (int)p20.g, 0);
+    passed += Test("pixel(2,0).b", (int)p20.b, 255);
+
+    passed += Test("pixel(3,3).r", (int)p33.r, 255);
+    passed += Test("pixel(3,3).g", (int)p33.g, 255);
+    passed += Test("pixel(3,3).b", (int)p33.b, 255);
+
+    delete loaded;
+    File.remove(path);
+    return passed;
+}
+
+// ── boundary: out-of-bounds get/set returns safely ────────────────────────────
+
+int testBounds()
+{
+    int passed = 0;
+
+    Bitmap* bmp = new Bitmap;
+    bmp->create(2, 2);
+
+    BitmapPixel oob = bmp->get(-1, 0);
+    passed += Test("oob get x<0 returns zero r", (int)oob.r, 0);
+
+    oob = bmp->get(2, 0);
+    passed += Test("oob get x>=w returns zero r", (int)oob.r, 0);
+
+    // set out of bounds should not crash
+    BitmapPixel px; px.r = 42;
+    bmp->set(-1, 0, px);
+    bmp->set(0, -1, px);
+    bmp->set(2,  0, px);
+    bmp->set(0,  2, px);
+    passed += Test("oob set does not crash", 1, 1);
+
+    delete bmp;
+    return passed;
+}
+
+// ── unloaded: load from non-existent path fails gracefully ────────────────────
+
+int testLoadMissing()
+{
+    int passed = 0;
+
+    Bitmap* bmp = new Bitmap;
+    string missing = "__nonexistent__.bmp";
+    passed += Test("load missing file returns false", bmp->load(missing), false);
+    passed += Test("isLoaded false after failed load", bmp->isLoaded(), false);
+
+    delete bmp;
+    return passed;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    int r;
+
+    r = testRoundTrip();    passed += r; total += 16;
+    r = testBounds();       passed += r; total += 3;
+    r = testLoadMissing();  passed += r; total += 2;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

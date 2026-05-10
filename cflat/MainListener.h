@@ -9210,16 +9210,28 @@ public:
                     if (rvalue != nullptr)
                     {
                         rvalue = compiler->Upconvert(rvalue, destType);
-                        if (rvalue->getType() != destType && destType->isStructTy())
+                        if (rvalue->getType() != destType)
                         {
-                            // Initializer type doesn't match struct field type (e.g. integer 0 used for
-                            // a struct-typed generic field).  Call the field's default constructor when
-                            // one is available; otherwise zero-initialize the aggregate.
-                            std::string fieldTypeName = declList[structIndex].TypeName;
-                            if (compiler->GetFunction(fieldTypeName))
-                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                            if (destType->isStructTy())
+                            {
+                                // Initializer type doesn't match struct field type (e.g. integer 0 used for
+                                // a struct-typed generic field).  Call the field's default constructor when
+                                // one is available; otherwise zero-initialize the aggregate.
+                                std::string fieldTypeName = declList[structIndex].TypeName;
+                                if (compiler->GetFunction(fieldTypeName))
+                                    rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                                else
+                                    rvalue = llvm::Constant::getNullValue(destType);
+                            }
                             else
-                                rvalue = llvm::Constant::getNullValue(destType);
+                            {
+                                // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                                compiler->LogWarning(std::format(
+                                    "implicit narrowing to '{}' in field '{}' — use an explicit cast",
+                                    declList[structIndex].TypeName,
+                                    declList[structIndex].VariableName));
+                                rvalue = compiler->CreateCast(rvalue, destType);
+                            }
                         }
                         structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
                     }
