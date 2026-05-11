@@ -1,0 +1,267 @@
+import "threadpool.cb";
+import "atomic.cb";
+import "string.cb";
+import "cruntime.cb";
+
+// ── Shared state for section 3 (priority ordering proof) ─────────────────────
+
+atomic_counter g_orderCounter = default;
+
+struct PriorityResult {
+    int taskId   = 0;
+    int priority = 0;
+    int order    = 0;   // completion order (1-based, set by priorityTask)
+};
+
+// Heap-allocated — global arrays of structs are not supported at file scope.
+PriorityResult* g_results = nullptr;
+
+// ── Task functions ────────────────────────────────────────────────────────────
+
+int squareTask(void* ctx) {
+    int* p = (int*)ctx;
+    *p = (*p) * (*p);
+    return 0;
+}
+
+int failTask(void* ctx) {
+    return 1;
+}
+
+int succeedTask(void* ctx) {
+    return 0;
+}
+
+int priorityTask(void* ctx) {
+    PriorityResult* r = (PriorityResult*)ctx;
+    // Burn CPU so pending tasks pile up while this one runs.
+    int i = 0;
+    int x = 1;
+    while (i < 2000000) { x = x + i; i++; }
+    r->order = (int)g_orderCounter.increment();
+    return 0;
+}
+
+char* priorityName(int p) {
+    if (p == PRIORITY_HIGH)   { return "HIGH  "; }
+    if (p == PRIORITY_NORMAL) { return "NORMAL"; }
+    return "LOW   ";
+}
+
+// ── Section 1: basic correctness ─────────────────────────────────────────────
+
+void section1(ThreadPool* pool) {
+    printf("=== Section 1: basic correctness ===\n");
+
+    int inputs[8];
+    inputs[0] = 1; inputs[1] = 2; inputs[2] = 3; inputs[3] = 4;
+    inputs[4] = 5; inputs[5] = 6; inputs[6] = 7; inputs[7] = 8;
+
+    TaskHandle* handles = new TaskHandle[8];
+
+    int i = 0;
+    while (i < 8) {
+        pool->submit(squareTask, (void*)&inputs[i], &handles[i]);
+        i++;
+    }
+    pool->drain();
+
+    bool ok = true;
+    i = 0;
+    while (i < 8) {
+        handles[i].done.acquire((i32 v) => {
+            int expected = (i + 1) * (i + 1);
+            bool match = inputs[i] == expected;
+            printf("  task %d: input^2=%d expected=%d %s\n",
+                i + 1, inputs[i], expected, match ? "OK" : "FAIL");
+            if (!match) { ok = false; }
+        });
+        i++;
+    }
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+
+    delete[8] handles;
+}
+
+// ── Section 2: error handling ─────────────────────────────────────────────────
+
+void section2(ThreadPool* pool) {
+    printf("=== Section 2: error handling ===\n");
+
+    TaskHandle h0; TaskHandle h1; TaskHandle h2; TaskHandle h3;
+
+    pool->submit(succeedTask, nullptr, &h0);
+    pool->submit(failTask,    nullptr, &h1);
+    pool->submit(succeedTask, nullptr, &h2);
+    pool->submit(failTask,    nullptr, &h3);
+    pool->drain();
+
+    bool ok = true;
+
+    h0.done.acquire((i32 v) => {
+        bool pass = !h0.failed && h0.exitCode == 0;
+        printf("  task 1 (succeed): exitCode=%d failed=%d %s\n",
+            h0.exitCode, (int)h0.failed, pass ? "OK" : "FAIL");
+        if (!pass) { ok = false; }
+    });
+    h1.done.acquire((i32 v) => {
+        bool pass = h1.failed && h1.exitCode != 0;
+        printf("  task 2 (fail):    exitCode=%d failed=%d %s\n",
+            h1.exitCode, (int)h1.failed, pass ? "OK" : "FAIL");
+        if (!pass) { ok = false; }
+    });
+    h2.done.acquire((i32 v) => {
+        bool pass = !h2.failed && h2.exitCode == 0;
+        printf("  task 3 (succeed): exitCode=%d failed=%d %s\n",
+            h2.exitCode, (int)h2.failed, pass ? "OK" : "FAIL");
+        if (!pass) { ok = false; }
+    });
+    h3.done.acquire((i32 v) => {
+        bool pass = h3.failed && h3.exitCode != 0;
+        printf("  task 4 (fail):    exitCode=%d failed=%d %s\n",
+            h3.exitCode, (int)h3.failed, pass ? "OK" : "FAIL");
+        if (!pass) { ok = false; }
+    });
+
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
+// ── Section 3: priority ordering ─────────────────────────────────────────────
+//
+// Single worker so tasks queue up and are drained in priority order.
+// Task 0 is submitted first so the worker is busy (in its compute loop) while
+// the remaining 8 tasks arrive; those 8 are then dequeued in priority order.
+//
+
+void section3() {
+    printf("=== Section 3: priority ordering (1 worker) ===\n");
+
+    g_results = new PriorityResult[9];
+
+    g_results[0].taskId = 0; g_results[0].priority = PRIORITY_LOW;
+    g_results[1].taskId = 1; g_results[1].priority = PRIORITY_LOW;
+    g_results[2].taskId = 2; g_results[2].priority = PRIORITY_LOW;
+    g_results[3].taskId = 3; g_results[3].priority = PRIORITY_NORMAL;
+    g_results[4].taskId = 4; g_results[4].priority = PRIORITY_NORMAL;
+    g_results[5].taskId = 5; g_results[5].priority = PRIORITY_NORMAL;
+    g_results[6].taskId = 6; g_results[6].priority = PRIORITY_HIGH;
+    g_results[7].taskId = 7; g_results[7].priority = PRIORITY_HIGH;
+    g_results[8].taskId = 8; g_results[8].priority = PRIORITY_HIGH;
+
+    ThreadPool pool1;
+    pool1.init(1);
+
+    TaskHandle* handles = new TaskHandle[9];
+
+    // Submit task 0 (LOW) first — worker picks it up immediately.
+    pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], PRIORITY_LOW);
+
+    // Brief spin so the worker enters its compute loop before we enqueue the rest.
+    int spin = 0;
+    while (spin < 500000) { spin++; }
+
+    // Enqueue remaining 8 in interleaved priority order while worker is busy.
+    pool1.submit(priorityTask, (void*)&g_results[1], &handles[1], PRIORITY_LOW);
+    pool1.submit(priorityTask, (void*)&g_results[2], &handles[2], PRIORITY_LOW);
+    pool1.submit(priorityTask, (void*)&g_results[3], &handles[3], PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[4], &handles[4], PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[5], &handles[5], PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[6], &handles[6], PRIORITY_HIGH);
+    pool1.submit(priorityTask, (void*)&g_results[7], &handles[7], PRIORITY_HIGH);
+    pool1.submit(priorityTask, (void*)&g_results[8], &handles[8], PRIORITY_HIGH);
+
+    pool1.drain();
+
+    int i = 0;
+    while (i < 9) {
+        printf("  task %d (%s): completion order %d\n",
+            g_results[i].taskId, priorityName(g_results[i].priority), g_results[i].order);
+        i++;
+    }
+
+    // Among tasks 1–8 (queued batch): all HIGH < all NORMAL < all LOW.
+    int maxHigh   = 0;
+    int minNormal = 9999;
+    int maxNormal = 0;
+    int minLow    = 9999;
+
+    i = 1;
+    while (i < 9) {
+        int prio  = g_results[i].priority;
+        int order = g_results[i].order;
+        if (prio == PRIORITY_HIGH) {
+            if (order > maxHigh)   { maxHigh   = order; }
+        } else if (prio == PRIORITY_NORMAL) {
+            if (order < minNormal) { minNormal = order; }
+            if (order > maxNormal) { maxNormal = order; }
+        } else {
+            if (order < minLow)    { minLow    = order; }
+        }
+        i++;
+    }
+
+    bool ok = (maxHigh < minNormal) && (maxNormal < minLow);
+    printf("  maxHigh=%d  minNormal=%d  maxNormal=%d  minLow=%d\n",
+        maxHigh, minNormal, maxNormal, minLow);
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+
+    pool1.shutdown();
+    delete[9] handles;
+    delete[9] g_results;
+    g_results = nullptr;
+}
+
+// ── Section 4: pool reuse and shutdown contract ───────────────────────────────
+
+void section4(ThreadPool* pool) {
+    printf("=== Section 4: pool reuse and shutdown contract ===\n");
+
+    int inputs[4];
+    inputs[0] = 10; inputs[1] = 20; inputs[2] = 30; inputs[3] = 40;
+
+    TaskHandle* handles = new TaskHandle[4];
+
+    int i = 0;
+    while (i < 4) {
+        bool accepted = pool->submit(squareTask, (void*)&inputs[i], &handles[i]);
+        printf("  submit %d accepted: %s\n", i, accepted ? "YES" : "NO");
+        i++;
+    }
+    pool->drain();
+
+    i = 0;
+    while (i < 4) {
+        handles[i].done.acquire((i32 v) => {
+            printf("  reuse task %d: exitCode=%d\n", i, handles[i].exitCode);
+        });
+        i++;
+    }
+
+    pool->shutdown();
+    printf("  pool shut down\n");
+
+    // Submit after shutdown must be rejected.
+    TaskHandle dummy;
+    bool rejected = !pool->submit(squareTask, nullptr, &dummy);
+    printf("  submit after shutdown rejected: %s\n", rejected ? "YES" : "NO");
+    printf("  result: %s\n\n", rejected ? "PASS" : "FAIL");
+
+    delete[4] handles;
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+extern int main() {
+    printf("ThreadPool comprehensive demo\n\n");
+
+    ThreadPool pool;
+    pool.init(4);
+
+    section1(&pool);
+    section2(&pool);
+    section3();       // uses its own 1-worker pool
+    section4(&pool);  // reuses then shuts down the shared pool
+
+    printf("All sections complete.\n");
+    return 0;
+}

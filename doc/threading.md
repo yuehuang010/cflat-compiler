@@ -17,6 +17,7 @@
   - [Function Clause (call-site contract)](#function-clause-call-site-contract)
   - [Positional Method Groups](#positional-method-groups)
   - [Reader-Writer Locks](#reader-writer-locks)
+  - [Atomic Memory-Ordering Guards](#atomic-memory-ordering-guards)
 
 ---
 
@@ -146,14 +147,29 @@ lock (a.mtx, b.mtx)
 
 ### Atomic (`core/atomic.cb`)
 
+`Atomic<T>` (from `mutex.cb`) is the high-level wrapper for a single integer value with seq-cst load/store/CAS:
+
 ```c
-import "atomic.cb";
+import "mutex.cb";
 
 Atomic<int> counter;
 counter.store(0);
 counter.fetchAdd(1);
 int v = counter.load();
 ```
+
+`atomic.cb` also provides low-level value-typed atomics — `atomic__i32`, `atomic__i64`, and `atomic_flag` — used when you need release/acquire ordering or want to guard associated fields (see [Atomic Memory-Ordering Guards](#atomic-memory-ordering-guards)):
+
+```c
+import "atomic.cb";
+
+atomic__i32 seq = default;
+seq.store(1);
+int v = seq.load();
+seq.fetchAdd(1);
+```
+
+> `atomic_flag` is a spinlock primitive (`test_and_set` / `clear`); it has no `load()`. Use `atomic__i32` when you need to poll a flag value.
 
 ### Other Synchronization Primitives
 
@@ -167,8 +183,9 @@ int v = counter.load();
 import "channel.cb";
 
 channel<int> ch;
+ch.init(1024);
 ch.send(42);
-int v = ch.recv();   // 42
+int v = ch.receive();   // 42
 ```
 
 ---
@@ -310,3 +327,104 @@ lock(rd.rw.write) {
 ```
 
 The `.read` / `.write` suffix is stripped when checking lock-set membership, so `lock(rw.read)` and `lock(rw.write)` both count as holding `rw` for the purposes of guarded-field checks.
+
+### Atomic Memory-Ordering Guards
+
+Mutexes provide mutual exclusion; atomics provide visibility ordering. CFlat extends the same lock-set analysis to lock-free code so the compiler can statically verify that every access to data protected by an atomic happens inside a correctly-ordered release or acquire scope.
+
+#### The problem
+
+Standard atomic operations carry a memory-ordering annotation (release, acquire, seq_cst), but nothing connects the **guard atomic** to the **data it protects**. A programmer can silently omit the ordering, use the wrong ordering, or access guarded fields entirely outside any fence:
+
+```c
+// nothing stops a bare write — no ordering, no happens-before edge
+s.value = 42;
+__atomic_i32_store(&s.ready, 1);  // wrong: seq_cst, not release; s.value may be reordered past
+```
+
+#### Declaring guarded fields
+
+In a struct, use `lock(atomicField) { ... }` — the same syntax as a mutex guard group — to declare that the enclosed fields require an atomic release or acquire scope to access:
+
+```c
+import "atomic.cb";
+
+struct SharedData {
+    atomic__i32 ready = default;
+    lock(ready) {
+        int value = 0;      // requires release/acquire scope to read or write
+    }
+};
+```
+
+Accessing `value` without a release or acquire scope is a compile error:
+
+```c
+SharedData s;
+s.value = 42;           // error: Field 'value' is guarded by 'ready'
+int x = s.value;        // error: Field 'value' is guarded by 'ready'
+```
+
+#### Producer — `release`
+
+Call `release` on the guard atomic to publish guarded fields. The lambda body executes first (data writes), then the atomic store is emitted with `memory_order_release`, establishing a happens-before edge:
+
+```c
+SharedData s;
+s.ready.release(1, () => {
+    s.value = 42;       // OK: inside release scope; compiler confirms 'ready' guards 'value'
+});
+// equivalent to: s.value = 42; atomic_store(&s.ready, 1, release)
+```
+
+#### Consumer — `acquire`
+
+Call `acquire` on the guard atomic to observe guarded fields. The atomic load is emitted with `memory_order_acquire` first, then the lambda body executes (data reads):
+
+```c
+s.ready.acquire((i32 v) => {
+    int x = s.value;    // OK: inside acquire scope; happens-after the producer's release
+});
+// equivalent to: v = atomic_load(&s.ready, acquire); use s.value ...
+```
+
+The loaded value is passed to the lambda as its argument. The consumer typically spins until the value signals ready:
+
+```c
+while (s.ready.load() == 0) {}    // spin-wait (plain seq_cst load)
+s.ready.acquire((i32 v) => {
+    process(s.value);
+});
+```
+
+#### `lock(this)` on function parameters
+
+The `release` and `acquire` methods work because their `function<>` parameter is declared with `lock(this)`:
+
+```c
+// simplified signature in atomic.cb
+void release(i32 val, lock(this) function<void()> body);
+void acquire(lock(this) function<void(i32)> body);
+```
+
+`lock(this)` is a parameter qualifier that tells the compiler: *when analysing the lambda passed here, seed `currentLockSet` with the call-site receiver.* At `s.ready.release(...)`, the receiver is `s.ready`, so the lambda body is checked as though `lock(s.ready)` was in effect — which satisfies the `GuardedBy` check on `s.value`.
+
+You can use the same qualifier in your own functions to propagate a guard into a callback:
+
+```c
+void withData(SharedData* d, lock(this) function<void()> body) lock(d->ready) {
+    body();
+}
+```
+
+> `lock(this)` is only accepted on `function<>` parameters. Using it on any other parameter type is a compile error.
+
+#### Available atomic guard types
+
+| Type | `release` / `acquire` | Notes |
+|------|-----------------------|-------|
+| `atomic__i32` | `release(i32, fn)` / `acquire(fn<void(i32)>)` | General-purpose guard counter or flag |
+| `atomic__i64` | `release(i64, fn)` / `acquire(fn<void(i64)>)` | 64-bit version counter |
+| `atomic_flag` | `release(bool, fn)` / `acquire(fn<void(bool)>)` | One-shot boolean flag (no `load()`) |
+
+Use `atomic__i32` when you need to poll the guard value in a spin loop before calling `acquire`; `atomic_flag` has no `load()` method and cannot be polled.

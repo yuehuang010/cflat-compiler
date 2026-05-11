@@ -1,0 +1,194 @@
+import "thread.cb";
+import "semaphore.cb";
+import "stop_token.cb";
+import "atomic.cb";
+import "mutex.cb";
+import "queue.cb";
+
+// Priority values for submit().
+int PRIORITY_HIGH   = 2;
+int PRIORITY_NORMAL = 1;
+int PRIORITY_LOW    = 0;
+
+// ── TaskHandle ────────────────────────────────────────────────────────────────
+// Owned by the caller.  Pass &handle to submit().
+//
+// After a task completes, poll done.load() != 0, then read results inside
+// done.acquire() to guarantee acquire-ordering on the result fields.
+//
+struct TaskHandle {
+    atomic__i32 done = default;
+    lock(done) {
+        int  exitCode = 0;
+        bool failed   = false;
+    }
+};
+
+// ── Task ──────────────────────────────────────────────────────────────────────
+// Internal — constructed by submit() and queued to a worker.
+//
+struct Task {
+    function<int(void*)> fn       = default;
+    void*                ctx      = nullptr;
+    TaskHandle*          handle   = nullptr;
+};
+
+// ── WorkerCtx ─────────────────────────────────────────────────────────────────
+// Passed to each worker thread.  Holds pointers into ThreadPool fields and
+// must not outlive the ThreadPool instance.
+//
+struct WorkerCtx {
+    mutex*          mtx      = nullptr;
+    semaphore*      ready    = nullptr;
+    queue<Task>*    qHigh    = nullptr;
+    queue<Task>*    qNormal  = nullptr;
+    queue<Task>*    qLow     = nullptr;
+    stop_source*    stop     = nullptr;
+    atomic_counter* inflight = nullptr;
+};
+
+// ── ThreadPool ────────────────────────────────────────────────────────────────
+//
+//   ThreadPool pool;
+//   pool.init(4);
+//
+//   TaskHandle h;
+//   pool.submit(myFn, ctx, &h);                        // PRIORITY_NORMAL
+//   pool.submit(urgentFn, ctx, &h, PRIORITY_HIGH);
+//
+//   pool.drain();         // wait for all in-flight tasks
+//
+//   while (h.done.load() == 0) {}
+//   h.done.acquire((i32 v) => {
+//       if (!h.failed) { /* use h.exitCode */ }
+//   });
+//
+//   pool.shutdown();
+//
+// IMPORTANT: do not copy or move a ThreadPool after init() — WorkerCtx holds
+// pointers into its fields.
+//
+class ThreadPool {
+    mutex          _lock    = default;
+    semaphore      _ready   = default;
+    queue<Task>    _qHigh   = default;
+    queue<Task>    _qNormal = default;
+    queue<Task>    _qLow    = default;
+    stop_source    _stop    = default;
+    atomic_counter _inflight = default;
+    Thread*        _workers = nullptr;
+    int            _count   = 0;
+    WorkerCtx      _ctx     = default;
+
+    void init(int workerCount) {
+        _stop.init();
+        _ready.init(0, 1000000);
+        _ctx.mtx      = &_lock;
+        _ctx.ready    = &_ready;
+        _ctx.qHigh    = &_qHigh;
+        _ctx.qNormal  = &_qNormal;
+        _ctx.qLow     = &_qLow;
+        _ctx.stop     = &_stop;
+        _ctx.inflight = &_inflight;
+        _count   = workerCount;
+        _workers = new Thread[workerCount];
+        int i = 0;
+        while (i < workerCount) {
+            _workers[i].start(_workerFn, &_ctx);
+            i++;
+        }
+    }
+
+    // Submit a task.  Returns false if the pool is shutting down.
+    // priority: PRIORITY_HIGH / PRIORITY_NORMAL (default) / PRIORITY_LOW
+    bool submit(function<int(void*)> fn, void* ctx, TaskHandle* handle, int priority) {
+        if (_workers == nullptr || _stop.stop_requested()) { return false; }
+        Task t;
+        t.fn     = fn;
+        t.ctx    = ctx;
+        t.handle = handle;
+        _inflight.increment();
+        _lock.acquire();
+        if (priority == PRIORITY_HIGH)       { _qHigh.enqueue(t); }
+        else if (priority == PRIORITY_LOW)   { _qLow.enqueue(t); }
+        else                                  { _qNormal.enqueue(t); }
+        _lock.release();
+        _ready.release();
+        return true;
+    }
+
+    // Overload with default priority (PRIORITY_NORMAL).
+    bool submit(function<int(void*)> fn, void* ctx, TaskHandle* handle) {
+        return submit(fn, ctx, handle, PRIORITY_NORMAL);
+    }
+
+    // Number of tasks waiting in all queues (excludes tasks currently running).
+    int pendingCount() {
+        _lock.acquire();
+        int n = _qHigh.count() + _qNormal.count() + _qLow.count();
+        _lock.release();
+        return n;
+    }
+
+    // Block until all submitted tasks have completed.
+    void drain() {
+        while (_inflight.read() > (i64)0) { SwitchToThread(); }
+    }
+
+    // Drain in-flight tasks, stop all workers, and join them.
+    void shutdown() {
+        drain();
+        _stop.request_stop();
+        _ready.release_n(_count);
+        int i = 0;
+        while (i < _count) {
+            _workers[i].join();
+            i++;
+        }
+        delete[_] _workers;
+        _workers = nullptr;
+        _count   = 0;
+        _ready.destroy();
+        _stop.dispose();
+    }
+
+    ~ThreadPool() {
+        if (_workers != nullptr) { shutdown(); }
+    }
+};
+
+int _workerFn(void* raw) {
+    WorkerCtx*  wctx  = (WorkerCtx*)raw;
+    stop_token  token = wctx->stop->get_token();
+    while (!token.stop_requested()) {
+        wctx->ready->acquire();
+        if (token.stop_requested()) { break; }
+
+        Task task;
+        bool hasTask = false;
+        wctx->mtx->acquire();
+        if (!wctx->qHigh->isEmpty()) {
+            task    = wctx->qHigh->dequeue();
+            hasTask = true;
+        } else if (!wctx->qNormal->isEmpty()) {
+            task    = wctx->qNormal->dequeue();
+            hasTask = true;
+        } else if (!wctx->qLow->isEmpty()) {
+            task    = wctx->qLow->dequeue();
+            hasTask = true;
+        }
+        wctx->mtx->release();
+
+        if (hasTask) {
+            int code = task.fn(task.ctx);
+            if (task.handle != nullptr) {
+                task.handle->done.release(1, () => {
+                    task.handle->exitCode = code;
+                    task.handle->failed   = code != 0;
+                });
+            }
+            wctx->inflight->decrement();
+        }
+    }
+    return 0;
+}
