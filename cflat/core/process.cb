@@ -1,0 +1,334 @@
+// process.cb — launch and communicate with a child process.
+//
+// API mirrors the compiler-built `program` construct:
+//   Same fields:   exe, exitCode, onStdout, onStdin
+//   Same methods:  run(), WaitForExit(), WaitForExit(ms), WaitForExit(stop_token), Kill()
+//
+// Differences from `program`:
+//   - `exe` must be set before run() — no user-defined main body.
+//   - Only stdio/out is supported (no allocator, no inbox, no >> wiring).
+//   - x64 only (STARTUPINFOA layout is Win64-specific).
+//
+// Usage:
+//   import "process.cb";
+//   process p;
+//   p.exe = "ping";
+//   p.onStdout = (char* buf, int len) => { printf("%.*s", len, buf); };
+//   list<string> args;
+//   args.add("127.0.0.1");
+//   p.run(args);
+//   p.WaitForExit();
+//   printf("exit: %d\n", p.exitCode);
+
+import "thread.cb";
+import "stop_token.cb";
+import "list.cb";
+import "string.cb";
+
+// ── Win32 externs not already in os.windows.cb ────────────────────────────────
+
+extern stdcall i32 CreateProcessA(
+    const char* lpApplicationName,
+    char*       lpCommandLine,
+    void*       lpProcessAttributes,
+    void*       lpThreadAttributes,
+    i32         bInheritHandles,
+    i32         dwCreationFlags,
+    void*       lpEnvironment,
+    const char* lpCurrentDirectory,
+    void*       lpStartupInfo,
+    void*       lpProcessInformation);
+
+extern stdcall i32 GetExitCodeProcess(void* hProcess, i32* lpExitCode);
+extern stdcall i32 TerminateProcess(void* hProcess, i32 uExitCode);
+extern stdcall i32 CreatePipe(void** hReadPipe, void** hWritePipe, void* lpPipeAttributes, i32 nSize);
+extern stdcall i32 ReadFile(void* hFile, char* lpBuffer, i32 nNumberOfBytesToRead, i32* lpNumberOfBytesRead, void* lpOverlapped);
+extern stdcall i32 SetHandleInformation(void* hObject, i32 dwMask, i32 dwFlags);
+
+// ── Win32 structs ─────────────────────────────────────────────────────────────
+
+// SECURITY_ATTRIBUTES — 24 bytes on x64 (pointer at offset 8 needs 4-byte pad after nLength).
+struct _SecAttrs {
+    i32   nLength              = 12;
+    i32   _pad0                = 0;
+    void* lpSecurityDescriptor = nullptr;
+    i32   bInheritHandle       = 1;
+    i32   _pad1                = 0;
+};
+
+// STARTUPINFOA — 104 bytes on x64.
+// cb(4) + pad(4) + lpReserved*(8) + lpDesktop*(8) + lpTitle*(8)
+// + dwX(4)+dwY(4)+dwXSize(4)+dwYSize(4)+dwXCountChars(4)+dwYCountChars(4)
+// + dwFillAttribute(4)+dwFlags(4)+wShowWindow(2)+cbReserved2(2)+pad(4)
+// + lpReserved2*(8)+hStdInput*(8)+hStdOutput*(8)+hStdError*(8) = 104
+struct _StartupInfoA {
+    i32   cb              = 104;
+    i32   _pad0           = 0;
+    void* lpReserved      = nullptr;
+    void* lpDesktop       = nullptr;
+    void* lpTitle         = nullptr;
+    i32   dwX             = 0;
+    i32   dwY             = 0;
+    i32   dwXSize         = 0;
+    i32   dwYSize         = 0;
+    i32   dwXCountChars   = 0;
+    i32   dwYCountChars   = 0;
+    i32   dwFillAttribute = 0;
+    i32   dwFlags         = 0;
+    i16   wShowWindow     = 0;
+    i16   cbReserved2     = 0;
+    i32   _pad1           = 0;
+    void* lpReserved2     = nullptr;
+    void* hStdInput       = nullptr;
+    void* hStdOutput      = nullptr;
+    void* hStdError       = nullptr;
+};
+
+// PROCESS_INFORMATION — 24 bytes on x64.
+struct _ProcessInfo {
+    void* hProcess   = nullptr;
+    void* hThread    = nullptr;
+    i32   dwProcessId = 0;
+    i32   dwThreadId  = 0;
+};
+
+// ── I/O thread context ────────────────────────────────────────────────────────
+
+struct __ProcessReaderCtx {
+    void*                     pipe    = nullptr;
+    function<void(char*, int)> callback = nullptr;
+};
+
+struct __ProcessWriterCtx {
+    void*              pipe    = nullptr;
+    function<char*()>  provider = nullptr;
+};
+
+// Reader thread: loops ReadFile on the pipe, calls onStdout(buf, len).
+// ctx->callback is always set — we only start this thread when onStdout != nullptr.
+int __process_reader_fn(void* rawCtx) {
+    __ProcessReaderCtx* ctx = (__ProcessReaderCtx*)rawCtx;
+    i8* buf = (i8*)malloc(4096);
+    i32 nRead = 0;
+    while (ReadFile(ctx->pipe, buf, 4096, &nRead, nullptr) != 0 && nRead > 0) {
+        ctx->callback(buf, (int)nRead);
+    }
+    free((void*)buf);
+    CloseHandle(ctx->pipe);
+    free((void*)ctx);
+    return 0;
+}
+
+// Writer thread: calls onStdin() to get a line, writes it to the pipe.
+// ctx->provider is always set — we only start this thread when onStdin != nullptr.
+// onStdin returns nullptr to signal EOF.
+int __process_writer_fn(void* rawCtx) {
+    __ProcessWriterCtx* ctx = (__ProcessWriterCtx*)rawCtx;
+    while (true) {
+        char* line = ctx->provider();
+        if (line == nullptr) break;
+        i32 len = (i32)strlen(line);
+        i32 written = 0;
+        WriteFile(ctx->pipe, line, len, &written, nullptr);
+        free((void*)line);
+    }
+    CloseHandle(ctx->pipe);
+    free((void*)ctx);
+    return 0;
+}
+
+// Build a quoted command-line string: exe [arg0 arg1 ...].
+// Tokens containing spaces are wrapped in double quotes.
+char* __process_build_cmdline(string exe, list<string>* pargs) {
+    stringbuilder sb;
+    bool nq = false;
+    i8* ep = exe.data(); int elen = exe.length(); int k = 0;
+    while (k < elen) { if (ep[k] == ' ') { nq = true; break; } k++; }
+    if (nq) sb.appendChar('"');
+    sb.append(exe);
+    if (nq) sb.appendChar('"');
+    int i = 0;
+    while (i < pargs->count()) {
+        sb.appendChar(' ');
+        string arg = pargs->get(i);
+        bool q = false;
+        i8* ap = arg.data(); int al = arg.length(); int j = 0;
+        while (j < al) { if (ap[j] == ' ') { q = true; break; } j++; }
+        if (q) sb.appendChar('"');
+        sb.append(arg);
+        if (q) sb.appendChar('"');
+        i++;
+    }
+    string s = sb.toString();
+    int clen = s.length();
+    char* buf = (char*)malloc(clen + 1);
+    memcpy(buf, s.data(), clen + 1);
+    return buf;
+}
+
+// ── process struct ────────────────────────────────────────────────────────────
+
+struct process {
+    // Public config — set before run().
+    string exe = default;
+
+    // Public result — valid after WaitForExit() returns.
+    int exitCode = 0;
+
+    // Stdio hooks — same types as the compiler-built `program` construct.
+    // onStdout: called with (buffer, length) for each chunk of child stdout.
+    //           Buffer is non-owning; do not free it.
+    // onStdin:  called to get each line to send to child stdin.
+    //           Return nullptr to close stdin. Returned string is freed by the runtime.
+    function<void(char*, int)> onStdout = nullptr;
+    function<char*()>          onStdin  = nullptr;
+
+    // Private Win32 state.
+    void* _proc_handle   = nullptr;
+    void* _thread_handle = nullptr;
+    void* _stdout_read   = nullptr;
+    void* _stdout_write  = nullptr;
+    void* _stdin_read    = nullptr;
+    void* _stdin_write   = nullptr;
+    Thread _reader = default;
+    Thread _writer = default;
+    bool _has_reader = false;
+    bool _has_writer = false;
+
+    // Launch the child process.  pargs is the argument list (not including exe).
+    // Set onStdout / onStdin before calling run().
+    void run(list<string>* pargs) {
+        bool _want_stdin  = !(onStdin  == nullptr);
+        bool _want_stdout = !(onStdout == nullptr);
+
+        // Create pipes.  Mark the parent-side handles as non-inheritable so the
+        // child does not accidentally inherit them.
+        _SecAttrs sa;
+
+        CreatePipe(&_stdout_read, &_stdout_write, &sa, 0);
+        SetHandleInformation(_stdout_read, 1, 0);  // HANDLE_FLAG_INHERIT = 1
+
+        if (_want_stdin) {
+            CreatePipe(&_stdin_read, &_stdin_write, &sa, 0);
+            SetHandleInformation(_stdin_write, 1, 0);
+        }
+
+        // Build STARTUPINFOA.
+        _StartupInfoA si;
+        si.dwFlags     = 0x100;  // STARTF_USESTDHANDLES
+        si.hStdOutput  = _stdout_write;
+        si.hStdError   = _stdout_write;
+        si.hStdInput   = _want_stdin ? _stdin_read : nullptr;
+
+        _ProcessInfo pi;
+
+        char* _cmdline = __process_build_cmdline(exe, pargs);
+
+        CreateProcessA(nullptr, _cmdline, nullptr, nullptr, 1, 0,
+                       nullptr, nullptr, &si, &pi);
+        free((void*)_cmdline);
+
+        _proc_handle   = pi.hProcess;
+        _thread_handle = pi.hThread;
+
+        // Close the child-side pipe ends — the child holds them now.
+        CloseHandle(_stdout_write);
+        _stdout_write = nullptr;
+        if (_want_stdin) {
+            CloseHandle(_stdin_read);
+            _stdin_read = nullptr;
+        }
+
+        // Start reader thread if onStdout was wired.
+        if (_want_stdout) {
+            __ProcessReaderCtx* rctx = (__ProcessReaderCtx*)malloc(sizeof(__ProcessReaderCtx));
+            rctx->pipe     = _stdout_read;
+            rctx->callback = onStdout;
+            _stdout_read = nullptr;  // ownership transferred to thread
+            _reader.start(__process_reader_fn, (void*)rctx);
+            _has_reader = true;
+        }
+
+        // Start writer thread if onStdin was wired.
+        if (_want_stdin) {
+            __ProcessWriterCtx* wctx = (__ProcessWriterCtx*)malloc(sizeof(__ProcessWriterCtx));
+            wctx->pipe     = _stdin_write;
+            wctx->provider = onStdin;
+            _stdin_write = nullptr;  // ownership transferred to thread
+            _writer.start(__process_writer_fn, (void*)wctx);
+            _has_writer = true;
+        }
+    }
+
+    // Block until the process exits.  Joins I/O threads and captures exitCode.
+    void WaitForExit() {
+        if (_proc_handle == nullptr) return;
+        WaitForSingleObject(_proc_handle, -1);
+        if (_has_reader) { _reader.join(); _has_reader = false; }
+        if (_has_writer) { _writer.join(); _has_writer = false; }
+        i32 code = 0;
+        GetExitCodeProcess(_proc_handle, &code);
+        exitCode = (int)code;
+        _closeHandles();
+    }
+
+    // Wait up to ms milliseconds.  Returns true if the process exited.
+    bool WaitForExit(int ms) {
+        if (_proc_handle == nullptr) return true;
+        i32 result = WaitForSingleObject(_proc_handle, (i32)ms);
+        if (result != 0) return false;
+        if (_has_reader) { _reader.join(); _has_reader = false; }
+        if (_has_writer) { _writer.join(); _has_writer = false; }
+        i32 code = 0;
+        GetExitCodeProcess(_proc_handle, &code);
+        exitCode = (int)code;
+        _closeHandles();
+        return true;
+    }
+
+    // Poll until the process exits or the token is cancelled.
+    // Returns true on clean exit, false if cancelled (process still running).
+    bool WaitForExit(stop_token tok) {
+        if (_proc_handle == nullptr) return true;
+        while (!tok.stop_requested()) {
+            i32 result = WaitForSingleObject(_proc_handle, 50);
+            if (result == 0) {
+                if (_has_reader) { _reader.join(); _has_reader = false; }
+                if (_has_writer) { _writer.join(); _has_writer = false; }
+                i32 code = 0;
+                GetExitCodeProcess(_proc_handle, &code);
+                exitCode = (int)code;
+                _closeHandles();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Forcibly terminate the child.  I/O threads are also terminated.
+    void Kill() {
+        if (_proc_handle != nullptr)
+            TerminateProcess(_proc_handle, 1);
+        if (_has_reader) { _reader.terminate(); _has_reader = false; }
+        if (_has_writer) { _writer.terminate(); _has_writer = false; }
+        _closeHandles();
+    }
+
+    // Close any remaining Win32 handles.  Safe to call multiple times.
+    void _closeHandles() {
+        if (_proc_handle   != nullptr) { CloseHandle(_proc_handle);   _proc_handle   = nullptr; }
+        if (_thread_handle != nullptr) { CloseHandle(_thread_handle); _thread_handle = nullptr; }
+        if (_stdout_read   != nullptr) { CloseHandle(_stdout_read);   _stdout_read   = nullptr; }
+        if (_stdout_write  != nullptr) { CloseHandle(_stdout_write);  _stdout_write  = nullptr; }
+        if (_stdin_read    != nullptr) { CloseHandle(_stdin_read);    _stdin_read    = nullptr; }
+        if (_stdin_write   != nullptr) { CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
+    }
+
+    ~process() {
+        // If the user drops a process without waiting, join/terminate I/O threads
+        // first (they hold references into this struct's callback fields).
+        if (_has_reader) { _reader.terminate(); _has_reader = false; }
+        if (_has_writer) { _writer.terminate(); _has_writer = false; }
+        _closeHandles();
+    }
+};

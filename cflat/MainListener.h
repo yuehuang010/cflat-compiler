@@ -2938,14 +2938,16 @@ public:
         else if (returnType.IsMove && returnType.Pointer)
             returnsOwned = true;
 
-        // Pre-scan declarations in the function body to queue and emit any generic
-        // struct instantiations before the function's IR block is opened.
+        // Pre-scan parameter types, return type, and function body to queue and emit any
+        // generic struct instantiations before the function's IR block is opened.
         // At this point no basic block is active, so it is safe to emit new functions.
+        // Parameter types must be scanned so that e.g. list<string>* params instantiate
+        // list__string before the body references its methods.
+        if (auto* paramTypeList = func->parameterTypeList())
+            ScanAndQueueGenericTypeUses(paramTypeList);
         if (auto* blockItemList = func->compoundStatement()->blockItemList())
-        {
             ScanAndQueueGenericTypeUses(blockItemList);
-            ProcessPendingInstantiations();
-        }
+        ProcessPendingInstantiations();
 
         auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl);
 
@@ -4808,8 +4810,8 @@ public:
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         std::string typeName = structTy->getName().str();
-        // Interface fat-ptrs compare by data pointer — let CreateOperation handle it.
-        if (typeName == "__iface_fat_ptr") return nullptr;
+        // Fat-ptr types compare by extracted field — let CreateOperation handle it.
+        if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
@@ -6362,7 +6364,10 @@ public:
 
                         // If the primary was a lambda, propagate its function-pointer type.
                         if (prevPrimary->lambdaExpression() != nullptr)
+                        {
                             namedVar.TypeAndValue = lastLambdaType;
+                            lastLambdaType = {};
+                        }
 
                         if (namedVar.TypeAndValue.IsInterface)
                         {

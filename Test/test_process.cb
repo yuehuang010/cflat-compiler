@@ -1,0 +1,87 @@
+// test_process.cb — smoke-test the process wrapper.
+//
+// Build:
+//   x64/Debug/cflat.exe Test/test_process.cb -i cflat/core -o out/test_process.exe
+// Run:
+//   out\test_process.exe
+
+import "process.cb";
+
+// Globals used by callbacks (lambdas are non-capturing).
+int g_lineCount = 0;
+
+extern int main(int argc, char** argv)
+{
+    // ── Test 1: run `cmd /c echo hello` and capture stdout ───────────────────
+    // Build arg list before assigning the lambda (lambda-before-add is a known compiler limitation).
+    list<string>* a1 = new list<string>;
+    string s1a = "/c";
+    string s1b = "echo hello";
+    a1->add(s1a);
+    a1->add(s1b);
+
+    process p1;
+    p1.exe = "cmd";
+    p1.onStdout = (char* buf, int len) => {
+        g_lineCount++;
+    };
+    p1.run(a1);
+    p1.WaitForExit();
+    delete a1;
+
+    if (p1.exitCode != 0)
+    {
+        printf("FAIL: test1 exitCode expected 0, got %d\n", p1.exitCode);
+        return 1;
+    }
+    if (g_lineCount == 0)
+    {
+        printf("FAIL: test1 onStdout never called\n");
+        return 1;
+    }
+    printf("PASS: test1 (echo, exitCode=%d, chunks=%d)\n", p1.exitCode, g_lineCount);
+
+    // ── Test 2: run `cmd /c exit 42` and check exit code ─────────────────────
+    list<string>* a2 = new list<string>;
+    string s2a = "/c";
+    string s2b = "exit 42";
+    a2->add(s2a);
+    a2->add(s2b);
+
+    process p2;
+    p2.exe = "cmd";
+    p2.run(a2);
+    p2.WaitForExit();
+    delete a2;
+
+    if (p2.exitCode != 42)
+    {
+        printf("FAIL: test2 exitCode expected 42, got %d\n", p2.exitCode);
+        return 1;
+    }
+    printf("PASS: test2 (exit code %d)\n", p2.exitCode);
+
+    // ── Test 3: WaitForExit(ms) timeout variant ───────────────────────────────
+    list<string>* a3 = new list<string>;
+    string s3a = "/c";
+    string s3b = "echo done";
+    a3->add(s3a);
+    a3->add(s3b);
+
+    process p3;
+    p3.exe = "cmd";
+    p3.run(a3);
+    delete a3;
+
+    bool finished = p3.WaitForExit(5000);
+    if (!finished)
+    {
+        printf("FAIL: test3 timed out\n");
+        p3.Kill();
+        return 1;
+    }
+    printf("PASS: test3 (WaitForExit(ms) returned %d, exitCode=%d)\n", (int)finished, p3.exitCode);
+
+    printf("All process tests passed.\n");
+    return 0;
+}

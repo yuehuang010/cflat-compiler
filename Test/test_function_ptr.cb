@@ -1,5 +1,6 @@
 import "test_helper.cb";
 import "list.cb";
+import "string.cb";
 
 // ── Named functions used throughout ──────────────────────────────────────────
 
@@ -388,6 +389,259 @@ bool testVoidLambda()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LAMBDA CAPTURE TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Counter {
+    int value = 0;
+};
+
+struct Stats {
+    float min   = 0.0f;
+    float max   = 0.0f;
+    int   count = 0;
+};
+
+interface ITransform {
+    int apply(int x);
+};
+
+class Multiplier : ITransform {
+    int factor = 1;
+    int apply(int x) { return x * factor; }
+};
+
+class Adder : ITransform {
+    int offset = 0;
+    int apply(int x) { return x + offset; }
+};
+
+bool testCapturePrimitives()
+{
+    bool result = true;
+
+    // int — value copy; outer mutation does not affect captured snapshot
+    {
+        int x = 10;
+        function<int()> getX = () => { return x; };
+        result &= Test("int capture",        getX(), 10);
+        x = 99;
+        result &= Test("int capture stable", getX(), 10);
+    }
+
+    // float — value copy
+    {
+        float factor = 2.5f;
+        function<float(float)> scale = (float v) => { return v * factor; };
+        result &= Test("float capture",        scale(4.0f), 10.0f);
+        factor = 999.0f;
+        result &= Test("float capture stable", scale(4.0f), 10.0f);
+    }
+
+    // bool — value copy
+    {
+        bool enabled = true;
+        function<bool()> check = () => { return enabled; };
+        result &= Test("bool capture", check(), true);
+        enabled = false;
+        result &= Test("bool capture stable", check(), true);
+    }
+
+    // i64 — value copy
+    {
+        i64 big = 4000000000;
+        function<i64()> getBig = () => { return big; };
+        result &= Test("i64 capture",        getBig(), 4000000000);
+        big = 0;
+        result &= Test("i64 capture stable", getBig(), 4000000000);
+    }
+
+    // char* — pointer copy; both sides read the same bytes
+    {
+        char* msg = "hello";
+        function<int()> getLen = () => { return strlen(msg); };
+        result &= Test("char* capture", getLen(), 5);
+    }
+
+    // int* — pointer copy; writes through shared pointer are visible
+    {
+        int* p = new int;
+        *p = 42;
+        function<int()> read = () => { return *p; };
+        result &= Test("int* initial",  read(), 42);
+        *p = 77;
+        result &= Test("int* mutation", read(), 77);
+        delete p;
+    }
+
+    return result;
+}
+
+bool testCaptureString()
+{
+    bool result = true;
+
+    // string — value copy taken at capture time; outer reassignment invisible
+    {
+        string label = "world";
+        function<int()> getLen = () => { return label.length(); };
+        result &= Test("string capture len",    getLen(), 5);
+        label = "hi";
+        result &= Test("string capture stable", getLen(), 5);
+    }
+
+    // string equality check inside lambda
+    {
+        string greeting = "hello";
+        function<bool(string)> matches = (string s) => { return greeting == s; };
+        result &= Test("string eq match",    matches("hello"), true);
+        result &= Test("string eq no-match", matches("world"), false);
+    }
+
+    // string data() access inside lambda
+    {
+        string word = "abc";
+        function<char*()> getPtr = () => { return word.data(); };
+        char* ptr = getPtr();
+        result &= Test("string data() non-null", ptr != nullptr, true);
+        result &= Test("string data() len",      strlen(ptr),    3);
+    }
+
+    return result;
+}
+
+bool testCaptureStructRef()
+{
+    bool result = true;
+
+    // struct (Counter) — reference capture; lambda mutations visible to caller
+    {
+        Counter c;
+        function<void()> inc = () => { c.value = c.value + 1; };
+        inc(); inc(); inc();
+        result &= Test("struct ref capture", c.value, 3);
+    }
+
+    // struct (Stats) — reference capture of multi-field struct
+    {
+        Stats s;
+        function<void(float)> observe = (float v) => {
+            if (s.count == 0 || v < s.min) s.min = v;
+            if (s.count == 0 || v > s.max) s.max = v;
+            s.count = s.count + 1;
+        };
+        observe(3.0f);
+        observe(1.0f);
+        observe(5.0f);
+        result &= Test("stats count", s.count, 3);
+        result &= Test("stats min",   s.min,   1.0f);
+        result &= Test("stats max",   s.max,   5.0f);
+    }
+
+    // class (Multiplier) — reference capture; caller mutations visible in lambda
+    {
+        Multiplier m;
+        m.factor = 3;
+        function<int(int)> tripleIt = (int x) => { return m.apply(x); };
+        result &= Test("class ref factor=3", tripleIt(7), 21);
+        m.factor = 5;
+        result &= Test("class ref factor=5", tripleIt(7), 35);
+    }
+
+    // class (Adder) — reference capture with method call
+    {
+        Adder a;
+        a.offset = 100;
+        function<int(int)> add100 = (int x) => { return a.apply(x); };
+        result &= Test("adder +100 5",  add100(5),  105);
+        result &= Test("adder +100 -3", add100(-3),  97);
+    }
+
+    // interface — value capture (fat ptr {vtable,data} copied)
+    {
+        Multiplier m;
+        m.factor = 4;
+        ITransform t = m;
+        function<int(int)> callT = (int x) => { return t.apply(x); };
+        result &= Test("iface capture 6", callT(6), 24);
+        result &= Test("iface capture 3", callT(3), 12);
+    }
+
+    return result;
+}
+
+bool testCaptureMultiple()
+{
+    bool result = true;
+
+    // int + float + struct
+    {
+        int base = 10;
+        float rate = 1.5f;
+        Counter total;
+        function<void(int)> accumulate = (int n) => {
+            total.value = total.value + (int)(n * rate) + base;
+        };
+        accumulate(2);   // (int)(2*1.5) + 10 = 3+10 = 13
+        accumulate(4);   // (int)(4*1.5) + 10 = 6+10 = 16  → total=29
+        result &= Test("multi int+float+struct", total.value, 29);
+    }
+
+    // string (value) + Counter (reference)
+    {
+        string prefix = "item_";
+        Counter counter;
+        function<int()> nextId = () => {
+            counter.value = counter.value + 1;
+            return prefix.length() + counter.value;
+        };
+        result &= Test("multi str+counter 1", nextId(), 6);
+        result &= Test("multi str+counter 2", nextId(), 7);
+        result &= Test("multi counter value", counter.value, 2);
+    }
+
+    // lambda passed as argument, captures struct
+    {
+        Counter c;
+        function<int(int)> addToC = (int n) => { c.value = c.value + n; return c.value; };
+        result &= Test("capture in arg 5",     transform(addToC, 5), 5);
+        result &= Test("capture in arg 3",     transform(addToC, 3), 8);
+        result &= Test("capture struct after",  c.value,              8);
+    }
+
+    // function<T> variable — value capture of fat struct
+    {
+        int base = 100;
+        function<int(int)> addBase = (int x) => { return x + base; };
+        function<int(int)> doubleAndAdd = (int x) => { return addBase(x * 2); };
+        result &= Test("nested lambda 5", doubleAndAdd(5),  110);
+        result &= Test("nested lambda 0", doubleAndAdd(0),  100);
+    }
+
+    return result;
+}
+
+bool testCaptureRegression()
+{
+    bool result = true;
+
+    // Regression: lambda before list<string>->add(string) must not corrupt overload
+    // resolution. lastLambdaType was not cleared after ParsePostfixExpression consumed
+    // it, causing CompareUpconvert on a struct arg to return -1 (no match).
+    {
+        function<void(int)> cb = (int x) => { };
+
+        list<string>* L = new list<string>;
+        string s = "world";
+        L->add(s);
+        result &= Test("lambda before list<string> add", L->count(), 1);
+        delete L;
+    }
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LIST SORT TESTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -500,6 +754,13 @@ extern int main()
     total++; passed += testLambdaInHigherOrder()       ? 1 : 0;
     total++; passed += testLambdaThreeParam()          ? 1 : 0;
     total++; passed += testVoidLambda()               ? 1 : 0;
+
+    // Lambda capture tests
+    total++; passed += testCapturePrimitives()         ? 1 : 0;
+    total++; passed += testCaptureString()             ? 1 : 0;
+    total++; passed += testCaptureStructRef()          ? 1 : 0;
+    total++; passed += testCaptureMultiple()           ? 1 : 0;
+    total++; passed += testCaptureRegression()         ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;
