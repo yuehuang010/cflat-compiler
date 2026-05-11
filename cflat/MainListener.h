@@ -3504,6 +3504,25 @@ public:
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                             }
                             lambdaExpectedType = {};
+                            // Implicit char* → string coercion: string s = "hello" or string s = charPtr.
+                            if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
+                                && right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                            {
+                                auto* c = llvm::dyn_cast<llvm::Constant>(right);
+                                if (c && compiler->IsStringLiteralConstant(c))
+                                    right = compiler->WrapStringLiteralAsString(right);
+                                else if (compiler->GetFunction("operator string"))
+                                {
+                                    LLVMBackend::NamedVariable argNV;
+                                    argNV.Primary = right;
+                                    argNV.BaseType = right->getType();
+                                    argNV.TypeAndValue.TypeName = "char";
+                                    argNV.TypeAndValue.Pointer = true;
+                                    right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
+                                }
+                                else
+                                    right = compiler->WrapStringLiteralAsString(right);
+                            }
                             // Bare 'function' type inference: infer signature from the assigned function value.
                             if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
                             {

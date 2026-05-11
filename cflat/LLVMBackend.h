@@ -3944,6 +3944,10 @@ public:
                                 result = 0;
                         }
                     }
+                    // Implicit char* → string coercion: string literal or char* passed to a string param.
+                    if (result < 0 && candidateParamItr->TypeName == "string" && !candidateParamItr->Pointer
+                        && arg.BaseType && arg.BaseType->isPointerTy())
+                        result = 1;
                 }
 
                 if (result != 0)
@@ -4426,9 +4430,31 @@ public:
 
                 if (!inVariadicRange)
                 {
-                    // Upconvert to match the declared parameter type (e.g. i16 -> i32).
-                    bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
-                    value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
+                    if (candParamItr->TypeName == "string" && !candParamItr->Pointer
+                        && value && value->getType() == builder->getInt8Ty()->getPointerTo())
+                    {
+                        // Implicit char* → string coercion: string literal or char* passed to a string param.
+                        auto* c = llvm::dyn_cast<llvm::Constant>(value);
+                        if (c && IsStringLiteralConstant(c))
+                            value = WrapStringLiteralAsString(value);
+                        else if (GetFunction("operator string"))
+                        {
+                            NamedVariable argNV2;
+                            argNV2.Primary = value;
+                            argNV2.BaseType = value->getType();
+                            argNV2.TypeAndValue.TypeName = "char";
+                            argNV2.TypeAndValue.Pointer = true;
+                            value = CreateOverloadedFunctionCall("operator string", { argNV2 });
+                        }
+                        else
+                            value = WrapStringLiteralAsString(value);
+                    }
+                    else
+                    {
+                        // Upconvert to match the declared parameter type (e.g. i16 -> i32).
+                        bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
+                        value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
+                    }
                 }
 
                 // Non-owning string (literal or view) passed to a move parameter — heap-copy it

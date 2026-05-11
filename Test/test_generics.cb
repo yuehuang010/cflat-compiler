@@ -1738,6 +1738,24 @@ bool testITuple()
     return result;
 }
 
+bool testImplicitStringLiteral()
+{
+    bool result = true;
+
+    // string s = "literal" — implicit char* → string coercion in variable declaration
+    string s1 = "hello";
+    result &= Test("implicit_decl", s1, "hello");
+
+    // list<string>.add("literal") — implicit char* → string coercion in function argument
+    list<string> words = default;
+    words.add("foo");
+    words.add("bar");
+    result &= Test("implicit_add_0", words.get(0), "foo");
+    result &= Test("implicit_add_1", words.get(1), "bar");
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1786,6 +1804,7 @@ extern int main()
     total++; passed += testTupleConstruct()              ? 1 : 0;
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
+    total++; passed += testImplicitStringLiteral()        ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
