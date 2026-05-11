@@ -1,0 +1,6 @@
+import "mutex.cb";
+
+expect_error("lock(this) is the only supported form on function parameters") {
+    mutex m;
+    void f(lock(m) function<void()> body) { body(); }
+}

@@ -282,6 +282,14 @@ private:
                     paramType.VariableName = getDirectDeclName(directDeclarer);
             if (paramType.IsMove && paramType.IsBond)
                 Compiler(paramDecl)->LogError(std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
+            if (auto* lc = paramDecl->lockClause())
+            {
+                auto args = lc->lockArgList()->expression();
+                if (args.size() == 1 && args[0]->getText() == "this")
+                    paramType.LockThis = true;
+                else
+                    Compiler(paramDecl)->LogError("lock(this) is the only supported form on function parameters");
+            }
             paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);
         }
@@ -991,6 +999,9 @@ private:
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
     LLVMBackend::TypeAndValue lambdaExpectedType;
     LLVMBackend::TypeAndValue lastLambdaType;
+    // Non-empty when the matched function parameter is declared lock(this): holds the canonical
+    // receiver name (e.g. "d->ready") to seed currentLockSet during lambda body analysis.
+    std::string lambdaLockThisReceiver;
 
     // Side-channel from ParsePrimaryExpression to ParsePostfixExpression:
     // carries the cast TypeAndValue when the primary is a parenthesized cast expression,
@@ -6389,6 +6400,7 @@ public:
                                     namedVar.Primary = result;
                                     namedVar.BaseType = result->getType();
                                     namedVar.TypeAndValue = fieldType;
+                                    namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     nullConditionalPending = false;
                                 }
                                 else
@@ -6442,6 +6454,7 @@ public:
                                         namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                     }
                                     namedVar.TypeAndValue = fieldType;
+                                    namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                 }
                             }
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier))
@@ -7799,12 +7812,29 @@ public:
                                         continue;
                                     }
 
-                                    // Set expected type when function expects a function-pointer at this position
+                                    // Set expected type when function expects a function-pointer at this position.
+                                    // If the parameter is lock(this), also seed lambdaLockThisReceiver so the
+                                    // lambda body gets currentLockSet seeded with the call-site receiver guard.
                                     lambdaExpectedType = {};
+                                    lambdaLockThisReceiver = {};
                                     if (funcSym && (argIdx + paramOffset) < funcSym->Parameters.size())
                                     {
                                         const auto& paramTv = funcSym->Parameters[argIdx + paramOffset];
-                                        if (paramTv.IsFunctionPointer) lambdaExpectedType = paramTv;
+                                        if (paramTv.IsFunctionPointer)
+                                        {
+                                            lambdaExpectedType = paramTv;
+                                            // If the parameter is declared lock(this), build the qualified
+                                            // guard name (e.g. "d.ready") to seed currentLockSet in the lambda body.
+                                            if (paramTv.LockThis)
+                                            {
+                                                const std::string& parent = structVar.TypeAndValue.ParentVariableName;
+                                                const std::string& field  = structVar.TypeAndValue.VariableName;
+                                                if (!parent.empty() && !field.empty())
+                                                    lambdaLockThisReceiver = parent + "." + field;
+                                                else if (!field.empty())
+                                                    lambdaLockThisReceiver = field;
+                                            }
+                                        }
                                     }
                                     auto argName = namedArgument->Identifier();
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
@@ -8468,6 +8498,17 @@ public:
             }
         }
 
+        // If the lambda parameter was declared lock(this), seed currentLockSet with the
+        // resolved receiver guard (e.g. "d.ready") so GuardedBy checks inside the body pass.
+        std::string consumedLockThisReceiver = lambdaLockThisReceiver;
+        lambdaLockThisReceiver = {};  // consumed — clear before body in case of nested lambdas
+        std::unordered_set<std::string> savedLockSet;
+        if (!consumedLockThisReceiver.empty())
+        {
+            savedLockSet = currentLockSet;
+            currentLockSet.insert(consumedLockThisReceiver);
+        }
+
         // Parse body
         if (auto* body = ctx->lambdaBody())
         {
@@ -8483,6 +8524,9 @@ public:
                     compiler->CreateReturnCall(val);
             }
         }
+
+        if (!consumedLockThisReceiver.empty())
+            currentLockSet = savedLockSet;
 
         if (returnType.TypeName == "void" && !compiler->IsBlockTerminated())
             compiler->CreateReturnCall(nullptr);
@@ -11906,6 +11950,15 @@ public:
 
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
+
+            if (auto* lc = paramDecl->lockClause())
+            {
+                auto args = lc->lockArgList()->expression();
+                if (args.size() == 1 && args[0]->getText() == "this")
+                    paramType.LockThis = true;
+                else
+                    LogErrorContext(paramDecl, "lock(this) is the only supported form on function parameters");
+            }
 
             paramType.DefaultValue = paramDecl->initializer();
             params.push_back(paramType);

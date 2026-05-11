@@ -128,6 +128,12 @@ public:
 
         // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
+        // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
+        // Used to reconstruct the qualified lock name (e.g. "d.ready") for lock(this) parameter seeding.
+        std::string ParentVariableName;
+        // True when this function parameter is declared lock(this): the lambda/callback passed here
+        // executes with the call-site receiver seeded into currentLockSet for GuardedBy checks.
+        bool LockThis = false;
 
         bool IsPrimitive() const
         {
@@ -4262,6 +4268,34 @@ public:
                 AtomicOrdering::Monotonic);
             // extract the success bit (second element of {T, i1})
             return builder->CreateExtractValue(result, 1, "cas_ok");
+        }
+        if (name == "__atomic_release_store_i32" || name == "__atomic_release_store_i64" || name == "__atomic_release_store_flag")
+        {
+            bool is64   = (name == "__atomic_release_store_i64");
+            bool isFlag = (name == "__atomic_release_store_flag");
+            Value* ptr = args[0];
+            Value* val = args[1];
+            // bool is i1 in LLVM; atomic ops require byte-sized types — widen to i32.
+            if (isFlag)
+                val = builder->CreateZExt(val, Type::getInt32Ty(ctx), "flag_i32");
+            auto* si = builder->CreateStore(val, ptr);
+            si->setAtomic(AtomicOrdering::Release);
+            si->setAlignment(is64 ? Align(8) : Align(4));
+            return ConstantInt::get(Type::getInt32Ty(ctx), 0); // void: unused
+        }
+        if (name == "__atomic_acquire_load_i32" || name == "__atomic_acquire_load_i64" || name == "__atomic_acquire_load_flag")
+        {
+            bool is64   = (name == "__atomic_acquire_load_i64");
+            bool isFlag = (name == "__atomic_acquire_load_flag");
+            Value* ptr = args[0];
+            auto* ty = is64 ? Type::getInt64Ty(ctx) : Type::getInt32Ty(ctx);
+            auto* li = builder->CreateLoad(ty, ptr, "atomic_acq_load");
+            li->setAtomic(AtomicOrdering::Acquire);
+            li->setAlignment(is64 ? Align(8) : Align(4));
+            // bool return: compare i32 result with zero.
+            if (isFlag)
+                return builder->CreateICmpNE(li, ConstantInt::get(Type::getInt32Ty(ctx), 0), "flag_bool");
+            return li;
         }
         return nullptr; // not an atomic builtin
     }

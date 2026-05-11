@@ -429,8 +429,8 @@ parameterList
     ;
 
 parameterDeclaration
-    : declarationSpecifiers declarator ('=' initializer)?
-    | declarationSpecifiers abstractDeclarator?
+    : lockClause? declarationSpecifiers declarator ('=' initializer)?
+    | lockClause? declarationSpecifiers abstractDeclarator?
     ;
 
 identifierList

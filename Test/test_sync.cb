@@ -424,6 +424,71 @@ bool testAtomicI64() {
 }
 
 // ---------------------------------------------------------------------------
+// atomic release/acquire guard tests
+// ---------------------------------------------------------------------------
+
+struct FlagGuarded {
+    atomic__i32 ready = default;
+    lock(ready) {
+        int value = 0;
+        int value2 = 0;
+    }
+};
+
+struct I32Guarded {
+    atomic__i32 version = default;
+    lock(version) {
+        int data = 0;
+    }
+};
+
+int flagReleaseWorker(void* ctx) {
+    FlagGuarded* s = (FlagGuarded*)ctx;
+    s->ready.release(1, () => {
+        s->value  = 42;
+        s->value2 = 99;
+    });
+    return 0;
+}
+
+bool testAtomicFlagReleaseAcquire() {
+    bool result = true;
+    FlagGuarded s;
+    Thread t;
+    t.start(flagReleaseWorker, &s);
+    while (s.ready.load() == 0) { }
+    s.ready.acquire((i32 v) => {
+        result &= Test("atomic release/acquire value",  s.value,  42);
+        result &= Test("atomic release/acquire value2", s.value2, 99);
+        result &= Test("atomic release/acquire loaded", (int)v, 1);
+    });
+    t.join();
+    return result;
+}
+
+int i32ReleaseWorker(void* ctx) {
+    I32Guarded* s = (I32Guarded*)ctx;
+    s->version.release(1, () => {
+        s->data = 77;
+    });
+    return 0;
+}
+
+bool testAtomicI32ReleaseAcquire() {
+    bool result = true;
+    I32Guarded s;
+    Thread t;
+    t.start(i32ReleaseWorker, &s);
+    while (s.version.load() == 0) { }
+    s.version.acquire((i32 v) => {
+        result &= Test("i32 release/acquire data",    s.data, 77);
+        result &= Test("i32 release/acquire version", (int)v, 1);
+    });
+    t.join();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // semaphore tests
 // ---------------------------------------------------------------------------
 
@@ -1001,6 +1066,9 @@ extern int main() {
     total++; passed += testSpscBasic()                ? 1 : 0;
     total++; passed += testSpscWrapAround()           ? 1 : 0;
     total++; passed += testSpscThreaded()             ? 1 : 0;
+
+    total++; passed += testAtomicFlagReleaseAcquire()     ? 1 : 0;
+    total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
 
     printf("Thread/Sync tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

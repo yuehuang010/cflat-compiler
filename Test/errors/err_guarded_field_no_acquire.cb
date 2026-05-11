@@ -1,0 +1,15 @@
+import "atomic.cb";
+
+struct SharedData {
+    atomic__i32 ready = default;
+    lock(ready) {
+        int value = 0;
+    }
+};
+
+extern int main()
+{
+    expect_error("Field 'value' is guarded by 'ready'");
+    SharedData s;
+    int x = s.value;
+}
