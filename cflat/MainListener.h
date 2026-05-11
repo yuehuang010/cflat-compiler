@@ -3666,7 +3666,7 @@ public:
                     right = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
                 }
 
-                if (right == nullptr && !typeAndValue.Pointer)
+                if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0)
                 {
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
@@ -6691,7 +6691,18 @@ public:
                             LogErrorContext(expressCtx, "Expecting be an integer type.");
                         }
 
-                        if (namedVar.TypeAndValue.Pointer)
+                        if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
+                        {
+                            // Fixed-size array (char buf[N] or char* words[N]): two-index GEP {0, i}.
+                            // Check BaseType first so pointer-element arrays (char*[N]) don't fall
+                            // into the pointer-arithmetic branch below.
+                            llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
+                            namedVar.Storage = Compiler(ctx)->builder->CreateGEP(
+                                arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
+                            namedVar.BaseType = arrTy->getElementType();
+                            namedVar.TypeAndValue.ConstArraySize = 0;
+                        }
+                        else if (namedVar.TypeAndValue.Pointer)
                         {
                             // Indexing through a pointer (e.g. char* p; p[i]).
                             auto elementTypeAndValue = namedVar.TypeAndValue;
@@ -6714,15 +6725,6 @@ public:
                             namedVar.Storage = Compiler(ctx)->CreateGEP(elementType, ptrValue, rvalue);
                             namedVar.BaseType = elementType;
                             namedVar.TypeAndValue = elementTypeAndValue;
-                        }
-                        else if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
-                        {
-                            // Fixed-size array (char buf[N]): two-index GEP {0, i} to reach element i
-                            llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
-                            namedVar.Storage = Compiler(ctx)->builder->CreateGEP(
-                                arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
-                            namedVar.BaseType = arrTy->getElementType();
-                            namedVar.TypeAndValue.ConstArraySize = 0;
                         }
                         else
                         {
@@ -8426,7 +8428,7 @@ public:
                     closureFields.push_back(compiler->GetType(cap.TV));
             }
             closureStructTy = llvm::StructType::create(*compiler->context, closureFields, closureName);
-            closureAlloca   = compiler->builder->CreateAlloca(closureStructTy, nullptr, closureName);
+            closureAlloca   = compiler->AllocaAtEntry(closureStructTy, nullptr, closureName);
 
             for (size_t i = 0; i < captures.size(); i++)
             {
@@ -8479,7 +8481,8 @@ public:
                     auto* outerPtr  = compiler->builder->CreateLoad(
                         structTy->getPointerTo(), fieldGEP, cap.Name + "_ref");
                     LLVMBackend::TypeAndValue captureTV = cap.TV;
-                    captureTV.Pointer = true;
+                    captureTV.Pointer       = true;
+                    captureTV.ConstArraySize = 0;  // inside the lambda this is a T*, not a T[N]
                     captureNV.Primary = outerPtr;
                     captureNV.TypeAndValue = captureTV;
                     captureNV.BaseType     = structTy->getPointerTo();

@@ -13,8 +13,7 @@ struct PriorityResult {
     int order    = 0;   // completion order (1-based, set by priorityTask)
 };
 
-// Heap-allocated — global arrays of structs are not supported at file scope.
-PriorityResult* g_results = nullptr;
+PriorityResult g_results[9];
 
 // ── Task functions ────────────────────────────────────────────────────────────
 
@@ -42,12 +41,6 @@ int priorityTask(void* ctx) {
     return 0;
 }
 
-char* priorityName(int p) {
-    if (p == PRIORITY_HIGH)   { return "HIGH  "; }
-    if (p == PRIORITY_NORMAL) { return "NORMAL"; }
-    return "LOW   ";
-}
-
 // ── Section 1: basic correctness ─────────────────────────────────────────────
 
 void section1(ThreadPool* pool) {
@@ -57,7 +50,7 @@ void section1(ThreadPool* pool) {
     inputs[0] = 1; inputs[1] = 2; inputs[2] = 3; inputs[3] = 4;
     inputs[4] = 5; inputs[5] = 6; inputs[6] = 7; inputs[7] = 8;
 
-    TaskHandle* handles = new TaskHandle[8];
+    TaskHandle handles[8];
 
     int i = 0;
     while (i < 8) {
@@ -79,8 +72,6 @@ void section1(ThreadPool* pool) {
         i++;
     }
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
-
-    delete[8] handles;
 }
 
 // ── Section 2: error handling ─────────────────────────────────────────────────
@@ -136,8 +127,6 @@ void section2(ThreadPool* pool) {
 void section3() {
     printf("=== Section 3: priority ordering (1 worker) ===\n");
 
-    g_results = new PriorityResult[9];
-
     g_results[0].taskId = 0; g_results[0].priority = PRIORITY_LOW;
     g_results[1].taskId = 1; g_results[1].priority = PRIORITY_LOW;
     g_results[2].taskId = 2; g_results[2].priority = PRIORITY_LOW;
@@ -151,7 +140,7 @@ void section3() {
     ThreadPool pool1;
     pool1.init(1);
 
-    TaskHandle* handles = new TaskHandle[9];
+    TaskHandle handles[9];
 
     // Submit task 0 (LOW) first — worker picks it up immediately.
     pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], PRIORITY_LOW);
@@ -172,10 +161,15 @@ void section3() {
 
     pool1.drain();
 
+    char* names[3];
+    names[PRIORITY_LOW]    = "LOW   ";
+    names[PRIORITY_NORMAL] = "NORMAL";
+    names[PRIORITY_HIGH]   = "HIGH  ";
+
     int i = 0;
     while (i < 9) {
         printf("  task %d (%s): completion order %d\n",
-            g_results[i].taskId, priorityName(g_results[i].priority), g_results[i].order);
+            g_results[i].taskId, names[g_results[i].priority], g_results[i].order);
         i++;
     }
 
@@ -206,9 +200,6 @@ void section3() {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 
     pool1.shutdown();
-    delete[9] handles;
-    delete[9] g_results;
-    g_results = nullptr;
 }
 
 // ── Section 4: pool reuse and shutdown contract ───────────────────────────────
@@ -219,7 +210,7 @@ void section4(ThreadPool* pool) {
     int inputs[4];
     inputs[0] = 10; inputs[1] = 20; inputs[2] = 30; inputs[3] = 40;
 
-    TaskHandle* handles = new TaskHandle[4];
+    TaskHandle handles[4];
 
     int i = 0;
     while (i < 4) {
@@ -245,8 +236,6 @@ void section4(ThreadPool* pool) {
     bool rejected = !pool->submit(squareTask, nullptr, &dummy);
     printf("  submit after shutdown rejected: %s\n", rejected ? "YES" : "NO");
     printf("  result: %s\n\n", rejected ? "PASS" : "FAIL");
-
-    delete[4] handles;
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

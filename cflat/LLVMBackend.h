@@ -3905,20 +3905,21 @@ public:
             }
         }
 
-        if (typeAndValue.ConstArraySize > 0)
-            return llvm::ArrayType::get(type, typeAndValue.ConstArraySize);
-
+        // Apply pointer wrapping to get the element type before array wrapping.
+        // This ensures char*[3] → [3 x ptr] not [3 x i8].
         if (allowPointer && typeAndValue.Pointer)
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
             if (type->isVoidTy())
-            {
-                auto p = builder->getInt8Ty()->getPointerTo();
-                return typeAndValue.ElemPointer ? p->getPointerTo() : p;
-            }
-            auto p = type->getPointerTo();
-            return typeAndValue.ElemPointer ? p->getPointerTo() : p;
+                type = builder->getInt8Ty()->getPointerTo();
+            else
+                type = type->getPointerTo();
+            if (typeAndValue.ElemPointer)
+                type = type->getPointerTo();
         }
+
+        if (typeAndValue.ConstArraySize > 0)
+            return llvm::ArrayType::get(type, typeAndValue.ConstArraySize);
 
         return type;
     }

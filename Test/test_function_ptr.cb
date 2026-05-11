@@ -641,6 +641,53 @@ bool testCaptureRegression()
     return result;
 }
 
+// Regression: capturing a local T arr[N] by reference must store T* in the closure
+// (element pointer), not [N x T]*.  Wrong type caused GEP to stride by N*sizeof(T)
+// instead of sizeof(T), so arr[1], arr[2], etc. read from garbage addresses.
+bool testCaptureLocalArray()
+{
+    bool result = true;
+
+    Counter pts[3];
+    pts[0].value = 10;
+    pts[1].value = 20;
+    pts[2].value = 30;
+
+    // Use a Counter (struct, captured by reference) to accumulate so writes
+    // from the lambda are visible to the caller.
+    Counter acc;
+    int i = 0;
+    while (i < 3)
+    {
+        callVoid(() => { acc.value = acc.value + pts[i].value; });
+        i++;
+    }
+    result &= Test("capture array sum", acc.value, 60);
+
+    return result;
+}
+
+// Regression: closure alloca created inside a loop body must be hoisted to the
+// function entry block.  Loop-body allocas grow the stack on every iteration,
+// causing stack overflow (0xC00000FD) on large trip counts.
+bool testLambdaAllocaInLoop()
+{
+    bool result = true;
+
+    Counter c;
+    int n = 5;
+    for (int i = 0; i < n; i++)
+    {
+        int delta = i + 1;
+        function<void()> inc = () => { c.value = c.value + delta; };
+        inc();
+    }
+    // 1+2+3+4+5 = 15
+    result &= Test("lambda alloca in loop", c.value, 15);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LIST SORT TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -761,6 +808,8 @@ extern int main()
     total++; passed += testCaptureStructRef()          ? 1 : 0;
     total++; passed += testCaptureMultiple()           ? 1 : 0;
     total++; passed += testCaptureRegression()         ? 1 : 0;
+    total++; passed += testCaptureLocalArray()         ? 1 : 0;
+    total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;
