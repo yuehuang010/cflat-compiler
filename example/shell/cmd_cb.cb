@@ -1,6 +1,6 @@
 // cmd_cb.cb - CFlat interactive shell
 //
-// Supported commands:
+// Built-in commands:
 //   cd [path]         - show or change current directory
 //   dir [path]        - list directory contents
 //   set [VAR[=VAL]]   - show / set environment variables
@@ -16,6 +16,8 @@
 //   help              - list commands
 //   exit              - quit
 //
+// Any other command is spawned as an external process via process.cb.
+//
 // Build:
 //   x64/Debug/cflat.exe example/shell/cmd_cb.cb -i cflat/core -o out/cmd_cb.exe
 // Run:
@@ -24,6 +26,7 @@
 import "string.cb";
 import "filesystem.cb";
 import "list.cb";
+import "process.cb";
 
 extern stdcall i32  GetEnvironmentVariableA(const char* name, char* buf, i32 size);
 extern stdcall i32  SetEnvironmentVariableA(const char* name, const char* value);
@@ -351,6 +354,33 @@ void cmdCls()
     printf("\033[2J\033[H");
 }
 
+// ── run external process ──────────────────────────────────────────────────────
+
+void cmdRun(list<string>* tokens)
+{
+    // Build the arg list before assigning the lambda (lambda-before-add compiler limitation).
+    list<string>* args = new list<string>;
+    int i = 1;
+    while (i < tokens->count())
+    {
+        string arg = tokens->get(i);
+        args->add(arg);
+        i++;
+    }
+
+    process p;
+    p.exe = tokens->get(0);
+    p.onStdout = (char* buf, int len) => {
+        printf("%.*s", len, buf);
+    };
+    p.run(args);
+    p.WaitForExit();
+    delete args;
+
+    if (p.exitCode != 0)
+        printf("\nProcess exited with code %d\n", p.exitCode);
+}
+
 // ── help ──────────────────────────────────────────────────────────────────────
 
 void cmdHelp()
@@ -370,6 +400,7 @@ void cmdHelp()
     printf("  cls                Clear the screen\n");
     printf("  help               Show this list\n");
     printf("  exit               Quit the shell\n");
+    printf("\nAny other input is run as an external process.\n");
 }
 
 // ── REPL ──────────────────────────────────────────────────────────────────────
@@ -405,7 +436,7 @@ extern int main(int argc, char** argv)
         else if (eqCI(cmd, "ren") || eqCI(cmd, "rename")) cmdRen(tokens);
         else if (eqCI(cmd, "cls") || eqCI(cmd, "clear"))  cmdCls();
         else if (eqCI(cmd, "help") || eqCI(cmd, "/?"))    cmdHelp();
-        else printf("'%s' is not recognized as a command. Type 'help'.\n", cmd.data());
+        else                                               cmdRun(tokens);
 
         delete tokens;
     }
