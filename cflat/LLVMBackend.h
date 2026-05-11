@@ -350,6 +350,9 @@ public:
         unsigned OutFieldIndex      = (unsigned)-1;     // struct field index of _out (stream*); -1 when stream.cb not imported
         unsigned InStreamFieldIndex = (unsigned)-1;     // struct field index of _in  (stream*); -1 when stream.cb not imported
         bool IsImportedProgram      = false;            // true when created via 'import program "file.cb" as Name'
+        std::vector<std::string> Interfaces;            // interfaces declared with ': IFoo, IBar'
+        std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // cached vtables keyed by interface name
+        llvm::GlobalVariable* typeDescriptor = nullptr; // unique type-identity global for 'is'/'as' checks
     };
 
     class StackState
@@ -1755,18 +1758,103 @@ public:
 
     bool StructImplementsInterface(const std::string& structName, const std::string& ifaceName) const
     {
-        auto structIt = dataStructures.find(structName);
-        if (structIt == dataStructures.end()) return false;
-        for (const auto& iface : structIt->second.Interfaces)
+        // Programs exist in both dataStructures (empty shell) and programTable (real data).
+        // Check programTable first so program-declared interfaces are found correctly.
+        auto progIt = programTable.find(structName);
+        if (progIt != programTable.end())
         {
-            if (iface == ifaceName) return true;
-            if (InterfaceInheritsFrom(iface, ifaceName)) return true;
+            for (const auto& iface : progIt->second.Interfaces)
+            {
+                if (iface == ifaceName) return true;
+                if (InterfaceInheritsFrom(iface, ifaceName)) return true;
+            }
+            return false;
+        }
+        auto structIt = dataStructures.find(structName);
+        if (structIt != dataStructures.end())
+        {
+            for (const auto& iface : structIt->second.Interfaces)
+            {
+                if (iface == ifaceName) return true;
+                if (InterfaceInheritsFrom(iface, ifaceName)) return true;
+            }
         }
         return false;
     }
 
+    llvm::GlobalVariable* GetOrCreateProgramVTable(ProgramData& pd, const std::string& structName, const std::string& ifaceName)
+    {
+        auto it = pd.VTables.find(ifaceName);
+        if (it != pd.VTables.end()) return it->second;
+
+        auto ifaceIt = interfaceTable.find(ifaceName);
+        if (ifaceIt == interfaceTable.end())
+        {
+            LogError(std::format("GetOrCreateProgramVTable: unknown interface '{}'", ifaceName));
+            return nullptr;
+        }
+
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        std::vector<llvm::Constant*> entries;
+
+        if (pd.typeDescriptor == nullptr)
+        {
+            pd.typeDescriptor = new llvm::GlobalVariable(
+                *module, builder->getInt8Ty(), true,
+                llvm::GlobalValue::InternalLinkage,
+                builder->getInt8(0), structName + "_typedesc");
+        }
+        entries.push_back(pd.typeDescriptor);
+
+        for (const auto& method : ifaceIt->second)
+        {
+            llvm::Function* fn = nullptr;
+            auto funcIt = functionTable.find(method.Name);
+            if (funcIt != functionTable.end())
+            {
+                size_t expectedParamCount = 1 + method.Parameters.size();
+                for (const auto& sym : funcIt->second)
+                {
+                    if (sym.Parameters.size() != expectedParamCount) continue;
+                    if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer) continue;
+                    bool paramsMatch = true;
+                    for (size_t pi = 0; pi < method.Parameters.size(); pi++)
+                    {
+                        if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
+                        { paramsMatch = false; break; }
+                    }
+                    if (paramsMatch) { fn = sym.Function; break; }
+                }
+            }
+            if (fn == nullptr)
+            {
+                LogError(std::format("GetOrCreateProgramVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
+                entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
+            }
+            else
+            {
+                entries.push_back(fn);
+            }
+        }
+
+        auto arrTy = llvm::ArrayType::get(ptrTy, entries.size());
+        auto vtableConst = llvm::ConstantArray::get(arrTy, entries);
+        auto vtableGlobal = new llvm::GlobalVariable(
+            *module, arrTy, true,
+            llvm::GlobalValue::InternalLinkage,
+            vtableConst, structName + "_" + ifaceName + "_vtable");
+
+        pd.VTables[ifaceName] = vtableGlobal;
+        return vtableGlobal;
+    }
+
     llvm::GlobalVariable* GetOrCreateVTable(const std::string& structName, const std::string& ifaceName)
     {
+        // Programs have their own VTable cache separate from dataStructures.
+        auto progIt = programTable.find(structName);
+        if (progIt != programTable.end())
+            return GetOrCreateProgramVTable(progIt->second, structName, ifaceName);
+
         auto& sd = dataStructures[structName];
         auto it = sd.VTables.find(ifaceName);
         if (it != sd.VTables.end()) return it->second;

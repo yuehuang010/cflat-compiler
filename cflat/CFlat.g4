@@ -638,7 +638,7 @@ lockFieldGroup
     ;
 
 programDefinition
-    : 'program' directDeclarator '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : 'program' directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 genericIdentifier

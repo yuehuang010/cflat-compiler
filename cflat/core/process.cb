@@ -168,7 +168,7 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
 
 // ── process struct ────────────────────────────────────────────────────────────
 
-struct process {
+class process : IProcess {
     // Public config — set before run().
     string exe = default;
 
@@ -259,6 +259,15 @@ struct process {
             _has_writer = true;
         }
     }
+
+    // IProcess interface — run with a value list (forwards to the pointer overload).
+    bool run(list<string> args) {
+        run(&args);
+        return true;
+    }
+
+    // IProcess interface — return the exit code field.
+    int exitCode() { return exitCode; }
 
     // Block until the process exits.  Joins I/O threads and captures exitCode.
     void WaitForExit() {

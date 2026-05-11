@@ -116,3 +116,11 @@ interface ITuple<T...>
 {
     (T...) get();
 };
+
+// Unified interface for both `program` constructs and `process` (external child processes).
+interface IProcess
+{
+    bool run(list<string> args);
+    void WaitForExit();
+    int  exitCode();
+};

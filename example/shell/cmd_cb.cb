@@ -357,12 +357,11 @@ void cmdCls()
     printf("\033[2J\033[H");
 }
 
-// ── wc ────────────────────────────────────────────────────────────────────────
+// ── builtin runner ────────────────────────────────────────────────────────────
 
-void cmdWc(list<string>* tokens)
+// Runs any IProcess with the given token list as argv (index 0 is the command name).
+void runBuiltin(IProcess p, list<string>* tokens)
 {
-    if (tokens->count() < 2) { printf("Usage: wc <file> [file2 ...]\n"); return; }
-    Wc w;
     list<string> args;
     int i = 0;
     while (i < tokens->count())
@@ -371,8 +370,18 @@ void cmdWc(list<string>* tokens)
         args.add(arg);
         i++;
     }
-    w.run(args);
-    w.WaitForExit();
+    p.run(args);
+    p.WaitForExit();
+}
+
+// ── wc ────────────────────────────────────────────────────────────────────────
+
+void cmdWc(list<string>* tokens)
+{
+    if (tokens->count() < 2) { printf("Usage: wc <file> [file2 ...]\n"); return; }
+    Wc w;
+    IProcess p = w;
+    runBuiltin(p, tokens);
 }
 
 // ── run external process ──────────────────────────────────────────────────────

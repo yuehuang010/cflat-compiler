@@ -752,6 +752,24 @@ public:
             compiler->CreateFunctionDeclaration("RequestStop", voidReturn, { thisParam });
         }
 
+        // Pre-declare exitCode(Name* this) -> int (IProcess method)
+        {
+            LLVMBackend::TypeAndValue intReturn{ .TypeName = "int" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("exitCode", intReturn, { thisParam });
+        }
+
+        // Store declared interfaces in programTable for VTable dispatch
+        {
+            std::vector<std::string> ifaces;
+            for (auto* id : ctx->Identifier())
+                ifaces.push_back(id->getText());
+            compiler->programTable[name].Interfaces = ifaces;
+        }
+
         // Pre-declare member functions (including user's main) and destructor
         for (auto func : ctx->functionDefinition())
             ScanFunctionDefinition(func, name);
@@ -864,7 +882,18 @@ public:
             thisParam.Pointer      = true;
             compiler->CreateFunctionDeclaration("RequestStop", voidReturn, { thisParam });
         }
-        // No member function scanning — imported program's main is already compiled
+        // Pre-declare exitCode(Name* this) -> int (IProcess method)
+        {
+            LLVMBackend::TypeAndValue intReturn{ .TypeName = "int" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("exitCode", intReturn, { thisParam });
+        }
+
+        // All imported programs implicitly implement IProcess.
+        compiler->programTable[name].Interfaces = { "IProcess" };
     }
 
     void ScanAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx)
@@ -2644,6 +2673,18 @@ public:
                             auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
                             compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
                         }
+                        else if (compiler->programTable.count(entry.typeCaseName))
+                        {
+                            // Concrete program case: single type descriptor comparison
+                            auto& pd = compiler->programTable[entry.typeCaseName];
+                            if (!pd.typeDescriptor)
+                            {
+                                LogErrorContext(expression, std::format("program '{}' has no type descriptor", entry.typeCaseName));
+                                continue;
+                            }
+                            auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
+                            compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
+                        }
                         else if (compiler->interfaceTable.count(entry.typeCaseName))
                         {
                             // Interface case: match if the concrete type implements this interface
@@ -2651,7 +2692,7 @@ public:
                             llvm::BasicBlock* anyMatchedBlock = entry.block;
                             auto* nextStruct = nextCheck;
 
-                            // Enumerate all classes that implement this interface
+                            // Enumerate all classes/structs that implement this interface
                             for (auto& [sName, sd] : compiler->dataStructures)
                             {
                                 if (!compiler->StructImplementsInterface(sName, entry.typeCaseName)) continue;
@@ -2661,6 +2702,24 @@ public:
                                 auto* cmpNextStruct = compiler->CreateBasicBlock("typeswitch_cmp_next");
 
                                 auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
+                                compiler->builder->CreateCondBr(cmp, matchBlock, cmpNextStruct);
+
+                                compiler->SwitchToBlock(matchBlock);
+                                compiler->builder->CreateBr(anyMatchedBlock);
+
+                                compiler->SwitchToBlock(cmpNextStruct);
+                                nextStruct = cmpNextStruct;
+                            }
+                            // Also enumerate programs that implement this interface
+                            for (auto& [pName, pd] : compiler->programTable)
+                            {
+                                if (!compiler->StructImplementsInterface(pName, entry.typeCaseName)) continue;
+                                if (!pd.typeDescriptor) continue;
+
+                                auto* matchBlock = compiler->CreateBasicBlock("typeswitch_match");
+                                auto* cmpNextStruct = compiler->CreateBasicBlock("typeswitch_cmp_next");
+
+                                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
                                 compiler->builder->CreateCondBr(cmp, matchBlock, cmpNextStruct);
 
                                 compiler->SwitchToBlock(matchBlock);
@@ -3432,8 +3491,9 @@ public:
                             {
                                 std::string structName = rightNV.TypeAndValue.TypeName;
                                 // Catch the case where the RHS is a known type that doesn't implement the interface.
-                                if (!structName.empty() && compiler->dataStructures.count(structName)
-                                    && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
+                                bool rhsIsKnownType = !structName.empty() &&
+                                    (compiler->dataStructures.count(structName) || compiler->programTable.count(structName));
+                                if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression,
                                         std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
@@ -4425,6 +4485,26 @@ public:
 
                 compiler->SwitchToBlock(matchBlock);
                 auto* vtable = compiler->GetOrCreateVTable(sName, targetTypeName);
+                auto fatVal = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                compiler->builder->CreateStore(fatVal, resultAlloca);
+                compiler->builder->CreateBr(afterBlock);
+
+                compiler->SwitchToBlock(nextBlock);
+            }
+            // Also check programs that implement the target interface
+            for (auto& [pName, pd] : compiler->programTable)
+            {
+                if (!compiler->StructImplementsInterface(pName, targetTypeName)) continue;
+                if (!pd.typeDescriptor) continue;
+
+                auto* matchBlock = compiler->CreateBasicBlock("as_iface_match");
+                auto* nextBlock = compiler->CreateBasicBlock("as_iface_next");
+
+                auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
+                compiler->builder->CreateCondBr(cmp, matchBlock, nextBlock);
+
+                compiler->SwitchToBlock(matchBlock);
+                auto* vtable = compiler->GetOrCreateVTable(pName, targetTypeName);
                 auto fatVal = compiler->BuildInterfaceFatValue(vtable, dataPtr);
                 compiler->builder->CreateStore(fatVal, resultAlloca);
                 compiler->builder->CreateBr(afterBlock);
@@ -10510,6 +10590,25 @@ public:
             compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
         }
+
+        // ======================================================================
+        // EMIT exitCode(): int exitCode(Name* this)
+        // Returns the exitCode field — satisfies the IProcess interface contract.
+        // ======================================================================
+        {
+            LLVMBackend::TypeAndValue intReturn;  intReturn.TypeName = "int";
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
+
+            auto* exitCodeFn = compiler->CreateFunctionDefinition("exitCode", intReturn, {thisParam});
+
+            auto* thisArg = exitCodeFn->getArg(0);
+            auto* exitCodeGEP = compiler->builder->CreateStructGEP(
+                progType, thisArg, exitCodeIdx, "exit_code_gep");
+            auto* exitCodeVal = compiler->builder->CreateLoad(i32Type, exitCodeGEP, "exit_code");
+            compiler->builder->CreateRet(exitCodeVal);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
     }
 
     void ParseImportedProgramDefinition(const std::string& name)
@@ -10785,6 +10884,9 @@ public:
         compiler->programTable[name].OutFieldIndex           = outFieldIndex;
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
         // IsImportedProgram and MainFunction were already set by LLVMBackend.cpp pre-scan
+
+        // All imported programs implicitly implement IProcess.
+        compiler->programTable[name].Interfaces = { "IProcess" };
 
         EmitProgramRunWrapper(name);
     }
