@@ -1832,6 +1832,7 @@ extern int main()
     total++; passed += testBreakContinue()               ? 1 : 0;
     total++; passed += testDoWhile()                     ? 1 : 0;
     total++; passed += testAndShortCircuit()             ? 1 : 0;
+    total++; passed += testInterfaceNullCheck()          ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -2198,5 +2199,59 @@ bool testAndShortCircuit()
     result &= Test("and_chain_iters",  k,    5);
     result &= Test("and_chain_hits",   hits, 1);
 
+    return result;
+}
+
+// =============================================================
+// Interface nullptr comparison tests
+// =============================================================
+
+interface ICounter
+{
+    int count();
+};
+
+class SimpleCounter : ICounter
+{
+    int n = default;
+    int count() { return n; }
+};
+
+bool checkIfaceNull(ICounter c)
+{
+    return c == nullptr;
+}
+
+bool checkIfaceNotNull(ICounter c)
+{
+    return c != nullptr;
+}
+
+bool testInterfaceNullCheck()
+{
+    bool result = true;
+
+    // Null fat-ptr compares equal to nullptr
+    ICounter empty = nullptr;
+    result &= Test("iface_null_eq",    empty == nullptr, true);
+    result &= Test("iface_null_ne",    empty != nullptr, false);
+
+    // Non-null fat-ptr compares not-equal to nullptr
+    SimpleCounter* sc = new SimpleCounter();
+    sc.n = 5;
+    ICounter live = sc;
+    result &= Test("iface_nonnull_ne", live != nullptr,  true);
+    result &= Test("iface_nonnull_eq", live == nullptr,  false);
+
+    // Reassign to nullptr clears the fat-ptr
+    live = nullptr;
+    result &= Test("iface_reassign_null", live == nullptr, true);
+
+    // Pass interface variable as interface parameter
+    ICounter nullIface = nullptr;
+    result &= Test("iface_param_null",    checkIfaceNull(nullIface),    true);
+    result &= Test("iface_param_nonnull", checkIfaceNotNull(nullIface), false);
+
+    delete sc;
     return result;
 }

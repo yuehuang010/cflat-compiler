@@ -3756,6 +3756,10 @@ public:
             if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
                 && right && right->getType() != compiler->GetFatPtrType())
             {
+                // nullptr assigned to a non-pointer interface variable — produce null fat pointer {null, null}.
+                // IsInterfacePointer (IFoo*) stores a pointer-to-fat-ptr, not a fat-ptr; skip this conversion.
+                if (!namedVar.TypeAndValue.IsInterfacePointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
+                    right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
                 std::string structName = rightNV.TypeAndValue.TypeName;
                 if (!structName.empty() && compiler->StructImplementsInterface(structName, namedVar.TypeAndValue.TypeName))
                 {
@@ -7607,6 +7611,13 @@ public:
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+
+                                    // Propagate interface type so overload resolution matches IFoo->IFoo parameters.
+                                    if (argNV.TypeAndValue.IsInterface)
+                                    {
+                                        argVar.TypeAndValue.IsInterface = true;
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
+                                    }
 
                                     // Extract struct name if this is a struct type
                                     if (argVar.TypeAndValue.TypeName.empty())
