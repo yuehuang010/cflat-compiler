@@ -36,10 +36,11 @@ Full msbuild path (if not on PATH):
 "/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" cflat.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
 ```
 
-**Quick dev loop** — `buildAndRun.bat` builds the solution and immediately runs the compiler on `cflat/Test/test_generics.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
+**Quick dev loop** — `buildAndRun.bat` builds both Release and Debug, then runs the Debug binary on `Test/test_basic.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
 
 ```bash
-./buildAndRun.bat
+./buildAndRun.bat            # builds Release + Debug, runs Debug binary on test_basic.cb
+./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
 ```
 
 ## Running
@@ -76,24 +77,22 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 ## Running Tests
 
 ```bash
-test.bat
+test.bat              # runs against Release (default)
+test.bat Debug        # runs against Debug
+test.bat Release      # explicit Release
 ```
 
-`test.bat` picks the compiler binary via `CFLAT_CONFIG` (defaults to `Debug`). Set it to `Release` to test the optimized build:
+`test.bat` defaults to Release. Pass `Debug` or `Release` as the first argument to override. The `CFLAT_CONFIG` environment variable is also respected (command-line arg takes precedence).
 
-```bash
-set CFLAT_CONFIG=Release   # cmd
-$env:CFLAT_CONFIG="Release" # PowerShell
-```
-
-> **Pitfall**: If `CFLAT_CONFIG` is set in the shell that invokes `test.bat`, all spawned worker processes inherit it. After rebuilding with a different configuration, clear or update `CFLAT_CONFIG` so tests run against the intended binary.
+> **Pitfall**: If `CFLAT_CONFIG` is set in the shell that invokes `test.bat`, it will be used as the default unless a command-line arg overrides it. After rebuilding with a different configuration, clear or update `CFLAT_CONFIG` so tests run against the intended binary.
 
 ### LSP Tests
 
 Run the LSP test suite (smoke tests + fixture/scenario tests) with:
 
 ```bash
-test_lsp.bat
+test_lsp.bat          # runs against Release (default)
+test_lsp.bat Debug    # runs against Debug
 ```
 
 LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h` (symbol registration), run `test_lsp.bat` to verify LSP behaviour. These are kept separate from `test.bat`.

@@ -7,7 +7,7 @@ REM ===========================================================================
 REM Worker mode: compile and run a single .c test, write result file
 REM All compiler/exe output goes to a log file; nothing printed to console.
 REM ===========================================================================
-if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
 
 if "%~1"=="--worker-c" (
     set NAME=%~2
@@ -101,14 +101,22 @@ if "%~1"=="--worker-err" (
 REM ===========================================================================
 REM Main: launch all tests in parallel, wait, collect results
 REM ===========================================================================
-set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library
 if not defined CFLAT_PLATFORM set CFLAT_PLATFORM=win64
 if "%CFLAT_PLATFORM%"=="win32" (set CFLAT_OUT=out32) else (set CFLAT_OUT=out)
 set CFLAT_PLATFORM_FLAG=-p %CFLAT_PLATFORM%
 set OUT=%CFLAT_OUT%
+set _CFG_ARG=%~1
 set CFLAT_EXTRA=%*
+if /I "%_CFG_ARG%"=="Debug" (
+    set CFLAT_CONFIG=Debug
+    set CFLAT_EXTRA=%2 %3 %4 %5 %6 %7 %8 %9
+) else if /I "%_CFG_ARG%"=="Release" (
+    set CFLAT_CONFIG=Release
+    set CFLAT_EXTRA=%2 %3 %4 %5 %6 %7 %8 %9
+)
+set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set EXCLUDE=test_helper
 set TIMEOUT_SECS=120
 set SCRIPT=%~f0
