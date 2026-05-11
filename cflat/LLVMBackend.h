@@ -4233,7 +4233,18 @@ public:
                     arg.BaseType->print(rso);
                     typeName = typeStr;
                 }
-                std::string name = arg.TypeAndValue.VariableName.empty() ? "<unnamed>" : arg.TypeAndValue.VariableName;
+                std::string name;
+                if (arg.TypeAndValue.VariableName.empty())
+                {
+                    bool isThis = i == 0 && !candidates.empty() &&
+                                  !candidates[0].Parameters.empty() &&
+                                  candidates[0].Parameters[0].VariableName.ends_with("__");
+                    name = isThis ? "<this>" : "<unnamed>";
+                }
+                else
+                {
+                    name = arg.TypeAndValue.VariableName;
+                }
                 msg += std::format("    [{}] {}{} {}\n", i, typeName, arg.TypeAndValue.Pointer ? "*" : "", name);
             }
 
