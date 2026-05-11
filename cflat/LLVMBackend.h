@@ -349,6 +349,7 @@ public:
         unsigned TrackHandlesFieldIndex = 0;           // struct field index of trackHandles (bool)
         unsigned OutFieldIndex      = (unsigned)-1;     // struct field index of _out (stream*); -1 when stream.cb not imported
         unsigned InStreamFieldIndex = (unsigned)-1;     // struct field index of _in  (stream*); -1 when stream.cb not imported
+        bool IsImportedProgram      = false;            // true when created via 'import program "file.cb" as Name'
     };
 
     class StackState

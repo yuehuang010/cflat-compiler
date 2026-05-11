@@ -1,0 +1,5 @@
+// Standalone: returns argc (0 = no args, N = N args passed).
+// Also importable as: import program "hello_imported.cb" as Hello;
+extern int main(int argc, char** argv) {
+    return argc;
+}

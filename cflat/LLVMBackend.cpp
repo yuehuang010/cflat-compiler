@@ -224,6 +224,21 @@ bool LLVMBackend::Compile(const ArgParser& args)
                         if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << "\n";
                         if (!CompileImportedFile(filename, importFilename, ns))
                             return false;
+
+                        // For 'import program "file.cb" as Name', rename @main to __imported_main_Name
+                        if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+                        {
+                            std::string alias = imp->Identifier()->getText();
+                            auto* mainFn = module->getFunction("main");
+                            if (!mainFn)
+                            {
+                                LogError(std::format("import program '{}': '{}' has no 'main' function", alias, importFilename));
+                                return false;
+                            }
+                            mainFn->setName("__imported_main_" + alias);
+                            programTable[alias].IsImportedProgram = true;
+                            programTable[alias].MainFunction = mainFn;
+                        }
                     }
                 }
             }

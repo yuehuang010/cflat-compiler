@@ -13,6 +13,7 @@
 //   rmdir <path>      - remove an empty directory
 //   ren <old> <new>   - rename a file or directory
 //   cls               - clear the screen
+//   wc <file> ...     - count lines, words, and characters (built-in via import program)
 //   help              - list commands
 //   exit              - quit
 //
@@ -26,7 +27,9 @@
 import "string.cb";
 import "filesystem.cb";
 import "list.cb";
+import "thread.cb";
 import "process.cb";
+import program "wc.cb" as Wc;
 
 extern stdcall i32  GetEnvironmentVariableA(const char* name, char* buf, i32 size);
 extern stdcall i32  SetEnvironmentVariableA(const char* name, const char* value);
@@ -354,6 +357,24 @@ void cmdCls()
     printf("\033[2J\033[H");
 }
 
+// ── wc ────────────────────────────────────────────────────────────────────────
+
+void cmdWc(list<string>* tokens)
+{
+    if (tokens->count() < 2) { printf("Usage: wc <file> [file2 ...]\n"); return; }
+    Wc w;
+    list<string> args;
+    int i = 0;
+    while (i < tokens->count())
+    {
+        string arg = "" + tokens->get(i);
+        args.add(arg);
+        i++;
+    }
+    w.run(args);
+    w.WaitForExit();
+}
+
 // ── run external process ──────────────────────────────────────────────────────
 
 void cmdRun(list<string>* tokens)
@@ -398,6 +419,7 @@ void cmdHelp()
     printf("  rmdir <path>       Remove an empty directory\n");
     printf("  ren <old> <new>    Rename a file or directory\n");
     printf("  cls                Clear the screen\n");
+    printf("  wc <file> ...      Count lines, words, and characters\n");
     printf("  help               Show this list\n");
     printf("  exit               Quit the shell\n");
     printf("\nAny other input is run as an external process.\n");
@@ -435,6 +457,7 @@ extern int main(int argc, char** argv)
         else if (eqCI(cmd, "rmdir") || eqCI(cmd, "rd"))   cmdRmdir(tokens);
         else if (eqCI(cmd, "ren") || eqCI(cmd, "rename")) cmdRen(tokens);
         else if (eqCI(cmd, "cls") || eqCI(cmd, "clear"))  cmdCls();
+        else if (eqCI(cmd, "wc"))                         cmdWc(tokens);
         else if (eqCI(cmd, "help") || eqCI(cmd, "/?"))    cmdHelp();
         else                                               cmdRun(tokens);
 

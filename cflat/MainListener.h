@@ -766,6 +766,107 @@ public:
         }
     }
 
+    void ScanImportedProgramDefinition(const std::string& name)
+    {
+        auto* compiler = compilerLLVM;
+
+        compiler->CreateStructType(name, {});
+        LLVMBackend::TypeAndValue returnType{ .TypeName = name };
+        compiler->CreateFunctionDeclaration(name, returnType, {});
+
+        // Pre-register channel<IMessage> so the synthetic inbox field resolves during the main pass
+        {
+            const std::string channelMangledName = "channel__IMessage";
+            if (!compiler->dataStructures.count(channelMangledName))
+            {
+                compiler->CreateStructType(channelMangledName, {});
+                LLVMBackend::TypeAndValue chReturnType{ .TypeName = channelMangledName };
+                compiler->CreateFunctionDeclaration(channelMangledName, chReturnType, {});
+            }
+        }
+
+        // Pre-declare trampoline: int __program_run_Name(void*)
+        {
+            LLVMBackend::TypeAndValue intReturn{ .TypeName = "int" };
+            LLVMBackend::DeclTypeAndValue ctxParam;
+            ctxParam.TypeName = "void";
+            ctxParam.VariableName = "ctx";
+            ctxParam.Pointer = true;
+            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false, false);
+        }
+
+        // Pre-declare run(Name* this, list__string args) -> bool
+        {
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer = true;
+            LLVMBackend::DeclTypeAndValue argsParam;
+            argsParam.TypeName = "list__string";
+            argsParam.VariableName = "args";
+            argsParam.IsMove = true;
+            compiler->CreateFunctionDeclaration("run", boolReturn, { thisParam, argsParam });
+        }
+
+        // Pre-declare WaitForExit(Name* this) -> void
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer = true;
+            compiler->CreateFunctionDeclaration("WaitForExit", voidReturn, { thisParam });
+        }
+
+        // Pre-declare WaitForExit(Name* this, stop_token token) -> bool
+        {
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            LLVMBackend::DeclTypeAndValue tokenParam;
+            tokenParam.TypeName     = "stop_token";
+            tokenParam.VariableName = "token";
+            compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, tokenParam });
+        }
+
+        // Pre-declare WaitForExit(Name* this, int timeoutMs) -> bool
+        {
+            LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            LLVMBackend::DeclTypeAndValue msParam;
+            msParam.TypeName     = "int";
+            msParam.VariableName = "timeoutMs";
+            compiler->CreateFunctionDeclaration("WaitForExit", boolReturn, { thisParam, msParam });
+        }
+
+        // Pre-declare Kill(Name* this) -> void
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("Kill", voidReturn, { thisParam });
+        }
+
+        // Pre-declare RequestStop(Name* this) -> void
+        {
+            LLVMBackend::TypeAndValue voidReturn{ .TypeName = "void" };
+            LLVMBackend::DeclTypeAndValue thisParam;
+            thisParam.TypeName     = name;
+            thisParam.VariableName = name + "__";
+            thisParam.Pointer      = true;
+            compiler->CreateFunctionDeclaration("RequestStop", voidReturn, { thisParam });
+        }
+        // No member function scanning — imported program's main is already compiled
+    }
+
     void ScanAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -800,6 +901,14 @@ public:
             ScanUsingDeclaration(usingDecl);
         else if (auto progDef = ctx->programDefinition())
             ScanProgramDefinition(progDef);
+        else if (auto imp = ctx->importDeclaration())
+        {
+            if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+            {
+                std::string alias = imp->Identifier()->getText();
+                ScanImportedProgramDefinition(alias);
+            }
+        }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
             // Set expectedError so errors during the scan are caught rather than aborting.
@@ -1619,6 +1728,14 @@ public:
         else if (auto progDef = ctx->programDefinition())
         {
             ParseProgramDefinition(progDef);
+        }
+        else if (auto imp = ctx->importDeclaration())
+        {
+            if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+            {
+                std::string alias = imp->Identifier()->getText();
+                ParseImportedProgramDefinition(alias);
+            }
         }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
@@ -9545,6 +9662,8 @@ public:
                                 ? compiler->dataStructures["BucketAllocator"].StructType : nullptr;
         auto* listStringType  = compiler->dataStructures.count("list__string")
                                 ? compiler->dataStructures["list__string"].StructType : nullptr;
+        auto* stringStructType= compiler->dataStructures.count("string")
+                                ? compiler->dataStructures["string"].StructType : nullptr;
         auto* threadType      = compiler->dataStructures.count("Thread")
                                 ? compiler->dataStructures["Thread"].StructType : nullptr;
         auto* fatTy           = compiler->GetFatPtrType();   // {i8*, i8*}
@@ -9578,12 +9697,72 @@ public:
         auto* threadCtorFn     = compiler->GetFunction("Thread");
         auto* threadStartFn    = FindMethodOf("start", "Thread");
         auto* threadJoinFn     = FindMethodOf("join", "Thread");
-        auto* mainFn           = FindMethodOf("main", name);
+
+        bool isImported = compiler->programTable[name].IsImportedProgram;
+
+        // Find the 'main' function for this program.
+        // For imported programs, MainFunction was already set by the pre-scan.
+        // For regular programs, search the function table for a method with self as first param.
+        llvm::Function* mainFn = nullptr;
+        if (isImported)
+        {
+            mainFn = compiler->programTable[name].MainFunction;
+        }
+        else
+        {
+            auto it = compiler->functionTable.find("main");
+            int mainCount = 0;
+            if (it != compiler->functionTable.end())
+            {
+                for (const auto& sym : it->second)
+                {
+                    if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == name)
+                    {
+                        ++mainCount;
+                        mainFn = sym.Function;
+                    }
+                }
+            }
+            if (mainCount > 1)
+            {
+                compiler->LogError(std::format(
+                    "program '{}': multiple 'main' methods defined; only one is allowed.", name));
+                return;
+            }
+        }
 
         if (!mallocFn || !freeFn || !defAllocCtorFn
             || !threadCtorFn || !threadStartFn || !threadJoinFn || !mainFn)
         {
             compiler->LogError(std::format("program '{}': missing helper function for run() generation", name));
+            return;
+        }
+
+        // Detect calling style from LLVM arg count.
+        // Regular program methods have 'self' as the first arg, so the counts are offset by 1:
+        //   1 arg  = NoArgs   (self — "int main()")
+        //   2 args = ListArgs (self + list<string> — "int main(move list<string> args)")
+        //   3 args = ArgcArgv (self + int + char** — "int main(int argc, char** argv)")
+        // Imported programs are free functions (no self), so counts are:
+        //   0 args = NoArgs   ("int main()")
+        //   1 arg  = ListArgs ("int main(move list<string> args)")  [not yet supported]
+        //   2 args = ArgcArgv ("int main(int argc, char** argv)")
+        auto mainArgCount = static_cast<unsigned>(mainFn->arg_size());
+        bool isNoArgs   = isImported ? (mainArgCount == 0) : (mainArgCount == 1);
+        bool isListArgs = isImported ? (mainArgCount == 1) : (mainArgCount == 2);
+        bool isArgcArgv = isImported ? (mainArgCount == 2) : (mainArgCount == 3);
+
+        if (!isNoArgs && !isListArgs && !isArgcArgv)
+        {
+            compiler->LogError(std::format(
+                "program '{}': 'main' has unsupported signature (expected 0, 1, or 2 user params).", name));
+            return;
+        }
+
+        if (isArgcArgv && !stringStructType)
+        {
+            compiler->LogError(std::format(
+                "program '{}': main(int,char**) style requires 'string' type to be available.", name));
             return;
         }
 
@@ -9803,6 +9982,91 @@ public:
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(
                 progType, self, exitCodeIdx, "exit_code_gep");
 
+            // ---- ArgcArgv conversion: list<string> → argc + char** argv ----
+            // Used only when main(int argc, char** argv) style is detected.
+            // argvHolderAlloca stores the malloc'd argv array so cleanupBB can free it.
+            llvm::AllocaInst* argvHolderAlloca = nullptr;
+            llvm::Value* argc32Val  = nullptr;
+            llvm::Value* argvPtrVal = nullptr;
+
+            if (isArgcArgv)
+            {
+                // Alloca to hold argv ptr across SEH paths; initialized to null.
+                argvHolderAlloca = compiler->AllocaAtEntry(voidPtrType, nullptr, "argv_holder");
+                compiler->builder->CreateStore(
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                    argvHolderAlloca);
+
+                // list<string> layout: { string* _data, i32 _size, i32 _capacity }
+                argc32Val        = compiler->builder->CreateExtractValue(argsVal, {1u}, "argc");
+                auto* dataPtr    = compiler->builder->CreateExtractValue(argsVal, {0u}, "args_data");
+
+                // malloc char*[argc+1]
+                auto* argcPlus1    = compiler->builder->CreateAdd(argc32Val, compiler->builder->getInt32(1), "argc_p1");
+                auto* argcPlus1_64 = compiler->builder->CreateZExt(argcPlus1, i64Type, "argc_p1_64");
+                auto* ptrSize      = compiler->GetTypeSizeBytes(voidPtrType);
+                auto* argvBytes    = compiler->builder->CreateMul(argcPlus1_64, ptrSize, "argv_bytes");
+                auto* argvRaw      = compiler->builder->CreateCall(
+                    mallocFn->getFunctionType(), mallocFn, {argvBytes}, "argv_raw");
+                compiler->builder->CreateStore(argvRaw, argvHolderAlloca);
+                argvPtrVal = compiler->builder->CreateBitCast(
+                    argvRaw, voidPtrType->getPointerTo(), "argv_ptr");
+
+                // Loop: argv[i] = data[i]._ptr  (string field 0 is i8* _ptr)
+                auto* iAlloca   = compiler->AllocaAtEntry(i32Type, nullptr, "argv_i");
+                compiler->builder->CreateStore(compiler->builder->getInt32(0), iAlloca);
+                auto* loopCondBB = llvm::BasicBlock::Create(*compiler->context, "argv_cond", trampolineFn);
+                auto* loopBodyBB = llvm::BasicBlock::Create(*compiler->context, "argv_body", trampolineFn);
+                auto* loopDoneBB = llvm::BasicBlock::Create(*compiler->context, "argv_done", trampolineFn);
+                compiler->builder->CreateBr(loopCondBB);
+
+                compiler->builder->SetInsertPoint(loopCondBB);
+                auto* iVal  = compiler->builder->CreateLoad(i32Type, iAlloca, "i");
+                auto* check = compiler->builder->CreateICmpSLT(iVal, argc32Val, "loop_cond");
+                compiler->builder->CreateCondBr(check, loopBodyBB, loopDoneBB);
+
+                compiler->builder->SetInsertPoint(loopBodyBB);
+                auto* i64Val    = compiler->builder->CreateZExt(iVal, i64Type, "i64");
+                auto* elemPtr   = compiler->builder->CreateGEP(stringStructType, dataPtr, {i64Val}, "elem");
+                auto* ptrFldGEP = compiler->builder->CreateStructGEP(stringStructType, elemPtr, 0, "elem_ptr");
+                auto* charPtr   = compiler->builder->CreateLoad(voidPtrType, ptrFldGEP, "char_ptr");
+                auto* argvSlot  = compiler->builder->CreateGEP(voidPtrType, argvPtrVal, {i64Val}, "argv_slot");
+                compiler->builder->CreateStore(charPtr, argvSlot);
+                auto* iNext = compiler->builder->CreateAdd(iVal, compiler->builder->getInt32(1), "i_next");
+                compiler->builder->CreateStore(iNext, iAlloca);
+                compiler->builder->CreateBr(loopCondBB);
+
+                compiler->builder->SetInsertPoint(loopDoneBB);
+                // Null-terminate: argv[argc] = nullptr
+                auto* argc64    = compiler->builder->CreateZExt(argc32Val, i64Type, "argc64");
+                auto* nullSlot  = compiler->builder->CreateGEP(voidPtrType, argvPtrVal, {argc64}, "null_slot");
+                compiler->builder->CreateStore(
+                    llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+                    nullSlot);
+            }
+
+            // Build the argument list for the call/invoke based on main style.
+            // Imported programs are free functions (no self pointer).
+            std::vector<llvm::Value*> mainArgs;
+            if (isImported)
+            {
+                if (isNoArgs)
+                    mainArgs = {};
+                else if (isListArgs)
+                    mainArgs = {argsVal};
+                else // ArgcArgv
+                    mainArgs = {argc32Val, argvPtrVal};
+            }
+            else
+            {
+                if (isNoArgs)
+                    mainArgs = {self};
+                else if (isListArgs)
+                    mainArgs = {self, argsVal};
+                else // ArgcArgv
+                    mainArgs = {self, argc32Val, argvPtrVal};
+            }
+
             if (compiler->platformValue == 64)
             {
                 // Win64: use SEH (invoke + catchswitch + catchpad) to catch hardware faults.
@@ -9818,7 +10082,7 @@ public:
                 auto* invokeInst = compiler->builder->CreateInvoke(
                     mainFn->getFunctionType(), mainFn,
                     normalBB, dispatchBB,
-                    {self, argsVal}, "main_result");
+                    mainArgs, "main_result");
 
                 // normalBB: main returned cleanly — store exit code, fall through to cleanup.
                 compiler->builder->SetInsertPoint(normalBB);
@@ -9847,7 +10111,7 @@ public:
                 // _except_handler3 + catchpad/catchret, producing broken EH tables.
                 // Fall back to a plain call — crash recovery is not supported on Win32.
                 auto* callResult = compiler->builder->CreateCall(
-                    mainFn->getFunctionType(), mainFn, {self, argsVal}, "main_result");
+                    mainFn->getFunctionType(), mainFn, mainArgs, "main_result");
                 compiler->builder->CreateStore(callResult, exitCodeGEP);
                 compiler->builder->CreateBr(cleanupBB);
             }
@@ -9925,6 +10189,13 @@ public:
                 compiler->builder->CreateBr(htrackLoopBB);
 
                 compiler->builder->SetInsertPoint(htrackDoneBB);
+            }
+
+            // Free argv array if ArgcArgv style (may be null on exception path before allocation).
+            if (isArgcArgv && argvHolderAlloca)
+            {
+                auto* argvToFree = compiler->builder->CreateLoad(voidPtrType, argvHolderAlloca, "argv_to_free");
+                compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {argvToFree});
             }
 
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
@@ -10220,6 +10491,283 @@ public:
             compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
         }
+    }
+
+    void ParseImportedProgramDefinition(const std::string& name)
+    {
+        auto* compiler = compilerLLVM;
+
+        if (compiler->IsVerbose())
+            std::cout << "[verbose]     parse imported program: " << name << "\n";
+
+        // Ensure channel<IMessage> is fully instantiated before CreateStructType uses its layout.
+        if (!instantiatedGenerics.count("channel__IMessage"))
+        {
+            pendingInstantiations.push_back({"channel", {"IMessage"}, "channel__IMessage"});
+            instantiatedGenerics.insert("channel__IMessage");
+            ProcessPendingInstantiations();
+        }
+
+        if (!instantiatedInterfaces.count("IQueue__IMessage"))
+        {
+            pendingInstantiations.push_back({"IQueue", {"IMessage"}, "IQueue__IMessage"});
+            ProcessPendingInstantiations();
+        }
+
+        // No user-declared fields — only synthetic fields
+        std::vector<LLVMBackend::DeclTypeAndValue> declList;
+
+        unsigned exitCodeFieldIndex     = (unsigned)declList.size();
+        unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
+        unsigned allocatorFieldIndex    = threadFieldIndex + 1;
+        unsigned onStdoutFieldIndex      = allocatorFieldIndex + 1;
+        unsigned onStdinFieldIndex       = onStdoutFieldIndex + 1;
+        unsigned onStdinReturnFieldIndex = onStdinFieldIndex + 1;
+        unsigned inboxFieldIndex         = onStdinReturnFieldIndex + 1;
+        unsigned stopSrcFieldIndex       = inboxFieldIndex + 1;
+        unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
+        unsigned outFieldIndex           = (unsigned)-1;
+        unsigned inStreamFieldIndex      = (unsigned)-1;
+        bool     hasStreamType           = compiler->dataStructures.count("stream") > 0;
+        {
+            LLVMBackend::DeclTypeAndValue exitCodeField;
+            exitCodeField.TypeName     = "int";
+            exitCodeField.VariableName = "exitCode";
+            declList.push_back(exitCodeField);
+
+            LLVMBackend::DeclTypeAndValue threadField;
+            threadField.TypeName     = "Thread";
+            threadField.VariableName = "_thread";
+            declList.push_back(threadField);
+
+            LLVMBackend::DeclTypeAndValue allocatorField;
+            allocatorField.TypeName     = "IAllocator";
+            allocatorField.VariableName = "_allocator";
+            allocatorField.IsInterface  = true;
+            allocatorField.Pointer      = true;
+            declList.push_back(allocatorField);
+
+            LLVMBackend::DeclTypeAndValue onStdoutField;
+            onStdoutField.VariableName          = "onStdout";
+            onStdoutField.IsFunctionPointer     = true;
+            onStdoutField.FuncPtrReturnTypeName = "void";
+            onStdoutField.FuncPtrParams         = {{"char", true}, {"int", false}};
+            declList.push_back(onStdoutField);
+
+            LLVMBackend::DeclTypeAndValue onStdinField;
+            onStdinField.VariableName          = "onStdin";
+            onStdinField.IsFunctionPointer     = true;
+            onStdinField.FuncPtrReturnTypeName = "char";
+            onStdinField.FuncPtrReturnPointer  = true;
+            onStdinField.FuncPtrParams         = {};
+            declList.push_back(onStdinField);
+
+            LLVMBackend::DeclTypeAndValue onStdinReturnField;
+            onStdinReturnField.VariableName          = "onStdinReturn";
+            onStdinReturnField.IsFunctionPointer     = true;
+            onStdinReturnField.FuncPtrReturnTypeName = "void";
+            onStdinReturnField.FuncPtrParams         = {{"char", true}};
+            declList.push_back(onStdinReturnField);
+
+            LLVMBackend::DeclTypeAndValue inboxField;
+            inboxField.TypeName     = "IQueue__IMessage";
+            inboxField.VariableName = "inbox";
+            inboxField.IsInterface  = true;
+            inboxField.Pointer      = true;
+            declList.push_back(inboxField);
+
+            LLVMBackend::DeclTypeAndValue stopSrcField;
+            stopSrcField.TypeName     = "stop_source";
+            stopSrcField.VariableName = "_stop_source";
+            declList.push_back(stopSrcField);
+
+            LLVMBackend::DeclTypeAndValue trackHandlesField;
+            trackHandlesField.TypeName     = "int";
+            trackHandlesField.VariableName = "trackHandles";
+            declList.push_back(trackHandlesField);
+
+            if (hasStreamType) {
+                LLVMBackend::DeclTypeAndValue outField;
+                outField.TypeName     = "stream";
+                outField.VariableName = "_out";
+                outField.Pointer      = true;
+                outFieldIndex = (unsigned)declList.size();
+                declList.push_back(outField);
+
+                LLVMBackend::DeclTypeAndValue inField;
+                inField.TypeName     = "stream";
+                inField.VariableName = "_in";
+                inField.Pointer      = true;
+                inStreamFieldIndex = (unsigned)declList.size();
+                declList.push_back(inField);
+            }
+        }
+
+        auto* structType = compiler->CreateStructType(name, declList);
+        if (structType->isOpaque())
+            structType->setBody(llvm::ArrayRef<llvm::Type*>());
+
+        // Create default constructor
+        {
+            LLVMBackend::TypeAndValue returnType;
+            returnType.TypeName = name;
+            compiler->CreateFunctionDefinition(name, returnType, {});
+
+            std::vector<llvm::Value*> initializers;
+            for (auto& typeValue : declList)
+            {
+                llvm::Value* rvalue = nullptr;
+                auto* initializer = typeValue.Initializer;
+                if (initializer)
+                {
+                    if (auto* ae = initializer->assignmentExpression())
+                        rvalue = ParseAssignmentExpression(ae);
+                    else if (initializer->Default())
+                        rvalue = GenerateDefaultValue(typeValue);
+                }
+                initializers.push_back(rvalue);
+            }
+
+            llvm::Value* structVal = llvm::UndefValue::get(structType);
+            unsigned int idx = 0;
+            for (auto* rvalue : initializers)
+            {
+                if (rvalue)
+                {
+                    auto* destType = structType->getTypeAtIndex(idx);
+                    rvalue = compiler->Upconvert(rvalue, destType);
+                    if (rvalue->getType() != destType && destType->isStructTy())
+                    {
+                        std::string fieldTypeName = declList[idx].TypeName;
+                        if (compiler->GetFunction(fieldTypeName))
+                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
+                        else
+                            rvalue = llvm::Constant::getNullValue(destType);
+                    }
+                    structVal = compiler->CreateInsertValue(structVal, rvalue, idx);
+                }
+                idx++;
+            }
+
+            // exitCode = -1
+            {
+                auto* minusOne = llvm::ConstantInt::getSigned(
+                    llvm::Type::getInt32Ty(*compiler->context), -1);
+                structVal = compiler->CreateInsertValue(structVal, minusOne, exitCodeFieldIndex);
+            }
+
+            // _thread = Thread()
+            if (auto* threadCtorFn = compiler->GetFunction("Thread"))
+            {
+                auto* threadInitVal = compiler->builder->CreateCall(
+                    threadCtorFn->getFunctionType(), threadCtorFn, {}, "thread_init");
+                structVal = compiler->CreateInsertValue(structVal, threadInitVal, threadFieldIndex);
+            }
+
+            // _allocator = zero (null fat-ptr)
+            {
+                auto* fatTy = compiler->GetFatPtrType();
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fatTy), allocatorFieldIndex);
+            }
+
+            // onStdout = nullptr
+            {
+                auto& onStdoutDecl = declList[onStdoutFieldIndex];
+                auto* fieldType = compiler->GetType(onStdoutDecl);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdoutFieldIndex);
+            }
+
+            // onStdin = nullptr
+            {
+                auto& onStdinDecl = declList[onStdinFieldIndex];
+                auto* fieldType = compiler->GetType(onStdinDecl);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdinFieldIndex);
+            }
+
+            // onStdinReturn = nullptr
+            {
+                auto& onStdinReturnDecl = declList[onStdinReturnFieldIndex];
+                auto* fieldType = compiler->GetType(onStdinReturnDecl);
+                structVal = compiler->CreateInsertValue(
+                    structVal, llvm::Constant::getNullValue(fieldType), onStdinReturnFieldIndex);
+            }
+
+            // inbox = heap-allocated channel<IMessage> fat-ptr
+            {
+                auto* fatTy = compiler->GetFatPtrType();
+                auto dsIt = compiler->dataStructures.find("channel__IMessage");
+                auto* inboxCtorFn = compiler->GetFunction("channel__IMessage");
+                auto* mallocInboxFn = compiler->GetFunction("malloc");
+                if (dsIt != compiler->dataStructures.end() && inboxCtorFn && mallocInboxFn)
+                {
+                    auto* channelType    = dsIt->second.StructType;
+                    auto* channelSize    = compiler->GetTypeSizeBytes(channelType);
+                    auto* channelRaw     = compiler->builder->CreateCall(
+                        mallocInboxFn->getFunctionType(), mallocInboxFn, {channelSize}, "inbox_raw");
+                    auto* channelPtr     = compiler->builder->CreateBitCast(
+                        channelRaw, channelType->getPointerTo(), "inbox_ptr");
+                    auto* channelZeroVal = compiler->builder->CreateCall(
+                        inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_zero");
+                    compiler->builder->CreateStore(channelZeroVal, channelPtr);
+                    auto* inboxVtable    = compiler->GetOrCreateVTable("channel__IMessage", "IQueue__IMessage");
+                    auto* inboxFatPtr    = compiler->BuildInterfaceFatValue(inboxVtable, channelPtr);
+                    structVal = compiler->CreateInsertValue(structVal, inboxFatPtr, inboxFieldIndex);
+                }
+                else
+                {
+                    structVal = compiler->CreateInsertValue(
+                        structVal, llvm::Constant::getNullValue(fatTy), inboxFieldIndex);
+                }
+            }
+
+            // _stop_source = stop_source()
+            if (auto* stopSrcCtorFn = compiler->GetFunction("stop_source"))
+            {
+                auto* stopSrcInitVal = compiler->builder->CreateCall(
+                    stopSrcCtorFn->getFunctionType(), stopSrcCtorFn, {}, "stop_src_zero");
+                structVal = compiler->CreateInsertValue(structVal, stopSrcInitVal, stopSrcFieldIndex);
+            }
+
+            // trackHandles = 0
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                trackHandlesFieldIndex);
+
+            // _out / _in = nullptr (only when stream.cb is imported)
+            if (outFieldIndex != (unsigned)-1)
+            {
+                auto* streamTy = compiler->GetDataStructure("stream").StructType;
+                auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
+            }
+
+            compiler->CreateReturnCall(structVal);
+            compiler->CreateBlockBreak(nullptr, true);
+        }
+
+        ProcessPendingInstantiations();
+
+        compiler->programTable[name].StructType          = structType;
+        compiler->programTable[name].ConfigFields        = declList;
+        compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
+        compiler->programTable[name].ThreadFieldIndex    = threadFieldIndex;
+        compiler->programTable[name].AllocatorFieldIndex = allocatorFieldIndex;
+        compiler->programTable[name].OnStdoutFieldIndex       = onStdoutFieldIndex;
+        compiler->programTable[name].OnStdinFieldIndex        = onStdinFieldIndex;
+        compiler->programTable[name].OnStdinReturnFieldIndex  = onStdinReturnFieldIndex;
+        compiler->programTable[name].InboxFieldIndex          = inboxFieldIndex;
+        compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
+        compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
+        compiler->programTable[name].OutFieldIndex           = outFieldIndex;
+        compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
+        // IsImportedProgram and MainFunction were already set by LLVMBackend.cpp pre-scan
+
+        EmitProgramRunWrapper(name);
     }
 
     void ParseProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx)

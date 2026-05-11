@@ -2,6 +2,7 @@ import "list.cb";
 import "thread.cb";
 import "filesystem.cb";
 import "test_helper.cb";
+import program "hello_imported.cb" as Hello;
 
 // ---------------------------------------------------------------------------
 // Program definitions
@@ -903,6 +904,86 @@ bool testTrackHandles() {
 }
 
 // ---------------------------------------------------------------------------
+// Main signature variants
+// ---------------------------------------------------------------------------
+
+// NoArgs: main() with no parameters
+program NoArgsMain {
+    int result = 0;
+
+    int main() {
+        return 42;
+    }
+};
+
+bool testNoArgsMain() {
+    bool ok = true;
+    NoArgsMain p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    ok &= Test("NoArgs main() returns 42", p.exitCode, 42);
+    return ok;
+}
+
+// ArgcArgv: main(int argc, char** argv) style
+program ArgcArgvMain {
+    int result = 0;
+
+    int main(int argc, char** argv) {
+        return argc;
+    }
+};
+
+bool testArgcArgvMain() {
+    bool ok = true;
+
+    // Empty args → argc = 0
+    ArgcArgvMain p0;
+    list<string> empty;
+    p0.run(empty);
+    p0.WaitForExit();
+    ok &= Test("ArgcArgv argc empty", p0.exitCode, 0);
+
+    // Two args → argc = 2
+    ArgcArgvMain p2;
+    list<string> twoArgs;
+    string s1 = "" + "hello";
+    string s2 = "" + "world";
+    twoArgs.add(s1);
+    twoArgs.add(s2);
+    p2.run(twoArgs);
+    p2.WaitForExit();
+    ok &= Test("ArgcArgv argc two args", p2.exitCode, 2);
+
+    return ok;
+}
+
+bool testImportedProgram() {
+    bool ok = true;
+
+    // Empty args → argc = 0
+    Hello h0;
+    list<string> empty;
+    h0.run(empty);
+    h0.WaitForExit();
+    ok &= Test("imported program empty args", h0.exitCode, 0);
+
+    // Two args → argc = 2
+    Hello h2;
+    list<string> twoArgs;
+    string s1 = "" + "hello";
+    string s2 = "" + "world";
+    twoArgs.add(s1);
+    twoArgs.add(s2);
+    h2.run(twoArgs);
+    h2.WaitForExit();
+    ok &= Test("imported program two args", h2.exitCode, 2);
+
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -947,6 +1028,9 @@ extern int main() {
     total++; passed += testKillInfiniteLoop()            ? 1 : 0;
     total++; passed += testSupervisorSpawnsChildren()    ? 1 : 0;
     total++; passed += testTrackHandles()                ? 1 : 0;
+    total++; passed += testNoArgsMain()                  ? 1 : 0;
+    total++; passed += testArgcArgvMain()                ? 1 : 0;
+    total++; passed += testImportedProgram()             ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

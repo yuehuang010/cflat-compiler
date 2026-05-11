@@ -173,7 +173,9 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="LLVMBackend.cpp" />
+    <ClCompile Include="LLVMBackend.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClInclude Include="LLVMBackend.h" />
     <ClInclude Include="MainListener.h" />
     <ClCompile Include="main.cpp" />

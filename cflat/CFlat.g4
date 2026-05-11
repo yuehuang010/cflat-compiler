@@ -613,6 +613,7 @@ usingDeclaration
 
 importDeclaration
     : Import StringLiteral (As Identifier)? ';'
+    | Import 'program' StringLiteral As Identifier ';'
     ;
 
 namespaceDefinition

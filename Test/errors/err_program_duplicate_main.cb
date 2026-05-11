@@ -1,0 +1,9 @@
+import "list.cb";
+import "thread.cb";
+
+expect_error("multiple 'main' methods defined") {
+    program DupMain {
+        int main() { return 0; }
+        int main(move list<string> args) { return 1; }
+    };
+}
