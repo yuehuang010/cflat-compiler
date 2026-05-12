@@ -757,9 +757,22 @@ private:
             newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
         }
 
+        // Last-known-good cache: if this analysis hit errors AND yielded fewer symbols
+        // than the cached index, keep serving the cached one. A partially-typed identifier
+        // typically aborts parsing and strips most of the file's symbols, which would
+        // otherwise black out hover/completion/go-to-definition until the user finishes typing.
         {
             std::lock_guard<std::mutex> lock(indexMutex_);
-            currentIndex_ = newIndex;
+            bool hasErrors    = !diagnostics.empty();
+            size_t newCount   = newIndex->SymbolCount();
+            size_t cachedCount = currentIndex_ ? currentIndex_->SymbolCount() : 0;
+            bool keepCached   = hasErrors && newCount < cachedCount;
+
+            if (!keepCached)
+                currentIndex_ = newIndex;
+            else if (verbose_)
+                std::cerr << "[lsp] keeping cached index (" << cachedCount
+                          << " symbols) over partial parse (" << newCount << ")\n";
         }
 
         PublishDiagnostics(uri, diagnostics);

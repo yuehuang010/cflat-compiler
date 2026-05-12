@@ -29,5 +29,13 @@ if errorlevel 1 (
 )
 
 echo.
+echo === LSP bulk source sweep ===
+python vscode-extension\test\lsp_bulk_test.py %COMPILER% %_EXTRA%
+if errorlevel 1 (
+    echo FAILED: LSP bulk source sweep
+    exit /b 1
+)
+
+echo.
 echo All LSP tests passed.
 exit /b 0

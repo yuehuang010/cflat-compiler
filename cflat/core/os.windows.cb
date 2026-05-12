@@ -21,6 +21,7 @@ extern stdcall i32       GetExitCodeThread(void* handle, i32* code);
 extern stdcall void      CloseHandle(void* handle);
 extern stdcall bool      TerminateThread(void* handle, i32 exitCode);
 extern stdcall bool      SwitchToThread();
+extern stdcall u32       GetCurrentThreadId();
 
 // Win32 Timing
 extern stdcall win_int  QueryPerformanceCounter(i64* count);

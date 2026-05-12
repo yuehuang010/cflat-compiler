@@ -709,6 +709,20 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                     if (!CompileImportedFile(filePath, importFilename, ns))
                         return false;
+
+                    // Mirror Compile()'s 'import program "file.cb" as Name' handling:
+                    // rename the imported 'main' so the EmitProgramRunWrapper helper
+                    // path can find it under programTable[alias].MainFunction.
+                    if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+                    {
+                        std::string alias = imp->Identifier() ? imp->Identifier()->getText() : "";
+                        if (auto* mainFn = module->getFunction("main"))
+                        {
+                            mainFn->setName("__imported_main_" + alias);
+                            programTable[alias].IsImportedProgram = true;
+                            programTable[alias].MainFunction = mainFn;
+                        }
+                    }
                 }
             }
         }

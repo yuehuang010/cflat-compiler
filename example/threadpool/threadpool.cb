@@ -6,8 +6,6 @@ import "mutex.cb";
 import "queue.cb";
 import "time.cb";
 
-extern u32 GetCurrentThreadId();
-
 // Priority values for submit() / submitDetached().
 // Prefer the named constants over raw integers in call sites.
 int THREADPOOL_PRIORITY_HIGH   = 2;

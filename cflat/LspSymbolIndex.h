@@ -31,6 +31,8 @@ public:
     void RegisterVariable(const std::string& varName, const std::string& typeName);
     const std::string* LookupVariableType(const std::string& varName) const;
 
+    size_t SymbolCount() const { return symbols_.size(); }
+
 private:
     std::unordered_map<std::string, SymbolDef> symbols_;
     std::unordered_map<std::string, std::string> variableTypes_;
