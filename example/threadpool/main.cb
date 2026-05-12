@@ -127,15 +127,15 @@ void section2(ThreadPool* pool) {
 void section3() {
     printf("=== Section 3: priority ordering (1 worker) ===\n");
 
-    g_results[0].taskId = 0; g_results[0].priority = PRIORITY_LOW;
-    g_results[1].taskId = 1; g_results[1].priority = PRIORITY_LOW;
-    g_results[2].taskId = 2; g_results[2].priority = PRIORITY_LOW;
-    g_results[3].taskId = 3; g_results[3].priority = PRIORITY_NORMAL;
-    g_results[4].taskId = 4; g_results[4].priority = PRIORITY_NORMAL;
-    g_results[5].taskId = 5; g_results[5].priority = PRIORITY_NORMAL;
-    g_results[6].taskId = 6; g_results[6].priority = PRIORITY_HIGH;
-    g_results[7].taskId = 7; g_results[7].priority = PRIORITY_HIGH;
-    g_results[8].taskId = 8; g_results[8].priority = PRIORITY_HIGH;
+    g_results[0].taskId = 0; g_results[0].priority = THREADPOOL_PRIORITY_LOW;
+    g_results[1].taskId = 1; g_results[1].priority = THREADPOOL_PRIORITY_LOW;
+    g_results[2].taskId = 2; g_results[2].priority = THREADPOOL_PRIORITY_LOW;
+    g_results[3].taskId = 3; g_results[3].priority = THREADPOOL_PRIORITY_NORMAL;
+    g_results[4].taskId = 4; g_results[4].priority = THREADPOOL_PRIORITY_NORMAL;
+    g_results[5].taskId = 5; g_results[5].priority = THREADPOOL_PRIORITY_NORMAL;
+    g_results[6].taskId = 6; g_results[6].priority = THREADPOOL_PRIORITY_HIGH;
+    g_results[7].taskId = 7; g_results[7].priority = THREADPOOL_PRIORITY_HIGH;
+    g_results[8].taskId = 8; g_results[8].priority = THREADPOOL_PRIORITY_HIGH;
 
     ThreadPool pool1;
     pool1.init(1);
@@ -143,28 +143,28 @@ void section3() {
     TaskHandle handles[9];
 
     // Submit task 0 (LOW) first — worker picks it up immediately.
-    pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], PRIORITY_LOW);
+    pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], THREADPOOL_PRIORITY_LOW);
 
     // Brief spin so the worker enters its compute loop before we enqueue the rest.
     int spin = 0;
     while (spin < 500000) { spin++; }
 
     // Enqueue remaining 8 in interleaved priority order while worker is busy.
-    pool1.submit(priorityTask, (void*)&g_results[1], &handles[1], PRIORITY_LOW);
-    pool1.submit(priorityTask, (void*)&g_results[2], &handles[2], PRIORITY_LOW);
-    pool1.submit(priorityTask, (void*)&g_results[3], &handles[3], PRIORITY_NORMAL);
-    pool1.submit(priorityTask, (void*)&g_results[4], &handles[4], PRIORITY_NORMAL);
-    pool1.submit(priorityTask, (void*)&g_results[5], &handles[5], PRIORITY_NORMAL);
-    pool1.submit(priorityTask, (void*)&g_results[6], &handles[6], PRIORITY_HIGH);
-    pool1.submit(priorityTask, (void*)&g_results[7], &handles[7], PRIORITY_HIGH);
-    pool1.submit(priorityTask, (void*)&g_results[8], &handles[8], PRIORITY_HIGH);
+    pool1.submit(priorityTask, (void*)&g_results[1], &handles[1], THREADPOOL_PRIORITY_LOW);
+    pool1.submit(priorityTask, (void*)&g_results[2], &handles[2], THREADPOOL_PRIORITY_LOW);
+    pool1.submit(priorityTask, (void*)&g_results[3], &handles[3], THREADPOOL_PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[4], &handles[4], THREADPOOL_PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[5], &handles[5], THREADPOOL_PRIORITY_NORMAL);
+    pool1.submit(priorityTask, (void*)&g_results[6], &handles[6], THREADPOOL_PRIORITY_HIGH);
+    pool1.submit(priorityTask, (void*)&g_results[7], &handles[7], THREADPOOL_PRIORITY_HIGH);
+    pool1.submit(priorityTask, (void*)&g_results[8], &handles[8], THREADPOOL_PRIORITY_HIGH);
 
     pool1.drain();
 
     char* names[3];
-    names[PRIORITY_LOW]    = "LOW   ";
-    names[PRIORITY_NORMAL] = "NORMAL";
-    names[PRIORITY_HIGH]   = "HIGH  ";
+    names[THREADPOOL_PRIORITY_LOW]    = "LOW   ";
+    names[THREADPOOL_PRIORITY_NORMAL] = "NORMAL";
+    names[THREADPOOL_PRIORITY_HIGH]   = "HIGH  ";
 
     int i = 0;
     while (i < 9) {
@@ -183,9 +183,9 @@ void section3() {
     while (i < 9) {
         int prio  = g_results[i].priority;
         int order = g_results[i].order;
-        if (prio == PRIORITY_HIGH) {
+        if (prio == THREADPOOL_PRIORITY_HIGH) {
             if (order > maxHigh)   { maxHigh   = order; }
-        } else if (prio == PRIORITY_NORMAL) {
+        } else if (prio == THREADPOOL_PRIORITY_NORMAL) {
             if (order < minNormal) { minNormal = order; }
             if (order > maxNormal) { maxNormal = order; }
         } else {
