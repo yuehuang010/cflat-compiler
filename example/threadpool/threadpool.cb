@@ -4,6 +4,7 @@ import "stop_token.cb";
 import "atomic.cb";
 import "mutex.cb";
 import "queue.cb";
+import "time.cb";
 
 // Priority values for submit() / submitDetached().
 // Prefer the named constants over raw integers in call sites.
@@ -16,25 +17,45 @@ int THREADPOOL_PRIORITY_LOW    = 0;
 //
 // After submitting, call handle.wait() to block until the task completes, then
 // read results inside done.acquire() to guarantee acquire-ordering on them.
+// Call handle.cancel() to signal the task to abort early (cooperative).
 //
 //   TaskHandle h;
 //   pool.submit(fn, ctx, &h);
-//   h.wait();
+//   h.cancel();               // signal abort
+//   h.wait();                 // wait for task to notice and return
 //   h.done.acquire((i32 v) => {
 //       if (!h.failed) { /* use h.exitCode */ }
 //   });
 //
 struct TaskHandle {
-    atomic__i32 done = default;
+    atomic__i32 done      = default;
+    stop_source _cancelSrc = default;
     lock(done) {
         int  exitCode = 0;
         bool failed   = false;
     }
 
+    // Signal the task to stop early.  The task must check tok.stop_requested().
+    void cancel() { _cancelSrc.request_stop(); }
+
     // Block until the task completes.  Cheap spin — yields after each check.
     void wait() {
         while (done.load() == 0) { SwitchToThread(); }
     }
+
+    // Block until the task completes or the timeout elapses.
+    // Returns true if the task finished within the deadline, false on timeout.
+    bool wait_for(int milliseconds) {
+        Timer deadline;
+        deadline.start((i64)milliseconds);
+        while (done.load() == 0) {
+            if (deadline.isExpired()) { return false; }
+            SwitchToThread();
+        }
+        return true;
+    }
+
+    ~TaskHandle() { _cancelSrc.dispose(); }
 };
 
 // ── TaskResult<T> ─────────────────────────────────────────────────────────────
@@ -104,11 +125,14 @@ struct TaskResult<T> {
 
 // ── Task ──────────────────────────────────────────────────────────────────────
 // Internal — constructed by submit() and enqueued for a worker.
+// _token is a copy of the handle's cancel token (or a null/never-cancelled
+// token for fire-and-forget tasks).
 //
 struct Task {
-    function<int(void*)> fn     = default;
-    void*                ctx    = nullptr;
-    TaskHandle*          handle = nullptr;  // nullptr for fire-and-forget tasks
+    function<int(void*, stop_token)> fn     = default;
+    void*                            ctx    = nullptr;
+    TaskHandle*                      handle = nullptr;  // nullptr for fire-and-forget tasks
+    stop_token                       _token = default;  // passed to fn; never-cancelled if no handle
 };
 
 // ── WorkerCtx ─────────────────────────────────────────────────────────────────
@@ -180,13 +204,17 @@ class ThreadPool {
 
     // Submit a task with an explicit priority.
     // Returns false if the pool is not running or is shutting down.
-    // handle may be nullptr for fire-and-forget tasks.
-    bool submit(function<int(void*)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
+    // handle may be nullptr for fire-and-forget tasks; cancellable tasks must pass a handle.
+    bool submit(function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
         if (_workers == nullptr || _stop.stop_requested()) { return false; }
         Task t;
         t.fn     = fn;
         t.ctx    = ctx;
         t.handle = handle;
+        if (handle != nullptr) {
+            handle->_cancelSrc.init();
+            t._token = handle->_cancelSrc.get_token();
+        }
         _inflight.increment();
         _lock.acquire();
         if      (priority == THREADPOOL_PRIORITY_HIGH) { _qHigh.enqueue(t); }
@@ -197,8 +225,8 @@ class ThreadPool {
         return true;
     }
 
-    // Convenience: submit a fire-and-forget task (no handle).
-    bool submitDetached(function<int(void*)> fn, void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+    // Convenience: submit a fire-and-forget task (no handle, no cancellation).
+    bool submitDetached(function<int(void*, stop_token)> fn, void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
         return submit(fn, ctx, nullptr, priority);
     }
 
@@ -269,7 +297,7 @@ int __threadpool_worker(void* raw) {
         wctx->mtx->release();
 
         if (hasTask) {
-            int code = task.fn(task.ctx);
+            int code = task.fn(task.ctx, task._token);
             if (task.handle != nullptr) {
                 task.handle->done.release(1, () => {
                     task.handle->exitCode = code;

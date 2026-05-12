@@ -2,6 +2,7 @@ import "threadpool.cb";
 import "atomic.cb";
 import "string.cb";
 import "cruntime.cb";
+import "time.cb";
 
 // ── Shared state for section 3 (priority ordering proof) ─────────────────────
 
@@ -17,21 +18,21 @@ PriorityResult g_results[9];
 
 // ── Task functions ────────────────────────────────────────────────────────────
 
-int squareTask(void* ctx) {
+int squareTask(void* ctx, stop_token tok) {
     int* p = (int*)ctx;
     *p = (*p) * (*p);
     return 0;
 }
 
-int failTask(void* ctx) {
+int failTask(void* ctx, stop_token tok) {
     return 1;
 }
 
-int succeedTask(void* ctx) {
+int succeedTask(void* ctx, stop_token tok) {
     return 0;
 }
 
-int priorityTask(void* ctx) {
+int priorityTask(void* ctx, stop_token tok) {
     PriorityResult* r = (PriorityResult*)ctx;
     // Burn CPU so pending tasks pile up while this one runs.
     int i = 0;
@@ -209,14 +210,14 @@ struct IntTaskCtx {
     TaskResult<int>* out   = nullptr;
 };
 
-int squareResultTask(void* raw) {
+int squareResultTask(void* raw, stop_token tok) {
     IntTaskCtx* ctx = (IntTaskCtx*)raw;
     int x = ctx->input;
     ctx->out->set(x * x);
     return 0;
 }
 
-int failResultTask(void* raw) {
+int failResultTask(void* raw, stop_token tok) {
     TaskResult<int>* out = (TaskResult<int>*)raw;
     out->fail();
     return 1;
@@ -320,6 +321,79 @@ void section4(ThreadPool* pool) {
     printf("  result: %s\n\n", rejected ? "PASS" : "FAIL");
 }
 
+// ── Section 6: per-task cancellation ─────────────────────────────────────────
+//
+// The task loops until tok.stop_requested(); the submitter calls handle.cancel()
+// after a short spin, then waits for the task to exit.
+//
+
+struct CancelCtx {
+    int  iterations = 0;
+    bool sawCancel  = false;
+};
+
+int cancellableTask(void* raw, stop_token tok) {
+    CancelCtx* ctx = (CancelCtx*)raw;
+    while (!tok.stop_requested()) {
+        ctx->iterations = ctx->iterations + 1;
+        SwitchToThread();
+    }
+    ctx->sawCancel = true;
+    return 0;
+}
+
+void section6(ThreadPool* pool) {
+    printf("=== Section 6: per-task cancellation ===\n");
+
+    CancelCtx ctx;
+    TaskHandle h;
+    pool->submit(cancellableTask, &ctx, &h);
+
+    // Spin briefly so the task gets a chance to start and accumulate iterations.
+    int spin = 0;
+    while (spin < 2000000) { spin++; }
+
+    h.cancel();
+    h.wait();
+
+    bool ok = ctx.sawCancel && ctx.iterations > 0;
+    printf("  task ran %d iterations, sawCancel=%s  %s\n",
+        ctx.iterations, ctx.sawCancel ? "YES" : "NO", ok ? "PASS" : "FAIL");
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
+// ── Section 7: wait_for (timed wait) ─────────────────────────────────────────
+//
+// Submit a CPU-bound task (~200 ms), then call wait_for(20) — should time out.
+// A second wait_for(5000) should then see the task already done (true).
+//
+
+int slowTask(void* raw, stop_token tok) {
+    // Burn ~200 ms worth of CPU so the short wait reliably times out.
+    int i = 0;
+    int x = 1;
+    while (i < 100000000) { x = x + i; i++; }
+    return 0;
+}
+
+void section7(ThreadPool* pool) {
+    printf("=== Section 7: wait_for (timed wait) ===\n");
+
+    TaskHandle h;
+    pool->submit(slowTask, nullptr, &h);
+
+    // Short timeout — task should still be running.
+    bool timedOut = !h.wait_for(20);
+
+    // Long timeout — enough for the task to finish from wherever it is now.
+    bool completed = h.wait_for(5000);
+
+    bool ok = timedOut && completed;
+    printf("  wait_for(20ms) timed out:     %s\n", timedOut   ? "YES" : "NO");
+    printf("  wait_for(5000ms) completed:   %s\n", completed  ? "YES" : "NO");
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 extern int main() {
@@ -332,6 +406,8 @@ extern int main() {
     section2(&pool);
     section3();       // uses its own 1-worker pool
     section5();       // uses its own pool; demonstrates TaskResult<T>
+    section6(&pool);  // per-task cancellation via stop_token
+    section7(&pool);  // wait_for: timed wait on TaskHandle
     section4(&pool);  // reuses then shuts down the shared pool
 
     printf("All sections complete.\n");
