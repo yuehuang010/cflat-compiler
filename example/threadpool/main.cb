@@ -443,6 +443,56 @@ void section8(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
+// ── Section 9: drain() called from within a task ─────────────────────────────
+//
+// A task running on the pool submits a child task and then calls pool->drain().
+// Without work-participation this would deadlock (the task is itself in-flight
+// so inflight never reaches zero while it blocks).  With work-participation the
+// draining worker executes the child task inline and then exits the drain loop
+// once inflight equals the number of workers currently draining.
+//
+// A 1-worker pool guarantees the outer task must participate — there is no other
+// worker to run the child.
+//
+
+struct DrainFromTaskCtx {
+    ThreadPool* pool  = nullptr;
+    int         value = 0;
+};
+
+int drainInnerTask(void* raw, stop_token tok) {
+    int* p = (int*)raw;
+    *p = 42;
+    return 0;
+}
+
+int drainOuterTask(void* raw, stop_token tok) {
+    DrainFromTaskCtx* ctx = (DrainFromTaskCtx*)raw;
+    ctx->pool->submit(drainInnerTask, &ctx->value, nullptr);
+    ctx->pool->drain();   // would deadlock without work-participation
+    return 0;
+}
+
+void section9() {
+    printf("=== Section 9: drain() from within a task (work-participation) ===\n");
+
+    ThreadPool pool1;
+    pool1.init(1);
+
+    DrainFromTaskCtx ctx;
+    ctx.pool = &pool1;
+
+    TaskHandle h;
+    pool1.submit(drainOuterTask, &ctx, &h);
+    h.wait();
+
+    bool ok = ctx.value == 42;
+    printf("  inner task value after worker-drain: %d  %s\n", ctx.value, ok ? "OK" : "FAIL");
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+
+    pool1.shutdown();
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 extern int main() {
@@ -458,6 +508,7 @@ extern int main() {
     section6(&pool);  // per-task cancellation via stop_token
     section7(&pool);  // wait_for: timed wait on TaskHandle
     section8(&pool);  // task continuations via then()
+    section9();       // drain() from within a task — work-participation
     section4(&pool);  // reuses then shuts down the shared pool
 
     printf("All sections complete.\n");

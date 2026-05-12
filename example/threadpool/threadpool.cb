@@ -6,6 +6,8 @@ import "mutex.cb";
 import "queue.cb";
 import "time.cb";
 
+extern u32 GetCurrentThreadId();
+
 // Priority values for submit() / submitDetached().
 // Prefer the named constants over raw integers in call sites.
 int THREADPOOL_PRIORITY_HIGH   = 2;
@@ -148,14 +150,17 @@ struct Task {
 // the owning ThreadPool; the pool MUST outlive every worker thread.
 //
 struct WorkerCtx {
-    mutex*          mtx      = nullptr;
-    void*           drainCv  = nullptr;  // &ThreadPool._drainCv (CONDITION_VARIABLE)
-    semaphore*      ready    = nullptr;
-    queue<Task>*    qHigh    = nullptr;
-    queue<Task>*    qNormal  = nullptr;
-    queue<Task>*    qLow     = nullptr;
-    stop_source*    stop     = nullptr;
-    atomic_counter* inflight = nullptr;
+    mutex*          mtx             = nullptr;
+    void*           drainCv         = nullptr;  // &ThreadPool._drainCv (CONDITION_VARIABLE)
+    semaphore*      ready           = nullptr;
+    queue<Task>*    qHigh           = nullptr;
+    queue<Task>*    qNormal         = nullptr;
+    queue<Task>*    qLow            = nullptr;
+    stop_source*    stop            = nullptr;
+    atomic_counter* inflight        = nullptr;
+    u32*            workerIds       = nullptr;  // per-worker thread-ID slots
+    atomic_counter* idReg           = nullptr;  // next free slot index for ID registration
+    atomic_counter* drainingWorkers = nullptr;  // workers currently inside drain()
 };
 
 // ── ThreadPool ────────────────────────────────────────────────────────────────
@@ -175,17 +180,20 @@ struct WorkerCtx {
 // raw pointers into the pool's fields.
 //
 class ThreadPool {
-    mutex          _lock     = default;
-    void*          _drainCv  = nullptr;  // Win32 CONDITION_VARIABLE (pointer-sized)
-    semaphore      _ready    = default;
-    queue<Task>    _qHigh    = default;
-    queue<Task>    _qNormal  = default;
-    queue<Task>    _qLow     = default;
-    stop_source    _stop     = default;
-    atomic_counter _inflight = default;
-    Thread*        _workers  = nullptr;
-    int            _count    = 0;
-    WorkerCtx      _ctx      = default;
+    mutex          _lock             = default;
+    void*          _drainCv          = nullptr;  // Win32 CONDITION_VARIABLE (pointer-sized)
+    semaphore      _ready            = default;
+    queue<Task>    _qHigh            = default;
+    queue<Task>    _qNormal          = default;
+    queue<Task>    _qLow             = default;
+    stop_source    _stop             = default;
+    atomic_counter _inflight         = default;
+    atomic_counter _idReg            = default;
+    atomic_counter _drainingWorkers  = default;
+    Thread*        _workers          = nullptr;
+    u32*           _workerIds        = nullptr;
+    int            _count            = 0;
+    WorkerCtx      _ctx              = default;
 
     // Start workerCount worker threads.  No-op if already initialised.
     void init(int workerCount) {
@@ -193,14 +201,20 @@ class ThreadPool {
         _stop.init();
         _ready.init(0, 1000000);
         InitializeConditionVariable(&_drainCv);
-        _ctx.mtx      = &_lock;
-        _ctx.drainCv  = &_drainCv;
-        _ctx.ready    = &_ready;
-        _ctx.qHigh    = &_qHigh;
-        _ctx.qNormal  = &_qNormal;
-        _ctx.qLow     = &_qLow;
-        _ctx.stop     = &_stop;
-        _ctx.inflight = &_inflight;
+        _workerIds = new u32[workerCount];
+        int j = 0;
+        while (j < workerCount) { _workerIds[j] = (u32)0; j++; }
+        _ctx.mtx             = &_lock;
+        _ctx.drainCv         = &_drainCv;
+        _ctx.ready           = &_ready;
+        _ctx.qHigh           = &_qHigh;
+        _ctx.qNormal         = &_qNormal;
+        _ctx.qLow            = &_qLow;
+        _ctx.stop            = &_stop;
+        _ctx.inflight        = &_inflight;
+        _ctx.workerIds       = _workerIds;
+        _ctx.idReg           = &_idReg;
+        _ctx.drainingWorkers = &_drainingWorkers;
         _count   = workerCount;
         _workers = new Thread[workerCount];
         int i = 0;
@@ -272,12 +286,52 @@ class ThreadPool {
     // Number of worker threads.
     int workerCount() { return _count; }
 
+    // True if the calling thread is one of this pool's workers.
+    bool _isWorkerThread() {
+        u32 tid = GetCurrentThreadId();
+        int i = 0;
+        while (i < _count) {
+            if (_workerIds[i] == tid) { return true; }
+            i++;
+        }
+        return false;
+    }
+
     // Block until every submitted task has finished executing.
-    // Uses a condition variable — does not spin or burn CPU.
+    //
+    // If called from a worker thread (i.e. from inside a task), the caller
+    // participates in executing queued tasks rather than blocking on the CV —
+    // this prevents deadlock.  The drain completes once inflight equals the
+    // number of workers currently participating (they are themselves in-flight)
+    // and all queues are empty.
     void drain() {
-        _lock.acquire();
-        while (_inflight.read() > (i64)0) { _lock.sleep_cv(&_drainCv); }
-        _lock.release();
+        if (_isWorkerThread()) {
+            _drainingWorkers.increment();
+            while (true) {
+                i64 inf      = _inflight.read();
+                i64 draining = _drainingWorkers.read();
+                _lock.acquire();
+                bool empty = _qHigh.isEmpty() && _qNormal.isEmpty() && _qLow.isEmpty();
+                _lock.release();
+                if (inf <= draining && empty) { break; }
+
+                Task task;
+                bool hasTask = false;
+                _lock.acquire();
+                if      (!_qHigh.isEmpty())   { task = _qHigh.dequeue();   hasTask = true; }
+                else if (!_qNormal.isEmpty()) { task = _qNormal.dequeue(); hasTask = true; }
+                else if (!_qLow.isEmpty())    { task = _qLow.dequeue();    hasTask = true; }
+                _lock.release();
+
+                if (hasTask) { __threadpool_execute_task(&_ctx, task); }
+                else         { SwitchToThread(); }
+            }
+            _drainingWorkers.decrement();
+        } else {
+            _lock.acquire();
+            while (_inflight.read() > (i64)0) { _lock.sleep_cv(&_drainCv); }
+            _lock.release();
+        }
     }
 
     // Drain all in-flight tasks, stop all workers, and join them.
@@ -291,8 +345,10 @@ class ThreadPool {
             i++;
         }
         delete[_] _workers;
-        _workers = nullptr;
-        _count   = 0;
+        delete[_] _workerIds;
+        _workers   = nullptr;
+        _workerIds = nullptr;
+        _count     = 0;
         _ready.destroy();
         _stop.dispose();
     }
@@ -302,11 +358,52 @@ class ThreadPool {
     }
 };
 
+// Execute a task and handle its completion: signal the handle, enqueue any
+// continuation, decrement inflight, and wake drain() waiters if inflight hits
+// zero.  Called by both the normal worker loop and the drain work-participation
+// path so the logic lives in exactly one place.
+void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
+    int code = task.fn(task.ctx, task._token);
+    if (task.handle != nullptr) {
+        task.handle->done.release(1, () => {
+            task.handle->exitCode = code;
+            task.handle->failed   = code != 0;
+        });
+    }
+    // Enqueue any continuation and decrement inflight under one lock acquisition
+    // so drain() never sees a spurious zero between the two.
+    bool fired = false;
+    wctx->mtx->acquire();
+    if (task.handle != nullptr && task.handle->_hasCont) {
+        Task cont;
+        cont.fn     = task.handle->_contFn;
+        cont.ctx    = task.handle->_contCtx;
+        cont.handle = task.handle->_contHandle;
+        if (cont.handle != nullptr) {
+            cont.handle->_cancelSrc.init();
+            cont._token = cont.handle->_cancelSrc.get_token();
+        }
+        int contPrio = task.handle->_contPriority;
+        wctx->inflight->increment();
+        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->enqueue(cont); }
+        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->enqueue(cont); }
+        else                                            { wctx->qNormal->enqueue(cont); }
+        fired = true;
+    }
+    i64 remaining = wctx->inflight->decrement();
+    if (remaining == (i64)0) { WakeAllConditionVariable(wctx->drainCv); }
+    wctx->mtx->release();
+    if (fired) { wctx->ready->release(); }
+}
+
 // Worker body — runs on each thread.
-// Named with double-underscore prefix to mark it as internal/private.
 int __threadpool_worker(void* raw) {
-    WorkerCtx* wctx  = (WorkerCtx*)raw;
-    stop_token token  = wctx->stop->get_token();
+    WorkerCtx* wctx = (WorkerCtx*)raw;
+    stop_token token = wctx->stop->get_token();
+
+    // Register this thread's ID so drain() can detect worker-calls-drain.
+    int slot = (int)wctx->idReg->increment() - 1;
+    wctx->workerIds[slot] = GetCurrentThreadId();
 
     while (!token.stop_requested()) {
         wctx->ready->acquire();
@@ -315,51 +412,12 @@ int __threadpool_worker(void* raw) {
         Task task;
         bool hasTask = false;
         wctx->mtx->acquire();
-        if (!wctx->qHigh->isEmpty()) {
-            task    = wctx->qHigh->dequeue();
-            hasTask = true;
-        } else if (!wctx->qNormal->isEmpty()) {
-            task    = wctx->qNormal->dequeue();
-            hasTask = true;
-        } else if (!wctx->qLow->isEmpty()) {
-            task    = wctx->qLow->dequeue();
-            hasTask = true;
-        }
+        if      (!wctx->qHigh->isEmpty())   { task = wctx->qHigh->dequeue();   hasTask = true; }
+        else if (!wctx->qNormal->isEmpty()) { task = wctx->qNormal->dequeue(); hasTask = true; }
+        else if (!wctx->qLow->isEmpty())    { task = wctx->qLow->dequeue();    hasTask = true; }
         wctx->mtx->release();
 
-        if (hasTask) {
-            int code = task.fn(task.ctx, task._token);
-            if (task.handle != nullptr) {
-                task.handle->done.release(1, () => {
-                    task.handle->exitCode = code;
-                    task.handle->failed   = code != 0;
-                });
-            }
-            // Enqueue any continuation and decrement inflight under one lock
-            // acquisition so drain() never sees a spurious zero between the two.
-            bool fired = false;
-            wctx->mtx->acquire();
-            if (task.handle != nullptr && task.handle->_hasCont) {
-                Task cont;
-                cont.fn     = task.handle->_contFn;
-                cont.ctx    = task.handle->_contCtx;
-                cont.handle = task.handle->_contHandle;
-                if (cont.handle != nullptr) {
-                    cont.handle->_cancelSrc.init();
-                    cont._token = cont.handle->_cancelSrc.get_token();
-                }
-                int contPrio = task.handle->_contPriority;
-                wctx->inflight->increment();
-                if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->enqueue(cont); }
-                else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->enqueue(cont); }
-                else                                            { wctx->qNormal->enqueue(cont); }
-                fired = true;
-            }
-            i64 remaining = wctx->inflight->decrement();
-            if (remaining == (i64)0) { WakeAllConditionVariable(wctx->drainCv); }
-            wctx->mtx->release();
-            if (fired) { wctx->ready->release(); }
-        }
+        if (hasTask) { __threadpool_execute_task(wctx, task); }
     }
     return 0;
 }
