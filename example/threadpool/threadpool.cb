@@ -145,6 +145,16 @@ struct Task {
     stop_token                       _token = default;  // passed to fn; never-cancelled if no handle
 };
 
+// ── WorkerStartCtx ────────────────────────────────────────────────────────────
+// Heap-allocated (malloc) per worker thread by init() and resize().  Freed by
+// the worker itself at startup before entering the work loop so the caller does
+// not need to track per-worker allocations.
+//
+struct WorkerStartCtx {
+    WorkerCtx* wctx = nullptr;
+    int        slot = 0;
+};
+
 // ── WorkerCtx ─────────────────────────────────────────────────────────────────
 // Passed to each worker thread at startup.  All fields are pointers into
 // the owning ThreadPool; the pool MUST outlive every worker thread.
@@ -159,7 +169,7 @@ struct WorkerCtx {
     stop_source*    stop            = nullptr;
     atomic_counter* inflight        = nullptr;
     u32*            workerIds       = nullptr;  // per-worker thread-ID slots
-    atomic_counter* idReg           = nullptr;  // next free slot index for ID registration
+    stop_source*    workerStops     = nullptr;  // per-worker stop sources (for resize)
     atomic_counter* drainingWorkers = nullptr;  // workers currently inside drain()
 };
 
@@ -188,11 +198,12 @@ class ThreadPool {
     queue<Task>    _qLow             = default;
     stop_source    _stop             = default;
     atomic_counter _inflight         = default;
-    atomic_counter _idReg            = default;
     atomic_counter _drainingWorkers  = default;
     Thread*        _workers          = nullptr;
     u32*           _workerIds        = nullptr;
+    stop_source*   _workerStops      = nullptr;
     int            _count            = 0;
+    int            _capacity         = 0;
     WorkerCtx      _ctx              = default;
 
     // Start workerCount worker threads.  No-op if already initialised.
@@ -201,9 +212,10 @@ class ThreadPool {
         _stop.init();
         _ready.init(0, 1000000);
         InitializeConditionVariable(&_drainCv);
-        _workerIds = new u32[workerCount];
+        _workerIds   = new u32[workerCount];
+        _workerStops = new stop_source[workerCount];
         int j = 0;
-        while (j < workerCount) { _workerIds[j] = (u32)0; j++; }
+        while (j < workerCount) { _workerIds[j] = (u32)0; _workerStops[j].init(); j++; }
         _ctx.mtx             = &_lock;
         _ctx.drainCv         = &_drainCv;
         _ctx.ready           = &_ready;
@@ -213,13 +225,17 @@ class ThreadPool {
         _ctx.stop            = &_stop;
         _ctx.inflight        = &_inflight;
         _ctx.workerIds       = _workerIds;
-        _ctx.idReg           = &_idReg;
+        _ctx.workerStops     = _workerStops;
         _ctx.drainingWorkers = &_drainingWorkers;
-        _count   = workerCount;
-        _workers = new Thread[workerCount];
+        _count    = workerCount;
+        _capacity = workerCount;
+        _workers  = new Thread[workerCount];
         int i = 0;
         while (i < workerCount) {
-            _workers[i].start(__threadpool_worker, &_ctx);
+            WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
+            sc->wctx = &_ctx;
+            sc->slot   = i;
+            _workers[i].start(__threadpool_worker, sc);
             i++;
         }
     }
@@ -286,6 +302,78 @@ class ThreadPool {
     // Number of worker threads.
     int workerCount() { return _count; }
 
+    // Change the number of worker threads at runtime.
+    //
+    // Grow (newCount > current): extends the arrays if needed and starts new
+    // workers immediately; tasks already queued are picked up by any worker.
+    //
+    // Shrink (newCount < current): signals the excess workers to stop, then
+    // blocks until each one exits and joins it.  Workers finish their current
+    // task before checking the stop signal, so in-flight work is not lost.
+    //
+    // No-op if the pool is not running, is shutting down, or newCount equals
+    // the current count.  Must not be called concurrently with drain().
+    //
+    void resize(int newCount) {
+        if (_workers == nullptr || _stop.stop_requested()) { return; }
+        if (newCount <= 0 || newCount == _count) { return; }
+        int oldCount = _count;
+        if (newCount > oldCount) {
+            // ── Grow ─────────────────────────────────────────────────────────
+            if (newCount > _capacity) {
+                // Reallocate all three per-worker arrays to newCount.
+                // Thread and stop_source have no destructors, so bitwise copy
+                // is safe: Win32 handles and heap _state pointers remain valid.
+                Thread*      nw = new Thread[newCount];
+                u32*         ni = new u32[newCount];
+                stop_source* ns = new stop_source[newCount];
+                int i = 0;
+                while (i < oldCount) { nw[i] = _workers[i]; ni[i] = _workerIds[i]; ns[i] = _workerStops[i]; i++; }
+                while (i < newCount) { ni[i] = (u32)0; i++; }
+                delete[_] _workers;
+                delete[_] _workerIds;
+                delete[_] _workerStops;   // no destructor; _state ptrs remain valid in ns
+                _workers         = nw;
+                _workerIds       = ni;
+                _workerStops     = ns;
+                _ctx.workerIds   = ni;
+                _ctx.workerStops = ns;
+                _capacity = newCount;
+            }
+            _count = newCount;
+            int j = oldCount;
+            while (j < newCount) {
+                _workerStops[j].init();
+                WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
+                sc->wctx = &_ctx;
+                sc->slot   = j;
+                _workers[j].start(__threadpool_worker, sc);
+                j++;
+            }
+        } else {
+            // ── Shrink ───────────────────────────────────────────────────────
+            // Signal per-worker stops for slots being retired.
+            int k = newCount;
+            while (k < oldCount) { _workerStops[k].request_stop(); k++; }
+            // Pulse the semaphore until every dying worker has exited.  A
+            // surviving worker that steals a token finds no task and re-blocks,
+            // so we keep pulsing; each dying worker needs exactly one wakeup to
+            // see its stop and zero its ID slot.
+            k = newCount;
+            while (k < oldCount) {
+                if (_workerIds[k] == (u32)0) {
+                    _workers[k].join();
+                    _workerStops[k].dispose();
+                    k++;
+                } else {
+                    _ready.release();
+                    SwitchToThread();
+                }
+            }
+            _count = newCount;
+        }
+    }
+
     // True if the calling thread is one of this pool's workers.
     bool _isWorkerThread() {
         u32 tid = GetCurrentThreadId();
@@ -344,11 +432,16 @@ class ThreadPool {
             _workers[i].join();
             i++;
         }
+        i = 0;
+        while (i < _count) { _workerStops[i].dispose(); i++; }
         delete[_] _workers;
         delete[_] _workerIds;
-        _workers   = nullptr;
-        _workerIds = nullptr;
-        _count     = 0;
+        delete[_] _workerStops;
+        _workers      = nullptr;
+        _workerIds    = nullptr;
+        _workerStops  = nullptr;
+        _count        = 0;
+        _capacity     = 0;
         _ready.destroy();
         _stop.dispose();
     }
@@ -398,16 +491,20 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
 
 // Worker body — runs on each thread.
 int __threadpool_worker(void* raw) {
-    WorkerCtx* wctx = (WorkerCtx*)raw;
-    stop_token token = wctx->stop->get_token();
+    WorkerStartCtx* ws   = (WorkerStartCtx*)raw;
+    WorkerCtx*      wctx = ws->wctx;
+    int             slot = ws->slot;
+    free((void*)ws);   // startup context no longer needed
+
+    stop_token poolStop = wctx->stop->get_token();
+    stop_token myStop   = wctx->workerStops[slot].get_token();
 
     // Register this thread's ID so drain() can detect worker-calls-drain.
-    int slot = (int)wctx->idReg->increment() - 1;
     wctx->workerIds[slot] = GetCurrentThreadId();
 
-    while (!token.stop_requested()) {
+    while (!poolStop.stop_requested()) {
         wctx->ready->acquire();
-        if (token.stop_requested()) { break; }
+        if (poolStop.stop_requested() || myStop.stop_requested()) { break; }
 
         Task task;
         bool hasTask = false;
@@ -419,5 +516,6 @@ int __threadpool_worker(void* raw) {
 
         if (hasTask) { __threadpool_execute_task(wctx, task); }
     }
+    wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()
     return 0;
 }

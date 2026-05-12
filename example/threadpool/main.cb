@@ -493,6 +493,74 @@ void section9() {
     pool1.shutdown();
 }
 
+// ── Section 10: dynamic resize ───────────────────────────────────────────────
+//
+// Exercises grow, shrink, and grow-again (slot reuse) on a pool that runs real
+// tasks after each resize.  Verifies workerCount() and task correctness.
+//
+
+void section10() {
+    printf("=== Section 10: dynamic resize ===\n");
+
+    ThreadPool pool;
+    pool.init(2);
+    bool sizeOk0 = pool.workerCount() == 2;
+    printf("  init(2):    workers=%d  %s\n", pool.workerCount(), sizeOk0 ? "OK" : "FAIL");
+
+    // Run 4 tasks with 2 workers.
+    int[4] v1; v1[0] = 3; v1[1] = 4; v1[2] = 5; v1[3] = 6;
+    TaskHandle[4] h1;
+    int i = 0;
+    while (i < 4) { pool.submit(squareTask, &v1[i], &h1[i]); i++; }
+    pool.drain();
+    bool ok1 = (v1[0] == 9 && v1[1] == 16 && v1[2] == 25 && v1[3] == 36);
+    printf("  2-worker tasks: %s\n", ok1 ? "OK" : "FAIL");
+
+    // Grow to 4 workers.
+    pool.resize(4);
+    bool sizeOk1 = pool.workerCount() == 4;
+    printf("  resize(4):  workers=%d  %s\n", pool.workerCount(), sizeOk1 ? "OK" : "FAIL");
+
+    int[4] v2; v2[0] = 2; v2[1] = 3; v2[2] = 4; v2[3] = 5;
+    TaskHandle[4] h2;
+    i = 0;
+    while (i < 4) { pool.submit(squareTask, &v2[i], &h2[i]); i++; }
+    pool.drain();
+    bool ok2 = (v2[0] == 4 && v2[1] == 9 && v2[2] == 16 && v2[3] == 25);
+    printf("  4-worker tasks: %s\n", ok2 ? "OK" : "FAIL");
+
+    // Shrink to 1 worker.
+    pool.resize(1);
+    bool sizeOk2 = pool.workerCount() == 1;
+    printf("  resize(1):  workers=%d  %s\n", pool.workerCount(), sizeOk2 ? "OK" : "FAIL");
+
+    int[4] v3; v3[0] = 7; v3[1] = 8; v3[2] = 9; v3[3] = 10;
+    TaskHandle[4] h3;
+    i = 0;
+    while (i < 4) { pool.submit(squareTask, &v3[i], &h3[i]); i++; }
+    pool.drain();
+    bool ok3 = (v3[0] == 49 && v3[1] == 64 && v3[2] == 81 && v3[3] == 100);
+    printf("  1-worker tasks: %s\n", ok3 ? "OK" : "FAIL");
+
+    // Grow again to 3 workers — exercises slot reuse after shrink.
+    pool.resize(3);
+    bool sizeOk3 = pool.workerCount() == 3;
+    printf("  resize(3):  workers=%d  %s\n", pool.workerCount(), sizeOk3 ? "OK" : "FAIL");
+
+    int[4] v4; v4[0] = 1; v4[1] = 2; v4[2] = 3; v4[3] = 4;
+    TaskHandle[4] h4;
+    i = 0;
+    while (i < 4) { pool.submit(squareTask, &v4[i], &h4[i]); i++; }
+    pool.drain();
+    bool ok4 = (v4[0] == 1 && v4[1] == 4 && v4[2] == 9 && v4[3] == 16);
+    printf("  3-worker tasks (slot reuse): %s\n", ok4 ? "OK" : "FAIL");
+
+    bool allOk = sizeOk0 && ok1 && sizeOk1 && ok2 && sizeOk2 && ok3 && sizeOk3 && ok4;
+    printf("  result: %s\n\n", allOk ? "PASS" : "FAIL");
+
+    pool.shutdown();
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 extern int main() {
@@ -509,6 +577,7 @@ extern int main() {
     section7(&pool);  // wait_for: timed wait on TaskHandle
     section8(&pool);  // task continuations via then()
     section9();       // drain() from within a task — work-participation
+    section10();      // dynamic resize: grow, shrink, grow (slot reuse)
     section4(&pool);  // reuses then shuts down the shared pool
 
     printf("All sections complete.\n");
