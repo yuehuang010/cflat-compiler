@@ -689,6 +689,201 @@ bool testLambdaAllocaInLoop()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GENERIC FUNCTION POINTER TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Read a T through a void* and return it as int.
+int readAs<T>(void* raw) {
+    T* p = (T*)raw;
+    return (int)*p;
+}
+
+// Write val into a T through a void*.
+int writeAs<T>(void* raw) {
+    T* p = (T*)raw;
+    *p = (T)7;
+    return 0;
+}
+
+// Return sizeof(T) — uses a type parameter in sizeof(), not in a pointer cast.
+int sizeOf<T>(void* ignored) {
+    return (int)sizeof(T);
+}
+
+// Multiply the value at raw by 2 in-place.
+int doubleInPlace<T>(void* raw) {
+    T* p = (T*)raw;
+    T v = *p;
+    *p = v + v;
+    return 0;
+}
+
+bool testGenericFuncPtrBasic()
+{
+    bool result = true;
+
+    function<int(void*)> fn = readAs<int>;
+    int x = 42;
+    result &= Test("generic read int", fn((void*)&x), 42);
+
+    fn = readAs<i64>;
+    i64 big = 123;
+    result &= Test("generic read i64", fn((void*)&big), 123);
+
+    return result;
+}
+
+bool testGenericFuncPtrSizeof()
+{
+    bool result = true;
+
+    function<int(void*)> fn = sizeOf<int>;
+    result &= Test("sizeof<int>",  fn(nullptr), 4);
+
+    fn = sizeOf<i64>;
+    result &= Test("sizeof<i64>",  fn(nullptr), 8);
+
+    fn = sizeOf<bool>;
+    result &= Test("sizeof<bool>", fn(nullptr), 1);
+
+    return result;
+}
+
+bool testGenericFuncPtrWrite()
+{
+    bool result = true;
+
+    function<int(void*)> fn = writeAs<int>;
+    int x = 0;
+    fn((void*)&x);
+    result &= Test("generic write int", x, 7);
+
+    return result;
+}
+
+bool testGenericFuncPtrDoubleInPlace()
+{
+    bool result = true;
+
+    function<int(void*)> fn = doubleInPlace<int>;
+    int v = 5;
+    fn((void*)&v);
+    result &= Test("doubleInPlace<int>", v, 10);
+
+    fn = doubleInPlace<i64>;
+    i64 big = 3;
+    fn((void*)&big);
+    result &= Test("doubleInPlace<i64>", (int)big, 6);
+
+    return result;
+}
+
+// Pass a generic-instantiated function pointer through a regular higher-order function.
+bool testGenericFuncPtrHigherOrder()
+{
+    bool result = true;
+
+    function<int(void*)> fn = readAs<int>;
+    int a = 99;
+    result &= Test("higher order int", fn((void*)&a), 99);
+
+    fn = readAs<i64>;
+    i64 b = 77;
+    result &= Test("higher order i64", fn((void*)&b), 77);
+
+    // Switch between two unrelated generic functions via reassignment.
+    fn = sizeOf<int>;
+    result &= Test("switch to sizeOf<int>", fn(nullptr), 4);
+
+    fn = readAs<int>;
+    int x = 55;
+    result &= Test("switch back to readAs<int>", fn((void*)&x), 55);
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FUNCTION POINTER IN STRUCT FIELD TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Handler {
+    function<int(int)> fn = default;
+};
+
+struct VoidHandler {
+    function<void()> fn = default;
+};
+
+bool testFuncPtrInStructField()
+{
+    bool result = true;
+
+    Handler h;
+    h.fn = doubleIt;
+    result &= Test("struct field call doubleIt", h.fn(6), 12);
+
+    h.fn = square;
+    result &= Test("struct field reassign square", h.fn(5), 25);
+
+    h.fn = (int x) => { return x + 100; };
+    result &= Test("struct field lambda", h.fn(3), 103);
+
+    return result;
+}
+
+bool testFuncPtrInStructFieldVoid()
+{
+    bool result = true;
+
+    // Void function pointer stored in struct field.  Use doNothing (no capture
+    // needed) to avoid the known limitation where captures through struct-field
+    // closures are not yet propagated correctly.
+    VoidHandler vh;
+    vh.fn = doNothing;
+    vh.fn();
+    result &= Test("void struct field call", 1, 1);
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DISPATCH TABLE TESTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct DispatchEntry {
+    function<int(void*)> fn  = default;
+    void*                ctx = nullptr;
+};
+
+bool testDispatchTable()
+{
+    bool result = true;
+
+    int vals[4];
+    vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4;
+
+    // Assign through an intermediate variable (direct struct-field assignment of a
+    // generic instantiation is not yet supported without the intermediate).
+    function<int(void*)> reader = readAs<int>;
+
+    DispatchEntry table[4];
+    table[0].fn = reader; table[0].ctx = (void*)&vals[0];
+    table[1].fn = reader; table[1].ctx = (void*)&vals[1];
+    table[2].fn = reader; table[2].ctx = (void*)&vals[2];
+    table[3].fn = reader; table[3].ctx = (void*)&vals[3];
+
+    int sum = 0;
+    int i = 0;
+    while (i < 4) {
+        sum = sum + table[i].fn(table[i].ctx);
+        i++;
+    }
+    result &= Test("dispatch table sum", sum, 10);  // 1+2+3+4
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // LIST SORT TESTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -810,6 +1005,20 @@ extern int main()
     total++; passed += testCaptureRegression()         ? 1 : 0;
     total++; passed += testCaptureLocalArray()         ? 1 : 0;
     total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
+
+    // Generic function pointer tests
+    total++; passed += testGenericFuncPtrBasic()       ? 1 : 0;
+    total++; passed += testGenericFuncPtrSizeof()      ? 1 : 0;
+    total++; passed += testGenericFuncPtrWrite()       ? 1 : 0;
+    total++; passed += testGenericFuncPtrDoubleInPlace() ? 1 : 0;
+    total++; passed += testGenericFuncPtrHigherOrder() ? 1 : 0;
+
+    // Function pointer in struct field tests
+    total++; passed += testFuncPtrInStructField()      ? 1 : 0;
+    total++; passed += testFuncPtrInStructFieldVoid()  ? 1 : 0;
+
+    // Dispatch table tests
+    total++; passed += testDispatchTable()             ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;

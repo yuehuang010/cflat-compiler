@@ -597,7 +597,7 @@ public:
 
             auto tryPreDeclare = [&](const std::string& baseName, CFlatParser::GenericTypeParametersContext* genericParams)
             {
-        auto* compiler = Compiler(genericParams);
+                auto* compiler = Compiler(genericParams);
                 std::string mangledName = baseName;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
                     mangledName += "__" + MangleTypeArg(entry->getText());
@@ -3570,10 +3570,12 @@ public:
                             // Thread expected function-pointer type into lambda expression parsing.
                             if (typeAndValue.IsFunctionPointer)
                                 lambdaExpectedType = typeAndValue;
+                            std::string genericFuncCallerName;
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 right = LoadNamedVariable(rightNV);
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
+                                genericFuncCallerName = rightNV.CallerName;
                             }
                             lambdaExpectedType = {};
                             // Implicit char* → string coercion: string s = "hello" or string s = charPtr.
@@ -3618,6 +3620,15 @@ public:
                                     right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                     right = compiler->WrapBareValueAsFatStruct(fn);
+                            }
+                            // Fallback for generic function pointers (e.g. function<int(void*)> fp = wrap<int>):
+                            // the RHS parses to an empty namedVar with CallerName set to the mangled function name.
+                            if (!right && typeAndValue.IsFunctionPointer && !genericFuncCallerName.empty())
+                            {
+                                int expectedParams = (int)typeAndValue.FuncPtrParams.size();
+                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams);
+                                if (genericFn)
+                                    right = compiler->WrapBareValueAsFatStruct(genericFn);
                             }
 
                             // Pointer variable assigned a struct value: catch the mismatch here
@@ -3935,6 +3946,17 @@ public:
                     right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                     right = compiler->WrapBareValueAsFatStruct(fn);
+            }
+            // Fallback for generic function pointer reassignment (e.g. fn = wrap<int>):
+            // the RHS produces a null value with CallerName set to the mangled function name.
+            // This mirrors the same fallback in ParseDeclaration for the initial assignment.
+            if (!right && operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+                && !rightNV.CallerName.empty())
+            {
+                int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
+                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams);
+                if (genericFn)
+                    right = compiler->WrapBareValueAsFatStruct(genericFn);
             }
 
             // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
@@ -5251,6 +5273,17 @@ public:
                 else
                 {
                     typeValue.TypeName = typeSpec->getText();
+                    // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).
+                    auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
+                    if (substIt != activeTypeSubstitutions.end())
+                    {
+                        typeValue.TypeName = substIt->second;
+                        while (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
+                        {
+                            typeValue.TypeName.pop_back();
+                            typeValue.Pointer = true;
+                        }
+                    }
                 }
             }
         }
@@ -5319,6 +5352,20 @@ public:
                     {
                         typeValue.Pointer = true;
                         typeValue.TypeName.pop_back();
+                    }
+
+                    // Apply active type-parameter substitutions (e.g. sizeof(T) inside a generic function body).
+                    {
+                        auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
+                        if (substIt != activeTypeSubstitutions.end())
+                        {
+                            typeValue.TypeName = substIt->second;
+                            while (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
+                            {
+                                typeValue.TypeName.pop_back();
+                                typeValue.Pointer = true;
+                            }
+                        }
                     }
 
                     // sizeof(T) where T is a pack param returns the element count
@@ -6543,10 +6590,17 @@ public:
                                 typeArgs.push_back(arg);
                                 mangledName += "__" + MangleTypeArg(arg);
                             }
-                            // If this is a generic function template call (e.g. MaxScore<Player>(...)),
-                            // instantiate the template now with the explicit type arguments.
+                            // If this is a generic function template (e.g. wrap<int>),
+                            // instantiate it and record the mangled name as CallerName so
+                            // ParseDeclaration can resolve the correct function pointer.
                             if (genericFunctionTemplates.count(baseName))
+                            {
                                 InstantiateGenericFunction(baseName, typeArgs);
+                                primaryIdentifier = mangledName;
+                                namedVar = {};
+                                namedVar.CallerName = mangledName;
+                                break;
+                            }
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -6761,7 +6815,10 @@ public:
                             }
                             std::string mangled = InstantiateGenericFunction(primaryIdentifier, typeArgs);
                             if (!mangled.empty())
+                            {
                                 primaryIdentifier = mangled;
+                                namedVar.CallerName = mangled;  // expose mangled name for function<T> assignment
+                            }
                         }
                         break;
                     }
