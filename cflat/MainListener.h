@@ -174,7 +174,7 @@ private:
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
                         declType.TypeName = mangledName;
                         declType.Pointer = declSpec->pointer() != nullptr;
-                        declType.ArraySize = declSpec->assignmentExpression();
+                        declType.ArraySize = declSpec->arrayDimSpec() ? declSpec->arrayDimSpec()->assignmentExpression(0) : nullptr;
                         break;
                     }
                     // function pointer type: function<RetType(Params)> or bare 'function'
@@ -229,7 +229,13 @@ private:
                     if (declSpec->pointer()->Star().size() >= 2)
                         declType.ElemPointer = true;
                 }
-                declType.ArraySize = declSpec->assignmentExpression();
+                if (declSpec->arrayDimSpec())
+                {
+                    auto dims = declSpec->arrayDimSpec()->assignmentExpression();
+                    declType.ArraySize = dims.empty() ? nullptr : dims[0];
+                    for (size_t di = 1; di < dims.size(); di++)
+                        declType.ExtraArrayDims.push_back(dims[di]);
+                }
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
                     std::cerr << std::format("error: pointer '*' is not allowed on interface type '{}'\n", declType.TypeName);
@@ -1197,7 +1203,7 @@ private:
                         }
                     }
                     declType.Pointer = declSpec->pointer() != nullptr;
-                    declType.ArraySize = declSpec->assignmentExpression();
+                    declType.ArraySize = declSpec->arrayDimSpec() ? declSpec->arrayDimSpec()->assignmentExpression(0) : nullptr;
                     break;
                 }
                 // function pointer type: function<RetType(Params)> or bare 'function'
@@ -1319,7 +1325,13 @@ private:
                 if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
                     declType.ElemPointer = true;
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
-                declType.ArraySize = declSpec->assignmentExpression();
+                if (declSpec->arrayDimSpec())
+                {
+                    auto dims = declSpec->arrayDimSpec()->assignmentExpression();
+                    declType.ArraySize = dims.empty() ? nullptr : dims[0];
+                    for (size_t di = 1; di < dims.size(); di++)
+                        declType.ExtraArrayDims.push_back(dims[di]);
+                }
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
                     LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
@@ -3405,6 +3417,17 @@ public:
             arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
         }
 
+        // Evaluate inner dimensions for multi-dim arrays: T[N][M] → ConstInnerDimensions = {M}
+        typeAndValue.ConstInnerDimensions.clear();
+        for (auto* dimExpr : typeAndValue.ExtraArrayDims)
+        {
+            auto* dimVal = ParseAssignmentExpression(dimExpr);
+            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(dimVal))
+                typeAndValue.ConstInnerDimensions.push_back(ci->getZExtValue());
+            else
+                LogErrorContext(dimExpr, "array dimension must be a compile-time constant");
+        }
+
         for (auto initDecl : initDeclarVec)
         {
             /*
@@ -3456,11 +3479,16 @@ public:
                 typeAndValue.ConstArraySize = 0;  // reset per-declarator
                 if (direct->assignmentExpression() && typeAndValue.ArraySize == nullptr)
                 {
+                    // Pointer arrays (char* arr[N]) can't use type-first form — grammar
+                    // doesn't support 'char*[N]' — so only error on non-pointer types.
+                    if (!typeAndValue.Pointer)
+                        LogErrorContext(direct, std::format(
+                            "C-style array declaration '{}[{}]' is not allowed; use '[{}] {}'",
+                            name, direct->assignmentExpression()->getText(),
+                            direct->assignmentExpression()->getText(), name));
                     auto* sizeVal = ParseAssignmentExpression(direct->assignmentExpression());
                     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
                         typeAndValue.ConstArraySize = ci->getZExtValue();
-                    else
-                        LogErrorContext(direct, "array size must be a compile-time constant");
                 }
                 else if (arraySize != nullptr)
                 {
@@ -5002,10 +5030,22 @@ public:
                 return namedVar.Primary;
             if (namedVar.Storage != nullptr)
             {
+                // Pointer array decay: char*[3] used as char** → GEP to first element.
+                // Must check before the alloca load path below.
+                if (namedVar.BaseType && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
+                {
+                    auto* arrTy = llvm::cast<llvm::ArrayType>(namedVar.BaseType);
+                    auto* zero = compiler->builder->getInt64(0);
+                    return compiler->builder->CreateGEP(arrTy, namedVar.Storage, {zero, zero}, "arrptr");
+                }
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
                     llvm::isa<llvm::GlobalVariable>(namedVar.Storage) ||
                     llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
                     return compiler->CreateLoad(namedVar.Storage);
+                // Through-pointer dereference of a pointer type (e.g. *pp where pp is char**):
+                // Storage is a raw loaded address — load again to get the pointer value.
+                if (namedVar.BaseType && namedVar.BaseType->isPointerTy())
+                    return compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
                 return namedVar.Storage;
             }
             return nullptr;
@@ -5535,8 +5575,15 @@ public:
                 }
 
                 // Strip one pointer level from the CFlat type to get the pointee type.
-                namedVar.TypeAndValue.Pointer = false;
-                namedVar.TypeAndValue.IsInterfacePointer = false; // dereference removes the pointer-to-fat-ptr level
+                // For char** (ElemPointer=true): deref gives char* (keep Pointer, clear ElemPointer).
+                // For char* (ElemPointer=false): deref gives char (clear Pointer).
+                if (namedVar.TypeAndValue.ElemPointer)
+                    namedVar.TypeAndValue.ElemPointer = false;
+                else
+                {
+                    namedVar.TypeAndValue.Pointer = false;
+                    namedVar.TypeAndValue.IsInterfacePointer = false;
+                }
                 auto* pointeeType = compiler->GetType(namedVar.TypeAndValue);
                 llvm::Value* loadedPtr = compiler->CreateLoad(namedVar.Storage);
                 // The deref'd location: loadedPtr is the address; pointeeType is what it holds.

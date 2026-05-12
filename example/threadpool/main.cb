@@ -14,7 +14,7 @@ struct PriorityResult {
     int order    = 0;   // completion order (1-based, set by priorityTask)
 };
 
-PriorityResult g_results[9];
+PriorityResult[9] g_results;
 
 // ── Task functions ────────────────────────────────────────────────────────────
 
@@ -47,11 +47,11 @@ int priorityTask(void* ctx, stop_token tok) {
 void section1(ThreadPool* pool) {
     printf("=== Section 1: basic correctness ===\n");
 
-    int inputs[8];
+    int[8] inputs;
     inputs[0] = 1; inputs[1] = 2; inputs[2] = 3; inputs[3] = 4;
     inputs[4] = 5; inputs[5] = 6; inputs[6] = 7; inputs[7] = 8;
 
-    TaskHandle handles[8];
+    TaskHandle[8] handles;
 
     int i = 0;
     while (i < 8) {
@@ -141,7 +141,7 @@ void section3() {
     ThreadPool pool1;
     pool1.init(1);
 
-    TaskHandle handles[9];
+    TaskHandle[9] handles;
 
     // Submit task 0 (LOW) first — worker picks it up immediately.
     pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], THREADPOOL_PRIORITY_LOW);
@@ -162,7 +162,7 @@ void section3() {
 
     pool1.drain();
 
-    char* names[3];
+    char*[3] names;
     names[THREADPOOL_PRIORITY_LOW]    = "LOW   ";
     names[THREADPOOL_PRIORITY_NORMAL] = "NORMAL";
     names[THREADPOOL_PRIORITY_HIGH]   = "HIGH  ";
@@ -234,8 +234,8 @@ void section5() {
     bool ok = true;
 
     // Basic: submit four squaring tasks, collect typed int results via get().
-    IntTaskCtx      ctxs[4];
-    TaskResult<int> results[4];
+    IntTaskCtx[4]      ctxs;
+    TaskResult<int>[4] results;
     int i = 0;
     while (i < 4) {
         ctxs[i].input = (i + 1) * 10;
@@ -290,10 +290,10 @@ void section5() {
 void section4(ThreadPool* pool) {
     printf("=== Section 4: pool reuse and shutdown contract ===\n");
 
-    int inputs[4];
+    int[4] inputs;
     inputs[0] = 10; inputs[1] = 20; inputs[2] = 30; inputs[3] = 40;
 
-    TaskHandle handles[4];
+    TaskHandle[4] handles;
 
     int i = 0;
     while (i < 4) {
@@ -362,6 +362,30 @@ void section6(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
+// ── Context and task functions for section 8 ─────────────────────────────────
+
+struct ChainCtx {
+    int value = 0;
+};
+
+int chainA(void* raw, stop_token tok) {
+    ChainCtx* ctx = (ChainCtx*)raw;
+    ctx->value = 3;
+    return 0;
+}
+
+int chainB(void* raw, stop_token tok) {
+    ChainCtx* ctx = (ChainCtx*)raw;
+    ctx->value = ctx->value * ctx->value;   // 3^2 = 9
+    return 0;
+}
+
+int chainC(void* raw, stop_token tok) {
+    ChainCtx* ctx = (ChainCtx*)raw;
+    ctx->value = ctx->value * ctx->value;   // 9^2 = 81
+    return 0;
+}
+
 // ── Section 7: wait_for (timed wait) ─────────────────────────────────────────
 //
 // Submit a CPU-bound task (~200 ms), then call wait_for(20) — should time out.
@@ -394,6 +418,31 @@ void section7(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
+// ── Section 8: task continuations (chaining) ─────────────────────────────────
+//
+// Register A→B→C with then() before A even starts.  Each step runs automatically
+// after the previous one finishes, sharing a ChainCtx by pointer.
+//
+// Expected: value = 3 → 3^2=9 → 9^2=81.
+//
+
+void section8(ThreadPool* pool) {
+    printf("=== Section 8: task continuations (chaining) ===\n");
+
+    ChainCtx ctx;
+    TaskHandle h1; TaskHandle h2; TaskHandle h3;
+
+    pool->submit(chainA, &ctx, &h1);
+    pool->then(&h1, chainB, &ctx, &h2);
+    pool->then(&h2, chainC, &ctx, &h3);
+
+    h3.wait();
+
+    bool ok = ctx.value == 81;
+    printf("  chain: 3 -> 3^2=9 -> 9^2=81  got=%d  %s\n", ctx.value, ok ? "PASS" : "FAIL");
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 extern int main() {
@@ -408,6 +457,7 @@ extern int main() {
     section5();       // uses its own pool; demonstrates TaskResult<T>
     section6(&pool);  // per-task cancellation via stop_token
     section7(&pool);  // wait_for: timed wait on TaskHandle
+    section8(&pool);  // task continuations via then()
     section4(&pool);  // reuses then shuts down the shared pool
 
     printf("All sections complete.\n");

@@ -648,7 +648,7 @@ bool testCaptureLocalArray()
 {
     bool result = true;
 
-    Counter pts[3];
+    Counter[3] pts;
     pts[0].value = 10;
     pts[1].value = 20;
     pts[2].value = 30;
@@ -859,10 +859,10 @@ bool testDispatchTable()
 {
     bool result = true;
 
-    int vals[4];
+    int[4] vals;
     vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4;
 
-    DispatchEntry table[4];
+    DispatchEntry[4] table;
     table[0].fn = readAs<int>; table[0].ctx = (void*)&vals[0];
     table[1].fn = readAs<int>; table[1].ctx = (void*)&vals[1];
     table[2].fn = readAs<int>; table[2].ctx = (void*)&vals[2];

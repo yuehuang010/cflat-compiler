@@ -124,7 +124,8 @@ public:
         struct FuncPtrParam { std::string TypeName; bool Pointer = false; };
         std::vector<FuncPtrParam> FuncPtrParams;
 
-        uint64_t ConstArraySize = 0; // non-zero for C-style fixed arrays: char buf[N] in struct fields
+        uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
+        std::vector<uint64_t> ConstInnerDimensions;   // inner dimensions for multi-dim arrays (e.g. [M] in T[N][M])
 
         // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
@@ -267,8 +268,9 @@ public:
         // Used for delayed Initialization
         CFlatParser::InitializerContext* Initializer = nullptr;
 
-        // Used for array
+        // Used for array — first (outer) dimension; extra inner dimensions in ExtraArrayDims
         CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
+        std::vector<CFlatParser::AssignmentExpressionContext*> ExtraArrayDims;
 
         // Used for default parameter values
         CFlatParser::InitializerContext* DefaultValue = nullptr;
@@ -3919,7 +3921,13 @@ public:
         }
 
         if (typeAndValue.ConstArraySize > 0)
-            return llvm::ArrayType::get(type, typeAndValue.ConstArraySize);
+        {
+            // Build from innermost to outermost: T[N1][N2] → [N1 x [N2 x T]]
+            llvm::Type* inner = type;
+            for (int i = (int)typeAndValue.ConstInnerDimensions.size() - 1; i >= 0; i--)
+                inner = llvm::ArrayType::get(inner, typeAndValue.ConstInnerDimensions[i]);
+            return llvm::ArrayType::get(inner, typeAndValue.ConstArraySize);
+        }
 
         return type;
     }

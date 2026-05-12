@@ -164,7 +164,7 @@ struct Terminal {
 
         Sleep(150);
 
-        char resp[128];
+        char[128] resp;
         int  rlen = 0;
 
         i32 count = 0;
@@ -217,7 +217,7 @@ struct Terminal {
 
         Sleep(150);
 
-        char resp[128];
+        char[128] resp;
         int  rlen = 0;
 
         i32 count = 0;

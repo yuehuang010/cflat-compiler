@@ -214,6 +214,13 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
 - **Range-based for**: `foreach (T x in collection)` — calls `count()` / `get(int)` on the collection
 - **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` — struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `MallocAllocator` by default (override by setting `p._allocator` before `p.run()`), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
+- **Fixed-size arrays**: Use type-first syntax `T[N] name` — the size belongs to the type, not the name. C-style `T name[N]` is a compiler error for non-pointer types. Initialization forms:
+  - `T[N] name;` — declared, not initialized
+  - `T[N] name = default;` — zero-initialized
+  - `T[N] name {}` or `T[N] name = {}` — value-initializes all N elements by calling the default constructor (struct types only)
+  - `T[N] name {field=v, ...}` — seeded value-init; overrides the listed fields in each element
+  - Struct fields still use C-style `T name[N]` (grammar limitation at struct scope)
+  - Pointer arrays use `T*[N] name` (type-first); C-style `T* name[N]` is still accepted (exempt from the C-style error since `T*[N]` was not always available)
 
 ### Ownership / Lifetime (`move` keyword)
 

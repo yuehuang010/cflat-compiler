@@ -28,12 +28,20 @@ int THREADPOOL_PRIORITY_LOW    = 0;
 //   });
 //
 struct TaskHandle {
-    atomic__i32 done      = default;
+    atomic__i32 done       = default;
     stop_source _cancelSrc = default;
     lock(done) {
         int  exitCode = 0;
         bool failed   = false;
     }
+
+    // Continuation — registered by ThreadPool.then(), fired by the worker.
+    // All fields are protected by the pool's _lock; never access them directly.
+    function<int(void*, stop_token)> _contFn       = default;
+    void*                            _contCtx      = nullptr;
+    TaskHandle*                      _contHandle   = nullptr;
+    int                              _contPriority = 1;   // THREADPOOL_PRIORITY_NORMAL
+    bool                             _hasCont      = false;
 
     // Signal the task to stop early.  The task must check tok.stop_requested().
     void cancel() { _cancelSrc.request_stop(); }
@@ -213,6 +221,7 @@ class ThreadPool {
         t.handle = handle;
         if (handle != nullptr) {
             handle->_cancelSrc.init();
+            handle->_hasCont = false;   // clear stale state; arrays are not per-element constructed
             t._token = handle->_cancelSrc.get_token();
         }
         _inflight.increment();
@@ -228,6 +237,28 @@ class ThreadPool {
     // Convenience: submit a fire-and-forget task (no handle, no cancellation).
     bool submitDetached(function<int(void*, stop_token)> fn, void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
         return submit(fn, ctx, nullptr, priority);
+    }
+
+    // Register fn to run automatically after dep's task finishes.
+    // Safe to call before or after dep completes; call at most once per dep handle.
+    // Returns false if the pool is shut down.
+    bool then(TaskHandle* dep, function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        if (_workers == nullptr || _stop.stop_requested()) { return false; }
+        bool submit_now = false;
+        _lock.acquire();
+        if (dep->done.load() != (i32)0) {
+            // dep already finished — submit the continuation immediately.
+            submit_now = true;
+        } else {
+            dep->_contFn       = fn;
+            dep->_contCtx      = ctx;
+            dep->_contHandle   = handle;
+            dep->_contPriority = priority;
+            dep->_hasCont      = true;
+        }
+        _lock.release();
+        if (submit_now) { submit(fn, ctx, handle, priority); }
+        return true;
     }
 
     // Number of tasks queued but not yet started (excludes tasks currently running).
@@ -304,11 +335,30 @@ int __threadpool_worker(void* raw) {
                     task.handle->failed   = code != 0;
                 });
             }
-            // Decrement under the lock so drain() cannot miss the transition to 0.
+            // Enqueue any continuation and decrement inflight under one lock
+            // acquisition so drain() never sees a spurious zero between the two.
+            bool fired = false;
             wctx->mtx->acquire();
+            if (task.handle != nullptr && task.handle->_hasCont) {
+                Task cont;
+                cont.fn     = task.handle->_contFn;
+                cont.ctx    = task.handle->_contCtx;
+                cont.handle = task.handle->_contHandle;
+                if (cont.handle != nullptr) {
+                    cont.handle->_cancelSrc.init();
+                    cont._token = cont.handle->_cancelSrc.get_token();
+                }
+                int contPrio = task.handle->_contPriority;
+                wctx->inflight->increment();
+                if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->enqueue(cont); }
+                else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->enqueue(cont); }
+                else                                            { wctx->qNormal->enqueue(cont); }
+                fired = true;
+            }
             i64 remaining = wctx->inflight->decrement();
             if (remaining == (i64)0) { WakeAllConditionVariable(wctx->drainCv); }
             wctx->mtx->release();
+            if (fired) { wctx->ready->release(); }
         }
     }
     return 0;

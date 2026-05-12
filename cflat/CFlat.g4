@@ -225,10 +225,14 @@ declarationSpecifiers
 
 declarationSpecifier
     : storageClassSpecifier
-    | typeSpecifier '?'? (pointer | '[' assignmentExpression ']')?
+    | typeSpecifier '?'? pointer? arrayDimSpec?
     | typeQualifier
     | functionSpecifier
     | alignmentSpecifier
+    ;
+
+arrayDimSpec
+    : ('[' assignmentExpression ']')+
     ;
 
 initDeclaratorList

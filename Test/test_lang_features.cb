@@ -47,7 +47,7 @@ struct Packet { char data[64]; int length = 0; };
 
 bool testFixedArrays()
 {
-    char buf[8];
+    char[8] buf;
     buf[0] = (char)10;
     buf[1] = (char)20;
     buf[2] = (char)30;
@@ -63,7 +63,7 @@ bool testFixedArrays()
     if ((int)pkt.data[1] != (int)'i') return false;
 
     // Regression: struct array must not produce invalid bitcast during default init
-    Point pts[3];
+    Point[3] pts;
     pts[0].x = 1; pts[1].x = 2; pts[2].x = 3;
     if (pts[0].x + pts[1].x + pts[2].x != 6) return false;
 
@@ -73,7 +73,7 @@ bool testFixedArrays()
 // Regression: char*[N] must be typed as [N x ptr], not [N x i8]
 bool testPointerArray()
 {
-    char* words[3];
+    char*[3] words;
     words[0] = "alpha";
     words[1] = "beta";
     words[2] = "gamma";
