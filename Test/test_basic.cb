@@ -1745,7 +1745,7 @@ int intTwo() { return 2; }
 
 bool boolFromIntReturn()
 {
-    return intTwo();
+    return intTwo() != 0;
 }
 
 bool testReturnBoolFromInt()

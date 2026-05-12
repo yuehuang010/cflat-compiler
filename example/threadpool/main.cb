@@ -202,6 +202,88 @@ void section3() {
     pool1.shutdown();
 }
 
+// ── Context structs and task functions for section 5 ─────────────────────────
+
+struct IntTaskCtx {
+    int              input = 0;
+    TaskResult<int>* out   = nullptr;
+};
+
+int squareResultTask(void* raw) {
+    IntTaskCtx* ctx = (IntTaskCtx*)raw;
+    int x = ctx->input;
+    ctx->out->set(x * x);
+    return 0;
+}
+
+int failResultTask(void* raw) {
+    TaskResult<int>* out = (TaskResult<int>*)raw;
+    out->fail();
+    return 1;
+}
+
+// ── Section 5: TaskResult<T> (typed future) ───────────────────────────────────
+
+void section5() {
+    printf("=== Section 5: TaskResult<T> (typed future) ===\n");
+
+    ThreadPool pool;
+    pool.init(4);
+
+    bool ok = true;
+
+    // Basic: submit four squaring tasks, collect typed int results via get().
+    IntTaskCtx      ctxs[4];
+    TaskResult<int> results[4];
+    int i = 0;
+    while (i < 4) {
+        ctxs[i].input = (i + 1) * 10;
+        ctxs[i].out   = &results[i];
+        pool.submit(squareResultTask, &ctxs[i], nullptr);
+        i++;
+    }
+    pool.drain();
+
+    i = 0;
+    while (i < 4) {
+        int expected = ((i + 1) * 10) * ((i + 1) * 10);
+        int got      = results[i].get();
+        bool match   = got == expected;
+        printf("  %d^2 = %d  expected %d  %s\n",
+            (i + 1) * 10, got, expected, match ? "OK" : "FAIL");
+        if (!match) { ok = false; }
+        i++;
+    }
+
+    // Failure path: hasFailed() reports true when the task calls fail().
+    TaskResult<int> failResult;
+    pool.submit(failResultTask, &failResult, nullptr);
+    pool.drain();
+    bool failDetected = failResult.hasFailed();
+    printf("  hasFailed() on failing task: %s\n", failDetected ? "OK" : "FAIL");
+    if (!failDetected) { ok = false; }
+
+    // isReady() / wait(): poll before submit, then block until ready.
+    TaskResult<int> waitResult;
+    IntTaskCtx waitCtx;
+    waitCtx.input = 7;
+    waitCtx.out   = &waitResult;
+    bool notReadyBefore = !waitResult.isReady();
+    pool.submit(squareResultTask, &waitCtx, nullptr);
+    waitResult.wait();
+    bool readyAfter = waitResult.isReady();
+    int  val        = waitResult.get();
+    bool waitOk     = notReadyBefore && readyAfter && val == 49;
+    printf("  wait()/isReady(): notReadyBefore=%s readyAfter=%s val=%d  %s\n",
+        notReadyBefore ? "YES" : "NO",
+        readyAfter     ? "YES" : "NO",
+        val, waitOk ? "OK" : "FAIL");
+    if (!waitOk) { ok = false; }
+
+    pool.shutdown();
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
 // ── Section 4: pool reuse and shutdown contract ───────────────────────────────
 
 void section4(ThreadPool* pool) {
@@ -249,6 +331,7 @@ extern int main() {
     section1(&pool);
     section2(&pool);
     section3();       // uses its own 1-worker pool
+    section5();       // uses its own pool; demonstrates TaskResult<T>
     section4(&pool);  // reuses then shuts down the shared pool
 
     printf("All sections complete.\n");

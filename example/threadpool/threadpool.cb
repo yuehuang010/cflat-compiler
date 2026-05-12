@@ -37,6 +37,71 @@ struct TaskHandle {
     }
 };
 
+// ── TaskResult<T> ─────────────────────────────────────────────────────────────
+// Typed result holder — the CFlat equivalent of std::future<T>.
+//
+// Bundle a TaskResult<T>* into your task's context struct.  The task calls
+// set() on success or fail() on error.  The submitting thread blocks on get()
+// to retrieve the typed value.
+//
+//   struct MyCtx { int input = 0; TaskResult<int>* out = nullptr; };
+//
+//   int myTask(void* raw) {
+//       MyCtx* ctx = (MyCtx*)raw;
+//       ctx->out->set(ctx->input * ctx->input);
+//       return 0;
+//   }
+//
+//   MyCtx ctx; ctx.input = 7;
+//   TaskResult<int> result;
+//   ctx.out = &result;
+//   pool.submit(myTask, &ctx, nullptr);
+//   int val = result.get();   // blocks; returns 49
+//
+struct TaskResult<T> {
+    atomic__i32 _ready  = default;
+    T           _value  = default;   // written before release; read after acquire
+    bool        _failed = false;     // written before release; read after acquire
+
+    // Publish a successful result.  Call exactly once from the task.
+    // Write _value before the release so get() sees it after the acquire fence.
+    void set(T val) {
+        _value = val;
+        _ready.release(1, () => { });
+    }
+
+    // Signal an error.  Call exactly once from the task on failure.
+    void fail() {
+        _failed = true;
+        _ready.release(1, () => { });
+    }
+
+    // Block until the result is ready and return it.
+    // Only valid after a successful set(); check hasFailed() if the task may fail.
+    T get() {
+        while (_ready.load() == 0) { SwitchToThread(); }
+        _ready.acquire((i32 v) => { });   // acquire fence; pairs with release in set()
+        return _value;
+    }
+
+    // True if fail() was called instead of set().
+    bool hasFailed() {
+        while (_ready.load() == 0) { SwitchToThread(); }
+        _ready.acquire((i32 v) => { });
+        return _failed;
+    }
+
+    // Block until set() or fail() has been called.  Does not consume the result.
+    void wait() {
+        while (_ready.load() == 0) { SwitchToThread(); }
+    }
+
+    // Non-blocking poll — true if set() or fail() has been called.
+    bool isReady() {
+        return _ready.load() != (i32)0;
+    }
+};
+
 // ── Task ──────────────────────────────────────────────────────────────────────
 // Internal — constructed by submit() and enqueued for a worker.
 //

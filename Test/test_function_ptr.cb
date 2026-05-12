@@ -862,15 +862,11 @@ bool testDispatchTable()
     int vals[4];
     vals[0] = 1; vals[1] = 2; vals[2] = 3; vals[3] = 4;
 
-    // Assign through an intermediate variable (direct struct-field assignment of a
-    // generic instantiation is not yet supported without the intermediate).
-    function<int(void*)> reader = readAs<int>;
-
     DispatchEntry table[4];
-    table[0].fn = reader; table[0].ctx = (void*)&vals[0];
-    table[1].fn = reader; table[1].ctx = (void*)&vals[1];
-    table[2].fn = reader; table[2].ctx = (void*)&vals[2];
-    table[3].fn = reader; table[3].ctx = (void*)&vals[3];
+    table[0].fn = readAs<int>; table[0].ctx = (void*)&vals[0];
+    table[1].fn = readAs<int>; table[1].ctx = (void*)&vals[1];
+    table[2].fn = readAs<int>; table[2].ctx = (void*)&vals[2];
+    table[3].fn = readAs<int>; table[3].ctx = (void*)&vals[3];
 
     int sum = 0;
     int i = 0;
