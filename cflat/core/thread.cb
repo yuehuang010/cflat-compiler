@@ -12,6 +12,15 @@ stdcall int __thread_trampoline(void* param) {
     return args->fn(args->ctx);
 }
 
+// Returns the number of logical processors on the current system.
+// Equivalent to std::thread::hardware_concurrency().
+// Returns 0 if the value cannot be determined.
+int hardware_concurrency() {
+    _SystemInfo info = default;
+    GetSystemInfo(&info);
+    return (int)info._numProc;
+}
+
 struct Thread {
     void* _handle = nullptr;
     void* _args   = nullptr;  // owns the __ThreadArgs packet; freed in join()
