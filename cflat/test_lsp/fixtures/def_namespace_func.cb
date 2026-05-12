@@ -1,0 +1,4 @@
+// $cursor line=1 col=32
+// $expect definition line=0
+namespace Math { extern int square(int x) { return x * x; } }
+extern int main() { return Math.square(3); }

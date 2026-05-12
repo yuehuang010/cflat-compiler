@@ -488,7 +488,7 @@ private:
             }
         }
 
-        // Cursor is on a field access (e.g. "myvar.center") — navigate to the field declaration.
+        // Cursor is on a member/static/namespace access (e.g. "myvar.center", "Math.square").
         if (!def && !word.empty())
         {
             auto [receiver, _partial] = extractReceiverAt(text, line, character);
@@ -497,7 +497,7 @@ private:
                 const std::string* typeName = index->LookupVariableType(receiver);
                 if (typeName)
                 {
-                    // Try "Circle.center", then "Circle.center" via bare type name.
+                    // Variable receiver: try "Circle.center", then unqualified type "Circle.center".
                     def = index->Lookup(*typeName + "." + word);
                     if (!def)
                     {
@@ -505,6 +505,11 @@ private:
                         if (dot != std::string::npos)
                             def = index->Lookup(typeName->substr(dot + 1) + "." + word);
                     }
+                }
+                else
+                {
+                    // Namespace or type name used directly (e.g. "Math.square", "MyStruct.staticFn").
+                    def = index->Lookup(receiver + "." + word);
                 }
             }
         }

@@ -5286,7 +5286,7 @@ public:
             // Warn: CFlat requires explicit narrowing — write "return expr != 0;" instead.
             if (retTy == builder->getInt1Ty() && value->getType()->isIntegerTy() && value->getType() != retTy)
             {
-                LogWarning("implicit int-to-bool conversion on return — use '!= 0' to make narrowing explicit");
+                LogError("implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit");
                 value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
             }
             builder->CreateRet(value);

@@ -155,6 +155,10 @@
     "keywords-cflat-extension": {
       "patterns": [
         {
+          "name": "keyword.control.import.cflat",
+          "match": "\\b(import|as)\\b"
+        },
+        {
           "name": "keyword.other.namespace.cflat",
           "match": "\\b(namespace|using)\\b"
         },

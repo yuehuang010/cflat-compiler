@@ -481,15 +481,16 @@ private:
 
         if (auto* s = compiler->GetSymbolSink())
         {
+            std::string keyword = ctx->getStart()->getText();
             s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        "struct " + typeName);
+                        keyword + " " + typeName);
             // Also register under the unqualified name so Lookup("Point") finds "Geometry.Point".
             size_t dot = typeName.rfind('.');
             if (dot != std::string::npos)
                 s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "struct " + typeName);
+                            keyword + " " + typeName);
         }
 
         // Pre-declare default constructor

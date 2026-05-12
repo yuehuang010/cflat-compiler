@@ -1,0 +1,4 @@
+// $cursor line=0 col=6
+// $expect hover contains="class"
+class Animal { int age = 0; };
+extern int main() { Animal a; return 0; }
