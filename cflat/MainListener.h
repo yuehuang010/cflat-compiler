@@ -3450,7 +3450,9 @@ public:
             {
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
-                // C-style fixed-size array local: char buf[N] — use [N x T] alloca representation
+                // Fixed-size array local — two forms:
+                //   C-style:    T arr[N]  — size in directDeclarator
+                //   Type-first: T[N] arr  — size in declarationSpecifier (arraySize already evaluated)
                 typeAndValue.ConstArraySize = 0;  // reset per-declarator
                 if (direct->assignmentExpression() && typeAndValue.ArraySize == nullptr)
                 {
@@ -3459,6 +3461,11 @@ public:
                         typeAndValue.ConstArraySize = ci->getZExtValue();
                     else
                         LogErrorContext(direct, "array size must be a compile-time constant");
+                }
+                else if (arraySize != nullptr)
+                {
+                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(arraySize))
+                        typeAndValue.ConstArraySize = ci->getZExtValue();
                 }
                 typeAndValue.VariableName = name;
 
@@ -3471,6 +3478,65 @@ public:
                 llvm::Value* right = nullptr;
                 bool srcIsUnsigned = false;
                 auto initializer = initDecl->initializer();
+
+                // Bare-brace form: T[N] arr {} — LeftBrace/initializerList are on initDecl directly.
+                // Equivalent to T[N] arr = {} / T[N] arr = {field=v,...}.
+                bool barebraceInit = initDecl->LeftBrace() != nullptr;
+                CFlatParser::InitializerListContext* barebraceList = barebraceInit ? initDecl->initializerList() : nullptr;
+
+                // Array value-initializer: T[N] arr = {} / T[N] arr {} / T[N] arr = {field=v,...}
+                // Seed-once pattern: construct one element, then memcpy into every slot.
+                if (typeAndValue.ConstArraySize > 0 &&
+                    ((initializer != nullptr && initializer->LeftBrace() != nullptr) || barebraceInit))
+                {
+                    if (global_scope)
+                    {
+                        LogErrorContext(initDecl, "array value-initializer '= {}' is not allowed at global scope");
+                    }
+                    else
+                    {
+                        auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
+                        if (structData.StructType == nullptr)
+                        {
+                            LogErrorContext(initDecl, std::format("array value-initializer '= {{}}' requires a struct element type, '{}' is not a struct", typeAndValue.TypeName));
+                        }
+                        else
+                        {
+                            // Build a single-element seed alloca and default-construct it.
+                            auto* elemTy = structData.StructType;
+                            auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "arrayseed");
+                            if (compiler->GetFunction(typeAndValue.TypeName))
+                            {
+                                llvm::Value* seedVal = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
+                                if (seedVal) compiler->CreateAssignment(seedVal, seedAlloc);
+                            }
+
+                            // Apply field overrides onto the seed (= {} or bare {} form).
+                            auto* initList = barebraceInit ? barebraceList
+                                           : initializer->initializerList();
+                            if (initList)
+                                EmitFieldInitializer(seedAlloc, typeAndValue.TypeName, initList);
+
+                            // Create the array alloca and register it.
+                            auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
+                            allocList.push_back(std::pair(name, arrAlloc));
+
+                            // Memcpy seed into every element.
+                            auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
+                            const auto& dl = compiler->module->getDataLayout();
+                            uint64_t elemBytes = dl.getTypeAllocSize(elemTy);
+                            llvm::Value* zero = compiler->builder->getInt32(0);
+                            uint64_t n = typeAndValue.ConstArraySize;
+                            for (uint64_t i = 0; i < n; i++)
+                            {
+                                llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+                                auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, {zero, idx}, "arrelem");
+                                compiler->builder->CreateMemCpy(elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+                            }
+                        }
+                    }
+                    continue;
+                }
 
                 // At global scope, any RHS evaluation emits IR into whatever block the builder
                 // currently points at (the tail of the last generated function), corrupting it.
@@ -9486,7 +9552,17 @@ public:
             ProcessPendingInstantiations();
             activeTypeSubstitutions = savedSubst;
         }
-        // Create default constructor
+        // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
+        // ParseConstructorDefinition will handle it later in the member function loop.
+        bool hasExplicitNoArgCtor = !isUnion && [&]() {
+            for (auto* f : ctx->functionDefinition())
+                if (getFunctionName(f) == baseName && !f->parameterTypeList())
+                    return true;
+            return false;
+        }();
+
+        // Create default constructor (skipped when user provides an explicit no-arg ctor)
+        if (!hasExplicitNoArgCtor)
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
@@ -9582,7 +9658,7 @@ public:
 
             // Pop the stack
             compiler->CreateBlockBreak(nullptr, true);
-        }
+        } // end if (!hasExplicitNoArgCtor)
 
         // Register struct fields in LSP index for dot-completion
         if (auto* s = compiler->GetSymbolSink())
@@ -9690,8 +9766,8 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                // Constructor overload — same name as struct, with parameters
-                if (funcName == baseName && func->parameterTypeList())
+                // Constructor — same name as struct (no-arg or with parameters)
+                if (funcName == baseName)
                 {
                     ParseConstructorDefinition(func, structName);
                     continue;
@@ -11503,7 +11579,16 @@ public:
             ProcessPendingInstantiations();
             activeTypeSubstitutions = savedSubst;
         }
-        // Create default constructor
+        // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
+        bool hasExplicitNoArgCtor = [&]() {
+            for (auto* f : ctx->functionDefinition())
+                if (getFunctionName(f) == baseName && !f->parameterTypeList())
+                    return true;
+            return false;
+        }();
+
+        // Create default constructor (skipped when user provides an explicit no-arg ctor)
+        if (!hasExplicitNoArgCtor)
         {
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
@@ -11571,7 +11656,7 @@ public:
 
             compiler->CreateReturnCall(structVal);
             compiler->CreateBlockBreak(nullptr, true);
-        }
+        } // end if (!hasExplicitNoArgCtor)
 
         // Register class fields in LSP index for dot-completion
         if (auto* s = compiler->GetSymbolSink())
@@ -11730,8 +11815,8 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                // Constructor overload — same name as class, with parameters
-                if (funcName == baseName && func->parameterTypeList())
+                // Constructor — same name as class (no-arg or with parameters)
+                if (funcName == baseName)
                 {
                     ParseConstructorDefinition(func, structName);
                     continue;
@@ -11930,15 +12015,49 @@ public:
         compiler->InitializeBlock(&fn->front(), false);
 
         // Get the struct's LLVM type (without pointer)
-        auto* structLLVMType = compiler->GetType(returnType, nullptr, false);
-
-        // Call the default constructor to get a fully default-initialized instance
-        auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {});
+        auto* structLLVMType = llvm::cast<llvm::StructType>(compiler->GetType(returnType, nullptr, false));
 
         // Alloca the struct so we can GEP into fields via 'this'
-        auto* thisAlloca = compiler->builder->CreateAlloca(structLLVMType, nullptr, structName + "__");
-        if (defaultVal)
-            compiler->builder->CreateStore(defaultVal, thisAlloca);
+        auto* thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
+
+        if (allParams.empty())
+        {
+            // No-arg constructor: calling structName() would be self-recursive.
+            // Zero-initialize the struct, then apply field defaults from the data structure.
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(structLLVMType), thisAlloca);
+            auto structData = compiler->GetDataStructure(structName);
+            unsigned fieldIdx = 0;
+            for (const auto& field : structData.StructFields)
+            {
+                if (field.Initializer != nullptr)
+                {
+                    auto* assignExpr = field.Initializer->assignmentExpression();
+                    if (assignExpr != nullptr)
+                    {
+                        llvm::Value* fieldVal = ParseAssignmentExpression(assignExpr);
+                        if (fieldVal)
+                        {
+                            auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
+                            fieldVal = compiler->Upconvert(fieldVal, destType);
+                            if (fieldVal->getType() == destType)
+                            {
+                                auto* fieldPtr = compiler->builder->CreateStructGEP(
+                                    structLLVMType, thisAlloca, fieldIdx, field.VariableName);
+                                compiler->builder->CreateStore(fieldVal, fieldPtr);
+                            }
+                        }
+                    }
+                }
+                fieldIdx++;
+            }
+        }
+        else
+        {
+            // Parameterized constructor: delegate to the no-arg ctor for default initialization.
+            auto* defaultVal = compiler->CreateOverloadedFunctionCall(structName, {});
+            if (defaultVal)
+                compiler->builder->CreateStore(defaultVal, thisAlloca);
+        }
 
         // Register the alloca as the implicit 'this' pointer so member field access works
         LLVMBackend::TypeAndValue thisTv;

@@ -237,6 +237,7 @@ initDeclaratorList
 
 initDeclarator
     : declarator ('=' initializer)?
+    | declarator '{' initializerList? ','? '}'
     ;
 
 storageClassSpecifier
@@ -451,7 +452,7 @@ typedefName
 
 initializer
     : assignmentExpression
-    | '{' initializerList ','? '}'
+    | '{' initializerList? ','? '}'
     | Default
     ;
 

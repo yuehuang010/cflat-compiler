@@ -1,0 +1,48 @@
+// Tests for T arr[N] = {} and T arr[N] = {field=v,...} array value-init syntax.
+
+import "test_helper.cb";
+
+struct Counter {
+    int count = 0;
+    int step  = 1;
+
+    Counter() {
+        count = 100;
+        step  = 5;
+    }
+};
+
+bool testArrayDefaultInit()
+{
+    bool result = true;
+
+    Counter[3] ctrs {};
+    result &= Test("arr_init_0_count", ctrs[0].count, 100);
+    result &= Test("arr_init_0_step",  ctrs[0].step,  5);
+    result &= Test("arr_init_1_count", ctrs[1].count, 100);
+    result &= Test("arr_init_2_count", ctrs[2].count, 100);
+
+    return result;
+}
+
+bool testArrayFieldInit()
+{
+    bool result = true;
+
+    Counter[2] seeded {count=42, step=7};
+    result &= Test("arr_seed_0_count", seeded[0].count, 42);
+    result &= Test("arr_seed_0_step",  seeded[0].step,  7);
+    result &= Test("arr_seed_1_count", seeded[1].count, 42);
+    result &= Test("arr_seed_1_step",  seeded[1].step,  7);
+
+    return result;
+}
+
+extern int main()
+{
+    bool result = true;
+    result &= testArrayDefaultInit();
+    result &= testArrayFieldInit();
+    printf("%s\n", result ? "Array init tests: PASSED" : "Array init tests: FAILED");
+    return result ? 0 : 1;
+}
