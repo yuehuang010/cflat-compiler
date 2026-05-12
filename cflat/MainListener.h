@@ -3151,6 +3151,13 @@ public:
 
         auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl);
 
+        // CreateFunctionDefinition returns the existing function (without setting up
+        // a fresh entry block) when a matching definition was already emitted by a
+        // transitive import. Detect that here and skip body emission — re-emitting
+        // into the live function's blocks would corrupt its IR.
+        if (!fn->empty() && fn->getEntryBlock().getTerminator() != nullptr)
+            return;
+
         compiler->InitializeBlock(&fn->front(), false);
 
         currentFunctionIsVariadic = varargs;
@@ -9468,6 +9475,27 @@ public:
             return;
         }
 
+        // Re-emission guard: when the user's main file is also reached via a
+        // transitive import under a different canonical path (e.g. the deployed
+        // copy of a cflat/core/ file), the runtime chain may have already fully
+        // emitted this struct. CreateFunctionDefinition's duplicate-skip leaves
+        // the IR builder without the right scope to safely emit the bodies a
+        // second time, so any field-or-method reference falls over. Detect
+        // "already fully defined" here and skip the entire walk.
+        {
+            auto sd = compiler->GetDataStructure(structName);
+            if (sd.StructType != nullptr && !sd.StructType->isOpaque())
+            {
+                if (auto* existing = compiler->GetFunction(structName);
+                    existing != nullptr && !existing->empty())
+                {
+                    if (compiler->IsVerbose())
+                        std::cout << "[verbose]     skipping duplicate struct definition: " << structName << "\n";
+                    return;
+                }
+            }
+        }
+
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
@@ -11509,6 +11537,27 @@ public:
             genericStructTypeParams[structName] = typeParams;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
             return;
+        }
+
+        // Re-emission guard: when the user's main file is also reached via a
+        // transitive import under a different canonical path (e.g. the deployed
+        // copy of a cflat/core/ file), the runtime chain may have already fully
+        // emitted this struct. CreateFunctionDefinition's duplicate-skip leaves
+        // the IR builder without the right scope to safely emit the bodies a
+        // second time, so any field-or-method reference falls over. Detect
+        // "already fully defined" here and skip the entire walk.
+        {
+            auto sd = compiler->GetDataStructure(structName);
+            if (sd.StructType != nullptr && !sd.StructType->isOpaque())
+            {
+                if (auto* existing = compiler->GetFunction(structName);
+                    existing != nullptr && !existing->empty())
+                {
+                    if (compiler->IsVerbose())
+                        std::cout << "[verbose]     skipping duplicate struct definition: " << structName << "\n";
+                    return;
+                }
+            }
         }
 
         if (compiler->IsVerbose())

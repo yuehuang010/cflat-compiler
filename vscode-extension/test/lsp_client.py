@@ -129,10 +129,10 @@ def find_exe() -> str | None:
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent.parent
     candidates = [
-        repo_root / "x64" / "Debug"   / "cflat.exe",
         repo_root / "x64" / "Release" / "cflat.exe",
-        repo_root / "x86" / "Debug"   / "cflat.exe",
+        repo_root / "x64" / "Debug"   / "cflat.exe",
         repo_root / "x86" / "Release" / "cflat.exe",
+        repo_root / "x86" / "Debug"   / "cflat.exe",
     ]
     for p in candidates:
         if p.exists():

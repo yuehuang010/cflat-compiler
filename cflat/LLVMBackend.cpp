@@ -633,7 +633,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     } rootGuard{importStack};
     importSearchDir = importDir;
     runtimeDir = runtimeDirPath;
-    verbose = false;
+    // verbose retains the value set by the LSP via SetVerbose() — left unmodified.
     bool debugInfo = false;
 
     platformValue = 64;

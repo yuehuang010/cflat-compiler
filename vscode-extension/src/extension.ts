@@ -19,10 +19,10 @@ function findCompilerExecutable(): string | undefined {
 
     // 2. Scan common build-output locations relative to each workspace folder.
     const candidates = [
-        path.join('x64', 'Debug',   'cflat.exe'),
         path.join('x64', 'Release', 'cflat.exe'),
-        path.join('x86', 'Debug',   'cflat.exe'),
+        path.join('x64', 'Debug',   'cflat.exe'),
         path.join('x86', 'Release', 'cflat.exe'),
+        path.join('x86', 'Debug',   'cflat.exe'),
     ];
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
         for (const rel of candidates) {
@@ -56,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: cflat.exe not found — checked x64/Debug, x64/Release, x86/Debug, x86/Release relative to each workspace folder.');
+        outputChannel.appendLine('ERROR: cflat.exe not found — checked x64/Release, x64/Debug, x86/Release, x86/Debug relative to each workspace folder.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
             'cflat: could not find cflat.exe. ' +
