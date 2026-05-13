@@ -1,9 +1,9 @@
-import "testmodule.c";
+import "library/testmodule.c";
 import "test_helper.cb";
 import "list.cb";
 import "thread.cb";
-import "prog_lib.cb";
-import "ns_math.cb" as MyMath;
+import "library/prog_lib.cb";
+import "library/ns_math.cb" as MyMath;
 
 // ---- C module interop ----
 

@@ -9,7 +9,7 @@
 
 import "string.cb";
 import "network/socket.cb";
-import "network/http_parser.cb";
+import "http_parser.cb";
 
 // Write null-terminated string s into buf at offset pos; return new pos.
 int _hc_puts(i8* buf, int pos, const char* s)

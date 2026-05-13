@@ -23,9 +23,9 @@ import "list.cb";
 import "thread.cb";
 import "stop_token.cb";
 import "network/socket.cb";
-import "network/http_parser.cb";
-import "network/http_response.cb";
-import "network/router.cb";
+import "http_parser.cb";
+import "http_response.cb";
+import "router.cb";
 
 // Per-connection program: dispatches one request through the shared router and exits.
 // Accepts the OS socket handle (void*) rather than a Socket* to avoid passing

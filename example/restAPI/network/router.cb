@@ -14,8 +14,8 @@
 //   // In userHandler: req->getParam("id") returns the captured value.
 //   // Returns HttpResponse.notFound() on miss.
 
-import "network/http_parser.cb";
-import "network/http_response.cb";
+import "http_parser.cb";
+import "http_response.cb";
 
 // One registered route.
 struct _RouteEntry {

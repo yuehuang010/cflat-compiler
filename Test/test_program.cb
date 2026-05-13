@@ -2,7 +2,7 @@ import "list.cb";
 import "thread.cb";
 import "filesystem.cb";
 import "test_helper.cb";
-import program "hello_imported.cb" as Hello;
+import program "library/hello_imported.cb" as Hello;
 
 // ---------------------------------------------------------------------------
 // Program definitions

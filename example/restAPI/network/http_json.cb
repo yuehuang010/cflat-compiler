@@ -11,8 +11,8 @@
 //   return HttpJson.respond<MyStruct>(val);
 
 import "json.cb";
-import "network/http_parser.cb";
-import "network/http_response.cb";
+import "http_parser.cb";
+import "http_response.cb";
 
 // Non-generic helper so generic methods avoid a string local variable.
 // (string locals in generic static methods can cause LLVM dominance errors.)

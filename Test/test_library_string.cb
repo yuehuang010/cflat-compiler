@@ -1,4 +1,4 @@
-import "string.c";
+import "library/string.c";
 import "test_helper.cb";
 
 bool testLength()
