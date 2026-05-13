@@ -1,4 +1,4 @@
-// core/network/http_response.cb — Build HTTP/1.1 responses.
+// core/network/http_response.cb - Build HTTP/1.1 responses.
 //
 // Usage:
 //   import "network/http_response.cb";
@@ -33,7 +33,7 @@ int _http_puti(i8* buf, int pos, int val)
 
 class HttpResponse {
     int       _status     = 200;
-    i8*       _statusText = nullptr;   // points to a string literal — not owned
+    i8*       _statusText = nullptr;   // points to a string literal - not owned
     list<i8*> _headerNames  = default; // owns the heap strings it stores
     list<i8*> _headerValues = default;
     i8*       _body       = nullptr;

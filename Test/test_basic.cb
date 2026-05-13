@@ -102,7 +102,7 @@ bool testNamedParameters()
 // Enum tests
 // =============================================================
 
-// Named enum — enumerators should be registered as globals.
+// Named enum - enumerators should be registered as globals.
 enum MyEnum : u8 { E_ONE = 1, E_TWO, E_THREE = 5 };
 
 bool testEnum()
@@ -374,7 +374,7 @@ bool testForwardFunction()
     return result;
 }
 
-// Test 2: Mutual recursion — no explicit forward declaration needed.
+// Test 2: Mutual recursion - no explicit forward declaration needed.
 bool isEven(int n)
 {
     if (n == 0) return true;
@@ -520,7 +520,7 @@ bool testAssertPass()
 bool testAssertFail()
 {
     Assert("assert 10==10", 10, 10);
-    Assert("assert 10==99", 10, 99);  // fails — exits testAssertFail with false
+    Assert("assert 10==99", 10, 99);  // fails - exits testAssertFail with false
     return true;
 }
 
@@ -591,9 +591,9 @@ bool testExplicitIntTypes()
     int x = 10;
     result &= Test("int_to_i32_param", sumI32(x, 5), 15);
 
-    // Hex literals with high bit set (contain hex digit 'E' — must not be parsed as float)
+    // Hex literals with high bit set (contain hex digit 'E' - must not be parsed as float)
     // C++ rule: hex literals that exceed i32 positive range type as unsigned int (same 32-bit pattern).
-    u32 magic = 0xBA63E001;             // contains 'E' — previously mistaken as float exponent
+    u32 magic = 0xBA63E001;             // contains 'E' - previously mistaken as float exponent
     u32 magic2 = (u32)0xBA63E001;
     result &= Test("hex_high_bit_direct", magic,  (u32)0xBA63E001);
     result &= Test("hex_high_bit_cast",   magic2, (u32)0xBA63E001);
@@ -823,7 +823,7 @@ bool testReturnDefaultStruct()
 {
     bool result = true;
     RdPoint pt = rdStruct();
-    // return default; zero-initializes — fields are 0, not declared defaults (10, 20)
+    // return default; zero-initializes - fields are 0, not declared defaults (10, 20)
     result &= Test("rd_struct_x", pt.x, 0);
     result &= Test("rd_struct_y", pt.y, 0);
     return result;
@@ -888,7 +888,7 @@ bool testStringLiteral()
     result &= Test("str_lit_length",      s.length(), 5);
     result &= Test("str_lit_data",     s.data(),  "hello");
 
-    // Longer literal — the canonical use case: string s = "My test string";
+    // Longer literal - the canonical use case: string s = "My test string";
     string s2 = "My test string";
     result &= Test("str_lit_long_length", s2.length(), 14);
     result &= Test("str_lit_long_data", s2.data(), "My test string");
@@ -898,7 +898,7 @@ bool testStringLiteral()
     result &= Test("str_lit_empty_length", s3.length(), 0);
     result &= Test("str_lit_empty_data", s3.data(), "");
 
-    // String with escape sequences — \n counts as one character
+    // String with escape sequences - \n counts as one character
     string s4 = "line1\nline2";
     result &= Test("str_lit_escape_length", s4.length(), 11);
 
@@ -988,7 +988,7 @@ bool testNewAssignNoOwnershipLeak()
     int i = 0;
     while (i < 3)
     {
-        p = new int;   // assignment — must NOT set lastOwningResult for next decl
+        p = new int;   // assignment - must NOT set lastOwningResult for next decl
         *p = i + 1;
         sum += *p;
         delete p;
@@ -999,7 +999,7 @@ bool testNewAssignNoOwnershipLeak()
 
     // q declared AFTER the loop that used 'p = new int'.
     // If lastOwningResult leaked, q would be marked owning and freed at scope
-    // exit even though it holds a stack address — causing heap corruption.
+    // exit even though it holds a stack address - causing heap corruption.
     int local = 99;
     int* q = &local;   // NOT a heap allocation; must not be freed at scope exit
     result &= Test("new_assign_no_leak", *q, 99);
@@ -1053,7 +1053,7 @@ bool testIfConst()
 {
     bool result = true;
 
-    // Test 1: if const with true literal — should enter true branch
+    // Test 1: if const with true literal - should enter true branch
     if const (true)
     {
         result &= Test("if_const_true", 1, 1);
@@ -1063,13 +1063,13 @@ bool testIfConst()
         result &= Test("if_const_true", 0, 1);  // should not execute
     }
 
-    // Test 2: if const with false literal — should skip body entirely
+    // Test 2: if const with false literal - should skip body entirely
     if const (false)
     {
         result &= Test("if_const_false", 0, 1);  // should not execute
     }
 
-    // Test 3: if const with comparison (1 == 1) — should enter true branch
+    // Test 3: if const with comparison (1 == 1) - should enter true branch
     if const (1 == 1)
     {
         result &= Test("if_const_eq_true", 1, 1);
@@ -1079,7 +1079,7 @@ bool testIfConst()
         result &= Test("if_const_eq_true", 0, 1);  // should not execute
     }
 
-    // Test 4: if const with false comparison (1 == 2) — should enter else branch
+    // Test 4: if const with false comparison (1 == 2) - should enter else branch
     if const (1 == 2)
     {
         result &= Test("if_const_eq_false", 0, 1);  // should not execute
@@ -1089,7 +1089,7 @@ bool testIfConst()
         result &= Test("if_const_eq_false", 1, 1);
     }
 
-    // Test 5: if const with inequality (5 != 3) — should enter true branch
+    // Test 5: if const with inequality (5 != 3) - should enter true branch
     if const (5 != 3)
     {
         result &= Test("if_const_neq_true", 1, 1);
@@ -1250,12 +1250,12 @@ bool testBraceEscapes()
 {
     bool result = true;
 
-    // Both \{ and {{ should produce a literal '{' — compare the two forms against each other
+    // Both \{ and {{ should produce a literal '{' - compare the two forms against each other
     const char* slash = "\{hello\}";
     const char* dbl   = "{{hello}}";
     result &= Test("brace_forms_equal", strcmp(slash, dbl), 0);
 
-    // In a format string, {{ folds to literal '{' and {x} interpolates — check resulting length
+    // In a format string, {{ folds to literal '{' and {x} interpolates - check resulting length
     // "value is {x} = 42" => 18 chars
     int x = 42;
     string s = "value is {{x}} = {x}";
@@ -1593,7 +1593,7 @@ bool testVariadic()
     bool result = true;
     char* buf = (char*)malloc(64);
 
-    // Positional: all args by position — regression for the original call path.
+    // Positional: all args by position - regression for the original call path.
     snprintf(buf, 64, "%d + %d = %d", 3, 4, 7);
     result &= Test("variadic_positional", (const char*)buf, "3 + 4 = 7");
 
@@ -1706,7 +1706,7 @@ bool testFixedArrays()
 }
 
 // =============================================================
-// Multi-dimensional arrays: T[N][M] — covers char, int, float, struct
+// Multi-dimensional arrays: T[N][M] - covers char, int, float, struct
 // =============================================================
 
 struct Cell { int x = 0; int y = 0; };
@@ -1796,7 +1796,7 @@ bool testMultiDimArrays()
 }
 
 // =============================================================
-// Regression: Bug 1 — cast result chained with -> member access
+// Regression: Bug 1 - cast result chained with -> member access
 // CFlat previously required a named variable to hold the cast
 // result before accessing a field (e.g. ((Struct*)ptr)->field).
 // =============================================================
@@ -1825,7 +1825,7 @@ bool testCastMemberAccess()
 }
 
 // =============================================================
-// Regression: Bug 2 — returning int from a bool function
+// Regression: Bug 2 - returning int from a bool function
 // The compiler previously emitted ret i32 inside an i1 function,
 // which fails LLVM module verification. The fix emits ICmpNE to
 // convert any nonzero int to true (matching bool assignment semantics).
@@ -2040,7 +2040,7 @@ bool testInPlaceDtor()
 
     g_inplace_dtor_count = 0;
 
-    // Destroy element 1 in place — buffer must remain usable.
+    // Destroy element 1 in place - buffer must remain usable.
     buf[1].~();
     result &= Test(".~() dtor called once",  g_inplace_dtor_count, 1);
     result &= Test(".~() buf[0] intact",     buf[0].value, 10);
@@ -2051,7 +2051,7 @@ bool testInPlaceDtor()
     buf[2].~();
     result &= Test(".~() all three called", g_inplace_dtor_count, 3);
 
-    // Free only the backing buffer — destructors already ran.
+    // Free only the backing buffer - destructors already ran.
     delete[_] buf;
 
     return result;
@@ -2278,7 +2278,7 @@ bool testAndShortCircuit()
     result &= Test("and_if_result_total_iters", totalIters,   6);
     result &= Test("and_if_result_true_count",  trueBranches, 2);
 
-    // Chained &&: a && b && c — false on first two operands must not exit loop.
+    // Chained &&: a && b && c - false on first two operands must not exit loop.
     int hits = 0;
     int k = 0;
     while (k < 5)

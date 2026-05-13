@@ -120,7 +120,7 @@ extern int main()
 
     // Path params
     srv.get("/hello",              featHelloHandler);
-    srv.get("/users/me",           featMeHandler);        // exact — takes priority over :id
+    srv.get("/users/me",           featMeHandler);        // exact - takes priority over :id
     srv.get("/users/:id",          featUserHandler);
     srv.get("/orgs/:org/repos/:repo", featOrgRepoHandler);
 

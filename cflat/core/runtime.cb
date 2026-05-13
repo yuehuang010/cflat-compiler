@@ -1,4 +1,4 @@
-// CFlat runtime — core library entry point.
+// CFlat runtime - core library entry point.
 import "os.cb";
 import "memory.cb";
 import "program.cb";

@@ -1,4 +1,4 @@
-// time.cb — Duration, TimePoint, Stopwatch, Timer, and sleep.
+// time.cb - Duration, TimePoint, Stopwatch, Timer, and sleep.
 //
 // Tick unit: 100-nanosecond intervals, matching C# DateTime/TimeSpan convention.
 //

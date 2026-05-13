@@ -90,7 +90,7 @@ bool testArenaChannel()
 }
 
 // ---- Test 2: program with global arena_channel ----
-// arena_channel is a global — the natural pattern (field) is covered by test 3.
+// arena_channel is a global - the natural pattern (field) is covered by test 3.
 
 arena_channel g_ac_prog = default;
 

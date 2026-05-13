@@ -1,4 +1,4 @@
-// core/graphic/bitmap.cb — BMP (Windows Bitmap) file parser and writer
+// core/graphic/bitmap.cb - BMP (Windows Bitmap) file parser and writer
 //
 // Supports 1, 4, 8, 16, 24, and 32 bpp uncompressed BMP files (BI_RGB and BI_BITFIELDS).
 // Pixel data is stored as RGBA, top-to-bottom, left-to-right.

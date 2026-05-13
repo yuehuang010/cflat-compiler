@@ -1,9 +1,9 @@
-// semaphore.cb — counting semaphore backed by Win32 CreateSemaphoreA.
+// semaphore.cb - counting semaphore backed by Win32 CreateSemaphoreA.
 //
 // Usage:
 //   semaphore s;
 //   s.init(0, 10);         // initial=0 (blocked), max=10 slots
-//   s.acquire();            // wait (down) — blocks if count is 0
+//   s.acquire();            // wait (down) - blocks if count is 0
 //   s.release();            // signal (up) by 1
 //   s.release_n(3);         // signal (up) by n
 //   s.destroy();            // close the Win32 handle
@@ -14,8 +14,8 @@ struct semaphore {
     void* _handle = nullptr;
 
     // Create the semaphore.  Must be called before acquire/release.
-    //   initial   — starting signal count (0 = fully blocked)
-    //   max_count — maximum count (typically capacity of the resource pool)
+    //   initial   - starting signal count (0 = fully blocked)
+    //   max_count - maximum count (typically capacity of the resource pool)
     void init(int initial, int max_count) {
         _handle = CreateSemaphoreA(nullptr, initial, max_count, nullptr);
     }

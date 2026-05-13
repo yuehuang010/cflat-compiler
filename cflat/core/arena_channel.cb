@@ -1,16 +1,16 @@
-// arena_channel.cb — combined bucket-backed allocator + zero-copy MPMC channel.
+// arena_channel.cb - combined bucket-backed allocator + zero-copy MPMC channel.
 //
 // Three main types:
 //
-//   block_pool    — program thread allocator (IAllocator) backed by BucketAllocator.
+//   block_pool    - program thread allocator (IAllocator) backed by BucketAllocator.
 //                   Also spawns transferable page_arena units via acquire_arena().
 //
-//   page_arena    — self-contained bump-allocation region (IAllocator).
+//   page_arena    - self-contained bump-allocation region (IAllocator).
 //                   Unique ownership: one thread at a time. All sub-allocations
 //                   live within the arena, so the receiver can use all pointers
 //                   immediately after recv() with no copy.
 //
-//   arena_channel — block_pool + channel<page_arena*>; zero-copy messaging.
+//   arena_channel - block_pool + channel<page_arena*>; zero-copy messaging.
 //
 // Pointer safety invariant: every allocation stored in a transferred message
 // must come from pa->alloc(). Enforced by convention, not at runtime.
@@ -109,7 +109,7 @@ class block_pool
         }
     }
 
-    // ── IAllocator — day-to-day allocation, delegates to bucket ───────────────
+    // ── IAllocator - day-to-day allocation, delegates to bucket ───────────────
 
     void* alloc(i64 size)    { return _bucket.alloc(size); }
     void  dealloc(void* ptr) { _bucket.dealloc(ptr); }
@@ -176,7 +176,7 @@ class arena_channel
         init(1024, (i64)65536);
     }
 
-    // Day-to-day allocation — forward to block_pool / slab.
+    // Day-to-day allocation - forward to block_pool / slab.
     void* alloc(i64 size)    { return _pool.alloc(size); }
     void  dealloc(void* ptr) { _pool.dealloc(ptr); }
 

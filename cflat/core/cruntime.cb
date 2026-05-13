@@ -1,4 +1,4 @@
-// C runtime bindings — extern declarations and wrappers for standard C library functions
+// C runtime bindings - extern declarations and wrappers for standard C library functions
 
 // === Memory Functions ===
 // size_t is pointer-sized (win_size: i64 on Win64, i32 on Win32).
@@ -18,19 +18,19 @@ if const (__PLATFORM__ == 32) {
 // and the FILE handle tracker.  All fields zero-initialize to "inactive".
 // Field indices must stay in sync with kPTLS_* constants in MainListener.h.
 struct __ProgramTLS {
-    function<void(char*, int)> stdout_hook = default;   // field 0 — printf interceptor
-    bool stdout_in_hook = false;                         // field 1 — re-entrancy guard
-    char* stdout_tls_buf = nullptr;                      // field 2 — per-thread format buffer
-    int stdout_tls_cap = 0;                              // field 3 — capacity of stdout_tls_buf
-    function<char*()> stdin_hook = default;              // field 4 — fgets/scanf interceptor
-    bool stdin_in_hook = false;                          // field 5 — re-entrancy guard
-    char* stdin_line = nullptr;                          // field 6 — current line from hook
-    int stdin_line_pos = 0;                              // field 7 — read cursor within stdin_line
-    function<void(char*)> stdin_return_hook = default;   // field 8 — return buffer to pool (stream path)
-    void* cached_stdin = nullptr;                        // field 9 — cached stdin FILE* (pre-populated by trampoline)
-    bool handle_tracker_enabled = false;                 // field 10 — FILE handle tracker on/off
-    void* handle_tracker_head = nullptr;                 // field 11 — head of open-handle linked list
-    bool stdin_active = false;                           // field 12 — true iff hook installed and not in re-entrant call
+    function<void(char*, int)> stdout_hook = default;   // field 0 - printf interceptor
+    bool stdout_in_hook = false;                         // field 1 - re-entrancy guard
+    char* stdout_tls_buf = nullptr;                      // field 2 - per-thread format buffer
+    int stdout_tls_cap = 0;                              // field 3 - capacity of stdout_tls_buf
+    function<char*()> stdin_hook = default;              // field 4 - fgets/scanf interceptor
+    bool stdin_in_hook = false;                          // field 5 - re-entrancy guard
+    char* stdin_line = nullptr;                          // field 6 - current line from hook
+    int stdin_line_pos = 0;                              // field 7 - read cursor within stdin_line
+    function<void(char*)> stdin_return_hook = default;   // field 8 - return buffer to pool (stream path)
+    void* cached_stdin = nullptr;                        // field 9 - cached stdin FILE* (pre-populated by trampoline)
+    bool handle_tracker_enabled = false;                 // field 10 - FILE handle tracker on/off
+    void* handle_tracker_head = nullptr;                 // field 11 - head of open-handle linked list
+    bool stdin_active = false;                           // field 12 - true iff hook installed and not in re-entrant call
 };
 thread_local __ProgramTLS __prog_tls = default;
 
@@ -48,7 +48,7 @@ extern void printf(const char* fmt, ...) {
     va_start(ap);
     if (__prog_tls.stdout_hook != nullptr && !__prog_tls.stdout_in_hook) {
         __prog_tls.stdout_in_hook = true;
-        // Fast path: no '%' in fmt — fmt is the literal output, skip vsprintf entirely.
+        // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
         int len = 0;
         bool has_format = false;
         while (fmt[len] != '\0') {
@@ -69,7 +69,7 @@ extern void printf(const char* fmt, ...) {
                 __prog_tls.stdout_tls_cap = needed + 1;
                 __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             }
-            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
+            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning - hook must NOT free buf
         }
         __prog_tls.stdout_in_hook = false;
     } else {
@@ -123,7 +123,7 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
 extern int vprintf(const char* fmt, va_list ap) {
     if (__prog_tls.stdout_hook != nullptr && !__prog_tls.stdout_in_hook) {
         __prog_tls.stdout_in_hook = true;
-        // Fast path: no '%' in fmt — fmt is the literal output, skip vsprintf entirely.
+        // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
         int len = 0;
         bool has_format = false;
         while (fmt[len] != '\0') {
@@ -144,7 +144,7 @@ extern int vprintf(const char* fmt, va_list ap) {
                 __prog_tls.stdout_tls_cap = needed + 1;
                 __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
             }
-            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning — hook must NOT free buf
+            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning - hook must NOT free buf
             len = needed;
         }
         __prog_tls.stdout_in_hook = false;
@@ -186,7 +186,7 @@ extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
 
 // === Stdin hook support ===
 
-// Windows CRT internal for the scanf fallback path (no size parameter — not in os.windows.cb).
+// Windows CRT internal for the scanf fallback path (no size parameter - not in os.windows.cb).
 extern int __stdio_common_vfscanf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 
 // Used by the fgets fallback to read one character from any stream.
@@ -217,11 +217,11 @@ int __stdin_next_char() {
     return c;
 }
 
-// fgets — when the stdin hook is active and the stream is stdin, serve bytes from
+// fgets - when the stdin hook is active and the stream is stdin, serve bytes from
 // the hook line-buffer instead of blocking on the real console.
 extern char* fgets(char* buf, int count, void* stream) {
     // Fast path: stdin hook is active and this is a stdin read.
-    // cached_stdin is pre-populated by the program trampoline — no null check needed here.
+    // cached_stdin is pre-populated by the program trampoline - no null check needed here.
     if (__prog_tls.stdin_active && stream == __prog_tls.cached_stdin) {
         char* src = __prog_tls.stdin_line;
         int   pos = __prog_tls.stdin_line_pos;
@@ -243,7 +243,7 @@ extern char* fgets(char* buf, int count, void* stream) {
             __prog_tls.stdin_line_pos = 0;
             if (src == nullptr) return nullptr;  // EOF
         }
-        // Find the next '\n' and bulk-copy — no extra TLS reads in the hot path.
+        // Find the next '\n' and bulk-copy - no extra TLS reads in the hot path.
         int end = pos;
         while (src[end] != '\0' && src[end] != '\n') { end++; }
         if (src[end] == '\n') { end++; }
@@ -268,7 +268,7 @@ extern char* fgets(char* buf, int count, void* stream) {
     return i > 0 ? buf : nullptr;
 }
 
-// scanf — when the stdin hook is active, copy the current line into a local buffer
+// scanf - when the stdin hook is active, copy the current line into a local buffer
 // and parse it with the Windows CRT vsscanf backend.  After parsing the line cursor
 // advances to EOL (correct for one-value-per-line; multi-value same-line reads are
 // a known v1 limitation).

@@ -129,7 +129,7 @@ del /q "%OUT%\results\*.log" 2>nul
 
 set /a LAUNCHED=0
 
-REM Launch error tests as 4 parallel groups — files distributed round-robin by test_err.bat
+REM Launch error tests as 4 parallel groups - files distributed round-robin by test_err.bat
 set /a LAUNCHED+=4
 start "" /b cmd /c "%SCRIPT% --worker-err 1"
 start "" /b cmd /c "%SCRIPT% --worker-err 2"

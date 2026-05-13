@@ -1,4 +1,4 @@
-// Core interfaces — auto-imported before string.cb so all modules can depend
+// Core interfaces - auto-imported before string.cb so all modules can depend
 // on these contracts without importing separately.
 
 interface IString
@@ -28,7 +28,7 @@ interface IHashable
     int hash();
 };
 
-// Hash() overloads for primitive types — use with is_primitive(T) and if const
+// Hash() overloads for primitive types - use with is_primitive(T) and if const
 // so generic data structures can call Hash(value) without knowing the concrete type.
 int Hash(i8  value) { return (int)value; }
 int Hash(i16 value) { return (int)value; }

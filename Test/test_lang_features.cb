@@ -14,7 +14,7 @@ bool testFieldInit()
     Point p = { x=10, y=20 };
     if (p.x != 10 || p.y != 20) return false;
 
-    // Partial initializer — unmentioned field keeps default
+    // Partial initializer - unmentioned field keeps default
     Point q = { x=5 };
     if (q.x != 5 || q.y != 0) return false;
 

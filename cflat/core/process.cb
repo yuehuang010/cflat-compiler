@@ -1,11 +1,11 @@
-// process.cb — launch and communicate with a child process.
+// process.cb - launch and communicate with a child process.
 //
 // API mirrors the compiler-built `program` construct:
 //   Same fields:   exe, exitCode, onStdout, onStdin
 //   Same methods:  run(), WaitForExit(), WaitForExit(ms), WaitForExit(stop_token), Kill()
 //
 // Differences from `program`:
-//   - `exe` must be set before run() — no user-defined main body.
+//   - `exe` must be set before run() - no user-defined main body.
 //   - Only stdio/out is supported (no allocator, no inbox, no >> wiring).
 //   - x64 only (STARTUPINFOA layout is Win64-specific).
 //
@@ -47,7 +47,7 @@ extern stdcall i32 SetHandleInformation(void* hObject, i32 dwMask, i32 dwFlags);
 
 // ── Win32 structs ─────────────────────────────────────────────────────────────
 
-// SECURITY_ATTRIBUTES — 24 bytes on x64 (pointer at offset 8 needs 4-byte pad after nLength).
+// SECURITY_ATTRIBUTES - 24 bytes on x64 (pointer at offset 8 needs 4-byte pad after nLength).
 struct _SecAttrs {
     i32   nLength              = 12;
     i32   _pad0                = 0;
@@ -56,7 +56,7 @@ struct _SecAttrs {
     i32   _pad1                = 0;
 };
 
-// STARTUPINFOA — 104 bytes on x64.
+// STARTUPINFOA - 104 bytes on x64.
 // cb(4) + pad(4) + lpReserved*(8) + lpDesktop*(8) + lpTitle*(8)
 // + dwX(4)+dwY(4)+dwXSize(4)+dwYSize(4)+dwXCountChars(4)+dwYCountChars(4)
 // + dwFillAttribute(4)+dwFlags(4)+wShowWindow(2)+cbReserved2(2)+pad(4)
@@ -84,7 +84,7 @@ struct _StartupInfoA {
     void* hStdError       = nullptr;
 };
 
-// PROCESS_INFORMATION — 24 bytes on x64.
+// PROCESS_INFORMATION - 24 bytes on x64.
 struct _ProcessInfo {
     void* hProcess   = nullptr;
     void* hThread    = nullptr;
@@ -105,7 +105,7 @@ struct __ProcessWriterCtx {
 };
 
 // Reader thread: loops ReadFile on the pipe, calls onStdout(buf, len).
-// ctx->callback is always set — we only start this thread when onStdout != nullptr.
+// ctx->callback is always set - we only start this thread when onStdout != nullptr.
 int __process_reader_fn(void* rawCtx) {
     __ProcessReaderCtx* ctx = (__ProcessReaderCtx*)rawCtx;
     i8* buf = (i8*)malloc(4096);
@@ -120,7 +120,7 @@ int __process_reader_fn(void* rawCtx) {
 }
 
 // Writer thread: calls onStdin() to get a line, writes it to the pipe.
-// ctx->provider is always set — we only start this thread when onStdin != nullptr.
+// ctx->provider is always set - we only start this thread when onStdin != nullptr.
 // onStdin returns nullptr to signal EOF.
 int __process_writer_fn(void* rawCtx) {
     __ProcessWriterCtx* ctx = (__ProcessWriterCtx*)rawCtx;
@@ -169,13 +169,13 @@ char* __process_build_cmdline(string exe, list<string>* pargs) {
 // ── process struct ────────────────────────────────────────────────────────────
 
 class process : IProcess {
-    // Public config — set before run().
+    // Public config - set before run().
     string exe = default;
 
-    // Public result — valid after WaitForExit() returns.
+    // Public result - valid after WaitForExit() returns.
     int exitCode = 0;
 
-    // Stdio hooks — same types as the compiler-built `program` construct.
+    // Stdio hooks - same types as the compiler-built `program` construct.
     // onStdout: called with (buffer, length) for each chunk of child stdout.
     //           Buffer is non-owning; do not free it.
     // onStdin:  called to get each line to send to child stdin.
@@ -231,7 +231,7 @@ class process : IProcess {
         _proc_handle   = pi.hProcess;
         _thread_handle = pi.hThread;
 
-        // Close the child-side pipe ends — the child holds them now.
+        // Close the child-side pipe ends - the child holds them now.
         CloseHandle(_stdout_write);
         _stdout_write = nullptr;
         if (_want_stdin) {
@@ -260,13 +260,13 @@ class process : IProcess {
         }
     }
 
-    // IProcess interface — run with a value list (forwards to the pointer overload).
+    // IProcess interface - run with a value list (forwards to the pointer overload).
     bool run(list<string> args) {
         run(&args);
         return true;
     }
 
-    // IProcess interface — return the exit code field.
+    // IProcess interface - return the exit code field.
     int exitCode() { return exitCode; }
 
     // Block until the process exits.  Joins I/O threads and captures exitCode.

@@ -43,7 +43,7 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
             if (!d.hint.empty())
                 msg += "\nhint: " + d.hint;
             diagnosticSink_(d.file, static_cast<size_t>(d.line), static_cast<size_t>(d.col), msg);
-            // No throw — parse errors are pre-codegen; caller returns false.
+            // No throw - parse errors are pre-codegen; caller returns false.
         }
         else
         {
@@ -442,7 +442,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
     llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
-    // Persist parse state for the lifetime of the compiler — generic template
+    // Persist parse state for the lifetime of the compiler - generic template
     // ctx pointers from imported files must remain valid when instantiated later
     // during the main-file walk.
     ImportedParseState state;
@@ -633,7 +633,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     } rootGuard{importStack};
     importSearchDir = importDir;
     runtimeDir = runtimeDirPath;
-    // verbose retains the value set by the LSP via SetVerbose() — left unmodified.
+    // verbose retains the value set by the LSP via SetVerbose() - left unmodified.
     bool debugInfo = false;
 
     platformValue = 64;

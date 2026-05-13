@@ -1,4 +1,4 @@
-// Accessing a guarded field outside any lock — error expected.
+// Accessing a guarded field outside any lock - error expected.
 
 import "mutex.cb";
 

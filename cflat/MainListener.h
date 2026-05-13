@@ -1,6 +1,6 @@
 ﻿#pragma once
 // ============================================================
-// MainListener.h — CFlat front-end: ForwardRefScanner + MainListener
+// MainListener.h - CFlat front-end: ForwardRefScanner + MainListener
 // ============================================================
 // SECTION         LINE     DESCRIPTION
 // ───────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ private:
                     if (typeSpec->tupleTypeSpecifier() != nullptr)
                     {
                         auto* tts = typeSpec->tupleTypeSpecifier();
-                        // Pack-only form (T...) resolved during instantiation — skip forward-declare here
+                        // Pack-only form (T...) resolved during instantiation - skip forward-declare here
                         if (tts->tupleTypePackEntry() != nullptr)
                             break;
                         std::vector<std::string> typeArgs;
@@ -305,11 +305,11 @@ private:
     void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::vector<std::string>& extraRequiredLocks = {})
     {
         auto* compiler = Compiler(func);
-        // Return-block functions are inlined at call sites — no LLVM proto needed.
+        // Return-block functions are inlined at call sites - no LLVM proto needed.
         if (IsReturnBlockFunction(func))
             return;
 
-        // Generic function templates are instantiated on demand — skip pre-declaration.
+        // Generic function templates are instantiated on demand - skip pre-declaration.
         if (func->genericTypeParameters() != nullptr)
             return;
 
@@ -508,7 +508,7 @@ private:
         {
             if (getFunctionName(func) == typeName)
             {
-                // Constructor overload — no implicit this* parameter, returns the type
+                // Constructor overload - no implicit this* parameter, returns the type
                 if (!func->parameterTypeList()) continue; // no-arg already declared above
                 auto ctorParams = ParseParameterTypeList(func->parameterTypeList());
                 std::vector<LLVMBackend::TypeAndValue> allCtorParams(ctorParams.begin(), ctorParams.end());
@@ -581,7 +581,7 @@ public:
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
             if (!ruleCtx) continue;
 
-            // Skip generic template definitions entirely — their bodies contain
+            // Skip generic template definitions entirely - their bodies contain
             // unbound type parameters (e.g. T) that are not valid type names.
             if (auto* structDef = dynamic_cast<CFlatParser::StructDefinitionContext*>(ruleCtx))
             {
@@ -621,7 +621,7 @@ public:
                 if (typeSpec->tupleTypeSpecifier() != nullptr)
                 {
                     auto* tts = typeSpec->tupleTypeSpecifier();
-                    // Pack-only form (T...) resolved during instantiation — skip forward-declare here
+                    // Pack-only form (T...) resolved during instantiation - skip forward-declare here
                     if (tts->tupleTypePackEntry() == nullptr)
                     {
                         std::string mangledName = "tuple";
@@ -1161,7 +1161,7 @@ private:
                     std::vector<std::string> typeArgs;
                     if (tts->tupleTypePackEntry() != nullptr)
                     {
-                        // (T...) — expand pack substitution
+                        // (T...) - expand pack substitution
                         std::string packName = tts->tupleTypePackEntry()->typeSpecifier()->getText();
                         auto packIt = activePackSubstitutions.find(packName);
                         if (packIt != activePackSubstitutions.end())
@@ -1448,7 +1448,7 @@ public:
         for (auto* term : ctx->Identifier())
             parentNames.push_back(term->getText());
 
-        // Generic interface template — store for on-demand instantiation
+        // Generic interface template - store for on-demand instantiation
         if (nameGid->genericTypeParameters() != nullptr)
         {
             auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
@@ -1707,7 +1707,7 @@ public:
         // Validate: no duplicate declaration
         if (compiler->annotationRegistry.count(name))
         {
-            // Already registered by ForwardRefScanner — nothing to emit (no LLVM type).
+            // Already registered by ForwardRefScanner - nothing to emit (no LLVM type).
             return;
         }
 
@@ -1909,15 +1909,15 @@ public:
         if constexpr (debugPrint)
             return;
 
-        // Skip nodes nested inside a namespace — they are handled by ParseNamespaceDefinition.
+        // Skip nodes nested inside a namespace - they are handled by ParseNamespaceDefinition.
         if (dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(ctx->parent))
             return;
 
-        // Skip nodes nested inside an if const block — they are handled by ParseIfConstDeclaration.
+        // Skip nodes nested inside an if const block - they are handled by ParseIfConstDeclaration.
         if (dynamic_cast<CFlatParser::IfConstBlockContext*>(ctx->parent))
             return;
 
-        // Skip nodes nested inside an expect_error block — handled by ParseExternalDeclaration's
+        // Skip nodes nested inside an expect_error block - handled by ParseExternalDeclaration's
         // expectErrorDeclaration branch, which processes them manually after setting expectedError.
         if (dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(ctx->parent))
             return;
@@ -1981,7 +1981,7 @@ public:
         llvm::Value* tupleAlloca = rhsNV.Storage;
         if (!tupleAlloca)
         {
-            // RHS was a value not stored — create a temp alloca
+            // RHS was a value not stored - create a temp alloca
             tupleAlloca = compiler->CreateAlloca(structType);
             compiler->builder->CreateStore(LoadNamedVariable(rhsNV), tupleAlloca);
         }
@@ -2076,7 +2076,7 @@ public:
             bool isStruct = compiler->dataStructures.count(exprText) > 0;
             bool isInterface = compiler->interfaceTable.count(exprText) > 0;
 
-            // _ is a soft wildcard in arm-style switches — register as both default and caseMap entry
+            // _ is a soft wildcard in arm-style switches - register as both default and caseMap entry
             // so ParseStatement can locate this labeled node and emit the arm body with auto-jump.
             if (hasArrow && exprText == "_")
             {
@@ -2201,7 +2201,7 @@ public:
             {
                 if (jump->Default() != nullptr)
                 {
-                    // return default; — zero-initialize the return type (null for pointers/interfaces, 0 for integers)
+                    // return default; - zero-initialize the return type (null for pointers/interfaces, 0 for integers)
                     auto* retTy = compiler->currentFunction->getReturnType();
                     auto* defaultVal = retTy->isVoidTy() ? nullptr : llvm::Constant::getNullValue(retTy);
                     compiler->CreateReturnCall(defaultVal);
@@ -2234,7 +2234,7 @@ public:
                                 || compiler->lastCallReturnsOwned
                                 || compiler->lastOwningResult;
                             if (!returnIsOwned)
-                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned — value must come from 'new', a move parameter, or another move-returning function");
+                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                         }
 
                         // Bond return check: bonded value may only be returned if all its sources
@@ -2244,7 +2244,7 @@ public:
                             {
                                 auto funcArg = compiler->GetFunctionArgument(source);
                                 if (funcArg.GetValue() == nullptr || !funcArg.TypeAndValue.IsBond)
-                                    LogErrorContext(jump, std::format("returning bonded value whose source '{}' is not a 'bond' parameter — bonded values cannot escape their source's scope", source));
+                                    LogErrorContext(jump, std::format("returning bonded value whose source '{}' is not a 'bond' parameter - bonded values cannot escape their source's scope", source));
                             }
                         };
                         if (returnNV.IsBonded)
@@ -2820,7 +2820,7 @@ public:
 
             if (auto* cs = expectErrorStmt->compoundStatement())
             {
-                // Scoped block form: expect_error("msg") { ... } — error must occur inside the braces.
+                // Scoped block form: expect_error("msg") { ... } - error must occur inside the braces.
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 compiler->InitializeBlock(nullptr, true);
@@ -2867,7 +2867,7 @@ public:
             }
             else
             {
-                // Bare-semicolon form: expect_error("msg"); — error must occur before the enclosing scope exits.
+                // Bare-semicolon form: expect_error("msg"); - error must occur before the enclosing scope exits.
                 compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
             }
             return;
@@ -2963,7 +2963,7 @@ public:
                 acquired.push_back({ canonical, acquireMethod, releaseMethod, mutexTypeName, mutexNV.Storage });
             }
 
-            // Push lock scope — only supports single-mutex cleanup via StackState today.
+            // Push lock scope - only supports single-mutex cleanup via StackState today.
             // For multi-lock, push one scope per mutex so each gets its own cleanup slot.
             compiler->InitializeBlock(nullptr, true);
             if (!acquired.empty())
@@ -2987,7 +2987,7 @@ public:
             for (const auto& lk : acquired)
                 currentLockSet.erase(lk.canonical);
 
-            // Close the scope — EmitDestructorsForScope will call unlock().
+            // Close the scope - EmitDestructorsForScope will call unlock().
             compiler->CreateBlockBreak(nullptr, true);
             return;
         }
@@ -3149,7 +3149,7 @@ public:
 
         // CreateFunctionDefinition returns the existing function (without setting up
         // a fresh entry block) when a matching definition was already emitted by a
-        // transitive import. Detect that here and skip body emission — re-emitting
+        // transitive import. Detect that here and skip body emission - re-emitting
         // into the live function's blocks would corrupt its IR.
         if (!fn->empty() && fn->getEntryBlock().getTerminator() != nullptr)
             return;
@@ -3190,7 +3190,7 @@ public:
             {
                 // Handle only if the expect_error was set at this function's entry depth
                 // (bare-semicolon form inside this function body).
-                // File-scope scoped-block form sets expectedErrorScopeDepth = SIZE_MAX — re-throw.
+                // File-scope scoped-block form sets expectedErrorScopeDepth = SIZE_MAX - re-throw.
                 if (!compilerLLVM->expectedError.empty() &&
                     compilerLLVM->expectedErrorScopeDepth == funcDepth)
                 {
@@ -3476,14 +3476,14 @@ public:
             {
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
-                // Fixed-size array local — two forms:
-                //   C-style:    T arr[N]  — size in directDeclarator
-                //   Type-first: T[N] arr  — size in declarationSpecifier (arraySize already evaluated)
+                // Fixed-size array local - two forms:
+                //   C-style:    T arr[N]  - size in directDeclarator
+                //   Type-first: T[N] arr  - size in declarationSpecifier (arraySize already evaluated)
                 typeAndValue.ConstArraySize = 0;  // reset per-declarator
                 if (direct->assignmentExpression() && typeAndValue.ArraySize == nullptr)
                 {
-                    // Pointer arrays (char* arr[N]) can't use type-first form — grammar
-                    // doesn't support 'char*[N]' — so only error on non-pointer types.
+                    // Pointer arrays (char* arr[N]) can't use type-first form - grammar
+                    // doesn't support 'char*[N]' - so only error on non-pointer types.
                     if (!typeAndValue.Pointer)
                         LogErrorContext(direct, std::format(
                             "C-style array declaration '{}[{}]' is not allowed; use '[{}] {}'",
@@ -3510,7 +3510,7 @@ public:
                 bool srcIsUnsigned = false;
                 auto initializer = initDecl->initializer();
 
-                // Bare-brace form: T[N] arr {} — LeftBrace/initializerList are on initDecl directly.
+                // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
                 // Equivalent to T[N] arr = {} / T[N] arr = {field=v,...}.
                 bool barebraceInit = initDecl->LeftBrace() != nullptr;
                 CFlatParser::InitializerListContext* barebraceList = barebraceInit ? initDecl->initializerList() : nullptr;
@@ -3658,7 +3658,7 @@ public:
                                     }
                                 }
                             }
-                            // nullptr constant assigned to an interface variable — produce null fat pointer {null, null}
+                            // nullptr constant assigned to an interface variable - produce null fat pointer {null, null}
                             if (llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
                                 right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
                         }
@@ -3882,7 +3882,7 @@ public:
                                 {
                                     auto tcs = eqs[0]->typeCheckExpression();
                                     // Guard: skip the fast path if the typeCheckExpression has 'is'/'as'
-                                    // operators — those must be handled by ParseConditionalExpression.
+                                    // operators - those must be handled by ParseConditionalExpression.
                                     if (tcs.size() == 1 && tcs[0]->typeSpecifier().empty())
                                     {
                                         auto* relCtx = tcs[0]->relationalExpression();
@@ -3963,7 +3963,7 @@ public:
 
             // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)
             // and BaseType holds the pointee type. All loads/stores through `destination` must use it.
-            // UnionFieldType is set for union field access — it overrides the load/store type so that
+            // UnionFieldType is set for union field access - it overrides the load/store type so that
             // reinterpret semantics work correctly even with LLVM opaque pointers.
             auto isDerefStorage = [&]() {
                 return namedVar.BaseType
@@ -4011,7 +4011,7 @@ public:
             }
 
             // Bond source reassignment check: error if LHS is a live bond source.
-            // Only fire when destination is the variable's own alloca/global — field assignments
+            // Only fire when destination is the variable's own alloca/global - field assignments
             // (GEP destinations) mutate the struct in place and do not invalidate any bond.
             // Must run before RHS evaluation so the error fires on the assignment statement.
             if (operatorText == "=" && !namedVar.CallerName.empty()
@@ -4019,13 +4019,13 @@ public:
             {
                 auto borrower = compiler->FindActiveBondBorrower(namedVar.CallerName);
                 if (!borrower.empty())
-                    LogErrorContext(ctx, std::format("cannot reassign '{}' while '{}' holds a bonded reference to it — assign null to '{}' first to break the bond", namedVar.CallerName, borrower, borrower));
+                    LogErrorContext(ctx, std::format("cannot reassign '{}' while '{}' holds a bonded reference to it - assign null to '{}' first to break the bond", namedVar.CallerName, borrower, borrower));
             }
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
             lambdaExpectedType = {};
             // An assignment to an existing variable (not a declaration) does not transfer
-            // ownership — consuming lastOwningResult here would be wrong (the new-allocated
+            // ownership - consuming lastOwningResult here would be wrong (the new-allocated
             // value is either moved via items.add(move p) or managed by the caller).
             // Reset the flag so it doesn't leak into the next declaration in this scope.
             compiler->lastOwningResult = false;
@@ -4063,8 +4063,8 @@ public:
                 const auto& bondedSources = rightNV.IsBonded ? rightNV.BondedSources : compiler->lastCallBondedSources;
                 if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
                 {
-                    // Struct field or heap dereference — bonded values cannot be stored there.
-                    LogErrorContext(ctx, "bonded value cannot be stored in a struct field or through a pointer — bond lifetime would be untrackable");
+                    // Struct field or heap dereference - bonded values cannot be stored there.
+                    LogErrorContext(ctx, "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
                 }
                 else if (!namedVar.CallerName.empty())
                 {
@@ -4073,7 +4073,7 @@ public:
                     {
                         size_t srcDepth = compiler->FindVariableScopeDepth(source);
                         if (srcDepth != SIZE_MAX && lhsDepth < srcDepth)
-                            LogErrorContext(ctx, std::format("bonded value cannot be assigned to '{}' — '{}' is in a wider scope than its bond source '{}'", namedVar.CallerName, namedVar.CallerName, source));
+                            LogErrorContext(ctx, std::format("bonded value cannot be assigned to '{}' - '{}' is in a wider scope than its bond source '{}'", namedVar.CallerName, namedVar.CallerName, source));
                     }
                 }
                 compiler->lastCallIsBonded = false;
@@ -4085,7 +4085,7 @@ public:
             if (operatorText == "=" && namedVar.TypeAndValue.IsInterface
                 && right && right->getType() != compiler->GetFatPtrType())
             {
-                // nullptr assigned to a non-pointer interface variable — produce null fat pointer {null, null}.
+                // nullptr assigned to a non-pointer interface variable - produce null fat pointer {null, null}.
                 // IsInterfacePointer (IFoo*) stores a pointer-to-fat-ptr, not a fat-ptr; skip this conversion.
                 if (!namedVar.TypeAndValue.IsInterfacePointer && llvm::isa_and_nonnull<llvm::ConstantPointerNull>(right))
                     right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
@@ -4256,7 +4256,7 @@ public:
         }
 
         // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
-        // — so `expression` is the TRUE branch and `conditionalExpression` is the FALSE branch.
+        // - so `expression` is the TRUE branch and `conditionalExpression` is the FALSE branch.
         auto expressionTrueCtx = ctx->expression();
         auto expressionFalseCtx = ctx->conditionalExpression();
 
@@ -4680,7 +4680,7 @@ public:
         auto loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
         auto typeMatches = compiler->builder->CreateICmpEQ(loadedDesc, typeDesc);
 
-        // In opaque pointer mode, dataPtr is already the right pointer type — no bitcast needed
+        // In opaque pointer mode, dataPtr is already the right pointer type - no bitcast needed
         auto nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(dataPtr->getType()));
         return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
@@ -4751,11 +4751,11 @@ public:
         auto* writeBytesFn = FindStreamMethodFn(compiler, "write_bytes");
         if (!writeBytesFn)
         {
-            LogErrorContext(ctx, "stream::write_bytes not found — import \"stream.cb\" before using >>.");
+            LogErrorContext(ctx, "stream::write_bytes not found - import \"stream.cb\" before using >>.");
             return;
         }
 
-        // Create/reuse __stream_write_shim(i8* env, char* data, i32 len) — casts env to stream*, calls write_bytes.
+        // Create/reuse __stream_write_shim(i8* env, char* data, i32 len) - casts env to stream*, calls write_bytes.
         // The hook is non-owning: printf passes a thread-local buffer; the shim copies it via write_bytes.
         llvm::Function* shim = compiler->module->getFunction("__stream_write_shim");
         if (!shim)
@@ -4808,11 +4808,11 @@ public:
         auto* readFn = FindStreamMethodFn(compiler, "read");
         if (!readFn)
         {
-            LogErrorContext(ctx, "stream::read not found — import \"stream.cb\" before using >>.");
+            LogErrorContext(ctx, "stream::read not found - import \"stream.cb\" before using >>.");
             return;
         }
 
-        // Create/reuse __stream_read_shim(i8* env) -> char* — casts env to stream*, calls read.
+        // Create/reuse __stream_read_shim(i8* env) -> char* - casts env to stream*, calls read.
         llvm::Function* shim = compiler->module->getFunction("__stream_read_shim");
         if (!shim)
         {
@@ -4844,7 +4844,7 @@ public:
         auto* returnFn = FindStreamMethodFn(compiler, "return_buffer");
         if (returnFn)
         {
-            // Create/reuse __stream_return_buffer_shim(i8* env, char* buf) — calls stream.return_buffer.
+            // Create/reuse __stream_return_buffer_shim(i8* env, char* buf) - calls stream.return_buffer.
             llvm::Function* returnShim = compiler->module->getFunction("__stream_return_buffer_shim");
             if (!returnShim)
             {
@@ -4998,7 +4998,7 @@ public:
                     if (op == "-")
                         rvalue = Compiler(ctx)->builder->CreateNeg(rvalue, "neg");
                     lvalue = Compiler(ctx)->CreateGEP(elemType, lvalue, rvalue, "ptrarith");
-                    // elemType stays the same — result is still a pointer to the same element type
+                    // elemType stays the same - result is still a pointer to the same element type
                 }
                 else
                 {
@@ -5046,7 +5046,7 @@ public:
                     llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
                     return compiler->CreateLoad(namedVar.Storage);
                 // Through-pointer dereference of a pointer type (e.g. *pp where pp is char**):
-                // Storage is a raw loaded address — load again to get the pointer value.
+                // Storage is a raw loaded address - load again to get the pointer value.
                 if (namedVar.BaseType && namedVar.BaseType->isPointerTy())
                     return compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
                 return namedVar.Storage;
@@ -5078,7 +5078,7 @@ public:
             }
         }
 
-        // namedVar is empty — caller's block was already terminated (e.g. by a return-block inline).
+        // namedVar is empty - caller's block was already terminated (e.g. by a return-block inline).
         return nullptr;
     }
 
@@ -5169,7 +5169,7 @@ public:
         auto* structTy = llvm::cast<llvm::StructType>(ty);
         if (structTy->isLiteral() || !structTy->hasName()) return nullptr;
         std::string typeName = structTy->getName().str();
-        // Fat-ptr types compare by extracted field — let CreateOperation handle it.
+        // Fat-ptr types compare by extracted field - let CreateOperation handle it.
         if (typeName == "__iface_fat_ptr" || typeName == "__closure_fat_ptr") return nullptr;
 
         std::string opName = "operator" + op;
@@ -5203,7 +5203,7 @@ public:
         };
 
         // Determine whether to pass lvalue by pointer or by value by inspecting the
-        // registered candidates — check if any candidate's first param is a pointer to
+        // registered candidates - check if any candidate's first param is a pointer to
         // this struct type. If so use pointer dispatch; otherwise use value dispatch.
         bool usePointer = false;
         {
@@ -5544,7 +5544,7 @@ public:
             // For '!', suspend any active short-circuit else-block before
             // evaluating the operand.  Without this, !(A && B) in a while
             // condition would short-circuit the inner && directly to the
-            // loop-exit block when A is false — bypassing the negation —
+            // loop-exit block when A is false - bypassing the negation -
             // instead of continuing the loop as !(false && B) == true demands.
             llvm::BasicBlock* savedElse = nullptr;
             if (opText == "!")
@@ -5977,7 +5977,7 @@ public:
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
 
         // For array new of a class type: call default constructor for each element (like C++).
-        // Skip when typeIsPtr — the element is a pointer (e.g. Point*), not a struct; calling
+        // Skip when typeIsPtr - the element is a pointer (e.g. Point*), not a struct; calling
         // the struct ctor would store sizeof(Point)=8 bytes into a sizeof(ptr)=4-byte slot on
         // Win32, corrupting the heap (on Win64 they happen to be equal so the bug is silent).
         if (isArray && count && !typeIsPtr && compiler->GetFunction(typeName))
@@ -6049,11 +6049,11 @@ public:
         auto* compiler = Compiler(ctx);
         bool isArray      = ctx->LeftBracket() != nullptr;
         bool hasSizeExpr  = ctx->deleteArraySize() != nullptr;
-        // delete[_] ptr — free backing buffer only, no destructor calls.
+        // delete[_] ptr - free backing buffer only, no destructor calls.
         bool isRawFree    = hasSizeExpr && ctx->deleteArraySize()->expression()->getText() == "_";
         if (hasSizeExpr && ctx->deleteArraySize()->expression()->getText() == "0")
         {
-            LogErrorContext(ctx, "'delete[0]' is not allowed — use 'delete[_]' to free a raw buffer without calling destructors");
+            LogErrorContext(ctx, "'delete[0]' is not allowed - use 'delete[_]' to free a raw buffer without calling destructors");
             return {};
         }
 
@@ -6072,7 +6072,7 @@ public:
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
 
             // Error: deleting a borrowed (non-move) parameter directly. If the caller owns the
-            // pointer, it will be freed again when the caller's scope exits — double-free.
+            // pointer, it will be freed again when the caller's scope exits - double-free.
             // Restrict to direct alloca storage (simple variable reference, not field access)
             // so 'delete param->field' is still allowed.
             if (!namedVar.CallerName.empty()
@@ -6082,7 +6082,7 @@ public:
                 && compiler->IsFunctionParameter(namedVar.CallerName))
             {
                 LogErrorContext(ctx, std::format(
-                    "cannot delete borrowed parameter '{}' — caller may own this pointer and "
+                    "cannot delete borrowed parameter '{}' - caller may own this pointer and "
                     "will free it on scope exit. Declare the parameter 'move {}' to take ownership.",
                     namedVar.CallerName, namedVar.CallerName));
                 return {};
@@ -6108,11 +6108,11 @@ public:
         }
         if (!ptrVal) return {};
 
-        // Error: bare delete[] on a named struct array — the caller must supply the count.
+        // Error: bare delete[] on a named struct array - the caller must supply the count.
         if (isArray && !hasSizeExpr && compiler->IsDataStructure(typeName) && !elemIsPtr)
         {
             LogErrorContext(ctx, std::format(
-                "'delete[]' is not allowed for struct type '{}' — use 'delete[n] ptr' to call destructors or 'delete[_] ptr' to free the raw buffer", typeName));
+                "'delete[]' is not allowed for struct type '{}' - use 'delete[n] ptr' to call destructors or 'delete[_] ptr' to free the raw buffer", typeName));
             return {};
         }
 
@@ -6207,7 +6207,7 @@ public:
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
         // move on a named struct value type: capture the value, then zero the source storage
-        // to leave it in a "moved-from" (default) state — enables safe delete[n] on the source.
+        // to leave it in a "moved-from" (default) state - enables safe delete[n] on the source.
         // Primitive value types (int, etc.) remain a no-op.
         if (!argNV.TypeAndValue.Pointer)
         {
@@ -6352,7 +6352,7 @@ public:
                                  && namedVar.Storage != nullptr)
                         {
                             // Embedded struct field (value, not pointer): namedVar.Storage is the GEP
-                            // address of the embedded field — use it directly as the struct base so
+                            // address of the embedded field - use it directly as the struct base so
                             // chained method calls (e.g. w.inbox.send()) pass the correct 'this'.
                             auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
                             if (sd.StructType)
@@ -6367,7 +6367,7 @@ public:
                     }
                     case CFlatParser::Tilde:
                     {
-                        // expr.~() — call destructor in place, no memory freed.
+                        // expr.~() - call destructor in place, no memory freed.
                         if (prevToken == CFlatParser::Dot)
                         {
                             auto* compiler = Compiler(ctx);
@@ -6466,7 +6466,7 @@ public:
                             }
                             else
                             {
-                                // Qualified name (e.g. EnumName.Member) — try to resolve as a global
+                                // Qualified name (e.g. EnumName.Member) - try to resolve as a global
                                 // variable (enum member) or a function. Fall back to leaving
                                 // namedVar empty so later code can handle it.
                                 primaryIdentifier = qualifiedName;
@@ -6490,7 +6490,7 @@ public:
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
-                            // Method name on interface variable — just record it; dispatch at call site
+                            // Method name on interface variable - just record it; dispatch at call site
                             primaryIdentifier = terminal->getText();
                             namedVar = {};
                         }
@@ -6623,7 +6623,7 @@ public:
                             }
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier))
                             {
-                                // Not a field — could be a member function or an extension method template.
+                                // Not a field - could be a member function or an extension method template.
                                 namedVar = {};
                             }
                             else
@@ -6638,7 +6638,7 @@ public:
                             // but Primary holds the unloaded LLVM float value.
                             if (namedVar.Primary != nullptr
                                 && namedVar.Primary->getType()->isFloatingPointTy()) return true;
-                            // Integer conversion methods — matched by name so they work on any
+                            // Integer conversion methods - matched by name so they work on any
                             // integer-typed base (named var, inline literal, call result).
                             static const std::unordered_set<std::string> intConvert = {
                                 "to_i8","to_u8","to_i16","to_u16","to_i32","to_u32","to_i64","to_u64"
@@ -6782,7 +6782,7 @@ public:
                         else if (!namedVar.TypeAndValue.TypeName.empty() && namedVar.TypeAndValue.Pointer
                                  && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
                         {
-                            // Opaque pointer to a known struct (e.g. string* a) — track as structVar
+                            // Opaque pointer to a known struct (e.g. string* a) - track as structVar
                             // so member call dispatch can dereference it correctly.
                             structVar = namedVar;
                             interfaceVar = {};
@@ -6830,7 +6830,7 @@ public:
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 if (namedVar.TypeAndValue.IsInterface)
                                 {
-                                    // operator[] returned an interface fat-ptr — expose as interfaceVar
+                                    // operator[] returned an interface fat-ptr - expose as interfaceVar
                                     // so subsequent member accesses dispatch via vtable.
                                     interfaceVar = namedVar;
                                     structVar = {};
@@ -6880,7 +6880,7 @@ public:
                             if (elementTypeAndValue.ElemPointer)
                             {
                                 // Double-pointer (e.g. T* where T=Employee*): element type is T* (Employee*).
-                                // Keep Pointer=true, clear ElemPointer — element is a pointer value.
+                                // Keep Pointer=true, clear ElemPointer - element is a pointer value.
                                 elementTypeAndValue.ElemPointer = false;
                             }
                             else
@@ -7033,7 +7033,7 @@ public:
                             llvm::Value* visitorAlloca = visitorNV.Storage;
                             if (!visitorAlloca)
                             {
-                                // Visitor was a temporary — alloca it now
+                                // Visitor was a temporary - alloca it now
                                 auto* fatTy = compiler->GetFatPtrType();
                                 visitorAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_visitor_tmp");
                                 llvm::Value* visitorVal = visitorNV.Primary;
@@ -7337,7 +7337,7 @@ public:
                                 break;
                             }
 
-                            // 3. Evaluate src argument — must be IJSON
+                            // 3. Evaluate src argument - must be IJSON
                             auto srcNV = ParseAssignmentExpressionNamed(namedArgCtx[1]->assignmentExpression());
                             if (!srcNV.TypeAndValue.IsInterface || srcNV.TypeAndValue.TypeName != "IJSON")
                             {
@@ -7573,7 +7573,7 @@ public:
                             break;
                         }
 
-                        // Compile-time intrinsic: is_pointer(T) — returns 1 if the type parameter T
+                        // Compile-time intrinsic: is_pointer(T) - returns 1 if the type parameter T
                         // resolves to a pointer type in the current generic instantiation, 0 otherwise.
                         // Useful with `if const` to branch on pointer vs value element types.
                         if (functionName == "is_pointer")
@@ -7599,7 +7599,7 @@ public:
                             break;
                         }
 
-                        // Compile-time intrinsic: is_primitive(T) — returns 1 if T resolves to a primitive
+                        // Compile-time intrinsic: is_primitive(T) - returns 1 if T resolves to a primitive
                         // type (integer, float, bool, void), 0 otherwise. Use with `if const` to branch
                         // on primitive vs struct element types in generic data structures.
                         if (functionName == "is_primitive")
@@ -7629,7 +7629,7 @@ public:
                             break;
                         }
 
-                        // Handle va_start / va_end — pass the va_list alloca address to the LLVM intrinsic.
+                        // Handle va_start / va_end - pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
                             if (argumentList.size() > 0)
@@ -7653,7 +7653,7 @@ public:
                             break;
                         }
 
-                        // Check if this is a function pointer variable — emit an indirect call.
+                        // Check if this is a function pointer variable - emit an indirect call.
                         if (namedVar.TypeAndValue.IsFunctionPointer)
                         {
                             llvm::Value* funcPtr = nullptr;
@@ -7684,7 +7684,7 @@ public:
                             }
                         }
 
-                        // Check if this is a return-block function — inline it at the call site.
+                        // Check if this is a return-block function - inline it at the call site.
                         // A 'return' inside the block returns from the caller function.
                         if (const auto* rb = Compiler(ctx)->GetReturnBlock(functionName))
                         {
@@ -7758,7 +7758,7 @@ public:
                             Compiler(ctx)->CreateBlockBreak(nullptr, true);
 
                             // The block's 'return' already terminated the caller's basic block.
-                            // Return an empty namedVar — callers must tolerate null after a terminator.
+                            // Return an empty namedVar - callers must tolerate null after a terminator.
                             namedVar = {};
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
@@ -7910,7 +7910,7 @@ public:
                             }
                             else
                             {
-                                // Bare call inside a member function — inject 'this' automatically
+                                // Bare call inside a member function - inject 'this' automatically
                                 // if the callee is a method of the same struct.
                                 auto thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
                                 if (thisVar.Storage != nullptr)
@@ -8059,7 +8059,7 @@ public:
 
                                     // Propagate struct TypeName for pointer args (e.g. move expressions, new)
                                     // so struct*->interface* upcast matching works in ComputeOverloadFunction.
-                                    // Only propagate for known struct types — primitive TypeNames (char, bool,
+                                    // Only propagate for known struct types - primitive TypeNames (char, bool,
                                     // int, …) must stay empty so LLVM-type comparison handles them correctly.
                                     if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
                                         && !argNV.TypeAndValue.TypeName.empty()
@@ -8239,7 +8239,7 @@ public:
             if (child->getTreeType() == antlr4::tree::ParseTreeType::RULE)
             {
                 if (singleRuleChild != nullptr)
-                    return nullptr; // multiple rule children — complex expression
+                    return nullptr; // multiple rule children - complex expression
                 singleRuleChild = dynamic_cast<antlr4::RuleContext*>(child);
             }
         }
@@ -8345,7 +8345,7 @@ public:
                 }
                 if (depth > 0)
                 {
-                    // No matching '}' within this string literal — treat '{' as a literal character.
+                    // No matching '}' within this string literal - treat '{' as a literal character.
                     litAccum += '{';
                     i++;
                     continue;
@@ -8353,7 +8353,7 @@ public:
                 std::string exprText = rawText.substr(exprStart, j - exprStart);
                 i = j + 1; // skip past '}'
 
-                // Empty or non-expression content (e.g. JSON {"key": "value"}) — keep as literal.
+                // Empty or non-expression content (e.g. JSON {"key": "value"}) - keep as literal.
                 if (exprText.empty() || exprText[0] == '\\' || exprText[0] == '"')
                 {
                     litAccum += '{';
@@ -8380,7 +8380,7 @@ public:
 
                 if (isString)
                 {
-                    // Already a string struct — extract _ptr (field 0) and _len (field 1)
+                    // Already a string struct - extract _ptr (field 0) and _len (field 1)
                     llvm::Value* strVal = nv.Primary ? nv.Primary : compiler->CreateLoad(nv.Storage);
                     ptr = compiler->builder->CreateExtractValue(strVal, { 0u });
                     len = compiler->builder->CreateExtractValue(strVal, { 1u });
@@ -8417,7 +8417,7 @@ public:
 
         if (segments.empty())
         {
-            // Degenerate: no content at all — return empty string struct
+            // Degenerate: no content at all - return empty string struct
             auto* gv = compiler->CreateGlobalString("fmtempty", "");
             return compiler->WrapStringLiteralAsString(gv);
         }
@@ -8472,7 +8472,7 @@ public:
         {
             if (!node) return;
 
-            // Stop at nested lambdas — they capture their own closures separately.
+            // Stop at nested lambdas - they capture their own closures separately.
             if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
                 return;
 
@@ -8621,7 +8621,7 @@ public:
             }
         }
 
-        // Save builder position — invoker emits into a separate LLVM function.
+        // Save builder position - invoker emits into a separate LLVM function.
         auto savedState = compiler->SaveBuilderState();
 
         // Invoker signature: (i8* __env, user_params...) -> RetType
@@ -8678,7 +8678,7 @@ public:
         // If the lambda parameter was declared lock(this), seed currentLockSet with the
         // resolved receiver guard (e.g. "d.ready") so GuardedBy checks inside the body pass.
         std::string consumedLockThisReceiver = lambdaLockThisReceiver;
-        lambdaLockThisReceiver = {};  // consumed — clear before body in case of nested lambdas
+        lambdaLockThisReceiver = {};  // consumed - clear before body in case of nested lambdas
         std::unordered_set<std::string> savedLockSet;
         if (!consumedLockThisReceiver.empty())
         {
@@ -8742,7 +8742,7 @@ public:
         result.Primary     = fat;
         result.TypeAndValue = tv;
 
-        // Phase 6: Bond tracking — reference-captured variables are held by pointer.
+        // Phase 6: Bond tracking - reference-captured variables are held by pointer.
         // The lambda borrows stack addresses that cannot outlive their source scope.
         for (const auto& cap : captures)
         {
@@ -8875,11 +8875,11 @@ public:
 
         if (ctx->TypeOf())
         {
-            // typeof(int), typeof(bool), typeof(MyStruct) — type specifier used directly
+            // typeof(int), typeof(bool), typeof(MyStruct) - type specifier used directly
             if (auto* ts = ctx->typeSpecifier())
                 return compiler->CreateGlobalString("typeof", ts->getText());
 
-            // typeof(expr) — navigate down to unaryExpression to read TypeAndValue
+            // typeof(expr) - navigate down to unaryExpression to read TypeAndValue
             std::string typeName;
 
             // ANTLR picks the expression alternative for user-defined type names (Identifier
@@ -9051,7 +9051,7 @@ public:
         if (compiler->GetReturnBlock(name) != nullptr)
             return {};
 
-        // Compiler intrinsics handled at the call site — not in the function table.
+        // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_primitive", "annotationof",
             "reflect", "reflect_set",
@@ -9293,7 +9293,7 @@ public:
             if (typeSpec->tupleTypeSpecifier() != nullptr)
             {
                 auto* tts = typeSpec->tupleTypeSpecifier();
-                // Pack-only form (T...) resolved during instantiation — skip queuing here
+                // Pack-only form (T...) resolved during instantiation - skip queuing here
                 if (tts->tupleTypePackEntry() != nullptr)
                     break;
                 std::vector<std::string> typeArgs;
@@ -9359,7 +9359,7 @@ public:
             {
                 if (ifaceIt != genericInterfaceTemplates.end())
                 {
-                    // It's a generic interface — instantiate it (pack-aware)
+                    // It's a generic interface - instantiate it (pack-aware)
                     std::unordered_map<std::string, std::string> ifaceSubst;
                     std::unordered_map<std::string, std::vector<std::string>> ifacePackSubst;
                     const auto& ifaceTypeParams = genericInterfaceTypeParams[pending.templateName];
@@ -9462,7 +9462,7 @@ public:
             genericStructTemplates[structName] = ctx;
             genericStructTypeParams[structName] = typeParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
-            // Record which param (if any) is variadic — always the last one
+            // Record which param (if any) is variadic - always the last one
             {
                 auto entries = ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry();
                 bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
@@ -9640,7 +9640,7 @@ public:
             if (isUnion)
             {
                 // Union: zero-initialize all storage. Fields share the same memory, so we
-                // can't insert individual field values — just return a zeroed union value.
+                // can't insert individual field values - just return a zeroed union value.
                 compiler->CreateReturnCall(llvm::Constant::getNullValue(structType));
             }
             else
@@ -9682,7 +9682,7 @@ public:
                 for (auto rvalue : initializers)
                 {
                     auto* destType = structType->getTypeAtIndex(structIndex);
-                    // No explicit initializer on a struct-typed field — call its default ctor.
+                    // No explicit initializer on a struct-typed field - call its default ctor.
                     if (rvalue == nullptr && destType->isStructTy())
                     {
                         std::string fieldTypeName = declList[structIndex].TypeName;
@@ -9711,7 +9711,7 @@ public:
                             {
                                 // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
                                 compiler->LogWarning(std::format(
-                                    "implicit narrowing to '{}' in field '{}' — use an explicit cast",
+                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
                                     declList[structIndex].TypeName,
                                     declList[structIndex].VariableName));
                                 rvalue = compiler->CreateCast(rvalue, destType);
@@ -9771,7 +9771,7 @@ public:
 
                 std::string funcName = getFunctionName(func);
 
-                // Constructor overload — pre-declare without this* parameter
+                // Constructor overload - pre-declare without this* parameter
                 if (funcName == baseName && func->parameterTypeList())
                 {
                     auto* declParamList = func->parameterTypeList();
@@ -9837,7 +9837,7 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                // Constructor — same name as struct (no-arg or with parameters)
+                // Constructor - same name as struct (no-arg or with parameters)
                 if (funcName == baseName)
                 {
                     ParseConstructorDefinition(func, structName);
@@ -9957,7 +9957,7 @@ public:
             if (head == "this")
             {
                 // this-relative lock: substitute with the receiver variable name.
-                if (receiverText.empty()) continue; // no known receiver — skip
+                if (receiverText.empty()) continue; // no known receiver - skip
                 canonical = rest.empty() ? receiverText : receiverText + "." + rest;
             }
             else
@@ -9971,7 +9971,7 @@ public:
                     if (pi < arguments.size())
                     {
                         const std::string& argName = arguments[pi].CallerName;
-                        if (argName.empty()) found = true; // complex expression — can't check
+                        if (argName.empty()) found = true; // complex expression - can't check
                         else
                             canonical = rest.empty() ? argName : argName + "." + rest;
                     }
@@ -9979,7 +9979,7 @@ public:
                     break;
                 }
                 if (!found)
-                    canonical = lock; // global lock — no substitution
+                    canonical = lock; // global lock - no substitution
             }
 
             if (!canonical.empty() && currentLockSet.find(canonical) == currentLockSet.end())
@@ -10007,7 +10007,7 @@ public:
     {
         auto* compiler = compilerLLVM;
 
-        // Resolve types — all must be concrete by this point (ProcessPendingInstantiations ran)
+        // Resolve types - all must be concrete by this point (ProcessPendingInstantiations ran)
         auto* progType        = compiler->dataStructures[name].StructType;
         auto* defAllocType    = compiler->dataStructures.count("BucketAllocator")
                                 ? compiler->dataStructures["BucketAllocator"].StructType : nullptr;
@@ -10091,9 +10091,9 @@ public:
 
         // Detect calling style from LLVM arg count.
         // Regular program methods have 'self' as the first arg, so the counts are offset by 1:
-        //   1 arg  = NoArgs   (self — "int main()")
-        //   2 args = ListArgs (self + list<string> — "int main(move list<string> args)")
-        //   3 args = ArgcArgv (self + int + char** — "int main(int argc, char** argv)")
+        //   1 arg  = NoArgs   (self - "int main()")
+        //   2 args = ListArgs (self + list<string> - "int main(move list<string> args)")
+        //   3 args = ArgcArgv (self + int + char** - "int main(int argc, char** argv)")
         // Imported programs are free functions (no self), so counts are:
         //   0 args = NoArgs   ("int main()")
         //   1 arg  = ListArgs ("int main(move list<string> args)")  [not yet supported]
@@ -10132,7 +10132,7 @@ public:
         auto* stopSrcType          = compiler->dataStructures.count("stop_source")
                                      ? compiler->dataStructures["stop_source"].StructType : nullptr;
 
-        // __ProgramTLS field indices — must match struct __ProgramTLS in cruntime.cb
+        // __ProgramTLS field indices - must match struct __ProgramTLS in cruntime.cb
         constexpr int kPTLS_stdout_hook            = 0;
         constexpr int kPTLS_stdin_hook             = 4;
         constexpr int kPTLS_stdin_return_hook      = 8;
@@ -10150,7 +10150,7 @@ public:
         if (!progTlsGlobal)
         {
             compiler->LogError(std::format(
-                "program '{}': __prog_tls not found — cruntime.cb must be imported", name));
+                "program '{}': __prog_tls not found - cruntime.cb must be imported", name));
             return;
         }
         auto* progTlsType        = llvm::StructType::getTypeByName(*compiler->context, "__ProgramTLS");
@@ -10160,7 +10160,7 @@ public:
         // Cast trampoline to the expected function pointer type: int(*)(void*)
         auto* trampolineFnTy = llvm::FunctionType::get(i32Type, {voidPtrType}, false);
 
-        // SEH filter: always return EXCEPTION_EXECUTE_HANDLER (1) — catch everything.
+        // SEH filter: always return EXCEPTION_EXECUTE_HANDLER (1) - catch everything.
         // Emitted once per module (deduped by name). Uses an isolated IRBuilder so the
         // main builder's insertion point is not disturbed.
         llvm::Function* sehFilterFn = compiler->module->getFunction("__cflat_seh_filter_always");
@@ -10216,7 +10216,7 @@ public:
             auto* selfGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 0, "self_gep");
             auto* self     = compiler->builder->CreateLoad(progPtrType, selfGEP, "self");
 
-            // Pointer to list__string (field 1) — passed by value to main
+            // Pointer to list__string (field 1) - passed by value to main
             auto* argsGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 1, "args_gep");
 
             // Load self->_allocator (IAllocator fat-ptr); user may have set it before run().
@@ -10329,7 +10329,7 @@ public:
             // Load list__string args by value from the packet
             auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
-            // exitCodeGEP must dominate all paths — compute in the entry block.
+            // exitCodeGEP must dominate all paths - compute in the entry block.
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(
                 progType, self, exitCodeIdx, "exit_code_gep");
 
@@ -10429,13 +10429,13 @@ public:
                 // which would move null-dereference faults outside the invoke's protected region.
                 mainFn->addFnAttr(llvm::Attribute::NoInline);
 
-                // Invoke main() — normal return lands in normalBB, any fault unwinds to dispatchBB.
+                // Invoke main() - normal return lands in normalBB, any fault unwinds to dispatchBB.
                 auto* invokeInst = compiler->builder->CreateInvoke(
                     mainFn->getFunctionType(), mainFn,
                     normalBB, dispatchBB,
                     mainArgs, "main_result");
 
-                // normalBB: main returned cleanly — store exit code, fall through to cleanup.
+                // normalBB: main returned cleanly - store exit code, fall through to cleanup.
                 compiler->builder->SetInsertPoint(normalBB);
                 compiler->builder->CreateStore(invokeInst, exitCodeGEP);
                 compiler->builder->CreateBr(cleanupBB);
@@ -10460,14 +10460,14 @@ public:
             {
                 // Win32: LLVM's x86 backend drops the catch-handler body when using
                 // _except_handler3 + catchpad/catchret, producing broken EH tables.
-                // Fall back to a plain call — crash recovery is not supported on Win32.
+                // Fall back to a plain call - crash recovery is not supported on Win32.
                 auto* callResult = compiler->builder->CreateCall(
                     mainFn->getFunctionType(), mainFn, mainArgs, "main_result");
                 compiler->builder->CreateStore(callResult, exitCodeGEP);
                 compiler->builder->CreateBr(cleanupBB);
             }
 
-            // cleanupBB: shared teardown — both normal and exception paths converge here.
+            // cleanupBB: shared teardown - both normal and exception paths converge here.
             compiler->builder->SetInsertPoint(cleanupBB);
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
             {
@@ -10558,7 +10558,7 @@ public:
         // ======================================================================
         // EMIT run(): bool run(Name* this, list__string args)
         // Allocates args packet, spawns thread into self->_thread, returns
-        // whether the thread started. Does NOT join — caller uses WaitForExit().
+        // whether the thread started. Does NOT join - caller uses WaitForExit().
         // ======================================================================
         {
             LLVMBackend::TypeAndValue boolReturn;  boolReturn.TypeName = "bool";
@@ -10574,7 +10574,7 @@ public:
             auto* thisArg = runFn->getArg(0);   // Name*
             auto* argsArg = runFn->getArg(1);   // list__string by value (move)
 
-            // Malloc the args packet (raw malloc — tracked alloc is per-thread)
+            // Malloc the args packet (raw malloc - tracked alloc is per-thread)
             auto* pkgSize = compiler->GetTypeSizeBytes(runArgsType);
             auto* pkgRaw  = compiler->builder->CreateCall(
                 mallocFn->getFunctionType(), mallocFn, {pkgSize}, "pkg_raw");
@@ -10597,7 +10597,7 @@ public:
                         llvm::ConstantAggregateZero::get(listStringType), runArgNV.Storage);
             }
 
-            // Init _stop_source before spawning — gives main() a live token to check
+            // Init _stop_source before spawning - gives main() a live token to check
             if (stopSrcInitFn && stopSrcType)
             {
                 auto* stopSrcGEP = compiler->builder->CreateStructGEP(
@@ -10728,7 +10728,7 @@ public:
         // ======================================================================
         // EMIT RequestStop(): void RequestStop(Name* this)
         // Signals the program's _stop_source so main() can observe it via
-        // _stop_source.get_token().stop_requested(). Cooperative — main() must check.
+        // _stop_source.get_token().stop_requested(). Cooperative - main() must check.
         // ======================================================================
         {
             if (stopSrcRequestStopFn && stopSrcType)
@@ -10768,7 +10768,7 @@ public:
 
                 auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
 
-                // Signal the stop token first — gives cooperative loops a chance to observe it.
+                // Signal the stop token first - gives cooperative loops a chance to observe it.
                 if (stopSrcRequestStopFn && stopSrcType)
                 {
                     auto* stopSrcGEP = compiler->builder->CreateStructGEP(
@@ -10845,7 +10845,7 @@ public:
 
         // ======================================================================
         // EMIT exitCode(): int exitCode(Name* this)
-        // Returns the exitCode field — satisfies the IProcess interface contract.
+        // Returns the exitCode field - satisfies the IProcess interface contract.
         // ======================================================================
         {
             LLVMBackend::TypeAndValue intReturn;  intReturn.TypeName = "int";
@@ -10884,7 +10884,7 @@ public:
             ProcessPendingInstantiations();
         }
 
-        // No user-declared fields — only synthetic fields
+        // No user-declared fields - only synthetic fields
         std::vector<LLVMBackend::DeclTypeAndValue> declList;
 
         unsigned exitCodeFieldIndex     = (unsigned)declList.size();
@@ -11193,8 +11193,8 @@ public:
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
         // onStdout (function<void(char*)>), onStdin (function<char*()>),
         // inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
-        // trackHandles (int — stored as i32 to avoid i1-in-ConstantStruct LLVM assertion),
-        // _out / _in (stream* — only when stream.cb is imported; set by >> for direct write_bytes/read_buf access)
+        // trackHandles (int - stored as i32 to avoid i1-in-ConstantStruct LLVM assertion),
+        // _out / _in (stream* - only when stream.cb is imported; set by >> for direct write_bytes/read_buf access)
         unsigned exitCodeFieldIndex     = (unsigned)declList.size();
         unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex    = threadFieldIndex + 1;
@@ -11247,7 +11247,7 @@ public:
             onStdinReturnField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdinReturnField);
 
-            // inbox: IQueue<IMessage> fat-ptr — swappable before run() just like _allocator.
+            // inbox: IQueue<IMessage> fat-ptr - swappable before run() just like _allocator.
             // By default the constructor pre-allocates a channel<IMessage> and builds the fat-ptr.
             // Users can replace it with any IQueue<IMessage> implementation via `p.inbox = &myQueue`.
             LLVMBackend::DeclTypeAndValue inboxField;
@@ -11416,7 +11416,7 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, stopSrcInitVal, stopSrcFieldIndex);
             }
 
-            // Synthetic field: trackHandles = 0 (int, not bool — avoids i1-in-ConstantStruct assertion)
+            // Synthetic field: trackHandles = 0 (int, not bool - avoids i1-in-ConstantStruct assertion)
             structVal = compiler->CreateInsertValue(
                 structVal,
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
@@ -11720,7 +11720,7 @@ public:
             for (auto rvalue : initializers)
             {
                 auto* destType = structType->getTypeAtIndex(structIndex);
-                // No explicit initializer on a struct-typed field — call its default ctor.
+                // No explicit initializer on a struct-typed field - call its default ctor.
                 if (rvalue == nullptr && destType->isStructTy())
                 {
                     std::string fieldTypeName = declList[structIndex].TypeName;
@@ -11789,7 +11789,7 @@ public:
 
                 std::string funcName = getFunctionName(func);
 
-                // Constructor overload — pre-declare without this* parameter
+                // Constructor overload - pre-declare without this* parameter
                 if (funcName == baseName && func->parameterTypeList())
                 {
                     auto* declParamList = func->parameterTypeList();
@@ -11907,7 +11907,7 @@ public:
                 std::string funcName = getFunctionName(func);
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
-                // Constructor — same name as class (no-arg or with parameters)
+                // Constructor - same name as class (no-arg or with parameters)
                 if (funcName == baseName)
                 {
                     ParseConstructorDefinition(func, structName);
@@ -12102,7 +12102,7 @@ public:
         returnType.TypeName = structName;
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
-        // Open constructor function — no this* parameter; returns the struct by value
+        // Open constructor function - no this* parameter; returns the struct by value
         auto fn = compiler->CreateFunctionDefinition(structName, returnType, allParams, false, varargs, line);
         compiler->InitializeBlock(&fn->front(), false);
 

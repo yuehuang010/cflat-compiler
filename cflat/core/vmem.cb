@@ -1,4 +1,4 @@
-// vmem.cb — OS virtual memory abstraction
+// vmem.cb - OS virtual memory abstraction
 //
 // Wraps platform page-allocation primitives behind four named functions so
 // allocators are not littered with Windows-specific magic constants.

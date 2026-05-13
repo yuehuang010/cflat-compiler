@@ -187,7 +187,7 @@ extern int main() {
         return 10;
     }
 
-    // Underscore-prefixed struct names — sizeof must handle identifiers starting with '_'
+    // Underscore-prefixed struct names - sizeof must handle identifiers starting with '_'
     i64 sizeof_underscore = sizeof(_UnderscoreStruct);
     if (sizeof_underscore != 8) return 11;
 
@@ -198,7 +198,7 @@ extern int main() {
         if (sizeof_dunder != 8) return 11;
     }
 
-    // Struct with function<T> pointer field — sizeof must return correct size
+    // Struct with function<T> pointer field - sizeof must return correct size
     // function<T> is a fat struct {i8*, i8*}; on x64: 16+8=24, on x86: 8+4=12
     i64 sizeof_funcptr_field = sizeof(FuncPtrFieldStruct);
     if const (__PLATFORM__ == 64) {

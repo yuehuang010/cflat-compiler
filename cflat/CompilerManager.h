@@ -41,7 +41,7 @@ public:
         // LLVM is a DLL with its own CRT, so its asserts won't reach this hook.
         _CrtSetReportHook2(_CRT_RPTHOOK_INSTALL, &CompilerManager::AssertHook);
 
-        // SIGABRT is process-wide — catches abort() from any module including LLVM DLLs.
+        // SIGABRT is process-wide - catches abort() from any module including LLVM DLLs.
         signal(SIGABRT, &CompilerManager::AbortHandler);
 
         // LLVM fatal errors (llvm_unreachable etc.) that go through LLVM's own handler.

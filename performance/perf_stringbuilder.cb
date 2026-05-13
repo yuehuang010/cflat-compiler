@@ -5,13 +5,13 @@
 // the first few calls; subsequent iterations hit the already-warm buffer.
 //
 // Sections:
-//   append(string)        — copies string value by length+memcpy path
-//   append(const char*)   — calls strlen then copies (len=1000 omitted, no literal)
-//   appendLine(string)    — append + appendChar('\n')
+//   append(string)        - copies string value by length+memcpy path
+//   append(const char*)   - calls strlen then copies (len=1000 omitted, no literal)
+//   appendLine(string)    - append + appendChar('\n')
 //   appendLine(const char*)
-//   append(i32)           — sprintf into a 32-byte scratch buf then copy
-//   append(bool)          — dispatches to appendCStr("true"/"false")
-//   appendChar(i8)        — single-byte hot path
+//   append(i32)           - sprintf into a 32-byte scratch buf then copy
+//   append(bool)          - dispatches to appendCStr("true"/"false")
+//   appendChar(i8)        - single-byte hot path
 
 import "string.cb";
 import "time.cb";
@@ -149,33 +149,33 @@ extern int main()
     printf("Payload lengths: s10=%d  s50=%d  s100=%d  s1000=%d\n",
         s10.length(), s50.length(), s100.length(), s1000.length());
 
-    PerfHeader("append(string) — N=500000");
+    PerfHeader("append(string) - N=500000");
     PerfPrint("len=10",   (i64)N, bench_append_str(N, s10),   (i64)0);
     PerfPrint("len=50",   (i64)N, bench_append_str(N, s50),   (i64)0);
     PerfPrint("len=100",  (i64)N, bench_append_str(N, s100),  (i64)0);
     PerfPrint("len=1000", (i64)N, bench_append_str(N, s1000), (i64)0);
 
-    PerfHeader("append(const char*) — N=500000");
+    PerfHeader("append(const char*) - N=500000");
     PerfPrint("len=10",  (i64)N, bench_append_cstr10(N),  (i64)0);
     PerfPrint("len=50",  (i64)N, bench_append_cstr50(N),  (i64)0);
     PerfPrint("len=100", (i64)N, bench_append_cstr100(N), (i64)0);
 
-    PerfHeader("appendLine(string) — N=500000");
+    PerfHeader("appendLine(string) - N=500000");
     PerfPrint("len=10",   (i64)N, bench_appendline_str(N, s10),   (i64)0);
     PerfPrint("len=50",   (i64)N, bench_appendline_str(N, s50),   (i64)0);
     PerfPrint("len=100",  (i64)N, bench_appendline_str(N, s100),  (i64)0);
     PerfPrint("len=1000", (i64)N, bench_appendline_str(N, s1000), (i64)0);
 
-    PerfHeader("appendLine(const char*) — N=500000");
+    PerfHeader("appendLine(const char*) - N=500000");
     PerfPrint("len=10", (i64)N, bench_appendline_cstr10(N), (i64)0);
 
-    PerfHeader("append(i32) — N=500000");
+    PerfHeader("append(i32) - N=500000");
     PerfPrint("value=42", (i64)N, bench_append_int(N), (i64)0);
 
-    PerfHeader("append(bool) — N=500000");
+    PerfHeader("append(bool) - N=500000");
     PerfPrint("value=true", (i64)N, bench_append_bool(N), (i64)0);
 
-    PerfHeader("appendChar(i8) — N=500000");
+    PerfHeader("appendChar(i8) - N=500000");
     PerfPrint("char='x'", (i64)N, bench_append_char(N), (i64)0);
 
     printf("\n");

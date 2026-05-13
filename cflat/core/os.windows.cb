@@ -1,4 +1,4 @@
-// Windows platform extern declarations — Win32 API and MSVC CRT.
+// Windows platform extern declarations - Win32 API and MSVC CRT.
 // Imported by os.cb when __WIN64__ or __WIN32__ is defined.
 
 // Win32 int is always 32-bit regardless of host pointer width.
@@ -13,7 +13,7 @@ if const (__PLATFORM__ == 64) {
     using win_usize   = u32;
 }
 
-// Win32 Threading — all Win32 API functions use __stdcall calling convention.
+// Win32 Threading - all Win32 API functions use __stdcall calling convention.
 extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
 extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
 extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
@@ -48,39 +48,39 @@ extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, 
 extern stdcall void     WakeConditionVariable(void* cv);
 extern stdcall void     WakeAllConditionVariable(void* cv);
 
-// Win32 SYSTEM_INFO — pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
+// Win32 SYSTEM_INFO - pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
 // x64: 48 bytes (pointers = 8 bytes); x86: 36 bytes (pointers = 4 bytes).
 struct _SystemInfo
 {
-    u32 _oemId            = default;  //  0 — dwOemId union
-    u32 _pageSize         = default;  //  4 — dwPageSize
-    i8* _minAddr          = default;  //  8 — lpMinimumApplicationAddress (pointer-sized)
-    i8* _maxAddr          = default;  // 16/12 — lpMaximumApplicationAddress (pointer-sized)
-    i8* _procMask         = default;  // 24/16 — dwActiveProcessorMask (ULONG_PTR, pointer-sized)
-    u32 _numProc          = default;  // 32/20 — dwNumberOfProcessors
-    u32 _procType         = default;  // 36/24 — dwProcessorType
-    u32 _allocGranularity = default;  // 40/28 — dwAllocationGranularity (VirtualAlloc page size)
+    u32 _oemId            = default;  //  0 - dwOemId union
+    u32 _pageSize         = default;  //  4 - dwPageSize
+    i8* _minAddr          = default;  //  8 - lpMinimumApplicationAddress (pointer-sized)
+    i8* _maxAddr          = default;  // 16/12 - lpMaximumApplicationAddress (pointer-sized)
+    i8* _procMask         = default;  // 24/16 - dwActiveProcessorMask (ULONG_PTR, pointer-sized)
+    u32 _numProc          = default;  // 32/20 - dwNumberOfProcessors
+    u32 _procType         = default;  // 36/24 - dwProcessorType
+    u32 _allocGranularity = default;  // 40/28 - dwAllocationGranularity (VirtualAlloc page size)
     u16 _procLevel        = default;  // 44/32
     u16 _procRevision     = default;  // 46/34
 };
 
-// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION — pointer-sized ProcessorMask.
+// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION - pointer-sized ProcessorMask.
 // x64: 32 bytes; x86: 24 bytes. The union at offset 8/4 is interpreted as
 // CACHE_DESCRIPTOR when _relationship == RelationCache (2).
 struct _SysLogicalProcInfo
 {
-    i8* _processorMask = default;  //  0 — ULONG_PTR ProcessorMask (pointer-sized)
-    u32 _relationship  = default;  //  8/4 — LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
-    u32 _pad           = default;  // 12/8 — padding before union
-    u8  _cacheLevel    = default;  // 16/12 — CACHE_DESCRIPTOR.Level
-    u8  _cacheAssoc    = default;  // 17/13 — CACHE_DESCRIPTOR.Associativity
-    u16 _cacheLineSize = default;  // 18/14 — CACHE_DESCRIPTOR.LineSize
-    u32 _cacheSize     = default;  // 20/16 — CACHE_DESCRIPTOR.Size
-    u32 _cacheType     = default;  // 24/20 — PROCESSOR_CACHE_TYPE
-    u32 _pad2          = default;  // 28/24 — trailing pad
+    i8* _processorMask = default;  //  0 - ULONG_PTR ProcessorMask (pointer-sized)
+    u32 _relationship  = default;  //  8/4 - LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
+    u32 _pad           = default;  // 12/8 - padding before union
+    u8  _cacheLevel    = default;  // 16/12 - CACHE_DESCRIPTOR.Level
+    u8  _cacheAssoc    = default;  // 17/13 - CACHE_DESCRIPTOR.Associativity
+    u16 _cacheLineSize = default;  // 18/14 - CACHE_DESCRIPTOR.LineSize
+    u32 _cacheSize     = default;  // 20/16 - CACHE_DESCRIPTOR.Size
+    u32 _cacheType     = default;  // 24/20 - PROCESSOR_CACHE_TYPE
+    u32 _pad2          = default;  // 28/24 - trailing pad
 };
 
-// Win32 Virtual Memory — dwSize is SIZE_T (win_size).
+// Win32 Virtual Memory - dwSize is SIZE_T (win_size).
 extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
 extern stdcall void     GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
 extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
@@ -98,7 +98,7 @@ if const (__PLATFORM__ == 32) {
     }
 }
 
-// WIN32_FIND_DATAA — mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
+// WIN32_FIND_DATAA - mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
 // FILETIME is two consecutive DWORDs; keeping them as i32 pairs avoids padding
 // that would appear if we used i64 (since ftCreationTime starts at byte offset 4).
 struct _WIN32_FIND_DATAA
@@ -145,45 +145,45 @@ extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefi
 extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
 
 // Win32 Console
-// _CONSOLE_CURSOR_INFO — 8 bytes (dwSize + bVisible).
+// _CONSOLE_CURSOR_INFO - 8 bytes (dwSize + bVisible).
 struct _CONSOLE_CURSOR_INFO {
-    i32 size    = default;  // 0 — dwSize: cursor fill percentage (1-100)
-    i32 visible = default;  // 4 — bVisible: BOOL
+    i32 size    = default;  // 0 - dwSize: cursor fill percentage (1-100)
+    i32 visible = default;  // 4 - bVisible: BOOL
 };
 
-// _CONSOLE_SCREEN_BUFFER_INFO — 22 bytes.
+// _CONSOLE_SCREEN_BUFFER_INFO - 22 bytes.
 // All SHORT fields (i16); no padding needed since all fields are 2-byte aligned.
 struct _CONSOLE_SCREEN_BUFFER_INFO {
-    i16 sizeX      = default;  //  0 — dwSize.X
-    i16 sizeY      = default;  //  2 — dwSize.Y
-    i16 cursorX    = default;  //  4 — dwCursorPosition.X
-    i16 cursorY    = default;  //  6 — dwCursorPosition.Y
-    i16 attributes = default;  //  8 — wAttributes
-    i16 winLeft    = default;  // 10 — srWindow.Left
-    i16 winTop     = default;  // 12 — srWindow.Top
-    i16 winRight   = default;  // 14 — srWindow.Right
-    i16 winBottom  = default;  // 16 — srWindow.Bottom
-    i16 maxX       = default;  // 18 — dwMaximumWindowSize.X
-    i16 maxY       = default;  // 20 — dwMaximumWindowSize.Y
+    i16 sizeX      = default;  //  0 - dwSize.X
+    i16 sizeY      = default;  //  2 - dwSize.Y
+    i16 cursorX    = default;  //  4 - dwCursorPosition.X
+    i16 cursorY    = default;  //  6 - dwCursorPosition.Y
+    i16 attributes = default;  //  8 - wAttributes
+    i16 winLeft    = default;  // 10 - srWindow.Left
+    i16 winTop     = default;  // 12 - srWindow.Top
+    i16 winRight   = default;  // 14 - srWindow.Right
+    i16 winBottom  = default;  // 16 - srWindow.Bottom
+    i16 maxX       = default;  // 18 - dwMaximumWindowSize.X
+    i16 maxY       = default;  // 20 - dwMaximumWindowSize.Y
 };
 
-// KEY_EVENT_RECORD — 16 bytes at offset 4 inside INPUT_RECORD.
+// KEY_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
 struct _KeyEventRecord {
-    i32 keyDown         = default;  //  0 — BOOL bKeyDown
-    i16 repeatCount     = default;  //  4 — wRepeatCount
-    i16 vkCode          = default;  //  6 — wVirtualKeyCode
-    i16 vkScan          = default;  //  8 — wVirtualScanCode
-    i16 uChar           = default;  // 10 — WCHAR/CHAR (low byte = ASCII)
-    i32 controlKeyState = default;  // 12 — dwControlKeyState
+    i32 keyDown         = default;  //  0 - BOOL bKeyDown
+    i16 repeatCount     = default;  //  4 - wRepeatCount
+    i16 vkCode          = default;  //  6 - wVirtualKeyCode
+    i16 vkScan          = default;  //  8 - wVirtualScanCode
+    i16 uChar           = default;  // 10 - WCHAR/CHAR (low byte = ASCII)
+    i32 controlKeyState = default;  // 12 - dwControlKeyState
 };
 
-// MOUSE_EVENT_RECORD — 16 bytes at offset 4 inside INPUT_RECORD.
+// MOUSE_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
 struct _MouseEventRecord {
-    i16 mouseX          = default;  //  0 — dwMousePosition.X
-    i16 mouseY          = default;  //  2 — dwMousePosition.Y
-    i32 buttonState     = default;  //  4 — dwButtonState
-    i32 controlKeyState = default;  //  8 — dwControlKeyState
-    i32 eventFlags      = default;  // 12 — dwEventFlags
+    i16 mouseX          = default;  //  0 - dwMousePosition.X
+    i16 mouseY          = default;  //  2 - dwMousePosition.Y
+    i32 buttonState     = default;  //  4 - dwButtonState
+    i32 controlKeyState = default;  //  8 - dwControlKeyState
+    i32 eventFlags      = default;  // 12 - dwEventFlags
 };
 
 // Union of the two event record types.
@@ -192,11 +192,11 @@ union _InputEvent {
     _MouseEventRecord mouse = default;
 };
 
-// _INPUT_RECORD — 20 bytes: eventType (2) + pad (2) + 16-byte event union.
+// _INPUT_RECORD - 20 bytes: eventType (2) + pad (2) + 16-byte event union.
 struct _INPUT_RECORD {
-    i16         eventType = default;  //  0 — 1=KEY_EVENT, 2=MOUSE_EVENT
-    i16         _pad      = default;  //  2 — alignment pad before union
-    _InputEvent _event    = default;  //  4 — KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
+    i16         eventType = default;  //  0 - 1=KEY_EVENT, 2=MOUSE_EVENT
+    i16         _pad      = default;  //  2 - alignment pad before union
+    _InputEvent _event    = default;  //  4 - KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
 };
 
 extern stdcall void*    GetStdHandle(i32 nStdHandle);
@@ -213,13 +213,13 @@ extern stdcall win_int  PeekConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lp
 extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
 extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
 
-// _CHAR_INFO — 4 bytes per console screen buffer cell.
+// _CHAR_INFO - 4 bytes per console screen buffer cell.
 struct _CHAR_INFO {
-    i16 ch   = default;  // 0 — WCHAR/CHAR union (low byte = ASCII)
-    i16 attr = default;  // 2 — WORD color attributes
+    i16 ch   = default;  // 0 - WCHAR/CHAR union (low byte = ASCII)
+    i16 attr = default;  // 2 - WORD color attributes
 };
 
-// _SMALL_RECT — 8 bytes, used by ReadConsoleOutputA.
+// _SMALL_RECT - 8 bytes, used by ReadConsoleOutputA.
 struct _SMALL_RECT {
     i16 left   = default;
     i16 top    = default;
@@ -232,7 +232,7 @@ struct _SMALL_RECT {
 // return to reflect the actual region read.
 extern stdcall win_int  ReadConsoleOutputA(void* hConsoleOutput, _CHAR_INFO* lpBuffer, i32 dwBufferSize, i32 dwBufferCoord, _SMALL_RECT* lpReadRegion);
 
-// MSVC CRT — cdecl (no stdcall). bufSize is SIZE_T (win_size).
+// MSVC CRT - cdecl (no stdcall). bufSize is SIZE_T (win_size).
 extern void*    __acrt_iob_func(win_int fd);
 extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);

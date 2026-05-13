@@ -1,4 +1,4 @@
-// bitmap.cb — BMP image viewer using Sixel terminal graphics
+// bitmap.cb - BMP image viewer using Sixel terminal graphics
 //
 // Build:
 //   x64/Debug/cflat.exe example/bitmap.cb -i cflat/core -o out/bitmap.exe
@@ -16,9 +16,9 @@ import "math.cb";
 // ── sample image generator ────────────────────────────────────────────────────
 //
 // Builds a 256×128 test card in memory:
-//   top half    — hue wheel (R→G→B across width, brightness increasing downward)
-//   lower quarter — 8-step grayscale ramp
-//   bottom strip  — 7 primary/secondary color bars
+//   top half    - hue wheel (R→G→B across width, brightness increasing downward)
+//   lower quarter - 8-step grayscale ramp
+//   bottom strip  - 7 primary/secondary color bars
 
 Bitmap* makeSample()
 {

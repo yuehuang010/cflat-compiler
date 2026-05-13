@@ -128,7 +128,7 @@ int testSort()
     one.sort((int a, int b) => { return a < b; });
     passed += Test("sort single element", one.get(0), 42);
 
-    // Large input — 100 elements in reverse order
+    // Large input - 100 elements in reverse order
     list<int> large;
     int i = 99;
     while (i >= 0) { large.add(i); i--; }

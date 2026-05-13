@@ -29,7 +29,7 @@ program BenchContainerStress
 
         list<int*> items;
         int i = 0;
-        int* p = nullptr;   // declared before loop — avoid alloca in loop body
+        int* p = nullptr;   // declared before loop - avoid alloca in loop body
         while (i < count)
         {
             p = new int;

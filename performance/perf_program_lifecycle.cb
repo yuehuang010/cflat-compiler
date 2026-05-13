@@ -28,7 +28,7 @@ program WorkUnit
     {
         int i   = 0;
         int sum = 0;
-        int* p  = nullptr;  // declared before loop — avoid alloca in loop body
+        int* p  = nullptr;  // declared before loop - avoid alloca in loop body
         while (i < workItems)
         {
             p = new int;

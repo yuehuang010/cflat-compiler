@@ -5,11 +5,11 @@ cflat is a C-dialect compiler for the CFlat language (`.cb` files), targeting LL
 
 ## Build, Test, Run
 
-**Build** — always use the solution file (`.vcxproj` alone puts the exe in the wrong location for `test.bat`):
+**Build** - always use the solution file (`.vcxproj` alone puts the exe in the wrong location for `test.bat`):
 ```
 msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
 ```
-In Git Bash use `-p:` (dash), not `/p:` (slash) — Git Bash mangles slash-prefixed flags.
+In Git Bash use `-p:` (dash), not `/p:` (slash) - Git Bash mangles slash-prefixed flags.
 
 **Quick dev loop:**
 ```
@@ -43,8 +43,8 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 ### Two-Pass Design
 `MainListener.h` contains **both** passes as separate classes:
 
-1. **ForwardRefScanner** — pre-registers struct shells, function signatures, and generic instantiations. Enables forward references and monomorphizes generics (`Box<int>` -> mangled name `Box__int`, double-underscore separator). Also detects `move` parameters and `if const` blocks.
-2. **MainListener** — walks the AST and emits LLVM IR via `LLVMBackend`.
+1. **ForwardRefScanner** - pre-registers struct shells, function signatures, and generic instantiations. Enables forward references and monomorphizes generics (`Box<int>` -> mangled name `Box__int`, double-underscore separator). Also detects `move` parameters and `if const` blocks.
+2. **MainListener** - walks the AST and emits LLVM IR via `LLVMBackend`.
 
 **Critical:** Both passes contain their own copy of `ParseDeclarationSpecifiers()`. Any type-parsing change must be made in **both** copies.
 
@@ -55,18 +55,18 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 | `CFlat.g4` | ANTLR4 grammar (~1,200 lines) |
 | `LLVMBackend.h/.cpp` | Type system, symbol tables, IR generation |
 | `MainListener.h` | Both AST passes (~4,100 lines) |
-| `CompilerManager.h` | Crash handler: CRT assert hook, SIGABRT, LLVM fatal error — dumps state on crash |
+| `CompilerManager.h` | Crash handler: CRT assert hook, SIGABRT, LLVM fatal error - dumps state on crash |
 | `ArgParser.h` | CLI argument parsing |
 | `main.cpp` | Entry point |
-| `core/` | Standard library — auto-compiled with every program |
+| `core/` | Standard library - auto-compiled with every program |
 
 ### Key Internal State (in `LLVMBackend`)
-- `stackNamedVariable` — deque of scopes for local variables
-- `dataStructures` — struct registry (fields, destructor, VTables)
-- `functionTable` — overload registry
-- `interfaceTable` — interface method contracts
-- `returnBlockTable` — inlined return-block bodies
-- `NamedVariable.IsOwning` / `TypeAndValue.IsMove` — drive the ownership system
+- `stackNamedVariable` - deque of scopes for local variables
+- `dataStructures` - struct registry (fields, destructor, VTables)
+- `functionTable` - overload registry
+- `interfaceTable` - interface method contracts
+- `returnBlockTable` - inlined return-block bodies
+- `NamedVariable.IsOwning` / `TypeAndValue.IsMove` - drive the ownership system
 
 ## Conventions & Patterns
 
@@ -79,10 +79,10 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 | New statement / expression | Add `Parse*()`/`exit*()` handler in `MainListener.h` |
 | Forward-declare a construct | Add scan logic to `ForwardRefScanner` in `MainListener.h` |
 | New binary operator | `TryBinaryOperatorOverload()` in `MainListener.h` + `Operation` enum in `LLVMBackend.h` |
-| New soft keyword | Text-match in **both** `ParseDeclarationSpecifiers()` copies — do NOT add to the ANTLR lexer |
+| New soft keyword | Text-match in **both** `ParseDeclarationSpecifiers()` copies - do NOT add to the ANTLR lexer |
 
 ### Soft Keywords
-`move` is not an ANTLR lexer token — it's detected by text matching in `ParseDeclarationSpecifiers()`. This avoids breaking identifiers/methods named `move`. All new keywords that could collide with identifiers must follow the same pattern.
+`move` is not an ANTLR lexer token - it's detected by text matching in `ParseDeclarationSpecifiers()`. This avoids breaking identifiers/methods named `move`. All new keywords that could collide with identifiers must follow the same pattern.
 
 ### Ownership (`move`)
 `move` on a parameter definition transfers ownership into the callee; the caller's pointer is automatically nulled after the call. For value types, `move` is a no-op. Implementation: `EmitOwningPtrCleanup()`, `EmitDestructorsForScope()`, `CreateOverloadedFunctionCall()`.
@@ -95,15 +95,15 @@ Auto-compiled with every program. To add a new module: add the `.cb` file to `co
 | `runtime.cb` | `new`, `delete`, exit/abort |
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` |
 | `string.cb` | `string` value type (`{ i8* _ptr, i32 _len }`) |
-| `list.cb` | `list<T>` — `add(move T)`, `get()`, `removeAt()` |
-| `dictionary.cb` | `dictionary<K,V>` — `add(K, move V)`, `get()`, `remove()` |
+| `list.cb` | `list<T>` - `add(move T)`, `get()`, `removeAt()` |
+| `dictionary.cb` | `dictionary<K,V>` - `add(K, move V)`, `get()`, `remove()` |
 | `math.cb` | `Math` namespace |
 | `hashset.cb`, `stack.cb`, `queue.cb`, `pair.cb`, `filesystem.cb` | Other collections and utilities |
 
 ### Known Limitations
 - `?.` null-conditional: only for pointer function arguments, not locals or fields
 - Generic `V x = default` in function locals / nested generic fields may not codegen correctly; field-level `= default` works
-- `removeAt()` does not auto-free owned pointer elements — caller must retrieve and free manually
+- `removeAt()` does not auto-free owned pointer elements - caller must retrieve and free manually
 
 ## Debugging Crashes
 - `CompilerManager.h` dumps compiler state on assert/abort automatically

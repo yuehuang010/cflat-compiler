@@ -4,10 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) — an extended C language with modern features — generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access — to LLVM Intermediate Representation for native execution.
+cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) - an extended C language with modern features - generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access - to LLVM Intermediate Representation for native execution.
 
 ## Git
 Do not commit to git.  Stash is allowed.  
+
+## Text Output
+
+- Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.
 
 ## Logging Conventions
 
@@ -22,7 +26,7 @@ Do not commit to git.  Stash is allowed.
 
 ## Building
 
-Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core/*.cb libraries.  Always build via the **solution file** — building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
+Visual Studio 2022 project with vcpkg dependencies (ANTLR4, LLVM) and deploy core/*.cb libraries.  Always build via the **solution file** - building the `.vcxproj` alone puts the exe in the wrong location for `test.bat`:
 
 ```bash
 msbuild cflat.slnx -p:Configuration=Debug -p:Platform=x64
@@ -36,7 +40,7 @@ Full msbuild path (if not on PATH):
 "/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/amd64/MSBuild.exe" cflat.slnx -p:Configuration=Debug -p:Platform=x64 -v:minimal
 ```
 
-**Quick dev loop** — `buildAndRun.bat` builds both Release and Debug, then runs the Debug binary on `Test/test_basic.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
+**Quick dev loop** - `buildAndRun.bat` builds both Release and Debug, then runs the Debug binary on `Test/test_basic.cb`. Run directly (without `cmd /c`) so MSBuild output is captured:
 
 ```bash
 ./buildAndRun.bat            # builds Release + Debug, runs Debug binary on test_basic.cb
@@ -64,7 +68,7 @@ The compiler automatically locates `runtime.cb` next to the executable. Both `.c
 - `-b / --bitcode`: Output LLVM bitcode file (.bc)
 - `-g / --debug-info`: Emit DWARF debug information
 - `-i / --import-dir`: Directory to search for imported modules
-- `-p / --platform`: Target platform — `x64` (default) or `x86`
+- `-p / --platform`: Target platform - `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
 
 ## Testing
@@ -123,19 +127,19 @@ x64/Debug/cflat.exe Test/errors/err_missing_return.cb -i Test/library
 Two forms are supported:
 
 ```cflat
-// Bare-semicolon form — error must occur before the enclosing scope closes
+// Bare-semicolon form - error must occur before the enclosing scope closes
 extern int main()
 {
     expect_error("Undefined variable foo.");
     int x = foo + 1;
 }
 
-// Scoped block form (statement scope) — error must occur inside the braces
+// Scoped block form (statement scope) - error must occur inside the braces
 expect_error("nullable '?' is not allowed on primitive type 'int'") {
     int? x = 0;
 }
 
-// Scoped block form (file scope) — for testing function/struct definitions
+// Scoped block form (file scope) - for testing function/struct definitions
 expect_error("missing a return statement") {
     int compute(int x) { int y = x * 2; }
 }
@@ -161,7 +165,7 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 1. **ForwardRefScanner** (`MainListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` -> symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
 2. **MainListener** (`MainListener.h`): Walks the AST and emits LLVM IR using `LLVMBackend` as the backend.
 
-Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MainListener` copy.
+Both passes share `ParseDeclarationSpecifiers()` - any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MainListener` copy.
 
 ### Core Components
 
@@ -170,14 +174,14 @@ Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing 
 | `CFlat.g4` | ANTLR4 grammar defining CFlat syntax |
 | `LLVMBackend.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
 | `MainListener.h` | AST visitor implementing both ForwardRefScanner and codegen passes |
-| `CompilerManager.h` | Singleton crash handler — installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
+| `CompilerManager.h` | Singleton crash handler - installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
 | `ArgParser.h` | CLI argument parsing |
 | `main.cpp` | Entry point |
 | `LspServer.h/.cpp` | Language Server Protocol server (hover, completion, go-to-definition) |
 | `LspSymbolIndex.h/.cpp` | LSP symbol index built during compilation |
 | `JsonRpcLoop.h/.cpp` | JSON-RPC protocol loop for LSP communication |
 | `LspTypes.h` | LSP type definitions |
-| `core/` | Standard library — compiled alongside every program |
+| `core/` | Standard library - compiled alongside every program |
 
 ### Key Internal State (in `LLVMBackend`)
 
@@ -191,34 +195,34 @@ Both passes share `ParseDeclarationSpecifiers()` — any change to type parsing 
 - `builder / module / context`: LLVM IR generation state
 - `diBuilder`: DWARF debug info builder (active with `-g`)
 
-`NamedVariable` has an `IsOwning` flag; `TypeAndValue` has an `IsMove` flag — both drive the ownership/lifetime system.
+`NamedVariable` has an `IsOwning` flag; `TypeAndValue` has an `IsMove` flag - both drive the ownership/lifetime system.
 
 ### Language Features
 
 For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 
-- **Generics**: `struct Box<T> { T value = default; }` — monomorphized at compile time
+- **Generics**: `struct Box<T> { T value = default; }` - monomorphized at compile time
 - **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
 - **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`
-- **Type aliases**: `using M = Math` — expands at reference time
+- **Type aliases**: `using M = Math` - expands at reference time
 - **Module system**: `import "file.cb"` for multi-file compilation
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
-- **Null-safe access**: `ptr?.field` — works on any struct pointer (local variables, function arguments, struct member fields)
+- **Null-safe access**: `ptr?.field` - works on any struct pointer (local variables, function arguments, struct member fields)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
-- **Ternary operator**: `condition ? trueValue : falseValue` — compact conditional expression; both branches must be compatible types
+- **Ternary operator**: `condition ? trueValue : falseValue` - compact conditional expression; both branches must be compatible types
 - **`break` / `continue`**: exit or advance the nearest enclosing `while`, `for`, `foreach` loop
 - **Operator overloading**: `operator+`, `operator==`, `operator new`, `operator delete`
 - **Function overloads** with type-based resolution and default parameters
-- **Named parameters**: `func(x: 1, y: 2)` — args matched by name, any order
-- **Return-block functions**: `return { ... }` — body inlined at call site
+- **Named parameters**: `func(x: 1, y: 2)` - args matched by name, any order
+- **Return-block functions**: `return { ... }` - body inlined at call site
 - **Intrinsics**: `typeof()`, `nameof()`, `sizeof()`, `alignof()`
-- **Range-based for**: `foreach (T x in collection)` — calls `count()` / `get(int)` on the collection
-- **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` — struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `MallocAllocator` by default (override by setting `p._allocator` before `p.run()`), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
-- **Fixed-size arrays**: Use type-first syntax `T[N] name` — the size belongs to the type, not the name. C-style `T name[N]` is a compiler error for non-pointer types. Initialization forms:
-  - `T[N] name;` — declared, not initialized
-  - `T[N] name = default;` — zero-initialized
-  - `T[N] name {}` or `T[N] name = {}` — value-initializes all N elements by calling the default constructor (struct types only)
-  - `T[N] name {field=v, ...}` — seeded value-init; overrides the listed fields in each element
+- **Range-based for**: `foreach (T x in collection)` - calls `count()` / `get(int)` on the collection
+- **Program**: `program Name { fields...; int main(move list<string> args) { ... } };` - struct-like construct with a managed entry point; instantiate with `Name p;`, configure fields, then call `p.run(args)`. The compiler auto-generates `run()`, which spawns a dedicated thread, installs a per-thread `MallocAllocator` by default (override by setting `p._allocator` before `p.run()`), calls `main`, joins the thread, and returns the exit code. Requires `import "list.cb"` and `import "thread.cb"`.
+- **Fixed-size arrays**: Use type-first syntax `T[N] name` - the size belongs to the type, not the name. C-style `T name[N]` is a compiler error for non-pointer types. Initialization forms:
+  - `T[N] name;` - declared, not initialized
+  - `T[N] name = default;` - zero-initialized
+  - `T[N] name {}` or `T[N] name = {}` - value-initializes all N elements by calling the default constructor (struct types only)
+  - `T[N] name {field=v, ...}` - seeded value-init; overrides the listed fields in each element
   - Struct fields still use C-style `T name[N]` (grammar limitation at struct scope)
   - Pointer arrays use `T*[N] name` (type-first); C-style `T* name[N]` is still accepted (exempt from the C-style error since `T*[N]` was not always available)
 
@@ -233,9 +237,9 @@ void consume(move Resource* r) { ... }  // r is freed when consume() returns
 void borrow(Resource* r)        { ... }  // caller still owns r
 ```
 
-- **Call site is silent** — no annotation needed; the caller's pointer is automatically nulled after a `move` call.
-- `move` is a **soft keyword** — detected via text matching in `ParseDeclarationSpecifiers()`, not as an ANTLR lexer token (avoids breaking identifiers/methods named `move`).
-- For primitive value types (int, float, bool, etc.) `move` is a no-op — ownership semantics only activate when `TypeAndValue.Pointer == true` **or** the value is an owning `string`. `string` owns a heap buffer (`_ptr` field) and is zeroed on move even though it is not a pointer type; use-after-move of `string` is a compile error like any pointer type.
+- **Call site is silent** - no annotation needed; the caller's pointer is automatically nulled after a `move` call.
+- `move` is a **soft keyword** - detected via text matching in `ParseDeclarationSpecifiers()`, not as an ANTLR lexer token (avoids breaking identifiers/methods named `move`).
+- For primitive value types (int, float, bool, etc.) `move` is a no-op - ownership semantics only activate when `TypeAndValue.Pointer == true` **or** the value is an owning `string`. `string` owns a heap buffer (`_ptr` field) and is zeroed on move even though it is not a pointer type; use-after-move of `string` is a compile error like any pointer type.
 - `list<T>::add(move T value)` and `dictionary<K,V>::add/set(K, move V value)` take ownership of pointer elements; `list::removeAt()` auto-frees pointer elements (destructor + delete); `dictionary::remove()` does not.
 
 Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsForScope()` handles move-param cleanup at scope exit; `CreateOverloadedFunctionCall()` nulls the caller's storage after the call.
@@ -256,7 +260,7 @@ Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsFor
 | New statement or expression | Add `Parse*()` / `exit*()` handler in `MainListener.h` |
 | Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MainListener.h` |
 | New binary operator | `TryBinaryOperatorOverload()` in `MainListener.h` + `Operation` enum in `LLVMBackend.h` |
-| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MainListener.h` — do NOT add to the ANTLR lexer |
+| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MainListener.h` - do NOT add to the ANTLR lexer |
 | New grammar keyword statement | Add rule to `CFlat.g4`; add `ctx->newRule()` retrieval in `ParseStatement`; add no-op overrides in `ForwardRefScanner` if the rule can appear at file scope |
 
 ### Debugging Compiler Crashes
@@ -272,30 +276,30 @@ The `core/` directory is implicitly added to the import search path by the compi
 
 | File | Exports |
 |------|---------|
-| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort — **auto-imported** |
-| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` — requires `import "interfaces.cb"` |
-| `string.cb` | `string` value type, manipulation, `IString` implementation — requires `import "string.cb"` |
-| `array.cb` | `array<T>` — fixed-size heap array; `init(n)`, `get(i)`, `set(i, v)`, `operator[]`; iterable with `for` |
-| `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
-| `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |
-| `dictionary.cb` | `dictionary<K,V>` — hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
+| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort - **auto-imported** |
+| `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` - requires `import "interfaces.cb"` |
+| `string.cb` | `string` value type, manipulation, `IString` implementation - requires `import "string.cb"` |
+| `array.cb` | `array<T>` - fixed-size heap array; `init(n)`, `get(i)`, `set(i, v)`, `operator[]`; iterable with `for` |
+| `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
+| `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
+| `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
 | `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |
-| `stack.cb` | `stack<T>` — LIFO; `push()`, `pop()`, `peek()` |
-| `queue.cb` | `queue<T>` — FIFO; `enqueue()`, `dequeue()`, `peek()` |
-| `pair.cb` | `pair<A,B>` — two-field generic struct |
+| `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
+| `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
+| `pair.cb` | `pair<A,B>` - two-field generic struct |
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
-| `thread.cb` | `thread<T>` — Win32 thread wrapper; requires `import "thread.cb"` |
+| `thread.cb` | `thread<T>` - Win32 thread wrapper; requires `import "thread.cb"` |
 | `random.cb` | Splitmix64 PRNG; requires `import "random.cb"` |
-| `channel.cb` | `channel<T>` — MPMC blocking channel; requires `import "channel.cb"` |
-| `spsc_queue.cb` | `spsc_queue<T>` — wait-free single-producer/single-consumer ring buffer |
-| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement — thread synchronization primitives |
-| `latch.cb` | `latch` — one-shot countdown synchronization |
-| `semaphore.cb` | `semaphore` — counting semaphore |
-| `rwlock.cb` | `rwlock` — reader-writer lock |
-| `stop_token.cb` | `stop_token` / `stop_source` — cooperative cancellation |
+| `channel.cb` | `channel<T>` - MPMC blocking channel; requires `import "channel.cb"` |
+| `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring buffer |
+| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - thread synchronization primitives |
+| `latch.cb` | `latch` - one-shot countdown synchronization |
+| `semaphore.cb` | `semaphore` - counting semaphore |
+| `rwlock.cb` | `rwlock` - reader-writer lock |
+| `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
 | `time.cb` | `Time.now()`, sleep, duration utilities |
-| `tuple.cb` | `tuple<A,B,C>` — fixed-arity generic struct |
-| `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` — JSON serialization |
+| `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
+| `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
 | `arena.cb` | Arena bump allocator |
 | `block_allocator.cb` | Block-based pooled allocator (used by `program` thread startup) |
 | `malloc_allocator.cb` | Thin wrapper around system malloc/free |
@@ -322,13 +326,13 @@ Reload VS Code to activate syntax highlighting for `.cb` files.
 
 ### Running benchmarks
 
-Always use `performance.bat` — it compiles all benchmarks with `-O2` and runs both the CFlat and C++ reference variants:
+Always use `performance.bat` - it compiles all benchmarks with `-O2` and runs both the CFlat and C++ reference variants:
 
 ```bash
 performance.bat
 ```
 
-Never compile benchmarks manually without `-O2`. Unoptimized numbers are misleading — the single-threaded loop drops from ~5B to ~300M iter/s without it, and stream throughput roughly halves.
+Never compile benchmarks manually without `-O2`. Unoptimized numbers are misleading - the single-threaded loop drops from ~5B to ~300M iter/s without it, and stream throughput roughly halves.
 
 Manual compile (if needed):
 
@@ -349,24 +353,24 @@ x64/Debug/cflat.exe performance/perf_yes_compare.cb -i cflat/core -o performance
 |---------|-------|-----|
 | single-threaded loop | ~5,000M iter/s | ~4,960M iter/s |
 | stream + raw Thread | ~295M lines/s | ~343M lines/s |
-| stream + program | ~76M lines/s | — |
-| channel + raw Thread | ~12M lines/s | — |
-| channel + program | ~46M lines/s | — |
-| spsc + program | ~28M lines/s | — |
+| stream + program | ~76M lines/s | - |
+| channel + raw Thread | ~12M lines/s | - |
+| channel + program | ~46M lines/s | - |
+| spsc + program | ~28M lines/s | - |
 
 **Notes on stream + program**: producer uses `_out.write_bytes()` directly (bypasses `printf`/TLS entirely; set by `>>` operator). Consumer uses `_in.read_buf()` directly (bypasses `fgets`/`__stdin_hook`/TLS; set by `>>` operator). Gap vs raw-thread (~295M) is stop_token polling overhead on the producer side.
 
-**Notes on channel variants**: the channel uses two spinlocks on separate cache lines (`_head_lock` for producers, `_tail_lock` for consumers). Under 1P:1C workloads the locks never contend with each other. Each side caches the other's cursor (`_cached_tail`/`_cached_head`) so the hot path never touches the remote cache line. No shared `_count` — full/empty are detected via head/tail comparison.
+**Notes on channel variants**: the channel uses two spinlocks on separate cache lines (`_head_lock` for producers, `_tail_lock` for consumers). Under 1P:1C workloads the locks never contend with each other. Each side caches the other's cursor (`_cached_tail`/`_cached_head`) so the hot path never touches the remote cache line. No shared `_count` - full/empty are detected via head/tail comparison.
 
 ### Stream design notes
 
-`stream` (`core/stream.cb`) is a double-buffered text pipe backed by a Win32 SRW lock + two `CONDITION_VARIABLE`s — mirroring the C++ reference:
+`stream` (`core/stream.cb`) is a double-buffered text pipe backed by a Win32 SRW lock + two `CONDITION_VARIABLE`s - mirroring the C++ reference:
 
 - `_cvFull`: consumer waits here when no full buffer is ready
 - `_cvEmpty`: producer waits here when no empty buffer is available for the next fill
-- The lock is a Win32 SRW lock (via `mutex.sleep_cv`) — lighter than CRITICAL_SECTION, matching C++'s `std::mutex` backing
+- The lock is a Win32 SRW lock (via `mutex.sleep_cv`) - lighter than CRITICAL_SECTION, matching C++'s `std::mutex` backing
 
-For best consumer throughput, use `read_buf(int* out_len)` instead of `read()` — it exposes the buffer length so the inner loop has a known trip count that LLVM can auto-vectorize:
+For best consumer throughput, use `read_buf(int* out_len)` instead of `read()` - it exposes the buffer length so the inner loop has a known trip count that LLVM can auto-vectorize:
 
 ```cflat
 int len = 0;

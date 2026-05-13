@@ -239,7 +239,7 @@ public:
             freeBackends_.push_back(i);
         }
 
-        // Worker pool — one thread per backend slot.
+        // Worker pool - one thread per backend slot.
         workers_.reserve(poolSize_);
         for (unsigned int i = 0; i < poolSize_; ++i)
             workers_.emplace_back([this] { WorkerLoop(); });
@@ -311,7 +311,7 @@ private:
             {}  // handled by loop exit condition
         else if (id)
         {
-            // Unknown request — send method-not-found error
+            // Unknown request - send method-not-found error
             nlohmann::json err = {
                 {"code", -32601},
                 {"message", "Method not found: " + method}
@@ -509,7 +509,7 @@ private:
         auto index = GetCurrentIndex();
         const SymbolDef* def = word.empty() ? nullptr : index->Lookup(word);
 
-        // Cursor is on a local variable name — follow through to the type's definition.
+        // Cursor is on a local variable name - follow through to the type's definition.
         if (!def)
         {
             const std::string* typeName = word.empty() ? nullptr : index->LookupVariableType(word);
@@ -655,7 +655,7 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Job dispatch — every analysis goes through the worker pool.
+    // Job dispatch - every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
 
     struct AnalysisJob
@@ -740,7 +740,7 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Worker pool — each thread owns one backend slot.
+    // Worker pool - each thread owns one backend slot.
     // -----------------------------------------------------------------------
 
     void WorkerLoop()
@@ -756,7 +756,7 @@ private:
                 jobQueue_.pop_front();
             }
 
-            // Drop superseded jobs — a newer revision of this URI has been enqueued.
+            // Drop superseded jobs - a newer revision of this URI has been enqueued.
             {
                 std::lock_guard<std::mutex> lock(uriGenMutex_);
                 auto it = uriGeneration_.find(job.uri);
@@ -812,7 +812,7 @@ private:
 
         LLVMBackend* backend = backendPool_[slot].get();
 
-        // Each backend slot is sticky across runs — reset before re-use.
+        // Each backend slot is sticky across runs - reset before re-use.
         if (backendAnalyzed_[slot])
             backend->ResetForReanalysis();
         backendAnalyzed_[slot] = true;
@@ -864,7 +864,7 @@ private:
             newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
         }
 
-        // Last-known-good cache — kept global for now. Edits land sequentially in
+        // Last-known-good cache - kept global for now. Edits land sequentially in
         // practice (debounce + single editor); bulk sweeps don't use this index.
         {
             std::lock_guard<std::mutex> lock(indexMutex_);
@@ -928,7 +928,7 @@ private:
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
 
-    // Backend pool — one LLVMBackend per slot. Workers check out a free slot,
+    // Backend pool - one LLVMBackend per slot. Workers check out a free slot,
     // run analysis, and return it. backendAnalyzed_[slot] tracks whether
     // ResetForReanalysis is needed before the next run on that slot.
     unsigned int poolSize_ = 1;
@@ -942,14 +942,14 @@ private:
     std::mutex tempCounterMutex_;
     int tempFileCounter_ = 0;
 
-    // Job queue — every analysis (immediate or debounced) lands here.
+    // Job queue - every analysis (immediate or debounced) lands here.
     std::deque<AnalysisJob> jobQueue_;
     std::mutex jobMutex_;
     std::condition_variable jobCV_;
     bool stopWorkers_ = false;
     std::vector<std::thread> workers_;
 
-    // Per-URI generation counter — older jobs for the same URI are dropped.
+    // Per-URI generation counter - older jobs for the same URI are dropped.
     std::mutex uriGenMutex_;
     std::unordered_map<std::string, uint64_t> uriGeneration_;
 

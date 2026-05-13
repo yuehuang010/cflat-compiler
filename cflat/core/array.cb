@@ -1,4 +1,4 @@
-// array<T> — owning fixed-size heap array with destructor support.
+// array<T> - owning fixed-size heap array with destructor support.
 // Use init(size) to allocate; the destructor frees and calls ~T() on each element.
 // Stackable or heap-allocated: array<T> a; a.init(n);  or  array<T>* a = new array<T>;  a->init(n);
 

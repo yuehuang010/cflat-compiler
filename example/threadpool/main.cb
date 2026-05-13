@@ -143,7 +143,7 @@ void section3() {
 
     TaskHandle[9] handles;
 
-    // Submit task 0 (LOW) first — worker picks it up immediately.
+    // Submit task 0 (LOW) first - worker picks it up immediately.
     pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], THREADPOOL_PRIORITY_LOW);
 
     // Brief spin so the worker enters its compute loop before we enqueue the rest.
@@ -388,7 +388,7 @@ int chainC(void* raw, stop_token tok) {
 
 // ── Section 7: wait_for (timed wait) ─────────────────────────────────────────
 //
-// Submit a CPU-bound task (~200 ms), then call wait_for(20) — should time out.
+// Submit a CPU-bound task (~200 ms), then call wait_for(20) - should time out.
 // A second wait_for(5000) should then see the task already done (true).
 //
 
@@ -406,10 +406,10 @@ void section7(ThreadPool* pool) {
     TaskHandle h;
     pool->submit(slowTask, nullptr, &h);
 
-    // Short timeout — task should still be running.
+    // Short timeout - task should still be running.
     bool timedOut = !h.wait_for(20);
 
-    // Long timeout — enough for the task to finish from wherever it is now.
+    // Long timeout - enough for the task to finish from wherever it is now.
     bool completed = h.wait_for(5000);
 
     bool ok = timedOut && completed;
@@ -451,7 +451,7 @@ void section8(ThreadPool* pool) {
 // draining worker executes the child task inline and then exits the drain loop
 // once inflight equals the number of workers currently draining.
 //
-// A 1-worker pool guarantees the outer task must participate — there is no other
+// A 1-worker pool guarantees the outer task must participate - there is no other
 // worker to run the child.
 //
 
@@ -542,7 +542,7 @@ void section10() {
     bool ok3 = (v3[0] == 49 && v3[1] == 64 && v3[2] == 81 && v3[3] == 100);
     printf("  1-worker tasks: %s\n", ok3 ? "OK" : "FAIL");
 
-    // Grow again to 3 workers — exercises slot reuse after shrink.
+    // Grow again to 3 workers - exercises slot reuse after shrink.
     pool.resize(3);
     bool sizeOk3 = pool.workerCount() == 3;
     printf("  resize(3):  workers=%d  %s\n", pool.workerCount(), sizeOk3 ? "OK" : "FAIL");
@@ -576,7 +576,7 @@ extern int main() {
     section6(&pool);  // per-task cancellation via stop_token
     section7(&pool);  // wait_for: timed wait on TaskHandle
     section8(&pool);  // task continuations via then()
-    section9();       // drain() from within a task — work-participation
+    section9();       // drain() from within a task - work-participation
     section10();      // dynamic resize: grow, shrink, grow (slot reuse)
     section4(&pool);  // reuses then shuts down the shared pool
 

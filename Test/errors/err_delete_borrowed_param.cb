@@ -1,4 +1,4 @@
-// Deleting a borrowed (non-move) parameter is an error — the caller may own
+// Deleting a borrowed (non-move) parameter is an error - the caller may own
 // the pointer and will free it on scope exit, causing a double-free.
 
 struct Node { int value = 0; };
@@ -8,7 +8,7 @@ expect_error("cannot delete borrowed parameter 'n'") {
     void badDelete(Node* n) { delete n; }
 }
 
-// move param: ownership transferred — delete is valid
+// move param: ownership transferred - delete is valid
 void goodDelete(move Node* n) { delete n; }
 
 extern int main() { return 0; }

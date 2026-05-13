@@ -1,4 +1,4 @@
-// Winsock2 raw bindings — imported only on Windows by socket.cb.
+// Winsock2 raw bindings - imported only on Windows by socket.cb.
 
 // Pointer-sized integer for fields that are size_t in the Win32 API.
 if const (__PLATFORM__ == 64) {
@@ -7,12 +7,12 @@ if const (__PLATFORM__ == 64) {
     using _net_size = i32;
 }
 
-// WSADATA — opaque; 408 bytes covers both Win32 and Win64 layouts.
+// WSADATA - opaque; 408 bytes covers both Win32 and Win64 layouts.
 struct _WsaData {
     i8 _data[408] = default;
 };
 
-// sockaddr_in — IPv4 socket address (16 bytes).
+// sockaddr_in - IPv4 socket address (16 bytes).
 struct _SockAddrIn {
     i16 sin_family = 0;
     u16 sin_port   = 0;
@@ -20,7 +20,7 @@ struct _SockAddrIn {
     i8  sin_zero[8] = default;
 };
 
-// ADDRINFOA — getaddrinfo result node.
+// ADDRINFOA - getaddrinfo result node.
 // ai_addrlen is size_t (pointer-wide); all pointer fields are i8* (naturally pointer-sized).
 struct _AddrInfo {
     i32        ai_flags     = 0;
@@ -29,7 +29,7 @@ struct _AddrInfo {
     i32        ai_protocol  = 0;
     _net_size  ai_addrlen   = 0;
     i8*        ai_canonname = nullptr;
-    i8*        ai_addr      = nullptr;  // sockaddr* — cast to _SockAddrIn* for IPv4
+    i8*        ai_addr      = nullptr;  // sockaddr* - cast to _SockAddrIn* for IPv4
     _AddrInfo* ai_next      = nullptr;
 };
 
@@ -39,7 +39,7 @@ extern stdcall i32  WSACleanup();
 extern stdcall i32  WSAGetLastError();
 
 // Socket creation / destruction
-// SOCKET is UINT_PTR; we use void* — INVALID_SOCKET == (void*)(i64)-1
+// SOCKET is UINT_PTR; we use void* - INVALID_SOCKET == (void*)(i64)-1
 extern stdcall void* socket(i32 af, i32 type, i32 protocol);
 extern stdcall i32   closesocket(void* sock);
 
@@ -64,7 +64,7 @@ extern stdcall u16   htons(u16 hostshort);
 extern stdcall u16   ntohs(u16 netshort);
 extern stdcall u32   inet_addr(const char* cp);
 
-// Name resolution — handles both hostnames and IP strings.
+// Name resolution - handles both hostnames and IP strings.
 extern stdcall i32  getaddrinfo(const char* hostname, const char* service, _AddrInfo* hints, _AddrInfo** result);
 extern stdcall void freeaddrinfo(_AddrInfo* ai);
 

@@ -1,4 +1,4 @@
-// core/filesystem.cb — File, Path, and Directory classes for CFlat
+// core/filesystem.cb - File, Path, and Directory classes for CFlat
 //
 // Wraps UCRT file I/O (fopen/fread/fwrite/…) and Win32 directory APIs.
 // Paths are null-terminated via string.data().

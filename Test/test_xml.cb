@@ -62,13 +62,13 @@ extern int main()
     int passed = 0;
     int total  = 0;
 
-    // ── flat struct — toXml ──────────────────────────────────────────────────
+    // ── flat struct - toXml ──────────────────────────────────────────────────
     Point p;
     p.x = 3;
     p.y = 7;
     total++; passed += Test("toXml_flat", XmlBuilder.toXml(p, "Point"), "<Point><x>3</x><y>7</y></Point>");
 
-    // ── all primitives — toXml ───────────────────────────────────────────────
+    // ── all primitives - toXml ───────────────────────────────────────────────
     AllPrimitives ap;
     ap.i = 42;
     ap.b = true;
@@ -85,7 +85,7 @@ extern int main()
     total++; passed += Test("toXml_bool_false", XmlBuilder.toXml(apFalse, "AllPrimitives"),
         "<AllPrimitives><i>-7</i><b>false</b><f>0</f><s></s></AllPrimitives>");
 
-    // ── nested struct with [JsonName] and [Private] — toXml ─────────────────
+    // ── nested struct with [JsonName] and [Private] - toXml ─────────────────
     Employee e;
     e.name = "Alice";
     e.id = 42;
@@ -95,7 +95,7 @@ extern int main()
     total++; passed += Test("toXml_nested", XmlBuilder.toXml(e, "Employee"),
         "<Employee><full_name>Alice</full_name><id>42</id><addr><street_name>Main St</street_name><zip>12345</zip></addr></Employee>");
 
-    // ── deeply nested — toXml ────────────────────────────────────────────────
+    // ── deeply nested - toXml ────────────────────────────────────────────────
     Level1 l1;
     l1.top = "root";
     l1.inner.mid = 99;
@@ -103,7 +103,7 @@ extern int main()
     total++; passed += Test("toXml_deep", XmlBuilder.toXml(l1, "Level1"),
         "<Level1><inner><deep><val>7</val></deep><mid>99</mid></inner><top>root</top></Level1>");
 
-    // ── class with [JsonName] and [Private] — toXml ──────────────────────────
+    // ── class with [JsonName] and [Private] - toXml ──────────────────────────
     Config cfg;
     cfg.maxRetries = 3;
     cfg.enabled = true;
@@ -112,7 +112,7 @@ extern int main()
     total++; passed += Test("toXml_class", XmlBuilder.toXml(cfg, "Config"),
         "<Config><max_retries>3</max_retries><enabled>true</enabled><threshold>0.5</threshold></Config>");
 
-    // ── XML entity escaping — toXml ──────────────────────────────────────────
+    // ── XML entity escaping - toXml ──────────────────────────────────────────
     AllPrimitives esc;
     esc.i = 0;
     esc.b = false;
@@ -121,14 +121,14 @@ extern int main()
     total++; passed += Test("toXml_escape", XmlBuilder.toXml(esc, "AllPrimitives"),
         "<AllPrimitives><i>0</i><b>false</b><f>0</f><s>a&amp;b&lt;c&gt;d</s></AllPrimitives>");
 
-    // ── fromXml — flat struct ────────────────────────────────────────────────
+    // ── fromXml - flat struct ────────────────────────────────────────────────
     // Use string variables so the string coercion works for fromXml (same pattern as fromJson).
     string xmlFlat = "<Point><x>3</x><y>7</y></Point>";
     Point p2 = XmlBuilder.fromXml<Point>(xmlFlat);
     total++; passed += Test("fromXml_flat_x", p2.x, 3);
     total++; passed += Test("fromXml_flat_y", p2.y, 7);
 
-    // ── fromXml — all primitives ─────────────────────────────────────────────
+    // ── fromXml - all primitives ─────────────────────────────────────────────
     string xmlPrim = "<AllPrimitives><i>42</i><b>true</b><f>1.5</f><s>hello</s></AllPrimitives>";
     AllPrimitives ap2 = XmlBuilder.fromXml<AllPrimitives>(xmlPrim);
     total++; passed += Test("fromXml_int",    ap2.i, 42);
@@ -138,14 +138,14 @@ extern int main()
     if (!floatNear(ap2.f, 1.5f)) { printf("fromXml_float MISMATCH (expected 1.5 got %f)\n", ap2.f); }
     else { passed++; if (printOnPass) printf("fromXml_float passed.\n"); }
 
-    // ── fromXml — negative int ───────────────────────────────────────────────
+    // ── fromXml - negative int ───────────────────────────────────────────────
     string xmlNeg = "<AllPrimitives><i>-7</i><b>false</b><f>0</f><s></s></AllPrimitives>";
     AllPrimitives ap3 = XmlBuilder.fromXml<AllPrimitives>(xmlNeg);
     total++; passed += Test("fromXml_neg_int",   ap3.i, -7);
     total++; passed += Test("fromXml_bool_false", ap3.b, false);
     total++; passed += Test("fromXml_empty_str",  ap3.s, "");
 
-    // ── fromXml — [JsonName] ─────────────────────────────────────────────────
+    // ── fromXml - [JsonName] ─────────────────────────────────────────────────
     string xmlEmp = "<Employee><full_name>Alice</full_name><id>42</id><addr><street_name>Main St</street_name><zip>12345</zip></addr></Employee>";
     Employee e2 = XmlBuilder.fromXml<Employee>(xmlEmp);
     total++; passed += Test("fromXml_name",   e2.name,        "Alice");
@@ -153,10 +153,10 @@ extern int main()
     total++; passed += Test("fromXml_street", e2.addr.street, "Main St");
     total++; passed += Test("fromXml_zip",    e2.addr.zip,    12345);
 
-    // ── fromXml — [Private] field must stay default ───────────────────────────
+    // ── fromXml - [Private] field must stay default ───────────────────────────
     total++; passed += Test("fromXml_private_skipped", e2._token, "");
 
-    // ── fromXml — class with [JsonName] and [Private] ────────────────────────
+    // ── fromXml - class with [JsonName] and [Private] ────────────────────────
     string xmlCfg = "<Config><max_retries>5</max_retries><enabled>false</enabled><secretKey>attempt</secretKey><threshold>0.75</threshold></Config>";
     Config cfg2 = XmlBuilder.fromXml<Config>(xmlCfg);
     total++; passed += Test("fromXml_class_retries", cfg2.maxRetries, 5);
@@ -166,19 +166,19 @@ extern int main()
     if (!floatNear(cfg2.threshold, 0.75f)) { printf("fromXml_class_threshold MISMATCH (expected 0.75 got %f)\n", cfg2.threshold); }
     else { passed++; if (printOnPass) printf("fromXml_class_threshold passed.\n"); }
 
-    // ── fromXml — deep nesting ───────────────────────────────────────────────
+    // ── fromXml - deep nesting ───────────────────────────────────────────────
     string xmlDeep = "<Level1><inner><deep><val>7</val></deep><mid>99</mid></inner><top>root</top></Level1>";
     Level1 l2 = XmlBuilder.fromXml<Level1>(xmlDeep);
     total++; passed += Test("fromXml_deep_top",  l2.top,            "root");
     total++; passed += Test("fromXml_deep_mid",  l2.inner.mid,      99);
     total++; passed += Test("fromXml_deep_val",  l2.inner.deep.val, 7);
 
-    // ── fromXml — entity unescaping ──────────────────────────────────────────
+    // ── fromXml - entity unescaping ──────────────────────────────────────────
     string xmlEsc = "<AllPrimitives><i>0</i><b>false</b><f>0</f><s>a&amp;b&lt;c&gt;d</s></AllPrimitives>";
     AllPrimitives ap4 = XmlBuilder.fromXml<AllPrimitives>(xmlEsc);
     total++; passed += Test("fromXml_unescape", ap4.s, "a&b<c>d");
 
-    // ── round-trip — Employee ────────────────────────────────────────────────
+    // ── round-trip - Employee ────────────────────────────────────────────────
     string xmlE3 = XmlBuilder.toXml(e, "Employee");
     Employee e3 = XmlBuilder.fromXml<Employee>(xmlE3);
     total++; passed += Test("roundtrip_name",   e3.name,        e.name);
@@ -186,7 +186,7 @@ extern int main()
     total++; passed += Test("roundtrip_street", e3.addr.street, e.addr.street);
     total++; passed += Test("roundtrip_zip",    e3.addr.zip,    e.addr.zip);
 
-    // ── round-trip — AllPrimitives ───────────────────────────────────────────
+    // ── round-trip - AllPrimitives ───────────────────────────────────────────
     string xmlAp5 = XmlBuilder.toXml(ap, "AllPrimitives");
     AllPrimitives ap5 = XmlBuilder.fromXml<AllPrimitives>(xmlAp5);
     total++; passed += Test("roundtrip_prim_int",    ap5.i, ap.i);

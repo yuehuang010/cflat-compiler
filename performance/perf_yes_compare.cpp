@@ -1,7 +1,7 @@
-// C++ throughput comparison — single-threaded loop vs raw threads + double-buffered stream.
+// C++ throughput comparison - single-threaded loop vs raw threads + double-buffered stream.
 // Mirrors perf_yes_compare.cb (CFlat) for direct cross-language comparison.
 //
-// Build (MSVC, from repo root — requires the x64 developer environment):
+// Build (MSVC, from repo root - requires the x64 developer environment):
 //   cmd /c "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 ^
 //     && cl /O2 /std:c++17 /EHsc performance\perf_yes_compare.cpp /Feperformance\perf_yes_compare.exe
 //
@@ -26,7 +26,7 @@ static const int BUF_BYTES  = 65536;
 // write buffer.  When it is full the buffer is handed to the consumer via
 // pendingFull and the producer blocks until the consumer returns an empty buffer
 // via emptyPool.  Blocking only occurs when both buffers are simultaneously full
-// (consumer is slow) — the same guarantee as the CFlat stream struct.
+// (consumer is slow) - the same guarantee as the CFlat stream struct.
 
 struct Stream {
     char  bufA[BUF_BYTES + 1];
@@ -126,7 +126,7 @@ static void consumer_thread() {
     while (true) {
         char* buf = g_stream.read_buf(&len);
         if (buf == nullptr) break;
-        // Count newlines — each "Y\n" is one iteration.
+        // Count newlines - each "Y\n" is one iteration.
         for (int i = 0; i < len; i++)
             if (buf[i] == '\n') count++;
         g_stream.return_buf(buf);

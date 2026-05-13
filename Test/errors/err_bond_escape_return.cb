@@ -2,7 +2,7 @@
 expect_error("is not a 'bond' parameter") {
     int* Borrow(bond int* src) { return src; }
 
-    // src is NOT declared bond here — so returning v would let a bonded value escape
+    // src is NOT declared bond here - so returning v would let a bonded value escape
     int* Bad(int* src) {
         int* v = Borrow(src);
         return v;

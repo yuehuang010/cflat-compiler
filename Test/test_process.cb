@@ -1,4 +1,4 @@
-// test_process.cb — smoke-test the process wrapper.
+// test_process.cb - smoke-test the process wrapper.
 //
 // Build:
 //   x64/Debug/cflat.exe Test/test_process.cb -i cflat/core -o out/test_process.exe

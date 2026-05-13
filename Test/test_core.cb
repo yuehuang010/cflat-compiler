@@ -50,7 +50,7 @@ int testArray()
     delete[_] zero;
     passed += Test("delete[_] 0 elements", g_dtor_count, 0);
 
-    // Primitive array — no cookie, no destructor (must not crash)
+    // Primitive array - no cookie, no destructor (must not crash)
     int* ints = new int[10];
     ints[0] = 42;
     delete[] ints;
@@ -263,7 +263,7 @@ int testDictionary()
     passed += Test("dict re-add 2",        d.add(2, 222),   true);
     passed += Test ("dict get 2 re-added",  d.get(2),         222);
 
-    // operator[] — same semantics as get()
+    // operator[] - same semantics as get()
     passed += Test ("dict op[] 1",       d[1],            111);
     passed += Test ("dict op[] 42",      d[42],            99);
     passed += Test ("dict op[] missing", d[999],            0);

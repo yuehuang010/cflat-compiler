@@ -236,12 +236,12 @@ bool testSortEdgeCases()
 {
     bool ok = true;
 
-    // Empty list — must not crash
+    // Empty list - must not crash
     list<int> empty;
     empty.sort((int a, int b) => { return a < b; });
     ok &= empty.count() == 0;
 
-    // Single element — no-op
+    // Single element - no-op
     list<int> one;
     one.add(42);
     one.sort((int a, int b) => { return a < b; });

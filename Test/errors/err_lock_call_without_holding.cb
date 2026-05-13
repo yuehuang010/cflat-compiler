@@ -16,6 +16,6 @@ void increment(Counter* a, int n) lock(a.mtx) {
 expect_error("must hold 'c.mtx' before calling this function") {
     void test() {
         Counter c;
-        increment(&c, 1);   // no lock held — error
+        increment(&c, 1);   // no lock held - error
     }
 }

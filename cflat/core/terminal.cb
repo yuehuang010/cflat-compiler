@@ -1,4 +1,4 @@
-// terminal.cb — Win32 console terminal utilities for CFlat
+// terminal.cb - Win32 console terminal utilities for CFlat
 //
 // Wraps Win32 Console API for terminal-mode applications (games, TUIs).
 // Provides: raw keyboard input (blocking and non-blocking), ANSI escape output
@@ -113,7 +113,7 @@ struct Terminal {
     // Enable ANSI processing on stdout and switch stdin to raw (no echo, no
     // line-buffering). Returns false if the handles are not real console handles
     // (e.g., redirected I/O in CI). Calling other methods is safe even after a
-    // false return — they just become no-ops or degrade gracefully.
+    // false return - they just become no-ops or degrade gracefully.
     bool init() {
         // STD_OUTPUT_HANDLE = (DWORD)(-11), STD_INPUT_HANDLE = (DWORD)(-10)
         _hOut = GetStdHandle(-11);
@@ -374,8 +374,8 @@ struct Terminal {
     ~Terminal() { restore(); }
 
     // Internal helper shared by pollKey and readKey.
-    // block=true  — keeps reading (discarding non-key and key-up events) until a key-down arrives.
-    // block=false — reads only already-queued events; returns false when the queue is drained.
+    // block=true  - keeps reading (discarding non-key and key-up events) until a key-down arrives.
+    // block=false - reads only already-queued events; returns false when the queue is drained.
     bool _readNextKey(KeyEvent* out, bool block) {
         _INPUT_RECORD rec;
         i32 read = 0;
@@ -422,8 +422,8 @@ struct Terminal {
 // ── ANSI color helpers ────────────────────────────────────────────────────────
 //
 // Standard 16-color codes:
-//   fg: 30-37 (normal), 90-97 (bright)   — e.g. 32=green, 91=bright red
-//   bg: 40-47 (normal), 100-107 (bright) — e.g. 41=red bg, 100=bright black bg
+//   fg: 30-37 (normal), 90-97 (bright)   - e.g. 32=green, 91=bright red
+//   bg: 40-47 (normal), 100-107 (bright) - e.g. 41=red bg, 100=bright black bg
 //
 // 256-color codes (xterm-256color):
 //   0-7: standard, 8-15: bright, 16-231: 6x6x6 color cube, 232-255: greyscale
@@ -439,7 +439,7 @@ void termColor256(int fg, int bg) { printf("\033[38;5;%d;48;5;%dm", fg, bg); }
 void termFg256(int fg)            { printf("\033[38;5;%dm", fg); }
 void termBg256(int bg)            { printf("\033[48;5;%dm", bg); }
 
-// Truecolor (24-bit) helpers — require Terminal.init() for UTF-8 and VT support.
+// Truecolor (24-bit) helpers - require Terminal.init() for UTF-8 and VT support.
 void termFgRgb(int r, int g, int b)                         { printf("\033[38;2;%d;%d;%dm", r, g, b); }
 void termBgRgb(int r, int g, int b)                         { printf("\033[48;2;%d;%d;%dm", r, g, b); }
 void termColorRgb(int fr, int fg, int fb, int br, int bg, int bb) { printf("\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm", fr, fg, fb, br, bg, bb); }
@@ -523,7 +523,7 @@ struct TerminalSnapshot {
 // ── TerminalDriver ────────────────────────────────────────────────────────────
 //
 // Automation counterpart to Terminal: injects synthetic key events and captures
-// screen snapshots. Borrows console handles from an existing Terminal — does not
+// screen snapshots. Borrows console handles from an existing Terminal - does not
 // own them and does not restore console mode.
 //
 // Typical in-process test pattern:

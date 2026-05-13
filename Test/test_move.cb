@@ -22,20 +22,20 @@ struct Container
     }
 };
 
-// move parameter takes ownership — Resource is deleted when consume returns
+// move parameter takes ownership - Resource is deleted when consume returns
 void consume(move Resource* r)
 {
     // use r inside the function
     int x = r->id;
 }
 
-// non-move parameter borrows — caller still owns
+// non-move parameter borrows - caller still owns
 void borrow(Resource* r)
 {
     int x = r->id;
 }
 
-// move T* return type — ownership propagates to caller
+// move T* return type - ownership propagates to caller
 move Resource* createResource(int id)
 {
     Resource* r = new Resource();
@@ -139,7 +139,7 @@ extern int main()
     passed += Test("move_borrow_no_dtor", dtorCount, 1);
     total++;
 
-    // Test 2: move param with null — no crash (null check in cleanup)
+    // Test 2: move param with null - no crash (null check in cleanup)
     dtorCount = 0;
     {
         Resource* r = new Resource();
@@ -156,7 +156,7 @@ extern int main()
     passed += Test("new_local_auto_free", dtorCount, 1);
     total++;
 
-    // Test 4: new local assigned to struct field — not freed early; freed when owner is destroyed
+    // Test 4: new local assigned to struct field - not freed early; freed when owner is destroyed
     dtorCount = 0;
     {
         Container* c = new Container();
@@ -175,7 +175,7 @@ extern int main()
     passed += testListStringMove();
     total += 10;
 
-    // Test 5: move T* return — caller receives ownership, pointer freed at scope exit
+    // Test 5: move T* return - caller receives ownership, pointer freed at scope exit
     dtorCount = 0;
     {
         Resource* r = createResource(7);
@@ -183,7 +183,7 @@ extern int main()
     passed += Test("move_return_new_freed", dtorCount, 1);
     total++;
 
-    // Test 6: move T* return — forward through move param, freed once
+    // Test 6: move T* return - forward through move param, freed once
     dtorCount = 0;
     {
         Resource* r = createResource(8);
@@ -192,7 +192,7 @@ extern int main()
     passed += Test("move_return_forward_freed_once", dtorCount, 1);
     total++;
 
-    // Test 7: list::take — transfers ownership out of list; element freed by caller,
+    // Test 7: list::take - transfers ownership out of list; element freed by caller,
     // not by list; list entry is nulled so no double-free
     dtorCount = 0;
     {

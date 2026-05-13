@@ -43,7 +43,7 @@ struct stop_source {
 
 // Polls t->try_join(50ms) until the thread exits or the token is cancelled.
 // Returns true if the thread exited cleanly; false if cancellation was requested.
-// When false, the thread is NOT joined — caller is responsible for cleanup.
+// When false, the thread is NOT joined - caller is responsible for cleanup.
 bool __wait_thread_or_stop(Thread* t, stop_token token) {
     while (!token.stop_requested()) {
         if (t->try_join(50))

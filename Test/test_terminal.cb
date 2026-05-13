@@ -9,7 +9,7 @@ extern int main()
     int h = 0;
     term.getSize(&w, &h);
 
-    // Basic output helpers — harmless even when redirected
+    // Basic output helpers - harmless even when redirected
     term.hideCursor();
     term.moveTo(1, 1);
     termColor(32, 40);
@@ -43,7 +43,7 @@ extern int main()
             return 1;
         }
 
-        // injectText — drain each character back out
+        // injectText - drain each character back out
         driver.injectText("Hi");
         KeyEvent k1;
         KeyEvent k2;
@@ -76,7 +76,7 @@ extern int main()
                 return 1;
             }
         }
-        // If snapped==false the output is redirected — skip snapshot assertions
+        // If snapped==false the output is redirected - skip snapshot assertions
     }
 
     term.restore();

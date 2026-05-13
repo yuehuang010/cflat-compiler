@@ -1,5 +1,5 @@
 // Returning a lambda that reference-captures a local struct must fail with a
-// bond escape error — the lambda would outlive the captured stack variable.
+// bond escape error - the lambda would outlive the captured stack variable.
 
 struct Counter {
     int value = default;

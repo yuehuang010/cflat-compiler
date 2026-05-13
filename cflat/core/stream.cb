@@ -5,8 +5,8 @@ import "string.cb";
 // Double-buffered text pipe between two 'program' constructs.
 //
 // Mirrors the C++ double-buffer design: one mutex + two condition variables.
-// _cvFull  — wakes the consumer when a full buffer is ready.
-// _cvEmpty — wakes the producer when an empty buffer is returned.
+// _cvFull  - wakes the consumer when a full buffer is ready.
+// _cvEmpty - wakes the producer when an empty buffer is returned.
 //
 // The consumer sleeps (SleepConditionVariableCS) while the producer fills
 // the buffer, so there is no cache-line contention on the hot write path.
@@ -14,7 +14,7 @@ import "string.cb";
 //
 // Usage:
 //   stream s;
-//   s.bufferSize = 65536;   // optional — default is 65536 bytes
+//   s.bufferSize = 65536;   // optional - default is 65536 bytes
 //   s.init();
 //   p1 >> s;                // wires p1.onStdout → s.write()
 //   s >> p2;                // wires p2.onStdin  → s.read(), p2.onStdinReturn → s.return_buffer()
@@ -147,7 +147,7 @@ struct stream {
         return buf;
     }
 
-    // Like read() but also returns the byte count — allows the caller to use a
+    // Like read() but also returns the byte count - allows the caller to use a
     // length-bounded loop instead of scanning for '\0', enabling LLVM vectorization.
     char* read_buf(int* out_len) {
         _mu.acquire();

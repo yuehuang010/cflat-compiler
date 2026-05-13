@@ -225,7 +225,7 @@
     "struct-declaration": {
       "patterns": [
         {
-          "comment": "struct/class/union/enum keyword followed by a type name — covers declarations AND type-usage positions (variable declarations, casts, parameters)",
+          "comment": "struct/class/union/enum keyword followed by a type name - covers declarations AND type-usage positions (variable declarations, casts, parameters)",
           "name": "meta.struct.cflat",
           "match": "\\b(struct|class|union|enum|program)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
           "captures": {
@@ -246,7 +246,7 @@
       ]
     },
     "new-expression": {
-      "comment": "new TypeName — color the keyword and the type name separately",
+      "comment": "new TypeName - color the keyword and the type name separately",
       "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
       "captures": {
         "1": { "name": "keyword.operator.expression.cflat" },

@@ -1,4 +1,4 @@
-// math.cb — common mathematical utilities.
+// math.cb - common mathematical utilities.
 // Provides abs, min, max, clamp for integers and floats.
 
 namespace Math

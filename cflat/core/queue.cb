@@ -1,4 +1,4 @@
-// queue<T> — FIFO (First In First Out) using simple array.
+// queue<T> - FIFO (First In First Out) using simple array.
 class queue<T>
 {
     T*  _data     = nullptr;

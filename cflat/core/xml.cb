@@ -1,7 +1,7 @@
 import "arena.cb";
 import "list.cb";
 
-// XmlBuilder — serializes a struct to XML using the reflect intrinsic.
+// XmlBuilder - serializes a struct to XML using the reflect intrinsic.
 // Honors [JsonName] (field rename) and [Private] (field skip) annotations,
 // the same as JsonBuilder, because both use the reflect/reflect_set intrinsics.
 class XmlBuilder : IReflector
@@ -159,7 +159,7 @@ class XmlBuilder : IReflector
         return result;
     }
 
-    // Parse XML from a raw byte pointer + length — avoids a string copy at the call site.
+    // Parse XML from a raw byte pointer + length - avoids a string copy at the call site.
     static T fromXmlRaw<T>(i8* data, int len)
     {
         Arena arena;
@@ -369,7 +369,7 @@ class XmlNode : IJSON, IJSONArray
 // Recursive-descent XML parser. Builds an XmlNode tree.
 // Nodes are bump-allocated from _arena when set; strings are heap-allocated.
 // Supports: elements, text content, XML declarations (<?...?>), comments.
-// Attributes are skipped — field values are carried by child elements only.
+// Attributes are skipped - field values are carried by child elements only.
 struct XmlParser
 {
     i8*    _src   = nullptr;
@@ -477,7 +477,7 @@ struct XmlParser
             _pos += 3;
             return;
         }
-        // <!DOCTYPE or similar — skip to >
+        // <!DOCTYPE or similar - skip to >
         while (_pos < _len && _src[_pos] != '>') _pos++;
         if (_pos < _len) _pos++;
     }
@@ -518,13 +518,13 @@ struct XmlParser
         _skipWs();
         if (_pos < _len && _src[_pos] != '<')
         {
-            // Leaf element — text content
+            // Leaf element - text content
             node._text = _parseText();
             _skipWs();
         }
         else
         {
-            // Container element — child elements
+            // Container element - child elements
             while (_pos < _len)
             {
                 _skipWs();

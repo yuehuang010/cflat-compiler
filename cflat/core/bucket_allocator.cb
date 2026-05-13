@@ -1,7 +1,7 @@
 import "vmem.cb";
 import "page_pool.cb";
 
-// bucket_allocator.cb — segregated free-list allocator backed by g_page_pool.
+// bucket_allocator.cb - segregated free-list allocator backed by g_page_pool.
 //
 // Eight size classes (8, 16, 32, 64, 128, 256, 512, 1024 bytes). Each class
 // holds a linked list of 64 KB pages from g_page_pool, subdivided into fixed-
@@ -22,7 +22,7 @@ import "page_pool.cb";
 // Requests > 1024 bytes go directly to vmem_alloc (large-alloc path), tracked
 // in _largeHead so cleanup can vmem_free them.
 //
-// NOTE: pages stay with the bucket until cleanup() — empty-page release back
+// NOTE: pages stay with the bucket until cleanup() - empty-page release back
 // to the pool is a follow-up optimization.
 //
 // Usage:
@@ -42,7 +42,7 @@ struct _BA_PageHdr
     i8* _pad1      = nullptr;
 };
 
-// Intrusive free-block link — overlays the first 8 bytes of any free block.
+// Intrusive free-block link - overlays the first 8 bytes of any free block.
 struct _BA_FreeBlock { i8* _next = nullptr; };
 
 // Per-size-class state held inline inside BucketAllocator.
@@ -109,7 +109,7 @@ class BucketAllocator : IAllocator
         return -1;
     }
 
-    // First block offset within a page — past the header, aligned to block size.
+    // First block offset within a page - past the header, aligned to block size.
     i64 _dataOffsetFor(i64 blockSize)
     {
         i64 hdrSize = (i64)sizeof(_BA_PageHdr);
@@ -209,7 +209,7 @@ class BucketAllocator : IAllocator
             cur  = ch->_next;
         }
 
-        // Foreign pointer — only free if it's on the CRT heap. HeapValidate
+        // Foreign pointer - only free if it's on the CRT heap. HeapValidate
         // guards against vmem-backed blocks from other allocators that would
         // corrupt the CRT heap.
         if (HeapValidate(GetProcessHeap(), 0u, ptr))

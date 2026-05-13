@@ -1,11 +1,11 @@
 // Throughput comparison across five producer-consumer variants.
 // Each variant runs for BENCH_SECS seconds; results are printed as a table.
 //
-//   channel   + program    — MPMC bounded channel, program actor overhead
-//   spsc_queue + program   — wait-free SPSC ring, program actor overhead
-//   channel   + raw Thread — same channel, raw Win32 threads (no program overhead)
-//   stream    + program    — printf/fgets pipe via stream struct (>> operator)
-//   single-threaded loop   — no queue, no threads; tight increment loop (ceiling)
+//   channel   + program    - MPMC bounded channel, program actor overhead
+//   spsc_queue + program   - wait-free SPSC ring, program actor overhead
+//   channel   + raw Thread - same channel, raw Win32 threads (no program overhead)
+//   stream    + program    - printf/fgets pipe via stream struct (>> operator)
+//   single-threaded loop   - no queue, no threads; tight increment loop (ceiling)
 //
 // All threaded variants use non-blocking push/pop so the stop flag is checked promptly.
 
@@ -146,7 +146,7 @@ int ac_perf_producer(void* ctx)
         if (g_ac_perf->try_send(pa))
             val = val + 1;
         else
-            g_ac_perf->release_arena(pa);   // ring full — skip this slot
+            g_ac_perf->release_arena(pa);   // ring full - skip this slot
     }
     __atomic_i32_store(&g_ac_done, 1);
     return 0;
@@ -202,8 +202,8 @@ int stream_raw_consumer(void* ctx)
 }
 
 // ── Variant 4: stream + program ───────────────────────────────────────────────
-// Producer writes via _out.write_bytes() — bypasses printf/TLS entirely.
-// Consumer reads via fgets — runtime hook intercepts and serves from stream buffer.
+// Producer writes via _out.write_bytes() - bypasses printf/TLS entirely.
+// Consumer reads via fgets - runtime hook intercepts and serves from stream buffer.
 
 program StreamProducer
 {
@@ -361,9 +361,9 @@ extern int main()
     tStrCons.join();
     i64 stream_raw_tps = g_stream_raw_count / dur_s;
 
-    // variant 7: single-threaded tight loop — no queue, no threads
+    // variant 7: single-threaded tight loop - no queue, no threads
     // Check time every 65536 iterations (same cadence as the C++ reference) so the
-    // loop body is just an increment — not a QueryPerformanceCounter + division.
+    // loop body is just an increment - not a QueryPerformanceCounter + division.
     printf("[7/7] single-threaded loop\n");
     i64 st_freq  = _timeGetQpcFreq();
     i64 st_dur   = (i64)BENCH_SECS * st_freq;

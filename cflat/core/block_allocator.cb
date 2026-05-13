@@ -1,14 +1,14 @@
 import "vmem.cb";
 
-// block_allocator.cb — fixed-block-size page allocator.
+// block_allocator.cb - fixed-block-size page allocator.
 //
 // Each page is a vmem_alloc'd buffer (MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE).
-// vmem_alloc guarantees OS-aligned, zero-initialized pages — no memset needed.
+// vmem_alloc guarantees OS-aligned, zero-initialized pages - no memset needed.
 //
 // Page layout: [bitmap | padding | data blocks]
-//   bitmap    — one byte per block (0 = free, 1 = used)
-//   padding   — zeros, rounds bitmap up to the next cache-line boundary
-//   data      — blockCount fixed-size blocks, each _blockSize bytes
+//   bitmap    - one byte per block (0 = free, 1 = used)
+//   padding   - zeros, rounds bitmap up to the next cache-line boundary
+//   data      - blockCount fixed-size blocks, each _blockSize bytes
 //
 // Block size is read once from GetLogicalProcessorInformation (L3 cache line size,
 // typically 64 bytes). Page size is read from GetSystemInfo (dwAllocationGranularity,
@@ -92,7 +92,7 @@ class BlockAllocator : IAllocator
         i64 bitmapSize = (rawCount + _blockSize - 1) / _blockSize * _blockSize;  // round up to cache line
         i64 blockCount = (_pageSize - bitmapSize) / _blockSize;
 
-        // vmem_alloc zero-initializes committed pages — bitmap is already cleared.
+        // vmem_alloc zero-initializes committed pages - bitmap is already cleared.
         i8* data = (i8*)vmem_alloc(_pageSize);
 
         if (_pageCount == _pageCapacity) _growPages();
@@ -133,7 +133,7 @@ class BlockAllocator : IAllocator
             pi = pi + 1;
         }
 
-        // No free slot found — add a new page and allocate block 0.
+        // No free slot found - add a new page and allocate block 0.
         _newPage();
         int last = _pageCount - 1;
         i64 bitmapSize = (_pages[last]._blockCount + _blockSize - 1) / _blockSize * _blockSize;

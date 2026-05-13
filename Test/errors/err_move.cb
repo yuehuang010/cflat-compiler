@@ -7,7 +7,7 @@ void consume(move MoveResource* r) { delete r; }
 struct Holder { MoveResource* item = nullptr; };
 void Holder(Holder* self) {}
 
-// use after move — assign move param to struct field, then read param again
+// use after move - assign move param to struct field, then read param again
 expect_error("use of moved variable 'child'") {
     void storeAndRead(Holder* h, move MoveResource* child)
     {
@@ -16,7 +16,7 @@ expect_error("use of moved variable 'child'") {
     }
 }
 
-// use after move — move param assigned to a field in each branch, read after the if/else
+// use after move - move param assigned to a field in each branch, read after the if/else
 expect_error("use of moved variable 'child2'") {
     void storeAndReadBranched(Holder* h, Holder* h2, move MoveResource* child2)
     {
@@ -27,28 +27,28 @@ expect_error("use of moved variable 'child2'") {
 
 extern int main()
 {
-    // use after move — pass to another call
+    // use after move - pass to another call
     expect_error("use of moved variable 'r'") {
         MoveResource* r = new MoveResource();
         consume(r);
         consume(r);
     }
 
-    // use after move — field read
+    // use after move - field read
     expect_error("use of moved variable 'r2'") {
         MoveResource* r2 = new MoveResource();
         consume(r2);
         int x = r2->id;
     }
 
-    // use after move — move happens inside an if, read happens after the if
+    // use after move - move happens inside an if, read happens after the if
     expect_error("use of moved variable 'r3'") {
         MoveResource* r3 = new MoveResource();
         if (1) consume(r3);
         consume(r3);
     }
 
-    // use after move — move happens inside an else, read happens after the if/else
+    // use after move - move happens inside an else, read happens after the if/else
     expect_error("use of moved variable 'r4'") {
         MoveResource* r4 = new MoveResource();
         if (0) { } else { consume(r4); }

@@ -1,4 +1,4 @@
-// core/network/rest_server.cb — REST server combining HttpRouter with an HTTP
+// core/network/rest_server.cb - REST server combining HttpRouter with an HTTP
 // accept loop. Configure routes before calling run().
 //
 // Usage:
@@ -29,7 +29,7 @@ import "network/router.cb";
 
 // Per-connection program: dispatches one request through the shared router and exits.
 // Accepts the OS socket handle (void*) rather than a Socket* to avoid passing
-// a cross-program pointer — each program owns its own allocator.
+// a cross-program pointer - each program owns its own allocator.
 program _RestConn {
     void*       handle = nullptr;
     HttpRouter* router = nullptr;
@@ -61,7 +61,7 @@ program _RestConn {
         conn->send(rbuf, rlen);
         delete rbuf;
         delete resp;
-        // conn is not deleted here — local Socket* is cleaned up at scope exit.
+        // conn is not deleted here - local Socket* is cleaned up at scope exit.
         return 0;
     }
 };

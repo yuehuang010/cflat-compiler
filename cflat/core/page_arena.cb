@@ -1,9 +1,9 @@
-// page_arena.cb — self-contained bump-allocation region for zero-copy transfer.
+// page_arena.cb - self-contained bump-allocation region for zero-copy transfer.
 //
 // page_arena is the transferable unit used by arena_channel. The producer
 // allocates everything into a page_arena via alloc(); the arena is sent
 // to the consumer via arena_channel.send(); the consumer reads all pointers
-// directly — no copy needed, because every allocation lives within the arena.
+// directly - no copy needed, because every allocation lives within the arena.
 //
 // Ownership is unique: exactly one thread holds a page_arena at a time.
 // dealloc() and cleanup() are no-ops; use arena_channel.release_arena() to
@@ -55,7 +55,7 @@ struct page_arena
         }
         else
         {
-            // Oversize chunk — vmem_alloc directly, rounded up to 64 KB granularity.
+            // Oversize chunk - vmem_alloc directly, rounded up to 64 KB granularity.
             sz = ((need + (i64)65535) / (i64)65536) * (i64)65536;
             c  = (_pa_chunk*)vmem_alloc(sz);
         }
@@ -104,7 +104,7 @@ struct page_arena
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     // Reset all chunks for reuse (zero _used, clear _root and _id).
-    // Chunks are NOT freed — they are retained for the next use.
+    // Chunks are NOT freed - they are retained for the next use.
     void reset()
     {
         _pa_chunk* c = _head;

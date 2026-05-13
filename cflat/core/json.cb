@@ -140,7 +140,7 @@ class JsonBuilder : IReflector
     }
 
     // Parse JSON from a raw byte pointer + length. Avoids a string copy at the
-    // call site — useful when the caller already holds an i8* buffer.
+    // call site - useful when the caller already holds an i8* buffer.
     static T fromJsonRaw<T>(i8* data, int len)
     {
         Arena arena;
@@ -203,7 +203,7 @@ class JsonNode : IJSON, IJSONArray
         if (firstChild == nullptr)
         {
             firstChild = child;         // child nulled by move semantics after this
-            lastChild = firstChild;     // read back from field — no ownership transfer
+            lastChild = firstChild;     // read back from field - no ownership transfer
         }
         else
         {
@@ -335,7 +335,7 @@ class JsonNode : IJSON, IJSONArray
 // ── JsonParser ────────────────────────────────────────────────────────────────
 // Recursive-descent JSON parser. Builds a JsonNode tree.
 // When _arena is set, nodes are bump-allocated from it and the caller must NOT
-// delete individual nodes — the arena is freed as a unit by the caller.
+// delete individual nodes - the arena is freed as a unit by the caller.
 // When _arena is null (e.g. the static parse() method), nodes are heap-allocated
 // and the returned root must be deleted by the caller as before.
 struct JsonParser
@@ -394,7 +394,7 @@ struct JsonParser
 
         if (_pos < _len && _src[_pos] == '"')
         {
-            // No escapes — copy directly, same pattern as stringbuilder.toString().
+            // No escapes - copy directly, same pattern as stringbuilder.toString().
             int len = _pos - start;
             _pos++; // consume closing "
             i8* buf = new i8[len + 1];

@@ -1,4 +1,4 @@
-// page_pool.cb — process-global pool of 64 KB pages for slab/arena backing.
+// page_pool.cb - process-global pool of 64 KB pages for slab/arena backing.
 //
 // One singleton instance, `g_page_pool`. Multi-threaded acquire/release.
 //
@@ -88,7 +88,7 @@ class page_pool
             old = __atomic_i64_load(&_top);
         }
 
-        // Free stack empty — allocate a fresh page direct from vmem.
+        // Free stack empty - allocate a fresh page direct from vmem.
         // vmem_alloc returns zeroed memory.
         return vmem_alloc((i64)65536);
     }

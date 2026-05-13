@@ -106,10 +106,10 @@ i64 bigNum = 200000;
 ```c
 string s = "hello";
 s.length();   // 5
-s.data();     // i8* — null-terminated bytes
+s.data();     // i8* - null-terminated bytes
 ```
 
-Concatenation with `operator+` — produces a freshly allocated buffer:
+Concatenation with `operator+` - produces a freshly allocated buffer:
 
 ```c
 string a = "hello";
@@ -129,13 +129,13 @@ Greeting g;
 string result = "hello " + g;     // "hello world"
 ```
 
-For incremental building, use `stringbuilder` — a mutable, growable buffer with `append`, `appendCStr`, `appendChar`, `clear`, and `toString`.
+For incremental building, use `stringbuilder` - a mutable, growable buffer with `append`, `appendCStr`, `appendChar`, `clear`, and `toString`.
 
 Define `operator string(T)` to convert arbitrary types to `string`; the core library provides conversions from `char*`, `i32`, and any `IString`.
 
 #### String interpolation
 
-Any string literal containing `{expr}` is automatically treated as an interpolated string — no prefix required. Each `{expr}` segment is converted to `string` via `operator string` and the segments are concatenated at runtime:
+Any string literal containing `{expr}` is automatically treated as an interpolated string - no prefix required. Each `{expr}` segment is converted to `string` via `operator string` and the segments are concatenated at runtime:
 
 ```c
 string name = "World";
@@ -162,7 +162,7 @@ Point p; p.x = 10; p.y = 20;
 string s = "Point is {p}.";   // "Point is 10, 20."
 ```
 
-**Brace escaping** — use `{{` or `\{` for a literal `{`, and `}}` or `\}` for a literal `}`:
+**Brace escaping** - use `{{` or `\{` for a literal `{`, and `}}` or `\}` for a literal `}`:
 
 ```c
 string s = "value is {{x}} = {x}";   // "value is {x} = 42"  (x == 42)
@@ -250,7 +250,7 @@ int c = sum(x: 1, y: 2, 3);            // mixed with positional
 
 ### Forward References
 
-Functions can be called before they are defined — no forward declarations needed. Mutual recursion works out of the box:
+Functions can be called before they are defined - no forward declarations needed. Mutual recursion works out of the box:
 
 ```c
 bool isEven(int n)
@@ -318,9 +318,9 @@ apply(add, 5, 6);   // 11
 
 ### Lambdas
 
-Anonymous functions use C#-style arrow syntax and are compatible with `function<T>`. Capture is automatic — the lambda body is scanned at compile time and outer variables are captured without any explicit capture list.
+Anonymous functions use C#-style arrow syntax and are compatible with `function<T>`. Capture is automatic - the lambda body is scanned at compile time and outer variables are captured without any explicit capture list.
 
-**Non-capturing lambda** — captures nothing; works identically to a named function:
+**Non-capturing lambda** - captures nothing; works identically to a named function:
 
 ```c
 function<int(int, int)> add = (int a, int b) => { return a + b; };
@@ -340,7 +340,7 @@ function<int(int)> sign = (int x) => {
 };
 ```
 
-**Value capture** — primitives, pointer types, and `string` are copied into the closure at lambda creation time. Subsequent changes to the outer variable do not affect the captured copy:
+**Value capture** - primitives, pointer types, and `string` are copied into the closure at lambda creation time. Subsequent changes to the outer variable do not affect the captured copy:
 
 ```c
 int offset = 10;
@@ -350,17 +350,17 @@ offset = 99;    // does NOT change the captured copy
 addOffset(5);   // still 15
 ```
 
-Pointer captures copy the pointer value — both the lambda and the outer code share the same pointed-to memory:
+Pointer captures copy the pointer value - both the lambda and the outer code share the same pointed-to memory:
 
 ```c
 int* p = new int;
 *p = 42;
 function<int()> read = () => { return *p; };
 *p = 77;
-read();   // 77 — both sides access the same heap cell
+read();   // 77 - both sides access the same heap cell
 ```
 
-**Reference capture** — non-pointer struct and class values are captured by reference. The lambda holds a pointer to the outer variable; mutations on either side are immediately visible to the other:
+**Reference capture** - non-pointer struct and class values are captured by reference. The lambda holds a pointer to the outer variable; mutations on either side are immediately visible to the other:
 
 ```c
 struct Counter { int value = 0; };
@@ -368,14 +368,14 @@ struct Counter { int value = 0; };
 Counter c;
 function<void()> inc = () => { c.value = c.value + 1; };
 inc(); inc(); inc();
-c.value;   // 3 — lambda mutations are visible in the caller
+c.value;   // 3 - lambda mutations are visible in the caller
 
 c.value = 10;   // outer mutation
 inc();
-c.value;   // 11 — outer mutation was visible inside the lambda
+c.value;   // 11 - outer mutation was visible inside the lambda
 ```
 
-**Lifetime constraint** — a lambda that reference-captures a local variable is *bonded* to it. The lambda cannot be returned from the function or assigned to a variable in a wider scope, because doing so would leave the lambda holding a dangling pointer to a stack variable that has gone out of scope:
+**Lifetime constraint** - a lambda that reference-captures a local variable is *bonded* to it. The lambda cannot be returned from the function or assigned to a variable in a wider scope, because doing so would leave the lambda holding a dangling pointer to a stack variable that has gone out of scope:
 
 ```c
 function<void()> bad()
@@ -386,14 +386,14 @@ function<void()> bad()
 }
 ```
 
-The lambda can be freely passed to functions called within the same scope — only escape (return or wider-scope assignment) is prevented.
+The lambda can be freely passed to functions called within the same scope - only escape (return or wider-scope assignment) is prevented.
 
 ---
 
 
 ## Generics/Templates & Ownership
 
-Generics are resolved at compile time (monomorphization — no runtime overhead).
+Generics are resolved at compile time (monomorphization - no runtime overhead).
 
 ### Generic Structs
 
@@ -467,7 +467,7 @@ Tuples are heterogeneous fixed-length sequences. The underlying type is `tuple<T
 point.item_0 = 3;
 point.item_1 = 1.5f;
 
-int n = point.size();   // 2 — number of elements
+int n = point.size();   // 2 - number of elements
 ```
 
 Fields are named `item_0`, `item_1`, … and can be accessed directly.
@@ -501,7 +501,7 @@ A tuple value can be unpacked into named local variables in a single declaration
 (int a, float b, bool c) = makeTriple();
 ```
 
-The right-hand side can be any expression that evaluates to a matching tuple type — a variable, a function call, or a construction expression.
+The right-hand side can be any expression that evaluates to a matching tuple type - a variable, a function call, or a construction expression.
 
 ### `ITuple<T...>` Interface
 
@@ -628,7 +628,7 @@ if (sc is Circle)   // true if sc holds a Circle
 }
 
 // as returns nullptr on mismatch
-Square* sp = sc as Square;   // nullptr — sc is a Circle
+Square* sp = sc as Square;   // nullptr - sc is a Circle
 ```
 
 `as` also casts between interface types:
@@ -660,7 +660,7 @@ switch (shape)
 
 CFlat uses **context-based ownership**: local variables and struct fields own their pointers; function parameters borrow by default.
 
-The `move` keyword on a parameter definition transfers ownership into the callee — the resource is freed when the function returns:
+The `move` keyword on a parameter definition transfers ownership into the callee - the resource is freed when the function returns:
 
 ```c
 void consume(move Resource* r)
@@ -680,16 +680,16 @@ consume(res);   // res is automatically nulled in the caller after this call
 // res is nullptr here
 ```
 
-- **Call site is silent** — no annotation required; the caller's pointer is automatically nulled after a `move` call.
-- `move` is a soft keyword detected by text matching, not an ANTLR token — identifiers named `move` still work.
+- **Call site is silent** - no annotation required; the caller's pointer is automatically nulled after a `move` call.
+- `move` is a soft keyword detected by text matching, not an ANTLR token - identifiers named `move` still work.
 - For value types `move` is a no-op; ownership semantics only activate on pointer types.
 
 ### `move` Return Type
 
-`move T*` on a function's return type declares that the caller receives ownership of the returned pointer — the caller is responsible for freeing it (or passing it along).
+`move T*` on a function's return type declares that the caller receives ownership of the returned pointer - the caller is responsible for freeing it (or passing it along).
 
 ```c
-// Caller receives ownership — pointer freed when r goes out of scope
+// Caller receives ownership - pointer freed when r goes out of scope
 move Resource* createResource(int id)
 {
     Resource* r = new Resource();
@@ -700,7 +700,7 @@ move Resource* createResource(int id)
 // Forward ownership through a move parameter
 move Resource* forwardResource(move Resource* r)
 {
-    return r;   // OK: r is a move parameter — already owned
+    return r;   // OK: r is a move parameter - already owned
 }
 
 {
@@ -709,7 +709,7 @@ move Resource* forwardResource(move Resource* r)
 }
 ```
 
-**Rules at return sites** — the compiler enforces that the returned expression is genuinely owned:
+**Rules at return sites** - the compiler enforces that the returned expression is genuinely owned:
 
 | Returned expression | Allowed? |
 |---|---|
@@ -726,12 +726,12 @@ move Widget* leak(Widget* w)
 }
 ```
 
-- **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership — the local is freed at scope exit just like a `new`-allocated pointer.
+- **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership - the local is freed at scope exit just like a `new`-allocated pointer.
 - **Forwarding**: a `move T*` function can return a `move` parameter directly; the cleanup that would normally run at scope exit is suppressed so the resource isn't freed prematurely.
 
 ### `bond` Lifetime Keyword
 
-`bond` annotates a function parameter to declare that the return value borrows from it — the caller's variable cannot be replaced or freed while a bonded local exists that refers to it. This catches dangling-reference bugs at compile time with no annotation required at call sites:
+`bond` annotates a function parameter to declare that the return value borrows from it - the caller's variable cannot be replaced or freed while a bonded local exists that refers to it. This catches dangling-reference bugs at compile time with no annotation required at call sites:
 
 ```c
 // The return value borrows from src; it must not outlive src.
@@ -745,13 +745,13 @@ int* view = Borrow(&a);   // view is bonded to a
 
 | Violation | Error |
 |-----------|-------|
-| Assign bonded value to a wider-scope variable | bonded value cannot be assigned to `x` — `x` is in a wider scope than its bond source |
+| Assign bonded value to a wider-scope variable | bonded value cannot be assigned to `x` - `x` is in a wider scope than its bond source |
 | Store bonded value into a struct field or through a pointer | bonded value cannot be stored in a struct field or through a pointer |
 | Reassign the bond source while the bond is live | cannot reassign `a` while `view` holds a bonded reference to it |
 | Pass bonded value to a `move` parameter | bonded value cannot be passed to a `move` parameter |
 | Return a bonded value whose source is a local (not a `bond` param) | returning bonded value whose source `x` is not a `bond` parameter |
 
-**Breaking a bond** — assigning `null` (or `nullptr`) to the bonded variable clears the bond, after which the source may be freely reassigned:
+**Breaking a bond** - assigning `null` (or `nullptr`) to the bonded variable clears the bond, after which the source may be freely reassigned:
 
 ```c
 int a = 10;
@@ -760,7 +760,7 @@ view = nullptr;   // bond cleared
 a = 20;           // OK now
 ```
 
-**Propagating a bond up the call chain** — a function that receives a `bond` parameter may return it, and the compiler tags the caller's local as bonded in turn:
+**Propagating a bond up the call chain** - a function that receives a `bond` parameter may return it, and the compiler tags the caller's local as bonded in turn:
 
 ```c
 int* ForwardBorrow(bond int* src) { return src; }
@@ -835,7 +835,7 @@ Math.Point p;             // uses Point struct from ns_math.cb
 
 `import "file.cb" as Alias` is a caller-side alias, not a namespace boundary. The file's symbols are compiled as-is (unqualified names in the file continue to work), and `Alias.X` resolves to `X` only if `X` was declared in that file. Accessing a name not contributed by the file is a compile error.
 
-If two imported files both declare a symbol with the same name and signature, that is a collision — the author should put the conflicting declarations inside a `namespace` block to make them distinct.
+If two imported files both declare a symbol with the same name and signature, that is a collision - the author should put the conflicting declarations inside a `namespace` block to make them distinct.
 
 ---
 
@@ -854,7 +854,7 @@ i64 big64 = 0x200000005;
 i32 trunc = (i32)big64;   // 5  (low 32 bits)
 ```
 
-UFCS integer narrowing methods — each wraps to the target width:
+UFCS integer narrowing methods - each wraps to the target width:
 
 ```c
 i32 v = 128;
@@ -974,7 +974,7 @@ struct Person
 };
 ```
 
-Read annotation values at compile time with `annotationof(StructType, "fieldName", "AnnotationName")`. Returns a `string` — `"1"` for marker annotations, the serialized value for single-field annotations, or empty if the annotation is absent:
+Read annotation values at compile time with `annotationof(StructType, "fieldName", "AnnotationName")`. Returns a `string` - `"1"` for marker annotations, the serialized value for single-field annotations, or empty if the annotation is absent:
 
 ```c
 string fn  = annotationof(Person, "name",   "JsonName");   // "full_name"
@@ -1036,7 +1036,7 @@ IReflector visitor = pr;
 reflect(p, visitor);    // prints: x=3 y=7
 ```
 
-`reflect` also works on null pointers — calls `visitNull` with the field name.
+`reflect` also works on null pointers - calls `visitNull` with the field name.
 
 ---
 
@@ -1056,7 +1056,7 @@ for (int x in nums)
     printf("%d\n", x);
 ```
 
-C-style fixed arrays work directly — no helper methods needed:
+C-style fixed arrays work directly - no helper methods needed:
 
 ```c
 int buf[4];
@@ -1085,7 +1085,7 @@ for (int v in arr)
 
 ### Ternary Operator (`? :`)
 
-`condition ? trueValue : falseValue` — a compact conditional expression that evaluates to one of two values:
+`condition ? trueValue : falseValue` - a compact conditional expression that evaluates to one of two values:
 
 ```c
 int x = 10;
@@ -1106,7 +1106,7 @@ printf("sign: %s\n", (n > 0) ? "pos" : (n < 0) ? "neg" : "zero");
 `break` exits the nearest enclosing `while`, `for`, or `foreach` loop immediately. `continue` jumps to the loop's next iteration:
 
 ```c
-// break — exit when sentinel found
+// break - exit when sentinel found
 int i = 0;
 while (i < 100)
 {
@@ -1115,7 +1115,7 @@ while (i < 100)
 }
 // i == 5
 
-// continue — skip even numbers
+// continue - skip even numbers
 for (int k = 0; k < 10; k++)
 {
     if (k % 2 == 0) continue;
@@ -1159,7 +1159,7 @@ int* end   = arr + 4;
 int diff = (int)(end - start);   // 4  (not 16 bytes)
 ```
 
-`i8*` (byte pointer) obeys the same rules — since `sizeof(i8) == 1`, `p++` and `p += n` advance by exactly one byte, as expected:
+`i8*` (byte pointer) obeys the same rules - since `sizeof(i8) == 1`, `p++` and `p += n` advance by exactly one byte, as expected:
 
 ```c
 i8* buf = (i8*)new i8[8];
@@ -1315,7 +1315,7 @@ p.age  = 30;
 p._token = "secret";
 
 string json = JsonBuilder.toJson(p);
-// {"full_name":"Alice","age":30}   — _token omitted
+// {"full_name":"Alice","age":30}   - _token omitted
 
 Person p2 = fromJson<Person>(json);
 // p2.name == "Alice", p2.age == 30
@@ -1365,30 +1365,30 @@ cflat.exe <input.cb> [options]
 
 | File | Exports |
 |------|---------|
-| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort — **auto-imported** |
+| `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort - **auto-imported** |
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
-| `tuple.cb` | `tuple<T...>` — variadic heterogeneous value type; fields `item_0`, `item_1`, …; `size()` |
+| `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type; fields `item_0`, `item_1`, …; `size()` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation |
-| `list.cb` | `list<T>` — growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
-| `hashset.cb` | `hashset<T>` — open-addressed set; T must be integer-like |
-| `dictionary.cb` | `dictionary<K,V>` — hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
+| `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
+| `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
+| `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
 | `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |
-| `stack.cb` | `stack<T>` — LIFO; `push()`, `pop()`, `peek()` |
-| `queue.cb` | `queue<T>` — FIFO; `enqueue()`, `dequeue()`, `peek()` |
-| `pair.cb` | `pair<A,B>` — two-field generic struct |
+| `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
+| `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
+| `pair.cb` | `pair<A,B>` - two-field generic struct |
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
-| `thread.cb` | `Thread` — Win32 thread wrapper; `start(fn, ctx)`, `join()` |
-| `random.cb` | `Random` — splitmix64 PRNG; `next()`, `nextRange(min, max)` |
-| `time.cb` | `Duration`, `TimePoint`, `Stopwatch` — high-resolution timing |
-| `mutex.cb` | `Mutex` — Win32 CRITICAL_SECTION wrapper |
-| `atomic.cb` | `Atomic<T>` — load/store/fetchAdd with LLVM atomic IR |
-| `semaphore.cb` | `Semaphore` — counting semaphore |
-| `latch.cb` | `Latch` — countdown latch |
-| `rwlock.cb` | `RwLock` — readers-writer lock |
-| `channel.cb` | `channel<T>` — blocking MPMC queue |
-| `spsc_queue.cb` | `spsc_queue<T>` — wait-free single-producer/single-consumer ring |
-| `stop_token.cb` | `StopSource` / `StopToken` — cooperative cancellation |
-| `arena.cb` | `Arena` — bump allocator |
-| `json.cb` | `JsonBuilder.toJson<T>`, `fromJson<T>` — JSON serialization/deserialization |
+| `thread.cb` | `Thread` - Win32 thread wrapper; `start(fn, ctx)`, `join()` |
+| `random.cb` | `Random` - splitmix64 PRNG; `next()`, `nextRange(min, max)` |
+| `time.cb` | `Duration`, `TimePoint`, `Stopwatch` - high-resolution timing |
+| `mutex.cb` | `Mutex` - Win32 CRITICAL_SECTION wrapper |
+| `atomic.cb` | `Atomic<T>` - load/store/fetchAdd with LLVM atomic IR |
+| `semaphore.cb` | `Semaphore` - counting semaphore |
+| `latch.cb` | `Latch` - countdown latch |
+| `rwlock.cb` | `RwLock` - readers-writer lock |
+| `channel.cb` | `channel<T>` - blocking MPMC queue |
+| `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring |
+| `stop_token.cb` | `StopSource` / `StopToken` - cooperative cancellation |
+| `arena.cb` | `Arena` - bump allocator |
+| `json.cb` | `JsonBuilder.toJson<T>`, `fromJson<T>` - JSON serialization/deserialization |
 
 ---

@@ -1,4 +1,4 @@
-// core/network/http_client.cb — Simple synchronous HTTP/1.1 client.
+// core/network/http_client.cb - Simple synchronous HTTP/1.1 client.
 //
 // Usage:
 //   import "network/http_client.cb";
@@ -45,7 +45,7 @@ class HttpClient {
         s->setNoDelay(true);
 
         // Build the complete request (headers + body) in one buffer so it goes
-        // out in a single send() — avoids the server seeing only headers in its
+        // out in a single send() - avoids the server seeing only headers in its
         // first recv() when Nagle is disabled.
         i8* reqbuf = new i8[8192];
         int pos = 0;

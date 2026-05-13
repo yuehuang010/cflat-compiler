@@ -48,7 +48,7 @@ def run_bulk(exe: str, extra_args: list) -> bool:
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
 
-    # Pipeline depth — open this many files concurrently, then wait for diagnostics.
+    # Pipeline depth - open this many files concurrently, then wait for diagnostics.
     # The server pool runs analyses in parallel up to its hardware_concurrency limit,
     # so a depth a bit larger than the pool keeps the pipeline full.
     pipeline = max(8, (os.cpu_count() or 4))

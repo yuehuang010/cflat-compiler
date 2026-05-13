@@ -24,7 +24,7 @@ extern int main()
 
     // integer conversion methods
     i64 big = 0x100000000;  // 2^32
-    big = big + 0x42;       // 0x1_0000_0042 — high bits above i32 range
+    big = big + 0x42;       // 0x1_0000_0042 - high bits above i32 range
     i32 lo = big.to_i32();
     total++; passed += Test("i64.to_i32 truncate", lo, (i32)0x42);
 

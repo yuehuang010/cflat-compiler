@@ -18,12 +18,12 @@ struct RwData {
     }
 };
 
-// Function with lock clause — caller must hold a.mtx.
+// Function with lock clause - caller must hold a.mtx.
 void increment(Counter* a, int n) lock(a.mtx) {
     a.value = a.value + n;
 }
 
-// Struct using positional lock group — methods declared inside lock(mtx){}.
+// Struct using positional lock group - methods declared inside lock(mtx){}.
 struct Account {
     mutex mtx = default;
     lock(mtx) {
@@ -70,7 +70,7 @@ extern int main() {
         printf("rd.data = %d\n", v);
     }
 
-    // Positional group: call methods while holding the lock — no error.
+    // Positional group: call methods while holding the lock - no error.
     Account acct;
     lock(acct.mtx) {
         acct.deposit(100);

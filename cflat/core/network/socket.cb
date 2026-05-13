@@ -1,4 +1,4 @@
-// core/network/socket.cb — Platform-agnostic TCP/UDP socket API.
+// core/network/socket.cb - Platform-agnostic TCP/UDP socket API.
 //
 // Usage:
 //   import "network/socket.cb";
@@ -16,7 +16,7 @@ if const (__WINDOWS__) {
     import "network/socket.windows.cb";
 }
 
-// AF_INET, SOCK_STREAM/DGRAM, IPPROTO_TCP/UDP — standard POSIX/Winsock constants.
+// AF_INET, SOCK_STREAM/DGRAM, IPPROTO_TCP/UDP - standard POSIX/Winsock constants.
 // SOL_SOCKET = 0xFFFF (Winsock) / 1 (POSIX); SO_REUSEADDR = 4 / 2.
 // These match Winsock2; a future POSIX path would need different values.
 int _SOCK_AF_INET    = 2;
@@ -30,7 +30,7 @@ int _SOCK_KEEPALIVE  = 8;
 int _TCP_NODELAY     = 1;
 int _IPPROTO_TCP     = 6;
 int _SOMAXCONN       = 2147483647;  // 0x7fffffff
-int _SOCK_FIONBIO    = -2147195266; // 0x8004667E — ioctlsocket non-blocking mode
+int _SOCK_FIONBIO    = -2147195266; // 0x8004667E - ioctlsocket non-blocking mode
 
 class Socket
 {

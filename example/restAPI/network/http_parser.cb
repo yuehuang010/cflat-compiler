@@ -1,4 +1,4 @@
-// core/network/http_parser.cb — Parse raw HTTP/1.x messages.
+// core/network/http_parser.cb - Parse raw HTTP/1.x messages.
 //
 // Request usage:
 //   import "network/http_parser.cb";
@@ -44,7 +44,7 @@ class HttpRequest {
     int         _queryCount  = 0;
 
     // Path parameters populated by the router when a parameterized route matches
-    // (e.g. /users/:id). Not set by parseHttpRequest — set by the router.
+    // (e.g. /users/:id). Not set by parseHttpRequest - set by the router.
     HttpHeader* _routeParams = nullptr;
     int         _paramCount  = 0;
 
@@ -270,7 +270,7 @@ void _http_parseQuery(HttpRequest* req, i8* buf, int start, int len)
 
         if (keyEnd >= end || buf[keyEnd] != '=')
         {
-            // No '=' — malformed pair, skip to next '&'
+            // No '=' - malformed pair, skip to next '&'
             while (i < end && buf[i] != '&') i++;
             if (i < end) i++;
             continue;
@@ -316,12 +316,12 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
     }
     if (lineEnd < 0) return req;
 
-    // Method — bytes before the first space.
+    // Method - bytes before the first space.
     int methodEnd = 0;
     while (methodEnd < lineEnd && buf[methodEnd] != ' ') methodEnd++;
     req->method = _http_substr(buf, 0, methodEnd);
 
-    // Raw path — between first and second space (may include ?query).
+    // Raw path - between first and second space (may include ?query).
     int pathStart = methodEnd + 1;
     int rawPathEnd = pathStart;
     while (rawPathEnd < lineEnd && buf[rawPathEnd] != ' ') rawPathEnd++;
@@ -335,11 +335,11 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
     if (qpos < rawPathEnd)
         _http_parseQuery(req, buf, qpos + 1, rawPathEnd - qpos - 1);
 
-    // Version — remainder of the request line.
+    // Version - remainder of the request line.
     int verStart = rawPathEnd + 1;
     req->version = _http_substr(buf, verStart, lineEnd - verStart);
 
-    // Headers — one per line until the blank line (\r\n\r\n).
+    // Headers - one per line until the blank line (\r\n\r\n).
     int pos = lineEnd + 2;
     bool headersEnd = false;
     while (pos < len - 1 && !headersEnd)
@@ -374,7 +374,7 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
         }
     }
 
-    // Body — everything after the blank line.
+    // Body - everything after the blank line.
     if (pos < len)
     {
         int blen = len - pos;
@@ -408,12 +408,12 @@ HttpClientResponse* parseHttpResponse(i8* buf, int len)
     }
     if (lineEnd < 0) return resp;
 
-    // Version — up to first space.
+    // Version - up to first space.
     int verEnd = 0;
     while (verEnd < lineEnd && buf[verEnd] != ' ') verEnd++;
     resp->version = _http_substr(buf, 0, verEnd);
 
-    // Status code — between first and second space.
+    // Status code - between first and second space.
     int codeStart = verEnd + 1;
     int codeEnd   = codeStart;
     while (codeEnd < lineEnd && buf[codeEnd] != ' ') codeEnd++;
@@ -421,11 +421,11 @@ HttpClientResponse* parseHttpResponse(i8* buf, int len)
     resp->statusCode = atoi(codeStr);
     delete codeStr;
 
-    // Status text — remainder of status line.
+    // Status text - remainder of status line.
     int textStart = codeEnd + 1;
     resp->statusText = _http_substr(buf, textStart, lineEnd - textStart);
 
-    // Headers — same CRLF-delimited scan as parseHttpRequest.
+    // Headers - same CRLF-delimited scan as parseHttpRequest.
     int pos = lineEnd + 2;
     bool headersEnd = false;
     while (pos < len - 1 && !headersEnd)
@@ -458,7 +458,7 @@ HttpClientResponse* parseHttpResponse(i8* buf, int len)
         }
     }
 
-    // Body — everything after the blank line.
+    // Body - everything after the blank line.
     if (pos < len)
     {
         int blen = len - pos;

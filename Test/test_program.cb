@@ -100,7 +100,7 @@ program ArgsSum {
     }
 };
 
-// CrashNull: dereferences a null pointer — triggers an access violation.
+// CrashNull: dereferences a null pointer - triggers an access violation.
 // SEH in the trampoline catches it and stores exitCode = -1.
 program CrashNull {
     int main(move list<string> args) {
@@ -228,7 +228,7 @@ bool testProgramMultipleFields() {
 
 bool testProgramFieldDefaultValues() {
     bool result = true;
-    // No fields set — all default to 0, so a+b+c = 0
+    // No fields set - all default to 0, so a+b+c = 0
     MultiField m;
     list<string> args;
     m.run(args);
@@ -367,7 +367,7 @@ bool testAllocatorUsedBlocksCleanExit() {
     list<string> args;
     m.run(args);
     m.WaitForExit();
-    // Minimal.main() makes no allocations — 0 blocks in use
+    // Minimal.main() makes no allocations - 0 blocks in use
     result &= Test("usedBytes clean exit", m._allocator.usedBytes(), (i64)0);
     return result;
 }
@@ -437,7 +437,7 @@ bool testOnStdoutNullByDefault() {
     bool result = true;
     g_stdout_count = 0;
     StdoutCapture p;
-    // onStdout is null by default — output goes to console (we just verify callback not called)
+    // onStdout is null by default - output goes to console (we just verify callback not called)
     list<string> args;
     p.run(args);
     p.WaitForExit();
@@ -467,7 +467,7 @@ char* provide_stdin() {
     return s;
 }
 
-// Canned integer provider for scanf tests — same malloc convention.
+// Canned integer provider for scanf tests - same malloc convention.
 int g_scanf_idx = 0;
 
 char* provide_stdin_scanf() {
@@ -669,7 +669,7 @@ bool testInboxPolymorphicMessages() {
     list<string> args;
     w.run(args);
 
-    // Mix PingMsg and SumMsg — worker only handles PingMsg
+    // Mix PingMsg and SumMsg - worker only handles PingMsg
     SumMsg* skip = new SumMsg;
     skip.a = 99;
     skip.b = 99;
@@ -745,7 +745,7 @@ bool testProgramCrashRecovery() {
         result &= Test("crash recovery exit code", p.exitCode, -1);
         return result;
     }
-    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend — skip.
+    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend - skip.
 }
 
 bool testWaitForExitWithToken() {
@@ -783,7 +783,7 @@ bool testWaitForExitCancelled() {
     result &= Test("WaitForExit(cancelled token) returns false", done, false);
     src.dispose();
 
-    // WaitForExit(token) returning false does NOT join — caller must join before
+    // WaitForExit(token) returning false does NOT join - caller must join before
     // the program goes out of scope, otherwise the thread is still accessing the struct.
     prog.WaitForExit();
 
@@ -843,7 +843,7 @@ bool testKillInfiniteLoop() {
     SpinForever prog;
     list<string> args;
     prog.run(args);
-    // Short timeout — infinite loop won't finish.
+    // Short timeout - infinite loop won't finish.
     bool done = prog.WaitForExit(100);
     result &= Test("WaitForExit(ms) infinite loop timeout", done, false);
     // Kill the stuck thread so the test process can exit cleanly.
@@ -876,7 +876,7 @@ program TrackHandlesCrash {
     int main(move list<string> args) {
         File f;
         f.openWrite(_path);
-        // Intentionally crash without closing — tracker must close the handle
+        // Intentionally crash without closing - tracker must close the handle
         int* p = nullptr;
         return *p;
     }
@@ -900,7 +900,7 @@ bool testTrackHandles() {
         result &= Test("trackHandles handle closed on crash", File.remove(path), true);
         return result;
     }
-    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend — skip.
+    return true; // Win32: SEH catch-handler not supported by LLVM x86 backend - skip.
 }
 
 // ---------------------------------------------------------------------------

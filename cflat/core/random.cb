@@ -1,4 +1,4 @@
-// random.cb — Pseudo-random number generation using splitmix64.
+// random.cb - Pseudo-random number generation using splitmix64.
 //
 // Uses the splitmix64 algorithm: state advances by a fixed golden-ratio-derived
 // increment, then the output is scrambled through three avalanche passes.

@@ -1,4 +1,4 @@
-// malloc_allocator.cb — passthrough IAllocator that forwards directly to malloc/free.
+// malloc_allocator.cb - passthrough IAllocator that forwards directly to malloc/free.
 // Passthrough allocator; suitable when slab/block allocation is not needed.
 
 class MallocAllocator : IAllocator

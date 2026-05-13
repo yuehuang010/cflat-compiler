@@ -42,7 +42,7 @@ call :Group4Tests
 goto :Done
 
 REM Files are distributed round-robin across 4 groups by index modulo 4.
-REM Adding a new err_*.cb is self-maintaining — no list updates needed.
+REM Adding a new err_*.cb is self-maintaining - no list updates needed.
 
 :Group1Tests
 call :RunModuloGroup 0 4

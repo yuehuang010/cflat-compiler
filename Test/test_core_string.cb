@@ -286,37 +286,37 @@ int testStringView()
 
     string source = "hello world";
 
-    // view() — whole string
+    // view() - whole string
     string_view* wholeView = source.view();
     passed += Test("view_length", wholeView->length(), 11);
     passed += Test("view_data",   wholeView->data(),   "hello world");
     delete wholeView;
 
-    // span() — middle slice "world"
+    // span() - middle slice "world"
     string_view* wordView = source.span(6, 11);
     passed += Test("span_mid_length", wordView->length(), 5);
     passed += Test("span_mid_get0",   (int)wordView->get(0), (int)'w');
     passed += Test("span_mid_get4",   (int)wordView->get(4), (int)'d');
     delete wordView;
 
-    // span() — prefix "hello"
+    // span() - prefix "hello"
     string_view* prefixView = source.span(0, 5);
     passed += Test("span_prefix_length", prefixView->length(), 5);
     passed += Test("span_prefix_get0",   (int)prefixView->get(0), (int)'h');
     passed += Test("span_prefix_get4",   (int)prefixView->get(4), (int)'o');
     delete prefixView;
 
-    // span() — empty slice (start == end)
+    // span() - empty slice (start == end)
     string_view* emptyView = source.span(3, 3);
     passed += Test("span_empty_length", emptyView->length(), 0);
     delete emptyView;
 
-    // span() — out-of-bounds clamped to full string
+    // span() - out-of-bounds clamped to full string
     string_view* clampedView = source.span(-5, 100);
     passed += Test("span_clamp_length", clampedView->length(), 11);
     delete clampedView;
 
-    // span() — inverted indices (start > end) clamped to empty
+    // span() - inverted indices (start > end) clamped to empty
     string_view* invertedView = source.span(7, 3);
     passed += Test("span_inv_length", invertedView->length(), 0);
     delete invertedView;

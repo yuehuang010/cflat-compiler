@@ -35,7 +35,7 @@ struct TaskHandle {
         bool failed   = false;
     }
 
-    // Continuation — registered by ThreadPool.then(), fired by the worker.
+    // Continuation - registered by ThreadPool.then(), fired by the worker.
     // All fields are protected by the pool's _lock; never access them directly.
     function<int(void*, stop_token)> _contFn       = default;
     void*                            _contCtx      = nullptr;
@@ -46,7 +46,7 @@ struct TaskHandle {
     // Signal the task to stop early.  The task must check tok.stop_requested().
     void cancel() { _cancelSrc.request_stop(); }
 
-    // Block until the task completes.  Cheap spin — yields after each check.
+    // Block until the task completes.  Cheap spin - yields after each check.
     void wait() {
         while (done.load() == 0) { SwitchToThread(); }
     }
@@ -67,7 +67,7 @@ struct TaskHandle {
 };
 
 // ── TaskResult<T> ─────────────────────────────────────────────────────────────
-// Typed result holder — the CFlat equivalent of std::future<T>.
+// Typed result holder - the CFlat equivalent of std::future<T>.
 //
 // Bundle a TaskResult<T>* into your task's context struct.  The task calls
 // set() on success or fail() on error.  The submitting thread blocks on get()
@@ -125,14 +125,14 @@ struct TaskResult<T> {
         while (_ready.load() == 0) { SwitchToThread(); }
     }
 
-    // Non-blocking poll — true if set() or fail() has been called.
+    // Non-blocking poll - true if set() or fail() has been called.
     bool isReady() {
         return _ready.load() != (i32)0;
     }
 };
 
 // ── Task ──────────────────────────────────────────────────────────────────────
-// Internal — constructed by submit() and enqueued for a worker.
+// Internal - constructed by submit() and enqueued for a worker.
 // _token is a copy of the handle's cancel token (or a null/never-cancelled
 // token for fire-and-forget tasks).
 //
@@ -184,7 +184,7 @@ struct WorkerCtx {
 //   pool.drain();         // block until all in-flight tasks finish
 //   pool.shutdown();      // drain + join all workers + release resources
 //
-// IMPORTANT: do not copy or move a ThreadPool after init() — WorkerCtx holds
+// IMPORTANT: do not copy or move a ThreadPool after init() - WorkerCtx holds
 // raw pointers into the pool's fields.
 //
 class ThreadPool {
@@ -275,7 +275,7 @@ class ThreadPool {
         bool submit_now = false;
         _lock.acquire();
         if (dep->done.load() != (i32)0) {
-            // dep already finished — submit the continuation immediately.
+            // dep already finished - submit the continuation immediately.
             submit_now = true;
         } else {
             dep->_contFn       = fn;
@@ -386,7 +386,7 @@ class ThreadPool {
     // Block until every submitted task has finished executing.
     //
     // If called from a worker thread (i.e. from inside a task), the caller
-    // participates in executing queued tasks rather than blocking on the CV —
+    // participates in executing queued tasks rather than blocking on the CV -
     // this prevents deadlock.  The drain completes once inflight equals the
     // number of workers currently participating (they are themselves in-flight)
     // and all queues are empty.
@@ -487,7 +487,7 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     if (fired) { wctx->ready->release(); }
 }
 
-// Worker body — runs on each thread.
+// Worker body - runs on each thread.
 int __threadpool_worker(void* raw) {
     WorkerStartCtx* ws   = (WorkerStartCtx*)raw;
     WorkerCtx*      wctx = ws->wctx;

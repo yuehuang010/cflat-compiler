@@ -1,4 +1,4 @@
-// stack<T> — LIFO (Last In First Out) using simple array.
+// stack<T> - LIFO (Last In First Out) using simple array.
 class stack<T>
 {
     T*  _data     = nullptr;

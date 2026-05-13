@@ -1,4 +1,4 @@
-// tetris.cb — Tetris demo for terminal.cb
+// tetris.cb - Tetris demo for terminal.cb
 //
 // Build:
 //   x64/Debug/cflat.exe example/tetris.cb -i cflat/core -o out/tetris.exe

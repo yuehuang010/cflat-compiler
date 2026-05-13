@@ -1,4 +1,4 @@
-// core/network/router.cb — HTTP request router.
+// core/network/router.cb - HTTP request router.
 //
 // Routes are matched first by exact (method, path) equality, then by
 // parameterized patterns like /users/:id. Exact routes always take priority.
@@ -114,7 +114,7 @@ bool _router_matchParams(const char* pattern, HttpRequest* req)
         }
         else
         {
-            // Literal segment — must match exactly
+            // Literal segment - must match exactly
             if (plen_seg != rlen_seg) return false;
             int k = 0;
             while (k < plen_seg)

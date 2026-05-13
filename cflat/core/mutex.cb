@@ -1,8 +1,8 @@
-// mutex.cb — mutual-exclusion primitive backed by Win32 SRW lock.
+// mutex.cb - mutual-exclusion primitive backed by Win32 SRW lock.
 //
 // Usage:
 //   mutex m;
-//   lock (m) {              // preferred — release is guaranteed on return
+//   lock (m) {              // preferred - release is guaranteed on return
 //       shared_value++;
 //   }
 //
@@ -15,7 +15,7 @@
 // an intervening release() will deadlock. Use a CRITICAL_SECTION if you need recursion.
 
 struct mutex {
-    void* _srw = nullptr;  // Win32 SRWLOCK — lock state stored in the pointer value; 0 == unlocked
+    void* _srw = nullptr;  // Win32 SRWLOCK - lock state stored in the pointer value; 0 == unlocked
 
     void acquire() {
         AcquireSRWLockExclusive(&_srw);
@@ -31,6 +31,6 @@ struct mutex {
         SleepConditionVariableSRW(cv, &_srw, -1, (u32)0);
     }
 
-    // No-op — SRW locks require no cleanup (no kernel object, no heap allocation).
+    // No-op - SRW locks require no cleanup (no kernel object, no heap allocation).
     void destroy() { }
 };

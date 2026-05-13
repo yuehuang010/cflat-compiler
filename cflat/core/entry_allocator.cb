@@ -1,6 +1,6 @@
 import "vmem.cb";
 
-// entry_allocator.cb — variable-size bump-pointer allocator with per-page entry tables.
+// entry_allocator.cb - variable-size bump-pointer allocator with per-page entry tables.
 //
 // Port of BlockAllocator.h (C++).  Each OS page (vmem_alloc'd,
 // MEM_RESERVE|MEM_COMMIT) begins with an _EntryLeaf header that tracks up to
@@ -191,7 +191,7 @@ class EntryAllocator : IAllocator
             if (ptr != nullptr) return (void*)ptr;
         }
 
-        // Current page full — open a new one and make it current.
+        // Current page full - open a new one and make it current.
         _currentPage = _newPage();
         if (_currentPage == nullptr) return nullptr;
         return (void*)_leafTryAlloc((_EntryLeaf*)_currentPage, (u16)size);
@@ -204,7 +204,7 @@ class EntryAllocator : IAllocator
         _EntryLeaf* leaf = _findLeaf((i8*)ptr);
         if (leaf != nullptr) { _leafFree(leaf, (i8*)ptr); return; }
 
-        // Not in any owned page — must be a large (system malloc) allocation.
+        // Not in any owned page - must be a large (system malloc) allocation.
         free(ptr);
     }
 
@@ -264,7 +264,7 @@ class EntryAllocator : IAllocator
     }
 
     // -----------------------------------------------------------------------
-    // Cleanup — must be called before the allocator goes out of scope.
+    // Cleanup - must be called before the allocator goes out of scope.
     // -----------------------------------------------------------------------
 
     void cleanup()

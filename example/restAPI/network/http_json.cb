@@ -1,4 +1,4 @@
-// core/network/http_json.cb — JSON body helpers for HTTP request handlers.
+// core/network/http_json.cb - JSON body helpers for HTTP request handlers.
 //
 // Usage:
 //   import "network/http_json.cb";

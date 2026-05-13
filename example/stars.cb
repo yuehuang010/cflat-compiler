@@ -1,4 +1,4 @@
-// stars.cb — 2.5D star field with Sixel pixel graphics.
+// stars.cb - 2.5D star field with Sixel pixel graphics.
 //
 // Requires a Sixel-capable terminal (Windows Terminal >= 1.22).
 //
@@ -45,7 +45,7 @@ int    g_sx_len = 0;
 int    g_W      = 0;        // pixel width
 int    g_H      = 0;        // pixel height
 int    g_bands  = 0;        // ceil(H / 6) sixel bands
-double g_pixAR2 = 1.0;      // (cellH/cellW)² — pixel aspect ratio squared, for ellipse test
+double g_pixAR2 = 1.0;      // (cellH/cellW)² - pixel aspect ratio squared, for ellipse test
 
 // ── Star helpers ─────────────────────────────────────────────────────────────
 
@@ -272,7 +272,7 @@ extern int main(int argc, char** argv) {
         printf("Sixel support  : %s\n", sixel ? "yes" : "no");
         printf("Terminal size  : %d x %d chars\n", W_chars, H_chars);
         printf("Cell size      : %d x %d px  (queried via CSI 16 t; fallback 8x16)\n", cellW, cellH);
-        printf("Pixel aspect   : %d:%d (cellH:cellW)  — Sixel px are %.2fx taller than wide\n", cellH, cellW, (double)cellH / (double)cellW);
+        printf("Pixel aspect   : %d:%d (cellH:cellW)  - Sixel px are %.2fx taller than wide\n", cellH, cellW, (double)cellH / (double)cellW);
         printf("Framebuffer    : %d x %d px\n", g_W, g_H);
         printf("Sixel bands    : %d  (ceil(H/6))\n", (g_H + 5) / 6);
         printf("Sixel buf      : 3 MB (hardcoded)\n");
@@ -292,7 +292,7 @@ extern int main(int argc, char** argv) {
     }
     g_bands = (g_H + 5) / 6;
     g_px    = (int*)malloc((i64)g_W * (i64)g_H * 4);
-    g_sx    = (char*)malloc(3145728);  // 3 MB — enough for any realistic terminal size
+    g_sx    = (char*)malloc(3145728);  // 3 MB - enough for any realistic terminal size
 
     Random rng;
     rng.seedFromTime();

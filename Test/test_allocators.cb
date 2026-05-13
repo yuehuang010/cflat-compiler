@@ -133,7 +133,7 @@ bool testEntryAllocatorBasic()
     EntryAllocator ea;
 
     if (ea.alloc(0) != nullptr) return false;  // zero-size → null
-    ea.dealloc(nullptr);                        // no-op — must not crash
+    ea.dealloc(nullptr);                        // no-op - must not crash
 
     void* p1 = ea.alloc(4);
     if (p1 == nullptr) return false;
@@ -195,7 +195,7 @@ bool testEntryAllocatorEntryTableFull()
     EntryAllocator ea;
 
     // Each leaf holds up to 1024 entry-table slots.  1025 simultaneous live
-    // allocs must spill onto a second vmem page.  Pointers are not stored —
+    // allocs must spill onto a second vmem page.  Pointers are not stored -
     // the destructor reclaims all vmem pages on scope exit.
     int i = 0;
     while (i < 1025)
@@ -225,7 +225,7 @@ bool testEntryAllocatorGarbageCollect()
     ea.dealloc(p);
     ea.garbageCollect();
     if (ea.usedBytes() != 0) return false;
-    // Current page is kept even when empty — at least one page remains.
+    // Current page is kept even when empty - at least one page remains.
     if (ea.totalBytes() < (i64)65536) return false;
 
     return true;
@@ -349,7 +349,7 @@ bool testFitCoalescing()
 
     fa.dealloc(a);
     fa.dealloc(c);
-    fa.dealloc(b);  // b is between a and c — should coalesce all three
+    fa.dealloc(b);  // b is between a and c - should coalesce all three
 
     if (fa.usedBytes() != 0)         return false;
     if (fa.freeBytes() <= freeBefore) return false;
@@ -384,7 +384,7 @@ bool testFitLargeAlloc()
 {
     FitAllocator fa;
 
-    void* p = fa.alloc(1048576);  // 1 MB — goes to large path
+    void* p = fa.alloc(1048576);  // 1 MB - goes to large path
     if (p == nullptr) return false;
     if (fa.usedBytes() != 1048576) return false;
 

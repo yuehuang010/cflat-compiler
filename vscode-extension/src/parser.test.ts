@@ -121,7 +121,7 @@ describe('extractParams', () => {
     });
 
     it('skips move keyword prefix on parameters', () => {
-        // "move Resource* r" — 'move' is in CANNOT_BE_TYPE, so full type is "Resource*"
+        // "move Resource* r" - 'move' is in CANNOT_BE_TYPE, so full type is "Resource*"
         const params = extractParams('move Resource* r');
         expect(params).toHaveLength(1);
         expect(params[0].name).toBe('r');
@@ -225,10 +225,10 @@ describe('parseCompilerOutput', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseDocumentSymbols — structs
+// parseDocumentSymbols - structs
 // ---------------------------------------------------------------------------
 
-describe('parseDocumentSymbols — structs', () => {
+describe('parseDocumentSymbols - structs', () => {
     it('extracts a struct with fields', () => {
         const src = 'struct Point { float x = 0; float y = 0; };';
         const symbols = parseDocumentSymbols(src);
@@ -253,10 +253,10 @@ describe('parseDocumentSymbols — structs', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseDocumentSymbols — functions
+// parseDocumentSymbols - functions
 // ---------------------------------------------------------------------------
 
-describe('parseDocumentSymbols — functions', () => {
+describe('parseDocumentSymbols - functions', () => {
     it('extracts a top-level function', () => {
         const src = 'int add(int a, int b)\n{\n    return a + b;\n}';
         const symbols = parseDocumentSymbols(src);
@@ -279,10 +279,10 @@ describe('parseDocumentSymbols — functions', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseDocumentSymbols — variables
+// parseDocumentSymbols - variables
 // ---------------------------------------------------------------------------
 
-describe('parseDocumentSymbols — variables', () => {
+describe('parseDocumentSymbols - variables', () => {
     it('extracts a simple variable declaration', () => {
         const src = 'int counter = 0;';
         const symbols = parseDocumentSymbols(src);
@@ -297,7 +297,7 @@ describe('parseDocumentSymbols — variables', () => {
     });
 
     it('extracts for-loop variable', () => {
-        // Loop must be on its own line — funcLineRe consumes function-signature lines with continue
+        // Loop must be on its own line - funcLineRe consumes function-signature lines with continue
         const src = 'void f()\n{\n    for (int i = 0; i < 10; i++) { }\n}';
         const symbols = parseDocumentSymbols(src);
         expect(symbols.get('i')?.kind).toBe('variable');
@@ -313,10 +313,10 @@ describe('parseDocumentSymbols — variables', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseDocumentSymbols — namespaces and aliases
+// parseDocumentSymbols - namespaces and aliases
 // ---------------------------------------------------------------------------
 
-describe('parseDocumentSymbols — namespaces and aliases', () => {
+describe('parseDocumentSymbols - namespaces and aliases', () => {
     it('extracts a namespace', () => {
         const src = 'namespace Utils { void helper() { } }';
         const symbols = parseDocumentSymbols(src);
@@ -338,10 +338,10 @@ describe('parseDocumentSymbols — namespaces and aliases', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseDocumentSymbols — built-in types injected
+// parseDocumentSymbols - built-in types injected
 // ---------------------------------------------------------------------------
 
-describe('parseDocumentSymbols — built-in types', () => {
+describe('parseDocumentSymbols - built-in types', () => {
     it('always provides string symbol', () => {
         const symbols = parseDocumentSymbols('');
         expect(symbols.get('string')?.kind).toBe('type');
@@ -363,7 +363,7 @@ describe('parseDocumentSymbols — built-in types', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CANNOT_BE_TYPE — new keywords
+// CANNOT_BE_TYPE - new keywords
 // ---------------------------------------------------------------------------
 
 describe('CANNOT_BE_TYPE', () => {
@@ -373,7 +373,7 @@ describe('CANNOT_BE_TYPE', () => {
 });
 
 // ---------------------------------------------------------------------------
-// KEYWORD_DOCS — new entries present
+// KEYWORD_DOCS - new entries present
 // ---------------------------------------------------------------------------
 
 describe('KEYWORD_DOCS', () => {
@@ -389,7 +389,7 @@ describe('KEYWORD_DOCS', () => {
 });
 
 // ---------------------------------------------------------------------------
-// BUILTIN_TYPE_SYMBOLS — collection types
+// BUILTIN_TYPE_SYMBOLS - collection types
 // ---------------------------------------------------------------------------
 
 describe('BUILTIN_TYPE_SYMBOLS', () => {

@@ -31,7 +31,7 @@ from lsp_client import LspClient, find_exe, initialize, wait_diagnostics_for
 REPO_ROOT = Path(__file__).parent.parent.parent
 FIXTURE_DIR = REPO_ROOT / "cflat" / "test_lsp" / "fixtures"
 
-# Virtual URI prefix — server analyzes via temp files internally, so these
+# Virtual URI prefix - server analyzes via temp files internally, so these
 # paths don't need to exist on disk.
 _URI_BASE = "file:///C%3A/lsp_fixture_"
 
@@ -114,7 +114,7 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
     expect_kind, expect_kv = directives.get("expect", (None, {}))
     cursor = directives.get("cursor", (0, 0))
 
-    # Open document — triggers immediate analysis.
+    # Open document - triggers immediate analysis.
     _open_doc(client, uri, source)
 
     # For diagnostic expectations we need the publishDiagnostics notification.
@@ -138,7 +138,7 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
     position = {"line": line, "character": col}
 
     if expect_kind == "hover_null":
-        # $expect hover_null — cursor is on non-symbol text; hover must return null.
+        # $expect hover_null - cursor is on non-symbol text; hover must return null.
         resp = client.request("textDocument/hover", {
             "textDocument": {"uri": uri},
             "position": position,
@@ -158,7 +158,7 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
             return f"hover: no result in response: {resp}"
         result = resp["result"]
         if result is None:
-            return f"hover: got null — symbol not found at ({line},{col})"
+            return f"hover: got null - symbol not found at ({line},{col})"
         value = result.get("contents", {}).get("value", "")
         needle = expect_kv.get("contains", "")
         if needle and needle not in value:
@@ -174,7 +174,7 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
             return f"definition: no result in response: {resp}"
         results = resp["result"]
         if not results:
-            return f"definition: empty result — symbol not found at ({line},{col})"
+            return f"definition: empty result - symbol not found at ({line},{col})"
         target_line = results[0].get("range", {}).get("start", {}).get("line")
         expected_line = expect_kv.get("line")
         if expected_line is not None and target_line != expected_line:
@@ -346,11 +346,11 @@ def test_def_nested_struct(client: LspClient) -> str | None:
         ("InnerStruct in qualified var decl",        10, 12),  # 'I' of InnerStruct after 'OuterStruct.'
         # Variable name whose type is a nested struct
         ("local var 'o' (OuterStruct type)",          9,  0),  # 'o' resolves via variableTypes
-        # Field access: "o.inner" — navigate to the 'inner' field declaration
+        # Field access: "o.inner" - navigate to the 'inner' field declaration
         ("field access 'o.inner'",                   11, 10),  # 'i' of inner after 'int v = o.'
     ]
 
-    # Cases where the cursor is already at the definition — must return null.
+    # Cases where the cursor is already at the definition - must return null.
     must_be_null = [
         # Field name at its own declaration site
         ("field name 'inner' at its own decl",        5, 12),  # 'i' of inner after 'InnerStruct '
@@ -390,7 +390,7 @@ def test_negative_hover_before_initialize(exe: str) -> str | None:
             "textDocument": {"uri": _uri_for("preinit")},
             "position": {"line": 0, "character": 0},
         }, timeout=5.0)
-        # Server should respond with an error or null result — not crash.
+        # Server should respond with an error or null result - not crash.
         if "error" not in resp and resp.get("result") is None:
             return None  # null result is acceptable
         if "error" in resp:
@@ -410,11 +410,11 @@ def test_server_resilience(client: LspClient) -> str | None:
     uri = _uri_for("resilience")
 
     _open_doc(client, uri, bad_source)
-    # Don't care about diagnostics content — just drain the notification.
+    # Don't care about diagnostics content - just drain the notification.
     try:
         wait_diagnostics_for(client, uri, timeout=10.0)
     except TimeoutError:
-        pass  # server may not publish diagnostics for a crash — that's OK
+        pass  # server may not publish diagnostics for a crash - that's OK
 
     # Verify server still responds to a subsequent hover request.
     try:

@@ -1,19 +1,19 @@
-// atomic.cb — lock-free atomic types.
+// atomic.cb - lock-free atomic types.
 //
 // Memory ordering is encoded in each operation and hidden from users.
-// Correct on both x86 and ARM — LLVM handles the platform-specific lowering.
+// Correct on both x86 and ARM - LLVM handles the platform-specific lowering.
 //
 // Types:
-//   atomic_counter  — shared counter (stats, reference counts)
-//   atomic_flag     — spinlock / one-shot signal
-//   atomic<T>       — generic load/store/CAS (T = i32 or i64)
+//   atomic_counter  - shared counter (stats, reference counts)
+//   atomic_flag     - spinlock / one-shot signal
+//   atomic<T>       - generic load/store/CAS (T = i32 or i64)
 //
 // The __atomic_* functions below are stubs: the compiler intercepts every
 // call whose name starts with __atomic_ and emits LLVM atomic IR instead of
 // a real call.  No object file for these functions is ever linked.
 
 // -------------------------------------------------------------------------
-// Stubs — intercepted by the compiler; never actually called.
+// Stubs - intercepted by the compiler; never actually called.
 // -------------------------------------------------------------------------
 extern i64  __atomic_counter_increment(i64* ptr);
 extern i64  __atomic_counter_decrement(i64* ptr);
@@ -38,7 +38,7 @@ extern void __atomic_release_store_i64(i64* ptr, i64 val);
 extern i64  __atomic_acquire_load_i64(i64* ptr);
 
 // -------------------------------------------------------------------------
-// atomic_counter — use for stats, reference counts, sequence numbers.
+// atomic_counter - use for stats, reference counts, sequence numbers.
 // -------------------------------------------------------------------------
 struct atomic_counter {
     i64 _value = 0;
@@ -65,7 +65,7 @@ struct atomic_counter {
 };
 
 // -------------------------------------------------------------------------
-// atomic_flag — spinlock / one-shot signal.
+// atomic_flag - spinlock / one-shot signal.
 // -------------------------------------------------------------------------
 struct atomic_flag {
     i32 _value = 0;
@@ -97,7 +97,7 @@ struct atomic_flag {
 };
 
 // -------------------------------------------------------------------------
-// atomic<i32> — generic atomic for 32-bit integers.
+// atomic<i32> - generic atomic for 32-bit integers.
 // -------------------------------------------------------------------------
 struct atomic__i32 {
     i32 _value = 0;
@@ -132,7 +132,7 @@ struct atomic__i32 {
 };
 
 // -------------------------------------------------------------------------
-// atomic<i64> — generic atomic for 64-bit integers.
+// atomic<i64> - generic atomic for 64-bit integers.
 // -------------------------------------------------------------------------
 struct atomic__i64 {
     i64 _value = 0;

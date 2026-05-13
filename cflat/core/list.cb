@@ -1,4 +1,4 @@
-// list<T> — mutable growable owning array (similar to vector<T>).
+// list<T> - mutable growable owning array (similar to vector<T>).
 // Supports any value type T.
 
 class list<T> : IEnumerable<T>, IList<T>
@@ -17,14 +17,14 @@ class list<T> : IEnumerable<T>, IList<T>
             newData[i] = move _data[i];
             i++;
         }
-        // Elements were moved out (zeroed); just free the old buffer — no destructor calls needed.
+        // Elements were moved out (zeroed); just free the old buffer - no destructor calls needed.
         if (_data != nullptr) delete[_] _data;
         _data = newData;
         _capacity = newCap;
     }
 
     // Append a value to the end.  When T is a pointer type, the list takes
-    // ownership — add(), removeAt(), clear(), and the destructor all free elements.
+    // ownership - add(), removeAt(), clear(), and the destructor all free elements.
     void add(move T value)
     {
         if (_size >= _capacity) _grow();
@@ -32,7 +32,7 @@ class list<T> : IEnumerable<T>, IList<T>
         _size++;
     }
 
-    // Read the element at index (borrow — caller does not receive ownership).
+    // Read the element at index (borrow - caller does not receive ownership).
     T get(int index)
     {
         return _data[index];
@@ -85,7 +85,7 @@ class list<T> : IEnumerable<T>, IList<T>
 
     // Remove all elements. Pointer elements are freed; value-type elements are not
     // individually destructed (CFlat has no in-place destructor call syntax).
-    // Backing buffer is kept — capacity is unchanged.
+    // Backing buffer is kept - capacity is unchanged.
     void clear()
     {
         if const (is_pointer(T))
@@ -152,7 +152,7 @@ class list<T> : IEnumerable<T>, IList<T>
             _qsort(0, _size - 1, compare);
     }
 
-    // l[index] — same semantics as get(index).
+    // l[index] - same semantics as get(index).
     T operator[](int index)
     {
         return _data[index];

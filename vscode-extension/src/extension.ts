@@ -56,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: cflat.exe not found — checked x64/Release, x64/Debug, x86/Release, x86/Debug relative to each workspace folder.');
+        outputChannel.appendLine('ERROR: cflat.exe not found - checked x64/Release, x64/Debug, x86/Release, x86/Debug relative to each workspace folder.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
             'cflat: could not find cflat.exe. ' +

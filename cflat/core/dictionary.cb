@@ -1,7 +1,7 @@
-// dictionary<K,V> — open-addressed hash map built on the same storage scheme
+// dictionary<K,V> - open-addressed hash map built on the same storage scheme
 // as hashset<T> (parallel status/keys arrays with linear probing), extended
 // with a parallel values array.  K must be a primitive or pointer type, or
-// implement hash().  K is non-owning — the caller manages the lifetime of any
+// implement hash().  K is non-owning - the caller manages the lifetime of any
 // heap-allocated keys.  When V is a pointer type, the dictionary owns the
 // values: add()/set() take ownership, set() frees the old value on overwrite,
 // remove() and clear() free values, and the destructor frees any remaining.
@@ -54,7 +54,7 @@ struct dictionary<K, V>
         _count = 0;
         _init(_capacity * 2);
 
-        // Direct insert — avoids calling add() (which has move V value) so the
+        // Direct insert - avoids calling add() (which has move V value) so the
         // compiler's move tracker does not flag oldValues as consumed.
         int i = 0;
         while (i < oldCap)
@@ -78,7 +78,7 @@ struct dictionary<K, V>
     }
 
     // Insert a new entry.  Returns true if added, false if key already present
-    // (existing value is left untouched — use set() to overwrite).
+    // (existing value is left untouched - use set() to overwrite).
     // When V is a pointer type the dictionary takes ownership of the value.
     bool add(K key, move V value)
     {
@@ -199,7 +199,7 @@ struct dictionary<K, V>
     }
 
     // Remove all entries. When V is a pointer type, frees each value.
-    // Backing arrays are kept — capacity is unchanged.
+    // Backing arrays are kept - capacity is unchanged.
     void clear()
     {
         int i = 0;
@@ -219,7 +219,7 @@ struct dictionary<K, V>
         _count = 0;
     }
 
-    // d[key] — same semantics as get(key): returns default(V) on miss.
+    // d[key] - same semantics as get(key): returns default(V) on miss.
     V operator[](K key)
     {
         return get(key);

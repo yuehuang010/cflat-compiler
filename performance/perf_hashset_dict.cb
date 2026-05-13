@@ -2,9 +2,9 @@
 // and dictionary<string,string> throughput.
 //
 // For each container, operations are timed at three sizes (N = 10, 500, 10000):
-//   add      — fill a pre-warmed (capacity pre-allocated, clear()ed) container
-//   contains — scan N lookups on a pre-filled container
-//   remove   — drain a pre-filled container; clear() + refill happen outside timer
+//   add      - fill a pre-warmed (capacity pre-allocated, clear()ed) container
+//   contains - scan N lookups on a pre-filled container
+//   remove   - drain a pre-filled container; clear() + refill happen outside timer
 //
 // String benchmarks use make_key(i) which produces 16-char keys ("bench_%010d"),
 // exceeding MSVC's 15-char SSO limit so both CFlat and C++ always heap-allocate.
@@ -22,7 +22,7 @@ import "dictionary.cb";
 import "time.cb";
 import "perf_framework.cb";
 
-// Produces a 16-char heap-allocated string "bench_%010d" — longer than MSVC's
+// Produces a 16-char heap-allocated string "bench_%010d" - longer than MSVC's
 // 15-char SSO limit so the C++ comparison benchmark also always heap-allocates.
 string make_key(int i)
 {
@@ -34,7 +34,7 @@ string make_key(int i)
     return result;
 }
 
-// Produces a 64-char string — well beyond any SSO limit — for list<string>
+// Produces a 64-char string - well beyond any SSO limit - for list<string>
 // benchmarks where we want to isolate list overhead from string-length effects.
 string make_large_key(int i)
 {
@@ -235,7 +235,7 @@ program BenchDictRemove
 };
 
 // ── list<string> ─────────────────────────────────────────────────────────────
-// Uses make_large_key (64 chars) — well above any SSO threshold.
+// Uses make_large_key (64 chars) - well above any SSO threshold.
 
 program BenchListStrAdd
 {

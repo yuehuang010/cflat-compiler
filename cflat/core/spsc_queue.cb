@@ -1,4 +1,4 @@
-// spsc_queue<T> — wait-free single-producer single-consumer ring queue.
+// spsc_queue<T> - wait-free single-producer single-consumer ring queue.
 //
 // IMPORTANT: exactly ONE thread may call push/try_push, and exactly ONE (different)
 // thread may call pop/try_pop.  Violating this is undefined behaviour.
@@ -7,12 +7,12 @@
 //   spsc_queue<int> q;
 //   q.init(1024);          // allocate 1023 usable slots (one slot is a sentinel)
 //
-//   q.try_push(42);        // producer thread — returns false if full
+//   q.try_push(42);        // producer thread - returns false if full
 //   int v = 0;
-//   q.try_pop(&v);         // consumer thread — returns false if empty
+//   q.try_pop(&v);         // consumer thread - returns false if empty
 //
-//   q.push(42);            // blocking push — spins until a slot is available
-//   int v = q.pop();       // blocking pop  — spins until an item is available
+//   q.push(42);            // blocking push - spins until a slot is available
+//   int v = q.pop();       // blocking pop  - spins until an item is available
 //
 //   q.destroy();           // free the ring buffer
 //
@@ -28,7 +28,7 @@
 
 import "interfaces.cb";
 
-// Atomic stubs — intercepted by compiler; emit LLVM atomic IR.
+// Atomic stubs - intercepted by compiler; emit LLVM atomic IR.
 extern int  __atomic_i32_load(int* ptr);
 extern void __atomic_i32_store(int* ptr, int val);
 
@@ -36,8 +36,8 @@ class spsc_queue<T>
 {
     T*  _buf  = nullptr;   // ring buffer (cap slots; cap-1 are usable)
     int _cap  = 0;         // total allocated slots (not visible to callers)
-    int _head = 0;         // next write position — producer writes, consumer reads
-    int _tail = 0;         // next read  position — consumer writes, producer reads
+    int _head = 0;         // next write position - producer writes, consumer reads
+    int _tail = 0;         // next read  position - consumer writes, producer reads
 
     // Allocate the ring buffer.  Must be called before push/pop.
     // capacity is the number of usable slots; internally cap+1 slots are allocated.

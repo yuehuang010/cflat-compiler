@@ -1,4 +1,4 @@
-// latch.cb — one-shot countdown latch.
+// latch.cb - one-shot countdown latch.
 //
 // Usage:
 //   latch l;
@@ -10,7 +10,7 @@
 // Once the count reaches 0 all past and future wait() calls return immediately.
 // The latch is NOT reusable after the count reaches 0.
 
-// Atomic stubs — intercepted by the compiler; emit LLVM atomic IR.
+// Atomic stubs - intercepted by the compiler; emit LLVM atomic IR.
 extern i64 __atomic_counter_decrement(i64* ptr);
 extern i64 __atomic_counter_read(i64* ptr);
 

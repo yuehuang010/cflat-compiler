@@ -1,4 +1,4 @@
-// A function that correctly propagates bond — should compile without error
+// A function that correctly propagates bond - should compile without error
 // (no expect_error here, so the compiler just needs to succeed)
 int* Borrow(bond int* src) { return src; }
 

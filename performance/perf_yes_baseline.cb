@@ -1,4 +1,4 @@
-// Baseline: raw Thread with channel<int> — no program construct overhead.
+// Baseline: raw Thread with channel<int> - no program construct overhead.
 // Both sides use non-blocking try_push / try_receive so the stop flag
 // is always checked promptly without waiting for a slot or an item.
 

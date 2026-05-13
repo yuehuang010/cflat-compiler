@@ -420,7 +420,7 @@ bool testCapturePrimitives()
 {
     bool result = true;
 
-    // int — value copy; outer mutation does not affect captured snapshot
+    // int - value copy; outer mutation does not affect captured snapshot
     {
         int x = 10;
         function<int()> getX = () => { return x; };
@@ -429,7 +429,7 @@ bool testCapturePrimitives()
         result &= Test("int capture stable", getX(), 10);
     }
 
-    // float — value copy
+    // float - value copy
     {
         float factor = 2.5f;
         function<float(float)> scale = (float v) => { return v * factor; };
@@ -438,7 +438,7 @@ bool testCapturePrimitives()
         result &= Test("float capture stable", scale(4.0f), 10.0f);
     }
 
-    // bool — value copy
+    // bool - value copy
     {
         bool enabled = true;
         function<bool()> check = () => { return enabled; };
@@ -447,7 +447,7 @@ bool testCapturePrimitives()
         result &= Test("bool capture stable", check(), true);
     }
 
-    // i64 — value copy
+    // i64 - value copy
     {
         i64 big = 4000000000;
         function<i64()> getBig = () => { return big; };
@@ -456,14 +456,14 @@ bool testCapturePrimitives()
         result &= Test("i64 capture stable", getBig(), 4000000000);
     }
 
-    // char* — pointer copy; both sides read the same bytes
+    // char* - pointer copy; both sides read the same bytes
     {
         char* msg = "hello";
         function<int()> getLen = () => { return strlen(msg); };
         result &= Test("char* capture", getLen(), 5);
     }
 
-    // int* — pointer copy; writes through shared pointer are visible
+    // int* - pointer copy; writes through shared pointer are visible
     {
         int* p = new int;
         *p = 42;
@@ -481,7 +481,7 @@ bool testCaptureString()
 {
     bool result = true;
 
-    // string — value copy taken at capture time; outer reassignment invisible
+    // string - value copy taken at capture time; outer reassignment invisible
     {
         string label = "world";
         function<int()> getLen = () => { return label.length(); };
@@ -514,7 +514,7 @@ bool testCaptureStructRef()
 {
     bool result = true;
 
-    // struct (Counter) — reference capture; lambda mutations visible to caller
+    // struct (Counter) - reference capture; lambda mutations visible to caller
     {
         Counter c;
         function<void()> inc = () => { c.value = c.value + 1; };
@@ -522,7 +522,7 @@ bool testCaptureStructRef()
         result &= Test("struct ref capture", c.value, 3);
     }
 
-    // struct (Stats) — reference capture of multi-field struct
+    // struct (Stats) - reference capture of multi-field struct
     {
         Stats s;
         function<void(float)> observe = (float v) => {
@@ -538,7 +538,7 @@ bool testCaptureStructRef()
         result &= Test("stats max",   s.max,   5.0f);
     }
 
-    // class (Multiplier) — reference capture; caller mutations visible in lambda
+    // class (Multiplier) - reference capture; caller mutations visible in lambda
     {
         Multiplier m;
         m.factor = 3;
@@ -548,7 +548,7 @@ bool testCaptureStructRef()
         result &= Test("class ref factor=5", tripleIt(7), 35);
     }
 
-    // class (Adder) — reference capture with method call
+    // class (Adder) - reference capture with method call
     {
         Adder a;
         a.offset = 100;
@@ -557,7 +557,7 @@ bool testCaptureStructRef()
         result &= Test("adder +100 -3", add100(-3),  97);
     }
 
-    // interface — value capture (fat ptr {vtable,data} copied)
+    // interface - value capture (fat ptr {vtable,data} copied)
     {
         Multiplier m;
         m.factor = 4;
@@ -609,7 +609,7 @@ bool testCaptureMultiple()
         result &= Test("capture struct after",  c.value,              8);
     }
 
-    // function<T> variable — value capture of fat struct
+    // function<T> variable - value capture of fat struct
     {
         int base = 100;
         function<int(int)> addBase = (int x) => { return x + base; };
@@ -705,7 +705,7 @@ int writeAs<T>(void* raw) {
     return 0;
 }
 
-// Return sizeof(T) — uses a type parameter in sizeof(), not in a pointer cast.
+// Return sizeof(T) - uses a type parameter in sizeof(), not in a pointer cast.
 int sizeOf<T>(void* ignored) {
     return (int)sizeof(T);
 }

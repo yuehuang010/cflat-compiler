@@ -1,8 +1,8 @@
-// assigning null to the bonded variable breaks the bond — source reassignment then allowed
+// assigning null to the bonded variable breaks the bond - source reassignment then allowed
 int* Borrow(bond int* src) { return src; }
 
 void Test(int* src, int* other) {
     int* v = Borrow(src);
     v = nullptr;   // breaks the bond
-    src = other;   // now OK — no live bond on src
+    src = other;   // now OK - no live bond on src
 }

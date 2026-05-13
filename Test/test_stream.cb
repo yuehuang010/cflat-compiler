@@ -96,7 +96,7 @@ bool testStreamSmallBuffer() {
 }
 
 // ---------------------------------------------------------------------------
-// Primitive type tests — int, negative int, large int, float
+// Primitive type tests - int, negative int, large int, float
 // ---------------------------------------------------------------------------
 
 // Sends 4 integers (positive, negative, zero, large) as "%d\n" lines.
@@ -296,7 +296,7 @@ bool testStreamCharPtr() {
 }
 
 // ---------------------------------------------------------------------------
-// Mixed-types test — int, string, char*, float all in one stream
+// Mixed-types test - int, string, char*, float all in one stream
 // ---------------------------------------------------------------------------
 
 // Sends one of each: int, CFlat string, char*, float (as "%g" for clean formatting).
@@ -336,7 +336,7 @@ program MixedReceiver {
             rawMatch = strcmp(buf, "rawline\n") == 0 ? 1 : 0;
         }
 
-        // 4. float — "%g" formats 2.5 as "2.5"; verify the exact string content
+        // 4. float - "%g" formats 2.5 as "2.5"; verify the exact string content
         if (fgets(buf, 256, stdinStream) != nullptr) {
             floatOk = strcmp(buf, "2.5\n") == 0 ? 1 : 0;
         }
@@ -378,7 +378,7 @@ bool testStreamMixedTypes() {
 }
 
 // ---------------------------------------------------------------------------
-// Bidirectional stdio test — "?" / "Y" handshake across two programs
+// Bidirectional stdio test - "?" / "Y" handshake across two programs
 // ---------------------------------------------------------------------------
 
 // Sends "?\n" to stdout, then reads one reply line from stdin.

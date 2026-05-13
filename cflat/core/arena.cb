@@ -1,4 +1,4 @@
-// arena.cb — bump allocator (memory arena / region allocator)
+// arena.cb - bump allocator (memory arena / region allocator)
 //
 // Allocates memory from large contiguous blocks; dispenses sub-allocations
 // by bumping a pointer.  All memory is freed at once on reset() or destruction.

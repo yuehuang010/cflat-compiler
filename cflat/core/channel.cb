@@ -1,4 +1,4 @@
-// channel<T> — bounded MPMC ring buffer, Vyukov sequence-based algorithm.
+// channel<T> - bounded MPMC ring buffer, Vyukov sequence-based algorithm.
 //
 // Lock-free.  N producers and M consumers may call push/try_push and
 // pop/try_pop concurrently without data races.
@@ -23,14 +23,14 @@
 //   A consumer claims slot (pos & _mask) by CAS-ing _tail from pos to pos+1.
 //   It reads the value then stores seq[slot] = pos+_cap to recycle the slot.
 //
-// Capacity MUST be a power of two — the hot path uses bitmasking (pos & _mask)
+// Capacity MUST be a power of two - the hot path uses bitmasking (pos & _mask)
 // instead of division.  init() enforces this; non-power-of-two values are
 // rounded up to the next power of two automatically.
 //
 // Cache line layout (64 bytes each):
-//   Line 0: _buf* + _seq* + _cap + _mask          — read-only after init
-//   Line 1: _head                                  — producer-local
-//   Line 2: _tail                                  — consumer-local
+//   Line 0: _buf* + _seq* + _cap + _mask          - read-only after init
+//   Line 1: _head                                  - producer-local
+//   Line 2: _tail                                  - consumer-local
 
 import "interfaces.cb";
 import "atomic.cb";
@@ -121,7 +121,7 @@ class channel<T>
         return false;
     }
 
-    // IQueue-compatible aliases — separate bodies to avoid generic forwarding issues.
+    // IQueue-compatible aliases - separate bodies to avoid generic forwarding issues.
     bool try_pop(T* out) {
         i64 pos = __atomic_i64_load(&_tail);
         while (true) {
@@ -145,7 +145,7 @@ class channel<T>
         return false;
     }
 
-    // Blocking send — spins until a slot is available.
+    // Blocking send - spins until a slot is available.
     // Yields the CPU after 1024 failed iterations to prevent starvation under
     // parallel process load (e.g. test.bat running 20+ concurrent test processes).
     void send(move T item) {
@@ -169,7 +169,7 @@ class channel<T>
         }
     }
 
-    // Blocking receive — spins until an item is available.
+    // Blocking receive - spins until an item is available.
     // Yields the CPU after 1024 failed iterations (same rationale as send).
     T receive() {
         i64 pos   = __atomic_i64_load(&_tail);

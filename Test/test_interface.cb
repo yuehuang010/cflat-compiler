@@ -76,7 +76,7 @@ bool testVTableDispatch()
     IShape st = t;
     result &= Test("vtable_triangle_area", st.area(), 5);    // 10/2
 
-    // Heap-allocated — interface holds pointer to heap object
+    // Heap-allocated - interface holds pointer to heap object
     Circle* hc = new Circle();
     hc.r = 6;
     IShape shc = hc;
@@ -115,7 +115,7 @@ bool testIsOperator()
     return result;
 }
 
-// ── Test 3: as operator — downcast to concrete struct ────────────────────────
+// ── Test 3: as operator - downcast to concrete struct ────────────────────────
 // Returns a non-null pointer on match, null on mismatch.
 
 bool testAsToStruct()
@@ -149,7 +149,7 @@ bool testAsToStruct()
     return result;
 }
 
-// ── Test 4: as operator — interface-to-interface cast ────────────────────────
+// ── Test 4: as operator - interface-to-interface cast ────────────────────────
 // Casting IShape (Circle) to IDrawable should succeed; calling the inherited
 // area() and own draw() on the result should dispatch correctly.
 
@@ -161,7 +161,7 @@ bool testAsToInterface()
     c.r = 4;
     IShape sc = c;
 
-    // Circle implements IDrawable — cast must succeed
+    // Circle implements IDrawable - cast must succeed
     IDrawable d = sc as IDrawable;
     result &= Test("as_iface_is_circle",     d is Circle, true);
     result &= Test("as_iface_area_inherited", d.area(),   48);   // 4*4*3

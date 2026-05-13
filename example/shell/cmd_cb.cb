@@ -227,7 +227,7 @@ void cmdSet(list<string>* args)
 
     if (eq < 0)
     {
-        // set NAME — display current value.
+        // set NAME - display current value.
         i8* buf = new i8[4096];
         i32 len = GetEnvironmentVariableA(arg.data(), buf, 4096);
         if (len == 0)

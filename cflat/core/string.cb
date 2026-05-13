@@ -1,8 +1,8 @@
 // Core string types.
 //
 // `string` is a built-in value type { i8* _ptr, i32 _len } with:
-//   i8* data()   — pointer to the underlying bytes (null-terminated)
-//   i32 length() — number of bytes, not counting the terminator
+//   i8* data()   - pointer to the underlying bytes (null-terminated)
+//   i32 length() - number of bytes, not counting the terminator
 //
 // String literals are automatically wrapped into a `string` by the compiler.
 // Use `operator string` overloads to convert other types to `string`.

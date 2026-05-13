@@ -275,7 +275,7 @@ typeSpecifier
     | 'va_list'
     | structClassUnion
     | 'auto'
-    | Move                           // soft keyword — ownership modifier on parameters
+    | Move                           // soft keyword - ownership modifier on parameters
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
     | genericIdentifier
     | functionPointerSpecifier

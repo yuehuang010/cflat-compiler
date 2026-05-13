@@ -1,4 +1,4 @@
-// missile_defender.cb — Mouse-driven missile defense game.
+// missile_defender.cb - Mouse-driven missile defense game.
 //
 // Build:
 //   x64/Debug/cflat.exe example/missile_defender.cb -i cflat/core -o out/missile_defender.exe

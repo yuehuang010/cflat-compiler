@@ -6,7 +6,7 @@ struct __ThreadArgs {
 };
 
 // Win32 LPTHREAD_START_ROUTINE. Must be __stdcall on Win32 (WINAPI convention).
-// stdcall is a no-op on Win64 — safe to always annotate.
+// stdcall is a no-op on Win64 - safe to always annotate.
 stdcall int __thread_trampoline(void* param) {
     __ThreadArgs* args = (__ThreadArgs*)param;
     return args->fn(args->ctx);

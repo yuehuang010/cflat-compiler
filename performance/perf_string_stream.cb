@@ -2,8 +2,8 @@
 // Tests how line length affects producer-consumer throughput over a double-buffered stream.
 //
 // Two variants per size:
-//   stream + raw Thread  — direct write_bytes / read_buf, no program overhead
-//   stream + program     — program actor overhead + fgets hook path
+//   stream + raw Thread  - direct write_bytes / read_buf, no program overhead
+//   stream + program     - program actor overhead + fgets hook path
 //
 // Metric: lines/second (newlines counted by consumer).
 

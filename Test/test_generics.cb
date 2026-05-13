@@ -682,7 +682,7 @@ bool testListPointerClear()
         result &= Test("list<ptr> clear count",      employees.count(), 0);
         result &= Test("list<ptr> clear dtor fires", empDtorCount,      3);
 
-        // add after clear — destructor must not double-free
+        // add after clear - destructor must not double-free
         Employee* e4 = new Employee; e4->id = 4;
         employees.add(e4);
         result &= Test("list<ptr> add after clear count", employees.count(), 1);
@@ -719,7 +719,7 @@ bool testHashsetPointer()
     s.clear();
     result &= Test("hashset<ptr> count after clear", s.count(), 0);
 
-    // caller owns e1 and e3 — delete them manually
+    // caller owns e1 and e3 - delete them manually
     delete e1;
     delete e3;
 
@@ -765,7 +765,7 @@ bool testDictionaryPointer()
         result &= Test("dict<ptr> clear dtor",  empDtorCount, 5);
         result &= Test("dict<ptr> clear count", d.count(),    0);
 
-        // add after clear — destructor must not double-free
+        // add after clear - destructor must not double-free
         Employee* e4 = new Employee; e4->id = 4;
         d.add(4, e4);
         result &= Test("dict<ptr> add after clear count", d.count(), 1);
@@ -1712,7 +1712,7 @@ bool testTupleReturnAndDestructure()
     return result;
 }
 
-// Phase 4: ITuple<T...> — a third-party type that implements the interface
+// Phase 4: ITuple<T...> - a third-party type that implements the interface
 class MyRange : ITuple<int, int>
 {
     int lo = 0;
@@ -1742,11 +1742,11 @@ bool testImplicitStringLiteral()
 {
     bool result = true;
 
-    // string s = "literal" — implicit char* → string coercion in variable declaration
+    // string s = "literal" - implicit char* → string coercion in variable declaration
     string s1 = "hello";
     result &= Test("implicit_decl", s1, "hello");
 
-    // list<string>.add("literal") — implicit char* → string coercion in function argument
+    // list<string>.add("literal") - implicit char* → string coercion in function argument
     list<string> words = default;
     words.add("foo");
     words.add("bar");

@@ -89,7 +89,7 @@ def test_hover(client: LspClient):
     if "result" not in resp:
         return f"expected result, got: {resp}"
     if resp["result"] is None:
-        return "hover returned null — symbol 'add' not found in index"
+        return "hover returned null - symbol 'add' not found in index"
     contents = resp["result"].get("contents", {})
     value = contents.get("value", "")
     if "add" not in value:

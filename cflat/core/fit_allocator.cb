@@ -1,6 +1,6 @@
 import "vmem.cb";
 
-// fit_allocator.cb — first-fit allocator with coalescing free list.
+// fit_allocator.cb - first-fit allocator with coalescing free list.
 //
 // Memory is sourced from vmem_alloc segments (MEM_COMMIT|MEM_RESERVE).
 // Every allocation (slab and large) carries an 8-byte _FA_Header directly
@@ -11,13 +11,13 @@ import "vmem.cb";
 //   _size < 0  → large allocation (free via vmem_free)
 //
 // Large-alloc vmem_alloc layout:
-//   [base + 0]  _FA_LargePrefix._totalSize (8 bytes — vmem_alloc size)
-//   [base + 8]  _FA_LargePrefix._next      (8 bytes — linked list)
-//   [base + 16] _FA_Header._size           (8 bytes — stored as -userSize)
+//   [base + 0]  _FA_LargePrefix._totalSize (8 bytes - vmem_alloc size)
+//   [base + 8]  _FA_LargePrefix._next      (8 bytes - linked list)
+//   [base + 16] _FA_Header._size           (8 bytes - stored as -userSize)
 //   [base + 24] user data                  ← returned pointer
 //
 // Slab-alloc block layout (within a segment):
-//   [block + 0] _FA_Header._size           (8 bytes — stored as +userSize)
+//   [block + 0] _FA_Header._size           (8 bytes - stored as +userSize)
 //   [block + 8] user data                  ← returned pointer
 //
 // The free list is a sorted doubly-linked list of free blocks ordered by
@@ -34,7 +34,7 @@ struct _FA_Header
     i64 _size = 0;   // +userSize for slab; -userSize for large
 };
 
-// Free block overlay — shares the same address as _FA_Header.
+// Free block overlay - shares the same address as _FA_Header.
 struct _FA_FreeBlock
 {
     i64            _size = 0;        // same field as _FA_Header._size (positive)

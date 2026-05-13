@@ -967,7 +967,7 @@ bool testSpscThreaded() {
 
 struct WithEmbeddedFlag {
     int    value = 0;
-    atomic_flag flag;   // no = default — tests sub-struct auto-init
+    atomic_flag flag;   // no = default - tests sub-struct auto-init
     int    other = 7;
 };
 

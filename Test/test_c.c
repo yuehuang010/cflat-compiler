@@ -473,27 +473,27 @@ bool testShortCircuitIf()
     bool result = true;
     int x;
 
-    // || in if condition: first operand true — body must execute
+    // || in if condition: first operand true - body must execute
     x = 0;
     if (FuncTrue() || FuncFalse()) x = 1;
     result &= Test("if(T||F) body", x, 1);
 
-    // || in if condition: second operand true — body must execute
+    // || in if condition: second operand true - body must execute
     x = 0;
     if (FuncFalse() || FuncTrue()) x = 1;
     result &= Test("if(F||T) body", x, 1);
 
-    // || in if condition: both false — else must execute
+    // || in if condition: both false - else must execute
     x = 0;
     if (FuncFalse() || FuncFalse()) x = 1; else x = 2;
     result &= Test("if(F||F) else", x, 2);
 
-    // || in if condition: both true — body must execute
+    // || in if condition: both true - body must execute
     x = 0;
     if (FuncTrue() || FuncTrue()) x = 1; else x = 2;
     result &= Test("if(T||T) body", x, 1);
 
-    // Three-way ||: first true — short-circuit, body executes
+    // Three-way ||: first true - short-circuit, body executes
     shortCircuitCounter = 0;
     x = 0;
     if (FuncTrue() || FuncTrue() || FuncTrue()) x = 1;
@@ -507,7 +507,7 @@ bool testShortCircuitIf()
     result &= Test("if(F||F||T) body", x, 1);
     result &= Test("if(F||F||T) count", shortCircuitCounter, 3);
 
-    // Three-way ||: all false — else executes
+    // Three-way ||: all false - else executes
     shortCircuitCounter = 0;
     x = 0;
     if (FuncFalse() || FuncFalse() || FuncFalse()) x = 1; else x = 2;

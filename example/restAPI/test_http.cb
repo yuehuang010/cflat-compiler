@@ -159,7 +159,7 @@ extern int main()
 
     delete req10;
 
-    // ── 11. Four headers — all parsed and retrievable ─────────────────────────
+    // ── 11. Four headers - all parsed and retrievable ─────────────────────────
 
     i8* raw11 = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n";
     HttpRequest* req11 = parseHttpRequest(raw11, strlen(raw11));
@@ -216,7 +216,7 @@ extern int main()
     delete rbuf14;
     delete r14;
 
-    // ── 15. Multiple addHeader calls — all appear in output ───────────────────
+    // ── 15. Multiple addHeader calls - all appear in output ───────────────────
 
     HttpResponse* r15 = HttpResponse.ok(nullptr);
     r15->addHeader("X-A", "alpha");
@@ -296,7 +296,7 @@ extern int main()
     delete rbuf20;
     delete r20;
 
-    // ── 21. okJson — Content-Type and body ───────────────────────────────────
+    // ── 21. okJson - Content-Type and body ───────────────────────────────────
 
     HttpResponse* r21 = HttpResponse.okJson(nullptr);
     r21->setTextBody("42");

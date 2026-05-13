@@ -1,16 +1,16 @@
-// rwlock.cb — slim reader-writer lock backed by Win32 SRWLOCK.
+// rwlock.cb - slim reader-writer lock backed by Win32 SRWLOCK.
 //
 // Usage:
 //   rwlock rw;
-//   rw.acquire_read();      // shared — many readers at once
+//   rw.acquire_read();      // shared - many readers at once
 //   rw.release_read();
-//   rw.acquire_write();     // exclusive — one writer, no readers
+//   rw.acquire_write();     // exclusive - one writer, no readers
 //   rw.release_write();
 //
 // lock statement uses exclusive (write) semantics:
 //   lock (rw) { }           // equivalent to acquire_write() / release_write()
 //
-// No init() or destroy() needed — SRWLOCK is zero-initialized and has no
+// No init() or destroy() needed - SRWLOCK is zero-initialized and has no
 // associated kernel object to release.
 //
 // SRWLOCK is a single pointer-sized opaque value.  Storing it as void* and
@@ -20,7 +20,7 @@
 struct rwlock {
     void* _lock = nullptr;   // SRWLOCK value; zero == unlocked
 
-    // Acquire a shared (read) lock — many readers can hold this simultaneously.
+    // Acquire a shared (read) lock - many readers can hold this simultaneously.
     void acquire_read() {
         AcquireSRWLockShared(&_lock);
     }
@@ -30,7 +30,7 @@ struct rwlock {
         ReleaseSRWLockShared(&_lock);
     }
 
-    // Acquire an exclusive (write) lock — no other readers or writers allowed.
+    // Acquire an exclusive (write) lock - no other readers or writers allowed.
     void acquire_write() {
         AcquireSRWLockExclusive(&_lock);
     }

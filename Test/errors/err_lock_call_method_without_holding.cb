@@ -16,6 +16,6 @@ struct Account {
 expect_error("must hold 'acct.mtx' before calling this function") {
     void test() {
         Account acct;
-        acct.deposit(50);   // acct.mtx not held — error
+        acct.deposit(50);   // acct.mtx not held - error
     }
 }

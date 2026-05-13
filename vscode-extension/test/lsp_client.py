@@ -132,7 +132,7 @@ class LspClient:
             self._proc.wait(timeout=5)
         except Exception:
             self._proc.kill()
-        # Drain thread is daemon — give it a moment to finish.
+        # Drain thread is daemon - give it a moment to finish.
         try:
             return b"".join(self._stderr_buf).decode("utf-8", errors="replace")
         except Exception:

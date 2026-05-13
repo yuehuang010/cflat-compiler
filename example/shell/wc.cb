@@ -1,4 +1,4 @@
-// wc.cb — count lines, words, and characters in text files.
+// wc.cb - count lines, words, and characters in text files.
 //
 // Build:
 //   x64/Debug/cflat.exe example/shell/wc.cb -o out/wc.exe

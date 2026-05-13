@@ -35,14 +35,14 @@ int* arr  = new int[5];
 delete[] arr;
 ```
 
-**`delete[n]`** — call destructors on exactly `n` elements, then free. Use when the array was allocated without a cookie (e.g. raw `malloc`/`operator new`) and you know the count:
+**`delete[n]`** - call destructors on exactly `n` elements, then free. Use when the array was allocated without a cookie (e.g. raw `malloc`/`operator new`) and you know the count:
 
 ```c
 Node* nodes = new Node[5];
 delete[5] nodes;    // calls ~Node() on each of the 5 elements, then frees
 ```
 
-**`delete[_]`** — free the backing buffer *without* calling any destructors. Use after you have already destroyed elements manually (e.g. with `.~()`):
+**`delete[_]`** - free the backing buffer *without* calling any destructors. Use after you have already destroyed elements manually (e.g. with `.~()`):
 
 ```c
 Node* buf = new Node[3];
@@ -58,7 +58,7 @@ Summary of array-delete forms:
 |------|-----------------|--------------|
 | `delete[] p` | all elements | hidden cookie |
 | `delete[n] p` | exactly `n` elements | explicit literal/variable |
-| `delete[_] p` | none | — |
+| `delete[_] p` | none | - |
 
 
 ### Custom Allocators (`operator new` / `operator delete`)
@@ -127,7 +127,7 @@ m.acquire();
 m.release();
 ```
 
-Use the `lock` statement for scoped acquisition — the lock is released automatically at the end of the block:
+Use the `lock` statement for scoped acquisition - the lock is released automatically at the end of the block:
 
 ```c
 lock (m)
@@ -158,7 +158,7 @@ counter.fetchAdd(1);
 int v = counter.load();
 ```
 
-`atomic.cb` also provides low-level value-typed atomics — `atomic__i32`, `atomic__i64`, and `atomic_flag` — used when you need release/acquire ordering or want to guard associated fields (see [Atomic Memory-Ordering Guards](#atomic-memory-ordering-guards)):
+`atomic.cb` also provides low-level value-typed atomics - `atomic__i32`, `atomic__i64`, and `atomic_flag` - used when you need release/acquire ordering or want to guard associated fields (see [Atomic Memory-Ordering Guards](#atomic-memory-ordering-guards)):
 
 ```c
 import "atomic.cb";
@@ -173,11 +173,11 @@ seq.fetchAdd(1);
 
 ### Other Synchronization Primitives
 
-- `core/semaphore.cb` — `Semaphore` with `acquire`/`release`
-- `core/latch.cb` — `Latch` countdown; `countDown`, `wait`
-- `core/rwlock.cb` — `RwLock`; `acquireRead`/`releaseRead`, `acquireWrite`/`releaseWrite`
-- `core/channel.cb` — `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
-- `core/spsc_queue.cb` — `spsc_queue<T>` wait-free single-producer/single-consumer ring
+- `core/semaphore.cb` - `Semaphore` with `acquire`/`release`
+- `core/latch.cb` - `Latch` countdown; `countDown`, `wait`
+- `core/rwlock.cb` - `RwLock`; `acquireRead`/`releaseRead`, `acquireWrite`/`releaseWrite`
+- `core/channel.cb` - `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
+- `core/spsc_queue.cb` - `spsc_queue<T>` wait-free single-producer/single-consumer ring
 
 ```c
 import "channel.cb";
@@ -192,7 +192,7 @@ int v = ch.receive();   // 42
 
 ## Compile-Time Lock-Set Analysis
 
-CFlat performs **static lock-set analysis** — the compiler tracks which locks are held at each point and reports unguarded accesses or missing lock requirements as errors. No annotations are needed at call sites; the compiler derives requirements from declarations.
+CFlat performs **static lock-set analysis** - the compiler tracks which locks are held at each point and reports unguarded accesses or missing lock requirements as errors. No annotations are needed at call sites; the compiler derives requirements from declarations.
 
 The `lock(...)` clause appears in four positions:
 
@@ -233,12 +233,12 @@ The `lock(expr)` statement acquires the lock before entering the block and relea
 Counter c;
 
 lock(c.mtx) {
-    c.value = 42;      // c.mtx is in the lock-set here — OK
+    c.value = 42;      // c.mtx is in the lock-set here - OK
 }
 
 Counter c2;
 lock(c.mtx, c2.mtx) {
-    c.value = c.value + c2.value;   // both locks held — OK
+    c.value = c.value + c2.value;   // both locks held - OK
 }
 ```
 
@@ -263,7 +263,7 @@ lock(c.mtx) {
 }
 ```
 
-The `lock(expr)` clause is a **contract** — it is enforced at the call site, not just documented. The formal parameter name in the clause (`a`) is substituted with the actual argument name (`c`) at each call site, so the error message names the concrete variable:
+The `lock(expr)` clause is a **contract** - it is enforced at the call site, not just documented. The formal parameter name in the clause (`a`) is substituted with the actual argument name (`c`) at each call site, so the error message names the concrete variable:
 
 ```
 error: must hold 'c.mtx' before calling this function
@@ -290,7 +290,7 @@ struct Account {
 };
 ```
 
-Methods inside the group use **standard CFlat method style** — no explicit self parameter; fields are accessed via implicit `this`. Calling these methods without holding the receiver's lock is a compile error:
+Methods inside the group use **standard CFlat method style** - no explicit self parameter; fields are accessed via implicit `this`. Calling these methods without holding the receiver's lock is a compile error:
 
 ```c
 Account acct;
@@ -337,14 +337,14 @@ Mutexes provide mutual exclusion; atomics provide visibility ordering. CFlat ext
 Standard atomic operations carry a memory-ordering annotation (release, acquire, seq_cst), but nothing connects the **guard atomic** to the **data it protects**. A programmer can silently omit the ordering, use the wrong ordering, or access guarded fields entirely outside any fence:
 
 ```c
-// nothing stops a bare write — no ordering, no happens-before edge
+// nothing stops a bare write - no ordering, no happens-before edge
 s.value = 42;
 __atomic_i32_store(&s.ready, 1);  // wrong: seq_cst, not release; s.value may be reordered past
 ```
 
 #### Declaring guarded fields
 
-In a struct, use `lock(atomicField) { ... }` — the same syntax as a mutex guard group — to declare that the enclosed fields require an atomic release or acquire scope to access:
+In a struct, use `lock(atomicField) { ... }` - the same syntax as a mutex guard group - to declare that the enclosed fields require an atomic release or acquire scope to access:
 
 ```c
 import "atomic.cb";
@@ -365,7 +365,7 @@ s.value = 42;           // error: Field 'value' is guarded by 'ready'
 int x = s.value;        // error: Field 'value' is guarded by 'ready'
 ```
 
-#### Producer — `release`
+#### Producer - `release`
 
 Call `release` on the guard atomic to publish guarded fields. The lambda body executes first (data writes), then the atomic store is emitted with `memory_order_release`, establishing a happens-before edge:
 
@@ -377,7 +377,7 @@ s.ready.release(1, () => {
 // equivalent to: s.value = 42; atomic_store(&s.ready, 1, release)
 ```
 
-#### Consumer — `acquire`
+#### Consumer - `acquire`
 
 Call `acquire` on the guard atomic to observe guarded fields. The atomic load is emitted with `memory_order_acquire` first, then the lambda body executes (data reads):
 
@@ -407,7 +407,7 @@ void release(i32 val, lock(this) function<void()> body);
 void acquire(lock(this) function<void(i32)> body);
 ```
 
-`lock(this)` is a parameter qualifier that tells the compiler: *when analysing the lambda passed here, seed `currentLockSet` with the call-site receiver.* At `s.ready.release(...)`, the receiver is `s.ready`, so the lambda body is checked as though `lock(s.ready)` was in effect — which satisfies the `GuardedBy` check on `s.value`.
+`lock(this)` is a parameter qualifier that tells the compiler: *when analysing the lambda passed here, seed `currentLockSet` with the call-site receiver.* At `s.ready.release(...)`, the receiver is `s.ready`, so the lambda body is checked as though `lock(s.ready)` was in effect - which satisfies the `GuardedBy` check on `s.value`.
 
 You can use the same qualifier in your own functions to propagate a guard into a callback:
 

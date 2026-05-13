@@ -113,12 +113,12 @@ private:
                 return "missing ';' at end of statement";
 
             if (dynamic_cast<CFlatParser::ParameterTypeListContext*>(ctx))
-                return "check parameter list — missing type or closing ')'?";
+                return "check parameter list - missing type or closing ')'?";
 
             if (offendingIsEof &&
                 (dynamic_cast<CFlatParser::CompoundStatementContext*>(ctx) ||
                  dynamic_cast<CFlatParser::BlockItemListContext*>(ctx)))
-                return "unclosed '{' — check for a missing closing brace";
+                return "unclosed '{' - check for a missing closing brace";
 
             if (dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx)       ||
                 dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(ctx) ||
@@ -132,7 +132,7 @@ private:
                 return "program definitions require a trailing ';'";
 
             if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(ctx))
-                return "check the function signature — missing return type or parameter type?";
+                return "check the function signature - missing return type or parameter type?";
 
             ctx = dynamic_cast<antlr4::RuleContext*>(ctx->parent);
         }

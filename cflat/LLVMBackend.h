@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================
-// LLVMBackend.h — LLVM IR backend, type system, symbol tables
+// LLVMBackend.h - LLVM IR backend, type system, symbol tables
 // ============================================================
 // SECTION      LINE     DESCRIPTION
 // ───────────────────────────────────────────────────────────
@@ -163,10 +163,10 @@ public:
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         bool IsNullable = false;
-        bool IsMove = false;     // parameter declared with 'move' — function takes ownership
-        bool IsBond = false;     // parameter declared with 'bond' — return value borrows from this parameter; return must not outlive it
-        bool IsStdcall = false;  // function declared with 'stdcall' — uses __stdcall calling convention on Win32
-        bool IsCdecl = false;   // function declared with 'cdecl'   — explicit C calling convention (default; recognized for clarity)
+        bool IsMove = false;     // parameter declared with 'move' - function takes ownership
+        bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
+        bool IsStdcall = false;  // function declared with 'stdcall' - uses __stdcall calling convention on Win32
+        bool IsCdecl = false;   // function declared with 'cdecl'   - explicit C calling convention (default; recognized for clarity)
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
@@ -319,7 +319,7 @@ public:
         // Used for delayed Initialization
         CFlatParser::InitializerContext* Initializer = nullptr;
 
-        // Used for array — first (outer) dimension; extra inner dimensions in ExtraArrayDims
+        // Used for array - first (outer) dimension; extra inner dimensions in ExtraArrayDims
         CFlatParser::AssignmentExpressionContext* ArraySize = nullptr;
         std::vector<CFlatParser::AssignmentExpressionContext*> ExtraArrayDims;
 
@@ -340,10 +340,10 @@ public:
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
-        bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer — freed on scope exit
-        bool IsNewAllocated = false;     // true only for 'new'-allocated locals — enables refcount on field escape (cleared on null-source transfer)
-        bool IsOwningString = false;     // true when a string local owns its heap buffer — destructor called on scope exit
-        bool IsOwningStruct = false;     // true for move parameters of struct types with destructors — destructor called on scope exit
+        bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
+        bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
+        bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
+        bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
@@ -451,7 +451,7 @@ public:
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
-        bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) — caller must free
+        bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
     };
@@ -732,7 +732,7 @@ private:
             if (namedVar.IsOwning && namedVar.Storage != nullptr)
                 EmitOwningPtrCleanup(namedVar);
 
-            // Clean up move string parameters (move string param — non-pointer ownership)
+            // Clean up move string parameters (move string param - non-pointer ownership)
             if (namedVar.IsOwningString && namedVar.Storage != nullptr)
             {
                 EnsureStringDtorRegistered();
@@ -923,7 +923,7 @@ private:
     }
 
     // Registers the built-in `string` value type: { i8* _ptr, i32 _len }.
-    // data() returns _ptr; length() returns _len.  No vtable — direct struct access.
+    // data() returns _ptr; length() returns _len.  No vtable - direct struct access.
     void RegisterBuiltinString()
     {
         auto* ptrTy = builder->getInt8Ty()->getPointerTo();
@@ -1273,7 +1273,7 @@ private:
 
     // Emit a single-argument LLVM float intrinsic (round, floor, ceil, fabs, sqrt).
     // Returns nullptr if methodName is not a recognized float method.
-    // Works for both float (f32) and double (f64) — type is inferred from floatVal.
+    // Works for both float (f32) and double (f64) - type is inferred from floatVal.
     llvm::Value* CreateFloatIntrinsic(const std::string& methodName, llvm::Value* floatVal)
     {
         llvm::Intrinsic::ID id;
@@ -1311,7 +1311,7 @@ private:
         if (srcBits < destBits)  return it->second.isSigned
                                      ? builder->CreateSExt(intVal, destTy)
                                      : builder->CreateZExt(intVal, destTy);
-        return intVal; // same width — no-op
+        return intVal; // same width - no-op
     }
 
     bool VerifyModule()
@@ -1638,7 +1638,7 @@ public:
     }
 
     // Terminate all unterminated basic blocks in every function in the module, then pop stack
-    // frames back down to targetDepth (without running destructors — used in error-skip paths).
+    // frames back down to targetDepth (without running destructors - used in error-skip paths).
     // Iterates the whole module because lambdas save/restore builder state: when an exception
     // fires inside a lambda the outer function's blocks may also be unterminated.
     void AbortFunctionBlocks(size_t targetDepth)
@@ -1746,7 +1746,7 @@ public:
         return llvm::StructType::create(*context, { ptrTy, ptrTy }, fatPtrName);
     }
 
-    // {i8* fnptr, i8* envptr} — storage type for all in-function function<T> variables.
+    // {i8* fnptr, i8* envptr} - storage type for all in-function function<T> variables.
     llvm::StructType* GetClosureFatPtrType() const
     {
         const char* name = "__closure_fat_ptr";
@@ -2511,7 +2511,7 @@ public:
         }
         else
         {
-            // Zero-initialize — works for all types: primitives, pointers, structs, fat-ptrs.
+            // Zero-initialize - works for all types: primitives, pointers, structs, fat-ptrs.
             initValue = llvm::Constant::getNullValue(destinationType);
         }
 
@@ -2744,7 +2744,7 @@ public:
             auto srcSize = srcType->getScalarSizeInBits();
 
             // Widening only (e.g. float -> double). Narrowing (double -> float) is
-            // not handled here — use a typed literal (0.0f) or an explicit cast at
+            // not handled here - use a typed literal (0.0f) or an explicit cast at
             // the source level so types match before reaching this path.
             if (srcSize < targetSize)
                 return builder->CreateFPExt(value, destType);
@@ -2758,7 +2758,7 @@ public:
         }
         else if (srcType->isIntegerTy() && destType->isPointerTy())
         {
-            // Integer 0 assigned to a pointer field — produce a proper null/ptr constant.
+            // Integer 0 assigned to a pointer field - produce a proper null/ptr constant.
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
             {
                 if (constInt->isZero())
@@ -3168,7 +3168,7 @@ public:
             return it->second;
 
         auto* gv = builder->CreateGlobalString(text, name);
-        // In LLVM 18 opaque-pointer mode the GlobalVariable* is already a ptr —
+        // In LLVM 18 opaque-pointer mode the GlobalVariable* is already a ptr -
         // no ConstantExpr GEP needed.
         stringPool[text] = gv;
         stringLiteralLenByPtr[gv] = (int32_t)text.size();
@@ -3591,7 +3591,7 @@ public:
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
 
         // Upconvert user args to match declared param types (index 0 is env, skip it).
-        // String literals arrive as i8* — wrap them into %string{ptr,len} when the
+        // String literals arrive as i8* - wrap them into %string{ptr,len} when the
         // param expects a string value type.
         for (size_t i = 0; i < args.size() && i + 1 < paramTypes.size(); i++)
         {
@@ -3668,7 +3668,7 @@ public:
     {
         if (exitBlockStack)
         {
-            // Bare-semicolon form: expect_error("msg"); — if the expected error never fired before this scope exits, report failure.
+            // Bare-semicolon form: expect_error("msg"); - if the expected error never fired before this scope exits, report failure.
             if (!expectedError.empty() && expectedErrorScopeDepth == stackNamedVariable.size())
             {
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectedError);
@@ -3830,7 +3830,7 @@ public:
                 if (verbose) std::cerr << "[verbose] skipping duplicate definition of '" << functionName << "'\n";
                 return fn;
             }
-            // Pre-declared by ForwardRefScanner — reuse the declaration and attach a body.
+            // Pre-declared by ForwardRefScanner - reuse the declaration and attach a body.
             alreadyDeclared = true;
         }
         else
@@ -4156,7 +4156,7 @@ public:
         // Fixed-param slots: 0..paramSize-1; variadic slots: paramSize, paramSize+1, ...
         std::vector<int64_t> posMap(inputSize, -1);
 
-        // Pass 1: named arguments — resolve to their fixed-param position by name.
+        // Pass 1: named arguments - resolve to their fixed-param position by name.
         int posIndex = 0;
         for (const auto& input : inputArguments)
         {
@@ -4189,7 +4189,7 @@ public:
                 usedTargetMap[pos] = true;
         }
 
-        // Pass 2: unnamed arguments — assign to the next free fixed-param slot; for
+        // Pass 2: unnamed arguments - assign to the next free fixed-param slot; for
         // variadic functions, arguments that overflow the fixed params go to trailing slots.
         bool successful = true;
         posIndex = 0;
@@ -4338,7 +4338,7 @@ public:
             bool isFlag = (name == "__atomic_release_store_flag");
             Value* ptr = args[0];
             Value* val = args[1];
-            // bool is i1 in LLVM; atomic ops require byte-sized types — widen to i32.
+            // bool is i1 in LLVM; atomic ops require byte-sized types - widen to i32.
             if (isFlag)
                 val = builder->CreateZExt(val, Type::getInt32Ty(ctx), "flag_i32");
             auto* si = builder->CreateStore(val, ptr);
@@ -4487,7 +4487,7 @@ public:
         {
             // Variadic arguments past the declared parameter list must not be dispatched
             // through pointer-parameter logic (candParamItr points at the last declared
-            // param, which for printf is 'ptr %fmt' — causing all variadic args to be
+            // param, which for printf is 'ptr %fmt' - causing all variadic args to be
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
 
@@ -4536,7 +4536,7 @@ public:
                 // (the pre-loaded value). Primary holds the struct value itself, which would
                 // be the wrong type for a pointer parameter.
                 // Guard: if Primary is already a pointer value (e.g. loaded from a global ptr),
-                // use Primary directly — Storage would be the wrong level of indirection.
+                // use Primary directly - Storage would be the wrong level of indirection.
                 if (!arg.TypeAndValue.Pointer && arg.Storage != nullptr
                     && !(arg.Primary != nullptr && arg.Primary->getType()->isPointerTy()))
                     argList.push_back(arg.Storage);
@@ -4562,7 +4562,7 @@ public:
             }
             else if (!inVariadicRange && candParamItr->IsFunctionPointer)
             {
-                // function<T> parameter — dispatch depends on whether the callee is extern C.
+                // function<T> parameter - dispatch depends on whether the callee is extern C.
                 llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
                 // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
                 auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType((unsigned)argList.size());
@@ -4586,7 +4586,7 @@ public:
                     // Extern C-compatible parameter: provide a bare C function pointer.
                     if (val && val->getType()->isStructTy())
                     {
-                        // Fat struct — extract the fn ptr (field 0) and cast to expected type.
+                        // Fat struct - extract the fn ptr (field 0) and cast to expected type.
                         auto* fnI8 = builder->CreateExtractValue(val, {0u});
                         val = builder->CreateBitCast(fnI8, llvmParamTy, "fn_for_extern");
                     }
@@ -4642,7 +4642,7 @@ public:
                     }
                 }
 
-                // Non-owning string (literal or view) passed to a move parameter — heap-copy it
+                // Non-owning string (literal or view) passed to a move parameter - heap-copy it
                 // so the callee receives an owned buffer it can safely free.
                 if (!inVariadicRange &&
                     candParamItr->IsMove &&
@@ -4692,7 +4692,7 @@ public:
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
-                LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter — bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
+                LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter - bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
         }
 
         auto* result = CreateFunctionCall(candidate.Function, argList);
@@ -4724,7 +4724,7 @@ public:
         {
             if (candidate.Parameters[i].IsMove)
             {
-                // Interface fat-ptr parameters (non-pointer) borrow the caller's data — don't zero it.
+                // Interface fat-ptr parameters (non-pointer) borrow the caller's data - don't zero it.
                 // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.
                 bool isInterfaceBorrow = candidate.Parameters[i].IsInterface && !candidate.Parameters[i].IsInterfacePointer;
                 if (matched[i].Storage != nullptr && !isInterfaceBorrow)
@@ -4752,7 +4752,7 @@ public:
                     }
                 }
                 // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
-                // Covers pointer, owning-string, and struct move params — all cases where caller storage was zeroed.
+                // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
                 if (!matched[i].CallerName.empty() && matched[i].Storage != nullptr &&
                     !isInterfaceBorrow && matched[i].BaseType != nullptr)
                 {
@@ -4851,7 +4851,7 @@ public:
             {
                 // The implicit `this` parameter is named "<StructName>__" (trailing
                 // double-underscore). functionArgument is a std::map sorted by key,
-                // so `begin()` is not guaranteed to be `this` — find it explicitly.
+                // so `begin()` is not guaranteed to be `this` - find it explicitly.
                 auto thisIt = functionArguments.end();
                 for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
                 {
@@ -4923,7 +4923,7 @@ public:
             if (functionArguments.empty())
                 continue;
 
-            // Find the implicit 'this' arg — its name ends with "__" (the struct
+            // Find the implicit 'this' arg - its name ends with "__" (the struct
             // name followed by "__"). functionArgument is a std::map (sorted
             // alphabetically), so we can't rely on begin() here.
             auto thisIt = functionArguments.end();
@@ -5345,7 +5345,7 @@ public:
             }
             value = Upconvert(value, retTy);
             // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).
-            // Warn: CFlat requires explicit narrowing — write "return expr != 0;" instead.
+            // Warn: CFlat requires explicit narrowing - write "return expr != 0;" instead.
             if (retTy == builder->getInt1Ty() && value->getType()->isIntegerTy() && value->getType() != retTy)
             {
                 LogError("implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit");

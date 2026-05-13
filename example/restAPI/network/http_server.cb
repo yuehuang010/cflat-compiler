@@ -1,4 +1,4 @@
-// core/network/http_server.cb — Single-handler HTTP/1.1 server using the
+// core/network/http_server.cb - Single-handler HTTP/1.1 server using the
 // `program` construct for lifecycle management.
 //
 // Usage:
@@ -56,12 +56,12 @@ void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
     conn->send(rbuf, rlen);
     delete rbuf;
     delete resp;
-    // conn is not deleted here — caller owns the Socket and cleans it up at scope exit.
+    // conn is not deleted here - caller owns the Socket and cleans it up at scope exit.
 }
 
 // Per-connection program: receives one request and exits.
 // Accepts the OS socket handle (void*) rather than a Socket* to avoid passing
-// a cross-program pointer — each program owns its own allocator.
+// a cross-program pointer - each program owns its own allocator.
 program _HttpConn {
     void* handle  = nullptr;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
