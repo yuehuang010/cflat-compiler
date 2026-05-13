@@ -193,6 +193,7 @@ private:
                                     LLVMBackend::TypeAndValue::FuncPtrParam p;
                                     p.TypeName = param->typeSpecifier()->getText();
                                     p.Pointer = param->pointer() != nullptr;
+                                    p.IsMove = param->Move() != nullptr;
                                     declType.FuncPtrParams.push_back(p);
                                 }
                             }
@@ -1246,6 +1247,7 @@ private:
                                 }
                                 if (!p.Pointer)
                                     p.Pointer = param->pointer() != nullptr;
+                                p.IsMove = param->Move() != nullptr;
                                 declType.FuncPtrParams.push_back(p);
                             }
                         }
@@ -3670,6 +3672,8 @@ public:
                             if (typeAndValue.IsFunctionPointer)
                                 lambdaExpectedType = typeAndValue;
                             std::string genericFuncCallerName;
+                            bool rhsIsFuncPtr = false;
+                            std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 right = LoadNamedVariable(rightNV);
@@ -3679,6 +3683,8 @@ public:
                                 srcBorrowedOrigin = rightNV.BorrowedOrigin.empty()
                                     ? rightNV.CallerName
                                     : rightNV.BorrowedOrigin;
+                                rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
+                                rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                             }
                             lambdaExpectedType = {};
                             // Implicit char* → string coercion: string s = "hello" or string s = charPtr.
@@ -3719,19 +3725,42 @@ public:
                                 // same plain key in functionTable (e.g. atomic_counter::add vs add).
                                 std::string funcName = assignmentExpression->getText();
                                 int expectedParams = (int)typeAndValue.FuncPtrParams.size();
-                                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams))
+                                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &typeAndValue.FuncPtrParams))
                                     right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
+                                {
+                                    VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
                                     right = compiler->WrapBareValueAsFatStruct(fn);
+                                }
                             }
                             // Fallback for generic function pointers (e.g. function<int(void*)> fp = wrap<int>):
                             // the RHS parses to an empty namedVar with CallerName set to the mangled function name.
                             if (!right && typeAndValue.IsFunctionPointer && !genericFuncCallerName.empty())
                             {
                                 int expectedParams = (int)typeAndValue.FuncPtrParams.size();
-                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams);
+                                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &typeAndValue.FuncPtrParams);
                                 if (genericFn)
+                                {
+                                    VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
                                     right = compiler->WrapBareValueAsFatStruct(genericFn);
+                                }
+                            }
+
+                            // Funcptr-to-funcptr declaration init: per-param IsMove flags must agree.
+                            if (right && typeAndValue.IsFunctionPointer && rhsIsFuncPtr
+                                && right->getType()->isStructTy()
+                                && typeAndValue.FuncPtrParams.size() == rhsFuncPtrParams.size())
+                            {
+                                for (size_t i = 0; i < typeAndValue.FuncPtrParams.size(); i++)
+                                {
+                                    if (typeAndValue.FuncPtrParams[i].IsMove != rhsFuncPtrParams[i].IsMove)
+                                    {
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "incompatible function pointer initializer: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",
+                                            i + 1));
+                                        break;
+                                    }
+                                }
                             }
 
                             // Pointer variable assigned a struct value: catch the mismatch here
@@ -4059,10 +4088,13 @@ public:
                 // same plain key in functionTable (e.g. atomic_counter::add vs add).
                 std::string funcName = assignCtx->getText();
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
-                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams))
+                if (auto* correctFn = compiler->GetFunctionForFuncPtr(funcName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams))
                     right = correctFn;
                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
+                {
+                    VerifyFuncPtrAssignmentMoveFlags(funcName, namedVar.TypeAndValue, ctx);
                     right = compiler->WrapBareValueAsFatStruct(fn);
+                }
             }
             // Fallback for generic function pointer reassignment (e.g. fn = wrap<int>):
             // the RHS produces a null value with CallerName set to the mangled function name.
@@ -4071,9 +4103,33 @@ public:
                 && !rightNV.CallerName.empty())
             {
                 int expectedParams = (int)namedVar.TypeAndValue.FuncPtrParams.size();
-                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams);
+                llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(rightNV.CallerName, expectedParams, &namedVar.TypeAndValue.FuncPtrParams);
                 if (genericFn)
+                {
+                    VerifyFuncPtrAssignmentMoveFlags(rightNV.CallerName, namedVar.TypeAndValue, ctx);
                     right = compiler->WrapBareValueAsFatStruct(genericFn);
+                }
+            }
+            // Funcptr-to-funcptr assignment: per-param IsMove flags must agree on both sides.
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+                && rightNV.TypeAndValue.IsFunctionPointer
+                && right && right->getType()->isStructTy())
+            {
+                const auto& lhsP = namedVar.TypeAndValue.FuncPtrParams;
+                const auto& rhsP = rightNV.TypeAndValue.FuncPtrParams;
+                if (lhsP.size() == rhsP.size())
+                {
+                    for (size_t i = 0; i < lhsP.size(); i++)
+                    {
+                        if (lhsP[i].IsMove != rhsP[i].IsMove)
+                        {
+                            LogErrorContext(ctx, std::format(
+                                "incompatible function pointer assignment: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",
+                                i + 1));
+                            break;
+                        }
+                    }
+                }
             }
 
             // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
@@ -5036,6 +5092,37 @@ public:
 
         LogErrorContext(ctx, "Additive expression has no operands.");
         return {};
+    }
+
+    // Diagnose move-flag mismatch when assigning a named function to a typed function pointer.
+    // E.g. `function<void(move T*)> fp = borrowFn;` is rejected because borrowFn declares a borrow param.
+    void VerifyFuncPtrAssignmentMoveFlags(const std::string& funcName,
+                                          const LLVMBackend::TypeAndValue& funcPtrType,
+                                          antlr4::ParserRuleContext* ctx)
+    {
+        if (!funcPtrType.IsFunctionPointer) return;
+        // No move modifiers anywhere -> nothing to enforce.
+        bool anyMove = false;
+        for (const auto& p : funcPtrType.FuncPtrParams) if (p.IsMove) { anyMove = true; break; }
+        if (!anyMove)
+        {
+            // Even when destination has no move flags, reject if every overload only has move params.
+            // We only flag when the function table has *no* matching all-borrow overload.
+        }
+        if (!Compiler(ctx)->HasFunctionWithMoveFlags(funcName, funcPtrType.FuncPtrParams))
+        {
+            std::string expected;
+            for (size_t i = 0; i < funcPtrType.FuncPtrParams.size(); i++)
+            {
+                if (i) expected += ", ";
+                if (funcPtrType.FuncPtrParams[i].IsMove) expected += "move ";
+                expected += funcPtrType.FuncPtrParams[i].TypeName;
+                if (funcPtrType.FuncPtrParams[i].Pointer) expected += "*";
+            }
+            Compiler(ctx)->LogError(std::format(
+                "function '{}' has no overload matching the 'move' modifiers of function pointer signature ({}) - 'move' is part of the function-pointer type and must agree on both sides",
+                funcName, expected));
+        }
     }
 
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
@@ -7700,16 +7787,46 @@ public:
                             if (funcPtr != nullptr)
                             {
                                 std::vector<llvm::Value*> callArgs;
+                                std::vector<LLVMBackend::NamedVariable> argNVs;
                                 if (argumentList.size() > 0)
                                 {
                                     auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
                                     for (const auto& namedArgument : namedArgCtx)
                                     {
-                                        auto argValue = this->ParseAssignmentExpression(namedArgument->assignmentExpression());
+                                        auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                        auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                         if (argValue) callArgs.push_back(argValue);
+                                        argNVs.push_back(argNV);
+
+                                        // Compile-time use-after-move check: arg is a moved variable.
+                                        if (argNV.IsMoved && argNV.IdentifierLine > 0)
+                                        {
+                                            // (Same diagnostic shape as direct-call site; conservative — only fires when source variable was already moved.)
+                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", argNV.CallerName));
+                                        }
                                     }
                                 }
+                                // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
+                                size_t pcount = std::min(argNVs.size(), namedVar.TypeAndValue.FuncPtrParams.size());
+                                for (size_t i = 0; i < pcount; i++)
+                                {
+                                    if (namedVar.TypeAndValue.FuncPtrParams[i].IsMove && argNVs[i].IsBonded)
+                                        Compiler(ctx)->LogError("cannot pass bonded value to 'move' parameter of function pointer - bonded values cannot be transferred out of their source's scope");
+                                }
                                 auto result = Compiler(ctx)->CreateIndirectCall(namedVar.TypeAndValue, funcPtr, callArgs);
+                                // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
+                                for (size_t i = 0; i < pcount; i++)
+                                {
+                                    if (!namedVar.TypeAndValue.FuncPtrParams[i].IsMove) continue;
+                                    auto& argNV = argNVs[i];
+                                    if (argNV.Storage != nullptr && argNV.TypeAndValue.Pointer)
+                                    {
+                                        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(argNV.BaseType))
+                                            Compiler(ctx)->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
+                                    }
+                                    if (!argNV.CallerName.empty())
+                                        Compiler(ctx)->MarkVariableMoved(argNV.CallerName);
+                                }
                                 namedVar.Primary = result;
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = result ? result->getType() : nullptr;

@@ -963,6 +963,35 @@ bool testListSortNamedComparator()
     return result;
 }
 
+// ── 'move' in function pointer signatures ────────────────────────────────────
+// function<R(move T*)> is a distinct type from function<R(T*)>. Calling through
+// such a pointer transfers ownership of the matching argument to the callee
+// (the caller's storage is auto-nulled), and the named function used to
+// initialize the pointer must declare the same 'move' modifier on that param.
+
+int g_move_fp_dtor_count = 0;
+struct MovePayload {
+    int value = 0;
+    ~MovePayload() { g_move_fp_dtor_count = g_move_fp_dtor_count + 1; }
+};
+
+int consume_payload(move MovePayload* p) {
+    int v = p->value;
+    delete p;
+    return v;
+}
+
+bool testFuncPtrMoveSignature()
+{
+    g_move_fp_dtor_count = 0;
+    function<int(move MovePayload*)> fp = consume_payload;
+    MovePayload* p = new MovePayload();
+    p->value = 7;
+    int got = fp(p);
+    // Caller's pointer is auto-nulled by the funcptr's 'move' contract; scope-exit cleanup is a no-op.
+    return got == 7 && g_move_fp_dtor_count == 1;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1015,6 +1044,9 @@ extern int main()
 
     // Dispatch table tests
     total++; passed += testDispatchTable()             ? 1 : 0;
+
+    // 'move' in function pointer signatures
+    total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;

@@ -1,0 +1,10 @@
+// Assigning a borrow-typed function to a `function<R(move T*)>` is rejected:
+// the 'move' modifier is part of the function-pointer type and must agree.
+
+expect_error("'move' modifiers of function pointer signature") {
+    void borrow_int_ptr(int* p) { }
+
+    void test_assign() {
+        function<void(move int*)> fp = borrow_int_ptr;
+    }
+}

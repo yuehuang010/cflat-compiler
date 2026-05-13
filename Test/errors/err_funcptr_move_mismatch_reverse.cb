@@ -1,0 +1,10 @@
+// Reverse direction: assigning a move-typed function to a `function<R(T*)>`
+// is also rejected for the same reason.
+
+expect_error("'move' modifiers of function pointer signature") {
+    void consume_int_ptr(move int* p) { delete p; }
+
+    void test_assign() {
+        function<void(int*)> fp = consume_int_ptr;
+    }
+}

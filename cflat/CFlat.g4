@@ -305,7 +305,7 @@ functionPointerParamList
     ;
 
 functionPointerParam
-    : typeSpecifier pointer?
+    : Move? typeSpecifier pointer?
     ;
 
 lambdaExpression

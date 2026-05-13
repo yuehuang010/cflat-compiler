@@ -7,6 +7,7 @@
 import "threadpool.cb";
 import "atomic.cb";
 import "cruntime.cb";
+import "time.cb";
 
 // Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
 int Test(const char* name, bool actual, bool expected) {
@@ -65,9 +66,9 @@ int taskCancellable(void* raw, stop_token tok) {
 }
 
 int taskSlow(void* raw, stop_token tok) {
-    int i = 0;
-    int x = 1;
-    while (i < 50000000) { x = x + i; i++; }
+    // Wall-clock sleep instead of a busy loop so -O2 can't eliminate the work
+    // (a pure compute loop with a dead result gets dropped by the optimiser).
+    sleep((i64)50);
     return 0;
 }
 
@@ -137,7 +138,7 @@ bool testBasicSubmitAndDrain() {
     int i = 0;
     while (i < 8) { inputs[i] = i + 1; i++; }
 
-    TaskHandle[8] handles;
+    TaskHandle[8] handles {};
     i = 0;
     while (i < 8) {
         bool accepted = pool.submit(taskSquare, &inputs[i], &handles[i]);
@@ -188,7 +189,7 @@ bool testSubmitDetached() {
     pool.init(2);
 
     atomic_counter counter = default;
-    AddCtx[100] ctxs;
+    AddCtx[100] ctxs {};
     int i = 0;
     while (i < 100) { ctxs[i].counter = &counter; i++; }
 
@@ -209,8 +210,8 @@ bool testTaskResultGet() {
     ThreadPool pool;
     pool.init(2);
 
-    IntCtx[5] ctxs;
-    TaskResult<int>[5] results;
+    IntCtx[5] ctxs {};
+    TaskResult<int>[5] results {};
     int i = 0;
     while (i < 5) {
         ctxs[i].input = (i + 1) * 3;
@@ -279,9 +280,9 @@ bool testCancellation() {
     TaskHandle h;
     pool.submit(taskCancellable, &ctx, &h);
 
-    // Spin a bit so the task actually starts.
-    int spin = 0;
-    while (spin < 1000000) { spin++; }
+    // Give the task time to actually start before we cancel it.  Wall-clock
+    // sleep so the wait is real under any optimisation level.
+    sleep((i64)20);
 
     h.cancel();
     h.wait();
@@ -393,7 +394,7 @@ bool testResizeGrowShrinkGrow() {
 
     int[4] v;
     v[0] = 2; v[1] = 3; v[2] = 4; v[3] = 5;
-    TaskHandle[4] handles;
+    TaskHandle[4] handles {};
     int i = 0;
     while (i < 4) { pool.submit(taskSquare, &v[i], &handles[i]); i++; }
     pool.drain();
@@ -408,7 +409,7 @@ bool testResizeGrowShrinkGrow() {
 
     int[4] w;
     w[0] = 6; w[1] = 7; w[2] = 8; w[3] = 9;
-    TaskHandle[4] wh;
+    TaskHandle[4] wh {};
     i = 0;
     while (i < 4) { pool.submit(taskSquare, &w[i], &wh[i]); i++; }
     pool.drain();
@@ -421,7 +422,7 @@ bool testResizeGrowShrinkGrow() {
 
     int[4] u;
     u[0] = 1; u[1] = 2; u[2] = 3; u[3] = 4;
-    TaskHandle[4] uh;
+    TaskHandle[4] uh {};
     i = 0;
     while (i < 4) { pool.submit(taskSquare, &u[i], &uh[i]); i++; }
     pool.drain();
@@ -471,7 +472,7 @@ bool testApproxPendingCount() {
     pool.init(1);
 
     int[10] vs;
-    TaskHandle[10] hs;
+    TaskHandle[10] hs {};
     int i = 0;
     while (i < 10) { vs[i] = i + 1; pool.submit(taskSquare, &vs[i], &hs[i]); i++; }
     pool.drain();

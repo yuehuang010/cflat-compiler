@@ -160,8 +160,11 @@ struct Task {
 
 // ── WorkerStartCtx ────────────────────────────────────────────────────────────
 // Heap-allocated (malloc) per worker thread by init() and resize().  Freed by
-// the worker itself at startup before entering the work loop so the caller
-// does not need to track per-worker allocations.
+// the worker itself at startup before entering the work loop.  malloc/free is
+// used (not new/delete) because Thread.start takes the context as a plain
+// void* - the ownership tracker can't follow the pointer through the type-
+// erased function<int(void*)> callback, so 'new' would trigger a scope-exit
+// delete at the caller in addition to the worker's free.
 //
 struct WorkerStartCtx {
     WorkerCtx* wctx = nullptr;
@@ -253,7 +256,7 @@ class ThreadPool {
         while (i < workerCount) {
             WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
             sc->wctx = &_ctx;
-            sc->slot   = i;
+            sc->slot = i;
             _workers[i].start(__threadpool_worker, sc);
             i++;
         }
@@ -433,7 +436,7 @@ class ThreadPool {
                 _workerStops[j].init();
                 WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
                 sc->wctx = &_ctx;
-                sc->slot   = j;
+                sc->slot = j;
                 _workers[j].start(__threadpool_worker, sc);
                 j++;
             }

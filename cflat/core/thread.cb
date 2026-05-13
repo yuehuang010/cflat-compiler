@@ -5,10 +5,23 @@ struct __ThreadArgs {
     void* ctx = nullptr;
 };
 
+// Move-typed args packet: the fn signature carries 'move void*', so the call
+// inside the trampoline transfers ownership of ctx to fn (matching the
+// move-overload of Thread.start()).
+struct __ThreadArgsMove {
+    function<int(move void*)> fn = nullptr;
+    void* ctx = nullptr;
+};
+
 // Win32 LPTHREAD_START_ROUTINE. Must be __stdcall on Win32 (WINAPI convention).
 // stdcall is a no-op on Win64 - safe to always annotate.
 stdcall int __thread_trampoline(void* param) {
     __ThreadArgs* args = (__ThreadArgs*)param;
+    return args->fn(args->ctx);
+}
+
+stdcall int __thread_trampoline_move(void* param) {
+    __ThreadArgsMove* args = (__ThreadArgsMove*)param;
     return args->fn(args->ctx);
 }
 
@@ -44,15 +57,21 @@ struct Thread {
     }
 
     // Move overload: ownership of ctx transfers to the thread. The caller's
-    // pointer is auto-nulled at the call site. The thread's fn is expected to
-    // take 'move' on its parameter (or otherwise free ctx) before returning.
-    bool start(function<int(void*)> fn, move void* ctx) {
-        __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
+    // pointer is auto-nulled at the call site. The fn's parameter is also
+    // typed 'move void*' so the trampoline's indirect call transfers ctx
+    // into the user function, which is responsible for freeing it.
+    //
+    // Note: if CreateThread fails, ctx is leaked - we have no destructor for
+    // 'void*' and the caller's pointer was already nulled by the move call.
+    // Callers needing recovery should validate inputs (e.g. handle limits)
+    // before invoking start().
+    bool start(function<int(move void*)> fn, move void* ctx) {
+        __ThreadArgsMove* args = (__ThreadArgsMove*)malloc(sizeof(__ThreadArgsMove));
         args->fn  = fn;
-        args->ctx = ctx;
-        _args = args;
+        args->ctx = ctx;          // assignment transfers ctx into args->ctx; ctx local is auto-nulled
+        _args = (void*)args;
         i32 id = 0;
-        _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
+        _handle = CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;

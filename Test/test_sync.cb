@@ -28,6 +28,44 @@ struct ComputeCtx {
     int output = 0;
 };
 
+// Move-overload: ownership of the heap-allocated payload transfers from the
+// caller into Thread.start, then via the trampoline into consume_payload, which
+// is responsible for freeing it. The caller's pointer is auto-nulled.
+struct MoveThreadPayload {
+    int* slot  = nullptr;
+    int  value = 0;
+};
+
+int g_move_thread_payload_dtors = 0;
+
+int consume_thread_payload(move void* ctx) {
+    MoveThreadPayload* p = (MoveThreadPayload*)ctx;
+    *p->slot = p->value;
+    int v = p->value;
+    free((void*)p);
+    g_move_thread_payload_dtors = g_move_thread_payload_dtors + 1;
+    // ctx and p alias the same heap block; we already freed it via free(p).
+    // Null ctx so the move-param scope-exit cleanup doesn't double-free.
+    ctx = nullptr;
+    return v;
+}
+
+bool testThreadStartMoveOwnership() {
+    bool result = true;
+    g_move_thread_payload_dtors = 0;
+    int observed = 0;
+    MoveThreadPayload* p = (MoveThreadPayload*)malloc(sizeof(MoveThreadPayload));
+    p->slot  = &observed;
+    p->value = 1234;
+    Thread t;
+    t.start(consume_thread_payload, (void*)p);
+    i32 code = t.join();
+    result &= Test("move start observed", observed, 1234);
+    result &= Test("move start exit code", (int)code, 1234);
+    result &= Test("move start freed once", g_move_thread_payload_dtors, 1);
+    return result;
+}
+
 int computeSquare(void* ctx) {
     ComputeCtx* c = (ComputeCtx*)ctx;
     c->output = c->input * c->input;
@@ -1024,6 +1062,7 @@ extern int main() {
     total++; passed += testSequentialThreads()           ? 1 : 0;
     total++; passed += testThreadExitCodeZero()          ? 1 : 0;
     total++; passed += testMultipleThreadsCompute()      ? 1 : 0;
+    total++; passed += testThreadStartMoveOwnership()    ? 1 : 0;
 
     // Mutex / atomic tests
     total++; passed += testMutexManual()              ? 1 : 0;

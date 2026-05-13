@@ -172,7 +172,7 @@ public:
         bool IsFunctionPointer = false;
         std::string FuncPtrReturnTypeName;
         bool FuncPtrReturnPointer = false;
-        struct FuncPtrParam { std::string TypeName; bool Pointer = false; };
+        struct FuncPtrParam { std::string TypeName; bool Pointer = false; bool IsMove = false; };
         std::vector<FuncPtrParam> FuncPtrParams;
 
         uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
@@ -289,7 +289,7 @@ public:
             {
                 std::string s = "funcptr_" + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
                 for (const auto& p : FuncPtrParams)
-                    s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "");
+                    s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "") + (p.IsMove ? "M" : "");
                 return s;
             }
 
@@ -3571,6 +3571,7 @@ public:
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
+            fp.IsMove = p.IsMove;
             tv.FuncPtrParams.push_back(fp);
         }
         return tv;
@@ -4146,6 +4147,9 @@ public:
                 // for each parameter, score +1 when the param's IsMove agrees with whether
                 // the caller-side argument is an owning lvalue (so the borrow overload wins
                 // for non-owning args, and the move overload wins for owning ones).
+                // For function-pointer parameters, also score +1 when the named function arg
+                // has an overload whose per-param IsMove flags match the candidate param's
+                // FuncPtrParams exactly (so the move-typed start() wins for a move-typed fn).
                 int moveScore = 0;
                 auto pi = candidate.Parameters.begin();
                 for (const auto& arg : arguments)
@@ -4156,6 +4160,11 @@ public:
                         !arg.IsMoved;
                     if (pi->IsMove == argOwning)
                         moveScore++;
+                    if (pi->IsFunctionPointer && !arg.CallerName.empty()
+                        && HasFunctionWithMoveFlags(arg.CallerName, pi->FuncPtrParams))
+                    {
+                        moveScore += 2;  // weight funcptr-IsMove match heavily so it can break a tie
+                    }
                     ++pi;
                 }
                 if (moveScore > bestPerfectScore)
@@ -4610,11 +4619,20 @@ public:
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
                     if (val && !val->getType()->isStructTy())
                     {
-                        // Re-resolve by CallerName to skip method overloads sharing the same key.
+                        // Re-resolve by CallerName to skip method overloads sharing the same key,
+                        // and pick the overload whose per-param 'move' flags match the destination.
                         if (!arg.CallerName.empty())
                         {
-                            if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, -1))
+                            int expectedCount = (int)candParamItr->FuncPtrParams.size();
+                            if (auto* correctFn = GetFunctionForFuncPtr(arg.CallerName, expectedCount, &candParamItr->FuncPtrParams))
                                 val = correctFn;
+                            // Reject when no overload's IsMove flags match the destination signature.
+                            if (!HasFunctionWithMoveFlags(arg.CallerName, candParamItr->FuncPtrParams))
+                            {
+                                LogError(std::format(
+                                    "function '{}' has no overload matching the 'move' modifiers required by parameter '{}' - 'move' is part of the function-pointer type",
+                                    arg.CallerName, candParamItr->VariableName));
+                            }
                         }
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
                             val = WrapBareValueAsFatStruct(fn);
@@ -4822,7 +4840,30 @@ public:
     // Like GetFunction, but prefers non-method (top-level) overloads.
     // Used when assigning a named function to a function<T> variable to avoid
     // picking a struct method that shares the same plain name.
-    llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1)
+    // Returns true if any overload of `functionName` has the given param count AND its per-param IsMove
+    // flags match `expectedParams`. Used to validate funcptr-assignment compatibility with `move` modifiers.
+    bool HasFunctionWithMoveFlags(std::string functionName, const std::vector<TypeAndValue::FuncPtrParam>& expectedParams) const
+    {
+        functionName = ResolveQualifiedName(functionName);
+        auto it = functionTable.find(functionName);
+        if (it == functionTable.end()) return true;  // unknown - leave to other mechanisms
+        bool sawCountMatch = false;
+        for (const auto& sym : it->second)
+        {
+            if (sym.IsMethod) continue;
+            if (sym.Parameters.size() != expectedParams.size()) continue;
+            sawCountMatch = true;
+            bool ok = true;
+            for (size_t i = 0; i < sym.Parameters.size(); i++)
+                if (sym.Parameters[i].IsMove != expectedParams[i].IsMove) { ok = false; break; }
+            if (ok) return true;
+        }
+        // No exact-count overload exists -> not a 'move-modifier' problem; let other type-check paths handle.
+        return !sawCountMatch;
+    }
+
+    llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
+                                          const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr)
     {
         functionName = ResolveQualifiedName(functionName);
         auto it = functionTable.find(functionName);
@@ -4833,7 +4874,24 @@ public:
         if (overloads.size() == 1)
             return overloads.front().Function;
 
-        // Prefer non-method overloads with matching param count.
+        // When expectedParams is provided, prefer the overload whose per-param IsMove flags match exactly.
+        auto moveFlagsMatch = [&](const FunctionSymbol& sym) -> bool {
+            if (!expectedParams) return true;
+            if (sym.Parameters.size() != expectedParams->size()) return false;
+            for (size_t i = 0; i < sym.Parameters.size(); i++)
+                if (sym.Parameters[i].IsMove != (*expectedParams)[i].IsMove) return false;
+            return true;
+        };
+
+        // Pass 1: non-method, param count + move flags match.
+        for (const auto& sym : overloads)
+        {
+            if (sym.IsMethod) continue;
+            if (expectedParamCount >= 0 && (int)sym.Parameters.size() != expectedParamCount) continue;
+            if (!moveFlagsMatch(sym)) continue;
+            return sym.Function;
+        }
+        // Pass 2: non-method, count only (legacy behavior when no expectedParams).
         for (const auto& sym : overloads)
         {
             if (sym.IsMethod) continue;
