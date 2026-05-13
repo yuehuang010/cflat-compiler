@@ -3811,6 +3811,8 @@ public:
         for (const auto& argument : arguments)
         {
             argumentString += argument.ToUniqueString();
+            if (argument.IsMove)
+                argumentString += "M";
         }
 
         std::string uniqueName = std::format("_{}_{}_{}_", functionName, returnType.ToUniqueString(), argumentString);
@@ -3998,6 +4000,8 @@ public:
     std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
     {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
+        std::pair<std::vector<NamedVariable>, FunctionSymbol> bestPerfect;
+        int bestPerfectScore = -1;  // moveScore is always >= 0; -1 means "no perfect match yet"
         // int score = 0; // 2 for promotionMatch, 1 for implicitMatch
 
         for (const auto& pair : candidates)
@@ -4137,13 +4141,39 @@ public:
             }
 
             if (perfectMatch)
-                return pair;
+            {
+                // Tie-breaker between perfect-match overloads that differ only in 'move':
+                // for each parameter, score +1 when the param's IsMove agrees with whether
+                // the caller-side argument is an owning lvalue (so the borrow overload wins
+                // for non-owning args, and the move overload wins for owning ones).
+                int moveScore = 0;
+                auto pi = candidate.Parameters.begin();
+                for (const auto& arg : arguments)
+                {
+                    if (pi == candidate.Parameters.end()) break;
+                    bool argOwning = !arg.CallerName.empty() &&
+                        (arg.IsOwning || arg.IsOwningString || arg.IsOwningStruct) &&
+                        !arg.IsMoved;
+                    if (pi->IsMove == argOwning)
+                        moveScore++;
+                    ++pi;
+                }
+                if (moveScore > bestPerfectScore)
+                {
+                    bestPerfectScore = moveScore;
+                    bestPerfect = pair;
+                }
+                continue;
+            }
 
             if (promotionMatch || implicitMatch)
             {
                 possibleResult = pair;
             }
         }
+
+        if (bestPerfectScore >= 0)
+            return bestPerfect;
 
         return possibleResult;
     }

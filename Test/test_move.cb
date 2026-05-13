@@ -70,6 +70,27 @@ void borrow(Resource* r)
     int x = r->id;
 }
 
+// Move/borrow overload pair: 'move' participates in mangling and overload selection.
+// probe(move Resource*) returns 100 + id and takes ownership (deletes r).
+// probe(Resource*)      returns 200 + id and borrows.
+int probe(move Resource* r)
+{
+    int id = r->id;
+    delete r;
+    return 100 + id;
+}
+
+int probe(Resource* r)
+{
+    return 200 + r->id;
+}
+
+// Helper: r is a borrowed (non-move) parameter, so probe(r) must pick the borrow overload.
+int delegateProbe(Resource* r)
+{
+    return probe(r);
+}
+
 // move T* return type - ownership propagates to caller
 move Resource* createResource(int id)
 {
@@ -282,6 +303,33 @@ extern int main()
         // list goes out of scope; remaining element (b) freed by list destructor
     }
     passed += Test("list_take_remaining_freed", dtorCount, 2);
+    total++;
+
+    // Test 8: move-vs-borrow overload selection.
+    // Owning local -> picks 'move' overload (returns 100+id, frees r).
+    dtorCount = 0;
+    {
+        Resource* a = new Resource();
+        a->id = 5;
+        int v = probe(a);
+        passed += Test("probe_picks_move_for_owning", v, 105);
+        total++;
+        // 'a' moved into probe; scope exit is a no-op.
+    }
+    passed += Test("probe_move_freed_once", dtorCount, 1);
+    total++;
+
+    // Borrowed pointer (non-move param) -> picks 'borrow' overload (returns 200+id, no free).
+    dtorCount = 0;
+    {
+        Resource* b = new Resource();
+        b->id = 9;
+        int v = delegateProbe(b);
+        passed += Test("probe_picks_borrow_for_non_owning", v, 209);
+        total++;
+        // b still owned here; freed at scope exit.
+    }
+    passed += Test("probe_borrow_freed_at_scope_exit", dtorCount, 1);
     total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);
