@@ -22,6 +22,41 @@ struct Container
     }
 };
 
+// Worker-style payload: pointer to an external observer slot plus a value.
+// Mirrors Test/repro_new_struct.cb but stays single-threaded so the test
+// is hermetic. The caller hands the owning pointer to 'workerMove' which
+// performs the side effect through ->slot, then ownership ends at the
+// callee's scope exit - exactly the pattern repro_new_struct.cb needs.
+struct Slot
+{
+    int* slot  = nullptr;
+    int  value = 0;
+    ~Slot()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+// Move param: side-effects through the pointer, never calls 'delete'.
+// Ownership ends when the function returns (scope-exit cleanup frees it).
+int workerMove(move Slot* s)
+{
+    *s->slot = s->value;
+    return s->value;
+}
+
+// Move param with an explicit 'delete': proves that an in-body delete
+// nulls the parameter's alloca so the scope-exit cleanup does not
+// double-free. This is the safe analogue of the unsafe pattern in
+// Test/errors/err_delete_borrowed_via_cast.cb.
+int workerMoveDelete(move Slot* s)
+{
+    *s->slot = s->value;
+    int v = s->value;
+    delete s;
+    return v;
+}
+
 // move parameter takes ownership - Resource is deleted when consume returns
 void consume(move Resource* r)
 {
@@ -190,6 +225,42 @@ extern int main()
         Resource* r2 = forwardResource(r);
     }
     passed += Test("move_return_forward_freed_once", dtorCount, 1);
+    total++;
+
+    // Worker-style ownership transfer (mirrors repro_new_struct.cb without threads).
+    // Caller 'new's a Slot, hands it to a function via 'move'; callee writes through
+    // ->slot and returns. Expect exactly one destructor, observed value updated.
+    dtorCount = 0;
+    {
+        int observed = 0;
+        Slot* p = new Slot();
+        p->slot  = &observed;
+        p->value = 42;
+        int got = workerMove(p);
+        passed += Test("worker_move_return", got, 42);
+        total++;
+        passed += Test("worker_move_observed", observed, 42);
+        total++;
+        // p is nulled by 'move'; scope exit is a no-op. Exactly one free inside workerMove.
+    }
+    passed += Test("worker_move_freed_once", dtorCount, 1);
+    total++;
+
+    // Same shape, but the callee calls 'delete' explicitly. ParseDeleteExpression
+    // nulls the parameter's alloca so scope-exit cleanup skips - still one free.
+    dtorCount = 0;
+    {
+        int observed = 0;
+        Slot* p = new Slot();
+        p->slot  = &observed;
+        p->value = 7;
+        int got = workerMoveDelete(p);
+        passed += Test("worker_move_delete_return", got, 7);
+        total++;
+        passed += Test("worker_move_delete_observed", observed, 7);
+        total++;
+    }
+    passed += Test("worker_move_delete_freed_once", dtorCount, 1);
     total++;
 
     // Test 7: list::take - transfers ownership out of list; element freed by caller,

@@ -3508,6 +3508,8 @@ public:
 
                 llvm::Value* right = nullptr;
                 bool srcIsUnsigned = false;
+                bool srcIsBorrowed = false;
+                std::string srcBorrowedOrigin;
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -3673,6 +3675,10 @@ public:
                                 right = LoadNamedVariable(rightNV);
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
+                                srcIsBorrowed = rightNV.IsBorrowed;
+                                srcBorrowedOrigin = rightNV.BorrowedOrigin.empty()
+                                    ? rightNV.CallerName
+                                    : rightNV.BorrowedOrigin;
                             }
                             lambdaExpectedType = {};
                             // Implicit char* → string coercion: string s = "hello" or string s = charPtr.
@@ -3844,6 +3850,20 @@ public:
                             nv.BondedSources = compiler->lastCallBondedSources;
                             compiler->lastCallIsBonded = false;
                             compiler->lastCallBondedSources.clear();
+                        }
+
+                        // Propagate borrow: if the RHS is a borrowed pointer (non-move param or
+                        // a local that already aliases one, possibly via cast), this local also
+                        // aliases the borrowed origin and must not be deleted. IsOwning/IsNewAllocated
+                        // sources override this (handled above by clearing in those branches).
+                        if (srcIsBorrowed && typeAndValue.Pointer && !compiler->lastOwningResult)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            if (!nv.IsOwning && !nv.IsNewAllocated)
+                            {
+                                nv.IsBorrowed = true;
+                                nv.BorrowedOrigin = srcBorrowedOrigin;
+                            }
                         }
                     }
                 }
@@ -6085,6 +6105,21 @@ public:
                     "cannot delete borrowed parameter '{}' - caller may own this pointer and "
                     "will free it on scope exit. Declare the parameter 'move {}' to take ownership.",
                     namedVar.CallerName, namedVar.CallerName));
+                return {};
+            }
+
+            // Error: deleting a local that aliases a borrowed parameter (e.g. via cast).
+            // 'Payload* p = (Payload*)raw; delete p;' is the laundered form of the case above.
+            if (!namedVar.IsOwning
+                && namedVar.IsBorrowed
+                && !namedVar.BorrowedOrigin.empty())
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - it aliases borrowed parameter '{}'. The caller may own "
+                    "this pointer and will free it on scope exit. Declare the source parameter "
+                    "'move {}' to take ownership.",
+                    namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName,
+                    namedVar.BorrowedOrigin, namedVar.BorrowedOrigin));
                 return {};
             }
 

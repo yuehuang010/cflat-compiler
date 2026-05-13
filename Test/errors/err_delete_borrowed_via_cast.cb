@@ -1,0 +1,40 @@
+// Laundered form of err_delete_borrowed_param: a non-move pointer parameter
+// is assigned/cast into a local, then deleted through the local. Without the
+// IsBorrowed taint, the compiler used to miss this and emit a free that the
+// caller's scope-exit cleanup would repeat - heap corruption.
+
+struct Payload { int value = 0; };
+
+// Direct alias: 'Payload* p = raw' inherits the borrow.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void laundered_direct(Payload* raw) {
+        Payload* p = raw;
+        delete p;
+    }
+}
+
+// Cast alias: 'Payload* p = (Payload*)raw' from a void* param also inherits the borrow.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    int laundered_cast(void* raw) {
+        Payload* p = (Payload*)raw;
+        delete p;
+        return 0;
+    }
+}
+
+// Chained alias: borrow taint survives intermediate aliasing.
+expect_error("cannot delete 'q' - it aliases borrowed parameter 'raw'") {
+    void laundered_chain(Payload* raw) {
+        Payload* p = raw;
+        Payload* q = p;
+        delete q;
+    }
+}
+
+// Sanity: move param can still be deleted through a cast local.
+void valid_move_via_cast(move void* raw) {
+    Payload* p = (Payload*)raw;
+    delete p;
+}
+
+extern int main() { return 0; }

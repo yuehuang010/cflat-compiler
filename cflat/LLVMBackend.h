@@ -347,6 +347,8 @@ public:
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
+        bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
+        std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
         int IdentifierLine = 0;          // source location for use-after-move error reporting
@@ -864,6 +866,13 @@ private:
                     .BaseType = ty,
                     .Storage = alloc,
                 };
+                // Non-move pointer parameters borrow from the caller. Track this so we can
+                // reject 'delete' on the param or any local that aliases it via assignment/cast.
+                if (itr_nameArg->Pointer && !itr_nameArg->IsMove)
+                {
+                    namedVar.IsBorrowed = true;
+                    namedVar.BorrowedOrigin = itr_nameArg->VariableName;
+                }
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
             if (symbolSink_ && !itr_nameArg->VariableName.empty())
