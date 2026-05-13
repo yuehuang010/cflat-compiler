@@ -7,8 +7,8 @@ import "channel.cb";
 import "time.cb";
 
 // Capacity (per priority) of the lock-free task channel.  Must be a power of
-// two large enough that bursts of submit() rarely exceed it; producers block
-// on push() if a channel is momentarily full.
+// two large enough that bursts of submit() rarely exceed it; submit() returns
+// false (and the caller may retry) if the targeted channel is saturated.
 int THREADPOOL_QUEUE_CAPACITY = 65536;
 
 // Priority values for submit() / submitDetached().
@@ -93,46 +93,56 @@ struct TaskHandle {
 //   int val = result.get();   // blocks; returns 49
 //
 struct TaskResult<T> {
+    // _ready transitions through three states:
+    //   0 - empty (initial)
+    //   1 - publishing in progress (winner has exclusive write access)
+    //   2 - published; readers may load _value / _failed
+    // The CAS 0 -> 1 acts as a one-shot claim so a second set()/fail() call
+    // returns without touching state.  The release-store 1 -> 2 publishes.
     atomic__i32 _ready  = default;
     T           _value  = default;   // written before release; read after acquire
     bool        _failed = false;     // written before release; read after acquire
 
-    // Publish a successful result.  Call exactly once from the task.
-    // Write _value before the release so get() sees it after the acquire fence.
+    // Publish a successful result.  Only the first call to set()/fail() wins;
+    // subsequent calls are dropped, so a misbehaving task cannot race a reader.
     void set(T val) {
+        if (!_ready.cas((i32)0, (i32)1)) { return; }
         _value = val;
-        _ready.release(1, () => { });
+        _ready.release(2, () => { });
     }
 
-    // Signal an error.  Call exactly once from the task on failure.
+    // Signal an error.  Mutually exclusive with set() via the same CAS.
     void fail() {
+        if (!_ready.cas((i32)0, (i32)1)) { return; }
         _failed = true;
-        _ready.release(1, () => { });
+        _ready.release(2, () => { });
     }
 
     // Block until the result is ready and return it.
     // Only valid after a successful set(); check hasFailed() if the task may fail.
     T get() {
-        while (_ready.load() == 0) { SwitchToThread(); }
+        while (_ready.load() < (i32)2) { SwitchToThread(); }
         _ready.acquire((i32 v) => { });   // acquire fence; pairs with release in set()
         return _value;
     }
 
     // True if fail() was called instead of set().
     bool hasFailed() {
-        while (_ready.load() == 0) { SwitchToThread(); }
+        while (_ready.load() < (i32)2) { SwitchToThread(); }
         _ready.acquire((i32 v) => { });
         return _failed;
     }
 
     // Block until set() or fail() has been called.  Does not consume the result.
     void wait() {
-        while (_ready.load() == 0) { SwitchToThread(); }
+        while (_ready.load() < (i32)2) { SwitchToThread(); }
     }
 
-    // Non-blocking poll - true if set() or fail() has been called.
+    // Non-blocking poll - true if set() or fail() has been called and the
+    // result has been published (state 2).  Returns false while a publisher is
+    // mid-write (state 1) so readers never observe partial state.
     bool isReady() {
-        return _ready.load() != (i32)0;
+        return _ready.load() >= (i32)2;
     }
 };
 
@@ -150,8 +160,8 @@ struct Task {
 
 // ── WorkerStartCtx ────────────────────────────────────────────────────────────
 // Heap-allocated (malloc) per worker thread by init() and resize().  Freed by
-// the worker itself at startup before entering the work loop so the caller does
-// not need to track per-worker allocations.
+// the worker itself at startup before entering the work loop so the caller
+// does not need to track per-worker allocations.
 //
 struct WorkerStartCtx {
     WorkerCtx* wctx = nullptr;
@@ -250,7 +260,10 @@ class ThreadPool {
     }
 
     // Submit a task with an explicit priority.
-    // Returns false if the pool is not running or is shutting down.
+    // Returns false if the pool is not running, is shutting down, or the
+    // targeted priority queue is full (channel saturated).  When full, the
+    // caller's _inflight reservation is rolled back and the handle is left
+    // untouched so it is safe to retry.
     // handle may be nullptr for fire-and-forget tasks; cancellable tasks must pass a handle.
     bool submit(function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
         if (_workers == nullptr || _stop.stop_requested()) { return false; }
@@ -263,10 +276,24 @@ class ThreadPool {
             handle->_hasCont = false;   // clear stale state; arrays are not per-element constructed
             t._token = handle->_cancelSrc.get_token();
         }
+        // Reserve a slot in the in-flight count BEFORE pushing so drain() never
+        // races past a freshly submitted task; roll back if the push fails.
         _inflight.increment();
-        if      (priority == THREADPOOL_PRIORITY_HIGH) { _qHigh.push(t); }
-        else if (priority == THREADPOOL_PRIORITY_LOW)  { _qLow.push(t); }
-        else                                            { _qNormal.push(t); }
+        bool pushed = false;
+        if      (priority == THREADPOOL_PRIORITY_HIGH) { pushed = _qHigh.try_push(t); }
+        else if (priority == THREADPOOL_PRIORITY_LOW)  { pushed = _qLow.try_push(t); }
+        else                                            { pushed = _qNormal.try_push(t); }
+        if (!pushed) {
+            // Channel full: undo the reservation.  If this drops inflight to
+            // zero, wake any drain() waiters so they don't sleep on stale state.
+            i64 remaining = _inflight.decrement();
+            if (remaining == (i64)0) {
+                _lock.acquire();
+                WakeAllConditionVariable(&_drainCv);
+                _lock.release();
+            }
+            return false;
+        }
         _ready.release();
         return true;
     }
@@ -277,15 +304,30 @@ class ThreadPool {
     }
 
     // Register fn to run automatically after dep's task finishes.
-    // Safe to call before or after dep completes; call at most once per dep handle.
-    // Returns false if the pool is shut down.
+    // Safe to call before or after dep completes; call at most once per dep
+    // handle - a second then() on the same dep returns false rather than
+    // silently overwriting the first continuation.
+    //
+    // The continuation is counted in _inflight from the moment then() succeeds
+    // so drain() cannot return between dep's completion and the continuation
+    // being enqueued.  This makes drain() honour continuations registered
+    // before or during drain.
+    //
+    // Returns false if the pool is shut down, the queue is saturated, or dep
+    // already has a registered (unfired) continuation.
     bool then(TaskHandle* dep, function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
         if (_workers == nullptr || _stop.stop_requested()) { return false; }
-        bool submit_now = false;
+        // Pre-reserve inflight: the continuation is logically pending from now.
+        _inflight.increment();
+        bool submit_now  = false;
+        bool duplicate   = false;
         _lock.acquire();
         if (dep->done.load() != (i32)0) {
-            // dep already finished - submit the continuation immediately.
+            // dep already finished - we must enqueue the continuation ourselves
+            // (the worker has already passed its _hasCont check).
             submit_now = true;
+        } else if (dep->_hasCont) {
+            duplicate = true;
         } else {
             dep->_contFn       = fn;
             dep->_contCtx      = ctx;
@@ -294,14 +336,53 @@ class ThreadPool {
             dep->_hasCont      = true;
         }
         _lock.release();
-        if (submit_now) { submit(fn, ctx, handle, priority); }
+
+        if (duplicate) {
+            // Roll back the reservation; nothing was enqueued.
+            i64 remaining = _inflight.decrement();
+            if (remaining == (i64)0) {
+                _lock.acquire();
+                WakeAllConditionVariable(&_drainCv);
+                _lock.release();
+            }
+            return false;
+        }
+
+        if (submit_now) {
+            // Build the task here and push directly so we don't double-count
+            // inflight (submit() would increment again).
+            Task t;
+            t.fn     = fn;
+            t.ctx    = ctx;
+            t.handle = handle;
+            if (handle != nullptr) {
+                handle->_cancelSrc.init();
+                handle->_hasCont = false;
+                t._token = handle->_cancelSrc.get_token();
+            }
+            bool pushed = false;
+            if      (priority == THREADPOOL_PRIORITY_HIGH) { pushed = _qHigh.try_push(t); }
+            else if (priority == THREADPOOL_PRIORITY_LOW)  { pushed = _qLow.try_push(t); }
+            else                                            { pushed = _qNormal.try_push(t); }
+            if (!pushed) {
+                i64 remaining = _inflight.decrement();
+                if (remaining == (i64)0) {
+                    _lock.acquire();
+                    WakeAllConditionVariable(&_drainCv);
+                    _lock.release();
+                }
+                return false;
+            }
+            _ready.release();
+        }
         return true;
     }
 
-    // Number of tasks queued but not yet started (excludes tasks currently running).
-    int pendingCount() {
-        // Three independent atomic loads - not snapshot-consistent, but fine
-        // for diagnostics.
+    // Approximate number of tasks queued but not yet started (excludes tasks
+    // currently running).  Three independent atomic loads - not snapshot-
+    // consistent across the queues, so the value can briefly be off by a
+    // handful while submits/pops are racing.  Use for diagnostics only.
+    int approxPendingCount() {
         return _qHigh.count() + _qNormal.count() + _qLow.count();
     }
 
@@ -429,7 +510,9 @@ class ThreadPool {
         }
     }
 
-    // Drain all in-flight tasks, stop all workers, and join them.
+    // Drain all in-flight tasks, stop all workers, and join them.  After
+    // shutdown returns, the pool is back in its uninitialised state and
+    // init() may be called again to restart it.
     void shutdown() {
         drain();
         _stop.request_stop();
@@ -451,6 +534,10 @@ class ThreadPool {
         _capacity     = 0;
         _ready.destroy();
         _stop.dispose();
+        // Release the channel buffers so a subsequent init() starts clean.
+        _qHigh.destroy();
+        _qNormal.destroy();
+        _qLow.destroy();
     }
 
     ~ThreadPool() {
@@ -478,6 +565,11 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     Task cont     = default;
     int  contPrio = THREADPOOL_PRIORITY_NORMAL;
 
+    // Invariant: then() pre-incremented _inflight when it registered the
+    // continuation, so we do NOT increment again here.  We hold the lock only
+    // to read/clear _hasCont and copy the cont fields under the same lock
+    // ordering used by then().  The actual channel push happens outside the
+    // lock, and if it fails we roll back the pre-reserved inflight slot.
     wctx->mtx->acquire();
     if (task.handle != nullptr && task.handle->_hasCont) {
         cont.fn     = task.handle->_contFn;
@@ -490,15 +582,22 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
         contPrio = task.handle->_contPriority;
         task.handle->_hasCont = false;   // consume so we don't fire twice
         fired = true;
-        wctx->inflight->increment();
     }
     wctx->mtx->release();
 
     if (fired) {
-        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->push(cont); }
-        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->push(cont); }
-        else                                            { wctx->qNormal->push(cont); }
-        wctx->ready->release();
+        bool pushed = false;
+        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { pushed = wctx->qHigh->try_push(cont); }
+        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { pushed = wctx->qLow->try_push(cont); }
+        else                                            { pushed = wctx->qNormal->try_push(cont); }
+        if (pushed) {
+            wctx->ready->release();
+        } else {
+            // Queue saturated: roll back the pre-reserved slot so drain() can
+            // make forward progress.  The continuation is silently dropped -
+            // sizing THREADPOOL_QUEUE_CAPACITY appropriately is the user's job.
+            wctx->inflight->decrement();
+        }
     }
 
     i64 remaining = wctx->inflight->decrement();

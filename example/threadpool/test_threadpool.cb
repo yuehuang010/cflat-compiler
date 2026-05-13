@@ -1,0 +1,531 @@
+// Comprehensive test suite for threadpool.cb.  Lives next to threadpool.cb so
+// it exercises the same source file the example links against.  Build/run:
+//
+//   x64/Release/cflat.exe example/threadpool/test_threadpool.cb \
+//       -o out/test_threadpool.exe && out/test_threadpool.exe
+
+import "threadpool.cb";
+import "atomic.cb";
+import "cruntime.cb";
+
+// Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
+int Test(const char* name, bool actual, bool expected) {
+    if (actual == expected) { return 1; }
+    printf("%s MISMATCH (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+int Test(const char* name, int actual, int expected) {
+    if (actual == expected) { return 1; }
+    printf("%s FAILED (expected %d got %d).\n", name, expected, actual);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Task functions and contexts shared across tests
+// ---------------------------------------------------------------------------
+
+int taskSquare(void* ctx, stop_token tok) {
+    int* p = (int*)ctx;
+    *p = (*p) * (*p);
+    return 0;
+}
+
+int taskNoop(void* ctx, stop_token tok) {
+    return 0;
+}
+
+int taskFail(void* ctx, stop_token tok) {
+    return 7;
+}
+
+struct AddCtx {
+    atomic_counter* counter = nullptr;
+};
+
+int taskIncrement(void* raw, stop_token tok) {
+    AddCtx* c = (AddCtx*)raw;
+    c->counter->increment();
+    return 0;
+}
+
+struct CancelCtx {
+    atomic_counter iterations = default;
+    bool           sawCancel  = false;
+};
+
+int taskCancellable(void* raw, stop_token tok) {
+    CancelCtx* c = (CancelCtx*)raw;
+    while (!tok.stop_requested()) {
+        c->iterations.increment();
+        SwitchToThread();
+    }
+    c->sawCancel = true;
+    return 0;
+}
+
+int taskSlow(void* raw, stop_token tok) {
+    int i = 0;
+    int x = 1;
+    while (i < 50000000) { x = x + i; i++; }
+    return 0;
+}
+
+struct IntCtx {
+    int              input = 0;
+    TaskResult<int>* out   = nullptr;
+};
+
+int taskSquareResult(void* raw, stop_token tok) {
+    IntCtx* c = (IntCtx*)raw;
+    c->out->set(c->input * c->input);
+    return 0;
+}
+
+int taskFailResult(void* raw, stop_token tok) {
+    TaskResult<int>* out = (TaskResult<int>*)raw;
+    out->fail();
+    return 1;
+}
+
+int taskDoubleSet(void* raw, stop_token tok) {
+    TaskResult<int>* out = (TaskResult<int>*)raw;
+    out->set(11);
+    out->set(22);   // second set() must be ignored
+    out->fail();    // mixed set/fail also ignored
+    return 0;
+}
+
+struct ChainCtx {
+    int value = 0;
+};
+
+int chainStep(void* raw, stop_token tok) {
+    ChainCtx* c = (ChainCtx*)raw;
+    c->value = c->value + 1;
+    return 0;
+}
+
+struct DrainFromTaskCtx {
+    ThreadPool* pool  = nullptr;
+    int         value = 0;
+};
+
+int drainInnerTask(void* raw, stop_token tok) {
+    int* p = (int*)raw;
+    *p = 42;
+    return 0;
+}
+
+int drainOuterTask(void* raw, stop_token tok) {
+    DrainFromTaskCtx* c = (DrainFromTaskCtx*)raw;
+    c->pool->submit(drainInnerTask, &c->value, nullptr);
+    c->pool->drain();   // would deadlock without work-participation
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+bool testBasicSubmitAndDrain() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(4);
+
+    int[8] inputs;
+    int i = 0;
+    while (i < 8) { inputs[i] = i + 1; i++; }
+
+    TaskHandle[8] handles;
+    i = 0;
+    while (i < 8) {
+        bool accepted = pool.submit(taskSquare, &inputs[i], &handles[i]);
+        result &= Test("submit accepted", accepted, true);
+        i++;
+    }
+    pool.drain();
+
+    i = 0;
+    while (i < 8) {
+        int expected = (i + 1) * (i + 1);
+        result &= Test("squared value", inputs[i], expected);
+        i++;
+    }
+    pool.shutdown();
+    return result;
+}
+
+bool testTaskExitCodeAndFailedFlag() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    TaskHandle hOk;
+    TaskHandle hFail;
+    pool.submit(taskNoop, nullptr, &hOk);
+    pool.submit(taskFail, nullptr, &hFail);
+    pool.drain();
+
+    bool localResult = true;
+    hOk.done.acquire((i32 v) => {
+        localResult &= Test("noop exitCode",    hOk.exitCode,    0);
+        localResult &= Test("noop failed flag", (int)hOk.failed, 0);
+    });
+    hFail.done.acquire((i32 v) => {
+        localResult &= Test("fail exitCode",    hFail.exitCode,   7);
+        localResult &= Test("fail failed flag", (int)hFail.failed, 1);
+    });
+    result &= localResult;
+
+    pool.shutdown();
+    return result;
+}
+
+bool testSubmitDetached() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    atomic_counter counter = default;
+    AddCtx[100] ctxs;
+    int i = 0;
+    while (i < 100) { ctxs[i].counter = &counter; i++; }
+
+    i = 0;
+    while (i < 100) {
+        pool.submitDetached(taskIncrement, &ctxs[i]);
+        i++;
+    }
+    pool.drain();
+
+    result &= Test("detached completion count", (int)counter.read(), 100);
+    pool.shutdown();
+    return result;
+}
+
+bool testTaskResultGet() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    IntCtx[5] ctxs;
+    TaskResult<int>[5] results;
+    int i = 0;
+    while (i < 5) {
+        ctxs[i].input = (i + 1) * 3;
+        ctxs[i].out   = &results[i];
+        pool.submit(taskSquareResult, &ctxs[i], nullptr);
+        i++;
+    }
+    pool.drain();
+
+    i = 0;
+    while (i < 5) {
+        int expected = ((i + 1) * 3) * ((i + 1) * 3);
+        result &= Test("TaskResult.get", results[i].get(), expected);
+        i++;
+    }
+    pool.shutdown();
+    return result;
+}
+
+bool testTaskResultFail() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    TaskResult<int> r;
+    pool.submit(taskFailResult, &r, nullptr);
+    pool.drain();
+    result &= Test("hasFailed after fail()", (int)r.hasFailed(), 1);
+    result &= Test("isReady after fail()",   (int)r.isReady(),   1);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testTaskResultDoubleSet() {
+    // Verifies the CAS-once guard in set()/fail(): only the first call wins,
+    // even if the task misbehaves and calls set() twice or set() then fail().
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);
+
+    TaskResult<int> r;
+    pool.submit(taskDoubleSet, &r, nullptr);
+    pool.drain();
+
+    result &= Test("first set() wins",        r.get(),             11);
+    result &= Test("second set/fail ignored", (int)r.hasFailed(),  0);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testTaskResultIsReadyBeforePublish() {
+    bool result = true;
+    TaskResult<int> r;
+    result &= Test("isReady before publish", (int)r.isReady(), 0);
+    return result;
+}
+
+bool testCancellation() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    CancelCtx ctx;
+    TaskHandle h;
+    pool.submit(taskCancellable, &ctx, &h);
+
+    // Spin a bit so the task actually starts.
+    int spin = 0;
+    while (spin < 1000000) { spin++; }
+
+    h.cancel();
+    h.wait();
+
+    result &= Test("task saw cancel",        (int)ctx.sawCancel, 1);
+    result &= Test("task ran some iterations", (int)(ctx.iterations.read() > (i64)0), 1);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testWaitForTimeoutThenComplete() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);
+
+    TaskHandle h;
+    pool.submit(taskSlow, nullptr, &h);
+
+    bool timedOut  = !h.wait_for(5);       // very short; task still busy
+    bool completed = h.wait_for(30000);    // generous deadline
+
+    result &= Test("wait_for(5ms) timed out",    (int)timedOut,  1);
+    result &= Test("wait_for(30s)  completed",   (int)completed, 1);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testThenChain() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    ChainCtx ctx;
+    TaskHandle h1; TaskHandle h2; TaskHandle h3;
+    pool.submit(chainStep, &ctx, &h1);
+    bool t2 = pool.then(&h1, chainStep, &ctx, &h2);
+    bool t3 = pool.then(&h2, chainStep, &ctx, &h3);
+    result &= Test("then() #1 accepted", (int)t2, 1);
+    result &= Test("then() #2 accepted", (int)t3, 1);
+
+    h3.wait();
+    result &= Test("chain ran 3 steps", ctx.value, 3);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testThenDuplicateRegistration() {
+    // Registering two continuations on the same dep must fail the second call
+    // rather than silently overwriting the first.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);
+
+    ChainCtx ctx;
+    TaskHandle hDep; TaskHandle hA; TaskHandle hB;
+
+    // Block a worker with a slow task so dep stays pending.
+    pool.submit(taskSlow, nullptr, &hDep);
+
+    ChainCtx depCtx;
+    TaskHandle hChainA; TaskHandle hChainB;
+    TaskHandle hUserDep;
+    pool.submit(chainStep, &depCtx, &hUserDep);
+
+    bool first  = pool.then(&hUserDep, chainStep, &depCtx, &hChainA);
+    bool second = pool.then(&hUserDep, chainStep, &depCtx, &hChainB);
+
+    result &= Test("first then() accepted",       (int)first,  1);
+    result &= Test("duplicate then() rejected",   (int)second, 0);
+
+    pool.drain();
+    // hUserDep ran (+1) and the first continuation ran (+1).
+    result &= Test("chain ran exactly twice", depCtx.value, 2);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testDrainFromWithinTask() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);   // 1 worker forces work-participation
+
+    DrainFromTaskCtx ctx;
+    ctx.pool = &pool;
+
+    TaskHandle h;
+    pool.submit(drainOuterTask, &ctx, &h);
+    h.wait();
+
+    result &= Test("inner task ran via worker-participation", ctx.value, 42);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testResizeGrowShrinkGrow() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+    result &= Test("init worker count", pool.workerCount(), 2);
+
+    // Grow.
+    pool.resize(4);
+    result &= Test("grow worker count", pool.workerCount(), 4);
+
+    int[4] v;
+    v[0] = 2; v[1] = 3; v[2] = 4; v[3] = 5;
+    TaskHandle[4] handles;
+    int i = 0;
+    while (i < 4) { pool.submit(taskSquare, &v[i], &handles[i]); i++; }
+    pool.drain();
+    result &= Test("v[0]", v[0], 4);
+    result &= Test("v[1]", v[1], 9);
+    result &= Test("v[2]", v[2], 16);
+    result &= Test("v[3]", v[3], 25);
+
+    // Shrink.
+    pool.resize(1);
+    result &= Test("shrink worker count", pool.workerCount(), 1);
+
+    int[4] w;
+    w[0] = 6; w[1] = 7; w[2] = 8; w[3] = 9;
+    TaskHandle[4] wh;
+    i = 0;
+    while (i < 4) { pool.submit(taskSquare, &w[i], &wh[i]); i++; }
+    pool.drain();
+    result &= Test("w[0]", w[0], 36);
+    result &= Test("w[3]", w[3], 81);
+
+    // Grow again (slot reuse).
+    pool.resize(3);
+    result &= Test("regrow worker count", pool.workerCount(), 3);
+
+    int[4] u;
+    u[0] = 1; u[1] = 2; u[2] = 3; u[3] = 4;
+    TaskHandle[4] uh;
+    i = 0;
+    while (i < 4) { pool.submit(taskSquare, &u[i], &uh[i]); i++; }
+    pool.drain();
+    result &= Test("u[2]", u[2], 9);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testSubmitAfterShutdown() {
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+    pool.shutdown();
+
+    TaskHandle h;
+    bool accepted = pool.submit(taskNoop, nullptr, &h);
+    result &= Test("submit after shutdown rejected", (int)accepted, 0);
+    return result;
+}
+
+bool testInitAfterShutdown() {
+    // After shutdown() the channel buffers are released, so a second init()
+    // must succeed and the pool must run tasks again.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+    pool.shutdown();
+
+    pool.init(2);
+    int x = 6;
+    TaskHandle h;
+    pool.submit(taskSquare, &x, &h);
+    pool.drain();
+    result &= Test("squared after re-init", x, 36);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testApproxPendingCount() {
+    // pendingCount only counts queued, not running tasks.  After drain it
+    // must be zero.  We don't assert a specific positive value because the
+    // workers may pop faster than we submit.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);
+
+    int[10] vs;
+    TaskHandle[10] hs;
+    int i = 0;
+    while (i < 10) { vs[i] = i + 1; pool.submit(taskSquare, &vs[i], &hs[i]); i++; }
+    pool.drain();
+
+    result &= Test("pending after drain", pool.approxPendingCount(), 0);
+    pool.shutdown();
+    return result;
+}
+
+bool testManyTasksStress() {
+    // Throw a large batch at the pool to exercise the channel under contention.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(4);
+
+    int N = 2000;
+    atomic_counter counter = default;
+    AddCtx ctx;
+    ctx.counter = &counter;
+
+    int i = 0;
+    while (i < N) {
+        pool.submitDetached(taskIncrement, &ctx);
+        i++;
+    }
+    pool.drain();
+
+    result &= Test("stress completion count", (int)counter.read(), N);
+    pool.shutdown();
+    return result;
+}
+
+extern int main() {
+    int total  = 0;
+    int passed = 0;
+
+    total++; passed += testBasicSubmitAndDrain()         ? 1 : 0;
+    total++; passed += testTaskExitCodeAndFailedFlag()   ? 1 : 0;
+    total++; passed += testSubmitDetached()              ? 1 : 0;
+    total++; passed += testTaskResultGet()               ? 1 : 0;
+    total++; passed += testTaskResultFail()              ? 1 : 0;
+    total++; passed += testTaskResultDoubleSet()         ? 1 : 0;
+    total++; passed += testTaskResultIsReadyBeforePublish() ? 1 : 0;
+    total++; passed += testCancellation()                ? 1 : 0;
+    total++; passed += testWaitForTimeoutThenComplete()  ? 1 : 0;
+    total++; passed += testThenChain()                   ? 1 : 0;
+    total++; passed += testThenDuplicateRegistration()   ? 1 : 0;
+    total++; passed += testDrainFromWithinTask()         ? 1 : 0;
+    total++; passed += testResizeGrowShrinkGrow()        ? 1 : 0;
+    total++; passed += testSubmitAfterShutdown()         ? 1 : 0;
+    total++; passed += testInitAfterShutdown()           ? 1 : 0;
+    total++; passed += testApproxPendingCount()          ? 1 : 0;
+    total++; passed += testManyTasksStress()             ? 1 : 0;
+
+    printf("ThreadPool tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
