@@ -19,6 +19,7 @@
 #include <thread>
 #include <unordered_map>
 #include <atomic>
+#include <deque>
 #include <windows.h>
 #include <nlohmann/json.hpp>
 
@@ -211,11 +212,40 @@ public:
         , runtimeDir_(runtimeDir)
         , importSearchDir_(importDir)
         , verbose_(verbose)
-        , compiler_(std::make_unique<LLVMBackend>())
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
-        compiler_->SetRuntimeDir(runtimeDir_);
-        compiler_->SetVerbose(verbose_);
+        // Backend pool sized to hardware_concurrency. Each backend owns its own
+        // LLVMContext/Module so multiple analyses can run in parallel.
+        unsigned int hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        poolSize_ = hw;
+        // CFLAT_LSP_POOL_SIZE overrides for diagnostics/testing.
+        size_t envLen = 0;
+        char envBuf[16] = {};
+        if (getenv_s(&envLen, envBuf, sizeof(envBuf), "CFLAT_LSP_POOL_SIZE") == 0 && envLen > 0)
+        {
+            int v = std::atoi(envBuf);
+            if (v > 0) poolSize_ = (unsigned int)v;
+        }
+        backendPool_.reserve(poolSize_);
+        backendInUse_.resize(poolSize_, false);
+        backendAnalyzed_.resize(poolSize_, false);
+        for (unsigned int i = 0; i < poolSize_; ++i)
+        {
+            auto b = std::make_unique<LLVMBackend>();
+            b->SetRuntimeDir(runtimeDir_);
+            b->SetVerbose(verbose_);
+            backendPool_.push_back(std::move(b));
+            freeBackends_.push_back(i);
+        }
+
+        // Worker pool — one thread per backend slot.
+        workers_.reserve(poolSize_);
+        for (unsigned int i = 0; i < poolSize_; ++i)
+            workers_.emplace_back([this] { WorkerLoop(); });
+
+        if (verbose_)
+            std::cerr << "[lsp] backend pool size: " << poolSize_ << "\n";
     }
 
     ~LspServer()
@@ -227,6 +257,14 @@ public:
         }
         if (debounceThread_.joinable())
             debounceThread_.join();
+
+        {
+            std::lock_guard<std::mutex> lock(jobMutex_);
+            stopWorkers_ = true;
+            jobCV_.notify_all();
+        }
+        for (auto& t : workers_)
+            if (t.joinable()) t.join();
     }
 
     void Run()
@@ -613,27 +651,44 @@ private:
                 text = it->second.text;
         }
         if (!filePath.empty())
-            RunAnalysis(uri, filePath, text);
+            EnqueueAnalysis(uri, filePath, text);
     }
 
     // -----------------------------------------------------------------------
-    // Debounced analysis scheduling
+    // Job dispatch — every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
+
+    struct AnalysisJob
+    {
+        std::string uri;
+        std::string filePath;
+        std::string text;
+        uint64_t    generation = 0;
+    };
+
+    void EnqueueAnalysis(const std::string& uri, const std::string& filePath, const std::string& text)
+    {
+        AnalysisJob job;
+        job.uri      = uri;
+        job.filePath = filePath;
+        job.text     = text;
+        {
+            std::lock_guard<std::mutex> lock(uriGenMutex_);
+            job.generation = ++uriGeneration_[uri];
+        }
+        {
+            std::lock_guard<std::mutex> lock(jobMutex_);
+            jobQueue_.push_back(std::move(job));
+        }
+        jobCV_.notify_one();
+    }
 
     void ScheduleAnalysis(const std::string& uri, const std::string& filePath,
                           const std::string& text, bool immediate)
     {
         if (immediate)
         {
-            {
-                std::unique_lock<std::mutex> lock(debounceMutex_);
-                pendingUri_      = uri;
-                pendingFilePath_ = filePath;
-                pendingText_     = text;
-                debounceGeneration_++;
-                debounceCV_.notify_all();
-            }
-            RunAnalysis(uri, filePath, text);
+            EnqueueAnalysis(uri, filePath, text);
             return;
         }
 
@@ -652,41 +707,99 @@ private:
 
     void DebounceWorker()
     {
+        uint64_t lastFiredGen = 0;
         while (true)
         {
             uint64_t gen;
             std::string uri, filePath, text;
             {
                 std::unique_lock<std::mutex> lock(debounceMutex_);
+                // Wait until there's something new to debounce, or shutdown.
+                debounceCV_.wait(lock, [&] {
+                    return stopDebounce_ || debounceGeneration_ != lastFiredGen;
+                });
+                if (stopDebounce_) return;
                 gen      = debounceGeneration_;
                 uri      = pendingUri_;
                 filePath = pendingFilePath_;
                 text     = pendingText_;
             }
 
+            // Wait the quiet period; if a new change arrives, restart the wait.
             {
                 std::unique_lock<std::mutex> lock(debounceMutex_);
                 debounceCV_.wait_for(lock, std::chrono::milliseconds(250),
                     [this, gen] { return stopDebounce_ || debounceGeneration_ != gen; });
-
                 if (stopDebounce_) return;
-                if (debounceGeneration_ != gen) continue;
+                if (debounceGeneration_ != gen) continue;  // newer change, redo
             }
 
-            RunAnalysis(uri, filePath, text);
+            lastFiredGen = gen;
+            EnqueueAnalysis(uri, filePath, text);
         }
     }
 
     // -----------------------------------------------------------------------
-    // Core analysis
+    // Worker pool — each thread owns one backend slot.
     // -----------------------------------------------------------------------
 
-    void RunAnalysis(const std::string& uri, const std::string& filePath, const std::string& text)
+    void WorkerLoop()
     {
+        while (true)
+        {
+            AnalysisJob job;
+            {
+                std::unique_lock<std::mutex> lock(jobMutex_);
+                jobCV_.wait(lock, [&] { return stopWorkers_ || !jobQueue_.empty(); });
+                if (stopWorkers_) return;
+                job = std::move(jobQueue_.front());
+                jobQueue_.pop_front();
+            }
+
+            // Drop superseded jobs — a newer revision of this URI has been enqueued.
+            {
+                std::lock_guard<std::mutex> lock(uriGenMutex_);
+                auto it = uriGeneration_.find(job.uri);
+                if (it != uriGeneration_.end() && it->second != job.generation)
+                    continue;
+            }
+
+            // Reserve a backend slot.
+            size_t slot;
+            {
+                std::unique_lock<std::mutex> lock(backendMutex_);
+                backendCV_.wait(lock, [&] { return !freeBackends_.empty(); });
+                slot = freeBackends_.back();
+                freeBackends_.pop_back();
+                backendInUse_[slot] = true;
+            }
+
+            RunAnalysisOnSlot(slot, job);
+
+            {
+                std::lock_guard<std::mutex> lock(backendMutex_);
+                backendInUse_[slot] = false;
+                freeBackends_.push_back(slot);
+            }
+            backendCV_.notify_one();
+        }
+    }
+
+    void RunAnalysisOnSlot(size_t slot, const AnalysisJob& job)
+    {
+        const std::string& uri      = job.uri;
+        const std::string& filePath = job.filePath;
+        const std::string& text     = job.text;
+
         char tempDirBuf[MAX_PATH] = {};
         GetTempPathA(MAX_PATH, tempDirBuf);
-        std::string tempPath = std::string(tempDirBuf) +
-            std::format("cflat_lsp_{}_{}.cb", GetCurrentProcessId(), tempFileCounter_++);
+        std::string tempPath;
+        {
+            int counter;
+            { std::lock_guard<std::mutex> lock(tempCounterMutex_); counter = tempFileCounter_++; }
+            tempPath = std::string(tempDirBuf) +
+                std::format("cflat_lsp_{}_{}_{}.cb", GetCurrentProcessId(), (int)slot, counter);
+        }
 
         {
             std::ofstream tmp(tempPath, std::ios::binary);
@@ -697,70 +810,62 @@ private:
         std::vector<lsp::Diagnostic> diagnostics;
         auto newIndex = std::make_shared<LspSymbolIndex>();
 
+        LLVMBackend* backend = backendPool_[slot].get();
+
+        // Each backend slot is sticky across runs — reset before re-use.
+        if (backendAnalyzed_[slot])
+            backend->ResetForReanalysis();
+        backendAnalyzed_[slot] = true;
+
+        if (!filePath.empty())
+            backend->SetSourceFileDir(std::filesystem::path(filePath).parent_path().string());
+
+        backend->SetDiagnosticSink([&](const std::string& /*file*/, size_t line, size_t col, const std::string& msg)
         {
-            std::lock_guard<std::mutex> lock(analysisMutex_);
+            lsp::Diagnostic diag;
+            diag.range   = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
+            diag.message = msg;
+            diagnostics.push_back(diag);
+        });
+        backend->SetSymbolSink(newIndex.get());
 
-            if (analysisCount_ > 0)
-                compiler_->ResetForReanalysis();
-            analysisCount_++;
+        bool ok = false;
+        llvm::CrashRecoveryContext crc;
+        bool recovered = crc.RunSafely([&]
+        {
+            ok = backend->Analyze(tempPath, importSearchDir_, runtimeDir_);
+        });
 
-            // Let the compiler resolve relative imports from the real source directory,
-            // not the %TEMP% directory where the temp analysis file lives.
-            if (!filePath.empty())
-                compiler_->SetSourceFileDir(
-                    std::filesystem::path(filePath).parent_path().string());
+        if (!recovered)
+        {
+            if (verbose_) std::cerr << "[lsp] compiler crash on slot " << slot << ", replacing backend\n";
+            auto fresh = std::make_unique<LLVMBackend>();
+            fresh->SetRuntimeDir(runtimeDir_);
+            fresh->SetVerbose(verbose_);
+            backendPool_[slot] = std::move(fresh);
+            backendAnalyzed_[slot] = false;
 
-            compiler_->SetDiagnosticSink([&](const std::string& file, size_t line, size_t col, const std::string& msg)
-            {
-                lsp::Diagnostic diag;
-                diag.range   = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
-                diag.message = msg;
-                diagnostics.push_back(diag);
-            });
-
-            compiler_->SetSymbolSink(newIndex.get());
-
-            bool ok = false;
-            llvm::CrashRecoveryContext crc;
-            bool recovered = crc.RunSafely([&]
-            {
-                ok = compiler_->Analyze(tempPath, importSearchDir_, runtimeDir_);
-            });
-
-            if (!recovered)
-            {
-                if (verbose_) std::cerr << "[lsp] compiler crash during analysis, resetting\n";
-                compiler_ = std::make_unique<LLVMBackend>();
-                compiler_->SetRuntimeDir(runtimeDir_);
-                compiler_->SetVerbose(verbose_);
-                analysisCount_ = 0;
-
-                lsp::Diagnostic crashDiag;
-                crashDiag.range   = { {0, 0}, {0, 1} };
-                crashDiag.message = "Internal compiler error during analysis";
-                diagnostics.push_back(crashDiag);
-            }
-
-            compiler_->SetDiagnosticSink(nullptr);
-            compiler_->SetSymbolSink(nullptr);
+            lsp::Diagnostic crashDiag;
+            crashDiag.range   = { {0, 0}, {0, 1} };
+            crashDiag.message = "Internal compiler error during analysis";
+            diagnostics.push_back(crashDiag);
+        }
+        else
+        {
+            backend->SetDiagnosticSink(nullptr);
+            backend->SetSymbolSink(nullptr);
         }
 
         std::filesystem::remove(tempPath);
 
-        // Symbols were registered under the temp path; remap to the real source path
-        // so that GoToDefinition jumps to the actual file, not the temp file.
-        // The compiler stores only the filename component in def.file (e.g. "cflat_lsp_42.cb"),
-        // not the full temp path, so we remap both forms.
         if (!filePath.empty())
         {
             newIndex->RemapFile(tempPath, filePath);
             newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
         }
 
-        // Last-known-good cache: if this analysis hit errors AND yielded fewer symbols
-        // than the cached index, keep serving the cached one. A partially-typed identifier
-        // typically aborts parsing and strips most of the file's symbols, which would
-        // otherwise black out hover/completion/go-to-definition until the user finishes typing.
+        // Last-known-good cache — kept global for now. Edits land sequentially in
+        // practice (debounce + single editor); bulk sweeps don't use this index.
         {
             std::lock_guard<std::mutex> lock(indexMutex_);
             bool hasErrors    = !diagnostics.empty();
@@ -823,10 +928,30 @@ private:
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
 
-    std::mutex analysisMutex_;
-    std::unique_ptr<LLVMBackend> compiler_;
-    int analysisCount_    = 0;
-    int tempFileCounter_  = 0;
+    // Backend pool — one LLVMBackend per slot. Workers check out a free slot,
+    // run analysis, and return it. backendAnalyzed_[slot] tracks whether
+    // ResetForReanalysis is needed before the next run on that slot.
+    unsigned int poolSize_ = 1;
+    std::vector<std::unique_ptr<LLVMBackend>> backendPool_;
+    std::vector<bool> backendInUse_;
+    std::vector<bool> backendAnalyzed_;  // sized on first use in WorkerLoop via lazy resize
+    std::vector<size_t> freeBackends_;
+    std::mutex backendMutex_;
+    std::condition_variable backendCV_;
+
+    std::mutex tempCounterMutex_;
+    int tempFileCounter_ = 0;
+
+    // Job queue — every analysis (immediate or debounced) lands here.
+    std::deque<AnalysisJob> jobQueue_;
+    std::mutex jobMutex_;
+    std::condition_variable jobCV_;
+    bool stopWorkers_ = false;
+    std::vector<std::thread> workers_;
+
+    // Per-URI generation counter — older jobs for the same URI are dropped.
+    std::mutex uriGenMutex_;
+    std::unordered_map<std::string, uint64_t> uriGeneration_;
 
     std::mutex indexMutex_;
     std::shared_ptr<LspSymbolIndex> currentIndex_;

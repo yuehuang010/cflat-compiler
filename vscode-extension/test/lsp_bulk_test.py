@@ -15,7 +15,9 @@ Exit code: 0 = every file clean, 1 = at least one file produced an error
 diagnostic (or the server died / timed out).
 """
 
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -27,7 +29,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent
 ERROR_SEVERITY = 1
 
 # Per-file diagnostics timeout (seconds). Some files (heavy generics) are slow.
-DIAG_TIMEOUT = 60.0
+DIAG_TIMEOUT = 300.0
 
 
 def collect_files() -> list[Path]:
@@ -44,49 +46,76 @@ def collect_files() -> list[Path]:
 def run_bulk(exe: str, extra_args: list) -> bool:
     paths = collect_files()
     print(f"Server: {exe}")
-    print(f"Files:  {len(paths)}\n")
+    print(f"Files:  {len(paths)}")
+
+    # Pipeline depth — open this many files concurrently, then wait for diagnostics.
+    # The server pool runs analyses in parallel up to its hardware_concurrency limit,
+    # so a depth a bit larger than the pool keeps the pipeline full.
+    pipeline = max(8, (os.cpu_count() or 4))
+    print(f"Pipeline depth: {pipeline}\n")
 
     client = LspClient(exe, extra_args)
+    started_at = time.monotonic()
     try:
         initialize(client)
 
         passed = 0
         failed = 0
         failures: list[tuple[Path, str]] = []
+        total = len(paths)
 
-        for i, path in enumerate(paths, 1):
-            uri = path.resolve().as_uri()
-            try:
-                text = path.read_text(encoding="utf-8")
-            except Exception as e:
-                print(f"  FAIL  [{i:>3}/{len(paths)}] {path.relative_to(REPO_ROOT)}  (read error: {e})")
-                failed += 1
-                failures.append((path, f"read error: {e}"))
-                continue
+        # uri -> (index, path)
+        in_flight: dict[str, tuple[int, Path]] = {}
+        next_idx = 0
 
-            client.notify("textDocument/didOpen", {
-                "textDocument": {
-                    "uri":        uri,
-                    "languageId": "cflat",
-                    "version":    1,
-                    "text":       text,
-                }
-            })
+        def submit_one() -> bool:
+            nonlocal next_idx
+            while next_idx < total:
+                i = next_idx
+                next_idx += 1
+                path = paths[i]
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except Exception as e:
+                    print(f"  FAIL  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}  (read error: {e})")
+                    nonlocal_failed_inc(e, path)
+                    continue
+                uri = path.resolve().as_uri()
+                in_flight[uri] = (i, path)
+                client.notify("textDocument/didOpen", {
+                    "textDocument": {
+                        "uri":        uri,
+                        "languageId": "cflat",
+                        "version":    1,
+                        "text":       text,
+                    }
+                })
+                return True
+            return False
 
-            try:
-                diags = wait_diagnostics_for(client, uri, timeout=DIAG_TIMEOUT)
-            except (TimeoutError, RuntimeError) as e:
-                print(f"  FAIL  [{i:>3}/{len(paths)}] {path.relative_to(REPO_ROOT)}  ({e})")
-                failed += 1
-                failures.append((path, str(e)))
-                # If the server died we can't continue meaningfully.
-                if isinstance(e, RuntimeError):
-                    break
-                continue
+        # Helper that mutates outer counters; declared as a closure to avoid passing
+        # everything around. Python's nonlocal doesn't reach across this lambda-style
+        # helper, so use list-cells.
+        _counters = {"failed": 0}
+        def nonlocal_failed_inc(e, path):
+            _counters["failed"] += 1
+            failures.append((path, f"read error: {e}"))
 
+        # Prime the pipeline.
+        for _ in range(pipeline):
+            if not submit_one(): break
+
+        # Drain.
+        while in_flight:
+            notif = client.wait_notification("textDocument/publishDiagnostics", timeout=DIAG_TIMEOUT)
+            uri = notif["params"]["uri"]
+            if uri not in in_flight:
+                continue  # stale or unrelated publish
+            i, path = in_flight.pop(uri)
+            diags = notif["params"]["diagnostics"]
             errors = [d for d in diags if d.get("severity", 1) == ERROR_SEVERITY]
             if errors:
-                print(f"  FAIL  [{i:>3}/{len(paths)}] {path.relative_to(REPO_ROOT)}  ({len(errors)} error diagnostic(s))")
+                print(f"  FAIL  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}  ({len(errors)} error diagnostic(s))")
                 failed += 1
                 summary = " | ".join(
                     f"L{d.get('range', {}).get('start', {}).get('line', '?')+1}: {d.get('message','')}"
@@ -94,14 +123,15 @@ def run_bulk(exe: str, extra_args: list) -> bool:
                 )
                 failures.append((path, summary))
             else:
-                print(f"  PASS  [{i:>3}/{len(paths)}] {path.relative_to(REPO_ROOT)}")
+                print(f"  PASS  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}")
                 passed += 1
+            client.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+            # Refill the pipeline.
+            submit_one()
 
-            client.notify("textDocument/didClose", {
-                "textDocument": {"uri": uri}
-            })
-
-        print(f"\n{passed} passed, {failed} failed")
+        failed += _counters["failed"]
+        elapsed = time.monotonic() - started_at
+        print(f"\n{passed} passed, {failed} failed in {elapsed:.1f}s")
         if failures:
             print("\n--- failures ---")
             for p, msg in failures:

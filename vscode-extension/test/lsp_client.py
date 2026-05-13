@@ -26,8 +26,23 @@ class LspClient:
         self._cond = threading.Condition()
         self._inbox: collections.deque = collections.deque()
         self._dead = False
+        self._stderr_buf: list[bytes] = []
         t = threading.Thread(target=self._reader_loop, daemon=True)
         t.start()
+        # Drain stderr concurrently so the server doesn't block on a full pipe buffer
+        # when many workers write diagnostics at once.
+        e = threading.Thread(target=self._stderr_drain, daemon=True)
+        e.start()
+
+    def _stderr_drain(self):
+        try:
+            while True:
+                chunk = self._proc.stderr.read(4096)
+                if not chunk:
+                    return
+                self._stderr_buf.append(chunk)
+        except Exception:
+            pass
 
     # --- internal reader thread ---
 
@@ -114,14 +129,14 @@ class LspClient:
         except Exception:
             pass
         try:
-            stderr = self._proc.stderr.read().decode("utf-8", errors="replace")
-        except Exception:
-            stderr = ""
-        try:
             self._proc.wait(timeout=5)
         except Exception:
             self._proc.kill()
-        return stderr
+        # Drain thread is daemon — give it a moment to finish.
+        try:
+            return b"".join(self._stderr_buf).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
 
 def find_exe() -> str | None:

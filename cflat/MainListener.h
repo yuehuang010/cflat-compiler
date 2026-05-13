@@ -1023,24 +1023,26 @@ private:
     // pushed/popped around lock statement bodies.
     std::unordered_set<std::string> currentLockSet;
 
-    // Generic template state is shared across all MainListener instances so that
-    // templates declared in an imported file remain visible when the importing
-    // file needs to instantiate them.
-    static inline std::unordered_map<std::string, CFlatParser::StructDefinitionContext*> genericStructTemplates;
-    static inline std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*> genericClassTemplates;
-    static inline std::unordered_map<std::string, std::vector<std::string>> genericStructTypeParams;
-    static inline std::unordered_set<std::string> instantiatedGenerics;
+    // Generic template state lives on the backend so each LLVMBackend instance
+    // owns its own copy. References below alias compilerLLVM->gts.<field> and are
+    // bound in the constructor's member initializer list.
+    using PendingInstantiation = GenericTemplateState::PendingInstantiation;
+
+    std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>&     genericStructTemplates;
+    std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>&      genericClassTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericStructTypeParams;
+    std::unordered_set<std::string>&                                            instantiatedGenerics;
     // Constraints: templateName -> { typeParamName -> [requiredInterface, …] }
-    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
-    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericStructConstraints;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
 
     // Pack param index per template: index of the variadic param, or npos if not variadic
-    static inline std::unordered_map<std::string, size_t> genericStructPackIndex;
-    static inline std::unordered_map<std::string, size_t> genericClassPackIndex;
-    static inline std::unordered_map<std::string, size_t> genericFunctionPackIndex;
-    static inline std::unordered_map<std::string, size_t> genericInterfacePackIndex;
+    std::unordered_map<std::string, size_t>& genericStructPackIndex;
+    std::unordered_map<std::string, size_t>& genericClassPackIndex;
+    std::unordered_map<std::string, size_t>& genericFunctionPackIndex;
+    std::unordered_map<std::string, size_t>& genericInterfacePackIndex;
 
     // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
     std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
@@ -1049,23 +1051,17 @@ private:
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
 
-    static inline std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*> genericInterfaceTemplates;
-    static inline std::unordered_map<std::string, std::vector<std::string>> genericInterfaceTypeParams;
-    static inline std::unordered_set<std::string> instantiatedInterfaces;
+    std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>&  genericInterfaceTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericInterfaceTypeParams;
+    std::unordered_set<std::string>&                                            instantiatedInterfaces;
 
-    static inline std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*> genericFunctionTemplates;
-    static inline std::unordered_map<std::string, std::vector<std::string>> genericFunctionTypeParams;
-    static inline std::unordered_set<std::string> instantiatedGenericFunctions;
-    static inline std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
+    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>&   genericFunctionTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericFunctionTypeParams;
+    std::unordered_set<std::string>&                                            instantiatedGenericFunctions;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericFunctionConstraints;
 
     // Queue for pending generic instantiations (delayed until safe to emit code)
-    struct PendingInstantiation
-    {
-        std::string templateName;
-        std::vector<std::string> typeArgs;
-        std::string mangledName;
-    };
-    static inline std::vector<PendingInstantiation> pendingInstantiations;
+    std::vector<PendingInstantiation>& pendingInstantiations;
 
     constexpr static bool debugPrint = false;
 
@@ -1414,6 +1410,24 @@ private:
 
 public:
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename)
+        : genericStructTemplates(compilerLLVM->gts.genericStructTemplates)
+        , genericClassTemplates(compilerLLVM->gts.genericClassTemplates)
+        , genericStructTypeParams(compilerLLVM->gts.genericStructTypeParams)
+        , instantiatedGenerics(compilerLLVM->gts.instantiatedGenerics)
+        , genericStructConstraints(compilerLLVM->gts.genericStructConstraints)
+        , genericClassConstraints(compilerLLVM->gts.genericClassConstraints)
+        , genericStructPackIndex(compilerLLVM->gts.genericStructPackIndex)
+        , genericClassPackIndex(compilerLLVM->gts.genericClassPackIndex)
+        , genericFunctionPackIndex(compilerLLVM->gts.genericFunctionPackIndex)
+        , genericInterfacePackIndex(compilerLLVM->gts.genericInterfacePackIndex)
+        , genericInterfaceTemplates(compilerLLVM->gts.genericInterfaceTemplates)
+        , genericInterfaceTypeParams(compilerLLVM->gts.genericInterfaceTypeParams)
+        , instantiatedInterfaces(compilerLLVM->gts.instantiatedInterfaces)
+        , genericFunctionTemplates(compilerLLVM->gts.genericFunctionTemplates)
+        , genericFunctionTypeParams(compilerLLVM->gts.genericFunctionTypeParams)
+        , instantiatedGenericFunctions(compilerLLVM->gts.instantiatedGenericFunctions)
+        , genericFunctionConstraints(compilerLLVM->gts.genericFunctionConstraints)
+        , pendingInstantiations(compilerLLVM->gts.pendingInstantiations)
     {
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
@@ -1421,24 +1435,6 @@ public:
     }
 
     void SetImportNamespace(const std::string& ns) { importNamespace_ = ns; }
-
-    static void ClearGenericCaches()
-    {
-        genericStructTemplates.clear();
-        genericClassTemplates.clear();
-        genericStructTypeParams.clear();
-        instantiatedGenerics.clear();
-        genericStructConstraints.clear();
-        genericClassConstraints.clear();
-        genericInterfaceTemplates.clear();
-        genericInterfaceTypeParams.clear();
-        instantiatedInterfaces.clear();
-        genericFunctionTemplates.clear();
-        genericFunctionTypeParams.clear();
-        genericFunctionConstraints.clear();
-        instantiatedGenericFunctions.clear();
-        pendingInstantiations.clear();
-    }
 
     void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
     {

@@ -58,6 +58,57 @@
 
 struct ExpectedErrorReceived {};
 
+// Per-backend generic template state. Holds the ANTLR contexts and metadata for
+// all generic struct/class/interface/function templates seen during one analysis,
+// plus the queue of pending instantiations. Lives on LLVMBackend so multiple
+// backends can run in parallel without stomping on each other.
+struct GenericTemplateState
+{
+    struct PendingInstantiation
+    {
+        std::string templateName;
+        std::vector<std::string> typeArgs;
+        std::string mangledName;
+    };
+
+    std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>      genericStructTemplates;
+    std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>       genericClassTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericStructTypeParams;
+    std::unordered_set<std::string>                                             instantiatedGenerics;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
+    std::unordered_map<std::string, size_t>                                     genericStructPackIndex;
+    std::unordered_map<std::string, size_t>                                     genericClassPackIndex;
+    std::unordered_map<std::string, size_t>                                     genericFunctionPackIndex;
+    std::unordered_map<std::string, size_t>                                     genericInterfacePackIndex;
+    std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>   genericInterfaceTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceTypeParams;
+    std::unordered_set<std::string>                                             instantiatedInterfaces;
+    std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
+    std::unordered_set<std::string>                                             instantiatedGenericFunctions;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
+    std::vector<PendingInstantiation>                                           pendingInstantiations;
+
+    void Clear()
+    {
+        genericStructTemplates.clear();
+        genericClassTemplates.clear();
+        genericStructTypeParams.clear();
+        instantiatedGenerics.clear();
+        genericStructConstraints.clear();
+        genericClassConstraints.clear();
+        genericInterfaceTemplates.clear();
+        genericInterfaceTypeParams.clear();
+        instantiatedInterfaces.clear();
+        genericFunctionTemplates.clear();
+        genericFunctionTypeParams.clear();
+        genericFunctionConstraints.clear();
+        instantiatedGenericFunctions.clear();
+        pendingInstantiations.clear();
+    }
+};
+
 struct CompilerAbortException {
     std::string message;
     std::string file;
@@ -511,6 +562,9 @@ public:
     std::string importSearchDir;
     std::string runtimeDir;
     std::string sourceFileDir_;  // original source dir for LSP temp-file analysis
+
+    // Per-backend generic-template state, shared with MainListener via references.
+    GenericTemplateState gts;
 private:
     // When true, disables auto-import of core/runtime.cb
     bool skipRuntimeImport = false;
@@ -5530,6 +5584,7 @@ public:
 // Defined here so LLVMBackend is fully declared before DumpState() is called.
 inline void CompilerManager::DumpAllState() const
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (compilers_.empty())
     {
         std::cerr << "  (no compiler instances registered)\n";

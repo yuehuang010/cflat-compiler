@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <mutex>
 #include <iostream>
 #include <csignal>
 #include <crtdbg.h>
@@ -22,11 +23,13 @@ public:
 
     void Register(LLVMBackend* compiler)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         compilers_.push_back(compiler);
     }
 
     void Unregister(LLVMBackend* compiler)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = std::find(compilers_.begin(), compilers_.end(), compiler);
         if (it != compilers_.end())
             compilers_.erase(it);
@@ -54,6 +57,7 @@ private:
     CompilerManager() = default;
 
     std::vector<LLVMBackend*> compilers_;
+    mutable std::mutex mutex_;
 
     static void AbortHandler(int)
     {

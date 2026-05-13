@@ -620,7 +620,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                               const std::string& importDir,
                               const std::string& runtimeDirPath)
 {
-    MainListener::ClearGenericCaches();
+    gts.Clear();
 
     sourceFileName = std::filesystem::path(filePath).filename().string();
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
@@ -797,6 +797,10 @@ void LLVMBackend::ResetForReanalysis()
     importedFiles.clear();
     importStack.clear();
     importedParseStates.clear();
+
+    // Generic-template state must also be cleared so prior-analysis ANTLR contexts
+    // (which point into a discarded parse tree) don't survive into the next run.
+    gts.Clear();
 
     // Re-register the built-in string type that was wiped by the clears above.
     // string.cb references 'string' as a return type before the struct is parsed,
