@@ -15,6 +15,23 @@
 //   bool ok = ch.try_pop(&out);
 //   ch.destroy();
 //
+// Pairing with external wakeup signals
+// -------------------------------------
+// try_pop can transiently return false when a producer has CAS-claimed _head
+// but has not yet stored its seq value - this is intrinsic to the Vyukov
+// algorithm.  Callers that pair try_pop with a counting semaphore (one
+// release() per push, one acquire() per consumer wake-up) MUST handle this
+// case by re-releasing the wakeup token so another consumer can retry:
+//
+//   sem.acquire();
+//   if (!ch.try_pop(&v)) {
+//       sem.release();          // forward the wake-up; another worker will pop
+//       continue;
+//   }
+//
+// This is the standard pattern for "transient-empty tolerant" consumption.
+// Without it, slow publishes can leak wake-up tokens and stall consumers.
+//
 // Algorithm (Dmitry Vyukov, 2010):
 //   Each slot carries a sequence number alongside the stored value.
 //   _head and _tail are monotonically increasing i64 cursors advanced via CAS.

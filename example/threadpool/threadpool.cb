@@ -3,8 +3,13 @@ import "semaphore.cb";
 import "stop_token.cb";
 import "atomic.cb";
 import "mutex.cb";
-import "queue.cb";
+import "channel.cb";
 import "time.cb";
+
+// Capacity (per priority) of the lock-free task channel.  Must be a power of
+// two large enough that bursts of submit() rarely exceed it; producers block
+// on push() if a channel is momentarily full.
+int THREADPOOL_QUEUE_CAPACITY = 65536;
 
 // Priority values for submit() / submitDetached().
 // Prefer the named constants over raw integers in call sites.
@@ -161,9 +166,9 @@ struct WorkerCtx {
     mutex*          mtx             = nullptr;
     void*           drainCv         = nullptr;  // &ThreadPool._drainCv (CONDITION_VARIABLE)
     semaphore*      ready           = nullptr;
-    queue<Task>*    qHigh           = nullptr;
-    queue<Task>*    qNormal         = nullptr;
-    queue<Task>*    qLow            = nullptr;
+    channel<Task>*  qHigh           = nullptr;
+    channel<Task>*  qNormal         = nullptr;
+    channel<Task>*  qLow            = nullptr;
     stop_source*    stop            = nullptr;
     atomic_counter* inflight        = nullptr;
     u32*            workerIds       = nullptr;  // per-worker thread-ID slots
@@ -191,9 +196,9 @@ class ThreadPool {
     mutex          _lock             = default;
     void*          _drainCv          = nullptr;  // Win32 CONDITION_VARIABLE (pointer-sized)
     semaphore      _ready            = default;
-    queue<Task>    _qHigh            = default;
-    queue<Task>    _qNormal          = default;
-    queue<Task>    _qLow             = default;
+    channel<Task>  _qHigh            = default;
+    channel<Task>  _qNormal          = default;
+    channel<Task>  _qLow             = default;
     stop_source    _stop             = default;
     atomic_counter _inflight         = default;
     atomic_counter _drainingWorkers  = default;
@@ -208,7 +213,13 @@ class ThreadPool {
     void init(int workerCount) {
         if (_count > 0) { return; }
         _stop.init();
-        _ready.init(0, 1000000);
+        // Semaphore max is the largest LONG (2^31 - 1); ReleaseSemaphore
+        // silently drops a token if count would exceed max, which would stall
+        // a worker.  Use the largest accepted value so saturation can't bite.
+        _ready.init(0, 2147483647);
+        _qHigh.init(THREADPOOL_QUEUE_CAPACITY);
+        _qNormal.init(THREADPOOL_QUEUE_CAPACITY);
+        _qLow.init(THREADPOOL_QUEUE_CAPACITY);
         InitializeConditionVariable(&_drainCv);
         _workerIds   = new u32[workerCount];
         _workerStops = new stop_source[workerCount];
@@ -253,11 +264,9 @@ class ThreadPool {
             t._token = handle->_cancelSrc.get_token();
         }
         _inflight.increment();
-        _lock.acquire();
-        if      (priority == THREADPOOL_PRIORITY_HIGH) { _qHigh.enqueue(t); }
-        else if (priority == THREADPOOL_PRIORITY_LOW)  { _qLow.enqueue(t); }
-        else                                            { _qNormal.enqueue(t); }
-        _lock.release();
+        if      (priority == THREADPOOL_PRIORITY_HIGH) { _qHigh.push(t); }
+        else if (priority == THREADPOOL_PRIORITY_LOW)  { _qLow.push(t); }
+        else                                            { _qNormal.push(t); }
         _ready.release();
         return true;
     }
@@ -291,10 +300,9 @@ class ThreadPool {
 
     // Number of tasks queued but not yet started (excludes tasks currently running).
     int pendingCount() {
-        _lock.acquire();
-        int n = _qHigh.count() + _qNormal.count() + _qLow.count();
-        _lock.release();
-        return n;
+        // Three independent atomic loads - not snapshot-consistent, but fine
+        // for diagnostics.
+        return _qHigh.count() + _qNormal.count() + _qLow.count();
     }
 
     // Number of worker threads.
@@ -394,23 +402,24 @@ class ThreadPool {
         if (_isWorkerThread()) {
             _drainingWorkers.increment();
             while (true) {
-                i64 inf      = _inflight.read();
-                i64 draining = _drainingWorkers.read();
-                _lock.acquire();
-                bool empty = _qHigh.isEmpty() && _qNormal.isEmpty() && _qLow.isEmpty();
-                _lock.release();
-                if (inf <= draining && empty) { break; }
-
                 Task task;
                 bool hasTask = false;
-                _lock.acquire();
-                if      (!_qHigh.isEmpty())   { task = _qHigh.dequeue();   hasTask = true; }
-                else if (!_qNormal.isEmpty()) { task = _qNormal.dequeue(); hasTask = true; }
-                else if (!_qLow.isEmpty())    { task = _qLow.dequeue();    hasTask = true; }
-                _lock.release();
+                if      (_qHigh.try_pop(&task))   { hasTask = true; }
+                else if (_qNormal.try_pop(&task)) { hasTask = true; }
+                else if (_qLow.try_pop(&task))    { hasTask = true; }
 
-                if (hasTask) { __threadpool_execute_task(&_ctx, task); }
-                else         { SwitchToThread(); }
+                if (hasTask) {
+                    __threadpool_execute_task(&_ctx, task);
+                } else {
+                    // Read inflight AFTER finding queues empty so a freshly
+                    // pushed task can't slip past us: submit() increments
+                    // inflight BEFORE pushing, so any task we missed is still
+                    // counted here.
+                    i64 inf      = _inflight.read();
+                    i64 draining = _drainingWorkers.read();
+                    if (inf <= draining) { break; }
+                    SwitchToThread();
+                }
             }
             _drainingWorkers.decrement();
         } else {
@@ -461,12 +470,16 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
             task.handle->failed   = code != 0;
         });
     }
-    // Enqueue any continuation and decrement inflight under one lock acquisition
-    // so drain() never sees a spurious zero between the two.
-    bool fired = false;
+    // Read the continuation under _lock to stay coherent with then(), but
+    // perform the channel push outside the lock.  Inflight is incremented for
+    // the cont BEFORE we decrement for self so drain() never sees a spurious
+    // zero between the two.
+    bool fired    = false;
+    Task cont     = default;
+    int  contPrio = THREADPOOL_PRIORITY_NORMAL;
+
     wctx->mtx->acquire();
     if (task.handle != nullptr && task.handle->_hasCont) {
-        Task cont;
         cont.fn     = task.handle->_contFn;
         cont.ctx    = task.handle->_contCtx;
         cont.handle = task.handle->_contHandle;
@@ -474,17 +487,26 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
             cont.handle->_cancelSrc.init();
             cont._token = cont.handle->_cancelSrc.get_token();
         }
-        int contPrio = task.handle->_contPriority;
-        wctx->inflight->increment();
-        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->enqueue(cont); }
-        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->enqueue(cont); }
-        else                                            { wctx->qNormal->enqueue(cont); }
+        contPrio = task.handle->_contPriority;
+        task.handle->_hasCont = false;   // consume so we don't fire twice
         fired = true;
+        wctx->inflight->increment();
     }
-    i64 remaining = wctx->inflight->decrement();
-    if (remaining == (i64)0) { WakeAllConditionVariable(wctx->drainCv); }
     wctx->mtx->release();
-    if (fired) { wctx->ready->release(); }
+
+    if (fired) {
+        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { wctx->qHigh->push(cont); }
+        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { wctx->qLow->push(cont); }
+        else                                            { wctx->qNormal->push(cont); }
+        wctx->ready->release();
+    }
+
+    i64 remaining = wctx->inflight->decrement();
+    if (remaining == (i64)0) {
+        wctx->mtx->acquire();
+        WakeAllConditionVariable(wctx->drainCv);
+        wctx->mtx->release();
+    }
 }
 
 // Worker body - runs on each thread.
@@ -506,13 +528,19 @@ int __threadpool_worker(void* raw) {
 
         Task task;
         bool hasTask = false;
-        wctx->mtx->acquire();
-        if      (!wctx->qHigh->isEmpty())   { task = wctx->qHigh->dequeue();   hasTask = true; }
-        else if (!wctx->qNormal->isEmpty()) { task = wctx->qNormal->dequeue(); hasTask = true; }
-        else if (!wctx->qLow->isEmpty())    { task = wctx->qLow->dequeue();    hasTask = true; }
-        wctx->mtx->release();
+        if      (wctx->qHigh->try_pop(&task))   { hasTask = true; }
+        else if (wctx->qNormal->try_pop(&task)) { hasTask = true; }
+        else if (wctx->qLow->try_pop(&task))    { hasTask = true; }
 
-        if (hasTask) { __threadpool_execute_task(wctx, task); }
+        if (hasTask) {
+            __threadpool_execute_task(wctx, task);
+        } else {
+            // Wake-up token consumed but no task popped (transient-empty in
+            // channel<T> - producer mid-publish).  Forward the token so
+            // another worker can retry; see channel.cb pairing pattern.
+            wctx->ready->release();
+            SwitchToThread();
+        }
     }
     wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()
     return 0;
