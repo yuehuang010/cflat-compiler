@@ -6,19 +6,27 @@ import "mutex.cb";
 import "channel.cb";
 import "time.cb";
 
+// Read-only configuration constants.  CFlat has no const globals, so these are
+// plain ints by necessity - treat them as immutable; do not mutate at runtime.
+
 // Capacity (per priority) of the lock-free task channel.  Must be a power of
 // two large enough that bursts of submit() rarely exceed it; submit() returns
 // false (and the caller may retry) if the targeted channel is saturated.
 int THREADPOOL_QUEUE_CAPACITY = 65536;
 
-// Priority values for submit() / submitDetached().
-// Prefer the named constants over raw integers in call sites.
+// Priority values for submit() / submitDetached().  Also used as indices into
+// per-priority arrays, so they must stay 0, 1, 2.  Prefer the named constants
+// over raw integers in call sites.
 int THREADPOOL_PRIORITY_HIGH   = 2;
 int THREADPOOL_PRIORITY_NORMAL = 1;
 int THREADPOOL_PRIORITY_LOW    = 0;
 
-// ── TaskHandle ────────────────────────────────────────────────────────────────
+// --- TaskHandle ---------------------------------------------------------------
 // Owned by the caller.  Pass &handle to submit().
+//
+// Single-use: a TaskHandle must not be resubmitted.  submit() re-inits
+// _cancelSrc but does not reset 'done', so a reused handle would report the
+// previous run's completion immediately.  Declare a fresh handle per task.
 //
 // After submitting, call handle.wait() to block until the task completes, then
 // read results inside done.acquire() to guarantee acquire-ordering on them.
@@ -51,7 +59,9 @@ struct TaskHandle {
     // Signal the task to stop early.  The task must check tok.stop_requested().
     void cancel() { _cancelSrc.request_stop(); }
 
-    // Block until the task completes.  Cheap spin - yields after each check.
+    // Block until the task completes.  Busy-spin that yields the core after
+    // each check - cheap for short tasks, but it keeps one logical CPU hot for
+    // the whole wait.  For long-running tasks prefer wait_for() with a budget.
     void wait() {
         while (done.load() == 0) { SwitchToThread(); }
     }
@@ -71,7 +81,7 @@ struct TaskHandle {
     ~TaskHandle() { _cancelSrc.dispose(); }
 };
 
-// ── TaskResult<T> ─────────────────────────────────────────────────────────────
+// --- TaskResult<T> ------------------------------------------------------------
 // Typed result holder - the CFlat equivalent of std::future<T>.
 //
 // Bundle a TaskResult<T>* into your task's context struct.  The task calls
@@ -146,7 +156,7 @@ struct TaskResult<T> {
     }
 };
 
-// ── Task ──────────────────────────────────────────────────────────────────────
+// --- Task ---------------------------------------------------------------------
 // Internal - constructed by submit() and enqueued for a worker.
 // _token is a copy of the handle's cancel token (or a null/never-cancelled
 // token for fire-and-forget tasks).
@@ -158,7 +168,7 @@ struct Task {
     stop_token                       _token = default;  // passed to fn; never-cancelled if no handle
 };
 
-// ── WorkerStartCtx ────────────────────────────────────────────────────────────
+// --- WorkerStartCtx -----------------------------------------------------------
 // Heap-allocated per worker thread by init() and resize().  Ownership transfers
 // to the worker thread through Thread.start's move overload: the callsite is
 // auto-nulled, the trampoline moves the pointer into __threadpool_worker, and
@@ -170,7 +180,7 @@ struct WorkerStartCtx {
     int        slot = 0;
 };
 
-// ── WorkerCtx ─────────────────────────────────────────────────────────────────
+// --- WorkerCtx ----------------------------------------------------------------
 // Passed to each worker thread at startup.  All fields are pointers into
 // the owning ThreadPool; the pool MUST outlive every worker thread.
 //
@@ -188,7 +198,28 @@ struct WorkerCtx {
     atomic_counter* drainingWorkers = nullptr;  // workers currently inside drain()
 };
 
-// ── ThreadPool ────────────────────────────────────────────────────────────────
+// Push a task onto the queue selected by priority.  Returns false if that
+// channel is saturated.  Shared by submit(), then(), and the worker so the
+// priority-to-queue mapping lives in exactly one place.
+bool __threadpool_push_by_priority(WorkerCtx* wctx, Task t, int priority) {
+    if      (priority == THREADPOOL_PRIORITY_HIGH) { return wctx->qHigh->try_push(t); }
+    else if (priority == THREADPOOL_PRIORITY_LOW)  { return wctx->qLow->try_push(t); }
+    return wctx->qNormal->try_push(t);
+}
+
+// Decrement _inflight by one and, if it reaches zero, wake any drain() waiters.
+// Used on every path that rolls back a reservation (push failed, duplicate
+// then()) and by the worker after a task completes.
+void __threadpool_release_inflight(WorkerCtx* wctx) {
+    i64 remaining = wctx->inflight->decrement();
+    if (remaining == (i64)0) {
+        wctx->mtx->acquire();
+        WakeAllConditionVariable(wctx->drainCv);
+        wctx->mtx->release();
+    }
+}
+
+// --- ThreadPool ---------------------------------------------------------------
 //
 //   ThreadPool pool;
 //   pool.init(4);
@@ -281,19 +312,10 @@ class ThreadPool {
         // Reserve a slot in the in-flight count BEFORE pushing so drain() never
         // races past a freshly submitted task; roll back if the push fails.
         _inflight.increment();
-        bool pushed = false;
-        if      (priority == THREADPOOL_PRIORITY_HIGH) { pushed = _qHigh.try_push(t); }
-        else if (priority == THREADPOOL_PRIORITY_LOW)  { pushed = _qLow.try_push(t); }
-        else                                            { pushed = _qNormal.try_push(t); }
-        if (!pushed) {
-            // Channel full: undo the reservation.  If this drops inflight to
-            // zero, wake any drain() waiters so they don't sleep on stale state.
-            i64 remaining = _inflight.decrement();
-            if (remaining == (i64)0) {
-                _lock.acquire();
-                WakeAllConditionVariable(&_drainCv);
-                _lock.release();
-            }
+        if (!__threadpool_push_by_priority(&_ctx, t, priority)) {
+            // Channel full: undo the reservation (wakes drain() if inflight
+            // drops to zero) so callers don't sleep on stale state.
+            __threadpool_release_inflight(&_ctx);
             return false;
         }
         _ready.release();
@@ -324,12 +346,20 @@ class ThreadPool {
         bool submit_now  = false;
         bool duplicate   = false;
         _lock.acquire();
-        if (dep->done.load() != (i32)0) {
-            // dep already finished - we must enqueue the continuation ourselves
-            // (the worker has already passed its _hasCont check).
-            submit_now = true;
-        } else if (dep->_hasCont) {
+        if (dep->_hasCont) {
+            // dep already has a registered, unfired continuation.  This holds
+            // whether or not dep has finished: if dep is done, the worker is
+            // about to fire that continuation; if not, it will fire it later.
+            // Either way a second then() on the same dep is a duplicate.  We
+            // must check _hasCont BEFORE done: if dep completed in the window
+            // between then()#1 registering and the worker firing, checking
+            // done first would take the submit_now path and enqueue a second
+            // continuation, so both would run.
             duplicate = true;
+        } else if (dep->done.load() != (i32)0) {
+            // dep already finished and has no continuation registered - the
+            // worker has passed its _hasCont check, so we enqueue ourselves.
+            submit_now = true;
         } else {
             dep->_contFn       = fn;
             dep->_contCtx      = ctx;
@@ -341,12 +371,7 @@ class ThreadPool {
 
         if (duplicate) {
             // Roll back the reservation; nothing was enqueued.
-            i64 remaining = _inflight.decrement();
-            if (remaining == (i64)0) {
-                _lock.acquire();
-                WakeAllConditionVariable(&_drainCv);
-                _lock.release();
-            }
+            __threadpool_release_inflight(&_ctx);
             return false;
         }
 
@@ -362,17 +387,8 @@ class ThreadPool {
                 handle->_hasCont = false;
                 t._token = handle->_cancelSrc.get_token();
             }
-            bool pushed = false;
-            if      (priority == THREADPOOL_PRIORITY_HIGH) { pushed = _qHigh.try_push(t); }
-            else if (priority == THREADPOOL_PRIORITY_LOW)  { pushed = _qLow.try_push(t); }
-            else                                            { pushed = _qNormal.try_push(t); }
-            if (!pushed) {
-                i64 remaining = _inflight.decrement();
-                if (remaining == (i64)0) {
-                    _lock.acquire();
-                    WakeAllConditionVariable(&_drainCv);
-                    _lock.release();
-                }
+            if (!__threadpool_push_by_priority(&_ctx, t, priority)) {
+                __threadpool_release_inflight(&_ctx);
                 return false;
             }
             _ready.release();
@@ -401,14 +417,19 @@ class ThreadPool {
     // task before checking the stop signal, so in-flight work is not lost.
     //
     // No-op if the pool is not running, is shutting down, or newCount equals
-    // the current count.  Must not be called concurrently with drain().
+    // the current count.
+    //
+    // NOT thread-safe against concurrent submit(), then(), drain(), or
+    // shutdown(): grow reallocates the per-worker arrays that those paths read
+    // unlocked.  The caller must quiesce the pool (no other pool calls in
+    // flight) for the duration of resize().
     //
     void resize(int newCount) {
         if (_workers == nullptr || _stop.stop_requested()) { return; }
         if (newCount <= 0 || newCount == _count) { return; }
         int oldCount = _count;
         if (newCount > oldCount) {
-            // ── Grow ─────────────────────────────────────────────────────────
+            // --- Grow ---
             if (newCount > _capacity) {
                 // Reallocate all three per-worker arrays to newCount.
                 // Thread and stop_source have no destructors, so bitwise copy
@@ -440,7 +461,7 @@ class ThreadPool {
                 j++;
             }
         } else {
-            // ── Shrink ───────────────────────────────────────────────────────
+            // --- Shrink ---
             // Signal per-worker stops for slots being retired.
             int k = newCount;
             while (k < oldCount) { _workerStops[k].request_stop(); k++; }
@@ -588,26 +609,20 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     wctx->mtx->release();
 
     if (fired) {
-        bool pushed = false;
-        if      (contPrio == THREADPOOL_PRIORITY_HIGH) { pushed = wctx->qHigh->try_push(cont); }
-        else if (contPrio == THREADPOOL_PRIORITY_LOW)  { pushed = wctx->qLow->try_push(cont); }
-        else                                            { pushed = wctx->qNormal->try_push(cont); }
-        if (pushed) {
+        if (__threadpool_push_by_priority(wctx, cont, contPrio)) {
             wctx->ready->release();
         } else {
             // Queue saturated: roll back the pre-reserved slot so drain() can
             // make forward progress.  The continuation is silently dropped -
             // sizing THREADPOOL_QUEUE_CAPACITY appropriately is the user's job.
+            // A bare decrement is enough: the release-and-wake for self below
+            // will observe inflight and wake drain() if this was the last task.
             wctx->inflight->decrement();
         }
     }
 
-    i64 remaining = wctx->inflight->decrement();
-    if (remaining == (i64)0) {
-        wctx->mtx->acquire();
-        WakeAllConditionVariable(wctx->drainCv);
-        wctx->mtx->release();
-    }
+    // Release this task's own in-flight slot, waking drain() if it was the last.
+    __threadpool_release_inflight(wctx);
 }
 
 // Worker body - runs on each thread.  'raw' is moved in by Thread.start's move

@@ -339,11 +339,10 @@ bool testThenDuplicateRegistration() {
     ThreadPool pool;
     pool.init(1);
 
-    ChainCtx ctx;
-    TaskHandle hDep; TaskHandle hA; TaskHandle hB;
-
-    // Block a worker with a slow task so dep stays pending.
-    pool.submit(taskSlow, nullptr, &hDep);
+    // Block the single worker with a slow task so depCtx's task stays pending
+    // while both then() calls race to register against it.
+    TaskHandle hBlocker;
+    pool.submit(taskSlow, nullptr, &hBlocker);
 
     ChainCtx depCtx;
     TaskHandle hChainA; TaskHandle hChainB;
@@ -359,6 +358,32 @@ bool testThenDuplicateRegistration() {
     pool.drain();
     // hUserDep ran (+1) and the first continuation ran (+1).
     result &= Test("chain ran exactly twice", depCtx.value, 2);
+
+    pool.shutdown();
+    return result;
+}
+
+bool testThenAfterDepCompleted() {
+    // then() on a dep that has already finished and has no pending continuation
+    // must still enqueue via the submit_now path.  Guards the ordering of the
+    // _hasCont / done checks in then(): _hasCont is checked first to close a
+    // double-fire race, but a completed dep with _hasCont == false must not be
+    // mistaken for a duplicate.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(2);
+
+    ChainCtx ctx;
+    TaskHandle hDep;
+    pool.submit(chainStep, &ctx, &hDep);
+    hDep.wait();   // dep fully completed; no continuation was ever registered
+
+    TaskHandle hCont;
+    bool accepted = pool.then(&hDep, chainStep, &ctx, &hCont);
+    result &= Test("then() after dep completed accepted", (int)accepted, 1);
+
+    pool.drain();
+    result &= Test("continuation ran after completed dep", ctx.value, 2);
 
     pool.shutdown();
     return result;
@@ -520,6 +545,7 @@ extern int main() {
     total++; passed += testWaitForTimeoutThenComplete()  ? 1 : 0;
     total++; passed += testThenChain()                   ? 1 : 0;
     total++; passed += testThenDuplicateRegistration()   ? 1 : 0;
+    total++; passed += testThenAfterDepCompleted()       ? 1 : 0;
     total++; passed += testDrainFromWithinTask()         ? 1 : 0;
     total++; passed += testResizeGrowShrinkGrow()        ? 1 : 0;
     total++; passed += testSubmitAfterShutdown()         ? 1 : 0;

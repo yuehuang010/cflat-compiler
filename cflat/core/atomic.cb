@@ -62,6 +62,12 @@ struct atomic_counter {
     i64 read() {
         return __atomic_counter_read(&_value);
     }
+
+    // Overwrite the value.  (store seq_cst)  Use to reset a counter between
+    // measurement runs - do not call while other threads are incrementing.
+    void store(i64 val) {
+        __atomic_i64_store(&_value, val);
+    }
 };
 
 // -------------------------------------------------------------------------

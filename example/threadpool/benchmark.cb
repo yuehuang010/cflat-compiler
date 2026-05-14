@@ -23,7 +23,7 @@ import "thread.cb";
 import "time.cb";
 import "cruntime.cb";
 
-// ── Shared state ─────────────────────────────────────────────────────────────
+// --- Shared state ---
 
 atomic_counter g_taskCounter = default;
 
@@ -32,7 +32,7 @@ int trivialTask(void* ctx, stop_token tok) {
     return 0;
 }
 
-// ── Producer thread ──────────────────────────────────────────────────────────
+// --- Producer thread ---
 
 struct ProducerCtx {
     ThreadPool* pool      = nullptr;
@@ -49,13 +49,13 @@ int producerThread(void* raw) {
     return 0;
 }
 
-// ── Scenario 1: single-producer ──────────────────────────────────────────────
+// --- Scenario 1: single-producer ---
 
 void scenarioSingleProducer(int workers, int taskCount) {
     ThreadPool pool;
     pool.init(workers);
 
-    __atomic_i64_store(&g_taskCounter._value, (i64)0);
+    g_taskCounter.store((i64)0);
 
     Stopwatch sw;
     sw.start();
@@ -79,13 +79,13 @@ void scenarioSingleProducer(int workers, int taskCount) {
     pool.shutdown();
 }
 
-// ── Scenario 2: multi-producer ───────────────────────────────────────────────
+// --- Scenario 2: multi-producer ---
 
 void scenarioMultiProducer(int workers, int producers, int totalTasks) {
     ThreadPool pool;
     pool.init(workers);
 
-    __atomic_i64_store(&g_taskCounter._value, (i64)0);
+    g_taskCounter.store((i64)0);
 
     int perProducer = totalTasks / producers;
     int actualTotal = perProducer * producers;
@@ -129,7 +129,7 @@ void scenarioMultiProducer(int workers, int producers, int totalTasks) {
     pool.shutdown();
 }
 
-// ── Entry point ──────────────────────────────────────────────────────────────
+// --- Entry point ---
 
 extern int main() {
     printf("ThreadPool throughput benchmark\n");

@@ -1,22 +1,12 @@
 import "threadpool.cb";
 import "atomic.cb";
-import "string.cb";
 import "cruntime.cb";
 import "time.cb";
 
-// ── Shared state for section 3 (priority ordering proof) ─────────────────────
+// Sections are defined below in the order main() runs them.  Each section's
+// helper structs and task functions sit directly above the section function.
 
-atomic_counter g_orderCounter = default;
-
-struct PriorityResult {
-    int taskId   = 0;
-    int priority = 0;
-    int order    = 0;   // completion order (1-based, set by priorityTask)
-};
-
-PriorityResult[9] g_results;
-
-// ── Task functions ────────────────────────────────────────────────────────────
+// --- Generic task functions (shared by sections 1, 2, 4, 10) -----------------
 
 int squareTask(void* ctx, stop_token tok) {
     int* p = (int*)ctx;
@@ -32,17 +22,7 @@ int succeedTask(void* ctx, stop_token tok) {
     return 0;
 }
 
-int priorityTask(void* ctx, stop_token tok) {
-    PriorityResult* r = (PriorityResult*)ctx;
-    // Burn CPU so pending tasks pile up while this one runs.
-    int i = 0;
-    int x = 1;
-    while (i < 2000000) { x = x + i; i++; }
-    r->order = (int)g_orderCounter.increment();
-    return 0;
-}
-
-// ── Section 1: basic correctness ─────────────────────────────────────────────
+// --- Section 1: basic correctness --------------------------------------------
 
 void section1(ThreadPool* pool) {
     printf("=== Section 1: basic correctness ===\n");
@@ -51,7 +31,7 @@ void section1(ThreadPool* pool) {
     inputs[0] = 1; inputs[1] = 2; inputs[2] = 3; inputs[3] = 4;
     inputs[4] = 5; inputs[5] = 6; inputs[6] = 7; inputs[7] = 8;
 
-    TaskHandle[8] handles;
+    TaskHandle[8] handles {};
 
     int i = 0;
     while (i < 8) {
@@ -75,7 +55,7 @@ void section1(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
-// ── Section 2: error handling ─────────────────────────────────────────────────
+// --- Section 2: error handling -----------------------------------------------
 
 void section2(ThreadPool* pool) {
     printf("=== Section 2: error handling ===\n");
@@ -118,12 +98,31 @@ void section2(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
-// ── Section 3: priority ordering ─────────────────────────────────────────────
+// --- Section 3: priority ordering --------------------------------------------
 //
 // Single worker so tasks queue up and are drained in priority order.
-// Task 0 is submitted first so the worker is busy (in its compute loop) while
-// the remaining 8 tasks arrive; those 8 are then dequeued in priority order.
+// Task 0 is submitted first so the worker is busy (asleep) while the remaining
+// 8 tasks arrive; those 8 are then dequeued in priority order.
 //
+
+atomic_counter g_orderCounter = default;
+
+struct PriorityResult {
+    int taskId   = 0;
+    int priority = 0;
+    int order    = 0;   // completion order (1-based, set by priorityTask)
+};
+
+PriorityResult[9] g_results;
+
+int priorityTask(void* ctx, stop_token tok) {
+    PriorityResult* r = (PriorityResult*)ctx;
+    // Sleep so pending tasks pile up while this one "runs".  A wall-clock wait
+    // survives -O2; a dead compute loop would be deleted by the optimiser.
+    sleep((i64)10);
+    r->order = (int)g_orderCounter.increment();
+    return 0;
+}
 
 void section3() {
     printf("=== Section 3: priority ordering (1 worker) ===\n");
@@ -141,14 +140,14 @@ void section3() {
     ThreadPool pool1;
     pool1.init(1);
 
-    TaskHandle[9] handles;
+    TaskHandle[9] handles {};
 
     // Submit task 0 (LOW) first - worker picks it up immediately.
     pool1.submit(priorityTask, (void*)&g_results[0], &handles[0], THREADPOOL_PRIORITY_LOW);
 
-    // Brief spin so the worker enters its compute loop before we enqueue the rest.
-    int spin = 0;
-    while (spin < 500000) { spin++; }
+    // Brief wait so the worker dequeues task 0 and is busy in its 10 ms sleep
+    // before we enqueue the rest.
+    sleep((i64)2);
 
     // Enqueue remaining 8 in interleaved priority order while worker is busy.
     pool1.submit(priorityTask, (void*)&g_results[1], &handles[1], THREADPOOL_PRIORITY_LOW);
@@ -174,7 +173,7 @@ void section3() {
         i++;
     }
 
-    // Among tasks 1–8 (queued batch): all HIGH < all NORMAL < all LOW.
+    // Among tasks 1-8 (queued batch): all HIGH < all NORMAL < all LOW.
     int maxHigh   = 0;
     int minNormal = 9999;
     int maxNormal = 0;
@@ -203,7 +202,7 @@ void section3() {
     pool1.shutdown();
 }
 
-// ── Context structs and task functions for section 5 ─────────────────────────
+// --- Section 5: TaskResult<T> (typed future) ---------------------------------
 
 struct IntTaskCtx {
     int              input = 0;
@@ -223,8 +222,6 @@ int failResultTask(void* raw, stop_token tok) {
     return 1;
 }
 
-// ── Section 5: TaskResult<T> (typed future) ───────────────────────────────────
-
 void section5() {
     printf("=== Section 5: TaskResult<T> (typed future) ===\n");
 
@@ -234,8 +231,8 @@ void section5() {
     bool ok = true;
 
     // Basic: submit four squaring tasks, collect typed int results via get().
-    IntTaskCtx[4]      ctxs;
-    TaskResult<int>[4] results;
+    IntTaskCtx[4]      ctxs {};
+    TaskResult<int>[4] results {};
     int i = 0;
     while (i < 4) {
         ctxs[i].input = (i + 1) * 10;
@@ -285,46 +282,10 @@ void section5() {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
-// ── Section 4: pool reuse and shutdown contract ───────────────────────────────
-
-void section4(ThreadPool* pool) {
-    printf("=== Section 4: pool reuse and shutdown contract ===\n");
-
-    int[4] inputs;
-    inputs[0] = 10; inputs[1] = 20; inputs[2] = 30; inputs[3] = 40;
-
-    TaskHandle[4] handles;
-
-    int i = 0;
-    while (i < 4) {
-        bool accepted = pool->submit(squareTask, (void*)&inputs[i], &handles[i]);
-        printf("  submit %d accepted: %s\n", i, accepted ? "YES" : "NO");
-        i++;
-    }
-    pool->drain();
-
-    i = 0;
-    while (i < 4) {
-        handles[i].done.acquire((i32 v) => {
-            printf("  reuse task %d: exitCode=%d\n", i, handles[i].exitCode);
-        });
-        i++;
-    }
-
-    pool->shutdown();
-    printf("  pool shut down\n");
-
-    // Submit after shutdown must be rejected.
-    TaskHandle dummy;
-    bool rejected = !pool->submit(squareTask, nullptr, &dummy);
-    printf("  submit after shutdown rejected: %s\n", rejected ? "YES" : "NO");
-    printf("  result: %s\n\n", rejected ? "PASS" : "FAIL");
-}
-
-// ── Section 6: per-task cancellation ─────────────────────────────────────────
+// --- Section 6: per-task cancellation ----------------------------------------
 //
 // The task loops until tok.stop_requested(); the submitter calls handle.cancel()
-// after a short spin, then waits for the task to exit.
+// after a short wait, then waits for the task to exit.
 //
 
 struct CancelCtx {
@@ -349,9 +310,9 @@ void section6(ThreadPool* pool) {
     TaskHandle h;
     pool->submit(cancellableTask, &ctx, &h);
 
-    // Spin briefly so the task gets a chance to start and accumulate iterations.
-    int spin = 0;
-    while (spin < 2000000) { spin++; }
+    // Give the task time to start and accumulate iterations.  Wall-clock sleep
+    // so the wait is real under any optimisation level.
+    sleep((i64)20);
 
     h.cancel();
     h.wait();
@@ -362,7 +323,44 @@ void section6(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
-// ── Context and task functions for section 8 ─────────────────────────────────
+// --- Section 7: wait_for (timed wait) ----------------------------------------
+//
+// Submit a task that sleeps ~200 ms, then call wait_for(20) - should time out.
+// A second wait_for(5000) should then see the task already done (true).
+//
+
+int slowTask(void* raw, stop_token tok) {
+    // Sleep ~200 ms so the short wait_for() reliably times out.  A wall-clock
+    // wait survives -O2; a dead compute loop would be deleted by the optimiser.
+    sleep((i64)200);
+    return 0;
+}
+
+void section7(ThreadPool* pool) {
+    printf("=== Section 7: wait_for (timed wait) ===\n");
+
+    TaskHandle h;
+    pool->submit(slowTask, nullptr, &h);
+
+    // Short timeout - task should still be running.
+    bool timedOut = !h.wait_for(20);
+
+    // Long timeout - enough for the task to finish from wherever it is now.
+    bool completed = h.wait_for(5000);
+
+    bool ok = timedOut && completed;
+    printf("  wait_for(20ms) timed out:     %s\n", timedOut   ? "YES" : "NO");
+    printf("  wait_for(5000ms) completed:   %s\n", completed  ? "YES" : "NO");
+    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
+}
+
+// --- Section 8: task continuations (chaining) --------------------------------
+//
+// Register A->B->C with then() before A even starts.  Each step runs
+// automatically after the previous one finishes, sharing a ChainCtx by pointer.
+//
+// Expected: value = 3 -> 3^2=9 -> 9^2=81.
+//
 
 struct ChainCtx {
     int value = 0;
@@ -386,46 +384,6 @@ int chainC(void* raw, stop_token tok) {
     return 0;
 }
 
-// ── Section 7: wait_for (timed wait) ─────────────────────────────────────────
-//
-// Submit a CPU-bound task (~200 ms), then call wait_for(20) - should time out.
-// A second wait_for(5000) should then see the task already done (true).
-//
-
-int slowTask(void* raw, stop_token tok) {
-    // Burn ~200 ms worth of CPU so the short wait reliably times out.
-    int i = 0;
-    int x = 1;
-    while (i < 100000000) { x = x + i; i++; }
-    return 0;
-}
-
-void section7(ThreadPool* pool) {
-    printf("=== Section 7: wait_for (timed wait) ===\n");
-
-    TaskHandle h;
-    pool->submit(slowTask, nullptr, &h);
-
-    // Short timeout - task should still be running.
-    bool timedOut = !h.wait_for(20);
-
-    // Long timeout - enough for the task to finish from wherever it is now.
-    bool completed = h.wait_for(5000);
-
-    bool ok = timedOut && completed;
-    printf("  wait_for(20ms) timed out:     %s\n", timedOut   ? "YES" : "NO");
-    printf("  wait_for(5000ms) completed:   %s\n", completed  ? "YES" : "NO");
-    printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
-}
-
-// ── Section 8: task continuations (chaining) ─────────────────────────────────
-//
-// Register A→B→C with then() before A even starts.  Each step runs automatically
-// after the previous one finishes, sharing a ChainCtx by pointer.
-//
-// Expected: value = 3 → 3^2=9 → 9^2=81.
-//
-
 void section8(ThreadPool* pool) {
     printf("=== Section 8: task continuations (chaining) ===\n");
 
@@ -443,7 +401,7 @@ void section8(ThreadPool* pool) {
     printf("  result: %s\n\n", ok ? "PASS" : "FAIL");
 }
 
-// ── Section 9: drain() called from within a task ─────────────────────────────
+// --- Section 9: drain() called from within a task ----------------------------
 //
 // A task running on the pool submits a child task and then calls pool->drain().
 // Without work-participation this would deadlock (the task is itself in-flight
@@ -493,7 +451,7 @@ void section9() {
     pool1.shutdown();
 }
 
-// ── Section 10: dynamic resize ───────────────────────────────────────────────
+// --- Section 10: dynamic resize ----------------------------------------------
 //
 // Exercises grow, shrink, and grow-again (slot reuse) on a pool that runs real
 // tasks after each resize.  Verifies workerCount() and task correctness.
@@ -509,7 +467,7 @@ void section10() {
 
     // Run 4 tasks with 2 workers.
     int[4] v1; v1[0] = 3; v1[1] = 4; v1[2] = 5; v1[3] = 6;
-    TaskHandle[4] h1;
+    TaskHandle[4] h1 {};
     int i = 0;
     while (i < 4) { pool.submit(squareTask, &v1[i], &h1[i]); i++; }
     pool.drain();
@@ -522,7 +480,7 @@ void section10() {
     printf("  resize(4):  workers=%d  %s\n", pool.workerCount(), sizeOk1 ? "OK" : "FAIL");
 
     int[4] v2; v2[0] = 2; v2[1] = 3; v2[2] = 4; v2[3] = 5;
-    TaskHandle[4] h2;
+    TaskHandle[4] h2 {};
     i = 0;
     while (i < 4) { pool.submit(squareTask, &v2[i], &h2[i]); i++; }
     pool.drain();
@@ -535,7 +493,7 @@ void section10() {
     printf("  resize(1):  workers=%d  %s\n", pool.workerCount(), sizeOk2 ? "OK" : "FAIL");
 
     int[4] v3; v3[0] = 7; v3[1] = 8; v3[2] = 9; v3[3] = 10;
-    TaskHandle[4] h3;
+    TaskHandle[4] h3 {};
     i = 0;
     while (i < 4) { pool.submit(squareTask, &v3[i], &h3[i]); i++; }
     pool.drain();
@@ -548,7 +506,7 @@ void section10() {
     printf("  resize(3):  workers=%d  %s\n", pool.workerCount(), sizeOk3 ? "OK" : "FAIL");
 
     int[4] v4; v4[0] = 1; v4[1] = 2; v4[2] = 3; v4[3] = 4;
-    TaskHandle[4] h4;
+    TaskHandle[4] h4 {};
     i = 0;
     while (i < 4) { pool.submit(squareTask, &v4[i], &h4[i]); i++; }
     pool.drain();
@@ -561,7 +519,46 @@ void section10() {
     pool.shutdown();
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// --- Section 4: pool reuse and shutdown contract -----------------------------
+//
+// Runs last because it shuts down the pool shared by sections 1, 2, 6, 7, 8.
+//
+
+void section4(ThreadPool* pool) {
+    printf("=== Section 4: pool reuse and shutdown contract ===\n");
+
+    int[4] inputs;
+    inputs[0] = 10; inputs[1] = 20; inputs[2] = 30; inputs[3] = 40;
+
+    TaskHandle[4] handles {};
+
+    int i = 0;
+    while (i < 4) {
+        bool accepted = pool->submit(squareTask, (void*)&inputs[i], &handles[i]);
+        printf("  submit %d accepted: %s\n", i, accepted ? "YES" : "NO");
+        i++;
+    }
+    pool->drain();
+
+    i = 0;
+    while (i < 4) {
+        handles[i].done.acquire((i32 v) => {
+            printf("  reuse task %d: exitCode=%d\n", i, handles[i].exitCode);
+        });
+        i++;
+    }
+
+    pool->shutdown();
+    printf("  pool shut down\n");
+
+    // Submit after shutdown must be rejected.
+    TaskHandle dummy;
+    bool rejected = !pool->submit(squareTask, nullptr, &dummy);
+    printf("  submit after shutdown rejected: %s\n", rejected ? "YES" : "NO");
+    printf("  result: %s\n\n", rejected ? "PASS" : "FAIL");
+}
+
+// --- Entry point -------------------------------------------------------------
 
 extern int main() {
     printf("ThreadPool comprehensive demo\n\n");
