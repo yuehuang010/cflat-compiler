@@ -807,7 +807,7 @@ bool testReturnDefaultPrimitives()
     result &= Test("rd_int",   rdInt(),   0);
     result &= Test("rd_float", rdFloat(), 0.0f);
     result &= Test("rd_bool",  rdBool(),  false);
-    result &= Test("rd_i64",   rdI64(),   (i64)0);
+    result &= Test("rd_i64",   rdI64(),   0);
     return result;
 }
 
@@ -1390,7 +1390,7 @@ bool testCast()
     big64 = big64 + 5;
     i32 neg32 = -1;
     result &= Test("(i32)(i64) truncate", (i32)big64,   5);
-    result &= Test("(i64)(i32) sign-ext", (i64)neg32,   (i64)-1);
+    result &= Test("(i64)(i32) sign-ext", (i64)neg32,   -1);
 
     result &= Test("(0.5f).round()",    (0.5f).round(),    1.0f);
     result &= Test("(-0.5f).round()",   (-0.5f).round(),  -1.0f);
@@ -1416,25 +1416,25 @@ bool testCast()
     i32 v128   = 128;
     i32 v32767 = 32767;
     i32 v32768 = 32768;
-    result &= Test("127.to_i8()",          (int)v127.to_i8(),    127);
-    result &= Test("128.to_i8() wrap",     (int)v128.to_i8(),   -128);
-    result &= Test("32767.to_i16()",       (int)v32767.to_i16(), 32767);
-    result &= Test("32768.to_i16() wrap",  (int)v32768.to_i16(),-32768);
+    result &= Test("127.to_i8()",          v127.to_i8(),    127);
+    result &= Test("128.to_i8() wrap",     v128.to_i8(),   -128);
+    result &= Test("32767.to_i16()",       v32767.to_i16(), 32767);
+    result &= Test("32768.to_i16() wrap",  v32768.to_i16(),-32768);
 
     i32 neg_src  = -100;
     i8  byte_neg = neg_src.to_i8();
-    result &= Test("i8(-100).to_i16()", (int)byte_neg.to_i16(), -100);
-    result &= Test("i8(-100).to_i32()", (int)byte_neg.to_i32(), -100);
-    result &= Test("i8(-100).to_i64()",  byte_neg.to_i64(),      (i64)-100);
+    result &= Test("i8(-100).to_i16()", byte_neg.to_i16(), -100);
+    result &= Test("i8(-100).to_i32()", byte_neg.to_i32(), -100);
+    result &= Test("i8(-100).to_i64()",  byte_neg.to_i64(),      -100);
 
     i16 short_neg = neg_src.to_i16();
-    result &= Test("i16(-100).to_i32()", (int)short_neg.to_i32(), -100);
-    result &= Test("i16(-100).to_i64()",  short_neg.to_i64(),     (i64)-100);
+    result &= Test("i16(-100).to_i32()", short_neg.to_i32(), -100);
+    result &= Test("i16(-100).to_i64()",  short_neg.to_i64(),     -100);
 
     i32 xi = 42;
-    result &= Test("i32(42).to_i32()",  xi.to_i32(),  (i32)42);
+    result &= Test("i32(42).to_i32()",  xi.to_i32(),  42);
     i64 yi = 999;
-    result &= Test("i64(999).to_i64()", yi.to_i64(),  (i64)999);
+    result &= Test("i64(999).to_i64()", yi.to_i64(),  999);
 
     return result;
 }
@@ -1633,8 +1633,8 @@ bool testPrimitiveTypeAlias()
     result &= Test("alias_u32_func",      primitiveAliasU32(10, 5), 15);
 
     MyI64  l = 1000000000;
-    result &= Test("alias_i64_decl",      l,                       (i64)1000000000);
-    result &= Test("alias_i64_func",      primitiveAliasI64(100, 200), (i64)300);
+    result &= Test("alias_i64_decl",      l,                       1000000000);
+    result &= Test("alias_i64_func",      primitiveAliasI64(100, 200), 300);
 
     MyBool b = true;
     result &= Test("alias_bool_decl",     b,                       true);
@@ -1645,7 +1645,7 @@ bool testPrimitiveTypeAlias()
     // Local alias inside a function
     using LocalU8 = u8;
     LocalU8 byte = 255;
-    result &= Test("local_alias_u8",      (int)byte,               255);
+    result &= Test("local_alias_u8",      byte,                    255);
 
     return result;
 }
@@ -1665,7 +1665,7 @@ int sumFixedBuf(i8* buf, int len)
 {
     int sum = 0;
     int i = 0;
-    while (i < len) { sum = sum + (int)buf[i]; i++; }
+    while (i < len) { sum = sum + buf[i]; i++; }
     return sum;
 }
 
@@ -1676,9 +1676,9 @@ bool testFixedArrays()
     // Local fixed-size array: write, read back
     i8[8] buf = default;
     buf[0] = (i8)10; buf[1] = (i8)20; buf[2] = (i8)30;
-    result &= Test("fixed_local_elem0", (int)buf[0], 10);
-    result &= Test("fixed_local_elem1", (int)buf[1], 20);
-    result &= Test("fixed_local_elem2", (int)buf[2], 30);
+    result &= Test("fixed_local_elem0", buf[0], 10);
+    result &= Test("fixed_local_elem1", buf[1], 20);
+    result &= Test("fixed_local_elem2", buf[2], 30);
 
     // Array decays to pointer when passed to a function
     result &= Test("fixed_local_decay", sumFixedBuf(buf, 3), 60);
@@ -1692,14 +1692,14 @@ bool testFixedArrays()
     h.label[0] = (i8)'O'; h.label[1] = (i8)'K'; h.label[2] = (i8)0;
     h.count = 7;
     h.data[0] = (i8)1; h.data[1] = (i8)2; h.data[2] = (i8)3;
-    result &= Test("fixed_struct_label0", (int)h.label[0], (int)'O');
-    result &= Test("fixed_struct_label1", (int)h.label[1], (int)'K');
+    result &= Test("fixed_struct_label0", h.label[0], 'O');
+    result &= Test("fixed_struct_label1", h.label[1], 'K');
     result &= Test("fixed_struct_count",  h.count, 7);
     result &= Test("fixed_struct_data_sum", sumFixedBuf(h.data, 3), 6);
 
     // Struct pointer access
     ArrayHolder* ph = &h;
-    result &= Test("fixed_struct_ptr_label0", (int)ph->label[0], (int)'O');
+    result &= Test("fixed_struct_ptr_label0", ph->label[0], 'O');
     result &= Test("fixed_struct_ptr_count",  ph->count, 7);
 
     return result;
@@ -1728,9 +1728,9 @@ bool testMultiDimArrays()
         }
         r++;
     }
-    result &= Test("char2d[0][0]", (int)cg[0][0], 0);
-    result &= Test("char2d[1][2]", (int)cg[1][2], 7);
-    result &= Test("char2d[2][4]", (int)cg[2][4], 14);
+    result &= Test("char2d[0][0]", cg[0][0], 0);
+    result &= Test("char2d[1][2]", cg[1][2], 7);
+    result &= Test("char2d[2][4]", cg[2][4], 14);
 
     // --- int[4][3]: 4 rows × 3 cols ---
     int[4][3] ig = default;
@@ -1985,20 +1985,20 @@ bool testPointerArithmetic()
     buf[0] = 65; buf[1] = 66; buf[2] = 67; buf[3] = 0;
 
     i8* b1 = buf + 1;
-    result &= Test("i8*+1", (int)b1[0], 66);
+    result &= Test("i8*+1", b1[0], 66);
 
     i8* b2 = b1 + 1;
-    result &= Test("i8*+1+1", (int)b2[0], 67);
+    result &= Test("i8*+1+1", b2[0], 67);
 
     i8* b3 = b2 - 2;
-    result &= Test("i8*-2", (int)b3[0], 65);
+    result &= Test("i8*-2", b3[0], 65);
 
     // i8* cursor walk with ++
     i8* cursor = buf;
     cursor++;
-    result &= Test("i8* cursor++", (int)*cursor, 66);
+    result &= Test("i8* cursor++", *cursor, 66);
     cursor++;
-    result &= Test("i8* cursor++ again", (int)*cursor, 67);
+    result &= Test("i8* cursor++ again", *cursor, 67);
 
     // i8* ptr - ptr → byte count
     i8* bstart = buf;
@@ -2085,7 +2085,7 @@ bool testUnion()
 
     UnionByteView bv;
     bv.value = 0x000000FF;
-    result &= Test("union aliasing low byte", (int)bv.byte0, -1);
+    result &= Test("union aliasing low byte", bv.byte0, -1);
 
     // Union with struct members: write and read sub-fields
     UnionWithStructs s;

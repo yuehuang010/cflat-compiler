@@ -6,10 +6,10 @@ import "time.cb";
 int testDurationFactories()
 {
     int passed = 0;
-    passed += Test("fromTicks(100)",        Duration.fromTicks(100).ticks(),        (i64)100);
-    passed += Test("fromMicroseconds(1)",   Duration.fromMicroseconds(1).ticks(),   (i64)10);
-    passed += Test("fromMilliseconds(1)",   Duration.fromMilliseconds(1).ticks(),   (i64)10000);
-    passed += Test("fromSeconds(1)",        Duration.fromSeconds(1).ticks(),        (i64)10000000);
+    passed += Test("fromTicks(100)",        Duration.fromTicks(100).ticks(),        100);
+    passed += Test("fromMicroseconds(1)",   Duration.fromMicroseconds(1).ticks(),   10);
+    passed += Test("fromMilliseconds(1)",   Duration.fromMilliseconds(1).ticks(),   10000);
+    passed += Test("fromSeconds(1)",        Duration.fromSeconds(1).ticks(),        10000000);
     return passed;
 }
 
@@ -40,8 +40,8 @@ int testDurationArithmetic()
     Duration b = Duration.fromSeconds(2);
     Duration sum  = a + b;
     Duration diff = a - b;
-    passed += Test("operator+", sum.ticks(),  (i64)50000000);
-    passed += Test("operator-", diff.ticks(), (i64)10000000);
+    passed += Test("operator+", sum.ticks(),  50000000);
+    passed += Test("operator-", diff.ticks(), 10000000);
     return passed;
 }
 

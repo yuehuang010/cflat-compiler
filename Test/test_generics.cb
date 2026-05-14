@@ -1468,8 +1468,8 @@ bool testTupleSizedIntegers()
     ts.item_1 = 30000;
     ts.item_2 = 2000000;
     ts.item_3 = 5000000000;
-    result &= Test("tuple_i8",          (int)ts.item_0, 100);
-    result &= Test("tuple_i16",         (int)ts.item_1, 30000);
+    result &= Test("tuple_i8",          ts.item_0,      100);
+    result &= Test("tuple_i16",         ts.item_1,      30000);
     result &= Test("tuple_i32",         ts.item_2,      2000000);
     result &= Test("tuple_i64_sized",   ts.item_3,      5000000000);
     result &= Test("tuple_signed_size", ts.size(),      4);
@@ -1480,10 +1480,10 @@ bool testTupleSizedIntegers()
     tu.item_1 = 50000;
     tu.item_2 = 2000000;
     tu.item_3 = 5000000000;
-    result &= Test("tuple_u8",            (int)tu.item_0, 200);
-    result &= Test("tuple_u16",           (int)tu.item_1, 50000);
-    result &= Test("tuple_u32",           (int)tu.item_2, 2000000);
-    result &= Test("tuple_u64_sized",     (i64)tu.item_3, 5000000000);
+    result &= Test("tuple_u8",            tu.item_0,      200);
+    result &= Test("tuple_u16",           tu.item_1,      50000);
+    result &= Test("tuple_u32",           tu.item_2,      2000000);
+    result &= Test("tuple_u64_sized",     tu.item_3,      5000000000);
     result &= Test("tuple_unsigned_size", tu.size(),      4);
 
     return result;

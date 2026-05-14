@@ -167,7 +167,7 @@ bool testProgramBasicArgsAndField() {
     c.run(args);
     c.WaitForExit();
     result &= Test("basic counter", c.exitCode, 12);
-    result &= Test("basic counter usedBytes", c._allocator.usedBytes(), (i64)0);
+    result &= Test("basic counter usedBytes", c._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -247,7 +247,7 @@ bool testProgramHeapAllocationsFreed() {
     h.WaitForExit();
     // sum of 1+2+...+10 = 55
     result &= Test("heap stress sum 10", h.exitCode, 55);
-    result &= Test("heap stress 10 usedBytes", h._allocator.usedBytes(), (i64)0);
+    result &= Test("heap stress 10 usedBytes", h._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -337,7 +337,7 @@ bool testProgramHeapStressLarge() {
     h.WaitForExit();
     // sum of 1+2+...+50 = 1275
     result &= Test("heap stress sum 50", h.exitCode, 1275);
-    result &= Test("heap stress 50 usedBytes", h._allocator.usedBytes(), (i64)0);
+    result &= Test("heap stress 50 usedBytes", h._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -369,7 +369,7 @@ bool testAllocatorUsedBlocksCleanExit() {
     m.run(args);
     m.WaitForExit();
     // Minimal.main() makes no allocations - 0 blocks in use
-    result &= Test("usedBytes clean exit", m._allocator.usedBytes(), (i64)0);
+    result &= Test("usedBytes clean exit", m._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -381,7 +381,7 @@ bool testAllocatorUsedBlocksLeaked() {
     h.run(args);
     h.WaitForExit();
     result &= Test("heap stress sum 5", h.exitCode, 15);
-    result &= Test("usedBytes no leak after exit", h._allocator.usedBytes(), (i64)0);
+    result &= Test("usedBytes no leak after exit", h._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -402,7 +402,7 @@ bool testAllocatorCustomAssignedBeforeRun() {
     result &= Test("custom allocator exit code", h.exitCode, 15);
     // MallocAllocator tracks cumulative alloc bytes; 5x `new int` => at least 20 bytes,
     // proving the user-assigned allocator (not the default) actually serviced main().
-    result &= Test("custom allocator was used", h._allocator.totalBytes() >= (i64)20, true);
+    result &= Test("custom allocator was used", h._allocator.totalBytes() >= 20, true);
     return result;
 }
 
@@ -483,7 +483,7 @@ char* provide_stdin() {
     else if (idx == 1) src = "world\n";
     else if (idx == 2) src = "foo\n";
     else return nullptr;
-    i64 len = (i64)strlen(src);
+    i64 len = strlen(src);
     char* s = (char*)malloc(len + 1);
     strcpy(s, src);
     return s;
@@ -500,7 +500,7 @@ char* provide_stdin_scanf() {
     else if (idx == 1) src = "20\n";
     else if (idx == 2) src = "30\n";
     else return nullptr;
-    i64 len = (i64)strlen(src);
+    i64 len = strlen(src);
     char* s = (char*)malloc(len + 1);
     strcpy(s, src);
     return s;
@@ -740,7 +740,7 @@ bool testListStringNoLeaks() {
     p.run(args);
     p.WaitForExit();
     result &= Test("list<string> exit code", p.exitCode, 0);
-    result &= Test("list<string> no leaks", p._allocator.usedBytes(), (i64)0);
+    result &= Test("list<string> no leaks", p._allocator.usedBytes(), 0);
     return result;
 }
 
@@ -752,7 +752,7 @@ bool testListOwnershipNoLeaks() {
     p.run(args);
     p.WaitForExit();
     result &= Test("list ownership exit code", p.exitCode, 0);
-    result &= Test("list ownership no leaks", p._allocator.usedBytes(), (i64)0);
+    result &= Test("list ownership no leaks", p._allocator.usedBytes(), 0);
     return result;
 }
 

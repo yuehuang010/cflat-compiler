@@ -166,7 +166,7 @@ void buildFrame() {
                 if (y < g_H) {
                     int c = g_px[y * g_W + x];
                     if (c >= 1 && c <= 48)
-                        present = present | ((i64)1 << (c - 1));
+                        present = present | (1 << (c - 1));
                 }
                 row++;
             }
@@ -176,7 +176,7 @@ void buildFrame() {
         // Second pass: encode each present color with RLE.
         int c = 1;
         while (c <= 48) {
-            if ((present >> (c - 1)) & (i64)1) {
+            if ((present >> (c - 1)) & 1) {
                 sxCh('#'); sxInt(c);
                 char prev = '\0';
                 int  run  = 0;
@@ -226,7 +226,7 @@ int strToInt(const char* s) {
     int v = 0, i = 0;
     bool found = false;
     while (s[i] >= '0' && s[i] <= '9') {
-        v = v * 10 + (int)(s[i] - '0');
+        v = v * 10 + s[i] - '0';
         found = true;
         i++;
     }

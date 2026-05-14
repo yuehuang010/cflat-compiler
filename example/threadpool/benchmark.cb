@@ -55,7 +55,7 @@ void scenarioSingleProducer(int workers, int taskCount) {
     ThreadPool pool;
     pool.init(workers);
 
-    g_taskCounter.store((i64)0);
+    g_taskCounter.store(0);
 
     Stopwatch sw;
     sw.start();
@@ -85,7 +85,7 @@ void scenarioMultiProducer(int workers, int producers, int totalTasks) {
     ThreadPool pool;
     pool.init(workers);
 
-    g_taskCounter.store((i64)0);
+    g_taskCounter.store(0);
 
     int perProducer = totalTasks / producers;
     int actualTotal = perProducer * producers;

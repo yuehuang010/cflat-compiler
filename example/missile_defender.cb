@@ -424,8 +424,8 @@ extern int main()
                 if (key.vkCode == (i16)VK_ESCAPE) g_running = false;
             } else if (evType == 2) {
                 if (mouse.isPress() && mouse.leftButton()) {
-                    int bc = toBoardCol((int)mouse.x + 1);
-                    int br = toBoardRow((int)mouse.y + 1);
+                    int bc = toBoardCol(mouse.x + 1);
+                    int br = toBoardRow(mouse.y + 1);
                     if (bc >= 0 && br >= 0 && br < BOARD_H - 1)
                         fireInterceptor(bc, br);
                 }

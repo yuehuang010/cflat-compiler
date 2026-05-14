@@ -199,8 +199,8 @@ int testFileInstanceMethods()
     i8* rbuf = new i8[4];
     int nread = f->readBytes(rbuf, 4);
     passed += Test("readBytes count", nread, 4);
-    passed += Test("readBytes[0]", (int)rbuf[0], 10);
-    passed += Test("readBytes[3]", (int)rbuf[3], 40);
+    passed += Test("readBytes[0]", rbuf[0], 10);
+    passed += Test("readBytes[3]", rbuf[3], 40);
 
     f->seek(1, 0);
     passed += Test("tell after seek", f->tell(), 1);

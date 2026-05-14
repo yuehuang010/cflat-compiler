@@ -51,7 +51,7 @@ bool testFixedArrays()
     buf[0] = (char)10;
     buf[1] = (char)20;
     buf[2] = (char)30;
-    int s = (int)buf[0] + (int)buf[1] + (int)buf[2];
+    int s = buf[0] + buf[1] + buf[2];
     if (s != 60) return false;
 
     Packet pkt;
@@ -59,8 +59,8 @@ bool testFixedArrays()
     pkt.data[1] = (char)'i';
     pkt.data[2] = (char)0;
     pkt.length = 2;
-    if ((int)pkt.data[0] != (int)'H') return false;
-    if ((int)pkt.data[1] != (int)'i') return false;
+    if (pkt.data[0] != 'H') return false;
+    if (pkt.data[1] != 'i') return false;
 
     // Regression: struct array must not produce invalid bitcast during default init
     Point[3] pts;
@@ -86,7 +86,7 @@ bool testPointerArray()
     int total = 0;
     while (i < 3)
     {
-        total = total + (int)strlen(words[i]);
+        total = total + strlen(words[i]);
         i++;
     }
     if (total != 14) return false;

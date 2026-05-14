@@ -185,7 +185,7 @@ void renderSixel(Bitmap* bmp)
                 if (y < h)
                 {
                     BitmapPixel px = bmp->get(x, y);
-                    idx[row * w + x] = quantizeRGB((int)px.r, (int)px.g, (int)px.b);
+                    idx[row * w + x] = quantizeRGB(px.r, px.g, px.b);
                 }
                 else
                 {
@@ -279,8 +279,8 @@ void renderHalfBlock(Bitmap* bmp)
         {
             BitmapPixel top = bmp->get(col, row);
             BitmapPixel bot = (row + 1 < h) ? bmp->get(col, row + 1) : top;
-            termPixel((int)top.r, (int)top.g, (int)top.b,
-                      (int)bot.r, (int)bot.g, (int)bot.b);
+            termPixel(top.r, top.g, top.b,
+                      bot.r, bot.g, bot.b);
             col++;
         }
         termReset();

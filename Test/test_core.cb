@@ -337,11 +337,11 @@ int testStack()
 
     passed += Test("stack count after 3 pushes", s.count(), 3);
     passed += Test("stack not empty",            s.isEmpty(), false);
-    passed += Test("stack peek top",             (int)s.peek(), 30);
+    passed += Test("stack peek top",             s.peek(), 30);
 
-    passed += Test("stack pop 1 (LIFO)", (int)s.pop(), 30);
-    passed += Test("stack pop 2",        (int)s.pop(), 20);
-    passed += Test("stack pop 3",        (int)s.pop(), 10);
+    passed += Test("stack pop 1 (LIFO)", s.pop(), 30);
+    passed += Test("stack pop 2",        s.pop(), 20);
+    passed += Test("stack pop 3",        s.pop(), 10);
 
     passed += Test("stack empty after drain", s.isEmpty(), true);
 
@@ -364,11 +364,11 @@ int testQueue()
 
     passed += Test("queue count after 3 enqueues", q.count(), 3);
     passed += Test("queue not empty",              q.isEmpty(), false);
-    passed += Test("queue peek front",             (int)q.peek(), 10);
+    passed += Test("queue peek front",             q.peek(), 10);
 
-    passed += Test("queue dequeue 1 (FIFO)", (int)q.dequeue(), 10);
-    passed += Test("queue dequeue 2",        (int)q.dequeue(), 20);
-    passed += Test("queue dequeue 3",        (int)q.dequeue(), 30);
+    passed += Test("queue dequeue 1 (FIFO)", q.dequeue(), 10);
+    passed += Test("queue dequeue 2",        q.dequeue(), 20);
+    passed += Test("queue dequeue 3",        q.dequeue(), 30);
 
     passed += Test("queue empty after drain", q.isEmpty(), true);
 
@@ -456,7 +456,7 @@ int testFor()
     fb.data[2] = (char)30; fb.data[3] = (char)40;
     int fieldSum = 0;
     for (char b in fb.data)
-        fieldSum += (int)b;
+        fieldSum += b;
     passed += Test("for struct field char[4] sum", fieldSum, 100);
 
     return passed;
@@ -522,20 +522,20 @@ int testHashsetI64()
     int passed = 0;
 
     hashset<i64> s;
-    passed += Test("hs-i64 add 1",    s.add((i64)1),             true);
-    passed += Test("hs-i64 add 2",    s.add((i64)2),             true);
-    passed += Test("hs-i64 add -1",   s.add((i64)-1),            true);
-    passed += Test("hs-i64 add big",  s.add((i64)1000000000000), true);
+    passed += Test("hs-i64 add 1",    s.add(1),             true);
+    passed += Test("hs-i64 add 2",    s.add(2),             true);
+    passed += Test("hs-i64 add -1",   s.add(-1),            true);
+    passed += Test("hs-i64 add big",  s.add(1000000000000), true);
     passed += Test("hs-i64 count 4",  s.count(), 4);
 
-    passed += Test("hs-i64 contains 1",   s.contains((i64)1),            true);
-    passed += Test("hs-i64 contains -1",  s.contains((i64)-1),           true);
-    passed += Test("hs-i64 contains big", s.contains((i64)1000000000000), true);
-    passed += Test("hs-i64 missing 3",    s.contains((i64)3),            false);
+    passed += Test("hs-i64 contains 1",   s.contains(1),            true);
+    passed += Test("hs-i64 contains -1",  s.contains(-1),           true);
+    passed += Test("hs-i64 contains big", s.contains(1000000000000), true);
+    passed += Test("hs-i64 missing 3",    s.contains(3),            false);
 
-    passed += Test("hs-i64 remove -1", s.remove((i64)-1),   true);
-    passed += Test("hs-i64 -1 gone",   s.contains((i64)-1), false);
-    passed += Test("hs-i64 1 still",   s.contains((i64)1),  true);
+    passed += Test("hs-i64 remove -1", s.remove(-1),   true);
+    passed += Test("hs-i64 -1 gone",   s.contains(-1), false);
+    passed += Test("hs-i64 1 still",   s.contains(1),  true);
 
     return passed;
 }
@@ -645,20 +645,20 @@ int testDictI64()
     int passed = 0;
 
     dictionary<i64, int> d;
-    passed += Test("d-i64 add 1=>1",    d.add((i64)1,             1),  true);
-    passed += Test("d-i64 add -1=>-1",  d.add((i64)-1,            -1), true);
-    passed += Test("d-i64 add big=>42", d.add((i64)1000000000000, 42), true);
+    passed += Test("d-i64 add 1=>1",    d.add(1,             1),  true);
+    passed += Test("d-i64 add -1=>-1",  d.add(-1,            -1), true);
+    passed += Test("d-i64 add big=>42", d.add(1000000000000, 42), true);
     passed += Test("d-i64 count 3",     d.count(), 3);
 
-    passed += Test("d-i64 get 1",   d.get((i64)1),             1);
-    passed += Test("d-i64 get -1",  d.get((i64)-1),            -1);
-    passed += Test("d-i64 get big", d.get((i64)1000000000000), 42);
-    passed += Test("d-i64 miss 2",  d.get((i64)2),             0);
+    passed += Test("d-i64 get 1",   d.get(1),             1);
+    passed += Test("d-i64 get -1",  d.get(-1),            -1);
+    passed += Test("d-i64 get big", d.get(1000000000000), 42);
+    passed += Test("d-i64 miss 2",  d.get(2),             0);
 
-    d.set((i64)1, 999);
-    passed += Test("d-i64 set 1",     d.get((i64)1),       999);
-    passed += Test("d-i64 remove -1", d.remove((i64)-1),   true);
-    passed += Test("d-i64 -1 gone",   d.contains((i64)-1), false);
+    d.set(1, 999);
+    passed += Test("d-i64 set 1",     d.get(1),       999);
+    passed += Test("d-i64 remove -1", d.remove(-1),   true);
+    passed += Test("d-i64 -1 gone",   d.contains(-1), false);
 
     return passed;
 }

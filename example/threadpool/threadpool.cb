@@ -70,7 +70,7 @@ struct TaskHandle {
     // Returns true if the task finished within the deadline, false on timeout.
     bool wait_for(int milliseconds) {
         Timer deadline;
-        deadline.start((i64)milliseconds);
+        deadline.start(milliseconds);
         while (done.load() == 0) {
             if (deadline.isExpired()) { return false; }
             SwitchToThread();
@@ -116,14 +116,14 @@ struct TaskResult<T> {
     // Publish a successful result.  Only the first call to set()/fail() wins;
     // subsequent calls are dropped, so a misbehaving task cannot race a reader.
     void set(T val) {
-        if (!_ready.cas((i32)0, (i32)1)) { return; }
+        if (!_ready.cas(0, 1)) { return; }
         _value = val;
         _ready.release(2, () => { });
     }
 
     // Signal an error.  Mutually exclusive with set() via the same CAS.
     void fail() {
-        if (!_ready.cas((i32)0, (i32)1)) { return; }
+        if (!_ready.cas(0, 1)) { return; }
         _failed = true;
         _ready.release(2, () => { });
     }
@@ -131,28 +131,28 @@ struct TaskResult<T> {
     // Block until the result is ready and return it.
     // Only valid after a successful set(); check hasFailed() if the task may fail.
     T get() {
-        while (_ready.load() < (i32)2) { SwitchToThread(); }
+        while (_ready.load() < 2) { SwitchToThread(); }
         _ready.acquire((i32 v) => { });   // acquire fence; pairs with release in set()
         return _value;
     }
 
     // True if fail() was called instead of set().
     bool hasFailed() {
-        while (_ready.load() < (i32)2) { SwitchToThread(); }
+        while (_ready.load() < 2) { SwitchToThread(); }
         _ready.acquire((i32 v) => { });
         return _failed;
     }
 
     // Block until set() or fail() has been called.  Does not consume the result.
     void wait() {
-        while (_ready.load() < (i32)2) { SwitchToThread(); }
+        while (_ready.load() < 2) { SwitchToThread(); }
     }
 
     // Non-blocking poll - true if set() or fail() has been called and the
     // result has been published (state 2).  Returns false while a publisher is
     // mid-write (state 1) so readers never observe partial state.
     bool isReady() {
-        return _ready.load() >= (i32)2;
+        return _ready.load() >= 2;
     }
 };
 
@@ -212,7 +212,7 @@ bool __threadpool_push_by_priority(WorkerCtx* wctx, Task t, int priority) {
 // then()) and by the worker after a task completes.
 void __threadpool_release_inflight(WorkerCtx* wctx) {
     i64 remaining = wctx->inflight->decrement();
-    if (remaining == (i64)0) {
+    if (remaining == 0) {
         wctx->mtx->acquire();
         WakeAllConditionVariable(wctx->drainCv);
         wctx->mtx->release();
@@ -356,7 +356,7 @@ class ThreadPool {
             // done first would take the submit_now path and enqueue a second
             // continuation, so both would run.
             duplicate = true;
-        } else if (dep->done.load() != (i32)0) {
+        } else if (dep->done.load() != 0) {
             // dep already finished and has no continuation registered - the
             // worker has passed its _hasCont check, so we enqueue ourselves.
             submit_now = true;
@@ -528,7 +528,7 @@ class ThreadPool {
             _drainingWorkers.decrement();
         } else {
             _lock.acquire();
-            while (_inflight.read() > (i64)0) { _lock.sleep_cv(&_drainCv); }
+            while (_inflight.read() > 0) { _lock.sleep_cv(&_drainCv); }
             _lock.release();
         }
     }

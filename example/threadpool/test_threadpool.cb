@@ -8,6 +8,8 @@ import "threadpool.cb";
 import "atomic.cb";
 import "cruntime.cb";
 import "time.cb";
+import "list.cb";
+import "program.cb";
 
 // Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
 int Test(const char* name, bool actual, bool expected) {
@@ -68,7 +70,7 @@ int taskCancellable(void* raw, stop_token tok) {
 int taskSlow(void* raw, stop_token tok) {
     // Wall-clock sleep instead of a busy loop so -O2 can't eliminate the work
     // (a pure compute loop with a dead result gets dropped by the optimiser).
-    sleep((i64)50);
+    sleep(50);
     return 0;
 }
 
@@ -282,13 +284,13 @@ bool testCancellation() {
 
     // Give the task time to actually start before we cancel it.  Wall-clock
     // sleep so the wait is real under any optimisation level.
-    sleep((i64)20);
+    sleep(20);
 
     h.cancel();
     h.wait();
 
     result &= Test("task saw cancel",        (int)ctx.sawCancel, 1);
-    result &= Test("task ran some iterations", (int)(ctx.iterations.read() > (i64)0), 1);
+    result &= Test("task ran some iterations", (int)(ctx.iterations.read() > 0), 1);
 
     pool.shutdown();
     return result;
@@ -530,6 +532,56 @@ bool testManyTasksStress() {
     return result;
 }
 
+// --- Program-hosted ThreadPool test ---
+
+program ThreadPoolProgram {
+    ThreadPool pool = default;
+
+    int main(move list<string> args) {
+        pool.init(2);
+
+        int[5] inputs;
+        int i = 0;
+        while (i < 5) { inputs[i] = i + 2; i++; }
+
+        TaskHandle[5] handles {};
+        i = 0;
+        while (i < 5) {
+            pool.submit(taskSquare, &inputs[i], &handles[i]);
+            i++;
+        }
+        pool.drain();
+
+        pool.shutdown();
+
+        // Verify results
+        i = 0;
+        int failed = 0;
+        while (i < 5) {
+            int expected = (i + 2) * (i + 2);
+            if (inputs[i] != expected) {
+                failed = 1;
+                break;
+            }
+            i++;
+        }
+
+        return failed;
+    }
+};
+
+bool testThreadPoolInProgram() {
+    bool result = true;
+
+    ThreadPoolProgram prog;
+    list<string> emptyArgs;
+    prog.run(emptyArgs);
+    prog.WaitForExit();
+
+    result &= Test("program threadpool exit code", prog.exitCode, 0);
+    return result;
+}
+
 extern int main() {
     int total  = 0;
     int passed = 0;
@@ -552,6 +604,7 @@ extern int main() {
     total++; passed += testInitAfterShutdown()           ? 1 : 0;
     total++; passed += testApproxPendingCount()          ? 1 : 0;
     total++; passed += testManyTasksStress()             ? 1 : 0;
+    total++; passed += testThreadPoolInProgram()         ? 1 : 0;
 
     printf("ThreadPool tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

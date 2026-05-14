@@ -11,8 +11,8 @@ extern int main()
 
     total++; passed += Test("a_not_less_than_b", a < b, false);
     total++; passed += Test("b_less_than_c",     b < c, true);
-    total++; passed += Test("min(3,7)=3",        Math.min(b, c), (i32)b);
-    total++; passed += Test("max(3,7)=7",        Math.max(b, c), (i32)c);
+    total++; passed += Test("min(3,7)=3",        Math.min(b, c), b);
+    total++; passed += Test("max(3,7)=7",        Math.max(b, c), c);
 
     // float methods
     float f = 3.7f;
@@ -26,20 +26,20 @@ extern int main()
     i64 big = 0x100000000;  // 2^32
     big = big + 0x42;       // 0x1_0000_0042 - high bits above i32 range
     i32 lo = big.to_i32();
-    total++; passed += Test("i64.to_i32 truncate", lo, (i32)0x42);
+    total++; passed += Test("i64.to_i32 truncate", lo, 0x42);
 
     i32 neg = -1;
     i64 sext = neg.to_i64();
-    total++; passed += Test("i32.to_i64 sign-extend", sext, (i64)-1);
+    total++; passed += Test("i32.to_i64 sign-extend", sext, -1);
 
     i32 pos = 0xFF;
     u64 zext = pos.to_u64();
-    total++; passed += Test("i32.to_u64 zero-extend", (i64)zext, (i64)0xFF);
+    total++; passed += Test("i32.to_u64 zero-extend", zext, 0xFF);
 
     i64 big2 = 0x100000000;
     big2 = big2 + 7;
     u32 ulo = big2.to_u32();
-    total++; passed += Test("i64.to_u32 truncate", (i32)ulo, (i32)7);
+    total++; passed += Test("i64.to_u32 truncate", ulo, 7);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -27,7 +27,7 @@ extern int main()
         driver.injectKey((i16)VK_LEFT, '\0', 0);
         KeyEvent key;
         bool got = term.pollKey(&key);
-        if (!got || key.vkCode != (i16)VK_LEFT) {
+        if (!got || key.vkCode != VK_LEFT) {
             printf("FAIL: inject+poll roundtrip\n");
             term.restore();
             return 1;

@@ -35,21 +35,21 @@ int testRoundTrip()
     BitmapPixel p20 = loaded->get(2, 0);
     BitmapPixel p33 = loaded->get(3, 3);
 
-    passed += Test("pixel(0,0).r", (int)p00.r, 255);
-    passed += Test("pixel(0,0).g", (int)p00.g, 0);
-    passed += Test("pixel(0,0).b", (int)p00.b, 0);
+    passed += Test("pixel(0,0).r", p00.r, 255);
+    passed += Test("pixel(0,0).g", p00.g, 0);
+    passed += Test("pixel(0,0).b", p00.b, 0);
 
-    passed += Test("pixel(1,0).r", (int)p10.r, 0);
-    passed += Test("pixel(1,0).g", (int)p10.g, 255);
-    passed += Test("pixel(1,0).b", (int)p10.b, 0);
+    passed += Test("pixel(1,0).r", p10.r, 0);
+    passed += Test("pixel(1,0).g", p10.g, 255);
+    passed += Test("pixel(1,0).b", p10.b, 0);
 
-    passed += Test("pixel(2,0).r", (int)p20.r, 0);
-    passed += Test("pixel(2,0).g", (int)p20.g, 0);
-    passed += Test("pixel(2,0).b", (int)p20.b, 255);
+    passed += Test("pixel(2,0).r", p20.r, 0);
+    passed += Test("pixel(2,0).g", p20.g, 0);
+    passed += Test("pixel(2,0).b", p20.b, 255);
 
-    passed += Test("pixel(3,3).r", (int)p33.r, 255);
-    passed += Test("pixel(3,3).g", (int)p33.g, 255);
-    passed += Test("pixel(3,3).b", (int)p33.b, 255);
+    passed += Test("pixel(3,3).r", p33.r, 255);
+    passed += Test("pixel(3,3).g", p33.g, 255);
+    passed += Test("pixel(3,3).b", p33.b, 255);
 
     delete loaded;
     File.remove(path);
@@ -66,10 +66,10 @@ int testBounds()
     bmp->create(2, 2);
 
     BitmapPixel oob = bmp->get(-1, 0);
-    passed += Test("oob get x<0 returns zero r", (int)oob.r, 0);
+    passed += Test("oob get x<0 returns zero r", oob.r, 0);
 
     oob = bmp->get(2, 0);
-    passed += Test("oob get x>=w returns zero r", (int)oob.r, 0);
+    passed += Test("oob get x>=w returns zero r", oob.r, 0);
 
     // set out of bounds should not crash
     BitmapPixel px; px.r = 42;

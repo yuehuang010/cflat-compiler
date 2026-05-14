@@ -295,15 +295,15 @@ int testStringView()
     // span() - middle slice "world"
     string_view* wordView = source.span(6, 11);
     passed += Test("span_mid_length", wordView->length(), 5);
-    passed += Test("span_mid_get0",   (int)wordView->get(0), (int)'w');
-    passed += Test("span_mid_get4",   (int)wordView->get(4), (int)'d');
+    passed += Test("span_mid_get0",   wordView->get(0), 'w');
+    passed += Test("span_mid_get4",   wordView->get(4), 'd');
     delete wordView;
 
     // span() - prefix "hello"
     string_view* prefixView = source.span(0, 5);
     passed += Test("span_prefix_length", prefixView->length(), 5);
-    passed += Test("span_prefix_get0",   (int)prefixView->get(0), (int)'h');
-    passed += Test("span_prefix_get4",   (int)prefixView->get(4), (int)'o');
+    passed += Test("span_prefix_get0",   prefixView->get(0), 'h');
+    passed += Test("span_prefix_get4",   prefixView->get(4), 'o');
     delete prefixView;
 
     // span() - empty slice (start == end)

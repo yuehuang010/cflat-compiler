@@ -25,11 +25,11 @@ int producer(void* unused)
     {
         page_arena* pa = g_ac_chan.acquire_arena();
 
-        ChannelPayload* msg = (ChannelPayload*)pa->alloc((i64)sizeof(ChannelPayload));
+        ChannelPayload* msg = (ChannelPayload*)pa->alloc(sizeof(ChannelPayload));
         pa->_root       = (void*)msg;
         msg->_value     = i;
         msg->_count     = 10;
-        msg->_data      = (int*)pa->alloc((i64)10 * (i64)sizeof(int));
+        msg->_data      = (int*)pa->alloc(10 * sizeof(int));
 
         int j = 0;
         while (j < 10)
@@ -74,7 +74,7 @@ int consumer(void* unused)
 
 bool testArenaChannel()
 {
-    g_ac_chan.init(128, (i64)65536);
+    g_ac_chan.init(128, 65536);
 
     Thread prod = default;
     Thread cons = default;
@@ -115,7 +115,7 @@ program ArenaConsumerGlobal
 
 bool testArenaProgram()
 {
-    g_ac_prog.init(128, (i64)65536);
+    g_ac_prog.init(128, 65536);
 
     ArenaConsumerGlobal w;
     list<string> args;
@@ -126,7 +126,7 @@ bool testArenaProgram()
     {
         page_arena* pa = g_ac_prog.acquire_arena();
 
-        ProgramPayload* msg = (ProgramPayload*)pa->alloc((i64)sizeof(ProgramPayload));
+        ProgramPayload* msg = (ProgramPayload*)pa->alloc(sizeof(ProgramPayload));
         pa->_root   = (void*)msg;
         msg->_value = i + 1;
 
@@ -166,7 +166,7 @@ program ArenaConsumerField
 bool testArenaProgramField()
 {
     ArenaConsumerField w;
-    w.ac.init(128, (i64)65536);
+    w.ac.init(128, 65536);
 
     list<string> args;
     w.run(args);
@@ -176,7 +176,7 @@ bool testArenaProgramField()
     {
         page_arena* pa = w.ac.acquire_arena();
 
-        ProgramPayload* msg = (ProgramPayload*)pa->alloc((i64)sizeof(ProgramPayload));
+        ProgramPayload* msg = (ProgramPayload*)pa->alloc(sizeof(ProgramPayload));
         pa->_root   = (void*)msg;
         msg->_value = i + 1;
 

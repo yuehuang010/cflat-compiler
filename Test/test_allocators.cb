@@ -206,7 +206,7 @@ bool testEntryAllocatorEntryTableFull()
     }
     if (ea.usedBytes() != (i64)1025 * 4) return false;
     // Windows allocation granularity is 65536, so two pages = at least 131072.
-    if (ea.totalBytes() < (i64)131072) return false;
+    if (ea.totalBytes() < 131072) return false;
 
     return true;
 }
@@ -226,7 +226,7 @@ bool testEntryAllocatorGarbageCollect()
     ea.garbageCollect();
     if (ea.usedBytes() != 0) return false;
     // Current page is kept even when empty - at least one page remains.
-    if (ea.totalBytes() < (i64)65536) return false;
+    if (ea.totalBytes() < 65536) return false;
 
     return true;
 }
@@ -608,7 +608,7 @@ bool testPagePoolAcquireZeroed()
     int i = 0;
     while (i < 65536)
     {
-        if (bytes[i] != (i8)0) { g_page_pool.release(p); return false; }
+        if (bytes[i] != 0) { g_page_pool.release(p); return false; }
         i = i + 1;
     }
     g_page_pool.release(p);
@@ -631,7 +631,7 @@ bool testPagePoolRecycle()
     if (b != a) return false;
 
     i8* bytesB = (i8*)b;
-    if (bytesB[100] != (i8)0) return false;
+    if (bytesB[100] != 0) return false;
 
     g_page_pool.release(b);
     return true;
@@ -660,10 +660,10 @@ bool testPagePoolSoftCap()
         i = i + 1;
     }
 
-    if (g_page_pool.cachedPages() > (i64)256) return false;
+    if (g_page_pool.cachedPages() > 256) return false;
 
     g_page_pool.cleanup();
-    if (g_page_pool.cachedPages() != (i64)0) return false;
+    if (g_page_pool.cachedPages() != 0) return false;
 
     return true;
 }

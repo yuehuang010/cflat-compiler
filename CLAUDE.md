@@ -103,6 +103,31 @@ test_lsp.bat Debug    # runs against Debug
 
 LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h` (symbol registration), run `test_lsp.bat` to verify LSP behaviour. These are kept separate from `test.bat`.
 
+### Example Programs
+
+Build all example programs in `example/` and subdirectories:
+
+```bash
+example.bat           # runs against Release (default)
+example.bat Debug     # runs against Debug
+```
+
+`example.bat` compiles all runnable `.cb` files in the `example/` tree, automatically skipping library/helper files (`threadpool.cb`, `test_helper.cb`, internal network modules) and setting appropriate import paths per category. Reports pass/fail/skip counts; exits with code 1 if any example fails to compile.
+
+Examples include:
+- **Visualization**: `bitmap.cb` (sixel/half-block image renderer), `stars.cb` (ASCII art starfield)
+- **Games**: `minesweeper.cb`, `tetris.cb`, `missile_defender.cb`
+- **CLI tools**: `shell/wc.cb`, `shell/cmd_cb.cb`
+- **Concurrency**: `threadpool/main.cb`, `threadpool/benchmark.cb`, `threadpool/test_threadpool.cb`
+- **HTTP/REST**: `restAPI/test_http.cb`, `restAPI/test_http_server.cb`
+
+To compile a single example manually:
+
+```bash
+x64/Debug/cflat.exe example/bitmap.cb -o out/bitmap.exe
+x64/Debug/cflat.exe example/threadpool/main.cb -i example/threadpool -o out/main.exe
+```
+
 To run a single test manually:
 
 ```bash

@@ -58,7 +58,7 @@ bool testThreadStartMoveOwnership() {
     t.start(consume_thread_payload, (void*)p);   // ownership transfers into thread
     i32 code = t.join();
     result &= Test("move start observed", observed, 1234);
-    result &= Test("move start exit code", (int)code, 1234);
+    result &= Test("move start exit code", code, 1234);
     result &= Test("move start freed once", g_move_thread_payload_dtors, 1);
     return result;
 }
@@ -85,7 +85,7 @@ bool testThreadReadsThroughPointer() {
     Thread t;
     t.start(readFromPtr, &value);
     i32 code = t.join();
-    result &= Test("read through ptr", (int)code, 42);
+    result &= Test("read through ptr", code, 42);
     return result;
 }
 
@@ -94,7 +94,7 @@ bool testThreadExitCode() {
     Thread t;
     t.start((void* ctx) => { return 42; }, nullptr);
     i32 code = t.join();
-    result &= Test("exit code 42", (int)code, 42);
+    result &= Test("exit code 42", code, 42);
     return result;
 }
 
@@ -141,7 +141,7 @@ bool testLambdaExitCodeFromCtx() {
         return *p * 3;
     }, &value);
     i32 code = t.join();
-    result &= Test("lambda exit code from ctx", (int)code, 30);
+    result &= Test("lambda exit code from ctx", code, 30);
     return result;
 }
 
@@ -193,7 +193,7 @@ bool testThreadExitCodeZero() {
     Thread t;
     t.start((void* ctx) => { return 0; }, nullptr);
     i32 code = t.join();
-    result &= Test("exit code 0", (int)code, 0);
+    result &= Test("exit code 0", code, 0);
     return result;
 }
 
