@@ -46,20 +46,25 @@ program BenchThroughput
 extern int main()
 {
     int N = 500000;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> argsM;
+    list<string> argsB;
+    list<string> argsBk;
+    list<string> argsF;
+    list<string> argsE;
     PerfHeader("Alloc/Dealloc Throughput (N=500000, new int / delete)");
 
     BenchThroughput bm;
     bm.iters = N;
     bm._allocator = new MallocAllocator;
-    bm.run(emptyArgs);
+    bm.run(argsM);
     bm.WaitForExit();
     PerfPrint("MallocAllocator", (i64)N, bm.measuredUs, bm._allocator.peakReserve());
 
     BenchThroughput bb;
     bb.iters = N;
     bb._allocator = new BlockAllocator;
-    bb.run(emptyArgs);
+    bb.run(argsB);
     bb.WaitForExit();
     PerfPrint("BlockAllocator", (i64)N, bb.measuredUs, bb._allocator.peakReserve());
     PerfCheckLeak("BlockAllocator", bb._allocator.usedBytes());
@@ -67,7 +72,7 @@ extern int main()
     BenchThroughput bs;
     bs.iters = N;
     bs._allocator = new BucketAllocator;
-    bs.run(emptyArgs);
+    bs.run(argsBk);
     bs.WaitForExit();
     PerfPrint("BucketAllocator", (i64)N, bs.measuredUs, bs._allocator.peakReserve());
     PerfCheckLeak("BucketAllocator", bs._allocator.usedBytes());
@@ -75,7 +80,7 @@ extern int main()
     BenchThroughput bf;
     bf.iters = N;
     bf._allocator = new FitAllocator;
-    bf.run(emptyArgs);
+    bf.run(argsF);
     bf.WaitForExit();
     PerfPrint("FitAllocator", (i64)N, bf.measuredUs, bf._allocator.peakReserve());
     PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
@@ -83,7 +88,7 @@ extern int main()
     BenchThroughput be;
     be.iters = N;
     be._allocator = new EntryAllocator;
-    be.run(emptyArgs);
+    be.run(argsE);
     be.WaitForExit();
     PerfPrint("EntryAllocator", (i64)N, be.measuredUs, be._allocator.peakReserve());
     PerfCheckLeak("EntryAllocator", be._allocator.usedBytes());

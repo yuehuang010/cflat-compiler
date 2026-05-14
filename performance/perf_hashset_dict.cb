@@ -518,19 +518,22 @@ program BenchDictStrRemove
 void RunHashset(int n, int repeats)
 {
     i64 totalOps = (i64)n * (i64)repeats;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> addArgs;
+    list<string> containsArgs;
+    list<string> removeArgs;
 
     BenchHashsetAdd ba;
     ba.n = n; ba.repeats = repeats;
-    ba.run(emptyArgs); ba.WaitForExit();
+    ba.run(addArgs); ba.WaitForExit();
 
     BenchHashsetContains bc;
     bc.n = n; bc.repeats = repeats;
-    bc.run(emptyArgs); bc.WaitForExit();
+    bc.run(containsArgs); bc.WaitForExit();
 
     BenchHashsetRemove br;
     br.n = n; br.repeats = repeats;
-    br.run(emptyArgs); br.WaitForExit();
+    br.run(removeArgs); br.WaitForExit();
 
     i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
     i64 cntUs = bc.measuredUs; if (cntUs == (i64)0) cntUs = (i64)1;
@@ -546,19 +549,22 @@ void RunHashset(int n, int repeats)
 void RunDict(int n, int repeats)
 {
     i64 totalOps = (i64)n * (i64)repeats;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> addArgs;
+    list<string> getArgs;
+    list<string> removeArgs;
 
     BenchDictAdd ba;
     ba.n = n; ba.repeats = repeats;
-    ba.run(emptyArgs); ba.WaitForExit();
+    ba.run(addArgs); ba.WaitForExit();
 
     BenchDictGet bg;
     bg.n = n; bg.repeats = repeats;
-    bg.run(emptyArgs); bg.WaitForExit();
+    bg.run(getArgs); bg.WaitForExit();
 
     BenchDictRemove br;
     br.n = n; br.repeats = repeats;
-    br.run(emptyArgs); br.WaitForExit();
+    br.run(removeArgs); br.WaitForExit();
 
     i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
     i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;
@@ -574,15 +580,17 @@ void RunDict(int n, int repeats)
 void RunListStr(int n, int repeats)
 {
     i64 totalOps = (i64)n * (i64)repeats;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> addArgs;
+    list<string> getArgs;
 
     BenchListStrAdd ba;
     ba.n = n; ba.repeats = repeats;
-    ba.run(emptyArgs); ba.WaitForExit();
+    ba.run(addArgs); ba.WaitForExit();
 
     BenchListStrGet bg;
     bg.n = n; bg.repeats = repeats;
-    bg.run(emptyArgs); bg.WaitForExit();
+    bg.run(getArgs); bg.WaitForExit();
 
     i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
     i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;
@@ -596,19 +604,22 @@ void RunListStr(int n, int repeats)
 void RunHashsetStr(int n, int repeats)
 {
     i64 totalOps = (i64)n * (i64)repeats;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> addArgs;
+    list<string> containsArgs;
+    list<string> removeArgs;
 
     BenchHashsetStrAdd ba;
     ba.n = n; ba.repeats = repeats;
-    ba.run(emptyArgs); ba.WaitForExit();
+    ba.run(addArgs); ba.WaitForExit();
 
     BenchHashsetStrContains bc;
     bc.n = n; bc.repeats = repeats;
-    bc.run(emptyArgs); bc.WaitForExit();
+    bc.run(containsArgs); bc.WaitForExit();
 
     BenchHashsetStrRemove br;
     br.n = n; br.repeats = repeats;
-    br.run(emptyArgs); br.WaitForExit();
+    br.run(removeArgs); br.WaitForExit();
 
     i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
     i64 cntUs = bc.measuredUs; if (cntUs == (i64)0) cntUs = (i64)1;
@@ -624,19 +635,22 @@ void RunHashsetStr(int n, int repeats)
 void RunDictStr(int n, int repeats)
 {
     i64 totalOps = (i64)n * (i64)repeats;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> addArgs;
+    list<string> getArgs;
+    list<string> removeArgs;
 
     BenchDictStrAdd ba;
     ba.n = n; ba.repeats = repeats;
-    ba.run(emptyArgs); ba.WaitForExit();
+    ba.run(addArgs); ba.WaitForExit();
 
     BenchDictStrGet bg;
     bg.n = n; bg.repeats = repeats;
-    bg.run(emptyArgs); bg.WaitForExit();
+    bg.run(getArgs); bg.WaitForExit();
 
     BenchDictStrRemove br;
     br.n = n; br.repeats = repeats;
-    br.run(emptyArgs); br.WaitForExit();
+    br.run(removeArgs); br.WaitForExit();
 
     i64 addUs = ba.measuredUs; if (addUs == (i64)0) addUs = (i64)1;
     i64 getUs = bg.measuredUs; if (getUs == (i64)0) getUs = (i64)1;

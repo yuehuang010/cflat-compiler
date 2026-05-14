@@ -46,7 +46,7 @@ extern int main()
 {
     int K = 100;
     int M = 1000;
-    list<string> emptyArgs;
+    // run() moves its args list, so a fresh one is declared per iteration below.
     PerfHeader("Program Lifecycle: K=100 runs x M=1000 allocs each");
     printf("  (ns/op = average time per run+WaitForExit cycle)\n");
 
@@ -58,6 +58,7 @@ extern int main()
     int k = 0;
     while (k < K)
     {
+        list<string> emptyArgs;
         pm.run(emptyArgs);
         pm.WaitForExit();
         k++;
@@ -73,6 +74,7 @@ extern int main()
     k = 0;
     while (k < K)
     {
+        list<string> emptyArgs;
         pb.run(emptyArgs);
         pb.WaitForExit();
         k++;
@@ -89,6 +91,7 @@ extern int main()
     k = 0;
     while (k < K)
     {
+        list<string> emptyArgs;
         ps.run(emptyArgs);
         ps.WaitForExit();
         k++;
@@ -105,6 +108,7 @@ extern int main()
     k = 0;
     while (k < K)
     {
+        list<string> emptyArgs;
         pf.run(emptyArgs);
         pf.WaitForExit();
         k++;
@@ -121,6 +125,7 @@ extern int main()
     k = 0;
     while (k < K)
     {
+        list<string> emptyArgs;
         pe.run(emptyArgs);
         pe.WaitForExit();
         k++;

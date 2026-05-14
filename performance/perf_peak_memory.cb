@@ -56,20 +56,24 @@ program BenchPeakMemory
 extern int main()
 {
     int N = 50000;
-    list<string> emptyArgs;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> argsM;
+    list<string> argsBk;
+    list<string> argsF;
+    list<string> argsE;
     PerfHeader("Peak Memory: hold N live allocs then free-all (N=50000 int*)");
 
     BenchPeakMemory bm;
     bm.count = N;
     bm._allocator = new MallocAllocator;
-    bm.run(emptyArgs);
+    bm.run(argsM);
     bm.WaitForExit();
     PerfPrint("MallocAllocator", (i64)N, bm.measuredUs, bm._allocator.peakReserve());
 
     BenchPeakMemory bs;
     bs.count = N;
     bs._allocator = new BucketAllocator;
-    bs.run(emptyArgs);
+    bs.run(argsBk);
     bs.WaitForExit();
     PerfPrint("BucketAllocator", (i64)N, bs.measuredUs, bs._allocator.peakReserve());
     PerfCheckLeak("BucketAllocator", bs._allocator.usedBytes());
@@ -77,7 +81,7 @@ extern int main()
     BenchPeakMemory bf;
     bf.count = N;
     bf._allocator = new FitAllocator;
-    bf.run(emptyArgs);
+    bf.run(argsF);
     bf.WaitForExit();
     PerfPrint("FitAllocator", (i64)N, bf.measuredUs, bf._allocator.peakReserve());
     PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
@@ -85,7 +89,7 @@ extern int main()
     BenchPeakMemory be;
     be.count = N;
     be._allocator = new EntryAllocator;
-    be.run(emptyArgs);
+    be.run(argsE);
     be.WaitForExit();
     PerfPrint("EntryAllocator", (i64)N, be.measuredUs, be._allocator.peakReserve());
     PerfCheckLeak("EntryAllocator", be._allocator.usedBytes());

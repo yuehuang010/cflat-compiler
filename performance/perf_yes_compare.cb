@@ -236,7 +236,13 @@ program StreamConsumer
 
 extern int main()
 {
-    list<string> args;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> chProdArgs;
+    list<string> chConsArgs;
+    list<string> spscProdArgs;
+    list<string> spscConsArgs;
+    list<string> strProdArgs;
+    list<string> strConsArgs;
     int dur_ms = BENCH_SECS * 1000;
     i64 dur_s  = (i64)BENCH_SECS;
 
@@ -253,8 +259,8 @@ extern int main()
     chSrc.init();
     chProd.token = chSrc.get_token();
     chCons.token = chSrc.get_token();
-    chProd.run(args);
-    chCons.run(args);
+    chProd.run(chProdArgs);
+    chCons.run(chConsArgs);
     sleep(dur_ms);
     chSrc.request_stop();
     chProd.WaitForExit();
@@ -274,8 +280,8 @@ extern int main()
     spscSrc.init();
     spscProd.token = spscSrc.get_token();
     spscCons.token = spscSrc.get_token();
-    spscProd.run(args);
-    spscCons.run(args);
+    spscProd.run(spscProdArgs);
+    spscCons.run(spscConsArgs);
     sleep(dur_ms);
     spscSrc.request_stop();
     spscProd.WaitForExit();
@@ -312,8 +318,8 @@ extern int main()
     strProd.token = streamSrc.get_token();
     strProd >> s;
     s >> strCons;
-    strProd.run(args);
-    strCons.run(args);
+    strProd.run(strProdArgs);
+    strCons.run(strConsArgs);
     strProd._thread.setAffinity((u64)1);  // core 0
     strCons._thread.setAffinity((u64)2);  // core 1
     sleep(dur_ms);

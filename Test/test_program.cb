@@ -1,6 +1,7 @@
 import "list.cb";
 import "thread.cb";
 import "filesystem.cb";
+import "malloc_allocator.cb";
 import "test_helper.cb";
 import program "library/hello_imported.cb" as Hello;
 
@@ -381,6 +382,27 @@ bool testAllocatorUsedBlocksLeaked() {
     h.WaitForExit();
     result &= Test("heap stress sum 5", h.exitCode, 15);
     result &= Test("usedBytes no leak after exit", h._allocator.usedBytes(), (i64)0);
+    return result;
+}
+
+// Regression: assigning `new <Allocator>` to the synthetic `_allocator` field
+// must compile. `_allocator` is an IAllocator fat-ptr declared with both Pointer
+// and IsInterface set; the assignment path used to misfire a "cannot assign a
+// value of type 'MallocAllocator' to pointer variable" error after performing a
+// correct interface upcast, because the pointer/struct-value guard did not
+// exempt interface targets.
+bool testAllocatorCustomAssignedBeforeRun() {
+    bool result = true;
+    HeapStress h;
+    h.count = 5;
+    h._allocator = new MallocAllocator;   // <- the assignment that used to fail to compile
+    list<string> args;
+    h.run(args);
+    h.WaitForExit();
+    result &= Test("custom allocator exit code", h.exitCode, 15);
+    // MallocAllocator tracks cumulative alloc bytes; 5x `new int` => at least 20 bytes,
+    // proving the user-assigned allocator (not the default) actually serviced main().
+    result &= Test("custom allocator was used", h._allocator.totalBytes() >= (i64)20, true);
     return result;
 }
 
@@ -1012,6 +1034,7 @@ extern int main() {
     total++; passed += testAllocatorNullBeforeRun()      ? 1 : 0;
     total++; passed += testAllocatorUsedBlocksCleanExit() ? 1 : 0;
     total++; passed += testAllocatorUsedBlocksLeaked()   ? 1 : 0;
+    total++; passed += testAllocatorCustomAssignedBeforeRun() ? 1 : 0;
     total++; passed += testOnStdoutNamedCallback()       ? 1 : 0;
     total++; passed += testOnStdoutSecondCallback()      ? 1 : 0;
     total++; passed += testOnStdoutNullByDefault()       ? 1 : 0;

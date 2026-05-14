@@ -131,7 +131,9 @@ i64 bench_program(char* word, int word_len, int dur_ms, i64 dur_s)
     g_word     = word;
     g_word_len = word_len;
 
-    list<string> args;
+    // run() takes ownership of (moves) its args list, so each program needs its own.
+    list<string> prodArgs;
+    list<string> consArgs;
     stream s;
     s.bufferSize = 65536;
     s.init();
@@ -143,8 +145,8 @@ i64 bench_program(char* word, int word_len, int dur_ms, i64 dur_s)
     prod.token = src.get_token();
     prod >> s;
     s >> cons;
-    prod.run(args);
-    cons.run(args);
+    prod.run(prodArgs);
+    cons.run(consArgs);
     prod._thread.setAffinity((u64)1);  // core 0
     cons._thread.setAffinity((u64)2);  // core 1
     sleep(dur_ms);

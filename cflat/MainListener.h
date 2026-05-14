@@ -4224,7 +4224,10 @@ public:
 
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
+            // Interface targets are exempt: an interface slot legitimately holds a fat-ptr
+            // struct value (produced by the upcast above), even when Pointer is set.
             if (operatorText == "=" && right && namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsFunctionPointer
+                && !namedVar.TypeAndValue.IsInterface
                 && right->getType()->isStructTy())
             {
                 LogErrorContext(ctx, std::format(
