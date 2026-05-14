@@ -645,6 +645,25 @@ private:
         }
     }
 
+    // Returns the Storage alloca and BaseType for a named variable in any active
+    // scope (innermost first). Searches both functionArgument (for move params)
+    // and namedVariable. Used by the transfer-ownership path to find the source
+    // alloca when an expression (e.g. a cast) has cleared rightNV.Storage but
+    // CallerName still names the original variable.
+    struct VarStorageRef { llvm::Value* Storage = nullptr; llvm::Type* BaseType = nullptr; };
+    VarStorageRef FindVariableStorage(const std::string& name) const
+    {
+        if (name.empty()) return {};
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return { it->second.Storage, it->second.BaseType };
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return { it->second.Storage, it->second.BaseType };
+        }
+        return {};
+    }
+
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount)
     {
         auto* zeroCond = builder->CreateICmpEQ(refCount, builder->getInt32(0), "refiszero");
@@ -4784,12 +4803,23 @@ public:
                 // Interface fat-ptr parameters (non-pointer) borrow the caller's data - don't zero it.
                 // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.
                 bool isInterfaceBorrow = candidate.Parameters[i].IsInterface && !candidate.Parameters[i].IsInterfacePointer;
-                if (matched[i].Storage != nullptr && !isInterfaceBorrow)
+                // When the arg expression went through a cast (or similar), matched[i].Storage
+                // may be cleared even though CallerName still names the original owning variable.
+                // Look up the source by name so we still null its alloca and prevent a double-free.
+                llvm::Value* srcStorage = matched[i].Storage;
+                llvm::Type*  srcBaseTy  = matched[i].BaseType;
+                if (srcStorage == nullptr && !matched[i].CallerName.empty())
                 {
-                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(matched[i].BaseType))
+                    auto ref = FindVariableStorage(matched[i].CallerName);
+                    srcStorage = ref.Storage;
+                    if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
+                }
+                if (srcStorage != nullptr && !isInterfaceBorrow)
+                {
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
                     {
                         // Pointer move param: null the caller's storage.
-                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), matched[i].Storage);
+                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
                     }
                     else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
                     {
@@ -4797,25 +4827,25 @@ public:
                         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
                         if (strTy)
                         {
-                            auto* ptrField = builder->CreateStructGEP(strTy, matched[i].Storage, 0);
+                            auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
                             auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
                             builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
                         }
                     }
-                    else if (auto* stTy = llvm::dyn_cast<llvm::StructType>(matched[i].BaseType))
+                    else if (auto* stTy = llvm::dyn_cast<llvm::StructType>(srcBaseTy))
                     {
                         // Struct move param: zero the caller's entire struct so its destructor is a no-op.
-                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), matched[i].Storage);
+                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
                     }
                 }
                 // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
-                if (!matched[i].CallerName.empty() && matched[i].Storage != nullptr &&
-                    !isInterfaceBorrow && matched[i].BaseType != nullptr)
+                if (!matched[i].CallerName.empty() && srcStorage != nullptr &&
+                    !isInterfaceBorrow && srcBaseTy != nullptr)
                 {
-                    bool isPtr = llvm::isa<llvm::PointerType>(matched[i].BaseType);
+                    bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
                     bool isOwningStr = candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString;
-                    bool isStruct = llvm::isa<llvm::StructType>(matched[i].BaseType);
+                    bool isStruct = llvm::isa<llvm::StructType>(srcBaseTy);
                     if (isPtr || isOwningStr || isStruct)
                         MarkVariableMoved(matched[i].CallerName);
                 }

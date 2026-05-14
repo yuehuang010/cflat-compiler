@@ -159,12 +159,11 @@ struct Task {
 };
 
 // ── WorkerStartCtx ────────────────────────────────────────────────────────────
-// Heap-allocated (malloc) per worker thread by init() and resize().  Freed by
-// the worker itself at startup before entering the work loop.  malloc/free is
-// used (not new/delete) because Thread.start takes the context as a plain
-// void* - the ownership tracker can't follow the pointer through the type-
-// erased function<int(void*)> callback, so 'new' would trigger a scope-exit
-// delete at the caller in addition to the worker's free.
+// Heap-allocated per worker thread by init() and resize().  Ownership transfers
+// to the worker thread through Thread.start's move overload: the callsite is
+// auto-nulled, the trampoline moves the pointer into __threadpool_worker, and
+// the cast inside the worker preserves the owning flag so 'delete ws' is the
+// single, well-formed free.
 //
 struct WorkerStartCtx {
     WorkerCtx* wctx = nullptr;
@@ -254,10 +253,10 @@ class ThreadPool {
         _workers  = new Thread[workerCount];
         int i = 0;
         while (i < workerCount) {
-            WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
+            WorkerStartCtx* sc = new WorkerStartCtx();
             sc->wctx = &_ctx;
             sc->slot = i;
-            _workers[i].start(__threadpool_worker, sc);
+            _workers[i].start(__threadpool_worker, sc);   // ownership transfers to worker
             i++;
         }
     }
@@ -434,10 +433,10 @@ class ThreadPool {
             int j = oldCount;
             while (j < newCount) {
                 _workerStops[j].init();
-                WorkerStartCtx* sc = (WorkerStartCtx*)malloc(sizeof(WorkerStartCtx));
+                WorkerStartCtx* sc = new WorkerStartCtx();
                 sc->wctx = &_ctx;
                 sc->slot = j;
-                _workers[j].start(__threadpool_worker, sc);
+                _workers[j].start(__threadpool_worker, sc);   // ownership transfers to worker
                 j++;
             }
         } else {
@@ -445,14 +444,14 @@ class ThreadPool {
             // Signal per-worker stops for slots being retired.
             int k = newCount;
             while (k < oldCount) { _workerStops[k].request_stop(); k++; }
-            // Pulse the semaphore until every dying worker has exited.  A
-            // surviving worker that steals a token finds no task and re-blocks,
-            // so we keep pulsing; each dying worker needs exactly one wakeup to
-            // see its stop and zero its ID slot.
+            // Pulse the semaphore until every dying worker has exited.  Use
+            // try_join(0) (OS-level probe) rather than checking _workerIds[k]:
+            // a newly-started worker may not have registered its TID yet, so
+            // _workerIds[k] == 0 conflates "not started" with "exited" and
+            // would cause join() to hang on a still-running thread.
             k = newCount;
             while (k < oldCount) {
-                if (_workerIds[k] == (u32)0) {
-                    _workers[k].join();
+                if (_workers[k].try_join(0)) {
                     _workerStops[k].dispose();
                     k++;
                 } else {
@@ -611,12 +610,14 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     }
 }
 
-// Worker body - runs on each thread.
-int __threadpool_worker(void* raw) {
+// Worker body - runs on each thread.  'raw' is moved in by Thread.start's move
+// trampoline; the cast transfers ownership to 'ws' and 'delete ws' is the
+// single, well-formed free.
+int __threadpool_worker(move void* raw) {
     WorkerStartCtx* ws   = (WorkerStartCtx*)raw;
     WorkerCtx*      wctx = ws->wctx;
     int             slot = ws->slot;
-    free((void*)ws);   // startup context no longer needed
+    delete ws;
 
     stop_token poolStop = wctx->stop->get_token();
     stop_token myStop   = wctx->workerStops[slot].get_token();

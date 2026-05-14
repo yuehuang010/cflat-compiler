@@ -3512,6 +3512,8 @@ public:
                 bool srcIsUnsigned = false;
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
+                bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
+                std::string srcOwningName;          // name of the original owning source, for nulling on transfer
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -3683,6 +3685,15 @@ public:
                                 srcBorrowedOrigin = rightNV.BorrowedOrigin.empty()
                                     ? rightNV.CallerName
                                     : rightNV.BorrowedOrigin;
+                                // Trigger transfer only when the RHS is an owning pointer whose
+                                // source link was severed (Storage cleared) - typically by a cast.
+                                // Direct refs ('T* q = p') keep Storage set and follow today's
+                                // alias semantics in ParseDeclaration; we don't disturb them.
+                                srcIsOwningMove = rightNV.IsOwning
+                                    && rightNV.TypeAndValue.Pointer
+                                    && rightNV.Storage == nullptr
+                                    && !rightNV.CallerName.empty();
+                                srcOwningName = rightNV.CallerName;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                             }
@@ -3894,6 +3905,32 @@ public:
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
                             }
                         }
+
+                        // Propagate move ownership: if the RHS is a cast (or similar) over an
+                        // owning pointer source - the source link was severed (Storage cleared)
+                        // but CallerName still names the original - transfer ownership to this
+                        // local: tag it owning, null the source alloca, mark source moved.
+                        // Without this, both the source's scope-exit cleanup and any 'delete'
+                        // on this local would free the same pointer (double-free).
+                        // Move params are treated like new-allocated for this purpose.
+                        if (srcIsOwningMove && typeAndValue.Pointer && !compiler->lastOwningResult)
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            if (!nv.IsOwning)
+                            {
+                                nv.IsOwning = true;
+                                nv.IsNewAllocated = true;
+                                auto ref = compiler->FindVariableStorage(srcOwningName);
+                                if (ref.Storage != nullptr)
+                                {
+                                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ref.BaseType))
+                                        compiler->builder->CreateStore(
+                                            llvm::ConstantPointerNull::get(ptrTy), ref.Storage);
+                                }
+                                compiler->MarkVariableMoved(srcOwningName);
+                            }
+                        }
+
                     }
                 }
             }
@@ -4255,18 +4292,31 @@ public:
             // Move params (IsOwning && !IsNewAllocated): null for any destination type.
             // New-allocated locals (IsOwning && IsNewAllocated): null only for local destinations;
             //   struct-field escapes use refcount above so both sides validly hold the pointer.
-            if (operatorText == "=" && rightNV.IsOwning && rightNV.Storage != nullptr
+            // When the RHS came through a cast that cleared rightNV.Storage, fall back to
+            // looking up the original variable by CallerName so the source is still nulled.
+            if (operatorText == "=" && rightNV.IsOwning
                 && rightNV.TypeAndValue.Pointer
                 && (!rightNV.IsNewAllocated
                     || destination == nullptr
                     || llvm::isa<llvm::AllocaInst>(destination)
                     || llvm::isa<llvm::GlobalVariable>(destination)))
             {
-                if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
+                llvm::Value* srcStorage = rightNV.Storage;
+                llvm::Type*  srcBaseTy  = rightNV.BaseType;
+                if (srcStorage == nullptr && !rightNV.CallerName.empty())
                 {
-                    compiler->builder->CreateStore(
-                        llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
-                    compiler->MarkVariableMoved(rightNV.CallerName);
+                    auto ref = compiler->FindVariableStorage(rightNV.CallerName);
+                    srcStorage = ref.Storage;
+                    srcBaseTy  = ref.BaseType;
+                }
+                if (srcStorage != nullptr)
+                {
+                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
+                    {
+                        compiler->builder->CreateStore(
+                            llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                    }
                 }
             }
             // Transfer ownership for move string: null _ptr so string.dtor is a no-op

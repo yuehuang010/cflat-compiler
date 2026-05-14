@@ -39,14 +39,11 @@ struct MoveThreadPayload {
 int g_move_thread_payload_dtors = 0;
 
 int consume_thread_payload(move void* ctx) {
-    MoveThreadPayload* p = (MoveThreadPayload*)ctx;
+    MoveThreadPayload* p = (MoveThreadPayload*)ctx;   // cast transfers ownership ctx -> p
     *p->slot = p->value;
     int v = p->value;
-    free((void*)p);
     g_move_thread_payload_dtors = g_move_thread_payload_dtors + 1;
-    // ctx and p alias the same heap block; we already freed it via free(p).
-    // Null ctx so the move-param scope-exit cleanup doesn't double-free.
-    ctx = nullptr;
+    // p owns the payload; scope-exit cleanup (operator delete) frees it once.
     return v;
 }
 
@@ -54,11 +51,11 @@ bool testThreadStartMoveOwnership() {
     bool result = true;
     g_move_thread_payload_dtors = 0;
     int observed = 0;
-    MoveThreadPayload* p = (MoveThreadPayload*)malloc(sizeof(MoveThreadPayload));
+    MoveThreadPayload* p = new MoveThreadPayload();
     p->slot  = &observed;
     p->value = 1234;
     Thread t;
-    t.start(consume_thread_payload, (void*)p);
+    t.start(consume_thread_payload, (void*)p);   // ownership transfers into thread
     i32 code = t.join();
     result &= Test("move start observed", observed, 1234);
     result &= Test("move start exit code", (int)code, 1234);
