@@ -21,6 +21,7 @@
     { "include": "#keywords-cflat-extension" },
     { "include": "#keywords-c11" },
     { "include": "#constants" },
+    { "include": "#generic-type-args" },
     { "include": "#type-in-declaration" },
     { "include": "#function-definition" },
     { "include": "#function-call" },
@@ -252,6 +253,16 @@
         "1": { "name": "keyword.operator.expression.cflat" },
         "2": { "name": "entity.name.type.cflat" }
       }
+    },
+    "generic-type-args": {
+      "comment": "Type names inside generic angle brackets, e.g. array<Explosion>, list<Foo*>, dictionary<string, int>. The lookbehind requires an identifier immediately before '<' and the lookahead requires the content to look like a type-arg list, which avoids matching arithmetic comparisons.",
+      "begin": "(?<=[A-Za-z_][A-Za-z0-9_])\\s*<(?=\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\*?\\s*[,>])",
+      "end": ">",
+      "patterns": [
+        { "include": "#keywords-type" },
+        { "include": "#keywords-qualifier" },
+        { "name": "entity.name.type.cflat", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" }
+      ]
     },
     "type-in-declaration": {
       "comment": "User-defined type name in variable/parameter declaration: 'TypeName varName;' or 'TypeName* varName ='",

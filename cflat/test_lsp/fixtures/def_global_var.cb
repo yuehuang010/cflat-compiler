@@ -1,0 +1,5 @@
+// $cursor line=2 col=27
+// $expect definition line=1
+struct Item { int x = 0; };
+Item g_obj = default;
+extern int main() { return g_obj.x; }

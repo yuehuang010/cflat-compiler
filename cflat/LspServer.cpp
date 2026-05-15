@@ -511,47 +511,78 @@ private:
 
         std::string word = extractWordAt(text, line, character);
         auto index = GetCurrentIndex();
-        const SymbolDef* def = word.empty() ? nullptr : index->Lookup(word);
+        const SymbolDef* def = nullptr;
 
-        // Cursor is on a local variable name - follow through to the type's definition.
-        if (!def)
+        // If the cursor follows "receiver.", resolve via the receiver first.
+        // Otherwise an unqualified Lookup(word) on a method name like "get" can
+        // hijack the answer with a same-named top-level function from elsewhere
+        // (e.g. string.cb's `get`).
+        std::string receiver;
+        if (!word.empty())
         {
-            const std::string* typeName = word.empty() ? nullptr : index->LookupVariableType(word);
+            auto rp = extractReceiverAt(text, line, character);
+            receiver = rp.first;
+        }
+        if (!receiver.empty())
+        {
+            const std::string* typeName = index->LookupVariableType(receiver);
             if (typeName)
             {
-                def = index->Lookup(*typeName);
-                // Also try the unqualified part of the type name ("Point" from "Geometry.Point").
+                // Variable receiver: try "Circle.center", then unqualified type "Circle.center".
+                def = index->Lookup(*typeName + "." + word);
                 if (!def)
                 {
                     size_t dot = typeName->rfind('.');
                     if (dot != std::string::npos)
-                        def = index->Lookup(typeName->substr(dot + 1));
+                        def = index->Lookup(typeName->substr(dot + 1) + "." + word);
                 }
+                // Generic instantiation: type is mangled (e.g. "array__Explosion").
+                // Fall back to the template name ("array") so the method on the
+                // generic template definition is discoverable.
+                if (!def)
+                {
+                    size_t dunder = typeName->find("__");
+                    if (dunder != std::string::npos)
+                        def = index->Lookup(typeName->substr(0, dunder) + "." + word);
+                }
+            }
+            else
+            {
+                // Namespace or type name used directly (e.g. "Math.square", "MyStruct.staticFn").
+                def = index->Lookup(receiver + "." + word);
             }
         }
 
-        // Cursor is on a member/static/namespace access (e.g. "myvar.center", "Math.square").
-        if (!def && !word.empty())
+        // Plain identifier (no receiver): direct symbol lookup.
+        if (!def && receiver.empty() && !word.empty())
+            def = index->Lookup(word);
+
+        // Cursor is on a variable name. Prefer jumping to the variable's own
+        // declaration site when we recorded one; otherwise fall through to
+        // the type's definition (legacy behavior for unlocated entries).
+        if (!def && receiver.empty() && !word.empty())
         {
-            auto [receiver, _partial] = extractReceiverAt(text, line, character);
-            if (!receiver.empty())
+            if (const VariableInfo* vi = index->LookupVariable(word))
             {
-                const std::string* typeName = index->LookupVariableType(receiver);
-                if (typeName)
+                if (vi->line > 0 && !vi->file.empty())
                 {
-                    // Variable receiver: try "Circle.center", then unqualified type "Circle.center".
-                    def = index->Lookup(*typeName + "." + word);
+                    lsp::Range range{
+                        { vi->line - 1, vi->column },
+                        { vi->line - 1, vi->column + (int)word.size() }
+                    };
+                    lsp::Location loc{ filePathToUri(vi->file), range };
+                    SendResponse(id, nlohmann::json::array({ lsp::locationToJson(loc) }));
+                    return;
+                }
+                if (!vi->typeName.empty())
+                {
+                    def = index->Lookup(vi->typeName);
                     if (!def)
                     {
-                        size_t dot = typeName->rfind('.');
+                        size_t dot = vi->typeName.rfind('.');
                         if (dot != std::string::npos)
-                            def = index->Lookup(typeName->substr(dot + 1) + "." + word);
+                            def = index->Lookup(vi->typeName.substr(dot + 1));
                     }
-                }
-                else
-                {
-                    // Namespace or type name used directly (e.g. "Math.square", "MyStruct.staticFn").
-                    def = index->Lookup(receiver + "." + word);
                 }
             }
         }
@@ -600,10 +631,21 @@ private:
 
             // LookupPrefix("TypeName.partial") returns matching fields and methods.
             auto members = index->LookupPrefix(typeName + "." + partial);
+            // Generic instantiation: also try the template name (e.g. "array" from
+            // "array__Explosion") so methods defined on the template show up.
+            if (members.empty())
+            {
+                size_t dunder = typeName.find("__");
+                if (dunder != std::string::npos)
+                    members = index->LookupPrefix(typeName.substr(0, dunder) + "." + partial);
+            }
             for (const SymbolDef* def : members)
             {
-                std::string label = def->name.size() > typeName.size() + 1
-                    ? def->name.substr(typeName.size() + 1)
+                // Strip the qualifying type prefix ("X.method" -> "method") regardless
+                // of whether the prefix is the variable's actual type or its template.
+                size_t dot = def->name.rfind('.');
+                std::string label = dot != std::string::npos
+                    ? def->name.substr(dot + 1)
                     : def->name;
                 nlohmann::json item = {{"label", label}, {"detail", def->signatureMarkdown}};
                 switch (def->kind)

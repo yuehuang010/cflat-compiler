@@ -22,6 +22,54 @@ struct Container
     }
 };
 
+// Mirrors the per-request route-param shape from example/restAPI/network/router.cb:
+// a borrowed pointer parameter ('Bag*') whose fields/sub-element fields get freed
+// inside the helper. The compiler used to reject this through the cast-launder
+// check; the fix keeps 'delete bag' rejected but allows 'delete bag->item' and
+// 'delete bag->entries[i].name' (the field's lifetime is the caller's contract).
+struct RouteEntry
+{
+    Resource* name = nullptr;
+};
+
+struct Bag
+{
+    Resource*    item    = nullptr;
+    RouteEntry*  entries = nullptr;
+
+    ~Bag()
+    {
+        if (item != nullptr) delete item;
+        if (entries != nullptr)
+        {
+            int i = 0;
+            while (i < 3)
+            {
+                if (entries[i].name != nullptr) { delete entries[i].name; entries[i].name = nullptr; }
+                i = i + 1;
+            }
+            delete[3] entries;
+        }
+    }
+};
+
+// Borrowed param: caller still owns 'b'. Freeing a field through 'b' is legal.
+void freeBagItem(Bag* b)
+{
+    if (b->item != nullptr) { delete b->item; b->item = nullptr; }
+}
+
+// Borrowed param plus array-subscript-then-field (the router.cb pattern).
+void freeBagEntryNames(Bag* b)
+{
+    int i = 0;
+    while (i < 3)
+    {
+        if (b->entries[i].name != nullptr) { delete b->entries[i].name; b->entries[i].name = nullptr; }
+        i = i + 1;
+    }
+}
+
 // Worker-style payload: pointer to an external observer slot plus a value.
 // Mirrors Test/repro_new_struct.cb but stays single-threaded so the test
 // is hermetic. The caller hands the owning pointer to 'workerMove' which
@@ -330,6 +378,37 @@ extern int main()
         // b still owned here; freed at scope exit.
     }
     passed += Test("probe_borrow_freed_at_scope_exit", dtorCount, 1);
+    total++;
+
+    // Test 9: 'delete borrowedParam->field' is allowed (regression for
+    // example/restAPI/network/router.cb). Both direct field access and
+    // subscript-then-field through a borrowed pointer must compile and run.
+    dtorCount = 0;
+    {
+        Bag bag;
+        bag.item = new Resource();
+        bag.item->id = 1;
+        bag.entries = new RouteEntry[3];
+        int i = 0;
+        while (i < 3)
+        {
+            bag.entries[i].name = new Resource();
+            bag.entries[i].name->id = i + 10;
+            i = i + 1;
+        }
+
+        // 4 resources alive: bag.item plus three entry names.
+        freeBagItem(&bag);
+        passed += Test("delete_field_via_borrowed_ptr", dtorCount, 1);
+        total++;
+
+        freeBagEntryNames(&bag);
+        passed += Test("delete_subscript_field_via_borrowed_ptr", dtorCount, 4);
+        total++;
+
+        // ~Bag runs at scope exit. Both fields nulled above, so no double-free.
+    }
+    passed += Test("bag_dtor_after_field_deletes_no_double_free", dtorCount, 4);
     total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);

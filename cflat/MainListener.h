@@ -622,8 +622,35 @@ private:
     {
         auto* compiler = Compiler(ctx);
         // Generic template definitions are not pre-declared; they are instantiated on demand.
+        // However, we still register the template name and its method names in the LSP
+        // symbol index so hover / go-to-definition can resolve uses through a variable
+        // of the instantiated type (e.g. `g_explosions.getPtr` -> `array.getPtr`).
         if (ctx->genericTypeParameters() != nullptr)
+        {
+            if (auto* s = compiler->GetSymbolSink())
+            {
+                std::string typeName = ctx->directDeclarator()->getText();
+                if (!namespaceName.empty())
+                    typeName = namespaceName + "." + typeName;
+                std::string keyword = ctx->getStart()->getText();
+                std::string doc = ExtractLeadingDoc(tokens_, ctx->getStart());
+                s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            keyword + " " + typeName, {}, doc);
+                for (auto* func : ctx->functionDefinition())
+                {
+                    std::string funcName = getFunctionName(func);
+                    if (funcName == typeName || funcName.empty()) continue;
+                    std::string qualName = typeName + "." + funcName;
+                    std::string fdoc = ExtractLeadingDoc(tokens_, func->getStart());
+                    s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
+                                (int)func->getStart()->getLine(),
+                                (int)func->getStart()->getCharPositionInLine(),
+                                funcName, {}, fdoc);
+                }
+            }
             return;
+        }
 
         std::string typeName = ctx->directDeclarator()->getText();
         if (!namespaceName.empty())
@@ -3996,6 +4023,14 @@ public:
                 {
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
                     compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal);
+                    // Record the variable's declaration site so LSP go-to-definition
+                    // on the variable name lands on the global itself, not on its
+                    // (possibly unregistered, e.g. generic-instantiation) type.
+                    if (auto* s = compiler->GetSymbolSink())
+                        s->RegisterVariable(name, typeAndValue.TypeName,
+                                            compiler->GetSourceFilePath(),
+                                            (int)direct->getStart()->getLine(),
+                                            (int)direct->getStart()->getCharPositionInLine());
                 }
                 else
                 {
@@ -6408,9 +6443,14 @@ public:
 
             // Error: deleting a local that aliases a borrowed parameter (e.g. via cast).
             // 'Payload* p = (Payload*)raw; delete p;' is the laundered form of the case above.
+            // Exempt field accesses (storage is a GEP, not an alloca): 'delete param->field'
+            // is intentionally allowed - the field's lifetime is the caller's contract, just
+            // like the simple-variable check above.
             if (!namedVar.IsOwning
                 && namedVar.IsBorrowed
-                && !namedVar.BorrowedOrigin.empty())
+                && !namedVar.BorrowedOrigin.empty()
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
             {
                 LogErrorContext(ctx, std::format(
                     "cannot delete '{}' - it aliases borrowed parameter '{}'. The caller may own "

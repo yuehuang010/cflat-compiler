@@ -1,0 +1,9 @@
+// $cursor line=6 col=31
+// $expect definition line=2
+struct Wrap<T> {
+T value = default;
+T get() { return value; }
+};
+struct Item { int v = 0; };
+Wrap<Item> g_w = default;
+extern int main() { return g_w.get().v; }
