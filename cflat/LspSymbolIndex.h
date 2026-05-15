@@ -13,6 +13,7 @@ struct SymbolDef
     int line;      // 1-based (ANTLR convention)
     int column;    // 0-based
     std::string signatureMarkdown;
+    std::string docComment;
     std::vector<std::string> memberNames;
 };
 
@@ -21,7 +22,8 @@ class LspSymbolIndex
 public:
     void Register(SymbolKind kind, const std::string& name, const std::string& file,
                   int line, int col, const std::string& sig,
-                  const std::vector<std::string>& members = {});
+                  const std::vector<std::string>& members = {},
+                  const std::string& docComment = {});
     const SymbolDef* Lookup(const std::string& name) const;
     std::vector<const SymbolDef*> LookupPrefix(const std::string& prefix) const;
     void Clear();

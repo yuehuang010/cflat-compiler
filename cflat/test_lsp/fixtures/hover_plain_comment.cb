@@ -1,0 +1,5 @@
+// $cursor line=1 col=11
+// $expect hover contains="multiplies two integers"
+// multiplies two integers
+extern int mul(int a, int b) { return a * b; }
+extern int main() { return mul(2, 3); }

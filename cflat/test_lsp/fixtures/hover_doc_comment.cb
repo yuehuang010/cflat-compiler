@@ -1,0 +1,5 @@
+// $cursor line=1 col=11
+// $expect hover contains="Adds two integers and returns the sum."
+/// Adds two integers and returns the sum.
+extern int add(int a, int b) { return a + b; }
+extern int main() { return add(1, 2); }

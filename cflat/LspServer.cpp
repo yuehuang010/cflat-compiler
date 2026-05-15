@@ -457,10 +457,14 @@ private:
 
         if (!def) { SendResponse(id, nullptr); return; }
 
+        std::string value = def->signatureMarkdown;
+        if (!def->docComment.empty())
+            value += "\n\n" + def->docComment;
+
         SendResponse(id, {
             {"contents", {
                 {"kind", "markdown"},
-                {"value", def->signatureMarkdown}
+                {"value", value}
             }}
         });
     }

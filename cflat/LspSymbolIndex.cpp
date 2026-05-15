@@ -3,7 +3,8 @@
 
 void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const std::string& file,
                                int line, int col, const std::string& sig,
-                               const std::vector<std::string>& members)
+                               const std::vector<std::string>& members,
+                               const std::string& docComment)
 {
     SymbolDef def;
     def.name = name;
@@ -12,6 +13,7 @@ void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const st
     def.line = line;
     def.column = col;
     def.signatureMarkdown = sig;
+    def.docComment = docComment;
     def.memberNames = members;
     symbols_[name] = std::move(def);
 }

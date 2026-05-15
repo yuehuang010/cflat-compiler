@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <format>
 #include <variant>
+#include <optional>
 #include <cstdlib>
 
 #include "CFlatParser.h"
@@ -108,6 +109,147 @@ static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     return directDecl->getText();
 }
 
+// Extract the leading doc comment block above the given declaration's start token.
+// Tier 1 (preferred): contiguous /// or /** ... */ doc comments anchored to the declaration.
+// Tier 2 (fallback): contiguous // or /* ... */ plain comments anchored to the declaration.
+// "Anchored" means no blank line between the comment block and the declaration, and no
+// blank line between adjacent comments in the chain.
+// Returns markdown-ready text with comment markers stripped, or empty string on no match.
+static std::string ExtractLeadingDoc(antlr4::BufferedTokenStream* tokens, antlr4::Token* declStart)
+{
+    if (!tokens || !declStart) return "";
+    size_t idx = declStart->getTokenIndex();
+    auto hidden = tokens->getHiddenTokensToLeft(idx);
+    if (hidden.empty()) return "";
+
+    struct Item { antlr4::Token* tok; int startLine; int endLine; bool isDoc; bool isLine; };
+    auto countNewlines = [](const std::string& s) {
+        int n = 0;
+        for (char c : s) if (c == '\n') ++n;
+        return n;
+    };
+    auto classify = [&](antlr4::Token* t) -> std::optional<Item> {
+        const std::string& text = t->getText();
+        if (text.size() < 2) return std::nullopt;
+        Item it{};
+        it.tok = t;
+        it.startLine = (int)t->getLine();
+        it.endLine = it.startLine + countNewlines(text);
+        if (text.compare(0, 2, "//") == 0)
+        {
+            it.isLine = true;
+            // /// is a doc comment; //// or longer slash run is not.
+            it.isDoc = text.size() >= 3 && text[2] == '/' && (text.size() < 4 || text[3] != '/');
+            return it;
+        }
+        if (text.compare(0, 2, "/*") == 0)
+        {
+            it.isLine = false;
+            // /** ... */ is a doc comment; bare /**/ is not.
+            it.isDoc = text.size() >= 3 && text[2] == '*' && text != "/**/";
+            return it;
+        }
+        return std::nullopt;
+    };
+
+    // Walk hidden tokens right-to-left and collect comments that chain up to the
+    // declaration with no blank line gap.
+    std::vector<Item> chain;
+    int nextExpectedEnd = (int)declStart->getLine() - 1;
+    for (auto it = hidden.rbegin(); it != hidden.rend(); ++it)
+    {
+        auto opt = classify(*it);
+        if (!opt) continue;
+        Item item = *opt;
+        if (item.endLine < nextExpectedEnd) break;     // blank-line gap broke the chain
+        if (item.endLine > nextExpectedEnd) continue;  // comment trailing other code on this line; skip
+        chain.push_back(item);
+        nextExpectedEnd = item.startLine - 1;
+    }
+    if (chain.empty()) return "";
+    std::reverse(chain.begin(), chain.end());
+
+    // Tier 1: keep only the trailing contiguous run of doc comments (closest to decl).
+    // Tier 2 (fallback): if no doc comments at all, keep the whole chain as plain.
+    bool anyDoc = false;
+    for (const auto& it : chain) if (it.isDoc) { anyDoc = true; break; }
+
+    std::vector<Item> selected;
+    if (anyDoc)
+    {
+        size_t first = chain.size();
+        for (size_t i = chain.size(); i-- > 0; )
+        {
+            if (!chain[i].isDoc) break;
+            first = i;
+        }
+        selected.assign(chain.begin() + first, chain.end());
+    }
+    else
+    {
+        selected = std::move(chain);
+    }
+
+    auto trimRight = [](std::string& s) {
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) s.pop_back();
+    };
+
+    std::vector<std::string> outLines;
+    for (const auto& it : selected)
+    {
+        const std::string& text = it.tok->getText();
+        if (it.isLine)
+        {
+            size_t off = it.isDoc ? 3 : 2;  // strip /// or //
+            std::string ln = (text.size() > off) ? text.substr(off) : std::string();
+            if (!ln.empty() && ln.front() == ' ') ln.erase(0, 1);
+            trimRight(ln);
+            outLines.push_back(ln);
+        }
+        else
+        {
+            // Strip leading /* or /** and trailing */.
+            size_t startOff = it.isDoc ? 3 : 2;
+            size_t endOff = (text.size() >= 2 && text.compare(text.size() - 2, 2, "*/") == 0) ? 2 : 0;
+            if (text.size() <= startOff + endOff) continue;
+            std::string body = text.substr(startOff, text.size() - startOff - endOff);
+            std::vector<std::string> lines;
+            std::string cur;
+            for (char c : body)
+            {
+                if (c == '\n') { lines.push_back(cur); cur.clear(); }
+                else cur.push_back(c);
+            }
+            lines.push_back(cur);
+            for (auto& ln : lines)
+            {
+                size_t j = 0;
+                while (j < ln.size() && (ln[j] == ' ' || ln[j] == '\t')) ++j;
+                if (j < ln.size() && ln[j] == '*')
+                {
+                    ++j;
+                    if (j < ln.size() && ln[j] == ' ') ++j;
+                }
+                std::string clean = (j < ln.size()) ? ln.substr(j) : std::string();
+                trimRight(clean);
+                outLines.push_back(clean);
+            }
+        }
+    }
+
+    while (!outLines.empty() && outLines.front().empty()) outLines.erase(outLines.begin());
+    while (!outLines.empty() && outLines.back().empty()) outLines.pop_back();
+    if (outLines.empty()) return "";
+
+    std::string result;
+    for (size_t i = 0; i < outLines.size(); ++i)
+    {
+        if (i > 0) result += '\n';
+        result += outLines[i];
+    }
+    return result;
+}
+
 // Check if a function definition has the 'static' storage class.
 static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
 {
@@ -125,6 +267,7 @@ class ForwardRefScanner
 {
 private:
     LLVMBackend* compilerLLVM;
+    antlr4::BufferedTokenStream* tokens_ = nullptr;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx)
     {
@@ -394,8 +537,10 @@ private:
                 if (!p.VariableName.empty()) sig += " " + p.VariableName;
             }
             sig += ")";
+            std::string doc = ExtractLeadingDoc(tokens_, func->getStart());
             s->Register(SymbolKind::Function, name, compiler->GetSourceFilePath(),
-                        (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
+                        (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
+                        sig, {}, doc);
 
             // Also register under "TypeName.method" for dot-completion prefix lookup.
             // Operators and statics already have the qualified name; only instance methods need this.
@@ -403,7 +548,8 @@ private:
             {
                 std::string qualName = structName + "." + getFunctionName(func);
                 s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
-                            (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(), sig);
+                            (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
+                            sig, {}, doc);
             }
         }
 
@@ -465,7 +611,7 @@ private:
                 memberNames.push_back(m.Name);
             s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        sig, memberNames);
+                        sig, memberNames, ExtractLeadingDoc(tokens_, ctx->getStart()));
         }
     }
 
@@ -489,15 +635,16 @@ private:
         if (auto* s = compiler->GetSymbolSink())
         {
             std::string keyword = ctx->getStart()->getText();
+            std::string doc = ExtractLeadingDoc(tokens_, ctx->getStart());
             s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        keyword + " " + typeName);
+                        keyword + " " + typeName, {}, doc);
             // Also register under the unqualified name so Lookup("Point") finds "Geometry.Point".
             size_t dot = typeName.rfind('.');
             if (dot != std::string::npos)
                 s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            keyword + " " + typeName);
+                            keyword + " " + typeName, {}, doc);
         }
 
         // Pre-declare default constructor
@@ -570,6 +717,7 @@ private:
 
 public:
     ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
+    void SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
 
     // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
     // struct type + default constructor for each generic instantiation found.
@@ -1438,6 +1586,13 @@ public:
 
     void SetImportNamespace(const std::string& ns) { importNamespace_ = ns; }
 
+    // Returns the BufferedTokenStream that backs this listener's parser, so that
+    // helpers like ExtractLeadingDoc can reach the hidden-channel comment tokens.
+    antlr4::BufferedTokenStream* GetTokens() const
+    {
+        return parser ? dynamic_cast<antlr4::BufferedTokenStream*>(parser->getTokenStream()) : nullptr;
+    }
+
     void ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx)
     {
         auto* nameGid = ctx->genericIdentifier();
@@ -1693,7 +1848,8 @@ public:
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + target);
+                            "using " + alias + " = " + target, {},
+                            ExtractLeadingDoc(GetTokens(), ctx->getStart()));
         }
         else if (global_scope)
             compiler->RegisterNamespaceAlias(alias, target);
@@ -1873,6 +2029,7 @@ public:
 
         // First pass: forward ref scan the taken branch to register symbols
         ForwardRefScanner scanner(Compiler());
+        scanner.SetTokens(GetTokens());
         for (auto* extDecl : branchDecls)
             scanner.ScanExternalDeclaration(extDecl, namespaceName);
 
@@ -1891,15 +2048,16 @@ public:
 
         if (auto* s = compiler->GetSymbolSink())
         {
+            std::string doc = ExtractLeadingDoc(GetTokens(), ctx->getStart());
             s->Register(SymbolKind::Namespace, namespaceName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        "namespace " + namespaceName);
+                        "namespace " + namespaceName, {}, doc);
             // Also register under the unqualified name so Lookup("Inner") finds "Outer.Inner".
             size_t dot = namespaceName.rfind('.');
             if (dot != std::string::npos)
                 s->Register(SymbolKind::Namespace, namespaceName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "namespace " + namespaceName);
+                            "namespace " + namespaceName, {}, doc);
         }
 
         for (auto* extDecl : ctx->externalDeclaration())

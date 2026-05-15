@@ -250,6 +250,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
             llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
             if (verbose) std::cout << "[verbose] forward-ref scan (" << sourceFileName << ")\n";
             ForwardRefScanner scanner(this);
+            scanner.SetTokens(&tokens);
             // First pass: pre-declare opaque types and constructors for every
             // generic instantiation found anywhere in the file (including inside
             // function bodies), so uses like Box<MyType> b = Box__MyType() resolve.
@@ -480,6 +481,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
 
     auto* parserPtr = state.parser.get();
+    auto* tokensPtr = state.tokens.get();
     state.canonicalPath = canonicalStr;
     importedParseStates.push_back(std::move(state));
 
@@ -523,6 +525,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
         if (verbose) std::cout << "[verbose]   forward-ref scan: " << importFilename << "\n";
         ForwardRefScanner scanner(this);
+        scanner.SetTokens(tokensPtr);
         // Pre-declare opaque types for all generic instantiations found in the file
         // (including inside function/program bodies) before scanning declarations.
         // Without this pass, program definitions that pre-declare run(Name*, list__string)
@@ -730,6 +733,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         // Forward-ref scan
         {
             ForwardRefScanner scanner(this);
+            scanner.SetTokens(&tokens);
             if (auto* tu = computeUnit->translationUnit())
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
