@@ -7,6 +7,10 @@ set PERF_SRC=performance
 set OUT=out\perf
 set SCRIPT=%~f0
 
+REM Max seconds to wait for the parallel compile workers. Debug-compiler + -O2
+REM builds of all benchmarks at once can take well over a minute on a cold run.
+set TIMEOUT_SECS=180
+
 REM ===========================================================================
 REM Worker mode: compile a single benchmark, write result file
 REM ===========================================================================
@@ -50,8 +54,8 @@ set /a WAITED=0
 set /a DONE=0
 for %%R in (%OUT%\results\*.result) do set /a DONE+=1
 if !DONE! lss !LAUNCHED! (
-    if !WAITED! geq 60 (
-        echo TIMEOUT: only !DONE! of !LAUNCHED! benchmarks compiled after 60s
+    if !WAITED! geq !TIMEOUT_SECS! (
+        echo TIMEOUT: only !DONE! of !LAUNCHED! benchmarks compiled after !TIMEOUT_SECS!s
         goto :Collect
     )
     ping -n 2 127.0.0.1 >nul 2>&1
@@ -62,13 +66,21 @@ if !DONE! lss !LAUNCHED! (
 :Collect
 set /a ERRORS=0
 for %%F in (%BENCH_FILES%) do (
-    set /p RESULT=<"%OUT%\results\%%F.result"
-    if /I "!RESULT:~0,4!" neq "PASS" (
-        echo ERROR: failed to compile %%F.cb
-        type "%OUT%\results\%%F.log"
-        set /a ERRORS+=1
-    ) else (
+    REM Clear RESULT each iteration: a missing .result file leaves `set /p`
+    REM untouched, which would otherwise inherit the previous loop's value
+    REM and silently report an unfinished compile as PASS.
+    set "RESULT="
+    if exist "%OUT%\results\%%F.result" set /p RESULT=<"%OUT%\results\%%F.result"
+    if /I "!RESULT:~0,4!"=="PASS" (
         echo   %%F.cb
+    ) else (
+        if not exist "%OUT%\results\%%F.result" (
+            echo ERROR: %%F.cb did not finish compiling within !TIMEOUT_SECS!s
+        ) else (
+            echo ERROR: failed to compile %%F.cb
+            if exist "%OUT%\results\%%F.log" type "%OUT%\results\%%F.log"
+        )
+        set /a ERRORS+=1
     )
 )
 

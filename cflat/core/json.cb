@@ -185,6 +185,7 @@ class JsonNode : IJSON, IJSONArray
     JsonNode* lastChild  = nullptr;
     JsonNode* next       = nullptr;
     int    _count     = 0;
+    JsonNode* _findCursor = nullptr;
 
     ~JsonNode()
     {
@@ -215,10 +216,25 @@ class JsonNode : IJSON, IJSONArray
 
     JsonNode* _findKey(string key)
     {
-        JsonNode* child = firstChild;
+        // Deserialization looks keys up in field-declaration order, which
+        // matches child order for JSON produced by toJson. Resume scanning
+        // from the last hit so in-order access is O(1) amortized instead of
+        // O(n) per key (O(n^2) over a whole struct). Out-of-order or repeated
+        // keys fall back to a full scan via the wrap-around pass below.
+        JsonNode* start = _findCursor;
+        if (start == nullptr) start = firstChild;
+
+        JsonNode* child = start;
         while (child != nullptr)
         {
-            if (child.keyStr == key) return child;
+            if (child.keyStr == key) { _findCursor = child; return child; }
+            child = child.next;
+        }
+        // Wrap: scan the head up to (but not including) the start node.
+        child = firstChild;
+        while (child != nullptr && child != start)
+        {
+            if (child.keyStr == key) { _findCursor = child; return child; }
             child = child.next;
         }
         return nullptr;
