@@ -118,14 +118,14 @@ Examples include:
 - **Visualization**: `bitmap.cb` (sixel/half-block image renderer), `stars.cb` (ASCII art starfield)
 - **Games**: `minesweeper.cb`, `tetris.cb`, `missile_defender.cb`
 - **CLI tools**: `shell/wc.cb`, `shell/cmd_cb.cb`
-- **Concurrency**: `threadpool/main.cb`, `threadpool/benchmark.cb`, `threadpool/test_threadpool.cb`
+- **Concurrency**: `threadpool/benchmark.cb`
 - **HTTP/REST**: `restAPI/test_http.cb`, `restAPI/test_http_server.cb`
 
 To compile a single example manually:
 
 ```bash
 x64/Debug/cflat.exe example/bitmap.cb -o out/bitmap.exe
-x64/Debug/cflat.exe example/threadpool/main.cb -i example/threadpool -o out/main.exe
+x64/Debug/cflat.exe example/threadpool/benchmark.cb -i example/threadpool -o out/benchmark.exe
 ```
 
 To run a single test manually:
@@ -135,7 +135,7 @@ x64/Debug/cflat.exe Test/test_operators.cb -i Test/library -o out/test_operators
 out\test_operators.exe
 ```
 
-Current tests (all in `Test/`, all CFlat with `-i Test\library`): `test_allocators`, `test_basic`, `test_core`, `test_core_string`, `test_field_init`, `test_filesystem`, `test_fit_allocator`, `test_function_ptr`, `test_generics`, `test_interface`, `test_json`, `test_library_string`, `test_math`, `test_module`, `test_move`, `test_operators`, `test_program`, `test_random`, `test_reflect`, `test_sizeof`, `test_bucket_allocator`, `test_page_pool`, `test_sync`, `test_time`. (`test_helper.cb` is a shared helper, not run directly.)
+Current tests (all in `Test/`, all CFlat with `-i Test\library`) (`test_helper.cb` is a shared helper, not run directly.)
 
 test.bat uses wildard `Test/*.*` to locate tests.  Remember to remove debug test or else it would be picked up by the wildcard expansion.
 
@@ -232,6 +232,7 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 - **Type aliases**: `using M = Math` - expands at reference time
 - **Module system**: `import "file.cb"` for multi-file compilation
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
+- **Implicit upcast, no implicit downcast**: widening conversions (e.g. `i32` -> `i64`, derived -> base/interface) happen implicitly; narrowing conversions (downcasts) require an explicit cast
 - **Null-safe access**: `ptr?.field` - works on any struct pointer (local variables, function arguments, struct member fields)
 - **Null-coalescing**: `a ?? b` (zero-check for integers)
 - **Ternary operator**: `condition ? trueValue : falseValue` - compact conditional expression; both branches must be compatible types
@@ -322,6 +323,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `semaphore.cb` | `semaphore` - counting semaphore |
 | `rwlock.cb` | `rwlock` - reader-writer lock |
 | `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
+| `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
 | `time.cb` | `Time.now()`, sleep, duration utilities |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
 | `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |

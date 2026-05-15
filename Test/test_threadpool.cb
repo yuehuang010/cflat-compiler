@@ -1,7 +1,8 @@
-// Comprehensive test suite for threadpool.cb.  Lives next to threadpool.cb so
-// it exercises the same source file the example links against.  Build/run:
+// Comprehensive test suite for core/threadpool.cb.  This file is the single
+// consolidated exercise for the pool - the former main.cb demo has been folded
+// in here as ordinary tests.  Run via test.bat, or build/run directly:
 //
-//   x64/Release/cflat.exe example/threadpool/test_threadpool.cb \
+//   x64/Release/cflat.exe Test/test_threadpool.cb -i Test/library \
 //       -o out/test_threadpool.exe && out/test_threadpool.exe
 
 import "threadpool.cb";
@@ -124,6 +125,21 @@ int drainOuterTask(void* raw, stop_token tok) {
     DrainFromTaskCtx* c = (DrainFromTaskCtx*)raw;
     c->pool->submit(drainInnerTask, &c->value, nullptr);
     c->pool->drain();   // would deadlock without work-participation
+    return 0;
+}
+
+struct PriorityCtx {
+    int             priority     = 0;
+    int             order        = 0;        // completion order (1-based)
+    atomic_counter* orderCounter = nullptr;
+};
+
+int taskPriority(void* raw, stop_token tok) {
+    PriorityCtx* c = (PriorityCtx*)raw;
+    // Wall-clock sleep so pending tasks pile up while this one "runs"; a dead
+    // compute loop would be deleted by the optimiser under -O2.
+    sleep(10);
+    c->order = (int)c->orderCounter->increment();
     return 0;
 }
 
@@ -532,14 +548,83 @@ bool testManyTasksStress() {
     return result;
 }
 
+bool testPriorityOrdering() {
+    // Single worker so the queued tasks drain in strict priority order:
+    // every HIGH runs before every NORMAL, which runs before every LOW.
+    bool result = true;
+    ThreadPool pool;
+    pool.init(1);
+
+    atomic_counter orderCounter = default;
+    PriorityCtx[9] ctxs {};
+    int i = 0;
+    while (i < 9) { ctxs[i].orderCounter = &orderCounter; i++; }
+
+    ctxs[0].priority = THREADPOOL_PRIORITY_LOW;
+    ctxs[1].priority = THREADPOOL_PRIORITY_LOW;
+    ctxs[2].priority = THREADPOOL_PRIORITY_LOW;
+    ctxs[3].priority = THREADPOOL_PRIORITY_NORMAL;
+    ctxs[4].priority = THREADPOOL_PRIORITY_NORMAL;
+    ctxs[5].priority = THREADPOOL_PRIORITY_NORMAL;
+    ctxs[6].priority = THREADPOOL_PRIORITY_HIGH;
+    ctxs[7].priority = THREADPOOL_PRIORITY_HIGH;
+    ctxs[8].priority = THREADPOOL_PRIORITY_HIGH;
+
+    TaskHandle[9] handles {};
+
+    // Submit task 0 (LOW) first so the lone worker picks it up and is busy in
+    // its 10 ms sleep before the remaining 8 tasks are queued.
+    pool.submit(taskPriority, &ctxs[0], &handles[0], THREADPOOL_PRIORITY_LOW);
+    sleep(2);
+
+    // Queue the rest in interleaved priority order while the worker is busy.
+    pool.submit(taskPriority, &ctxs[1], &handles[1], THREADPOOL_PRIORITY_LOW);
+    pool.submit(taskPriority, &ctxs[2], &handles[2], THREADPOOL_PRIORITY_LOW);
+    pool.submit(taskPriority, &ctxs[3], &handles[3], THREADPOOL_PRIORITY_NORMAL);
+    pool.submit(taskPriority, &ctxs[4], &handles[4], THREADPOOL_PRIORITY_NORMAL);
+    pool.submit(taskPriority, &ctxs[5], &handles[5], THREADPOOL_PRIORITY_NORMAL);
+    pool.submit(taskPriority, &ctxs[6], &handles[6], THREADPOOL_PRIORITY_HIGH);
+    pool.submit(taskPriority, &ctxs[7], &handles[7], THREADPOOL_PRIORITY_HIGH);
+    pool.submit(taskPriority, &ctxs[8], &handles[8], THREADPOOL_PRIORITY_HIGH);
+
+    pool.drain();
+
+    // Among the 8 queued tasks (indices 1-8): all HIGH < all NORMAL < all LOW.
+    int maxHigh   = 0;
+    int minNormal = 9999;
+    int maxNormal = 0;
+    int minLow    = 9999;
+
+    i = 1;
+    while (i < 9) {
+        int prio  = ctxs[i].priority;
+        int order = ctxs[i].order;
+        if (prio == THREADPOOL_PRIORITY_HIGH) {
+            if (order > maxHigh)   { maxHigh   = order; }
+        } else if (prio == THREADPOOL_PRIORITY_NORMAL) {
+            if (order < minNormal) { minNormal = order; }
+            if (order > maxNormal) { maxNormal = order; }
+        } else {
+            if (order < minLow)    { minLow    = order; }
+        }
+        i++;
+    }
+
+    result &= Test("HIGH batch drains before NORMAL", (int)(maxHigh < minNormal), 1);
+    result &= Test("NORMAL batch drains before LOW",  (int)(maxNormal < minLow), 1);
+
+    pool.shutdown();
+    return result;
+}
+
 // --- Program-hosted ThreadPool test ---
 
 program ThreadPoolProgram {
     ThreadPool pool = default;
 
     int main(move list<string> args) {
-        pool.init(2);
-
+        // Pool is initialized in outer scope before run() - just use it here.
+        // Submit multiple tasks that square numbers.
         int[5] inputs;
         int i = 0;
         while (i < 5) { inputs[i] = i + 2; i++; }
@@ -551,8 +636,6 @@ program ThreadPoolProgram {
             i++;
         }
         pool.drain();
-
-        pool.shutdown();
 
         // Verify results
         i = 0;
@@ -574,6 +657,10 @@ bool testThreadPoolInProgram() {
     bool result = true;
 
     ThreadPoolProgram prog;
+    // Initialize the pool field in outer scope before run()
+    // (pattern: complex fields initialized before program execution)
+    prog.pool.init(2);
+
     list<string> emptyArgs;
     prog.run(emptyArgs);
     prog.WaitForExit();
@@ -604,6 +691,7 @@ extern int main() {
     total++; passed += testInitAfterShutdown()           ? 1 : 0;
     total++; passed += testApproxPendingCount()          ? 1 : 0;
     total++; passed += testManyTasksStress()             ? 1 : 0;
+    total++; passed += testPriorityOrdering()            ? 1 : 0;
     total++; passed += testThreadPoolInProgram()         ? 1 : 0;
 
     printf("ThreadPool tests: %d/%d passed.\n", passed, total);
