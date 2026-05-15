@@ -234,6 +234,11 @@ extern stdcall win_int  ReadConsoleOutputA(void* hConsoleOutput, _CHAR_INFO* lpB
 
 // MSVC CRT - cdecl (no stdcall). bufSize is SIZE_T (win_size).
 extern void*    __acrt_iob_func(win_int fd);
+
+// <conio.h> - read one keystroke directly from the console. Unbuffered, no
+// echo, bypasses stdin entirely. Special keys (arrows, F-keys) arrive as a
+// 0 or 0xE0 prefix followed by a second _getch() returning the scan code.
+extern int      _getch();
 extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
 extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
 extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);

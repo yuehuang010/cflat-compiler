@@ -100,6 +100,22 @@ struct MouseEvent {
     bool middleButton()  { return (buttonState & MOUSE_BTN_MIDDLE) != 0; }
 };
 
+// ── Standalone key read ──────────────────────────────────────────────────────
+//
+// Read one keystroke from the console without going through stdin (unbuffered,
+// no echo). Useful for simple line editors that need to intercept Tab/Backspace
+// but do not need the full Terminal/KeyEvent machinery.
+//
+// Special keys (arrows, F-keys) come through as two calls: the first returns
+// 0 or 0xE0 as a prefix, and the next readKey() returns the scan code.
+//
+// TODO: on non-Windows, this should switch the tty to cbreak mode via termios
+// (ICANON/ECHO off) and read one byte from stdin.
+
+int readKey() {
+    return _getch();
+}
+
 // ── Terminal ─────────────────────────────────────────────────────────────────
 
 struct Terminal {

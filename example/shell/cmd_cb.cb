@@ -29,6 +29,7 @@ import "filesystem.cb";
 import "list.cb";
 import "thread.cb";
 import "process.cb";
+import "terminal.cb";
 import program "wc.cb" as Wc;
 
 extern stdcall i32  GetEnvironmentVariableA(const char* name, char* buf, i32 size);
@@ -38,19 +39,193 @@ extern stdcall i32  FreeEnvironmentStringsA(i8* env);
 
 // ── I/O helpers ───────────────────────────────────────────────────────────────
 
-// Read one line from stdin (blocking), stripping trailing CR/LF.
-// Returns "" on EOF.
+// Find the start index of the last whitespace-separated token in buf[0..len).
+int findTokenStart(i8* buf, int len)
+{
+    int i = len;
+    while (i > 0 && isspace((int)(u8)buf[i - 1]) == 0) i--;
+    return i;
+}
+
+// Gather filesystem completions for the path-prefix buf[tokenStart..len).
+// Writes the length of the filename stub (the part after the last slash) to
+// *outStubLen. Directory matches have a trailing backslash appended.
+list<string>* gatherMatches(i8* buf, int tokenStart, int len, int* outStubLen)
+{
+    // Split the prefix into "<dir>\" and "<stub>".
+    int slashEnd = tokenStart;
+    int i = tokenStart;
+    while (i < len)
+    {
+        if (buf[i] == '\\' || buf[i] == '/') slashEnd = i + 1;
+        i++;
+    }
+
+    int dirLen  = slashEnd - tokenStart;
+    int stubLen = len - slashEnd;
+    *outStubLen = stubLen;
+
+    // pattern = "<dir>\<stub>*"
+    int patLen = dirLen + stubLen + 1;
+    i8* patBuf = new i8[patLen + 1];
+    int k = 0;
+    while (k < dirLen)  { patBuf[k] = buf[tokenStart + k];     k++; }
+    while (k < dirLen + stubLen) { patBuf[k] = buf[slashEnd + (k - dirLen)]; k++; }
+    patBuf[k] = '*'; k++;
+    patBuf[k] = 0;
+
+    list<string>* matches = new list<string>;
+    _WIN32_FIND_DATAA* fd = new _WIN32_FIND_DATAA;
+    void* handle = FindFirstFileA(patBuf, fd);
+    if (handle != (void*)(i64)-1)
+    {
+        bool more = true;
+        while (more)
+        {
+            i8* nm = fd->cFileName;
+            bool isDot = strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0;
+            if (!isDot)
+            {
+                int nlen = (int)strlen(nm);
+                bool isDir = (fd->dwFileAttributes & 16) != 0;
+                int outLen = isDir ? nlen + 1 : nlen;
+                i8* nb = new i8[outLen + 1];
+                int j = 0;
+                while (j < nlen) { nb[j] = nm[j]; j++; }
+                if (isDir) { nb[nlen] = '\\'; nb[nlen + 1] = 0; }
+                else        { nb[nlen] = 0; }
+                string s;
+                s._ptr = nb;
+                s._len = outLen;
+                matches->add(s);
+            }
+            if (FindNextFileA(handle, fd) == 0) more = false;
+        }
+        FindClose(handle);
+    }
+    delete fd;
+    delete[] patBuf;
+    return matches;
+}
+
+// Append a character to the input buffer and echo it. Returns the new length.
+int appendChar(i8* buf, int len, int cap, i8 c)
+{
+    if (len >= cap - 1) return len;
+    buf[len] = c;
+    printf("%c", (int)(u8)c);
+    return len + 1;
+}
+
+// Tab-complete the last token in buf[0..*lenPtr). Updates *lenPtr in place,
+// echoes any added characters, and (on ambiguity) lists the alternatives and
+// redraws the prompt.
+void handleTab(i8* buf, int* lenPtr, int cap)
+{
+    int len = *lenPtr;
+    int tokenStart = findTokenStart(buf, len);
+    int stubLen = 0;
+    list<string>* matches = gatherMatches(buf, tokenStart, len, &stubLen);
+    int n = matches->count();
+
+    if (n == 0) { delete matches; return; }
+
+    if (n == 1)
+    {
+        string m = matches->get(0);
+        i8* mp = m.data();
+        int mlen = m.length();
+        int j = stubLen;
+        while (j < mlen) { *lenPtr = appendChar(buf, *lenPtr, cap, mp[j]); j++; }
+        delete matches;
+        return;
+    }
+
+    // Multiple matches: extend the buffer by the common-prefix characters.
+    string first = matches->get(0);
+    int cpLen = first.length();
+    int mi = 1;
+    while (mi < n)
+    {
+        string s = matches->get(mi);
+        int slen = s.length();
+        int limit = cpLen < slen ? cpLen : slen;
+        i8* a = first.data();
+        i8* b = s.data();
+        int k = 0;
+        while (k < limit && tolower((int)(u8)a[k]) == tolower((int)(u8)b[k])) k++;
+        cpLen = k;
+        mi++;
+    }
+
+    if (cpLen > stubLen)
+    {
+        i8* fp = first.data();
+        int j = stubLen;
+        while (j < cpLen) { *lenPtr = appendChar(buf, *lenPtr, cap, fp[j]); j++; }
+    }
+    else
+    {
+        // No further common prefix - list alternatives and redraw.
+        printf("\n");
+        int mj = 0;
+        while (mj < n) { printf("%s  ", matches->get(mj).data()); mj++; }
+        printf("\n");
+        printPrompt();
+        int j = 0;
+        while (j < *lenPtr) { printf("%c", (int)(u8)buf[j]); j++; }
+    }
+
+    delete matches;
+}
+
+// Read one line from stdin in raw character mode, with tab completion.
+// Returns "" on Ctrl+Z (EOF).
 string readLine()
 {
-    void* stdinHandle = __acrt_iob_func(0);
-    stringbuilder sb;
+    i8[1024] buf;
+    int len = 0;
+
     while (true)
     {
-        int c = fgetc(stdinHandle);
-        if (c == -1 || c == '\n') break;
-        if (c != '\r') sb.appendChar((i8)c);
+        int c = readKey();
+        if (c == 13)                              // Enter
+        {
+            printf("\n");
+            break;
+        }
+        else if (c == 26)                         // Ctrl+Z -> EOF
+        {
+            printf("\n");
+            len = 0;
+            break;
+        }
+        else if (c == 8 || c == 127)              // Backspace
+        {
+            if (len > 0) { len--; printf("\b \b"); }
+        }
+        else if (c == 9)                          // Tab
+        {
+            handleTab(buf, &len, 1024);
+        }
+        else if (c == 0 || c == 0xE0)             // Function/arrow key prefix
+        {
+            readKey();
+        }
+        else if (c >= 32 && c < 127)              // Printable
+        {
+            len = appendChar(buf, len, 1024, (i8)c);
+        }
     }
-    return sb.toString();
+
+    i8* out = new i8[len + 1];
+    int k = 0;
+    while (k < len) { out[k] = buf[k]; k++; }
+    out[len] = 0;
+    string result;
+    result._ptr = out;
+    result._len = len;
+    return result;
 }
 
 // ── String helpers ────────────────────────────────────────────────────────────
