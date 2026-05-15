@@ -261,6 +261,8 @@ extern int main()
     chCons.token = chSrc.get_token();
     chProd.run(chProdArgs);
     chCons.run(chConsArgs);
+    chProd._thread.setAffinity((u64)1);  // core 0
+    chCons._thread.setAffinity((u64)2);  // core 1
     sleep(dur_ms);
     chSrc.request_stop();
     chProd.WaitForExit();
@@ -299,6 +301,8 @@ extern int main()
     Thread tCons;
     tProd.start(raw_producer, nullptr);
     tCons.start(raw_consumer, nullptr);
+    tProd.setAffinity((u64)1);  // core 0
+    tCons.setAffinity((u64)2);  // core 1
     sleep(dur_ms);
     __atomic_i32_store(&g_raw_stop, 1);
     tProd.join();

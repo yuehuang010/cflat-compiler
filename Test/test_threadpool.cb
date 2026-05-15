@@ -11,6 +11,7 @@ import "cruntime.cb";
 import "time.cb";
 import "list.cb";
 import "program.cb";
+import "latch.cb";
 
 // Inline test helpers (mirroring Test/test_helper.cb's bool/int Test() API).
 int Test(const char* name, bool actual, bool expected) {
@@ -132,13 +133,18 @@ struct PriorityCtx {
     int             priority     = 0;
     int             order        = 0;        // completion order (1-based)
     atomic_counter* orderCounter = nullptr;
+    latch*          gate         = nullptr;  // if set, wait on it instead of sleeping
 };
 
 int taskPriority(void* raw, stop_token tok) {
     PriorityCtx* c = (PriorityCtx*)raw;
-    // Wall-clock sleep so pending tasks pile up while this one "runs"; a dead
-    // compute loop would be deleted by the optimiser under -O2.
-    sleep(10);
+    // testPriorityOrdering hands the "keep-busy" task a latch so it blocks
+    // deterministically until the main thread has enqueued the priority batch
+    // (sleep-based coordination is unreliable under Windows timer granularity).
+    // Other callers leave gate==nullptr and fall back to a wall-clock sleep;
+    // a dead compute loop would be deleted by the optimiser under -O2.
+    if (c->gate != nullptr) { c->gate.wait(); }
+    else                    { sleep(10); }
     c->order = (int)c->orderCounter->increment();
     return 0;
 }
@@ -560,6 +566,14 @@ bool testPriorityOrdering() {
     int i = 0;
     while (i < 9) { ctxs[i].orderCounter = &orderCounter; i++; }
 
+    // Gate task 0 on a latch so we can deterministically enqueue the priority
+    // batch before the worker becomes free.  Without this, the precondition
+    // ("all 8 tasks enqueued before the worker drains task 0") would rely on
+    // Windows Sleep() granularity (~15 ms) and the test would be flaky.
+    latch gate;
+    gate.init(1);
+    ctxs[0].gate = &gate;
+
     ctxs[0].priority = THREADPOOL_PRIORITY_LOW;
     ctxs[1].priority = THREADPOOL_PRIORITY_LOW;
     ctxs[2].priority = THREADPOOL_PRIORITY_LOW;
@@ -572,12 +586,12 @@ bool testPriorityOrdering() {
 
     TaskHandle[9] handles {};
 
-    // Submit task 0 (LOW) first so the lone worker picks it up and is busy in
-    // its 10 ms sleep before the remaining 8 tasks are queued.
+    // Submit task 0 (LOW) first; the worker will pick it up and block on the
+    // latch.  Order of the queue-rest submits vs. worker pickup no longer
+    // matters: the worker cannot make progress past task 0 until we release.
     pool.submit(taskPriority, &ctxs[0], &handles[0], THREADPOOL_PRIORITY_LOW);
-    sleep(2);
 
-    // Queue the rest in interleaved priority order while the worker is busy.
+    // Queue the rest in interleaved priority order while task 0 is gated.
     pool.submit(taskPriority, &ctxs[1], &handles[1], THREADPOOL_PRIORITY_LOW);
     pool.submit(taskPriority, &ctxs[2], &handles[2], THREADPOOL_PRIORITY_LOW);
     pool.submit(taskPriority, &ctxs[3], &handles[3], THREADPOOL_PRIORITY_NORMAL);
@@ -586,6 +600,10 @@ bool testPriorityOrdering() {
     pool.submit(taskPriority, &ctxs[6], &handles[6], THREADPOOL_PRIORITY_HIGH);
     pool.submit(taskPriority, &ctxs[7], &handles[7], THREADPOOL_PRIORITY_HIGH);
     pool.submit(taskPriority, &ctxs[8], &handles[8], THREADPOOL_PRIORITY_HIGH);
+
+    // All 8 are now enqueued.  Release task 0 so the worker can drain in
+    // strict priority order: qHigh then qNormal then qLow.
+    gate.count_down();
 
     pool.drain();
 
@@ -614,6 +632,7 @@ bool testPriorityOrdering() {
     result &= Test("NORMAL batch drains before LOW",  (int)(maxNormal < minLow), 1);
 
     pool.shutdown();
+    gate.destroy();
     return result;
 }
 

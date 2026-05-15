@@ -96,12 +96,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
                     _buf[slot] = item;
-                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return true;
                 }
                 pos = __atomic_i64_load(&_head);
@@ -120,12 +120,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
                     *out = _buf[slot];
-                    __atomic_i64_store(seqPtr, pos + _cap);
+                    __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
                 pos = __atomic_i64_load(&_tail);
@@ -144,12 +144,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
                     *out = _buf[slot];
-                    __atomic_i64_store(seqPtr, pos + _cap);
+                    __atomic_release_store_i64(seqPtr, pos + _cap);
                     return true;
                 }
                 pos = __atomic_i64_load(&_tail);
@@ -171,12 +171,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
                     _buf[slot] = item;
-                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return;
                 }
             }
@@ -194,12 +194,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
                     T value = _buf[slot];
-                    __atomic_i64_store(seqPtr, pos + _cap);
+                    __atomic_release_store_i64(seqPtr, pos + _cap);
                     return value;
                 }
             }
@@ -217,12 +217,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - pos;
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_head, pos, pos + (i64)1)) {
                     _buf[slot] = item;
-                    __atomic_i64_store(seqPtr, pos + (i64)1);
+                    __atomic_release_store_i64(seqPtr, pos + (i64)1);
                     return;
                 }
             }
@@ -238,12 +238,12 @@ class channel<T>
         while (true) {
             int  slot   = (int)(pos & _mask);
             i64* seqPtr = _seq + slot;
-            i64  seq    = __atomic_i64_load(seqPtr);
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
             i64  dif    = seq - (pos + (i64)1);
             if (dif == (i64)0) {
                 if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
                     T value = _buf[slot];
-                    __atomic_i64_store(seqPtr, pos + _cap);
+                    __atomic_release_store_i64(seqPtr, pos + _cap);
                     return value;
                 }
             }

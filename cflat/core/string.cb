@@ -240,19 +240,40 @@ struct stringbuilder
     // Append a signed 32-bit integer formatted as decimal.
     void append(i32 n)
     {
-        i8* buf = new i8[32];
-        i32 len = sprintf(buf, "%d", n);
+        // Format into a stack buffer - no heap alloc, no sprintf. Digits are
+        // emitted least-significant first into the back of the buffer, then
+        // copied out in order. Widen to i64 so INT32_MIN negates safely.
+        i8[12] tmp;            // max "-2147483648" is 11 chars
+        i32 pos = 12;
+        i64 v = (i64)n;
+        bool neg = v < (i64)0;
+        if (neg) v = -v;
+        // Emit at least one digit (handles n == 0), then the rest.
+        pos = pos - 1;
+        tmp[pos] = (i8)((i32)'0' + (i32)(v % (i64)10));
+        v = v / (i64)10;
+        while (v > (i64)0)
+        {
+            pos = pos - 1;
+            tmp[pos] = (i8)((i32)'0' + (i32)(v % (i64)10));
+            v = v / (i64)10;
+        }
+        if (neg)
+        {
+            pos = pos - 1;
+            tmp[pos] = '-';
+        }
+        i32 len = 12 - pos;
         i32 newLen = _length + len;
         _ensure(newLen + 1);
         int i = 0;
         while (i < len)
         {
-            _data[_length + i] = buf[i];
+            _data[_length + i] = tmp[pos + i];
             i++;
         }
         _data[newLen] = 0;
         _length = newLen;
-        delete[] buf;
     }
 
     // Append "true" or "false".
