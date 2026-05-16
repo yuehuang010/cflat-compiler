@@ -614,6 +614,10 @@ private:
     llvm::DIFile* diFile = nullptr;
     llvm::DICompileUnit* compileUnit = nullptr;
     llvm::DISubprogram* currentSubprogram = nullptr;
+    // Cache: base type name -> DIType (no pointer/array wrapper). Pointer / array /
+    // function-pointer / interface fat-ptr wrappers are built on demand so the cache
+    // key stays simple.
+    std::unordered_map<std::string, llvm::DIType*> diTypeCache;
 
 
 private:
@@ -714,6 +718,18 @@ private:
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
+        // Cleanup calls (destructors, operator delete, lock release) emitted here
+        // belong to "the end of the scope" rather than any user statement. If we
+        // have a subprogram but the builder lost its debug location (e.g. just
+        // after a branch / return / lambda body), the verifier rejects untagged
+        // inlinable calls in -g builds. Pin a synthetic location to the function
+        // line so every cleanup instruction is properly attributed.
+        if (currentSubprogram && !builder->getCurrentDebugLocation())
+        {
+            builder->SetCurrentDebugLocation(llvm::DILocation::get(
+                *context, currentSubprogram->getLine(), 0, currentSubprogram));
+        }
+
         for (const auto& [varName, namedVar] : frame.namedVariable)
         {
             if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning)
@@ -784,6 +800,13 @@ private:
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
         builder->SetInsertPoint(entry);
+        // Drop any debug location lingering from the caller's emission context
+        // before emitting parameter allocas/stores: otherwise those instructions
+        // get tagged with the outer function's DISubprogram, which trips the
+        // LLVM verifier (`!dbg attachment points at wrong subprogram`).
+        // CreateFunctionDefinition will re-set the location once it attaches the
+        // new function's subprogram below.
+        builder->SetCurrentDebugLocation(llvm::DebugLoc());
         auto& stackState = stackNamedVariable.emplace_back();
 
         stackState.continueBlock = &fn->back();
@@ -904,50 +927,150 @@ private:
         autoVaListAlloca = nullptr;
     }
 
-    llvm::DIType* GetDIType(const TypeAndValue& typeValue)
+    llvm::DIType* GetDIType(const TypeAndValue& tv)
     {
         using namespace llvm::dwarf;
-        llvm::DIType* baseType = nullptr;
+        const llvm::DataLayout& DL = module->getDataLayout();
+        unsigned ptrBits = DL.getPointerSizeInBits();
 
-        if (typeValue.TypeName == "int")
-            baseType = diBuilder->createBasicType("int", 32, DW_ATE_signed);
-        else if (typeValue.TypeName == "char")
-            baseType = diBuilder->createBasicType("char", 8, DW_ATE_signed_char);
-        else if (typeValue.TypeName == "short")
-            baseType = diBuilder->createBasicType("short", 16, DW_ATE_signed);
-        else if (typeValue.TypeName == "long")
-            baseType = diBuilder->createBasicType("long", 64, DW_ATE_signed);
-        else if (typeValue.TypeName == "float")
-            baseType = diBuilder->createBasicType("float", 32, DW_ATE_float);
-        else if (typeValue.TypeName == "double")
-            baseType = diBuilder->createBasicType("double", 64, DW_ATE_float);
-        else if (typeValue.TypeName == "bool")
-            baseType = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
-        // Explicit-width signed integer types (C equivalents: int8_t, int16_t, int32_t, int64_t)
-        else if (typeValue.TypeName == "i8")
-            baseType = diBuilder->createBasicType("i8", 8, DW_ATE_signed);
-        else if (typeValue.TypeName == "i16")
-            baseType = diBuilder->createBasicType("i16", 16, DW_ATE_signed);
-        else if (typeValue.TypeName == "i32")
-            baseType = diBuilder->createBasicType("i32", 32, DW_ATE_signed);
-        else if (typeValue.TypeName == "i64")
-            baseType = diBuilder->createBasicType("i64", 64, DW_ATE_signed);
-        // Explicit-width unsigned integer types (C equivalents: uint8_t, uint16_t, uint32_t, uint64_t)
-        else if (typeValue.TypeName == "u8")
-            baseType = diBuilder->createBasicType("u8", 8, DW_ATE_unsigned);
-        else if (typeValue.TypeName == "u16")
-            baseType = diBuilder->createBasicType("u16", 16, DW_ATE_unsigned);
-        else if (typeValue.TypeName == "u32")
-            baseType = diBuilder->createBasicType("u32", 32, DW_ATE_unsigned);
-        else if (typeValue.TypeName == "u64")
-            baseType = diBuilder->createBasicType("u64", 64, DW_ATE_unsigned);
-        else
-            baseType = diBuilder->createUnspecifiedType(typeValue.TypeName);
+        // Fixed-size array: T[N] - wrap element DI in an array DIType.
+        if (tv.ConstArraySize > 0)
+        {
+            TypeAndValue elem = tv;
+            elem.ConstArraySize = 0;
+            elem.ConstInnerDimensions.clear();
+            auto* elemDI = GetDIType(elem);
+            auto* elemTy = GetType(elem, nullptr, elem.Pointer);
+            uint64_t total = DL.getTypeAllocSizeInBits(elemTy) * tv.ConstArraySize;
+            llvm::SmallVector<llvm::Metadata*, 1> subs;
+            subs.push_back(diBuilder->getOrCreateSubrange(0, (int64_t)tv.ConstArraySize));
+            return diBuilder->createArrayType(total, 0, elemDI,
+                diBuilder->getOrCreateArray(subs));
+        }
 
-        if (typeValue.Pointer)
-            return diBuilder->createPointerType(baseType, 64);
+        // Function pointer: build subroutine + pointer wrapper.
+        if (tv.IsFunctionPointer)
+        {
+            std::vector<llvm::Metadata*> types;
+            TypeAndValue retTV;
+            retTV.TypeName = tv.FuncPtrReturnTypeName;
+            retTV.Pointer = tv.FuncPtrReturnPointer;
+            types.push_back((retTV.TypeName == "void" && !retTV.Pointer)
+                ? nullptr : (llvm::Metadata*)GetDIType(retTV));
+            for (const auto& p : tv.FuncPtrParams)
+            {
+                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+                types.push_back(GetDIType(pTV));
+            }
+            auto srt = diBuilder->createSubroutineType(
+                diBuilder->getOrCreateTypeArray(types));
+            return diBuilder->createPointerType(srt, ptrBits);
+        }
 
-        return baseType;
+        // Pointer wrapper: strip and recurse on base.
+        if (tv.Pointer)
+        {
+            TypeAndValue base = tv;
+            base.Pointer = false;
+            auto* baseDI = GetDIType(base);
+            return diBuilder->createPointerType(baseDI, ptrBits);
+        }
+
+        // Interface fat pointer {i8* vtable, i8* data} - cached once.
+        if (tv.IsInterface && !tv.IsInterfacePointer)
+        {
+            auto it = diTypeCache.find("__interface_fatptr");
+            if (it != diTypeCache.end()) return it->second;
+            auto i8DI = diBuilder->createBasicType("i8", 8, DW_ATE_unsigned_char);
+            auto i8Ptr = diBuilder->createPointerType(i8DI, ptrBits);
+            std::vector<llvm::Metadata*> members = {
+                diBuilder->createMemberType(compileUnit, "vtable", diFile, 0,
+                    ptrBits, ptrBits, 0, llvm::DINode::FlagZero, i8Ptr),
+                diBuilder->createMemberType(compileUnit, "data", diFile, 0,
+                    ptrBits, ptrBits, ptrBits, llvm::DINode::FlagZero, i8Ptr),
+            };
+            auto fatTy = diBuilder->createStructType(compileUnit, "__interface",
+                diFile, 0, ptrBits * 2, ptrBits, llvm::DINode::FlagZero, nullptr,
+                diBuilder->getOrCreateArray(members));
+            diTypeCache["__interface_fatptr"] = fatTy;
+            return fatTy;
+        }
+
+        // Cache lookup for basic + struct types.
+        auto cacheIt = diTypeCache.find(tv.TypeName);
+        if (cacheIt != diTypeCache.end()) return cacheIt->second;
+
+        llvm::DIType* basic = nullptr;
+        if      (tv.TypeName == "int")    basic = diBuilder->createBasicType("int", 32, DW_ATE_signed);
+        else if (tv.TypeName == "char")   basic = diBuilder->createBasicType("char", 8, DW_ATE_signed_char);
+        else if (tv.TypeName == "short")  basic = diBuilder->createBasicType("short", 16, DW_ATE_signed);
+        else if (tv.TypeName == "long")   basic = diBuilder->createBasicType("long", 64, DW_ATE_signed);
+        else if (tv.TypeName == "float")  basic = diBuilder->createBasicType("float", 32, DW_ATE_float);
+        else if (tv.TypeName == "double") basic = diBuilder->createBasicType("double", 64, DW_ATE_float);
+        else if (tv.TypeName == "bool")   basic = diBuilder->createBasicType("bool", 1, DW_ATE_boolean);
+        else if (tv.TypeName == "i8")     basic = diBuilder->createBasicType("i8", 8, DW_ATE_signed);
+        else if (tv.TypeName == "i16")    basic = diBuilder->createBasicType("i16", 16, DW_ATE_signed);
+        else if (tv.TypeName == "i32")    basic = diBuilder->createBasicType("i32", 32, DW_ATE_signed);
+        else if (tv.TypeName == "i64")    basic = diBuilder->createBasicType("i64", 64, DW_ATE_signed);
+        else if (tv.TypeName == "u8")     basic = diBuilder->createBasicType("u8", 8, DW_ATE_unsigned);
+        else if (tv.TypeName == "u16")    basic = diBuilder->createBasicType("u16", 16, DW_ATE_unsigned);
+        else if (tv.TypeName == "u32")    basic = diBuilder->createBasicType("u32", 32, DW_ATE_unsigned);
+        else if (tv.TypeName == "u64")    basic = diBuilder->createBasicType("u64", 64, DW_ATE_unsigned);
+        else if (tv.TypeName == "void")   basic = diBuilder->createUnspecifiedType("void");
+
+        if (basic)
+        {
+            diTypeCache[tv.TypeName] = basic;
+            return basic;
+        }
+
+        // Struct (including generic instantiations like Box__int and the built-in `string`).
+        auto sdIt = dataStructures.find(tv.TypeName);
+        if (sdIt != dataStructures.end() && sdIt->second.StructType != nullptr
+            && !sdIt->second.StructType->isOpaque())
+        {
+            auto* st = sdIt->second.StructType;
+            uint64_t sizeBits = DL.getTypeAllocSizeInBits(st);
+            uint64_t alignBits = (uint64_t)DL.getABITypeAlign(st).value() * 8;
+            const llvm::StructLayout* SL = DL.getStructLayout(st);
+
+            // Insert a forward declaration into the cache before recursing into
+            // fields - this lets a struct that contains a pointer to itself (or
+            // a mutually-recursive struct) resolve without infinite recursion.
+            auto fwd = diBuilder->createReplaceableCompositeType(
+                llvm::dwarf::DW_TAG_structure_type, tv.TypeName, compileUnit, diFile, 0);
+            diTypeCache[tv.TypeName] = fwd;
+
+            std::vector<llvm::Metadata*> members;
+            const auto& fields = sdIt->second.StructFields;
+            unsigned n = st->getNumElements();
+            for (size_t i = 0; i < fields.size() && i < n; ++i)
+            {
+                const auto& f = fields[i];
+                auto* fieldTy = st->getElementType((unsigned)i);
+                uint64_t fSize = DL.getTypeAllocSizeInBits(fieldTy);
+                uint64_t fAlign = (uint64_t)DL.getABITypeAlign(fieldTy).value() * 8;
+                uint64_t fOffset = SL->getElementOffsetInBits((unsigned)i);
+                auto* fDI = GetDIType(f);
+                members.push_back(diBuilder->createMemberType(
+                    fwd, f.VariableName, diFile, 0,
+                    fSize, (uint32_t)fAlign, fOffset, llvm::DINode::FlagZero, fDI));
+            }
+
+            auto real = diBuilder->createStructType(
+                compileUnit, tv.TypeName, diFile, 0,
+                sizeBits, (uint32_t)alignBits, llvm::DINode::FlagZero, nullptr,
+                diBuilder->getOrCreateArray(members));
+
+            fwd->replaceAllUsesWith(real);
+            diTypeCache[tv.TypeName] = real;
+            return real;
+        }
+
+        // Unknown / opaque - leave as unspecified so the debugger at least knows the name.
+        auto unspec = diBuilder->createUnspecifiedType(tv.TypeName);
+        diTypeCache[tv.TypeName] = unspec;
+        return unspec;
     }
 
     // Registers the built-in `string` value type: { i8* _ptr, i32 _len }.
@@ -1383,7 +1506,7 @@ private:
         return true;
     }
 
-    bool EmitExecutable(const std::string& exePath, const std::string& platform)
+    bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false)
     {
         std::string triple;
         std::string clangTarget;
@@ -1537,6 +1660,21 @@ private:
             "/out:" + exePath,
             "/subsystem:console",
         };
+        if (debugInfo)
+        {
+            // /DEBUG embeds CodeView from the object into a PDB next to the EXE.
+            // Without this, the DI metadata we emitted is dropped at link time.
+            linkArgStrs.push_back("/DEBUG");
+            // Derive <exe>.pdb from the exe path by swapping the extension.
+            std::string pdbPath = exePath;
+            auto dot = pdbPath.find_last_of('.');
+            auto sep = pdbPath.find_last_of("/\\");
+            if (dot != std::string::npos && (sep == std::string::npos || dot > sep))
+                pdbPath.replace(dot, std::string::npos, ".pdb");
+            else
+                pdbPath += ".pdb";
+            linkArgStrs.push_back("/PDB:" + pdbPath);
+        }
         if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
         if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
         if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
@@ -1642,7 +1780,9 @@ public:
     {
         diBuilder = std::make_unique<llvm::DIBuilder>(*module);
         module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
-        module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 4);
+        // Target is *-pc-windows-msvc: emit CodeView so lld-link can produce a PDB.
+        // DWARF would be ignored by VS / WinDbg / cppvsdbg on Windows.
+        module->addModuleFlag(llvm::Module::Warning, "CodeView", 1);
         diFile = diBuilder->createFile(filename, directory);
         compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "cflat", false, "", 0);
     }
@@ -1691,11 +1831,12 @@ public:
         llvm::IRBuilder<>::InsertPoint ip;
         llvm::Function* function = nullptr;
         llvm::DISubprogram* subprogram = nullptr;
+        llvm::DebugLoc debugLoc;
     };
 
     BuilderState SaveBuilderState() const
     {
-        return { builder->saveIP(), currentFunction, currentSubprogram };
+        return { builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation() };
     }
 
     void RestoreBuilderState(const BuilderState& state)
@@ -1703,10 +1844,7 @@ public:
         builder->restoreIP(state.ip);
         currentFunction = state.function;
         currentSubprogram = state.subprogram;
-        if (state.subprogram)
-            builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, 0, 0, state.subprogram));
-        else
-            builder->SetCurrentDebugLocation(llvm::DebugLoc());
+        builder->SetCurrentDebugLocation(state.debugLoc);
     }
 
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)
@@ -2560,6 +2698,16 @@ public:
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
+
+        if (diBuilder && diFile && !typeValue.VariableName.empty())
+        {
+            auto diType = GetDIType(typeValue);
+            auto diGVE = diBuilder->createGlobalVariableExpression(
+                compileUnit, typeValue.VariableName, gVar->getName(),
+                diFile, /*lineNo*/ 0, diType,
+                /*isLocalToUnit*/ false, /*isDefined*/ true);
+            gVar->addDebugInfo(diGVE);
+        }
 
         return gVar;
     }
@@ -3882,16 +4030,56 @@ public:
 
         if (diBuilder && diFile && line > 0)
         {
-            auto funcDIType = diBuilder->createSubroutineType(diBuilder->getOrCreateTypeArray({}));
-            auto sp = diBuilder->createFunction(
-                diFile, functionName, fn->getName(),
-                diFile, (unsigned)line, funcDIType, (unsigned)line,
-                llvm::DINode::FlagPrototyped,
-                llvm::DISubprogram::SPFlagDefinition
-            );
-            fn->setSubprogram(sp);
+            // Reuse an existing subprogram if the function was previously processed
+            // (e.g. constraint-instantiation re-entered this path). Creating a new
+            // distinct DISubprogram and overwriting setSubprogram() leaves the prior
+            // node orphaned, which the LLVM verifier rejects.
+            auto sp = fn->getSubprogram();
+            if (!sp)
+            {
+                // DWARF / CodeView subroutine type: element 0 is the return type
+                // (nullptr means void), followed by parameter types in order.
+                std::vector<llvm::Metadata*> diTypes;
+                diTypes.reserve(1 + arguments.size());
+                if (returnType.TypeName == "void" && !returnType.Pointer)
+                    diTypes.push_back(nullptr);
+                else
+                    diTypes.push_back(GetDIType(returnType));
+                for (const auto& a : arguments)
+                    diTypes.push_back(GetDIType(a));
+
+                auto funcDIType = diBuilder->createSubroutineType(
+                    diBuilder->getOrCreateTypeArray(diTypes));
+                sp = diBuilder->createFunction(
+                    diFile, functionName, fn->getName(),
+                    diFile, (unsigned)line, funcDIType, (unsigned)line,
+                    llvm::DINode::FlagPrototyped,
+                    llvm::DISubprogram::SPFlagDefinition
+                );
+                fn->setSubprogram(sp);
+            }
             currentSubprogram = sp;
             builder->SetCurrentDebugLocation(llvm::DILocation::get(*context, (unsigned)line, 0, sp));
+
+            // Attach parameter DI to the allocas createFunctionBlock just emitted.
+            // argNo is 1-based and follows declaration order.
+            auto& frame = stackNamedVariable.back();
+            unsigned argNo = 1;
+            for (const auto& a : arguments)
+            {
+                auto it = frame.functionArgument.find(a.VariableName);
+                if (it != frame.functionArgument.end() && it->second.Storage != nullptr)
+                {
+                    auto diParam = diBuilder->createParameterVariable(
+                        sp, a.VariableName, argNo, diFile,
+                        (unsigned)line, GetDIType(a), /*alwaysPreserve*/ true);
+                    diBuilder->insertDeclare(
+                        it->second.Storage, diParam, diBuilder->createExpression(),
+                        llvm::DILocation::get(*context, (unsigned)line, 0, sp),
+                        builder->GetInsertBlock());
+                }
+                ++argNo;
+            }
         }
 
         if (!alreadyDeclared)

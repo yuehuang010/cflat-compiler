@@ -121,12 +121,6 @@ bool LLVMBackend::Compile(const ArgParser& args)
         return false;
     }
 
-    if (debugInfo)
-    {
-        std::filesystem::path filePath = std::filesystem::absolute(filename);
-        InitDebugInfo(filePath.filename().string(), filePath.parent_path().string());
-    }
-
     // Set the platform constant (__PLATFORM__) based on the target platform.
     // This is a compile-time constant available in all compiled files.
     platformValue = (platformOption == "win32") ? 32 : 64;
@@ -134,12 +128,20 @@ bool LLVMBackend::Compile(const ArgParser& args)
 
     // Set the module data layout now so sizeof/alignof produce correct sizes during
     // codegen (the final target-machine layout is set again in EmitExecutable).
+    // Must precede InitDebugInfo so pointer-width queries during DI construction
+    // see the real layout instead of the LLVM default.
     {
         // Win32: 32-bit pointers; Win64: 64-bit pointers. Both little-endian MSVC.
         const char* dl = (platformValue == 32)
             ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
             : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
         module->setDataLayout(llvm::DataLayout(dl));
+    }
+
+    if (debugInfo)
+    {
+        std::filesystem::path filePath = std::filesystem::absolute(filename);
+        InitDebugInfo(filePath.filename().string(), filePath.parent_path().string());
     }
 
     // Pre-populate compile-time macros (constants throughout compilation)
@@ -347,7 +349,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     {
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
         if (verbose) std::cout << "[verbose] emitting executable to " << *exePath << "\n";
-        if (!EmitExecutable(*exePath, platformOption))
+        if (!EmitExecutable(*exePath, platformOption, debugInfo))
         {
             std::cerr << "Error: failed to emit executable '" << *exePath << "'.\n";
             return false;

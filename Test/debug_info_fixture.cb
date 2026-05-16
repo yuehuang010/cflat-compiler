@@ -1,0 +1,44 @@
+// Fixture for test_debug_info.bat - exercises the debug-info code paths so the
+// regression script can assert the expected DI metadata is emitted.
+//
+// Filename intentionally does NOT start with "test_" so test.bat's
+// Test\test_*.cb wildcard skips it; test_debug_info.bat drives it directly.
+
+struct Point
+{
+    int x = default;
+    int y = default;
+};
+
+struct Box<T>
+{
+    T value = default;
+};
+
+int g_counter = 0;
+
+int add(int a, int b)
+{
+    return a + b;
+}
+
+int sumPoint(Point* p)
+{
+    return p->x + p->y;
+}
+
+extern int main()
+{
+    g_counter = add(2, 3);
+
+    Point p;
+    p.x = 10;
+    p.y = 20;
+
+    Box<int> b;
+    b.value = sumPoint(&p);
+
+    if (g_counter == 5 && b.value == 30)
+        return 0;
+    return 1;
+}
