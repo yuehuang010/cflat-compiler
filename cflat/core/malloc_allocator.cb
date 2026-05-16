@@ -12,4 +12,10 @@ class MallocAllocator : IAllocator
     i64   totalBytes()      { return _totalBytes; }
     // dealloc has no size, so we track cumulative alloc as a conservative upper bound.
     i64   peakReserve()     { return _totalBytes; }
+
+    // CRT malloc/free is thread-safe; child threads share this instance.
+    IAllocator spawn_child() {
+        IAllocator self_iface = MallocAllocator__;   // pointer -> fat-ptr upcast via assignment
+        return self_iface;
+    }
 };

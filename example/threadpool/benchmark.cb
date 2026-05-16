@@ -27,7 +27,7 @@ import "cruntime.cb";
 
 atomic_counter g_taskCounter = default;
 
-int trivialTask(void* ctx, stop_token tok) {
+int trivialTask(move void* ctx, stop_token tok) {
     g_taskCounter.increment();
     return 0;
 }

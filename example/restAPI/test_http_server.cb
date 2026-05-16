@@ -1,7 +1,6 @@
 import "list.cb";
 import "thread.cb";
 import "stop_token.cb";
-import "threadpool.cb";
 import "test_helper.cb";
 import "network/http_server.cb";
 import "network/http_client.cb";
@@ -200,18 +199,14 @@ extern int main()
         return 1;
     }
 
-    // Shared worker pool that handles every accepted connection.
-    ThreadPool pool;
-    pool.init(4);
-
     stop_source src;
     src.init();
 
     HttpServer srv;
-    srv.port      = g_srv_port;
-    srv.stopToken = src.get_token();
-    srv.handler   = testHandler;
-    srv.pool      = &pool;
+    srv.port        = g_srv_port;
+    srv.workerCount = 4;
+    srv.stopToken   = src.get_token();
+    srv.handler     = testHandler;
 
     list<string> srvArgs;
     srv.run(srvArgs);
@@ -232,7 +227,6 @@ extern int main()
     srv.WaitForExit();
     src.dispose();
 
-    pool.shutdown();
     Socket.shutdownNetwork();
 
     if (ok) printf("HTTP server/client tests: all passed.\n");

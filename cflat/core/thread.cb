@@ -1,8 +1,18 @@
 // Args packet allocated with malloc so thread infrastructure bypasses any
 // per-program tracked allocator.
+//
+// _allocator carries the allocator that the child thread should install in its
+// __active_allocator TLS slot before calling fn. start() obtains it by calling
+// __active_allocator.spawn_child() on the parent thread, which lets allocators
+// choose between sharing (MallocAllocator returns self) and per-thread
+// instancing (BucketAllocator returns a fresh child registered for parent
+// cleanup). Without this propagation, the child starts with a null allocator
+// and any new/delete falls through to CRT malloc/free, which corrupts the
+// heap for vmem-backed BucketAllocator pages.
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
+    IAllocator _allocator;
 };
 
 // Move-typed args packet: the fn signature carries 'move void*', so the call
@@ -11,17 +21,20 @@ struct __ThreadArgs {
 struct __ThreadArgsMove {
     function<int(move void*)> fn = nullptr;
     void* ctx = nullptr;
+    IAllocator _allocator;
 };
 
 // Win32 LPTHREAD_START_ROUTINE. Must be __stdcall on Win32 (WINAPI convention).
 // stdcall is a no-op on Win64 - safe to always annotate.
 stdcall int __thread_trampoline(void* param) {
     __ThreadArgs* args = (__ThreadArgs*)param;
+    __active_allocator = args->_allocator;
     return args->fn(args->ctx);
 }
 
 stdcall int __thread_trampoline_move(void* param) {
     __ThreadArgsMove* args = (__ThreadArgsMove*)param;
+    __active_allocator = args->_allocator;
     return args->fn(args->ctx);
 }
 
@@ -45,6 +58,9 @@ struct Thread {
         __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
         args->fn  = fn;
         args->ctx = ctx;
+        IAllocator child = default;
+        if (__active_allocator != nullptr) child = __active_allocator.spawn_child();
+        args->_allocator = child;
         _args = args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
@@ -69,6 +85,9 @@ struct Thread {
         __ThreadArgsMove* args = (__ThreadArgsMove*)malloc(sizeof(__ThreadArgsMove));
         args->fn  = fn;
         args->ctx = ctx;          // assignment transfers ctx into args->ctx; ctx local is auto-nulled
+        IAllocator child = default;
+        if (__active_allocator != nullptr) child = __active_allocator.spawn_child();
+        args->_allocator = child;
         _args = (void*)args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);

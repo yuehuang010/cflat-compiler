@@ -1,0 +1,174 @@
+// benchmark.cb - HTTP server throughput benchmark.
+//
+// Drives the HttpServer (which owns a ThreadPool inside its program scope)
+// from N client threads firing back-to-back HTTP/1.1 GETs (Connection:
+// close, fresh TCP per request) and reports wall-time requests/sec across
+// a concurrency sweep (2, 4, 8 clients).
+//
+// History: an earlier version of this file capped the sweep at one client
+// because >= 2 concurrent clients reliably tripped STATUS_HEAP_CORRUPTION.
+// The root cause was on the ThreadPool side: ctx flowed through a borrowed
+// void* into a worker that retained it past the caller's scope, so cflat's
+// auto-emitted operator delete(ctx) at scope exit competed with the
+// worker's free.  The ThreadPool API was rewritten to take move void* ctx
+// and a move-typed task fn (mirroring Thread.start's move overload), and
+// the http/rest server tasks now receive ctx as a move parameter that
+// auto-deletes at scope exit.  With that change the heap-ownership story
+// is sound and concurrent clients no longer corrupt the heap.
+
+import "list.cb";
+import "thread.cb";
+import "stop_token.cb";
+import "atomic.cb";
+import "time.cb";
+import "cruntime.cb";
+import "network/http_server.cb";
+import "network/http_client.cb";
+
+int g_bench_port    = 18900;
+int g_serverWorkers = 4;   // server-side workers; client side currently limited to 1
+
+// --------------------------------------------------------------------------
+// Server side
+// --------------------------------------------------------------------------
+
+atomic_counter g_serverRequests = default;
+
+HttpResponse* benchHandler(HttpRequest* req)
+{
+    g_serverRequests.increment();
+    // Small fixed body keeps the network cost low so the server's per-request
+    // alloc / free path dominates.
+    return HttpResponse.ok("OK");
+}
+
+// --------------------------------------------------------------------------
+// Client side
+// --------------------------------------------------------------------------
+
+struct ClientCtx {
+    int port           = 0;
+    int requestCount   = 0;
+    int successCount   = 0;
+    int failCount      = 0;
+};
+
+int clientThread(void* raw)
+{
+    ClientCtx* ctx = (ClientCtx*)raw;
+
+    HttpClient client;
+    string host = "127.0.0.1";
+
+    int i = 0;
+    while (i < ctx->requestCount)
+    {
+        HttpClientResponse* resp = client.get(host, ctx->port, "/ping");
+        if (resp != nullptr && resp->valid && resp->statusCode == 200)
+            ctx->successCount = ctx->successCount + 1;
+        else
+            ctx->failCount = ctx->failCount + 1;
+        if (resp != nullptr) delete resp;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// --------------------------------------------------------------------------
+// Run one row: spawn `clientCount` client threads, each firing
+// `requestsPerClient` requests; print throughput when they finish.
+// --------------------------------------------------------------------------
+
+void runRow(int clientCount, int requestsPerClient)
+{
+    i64 serverBefore = g_serverRequests.read();
+
+    ClientCtx* ctxs = new ClientCtx[clientCount];
+    Thread*    ths  = new Thread[clientCount];
+
+    int i = 0;
+    while (i < clientCount)
+    {
+        ctxs[i].port         = g_bench_port;
+        ctxs[i].requestCount = requestsPerClient;
+        ctxs[i].successCount = 0;
+        ctxs[i].failCount    = 0;
+        i = i + 1;
+    }
+
+    Stopwatch sw;
+    sw.start();
+
+    i = 0;
+    while (i < clientCount) { ths[i].start(clientThread, &ctxs[i]); i = i + 1; }
+
+    i = 0;
+    while (i < clientCount) { ths[i].join(); i = i + 1; }
+
+    sw.stop();
+
+    int success = 0;
+    int fail    = 0;
+    i = 0;
+    while (i < clientCount)
+    {
+        success = success + ctxs[i].successCount;
+        fail    = fail    + ctxs[i].failCount;
+        i = i + 1;
+    }
+
+    int totalRequests = clientCount * requestsPerClient;
+    double elapsedMs  = sw.elapsed().milliseconds();
+    double reqsPerSec = elapsedMs > 0.0 ? (double)success * 1000.0 / elapsedMs : 0.0;
+    i64    serverDelta = g_serverRequests.read() - serverBefore;
+
+    printf("  clients=%2d  reqs=%5d  elapsed=%8.2f ms  %10.0f req/s  ok=%d fail=%d  (server saw %lld)\n",
+           clientCount, totalRequests,
+           elapsedMs, reqsPerSec, success, fail, serverDelta);
+
+    delete[_] ths;
+    delete[_] ctxs;
+}
+
+// --------------------------------------------------------------------------
+
+extern int main()
+{
+    if (!Socket.initNetwork()) { printf("FAIL: initNetwork\n"); return 1; }
+
+    printf("HTTP server throughput benchmark\n");
+    printf("================================\n");
+    printf("Endpoint: GET /ping -> 200 \"OK\" (HTTP/1.1, Connection: close)\n");
+    printf("Server: HttpServer program (workers=%d), pool owned inside program scope.\n\n",
+           g_serverWorkers);
+
+    // Start the server once, reuse across all rows.
+    stop_source src;
+    src.init();
+
+    HttpServer srv;
+    srv.port        = g_bench_port;
+    srv.workerCount = g_serverWorkers;
+    srv.stopToken   = src.get_token();
+    srv.handler     = benchHandler;
+
+    list<string> srvArgs;
+    srv.run(srvArgs);
+    Sleep(100);   // let the listener come up
+
+    printf("Concurrency sweep (client threads)\n");
+    printf("----------------------------------\n");
+    runRow(1, 200);
+    runRow(2, 200);
+    runRow(4, 200);
+    runRow(8, 200);
+    runRow(8, 500);
+
+    src.request_stop();
+    srv.WaitForExit();
+    src.dispose();
+
+    Socket.shutdownNetwork();
+    printf("\nDone. Total server requests: %lld\n", g_serverRequests.read());
+    return 0;
+}

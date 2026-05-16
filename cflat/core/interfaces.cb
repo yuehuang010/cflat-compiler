@@ -61,6 +61,13 @@ interface IAllocator
     i64   usedBytes();
     i64   totalBytes();
     i64   peakReserve();
+
+    // Spawn an allocator for a newly created thread. Allocators that are
+    // thread-safe to share (e.g. MallocAllocator) typically return self.
+    // Allocators with per-thread state (e.g. BucketAllocator) create a fresh
+    // child instance, register it for cleanup, and return it. The child's
+    // lifetime is owned by the parent - the caller MUST NOT free the result.
+    IAllocator spawn_child();
 };
 
 interface IQueue<T>

@@ -257,6 +257,12 @@ class EntryAllocator : IAllocator
     i64 totalBytes()   { return (i64)_pageCount * _pageSize; }
     i64 peakReserve()  { return _peakReserved; }
 
+    // Not thread-safe; sharing across threads is the caller's responsibility.
+    IAllocator spawn_child() {
+        IAllocator self_iface = EntryAllocator__;
+        return self_iface;
+    }
+
     void printUsage()
     {
         printf("EntryAllocator: %d pages, used=%lld / committed=%lld bytes\n",

@@ -1,5 +1,6 @@
 import "vmem.cb";
 import "page_pool.cb";
+import "mutex.cb";
 
 // bucket_allocator.cb - segregated free-list allocator backed by g_page_pool.
 //
@@ -33,13 +34,17 @@ import "page_pool.cb";
 
 
 // Page header at offset 0 of every bucket-owned 64 KB page.
+//
+// _owner is a back-pointer to the BucketAllocator that owns this page; used
+// by operator delete to route cross-allocator frees (e.g. inbox messages
+// flowing between programs) back to the owning BA without consulting TLS.
 struct _BA_PageHdr
 {
     u32 _magic     = 0;        // 0xBA63E001 when owned by a BucketAllocator
     i32 _class     = 0;        // size class index 0..7
     i8* _next_page = nullptr;  // next page in this bucket's _page list
-    i8* _pad0      = nullptr;  // pad to 32 bytes for cache alignment
-    i8* _pad1      = nullptr;
+    i8* _owner     = nullptr;  // BucketAllocator* that owns this page (cast at use site)
+    i8* _pad1      = nullptr;  // pad to 32 bytes for cache alignment
 };
 
 // Intrusive free-block link - overlays the first 8 bytes of any free block.
@@ -55,12 +60,54 @@ struct _BA_Bucket
 };
 
 // Header prepended to every large-alloc vmem_alloc region.
+//
+// _magic distinguishes large-alloc base pages from small-block pages so the
+// shared page-masked dispatch in operator delete can identify both kinds.
+// _owner is the BucketAllocator that owns this large alloc.
 struct _BA_LargeHdr
 {
+    u32 _magic      = 0;       // 0xBA63E002 when owned by a BucketAllocator
+    u32 _pad        = 0;
     i64 _userSize   = 0;
     i64 _regionSize = 0;
     i8* _next       = nullptr;
+    i8* _owner      = nullptr; // BucketAllocator* that owns this large alloc
 };
+
+// Page-header dispatch hook registered with memory.cb.
+//
+// Looks up the page-aligned base address of ptr (64K-aligned because both
+// vmem_alloc-backed pages and large-alloc regions are 64K-granular). If the
+// base carries either the small-block magic (0xBA63E001) or the large-alloc
+// magic (0xBA63E002), routes the free to the owning BucketAllocator. Returns
+// true if the dispatch happened, false otherwise so operator delete can fall
+// through to __active_allocator or CRT free.
+bool __BA_try_owner_dealloc(void* ptr)
+{
+    i64 page_addr = (i64)ptr & ~(i64)0xFFFF;
+    if (page_addr == (i64)0) return false;
+
+    u32* magicPtr = (u32*)page_addr;
+    u32 magic = *magicPtr;
+
+    if (magic == (u32)0xBA63E001)
+    {
+        _BA_PageHdr* hdr = (_BA_PageHdr*)page_addr;
+        BucketAllocator* owner = (BucketAllocator*)hdr->_owner;
+        if (owner == nullptr) return false;
+        owner.dealloc(ptr);
+        return true;
+    }
+    if (magic == (u32)0xBA63E002)
+    {
+        _BA_LargeHdr* hdr = (_BA_LargeHdr*)page_addr;
+        BucketAllocator* owner = (BucketAllocator*)hdr->_owner;
+        if (owner == nullptr) return false;
+        owner.dealloc(ptr);
+        return true;
+    }
+    return false;
+}
 
 class BucketAllocator : IAllocator
 {
@@ -73,6 +120,22 @@ class BucketAllocator : IAllocator
     i64 _reservedNow  = 0;
     i64 _peakReserved = 0;
 
+    // Intrusive list of child BAs spawned via spawn_child(). The parent owns
+    // its children: their pages stay live until the parent's destructor walks
+    // the chain and cleans each one up. Sibling pointers link children
+    // together; _first_child is the head of the list on the parent.
+    BucketAllocator* _first_child   = nullptr;
+    BucketAllocator* _next_sibling  = nullptr;
+
+    // Per-BA mutex guarding all bucket/page/large-list mutation. Required
+    // because Phase B routes cross-thread/cross-program frees back through
+    // the owning BA's dealloc, where they race with the owner's own
+    // alloc/dealloc on its native thread.
+    //
+    // Future optimization (Phase D'): replace the mutex with a lock-free
+    // remote-free LIFO so the owning thread's hot path takes zero atomics.
+    mutex _lock = default;
+
     // -----------------------------------------------------------------------
     // Initialization
     // -----------------------------------------------------------------------
@@ -82,6 +145,12 @@ class BucketAllocator : IAllocator
         int i = 0;
         while (i < 8) { _buckets[i]._block_size = _blockSizeFor(i); i = i + 1; }
         _initialized = true;
+
+        // Register the page-header dispatch hook with memory.cb on first init.
+        // Idempotent: setting to the same value is safe even if two BAs init
+        // concurrently on different threads.
+        if (__try_owner_dealloc == nullptr)
+            __try_owner_dealloc = __BA_try_owner_dealloc;
     }
 
     i64 _blockSizeFor(int cls)
@@ -132,6 +201,7 @@ class BucketAllocator : IAllocator
         hdr->_magic     = (u32)0xBA63E001;
         hdr->_class     = (i32)cls;
         hdr->_next_page = _buckets[cls]._page;
+        hdr->_owner     = (i8*)BucketAllocator__;
         _buckets[cls]._page = page;
         _reservedNow = _reservedNow + (i64)65536;
         if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
@@ -166,9 +236,11 @@ class BucketAllocator : IAllocator
         if (base == nullptr) return nullptr;
 
         _BA_LargeHdr* hdr = (_BA_LargeHdr*)base;
+        hdr->_magic      = (u32)0xBA63E002;
         hdr->_userSize   = size;
         hdr->_regionSize = total;
         hdr->_next       = _largeHead;
+        hdr->_owner      = (i8*)BucketAllocator__;
         _largeHead       = base;
         _largeBytes  = _largeBytes + size;
         _largeCount  = _largeCount + 1;
@@ -222,6 +294,14 @@ class BucketAllocator : IAllocator
 
     void* alloc(i64 size)
     {
+        _lock.acquire();
+        void* r = _allocUnsynced(size);
+        _lock.release();
+        return r;
+    }
+
+    void* _allocUnsynced(i64 size)
+    {
         if (size <= (i64)0) return nullptr;
         if (!_initialized) _init();
 
@@ -239,6 +319,13 @@ class BucketAllocator : IAllocator
     }
 
     void dealloc(void* ptr)
+    {
+        _lock.acquire();
+        _deallocUnsynced(ptr);
+        _lock.release();
+    }
+
+    void _deallocUnsynced(void* ptr)
     {
         if (ptr == nullptr) return;
 
@@ -278,6 +365,33 @@ class BucketAllocator : IAllocator
 
     i64 totalBytes()   { return (i64)0; }
     i64 peakReserve()  { return _peakReserved; }
+
+    // Spawn a fresh BucketAllocator for a child thread and chain it onto this
+    // allocator's child list. The parent's destructor walks the chain and
+    // cleans up each child. Caller MUST NOT free the returned allocator -
+    // ownership stays with this parent.
+    //
+    // Thread-safety: spawn_child mutates _first_child without synchronization;
+    // it must be called from the parent's own thread (the usual case: a
+    // program's main thread spawning child Threads sequentially). Phase D
+    // will add atomic linking if concurrent spawn becomes a need.
+    IAllocator spawn_child()
+    {
+        BucketAllocator* child = (BucketAllocator*)malloc((i64)sizeof(BucketAllocator));
+        // Zero-initialize so default field values take effect (matches global
+        // `BucketAllocator b;` semantics). malloc returns uninitialized memory.
+        i8* raw = (i8*)child;
+        i64 i = 0;
+        while (i < (i64)sizeof(BucketAllocator)) { raw[i] = (i8)0; i = i + 1; }
+
+        _lock.acquire();
+        child->_next_sibling = _first_child;
+        _first_child         = child;
+        _lock.release();
+
+        IAllocator child_iface = child;   // pointer -> fat-ptr upcast via assignment
+        return child_iface;
+    }
 
     i64 committedBytes()
     {
@@ -357,5 +471,20 @@ class BucketAllocator : IAllocator
         _reservedNow = (i64)0;
     }
 
-    ~BucketAllocator() { cleanup(); }
+    ~BucketAllocator()
+    {
+        // Walk and clean up spawned children before tearing down our own state.
+        // Each child's cleanup releases its pages back to g_page_pool; the
+        // child struct itself was malloc'd by spawn_child so it's free'd here.
+        BucketAllocator* c = _first_child;
+        while (c != nullptr)
+        {
+            BucketAllocator* next = c->_next_sibling;
+            c->cleanup();
+            free((void*)c);
+            c = next;
+        }
+        _first_child = nullptr;
+        cleanup();
+    }
 };

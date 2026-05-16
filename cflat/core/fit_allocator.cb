@@ -339,6 +339,12 @@ class FitAllocator : IAllocator
     i64 totalBytes()  { return (i64)0; }
     i64 peakReserve() { return _peakReserved; }
 
+    // Not thread-safe; sharing across threads is the caller's responsibility.
+    IAllocator spawn_child() {
+        IAllocator self_iface = FitAllocator__;
+        return self_iface;
+    }
+
     i64 freeBytes()
     {
         i64 total = 0;

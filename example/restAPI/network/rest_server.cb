@@ -1,21 +1,17 @@
 // network/rest_server.cb - REST server combining HttpRouter with an HTTP
-// accept loop.  Accepted connections are dispatched to a caller-supplied
-// `ThreadPool` so one thread per connection is replaced by a bounded worker
-// pool.  The pool is created and shut down by the caller (typically main);
-// a single pool can be shared by multiple servers and its lifecycle stays
-// out of the program teardown path.
+// accept loop.  Accepted connections are dispatched to an internally-owned
+// `ThreadPool`.  The pool is initialized inside the program's main() so
+// worker threads inherit the program's allocator via spawn_child(), and
+// shut down before main() returns so teardown stays on the program thread.
 //
 // Usage:
-//   import "threadpool.cb";
 //   import "network/rest_server.cb";
-//
-//   ThreadPool pool;  pool.init(8);
 //
 //   stop_source src; src.init();
 //   RestServer srv;
-//   srv.port = 8080;
-//   srv.stopToken = src.get_token();
-//   srv.pool      = &pool;
+//   srv.port         = 8080;
+//   srv.workerCount  = 8;
+//   srv.stopToken    = src.get_token();
 //   srv.get("/hello",       helloHandler);
 //   srv.get("/users/:id",   userHandler);   // path param -> req->getParam("id")
 //   srv.post("/items",      createHandler);
@@ -25,7 +21,6 @@
 //   src.request_stop();
 //   srv.WaitForExit();
 //   src.dispose();
-//   pool.shutdown();
 
 import "string.cb";
 import "list.cb";
@@ -45,10 +40,10 @@ struct _RestConnCtx {
     HttpRouter* router = nullptr;
 };
 
-// Pool task: dispatches one request through the shared router and frees ctx.
-// ctx is malloc-allocated (not 'new') so this borrowed-pointer signature can
-// free it without tripping the ownership analyzer.
-int _restConnTask(void* raw, stop_token tok)
+// Pool task: dispatches one request through the shared router.  ctx is
+// delivered move-owned via cflat's move void* convention; the cast to
+// _RestConnCtx* preserves the owning flag, and scope exit auto-deletes.
+int _restConnTask(move void* raw, stop_token tok)
 {
     _RestConnCtx* ctx = (_RestConnCtx*)raw;
 
@@ -78,18 +73,18 @@ int _restConnTask(void* raw, stop_token tok)
     delete rbuf;
     delete resp;
 
-    free((void*)ctx);
     return 0;
 }
 
-// REST server program. Register routes and assign a pool, then call run().
+// REST server program. Register routes before calling run().
 // Routes must not be modified after run() is called.
 program RestServer {
-    int         port      = 8080;
-    int         backlog   = 16;
-    stop_token  stopToken = default;
-    ThreadPool* pool      = nullptr;
-    HttpRouter  router    = default;
+    int         port        = 8080;
+    int         backlog     = 16;
+    int         workerCount = 4;
+    stop_token  stopToken   = default;
+    ThreadPool  pool        = default;
+    HttpRouter  router      = default;
 
     void get(const char* path, function<HttpResponse*(HttpRequest*)> h)
         { router.add("GET",    path, h); }
@@ -102,40 +97,45 @@ program RestServer {
 
     int main(move list<string> args)
     {
-        if (pool == nullptr) { return 1; }
+        pool.init(workerCount);
 
         Socket* listener = new Socket;
-        if (!listener->createTcp()) { delete listener; return 1; }
+        if (!listener->createTcp()) { delete listener; pool.shutdown(); return 1; }
 
         listener->setReuseAddr(true);
         listener->setNonBlocking(true);
 
         string any = "";
-        if (!listener->bind(any, port))   { delete listener; return 1; }
-        if (!listener->listenOn(backlog)) { delete listener; return 1; }
+        if (!listener->bind(any, port))   { delete listener; pool.shutdown(); return 1; }
+        if (!listener->listenOn(backlog)) { delete listener; pool.shutdown(); return 1; }
 
         while (!stopToken.stop_requested())
         {
             Socket* conn = listener->accept();
             if (conn == nullptr) { Sleep(5); continue; }
 
-            _RestConnCtx* c = (_RestConnCtx*)malloc(sizeof(_RestConnCtx));
+            _RestConnCtx* c = new _RestConnCtx;
             c->handle = conn->_handle;
             c->router = &router;
             conn->_handle = nullptr;  // transfer OS handle; Socket shell freed here
             delete conn;
 
-            if (!pool->submitDetached(_restConnTask, c))
+            // Extract the socket handle BEFORE submit: pool consumes c and
+            // deletes it on refusal, so post-call access to c is invalid.
+            void* sock = c->handle;
+            if (!pool.submitDetached(_restConnTask, c))
             {
                 Socket drop;
-                drop._handle = c->handle;
-                free((void*)c);
+                drop._handle = sock;
+                // pool already deleted c on refusal; drop's destructor closes
+                // the socket handle at scope exit.
             }
         }
 
-        // Flush in-flight tasks before we tear down so no task outlives the
-        // router it references.  pool.shutdown() is the caller's job.
-        pool->drain();
+        // Drain in-flight tasks and tear the pool down on the program thread
+        // so worker join + allocator cleanup happens in the right scope.
+        pool.drain();
+        pool.shutdown();
 
         delete listener;
         return 0;

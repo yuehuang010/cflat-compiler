@@ -8,6 +8,17 @@ import "cruntime.cb";
 
 thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null data = inactive
 
+// Page-header dispatch hook. Set by an owning allocator at init time
+// (currently BucketAllocator via __BA_try_owner_dealloc). When set, operator
+// delete consults this hook first so pointers whose owning allocator differs
+// from the caller's __active_allocator (e.g. an inbox message that flowed from
+// program A to program B) still route back to the correct owner.
+//
+// Contract: returns true if the hook claimed and freed ptr; false otherwise.
+// Hook must be safe to call on arbitrary non-null pointers - it inspects a
+// page-aligned header magic before touching anything else.
+function<bool(void*)> __try_owner_dealloc = nullptr;
+
 void __register_handle(void* handle, void* closeFn)
 {
     // stub - handle tracking is future work
@@ -22,6 +33,8 @@ void* operator new(i64 size)
 
 void operator delete(void* ptr)
 {
+    if (ptr == nullptr) return;
+    if (__try_owner_dealloc != nullptr && __try_owner_dealloc(ptr)) return;
     if (__active_allocator != nullptr)
     {
         __active_allocator.dealloc(ptr);

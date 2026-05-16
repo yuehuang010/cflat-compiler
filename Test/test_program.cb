@@ -926,6 +926,59 @@ bool testTrackHandles() {
 }
 
 // ---------------------------------------------------------------------------
+// Cross-thread allocator inheritance
+// ---------------------------------------------------------------------------
+
+// A child Thread spawned inside main must inherit __active_allocator from the
+// program thread. Without inheritance, the child's `new` falls through to
+// CRT malloc and the program's allocator never sees the allocations.
+//
+// Signal: the program is configured with a MallocAllocator (which tracks
+// cumulative alloc bytes in totalBytes()). main does no allocations itself;
+// the child thread does `count` allocations and frees them. After join, the
+// MallocAllocator's totalBytes should equal count * 4. Pre-fix the child
+// would use CRT malloc directly and totalBytes would be 0.
+program ChildThreadInheritsAllocator {
+    int count = 0;
+
+    int main(move list<string> args) {
+        int n = count;
+        Thread t;
+        t.start((void* ctx) => {
+            int* np = (int*)ctx;
+            int local_n = *np;
+            int i = 0;
+            while (i < local_n) {
+                int* p = new int;
+                *p = i;
+                delete p;
+                i++;
+            }
+            return 0;
+        }, (void*)&n);
+        t.join();
+        return 0;
+    }
+};
+
+bool testChildThreadInheritsAllocator() {
+    bool result = true;
+    ChildThreadInheritsAllocator p;
+    p._allocator = new MallocAllocator;
+    p.count = 5;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    // Child allocated 5 ints. MallocAllocator's totalBytes is cumulative and
+    // survives the program teardown's allocator-cleanup step.
+    // Inheritance working -> totalBytes >= 20 (5 * sizeof(int)).
+    // Inheritance broken  -> child used CRT malloc; MA never saw allocs;
+    //                        totalBytes is 0.
+    result &= Test("child inherited allocator totalBytes", p._allocator.totalBytes() >= 20, true);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Main signature variants
 // ---------------------------------------------------------------------------
 
@@ -1054,6 +1107,7 @@ extern int main() {
     total++; passed += testNoArgsMain()                  ? 1 : 0;
     total++; passed += testArgcArgvMain()                ? 1 : 0;
     total++; passed += testImportedProgram()             ? 1 : 0;
+    total++; passed += testChildThreadInheritsAllocator() ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

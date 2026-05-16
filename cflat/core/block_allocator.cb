@@ -181,6 +181,13 @@ class BlockAllocator : IAllocator
     i64 totalBytes()   { return (i64)0; }
     i64 peakReserve()  { return _peakReserved; }
 
+    // BlockAllocator is not thread-safe; sharing across threads is the caller's
+    // responsibility. Returns self for now; per-thread instancing can layer on later.
+    IAllocator spawn_child() {
+        IAllocator self_iface = BlockAllocator__;
+        return self_iface;
+    }
+
     // Total block capacity across all pages.
     i64 totalBlocks()
     {

@@ -22,23 +22,21 @@ int THREADPOOL_PRIORITY_NORMAL = 1;
 int THREADPOOL_PRIORITY_LOW    = 0;
 
 // --- TaskHandle ---------------------------------------------------------------
-// Owned by the caller.  Pass &handle to submit().
+// Returned by pool.submit() and pool.then() as a move-owned pointer.  Single-
+// use: each submit() allocates a fresh handle, so the resubmission hazard of
+// the old API no longer exists.
 //
-// Single-use: a TaskHandle must not be resubmitted.  submit() re-inits
-// _cancelSrc but does not reset 'done', so a reused handle would report the
-// previous run's completion immediately.  Declare a fresh handle per task.
+// Destructor blocks until the worker has signalled 'done' before disposing
+// _cancelSrc.  Forgetting to wait() is therefore safe (the caller blocks at
+// scope exit instead of UAF'ing the worker's writes through a freed handle).
 //
-// After submitting, call handle.wait() to block until the task completes, then
-// read results inside done.acquire() to guarantee acquire-ordering on them.
-// Call handle.cancel() to signal the task to abort early (cooperative).
-//
-//   TaskHandle h;
-//   pool.submit(fn, ctx, &h);
-//   h.cancel();               // signal abort
-//   h.wait();                 // wait for task to notice and return
-//   h.done.acquire((i32 v) => {
-//       if (!h.failed) { /* use h.exitCode */ }
-//   });
+//   move TaskHandle* h = pool.submit(fn, ctx);
+//   if (h == nullptr) { /* pool refused; ctx already freed by pool */ }
+//   else {
+//       h->wait();
+//       int code = h->exitCode;
+//       // h scope-exits -> ~TaskHandle (done already 1) -> dispose
+//   }
 //
 struct TaskHandle {
     atomic__i32 done       = default;
@@ -50,11 +48,11 @@ struct TaskHandle {
 
     // Continuation - registered by ThreadPool.then(), fired by the worker.
     // All fields are protected by the pool's _lock; never access them directly.
-    function<int(void*, stop_token)> _contFn       = default;
-    void*                            _contCtx      = nullptr;
-    TaskHandle*                      _contHandle   = nullptr;
-    int                              _contPriority = 1;   // THREADPOOL_PRIORITY_NORMAL
-    bool                             _hasCont      = false;
+    function<int(move void*, stop_token)> _contFn       = default;
+    void*                                 _contCtx      = nullptr;
+    TaskHandle*                           _contHandle   = nullptr;
+    int                                   _contPriority = 1;   // THREADPOOL_PRIORITY_NORMAL
+    bool                                  _hasCont      = false;
 
     // Signal the task to stop early.  The task must check tok.stop_requested().
     void cancel() { _cancelSrc.request_stop(); }
@@ -78,7 +76,14 @@ struct TaskHandle {
         return true;
     }
 
-    ~TaskHandle() { _cancelSrc.dispose(); }
+    // Safe-by-construction: block until worker has finished writing exitCode /
+    // failed (signalled by done=1) before disposing _cancelSrc.  Submit's
+    // failure paths set done=1 manually so this never blocks for a handle that
+    // was never enqueued.
+    ~TaskHandle() {
+        while (done.load() == 0) { SwitchToThread(); }
+        _cancelSrc.dispose();
+    }
 };
 
 // --- TaskResult<T> ------------------------------------------------------------
@@ -162,10 +167,10 @@ struct TaskResult<T> {
 // token for fire-and-forget tasks).
 //
 struct Task {
-    function<int(void*, stop_token)> fn     = default;
-    void*                            ctx    = nullptr;
-    TaskHandle*                      handle = nullptr;  // nullptr for fire-and-forget tasks
-    stop_token                       _token = default;  // passed to fn; never-cancelled if no handle
+    function<int(move void*, stop_token)> fn     = default;
+    void*                                 ctx    = nullptr;
+    TaskHandle*                           handle = nullptr;  // nullptr for fire-and-forget tasks
+    stop_token                            _token = default;  // passed to fn; never-cancelled if no handle
 };
 
 // --- WorkerStartCtx -----------------------------------------------------------
@@ -198,6 +203,29 @@ struct WorkerCtx {
     atomic_counter* drainingWorkers = nullptr;  // workers currently inside drain()
 };
 
+// Publish a task's exit code on its handle under the 'done' lock.  Lives as
+// a helper so callers can pass an owning TaskHandle* in by borrow - cflat's
+// lambda capture treats an owning local as moved, but a borrowed parameter
+// is fine.
+void __threadpool_publish_done(TaskHandle* h, int code) {
+    h->done.release(1, () => {
+        h->exitCode = code;
+        h->failed   = code != 0;
+    });
+}
+
+// Run a task synchronously on the caller's thread, then publish its result on
+// the handle.  Takes Task by value; consuming t.ctx through the move-typed
+// indirect call marks the whole struct t as consumed in cflat's tracker, so
+// any post-call state must be hoisted into locals first.
+void __threadpool_run_inline(Task t) {
+    TaskHandle* h_ref = t.handle;
+    int code = t.fn(t.ctx, t._token);
+    if (h_ref != nullptr) {
+        __threadpool_publish_done(h_ref, code);
+    }
+}
+
 // Push a task onto the queue selected by priority.  Returns false if that
 // channel is saturated.  Shared by submit(), then(), and the worker so the
 // priority-to-queue mapping lives in exactly one place.
@@ -224,13 +252,21 @@ void __threadpool_release_inflight(WorkerCtx* wctx) {
 //   ThreadPool pool;
 //   pool.init(4);
 //
-//   TaskHandle h;
-//   pool.submit(myFn, ctx, &h);                           // NORMAL priority
-//   pool.submit(urgentFn, ctx, &h, THREADPOOL_PRIORITY_HIGH);
-//   pool.submitDetached(backgroundFn, ctx);               // fire-and-forget
+//   MyCtx* c = new MyCtx; c->in = ...;
+//   move TaskHandle* h = pool.submit(myFn, c);           // NORMAL priority
+//                                                         // c is moved into pool
+//   if (h != nullptr) { h->wait(); use h->exitCode; }
+//
+//   MyCtx* c2 = new MyCtx; c2->payload = ...;
+//   pool.submitDetached(backgroundFn, c2);                // fire-and-forget
 //
 //   pool.drain();         // block until all in-flight tasks finish
 //   pool.shutdown();      // drain + join all workers + release resources
+//
+// Pool owns ctx the moment submit / submitDetached returns: on success the
+// ctx pointer is delivered (still owning) to the task function via the move
+// signature; on refusal (nullptr / false) the pool deletes ctx itself.
+// Callers never free ctx after handing it to the pool.
 //
 // IMPORTANT: do not copy or move a ThreadPool after init() - WorkerCtx holds
 // raw pointers into the pool's fields.
@@ -266,15 +302,12 @@ class ThreadPool {
     // executes tasks synchronously on the caller's thread.  See _inlineMode.
     void init(int workerCount) {
         if (_count > 0 || _inlineMode) { return; }
-        if (__active_allocator != nullptr) {
-            // Inline mode: no workers, no channels needed.  Mark _count as 1 so
-            // workerCount() reports a sensible value, but leave _workers null so
-            // submit() / shutdown() take the inline branch.
-            _inlineMode = true;
-            _count      = 1;
-            _capacity   = 1;
-            return;
-        }
+        // Inline-mode trigger for program-scope use was a workaround for the
+        // cross-thread free hazard. With page-header-driven operator delete
+        // (memory.cb) plus per-thread BucketAllocator via spawn_child
+        // (thread.cb / bucket_allocator.cb), workers can safely cross-allocate
+        // and cross-free against the program allocator. Trigger is removed so
+        // ThreadPool runs true multi-threaded inside `program` scope.
         _stop.init();
         // Semaphore max is the largest LONG (2^31 - 1); ReleaseSemaphore
         // silently drops a token if count would exceed max, which would stall
@@ -313,136 +346,167 @@ class ThreadPool {
     }
 
     // Submit a task with an explicit priority.
-    // Returns false if the pool is not running, is shutting down, or the
-    // targeted priority queue is full (channel saturated).  When full, the
-    // caller's _inflight reservation is rolled back and the handle is left
-    // untouched so it is safe to retry.
-    // handle may be nullptr for fire-and-forget tasks; cancellable tasks must pass a handle.
-    bool submit(function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        if (_inlineMode) {
-            // Run synchronously on the caller's thread.  Handle bookkeeping
-            // mirrors __threadpool_execute_task: signal done, fire any
-            // continuation registered via then() before this submit returned.
-            stop_token tok = default;
-            if (handle != nullptr) {
-                handle->_cancelSrc.init();
-                handle->_hasCont = false;
-                tok = handle->_cancelSrc.get_token();
-            }
-            int code = fn(ctx, tok);
-            if (handle != nullptr) {
-                handle->done.release(1, () => {
-                    handle->exitCode = code;
-                    handle->failed   = code != 0;
-                });
-                // Fire continuation (registered before this submit returned).
-                if (handle->_hasCont) {
-                    handle->_hasCont = false;
-                    submit(handle->_contFn, handle->_contCtx, handle->_contHandle, handle->_contPriority);
-                }
-            }
-            return true;
+    // Returns an owning TaskHandle* on success.  Returns nullptr if the pool
+    // is not running, is shutting down, or the targeted priority queue is
+    // full; in that case the pool deletes ctx, so the caller never frees ctx
+    // after this call.
+    move TaskHandle* submit(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        // Refuse BEFORE consuming ctx.  cflat's move tracker is path-
+        // insensitive, so all ctx consumption funnels through the single
+        // store into t.ctx below.
+        if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
+            delete (void*)ctx;
+            return nullptr;
         }
-        if (_workers == nullptr || _stop.stop_requested()) { return false; }
+
+        TaskHandle* h = new TaskHandle;
+        h->_cancelSrc.init();
+
+        Task t;
+        t.fn     = fn;
+        t.ctx    = ctx;          // unconditional transfer; t.ctx now owns
+        t.handle = h;
+        t._token = h->_cancelSrc.get_token();
+
+        if (_inlineMode) {
+            // Run synchronously on the caller's thread; t consumed via helper.
+            // Inline-mode then() submits the continuation directly rather than
+            // registering on dep, so _hasCont should never be set here.
+            __threadpool_run_inline(t);
+            return h;
+        }
+
+        // Reserve a slot in the in-flight count BEFORE pushing so drain()
+        // never races past a freshly submitted task; roll back if push fails.
+        _inflight.increment();
+        if (!__threadpool_push_by_priority(&_ctx, t, priority)) {
+            __threadpool_release_inflight(&_ctx);
+            void* lost = t.ctx;
+            t.ctx = nullptr;
+            delete lost;
+            h->done.store(1);   // unblock ~TaskHandle's wait
+            delete h;
+            return nullptr;
+        }
+        _ready.release();
+        return h;
+    }
+
+    // Fire-and-forget submission: no handle is allocated, ctx is moved into
+    // the pool, and the caller cannot wait or cancel.  Returns true if the
+    // task was accepted, false if the pool refused (queue full / shutdown),
+    // in which case the pool deletes ctx.
+    bool submitDetached(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        // Refuse BEFORE consuming ctx; cflat's move tracker is path-insensitive.
+        if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
+            delete (void*)ctx;
+            return false;
+        }
+
         Task t;
         t.fn     = fn;
         t.ctx    = ctx;
-        t.handle = handle;
-        if (handle != nullptr) {
-            handle->_cancelSrc.init();
-            handle->_hasCont = false;   // clear stale state; arrays are not per-element constructed
-            t._token = handle->_cancelSrc.get_token();
+        t.handle = nullptr;
+        // _token left default (never-cancelled).
+
+        if (_inlineMode) {
+            __threadpool_run_inline(t);
+            return true;
         }
-        // Reserve a slot in the in-flight count BEFORE pushing so drain() never
-        // races past a freshly submitted task; roll back if the push fails.
+
         _inflight.increment();
         if (!__threadpool_push_by_priority(&_ctx, t, priority)) {
-            // Channel full: undo the reservation (wakes drain() if inflight
-            // drops to zero) so callers don't sleep on stale state.
             __threadpool_release_inflight(&_ctx);
+            void* lost = t.ctx;
+            t.ctx = nullptr;
+            delete lost;
             return false;
         }
         _ready.release();
         return true;
     }
 
-    // Convenience: submit a fire-and-forget task (no handle, no cancellation).
-    bool submitDetached(function<int(void*, stop_token)> fn, void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        return submit(fn, ctx, nullptr, priority);
-    }
-
-    // Register fn to run automatically after dep's task finishes.
+    // Register fn to run automatically after dep's task finishes.  dep is
+    // borrowed: the caller keeps ownership of dep until the chain's terminal
+    // handle has completed.
+    //
     // Safe to call before or after dep completes; call at most once per dep
-    // handle - a second then() on the same dep returns false rather than
+    // handle - a second then() on the same dep returns nullptr rather than
     // silently overwriting the first continuation.
     //
     // The continuation is counted in _inflight from the moment then() succeeds
     // so drain() cannot return between dep's completion and the continuation
-    // being enqueued.  This makes drain() honour continuations registered
-    // before or during drain.
+    // being enqueued.
     //
-    // Returns false if the pool is shut down, the queue is saturated, or dep
-    // already has a registered (unfired) continuation.
-    bool then(TaskHandle* dep, function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        if (_inlineMode) {
-            // dep ran inline so it has already completed.  Fire the
-            // continuation immediately.
-            return submit(fn, ctx, handle, priority);
+    // Returns an owning TaskHandle* on success, nullptr on shutdown / queue
+    // saturation / duplicate-then.  On nullptr the pool deletes ctx.
+    move TaskHandle* then(TaskHandle* dep, function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        // _inlineMode is not currently auto-triggered (see init()), so then()
+        // does not need a synchronous fast-path.  If inline mode is ever
+        // re-enabled, dep will already be done and the cleanest re-introduction
+        // is to call submit(fn, ctx, priority) here - but it must be the only
+        // ctx-consuming early-return to satisfy cflat's move tracker (one
+        // return-after-consume + one main-flow consume is the supported shape).
+        if (_workers == nullptr || _stop.stop_requested()) {
+            delete (void*)ctx;
+            return nullptr;
         }
-        if (_workers == nullptr || _stop.stop_requested()) { return false; }
+
+        TaskHandle* h = new TaskHandle;
+        h->_cancelSrc.init();
+
+        // Single consumption point for ctx; from here on we work with t.ctx.
+        Task t;
+        t.fn     = fn;
+        t.ctx    = ctx;
+        t.handle = h;
+        t._token = h->_cancelSrc.get_token();
+
         // Pre-reserve inflight: the continuation is logically pending from now.
         _inflight.increment();
         bool submit_now  = false;
         bool duplicate   = false;
         _lock.acquire();
         if (dep->_hasCont) {
-            // dep already has a registered, unfired continuation.  This holds
-            // whether or not dep has finished: if dep is done, the worker is
-            // about to fire that continuation; if not, it will fire it later.
-            // Either way a second then() on the same dep is a duplicate.  We
-            // must check _hasCont BEFORE done: if dep completed in the window
-            // between then()#1 registering and the worker firing, checking
-            // done first would take the submit_now path and enqueue a second
-            // continuation, so both would run.
             duplicate = true;
         } else if (dep->done.load() != 0) {
-            // dep already finished and has no continuation registered - the
-            // worker has passed its _hasCont check, so we enqueue ourselves.
+            // dep finished without a registered continuation; enqueue ourselves.
             submit_now = true;
         } else {
-            dep->_contFn       = fn;
-            dep->_contCtx      = ctx;
-            dep->_contHandle   = handle;
+            // Register on dep.  Transfer t.ctx into dep->_contCtx; t.ctx is
+            // nulled so the duplicate/submit_now cleanup below is a no-op.
+            dep->_contFn       = t.fn;
+            dep->_contCtx      = t.ctx;
+            t.ctx              = nullptr;
+            dep->_contHandle   = h;
             dep->_contPriority = priority;
             dep->_hasCont      = true;
         }
         _lock.release();
 
         if (duplicate) {
-            // Roll back the reservation; nothing was enqueued.
             __threadpool_release_inflight(&_ctx);
-            return false;
+            void* lost = t.ctx;
+            t.ctx = nullptr;
+            delete lost;
+            h->done.store(1);
+            delete h;
+            return nullptr;
         }
 
         if (submit_now) {
-            // Build the task here and push directly so we don't double-count
-            // inflight (submit() would increment again).
-            Task t;
-            t.fn     = fn;
-            t.ctx    = ctx;
-            t.handle = handle;
-            if (handle != nullptr) {
-                handle->_cancelSrc.init();
-                handle->_hasCont = false;
-                t._token = handle->_cancelSrc.get_token();
-            }
             if (!__threadpool_push_by_priority(&_ctx, t, priority)) {
                 __threadpool_release_inflight(&_ctx);
-                return false;
+                void* lost = t.ctx;
+                t.ctx = nullptr;
+                delete lost;
+                h->done.store(1);
+                delete h;
+                return nullptr;
             }
             _ready.release();
         }
-        return true;
+        return h;
     }
 
     // Approximate number of tasks queued but not yet started (excludes tasks
@@ -631,12 +695,13 @@ class ThreadPool {
 // zero.  Called by both the normal worker loop and the drain work-participation
 // path so the logic lives in exactly one place.
 void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
+    // Hoist task.handle before the indirect call: cflat's tracker treats the
+    // move-typed fn call as consuming the whole task struct, so any post-call
+    // access has to go through a local copy taken upfront.
+    TaskHandle* h_ref = task.handle;
     int code = task.fn(task.ctx, task._token);
-    if (task.handle != nullptr) {
-        task.handle->done.release(1, () => {
-            task.handle->exitCode = code;
-            task.handle->failed   = code != 0;
-        });
+    if (h_ref != nullptr) {
+        __threadpool_publish_done(h_ref, code);
     }
     // Read the continuation under _lock to stay coherent with then(), but
     // perform the channel push outside the lock.  Inflight is incremented for
@@ -652,16 +717,17 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     // ordering used by then().  The actual channel push happens outside the
     // lock, and if it fails we roll back the pre-reserved inflight slot.
     wctx->mtx->acquire();
-    if (task.handle != nullptr && task.handle->_hasCont) {
-        cont.fn     = task.handle->_contFn;
-        cont.ctx    = task.handle->_contCtx;
-        cont.handle = task.handle->_contHandle;
+    if (h_ref != nullptr && h_ref->_hasCont) {
+        cont.fn     = h_ref->_contFn;
+        cont.ctx    = h_ref->_contCtx;
+        h_ref->_contCtx = nullptr;  // mark transferred; field never read after _hasCont=false
+        cont.handle = h_ref->_contHandle;
         if (cont.handle != nullptr) {
-            cont.handle->_cancelSrc.init();
+            // then() already initialised _cancelSrc on the cont handle.
             cont._token = cont.handle->_cancelSrc.get_token();
         }
-        contPrio = task.handle->_contPriority;
-        task.handle->_hasCont = false;   // consume so we don't fire twice
+        contPrio = h_ref->_contPriority;
+        h_ref->_hasCont = false;   // consume so we don't fire twice
         fired = true;
     }
     wctx->mtx->release();
