@@ -1,0 +1,56 @@
+// test_alignas.cb - sanity tests for C++-style alignas(N).
+
+import "test_helper.cb";
+
+// 1. Struct alignas: a single-int struct padded to a cache line.
+struct alignas(64) CL { int x = 0; };
+
+// 2. Class alignas: bumps a small class to 32-byte alignment.
+class alignas(32) PaddedPair { int a = 0; int b = 0; };
+
+// 3. Plain struct for baseline comparison.
+struct PlainCounter { int v = 0; };
+
+// 4. Global with alignas: storage is over-aligned.
+alignas(64) i64 g_counter = 0;
+alignas(64) CL g_cl = default;
+
+extern int main()
+{
+    int result = 1;
+
+    // sizeof must round up to a multiple of alignof.
+    result &= Test("sizeof(CL) == 64",            (int)sizeof(CL), 64);
+    result &= Test("alignof(CL) == 64",           (int)alignof(CL), 64);
+    result &= Test("sizeof(PaddedPair) == 32",    (int)sizeof(PaddedPair), 32);
+    result &= Test("alignof(PaddedPair) == 32",   (int)alignof(PaddedPair), 32);
+    result &= Test("sizeof(PlainCounter) == 4",   (int)sizeof(PlainCounter), 4);
+    result &= Test("alignof(PlainCounter) == 4",  (int)alignof(PlainCounter), 4);
+
+    // Locals: address must be aligned.
+    CL local_cl;
+    PaddedPair local_pp;
+    alignas(32) int local_int = 0;
+    result &= Test("local CL aligned to 64",     (int)(((i64)&local_cl) & 63),       0);
+    result &= Test("local PaddedPair to 32",     (int)(((i64)&local_pp) & 31),       0);
+    result &= Test("local alignas(32) int",      (int)(((i64)&local_int) & 31),      0);
+
+    // Globals: address must be aligned.
+    result &= Test("global alignas(64) i64",     (int)(((i64)&g_counter) & 63),      0);
+    result &= Test("global CL aligned to 64",    (int)(((i64)&g_cl) & 63),           0);
+
+    // Array stride uses padded sizeof, so each element stays aligned.
+    CL[4] arr;
+    result &= Test("CL[4] sizeof per elem 64",   (int)(((i64)&arr[1]) - ((i64)&arr[0])), 64);
+    result &= Test("CL[4] base aligned to 64",   (int)(((i64)&arr[0]) & 63),         0);
+    result &= Test("CL[4] arr[2] aligned to 64", (int)(((i64)&arr[2]) & 63),         0);
+
+    // Heap path: `new CL` routes to operator new(size, align).
+    CL* p = new CL;
+    result &= Test("new CL aligned to 64",       (int)(((i64)p) & 63),               0);
+    delete p;
+
+    if (result == 1) printf("test_alignas: ALL PASSED\n");
+    else             printf("test_alignas: FAILED\n");
+    return result == 1 ? 0 : 1;
+}

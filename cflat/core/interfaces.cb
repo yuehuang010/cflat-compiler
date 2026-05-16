@@ -68,6 +68,13 @@ interface IAllocator
     // child instance, register it for cleanup, and return it. The child's
     // lifetime is owned by the parent - the caller MUST NOT free the result.
     IAllocator spawn_child();
+
+    // Over-aligned allocation: returns memory aligned to `align` bytes.
+    // `align` must be a power of two. The compiler routes `new T` here
+    // when alignof(T) exceeds the default-new threshold (16 on x64).
+    // Pointers from alloc_aligned MUST be freed with dealloc_aligned.
+    void* alloc_aligned(i64 size, i64 align);
+    void  dealloc_aligned(void* ptr);
 };
 
 interface IQueue<T>

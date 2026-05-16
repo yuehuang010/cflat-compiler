@@ -329,6 +329,11 @@ public:
         bool external = false;
         bool threadLocal = false;
 
+        // User-requested alignment from `alignas(N)`. 0 means unset; honored only
+        // when greater than the type's ABI alignment. Power of two, validated at
+        // parse time.
+        uint64_t UserAlignValue = 0;
+
         std::vector<AnnotationValue> Annotations;
     };
 
@@ -390,6 +395,10 @@ public:
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
         bool IsUnion = false;
+        // User-requested alignment from `alignas(N)` on the struct definition.
+        // 0 means unset. When set, the struct's effective alignment is max of
+        // this and the ABI alignment LLVM derived from the field types.
+        uint64_t UserRequestedAlignment = 0;
     };
 
     struct ProgramData
@@ -2401,6 +2410,42 @@ public:
         return llvm::ConstantInt::get(llvm::Type::getInt64Ty(*context), align);
     }
 
+    /// Effective alignment of a declaration: max of `alignas` on the decl,
+    /// `alignas` on the struct type (if any), and the ABI alignment.
+    uint64_t GetEffectiveAlignment(const DeclTypeAndValue& decl, llvm::Type* type)
+    {
+        uint64_t a = 1;
+        if (type && type->isSized())
+            a = module->getDataLayout().getABITypeAlign(type).value();
+        if (decl.UserAlignValue > a) a = decl.UserAlignValue;
+        auto it = dataStructures.find(decl.TypeName);
+        if (it != dataStructures.end() && it->second.UserRequestedAlignment > a)
+            a = it->second.UserRequestedAlignment;
+        return a;
+    }
+
+    /// Same as above but starting from a type name (no DeclTypeAndValue handy).
+    uint64_t GetEffectiveAlignmentForType(const std::string& typeName, llvm::Type* type)
+    {
+        uint64_t a = 1;
+        if (type && type->isSized())
+            a = module->getDataLayout().getABITypeAlign(type).value();
+        auto it = dataStructures.find(typeName);
+        if (it != dataStructures.end() && it->second.UserRequestedAlignment > a)
+            a = it->second.UserRequestedAlignment;
+        return a;
+    }
+
+    /// C++-style padded size: roundUp(allocSize, effectiveAlign).
+    /// Used by sizeof so that arrays of over-aligned types stride correctly.
+    uint64_t GetEffectiveAllocSize(llvm::Type* type, uint64_t effAlign)
+    {
+        if (!type || !type->isSized()) return 0;
+        uint64_t sz = module->getDataLayout().getTypeAllocSize(type);
+        if (effAlign <= 1) return sz;
+        return (sz + effAlign - 1) / effAlign * effAlign;
+    }
+
     void RegisterStructInterfaces(const std::string& structName, const std::vector<std::string>& interfaces)
     {
         dataStructures[structName].Interfaces = interfaces;
@@ -2703,7 +2748,7 @@ public:
         return fn;
     }
 
-    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false)
+    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0)
     {
         llvm::Type* destinationType = GetType(typeValue);
         if (initValue)
@@ -2747,6 +2792,14 @@ public:
         if (threadLocal)
             gVar->setThreadLocalMode(llvm::GlobalVariable::GeneralDynamicTLSModel);
 
+        // Apply effective alignment (decl-level alignas, struct alignas, or ABI).
+        uint64_t effAlign = GetEffectiveAlignmentForType(typeValue.TypeName, destinationType);
+        if (userAlign > effAlign) effAlign = userAlign;
+        uint64_t abiAlign = (destinationType && destinationType->isSized())
+            ? module->getDataLayout().getABITypeAlign(destinationType).value() : 0;
+        if (effAlign > abiAlign)
+            gVar->setAlignment(llvm::Align(effAlign));
+
         globalNamedVariable[typeValue.VariableName] = gVar;
         globalVariableTypes[typeValue.VariableName] = typeValue;
 
@@ -2766,22 +2819,45 @@ public:
     // Emit an alloca in the function entry block so that loop-body declarations
     // don't grow the stack unboundedly across iterations.  VLAs (non-null arraySize)
     // must stay at the current point because their size is computed dynamically.
-    llvm::AllocaInst* AllocaAtEntry(llvm::Type* type, llvm::Value* arraySize, const llvm::Twine& name = "")
+    // When `align` is nonzero, the alloca is annotated with that alignment.
+    llvm::AllocaInst* AllocaAtEntry(llvm::Type* type, llvm::Value* arraySize, const llvm::Twine& name = "", uint64_t align = 0)
     {
+        llvm::AllocaInst* a;
         if (arraySize != nullptr)
-            return builder->CreateAlloca(type, arraySize, name);
-        auto* currentBlock = builder->GetInsertBlock();
-        auto* entryBlock = &currentBlock->getParent()->getEntryBlock();
-        if (currentBlock == entryBlock)
-            return builder->CreateAlloca(type, nullptr, name);
-        llvm::IRBuilder<> eb(entryBlock, entryBlock->begin());
-        return eb.CreateAlloca(type, nullptr, name);
+        {
+            a = builder->CreateAlloca(type, arraySize, name);
+        }
+        else
+        {
+            auto* currentBlock = builder->GetInsertBlock();
+            auto* entryBlock = &currentBlock->getParent()->getEntryBlock();
+            if (currentBlock == entryBlock)
+            {
+                a = builder->CreateAlloca(type, nullptr, name);
+            }
+            else
+            {
+                llvm::IRBuilder<> eb(entryBlock, entryBlock->begin());
+                a = eb.CreateAlloca(type, nullptr, name);
+            }
+        }
+        if (align != 0)
+            a->setAlignment(llvm::Align(align));
+        return a;
     }
 
-    llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0)
+    llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
         auto type = GetType(typeValue, autoType);
-        auto alloc = AllocaAtEntry(type, arraySize, typeValue.VariableName);
+        // Effective alignment: max(decl-level alignas, struct-level alignas, ABI).
+        uint64_t effAlign = GetEffectiveAlignmentForType(typeValue.TypeName, type);
+        if (userAlign > effAlign) effAlign = userAlign;
+        // Only annotate when above the natural ABI alignment - otherwise LLVM's
+        // default is already correct and we avoid noisy IR.
+        uint64_t abiAlign = (type && type->isSized())
+            ? module->getDataLayout().getABITypeAlign(type).value() : 0;
+        uint64_t allocaAlign = (effAlign > abiAlign) ? effAlign : 0;
+        auto alloc = AllocaAtEntry(type, arraySize, typeValue.VariableName, allocaAlign);
         auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
@@ -3151,7 +3227,7 @@ public:
     }
 
     // Create StructType or OpaqueStruct
-    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues)
+    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0)
     {
         if (typeAndValues.size() > 0)
         {
@@ -3160,6 +3236,22 @@ public:
             for (const auto& typeValue : typeAndValues)
             {
                 types.emplace_back(GetType(typeValue));
+            }
+
+            // alignas(N) on the struct: append a trailing [padBytes x i8] member
+            // so getTypeAllocSize matches the padded sizeof. Without this, arrays
+            // of the struct stride at the natural size and elements lose alignment.
+            // The padding is NOT added to StructFields metadata - user code never
+            // sees the synthetic trailing field. Computed BEFORE any setBody call
+            // so we only set the body once (LLVM asserts on resetting non-opaque
+            // structs).
+            if (userAlign > 1)
+            {
+                auto* tmp = llvm::StructType::get(*context, types);
+                uint64_t natural = module->getDataLayout().getTypeAllocSize(tmp);
+                uint64_t padded = (natural + userAlign - 1) / userAlign * userAlign;
+                if (padded > natural)
+                    types.push_back(llvm::ArrayType::get(builder->getInt8Ty(), padded - natural));
             }
 
             auto mystuct = dataStructures.find(name);
@@ -3173,6 +3265,9 @@ public:
                     llvm::GlobalValue::InternalLinkage,
                     builder->getInt8(0), name + "_typedesc");
 
+                if (userAlign > 1)
+                    dataStructures[name].UserRequestedAlignment = userAlign;
+
                 return myStruct;
             }
 
@@ -3181,6 +3276,8 @@ public:
             structData.StructFields = typeAndValues;
             if (structData.StructType->isOpaque())
                 structData.StructType->setBody(types);
+            if (userAlign > 1)
+                structData.UserRequestedAlignment = userAlign;
 
             return structData.StructType;
         }

@@ -1,0 +1,5 @@
+// alignas values above 4096 are rejected.
+
+expect_error("alignas: value 8192 exceeds maximum of 4096") {
+    alignas(8192) int x = 0;
+}

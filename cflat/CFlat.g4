@@ -630,12 +630,12 @@ functionDefinition
     ;
 
 structDefinition
-    : 'struct' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
-    | 'union' directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    : 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    | 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
     ;
 
 classDefinition
-    : Class directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    : Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
     ;
 
 lockFieldGroup

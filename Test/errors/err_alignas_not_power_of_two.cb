@@ -1,0 +1,5 @@
+// alignas requires a power-of-two value.
+
+expect_error("alignas: value 7 is not a power of two") {
+    alignas(7) int x = 0;
+}

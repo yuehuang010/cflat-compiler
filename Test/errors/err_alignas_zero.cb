@@ -1,0 +1,5 @@
+// alignas(0) must be rejected.
+
+expect_error("alignas: value must be positive") {
+    alignas(0) int x = 0;
+}

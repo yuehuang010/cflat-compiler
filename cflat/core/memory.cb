@@ -42,3 +42,28 @@ void operator delete(void* ptr)
     }
     free(ptr);
 }
+
+// Over-aligned allocation. Routes to the active allocator's alloc_aligned, or
+// falls back to _aligned_malloc. The compiler emits a call to this overload
+// for `new T` when alignof(T) exceeds the default-new threshold (16 on x64).
+// Pointers from this overload MUST be freed via operator delete_aligned.
+void* operator new(i64 size, i64 align)
+{
+    if (__active_allocator != nullptr)
+        return __active_allocator.alloc_aligned(size, align);
+    return _aligned_malloc((win_size)size, (win_size)align);
+}
+
+// Companion to `operator new(size, align)`. Not an operator (grammar reserves
+// `operator delete` for the size-less form); called explicitly from compiler-
+// generated delete sites when the static type's alignment exceeds the default.
+void __delete_aligned(void* ptr)
+{
+    if (ptr == nullptr) return;
+    if (__active_allocator != nullptr)
+    {
+        __active_allocator.dealloc_aligned(ptr);
+        return;
+    }
+    _aligned_free(ptr);
+}

@@ -345,6 +345,23 @@ class FitAllocator : IAllocator
         return self_iface;
     }
 
+    void* alloc_aligned(i64 size, i64 align) {
+        if (align <= (i64)16) return alloc(size);
+        i64 total = size + align - (i64)1 + (i64)16;
+        i8* raw = (i8*)alloc(total);
+        if (raw == nullptr) return nullptr;
+        i64 base = ((i64)raw + (i64)16 + align - (i64)1) & ~(align - (i64)1);
+        i8* aligned = (i8*)base;
+        void** stash = (void**)(aligned - (i64)16);
+        stash[0] = (void*)raw;
+        return (void*)aligned;
+    }
+    void dealloc_aligned(void* ptr) {
+        if (ptr == nullptr) return;
+        void** stash = (void**)((i8*)ptr - (i64)16);
+        dealloc(stash[0]);
+    }
+
     i64 freeBytes()
     {
         i64 total = 0;

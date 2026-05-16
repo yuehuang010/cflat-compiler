@@ -18,4 +18,13 @@ class MallocAllocator : IAllocator
         IAllocator self_iface = MallocAllocator__;   // pointer -> fat-ptr upcast via assignment
         return self_iface;
     }
+
+    // Over-aligned allocations use the Win32 CRT _aligned_malloc / _aligned_free pair.
+    // Pointers returned by alloc_aligned MUST be freed with dealloc_aligned (CRT requirement).
+    void* alloc_aligned(i64 size, i64 align)
+    {
+        _totalBytes = _totalBytes + size;
+        return _aligned_malloc((win_size)size, (win_size)align);
+    }
+    void dealloc_aligned(void* ptr) { _aligned_free(ptr); }
 };

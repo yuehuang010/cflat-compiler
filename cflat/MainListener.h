@@ -413,6 +413,11 @@ private:
                 else if (funcSpec->getText() == "cdecl")
                     declType.IsCdecl = true;
             }
+            else if (declSpec->alignmentSpecifier() != nullptr)
+            {
+                // ForwardRefScanner: alignment doesn't affect forward declarations.
+                // The codegen pass captures the actual value.
+            }
         }
         return declType;
     }
@@ -1540,9 +1545,64 @@ private:
                 else if (funcSpec->getText() == "cdecl")
                     declType.IsCdecl = true;
             }
+            else if (auto alignSpec = declSpec->alignmentSpecifier())
+            {
+                uint64_t alignVal = ParseAlignmentSpecifier(alignSpec);
+                if (alignVal != 0)
+                    declType.UserAlignValue = alignVal;
+            }
         }
 
         return declType;
+    }
+
+    // Evaluate `alignas(N)` / `alignas(T)` into a power-of-two byte count.
+    // Validates: power of two, 1 <= N <= 4096. Returns 0 on error (and logs).
+    uint64_t ParseAlignmentSpecifier(CFlatParser::AlignmentSpecifierContext* alignSpec)
+    {
+        uint64_t alignVal = 0;
+        if (auto* typeName = alignSpec->typeName())
+        {
+            LLVMBackend::DeclTypeAndValue dt;
+            dt.TypeName = typeName->getText();
+            llvm::Type* t = compilerLLVM->GetType(dt);
+            if (t == nullptr || !t->isSized())
+            {
+                LogErrorContext(alignSpec, std::format("alignas: cannot resolve type '{}'", dt.TypeName));
+                return 0;
+            }
+            alignVal = compilerLLVM->module->getDataLayout().getABITypeAlign(t).value();
+        }
+        else if (auto* cexpr = alignSpec->constantExpression())
+        {
+            auto* cond = cexpr->conditionalExpression();
+            llvm::Value* condVal = ParseConditionalExpression(cond);
+            auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(condVal);
+            if (ci == nullptr)
+            {
+                LogErrorContext(alignSpec, "alignas: argument must be a constant integer expression");
+                return 0;
+            }
+            int64_t signedVal = ci->getSExtValue();
+            if (signedVal <= 0)
+            {
+                LogErrorContext(alignSpec, std::format("alignas: value must be positive (got {})", signedVal));
+                return 0;
+            }
+            alignVal = (uint64_t)signedVal;
+        }
+        if (alignVal == 0) return 0;
+        if (alignVal > 4096)
+        {
+            LogErrorContext(alignSpec, std::format("alignas: value {} exceeds maximum of 4096", alignVal));
+            return 0;
+        }
+        if ((alignVal & (alignVal - 1)) != 0)
+        {
+            LogErrorContext(alignSpec, std::format("alignas: value {} is not a power of two", alignVal));
+            return 0;
+        }
+        return alignVal;
     }
 
     LLVMBackend::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx)
@@ -4029,7 +4089,7 @@ public:
                 if (global_scope)
                 {
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
-                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal);
+                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue);
                     // Record the variable's declaration site so LSP go-to-definition
                     // on the variable name lands on the global itself, not on its
                     // (possibly unregistered, e.g. generic-instantiation) type.
@@ -4043,7 +4103,7 @@ public:
                 {
                     if (typeAndValue.threadLocal)
                         LogErrorContext(direct, "thread_local is only allowed on global variables.");
-                    auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line);
+                    auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, alloc));
 
                     if (right != nullptr)
@@ -5856,13 +5916,27 @@ public:
                     if (llvmType && !llvmType->isVoidTy())  // Void is a valid type but let's use basic validity check
                     {
                         llvm::Value* result;
+                        uint64_t effAlign = typeValue.Pointer
+                            ? 0
+                            : compiler->GetEffectiveAlignmentForType(typeValue.TypeName, llvmType);
                         if (prefixSizeof)
                         {
-                            result = compiler->GetTypeSizeBytes(llvmType);
+                            if (effAlign > 1)
+                            {
+                                uint64_t paddedSize = compiler->GetEffectiveAllocSize(llvmType, effAlign);
+                                result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), paddedSize);
+                            }
+                            else
+                            {
+                                result = compiler->GetTypeSizeBytes(llvmType);
+                            }
                         }
                         else
                         {
-                            result = compiler->GetTypeAlignBytes(llvmType);
+                            if (effAlign > 1)
+                                result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
+                            else
+                                result = compiler->GetTypeAlignBytes(llvmType);
                         }
 
                         if (result)
@@ -6079,15 +6153,29 @@ public:
                     return {};
                 }
 
-                // Get the size or alignment value
+                // Get the size or alignment value, honoring any struct-level alignas.
+                uint64_t effAlign = typeValue.Pointer
+                    ? 0
+                    : compiler->GetEffectiveAlignmentForType(typeValue.TypeName, llvmType);
                 llvm::Value* result;
                 if (isSizeof)
                 {
-                    result = compiler->GetTypeSizeBytes(llvmType);
+                    if (effAlign > 1)
+                    {
+                        uint64_t paddedSize = compiler->GetEffectiveAllocSize(llvmType, effAlign);
+                        result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), paddedSize);
+                    }
+                    else
+                    {
+                        result = compiler->GetTypeSizeBytes(llvmType);
+                    }
                 }
                 else
                 {
-                    result = compiler->GetTypeAlignBytes(llvmType);
+                    if (effAlign > 1)
+                        result = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
+                    else
+                        result = compiler->GetTypeAlignBytes(llvmType);
                 }
 
                 // Return as a named variable with i64 type
@@ -6304,7 +6392,20 @@ public:
             LogErrorContext(ctx, std::format("'new': cannot compute size of unsized or unresolved type '{}'", typeName));
             return {};
         }
-        llvm::Value* sizeVal = compiler->GetTypeSizeBytes(elemType);
+        // Honor struct-level alignas: pad sizeof so arrays stride correctly.
+        uint64_t effAlign = typeIsPtr
+            ? 0
+            : compiler->GetEffectiveAlignmentForType(typeName, elemType);
+        llvm::Value* sizeVal;
+        if (effAlign > 1)
+        {
+            uint64_t paddedSize = compiler->GetEffectiveAllocSize(elemType, effAlign);
+            sizeVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), paddedSize);
+        }
+        else
+        {
+            sizeVal = compiler->GetTypeSizeBytes(elemType);
+        }
         llvm::Value* count = nullptr;
         if (isArray)
         {
@@ -6313,19 +6414,32 @@ public:
             sizeVal = compiler->builder->CreateMul(sizeVal, count, "arraysz");
         }
 
-        // Call operator new: class-specific -> global
+        // Call operator new: class-specific -> global. When effective alignment
+        // exceeds the default-new threshold (16 on x64), route to the 2-arg
+        // overload `operator new(size, align)` so the allocator picks aligned
+        // memory and the matching delete uses operator delete_aligned.
+        constexpr uint64_t kDefaultNewAlign = 16;
+        bool useAligned = effAlign > kDefaultNewAlign;
         llvm::Value* rawPtr = nullptr;
         std::string opNewName = typeName + ".operator new";
         LLVMBackend::NamedVariable szArg;
         szArg.Primary = sizeVal;
         szArg.BaseType = sizeVal->getType();
+        std::vector<LLVMBackend::NamedVariable> newArgs = { szArg };
+        if (useAligned)
+        {
+            LLVMBackend::NamedVariable alignArg;
+            alignArg.Primary = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*compiler->context), effAlign);
+            alignArg.BaseType = alignArg.Primary->getType();
+            newArgs.push_back(alignArg);
+        }
         if (!typeName.empty() && compiler->GetFunction(opNewName))
         {
-            rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, { szArg });
+            rawPtr = compiler->CreateOverloadedFunctionCall(opNewName, newArgs);
         }
         else if (compiler->GetFunction("operator new"))
         {
-            rawPtr = compiler->CreateOverloadedFunctionCall("operator new", { szArg });
+            rawPtr = compiler->CreateOverloadedFunctionCall("operator new", newArgs);
         }
         else
         {
@@ -6588,14 +6702,29 @@ public:
         auto* voidPtrTy = compiler->builder->getInt8Ty()->getPointerTo();
         llvm::Value* voidPtr = compiler->builder->CreateBitCast(freeBase, voidPtrTy, "freeptr");
 
-        // 3. Call operator delete: class-specific -> global
+        // 3. Call operator delete: class-specific -> global. When the static
+        // type carries effective alignment > 16 (the default-new threshold),
+        // route to `operator delete_aligned` so it matches the aligned new path.
         std::string opDelName = typeName + ".operator delete";
         LLVMBackend::NamedVariable ptrArg;
         ptrArg.Primary = voidPtr;
         ptrArg.BaseType = voidPtrTy;
+        uint64_t deleteEffAlign = 0;
+        if (!typeName.empty() && !elemIsPtr)
+        {
+            LLVMBackend::TypeAndValue tv{ .TypeName = typeName };
+            llvm::Type* t = compiler->GetType(tv);
+            if (t != nullptr && t->isSized())
+                deleteEffAlign = compiler->GetEffectiveAlignmentForType(typeName, t);
+        }
+        bool useAlignedDelete = deleteEffAlign > 16;
         if (!typeName.empty() && compiler->GetFunction(opDelName))
         {
             compiler->CreateOverloadedFunctionCall(opDelName, { ptrArg });
+        }
+        else if (useAlignedDelete && compiler->GetFunction("__delete_aligned"))
+        {
+            compiler->CreateOverloadedFunctionCall("__delete_aligned", { ptrArg });
         }
         else if (compiler->GetFunction("operator delete"))
         {
@@ -10081,7 +10210,12 @@ public:
         }
         else
         {
-            structType = compiler->CreateStructType(structName, declList);
+            // Capture `struct alignas(N) S { ... }` BEFORE struct layout so the
+            // padding member can be appended atomically.
+            uint64_t userAlign = 0;
+            if (auto* alignSpec = ctx->alignmentSpecifier())
+                userAlign = ParseAlignmentSpecifier(alignSpec);
+            structType = compiler->CreateStructType(structName, declList, userAlign);
             // A struct with zero fields still needs a sized (non-opaque) type
             // so that alloca/sizeof work correctly (e.g. when passed via interface).
             if (structType->isOpaque())
@@ -12130,7 +12264,12 @@ public:
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create struct type: " << structName << "\n";
-        auto structType = compiler->CreateStructType(structName, declList);
+        // Capture `class alignas(N) Foo { ... }` before layout so trailing
+        // padding can be inserted atomically by CreateStructType.
+        uint64_t userAlign = 0;
+        if (auto* alignSpec = ctx->alignmentSpecifier())
+            userAlign = ParseAlignmentSpecifier(alignSpec);
+        auto structType = compiler->CreateStructType(structName, declList, userAlign);
         // A class with zero fields still needs a sized (non-opaque) type
         // so that alloca/sizeof work correctly (e.g. when passed via interface).
         if (structType->isOpaque())

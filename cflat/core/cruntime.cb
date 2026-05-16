@@ -6,6 +6,8 @@ extern void* malloc(win_size size);
 extern void  free(void* ptr);
 extern void* calloc(win_size count, win_size size);
 extern void* realloc(void* ptr, win_size size);
+extern void* _aligned_malloc(win_size size, win_size alignment);
+extern void  _aligned_free(void* ptr);
 
 // Win32: callers always pass i64; these wrappers truncate to i32 before calling the CRT.
 if const (__PLATFORM__ == 32) {
