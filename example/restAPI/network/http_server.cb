@@ -1,7 +1,13 @@
-// core/network/http_server.cb - Single-handler HTTP/1.1 server using the
-// `program` construct for lifecycle management.
+// network/http_server.cb - Single-handler HTTP/1.1 server.
+//
+// Accepted connections are dispatched to a caller-supplied `ThreadPool` so
+// one thread per connection is replaced by a bounded worker pool.  The pool
+// is created and shut down by the caller (typically main); a single pool can
+// be shared by multiple servers and pool lifecycle stays out of the program
+// teardown path.
 //
 // Usage:
+//   import "threadpool.cb";
 //   import "network/http_server.cb";
 //
 //   HttpResponse* myHandler(HttpRequest* req) {
@@ -9,33 +15,51 @@
 //       return HttpResponse.notFound();
 //   }
 //
+//   ThreadPool pool;  pool.init(8);
+//
 //   stop_source src; src.init();
 //   HttpServer srv;
 //   srv.port      = 8080;
 //   srv.stopToken = src.get_token();
 //   srv.handler   = myHandler;
+//   srv.pool      = &pool;
 //   list<string> args;
 //   srv.run(args);
 //   ...
 //   src.request_stop();
 //   srv.WaitForExit();
 //   src.dispose();
+//   pool.shutdown();
 
 import "string.cb";
 import "list.cb";
 import "thread.cb";
 import "stop_token.cb";
+import "threadpool.cb";
+import "cruntime.cb";
 import "network/socket.cb";
 import "http_parser.cb";
 import "http_response.cb";
 
-// Handle one accepted connection: receive request, call handler, send response.
-// Defined as a top-level function so it can be shared by both HttpServer and
-// the per-connection _HttpConn program.
-void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
+// Per-connection context handed to a pool worker.  Owns the OS socket handle
+// until the task wraps it in a stack Socket and lets the destructor close it.
+struct _HttpConnCtx {
+    void* handle = nullptr;
+    function<HttpResponse*(HttpRequest*)> handler = nullptr;
+};
+
+// Pool task: handles one accepted connection end-to-end then frees its ctx.
+// ctx is malloc-allocated (not 'new') so this borrowed-pointer signature can
+// free it without tripping the ownership analyzer.
+int _httpConnTask(void* raw, stop_token tok)
 {
+    _HttpConnCtx* ctx = (_HttpConnCtx*)raw;
+
+    Socket conn;
+    conn._handle = ctx->handle;
+
     i8* buf = new i8[8192];
-    int n = conn->recv(buf, 8191);
+    int n = conn.recv(buf, 8191);
     HttpResponse* resp = nullptr;
 
     if (n > 0)
@@ -43,7 +67,7 @@ void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
         buf[n] = 0;
         HttpRequest* req = parseHttpRequest(buf, n);
         if (req->valid)
-            resp = handler(req);
+            resp = ctx->handler(req);
         delete req;
     }
     delete buf;
@@ -53,38 +77,27 @@ void _httpServeConn(Socket* conn, function<HttpResponse*(HttpRequest*)> handler)
 
     int rlen = 0;
     i8* rbuf = resp->build(&rlen);
-    conn->send(rbuf, rlen);
+    conn.send(rbuf, rlen);
     delete rbuf;
     delete resp;
-    // conn is not deleted here - caller owns the Socket and cleans it up at scope exit.
+
+    free((void*)ctx);
+    return 0;
 }
 
-// Per-connection program: receives one request and exits.
-// Accepts the OS socket handle (void*) rather than a Socket* to avoid passing
-// a cross-program pointer - each program owns its own allocator.
-program _HttpConn {
-    void* handle  = nullptr;
-    function<HttpResponse*(HttpRequest*)> handler = nullptr;
-
-    int main(move list<string> args)
-    {
-        Socket* conn = new Socket;
-        conn->_handle = handle;
-        _httpServeConn(conn, handler);
-        return 0;
-    }
-};
-
-// HTTP server program. Set port / handler / stopToken before calling run().
-// Each accepted connection is handled in its own _HttpConn program thread.
+// HTTP server program. Set port / handler / stopToken / pool before run().
+// The pool is owned by the caller and must outlive WaitForExit().
 program HttpServer {
-    int        port      = 8080;
-    int        backlog   = 16;
-    stop_token stopToken = default;
+    int         port      = 8080;
+    int         backlog   = 16;
+    stop_token  stopToken = default;
+    ThreadPool* pool      = nullptr;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
 
     int main(move list<string> args)
     {
+        if (pool == nullptr) { return 1; }
+
         Socket* listener = new Socket;
         if (!listener->createTcp()) { delete listener; return 1; }
 
@@ -95,8 +108,6 @@ program HttpServer {
         if (!listener->bind(any, port))      { delete listener; return 1; }
         if (!listener->listenOn(backlog))    { delete listener; return 1; }
 
-        list<_HttpConn*> conns;
-
         while (!stopToken.stop_requested())
         {
             Socket* conn = listener->accept();
@@ -106,22 +117,26 @@ program HttpServer {
                 continue;
             }
 
-            _HttpConn* c = new _HttpConn;
+            _HttpConnCtx* c = (_HttpConnCtx*)malloc(sizeof(_HttpConnCtx));
             c->handle  = conn->_handle;
             c->handler = handler;
             conn->_handle = nullptr;  // transfer OS handle; Socket shell freed here
             delete conn;
-            list<string> connArgs;
-            c->run(connArgs);
-            conns.add(c);
+
+            if (!pool->submitDetached(_httpConnTask, c))
+            {
+                // Pool queue saturated: close the handle directly and drop ctx.
+                Socket drop;
+                drop._handle = c->handle;
+                free((void*)c);
+                // drop's destructor closes the handle at scope exit.
+            }
         }
 
-        // Drain: wait for all in-flight connection programs to finish.
-        while (conns.count() > 0)
-        {
-            conns.get(0)->WaitForExit();
-            conns.removeAt(0);
-        }
+        // Flush in-flight tasks before we tear down.  pool.shutdown() is the
+        // caller's responsibility - we only drain so no task outlives the
+        // routes / handler it references.
+        pool->drain();
 
         delete listener;
         return 0;

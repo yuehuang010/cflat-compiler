@@ -251,10 +251,30 @@ class ThreadPool {
     int            _count            = 0;
     int            _capacity         = 0;
     WorkerCtx      _ctx              = default;
+    // Inline mode: when init() is called on a thread that already has an
+    // installed __active_allocator (i.e. inside a `program`), spawning worker
+    // threads is unsafe.  Worker threads start with a null __active_allocator,
+    // so 'new' on the parent / 'delete' on the worker (or vice versa) crosses
+    // allocators and corrupts the heap.  In that case submit() runs tasks
+    // synchronously on the caller's thread and no worker threads are created.
+    bool           _inlineMode       = false;
 
     // Start workerCount worker threads.  No-op if already initialised.
+    //
+    // If called inside a `program` scope (i.e. with a non-null __active_allocator),
+    // the pool switches to inline mode: no worker threads are spawned and submit()
+    // executes tasks synchronously on the caller's thread.  See _inlineMode.
     void init(int workerCount) {
-        if (_count > 0) { return; }
+        if (_count > 0 || _inlineMode) { return; }
+        if (__active_allocator != nullptr) {
+            // Inline mode: no workers, no channels needed.  Mark _count as 1 so
+            // workerCount() reports a sensible value, but leave _workers null so
+            // submit() / shutdown() take the inline branch.
+            _inlineMode = true;
+            _count      = 1;
+            _capacity   = 1;
+            return;
+        }
         _stop.init();
         // Semaphore max is the largest LONG (2^31 - 1); ReleaseSemaphore
         // silently drops a token if count would exceed max, which would stall
@@ -299,6 +319,30 @@ class ThreadPool {
     // untouched so it is safe to retry.
     // handle may be nullptr for fire-and-forget tasks; cancellable tasks must pass a handle.
     bool submit(function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        if (_inlineMode) {
+            // Run synchronously on the caller's thread.  Handle bookkeeping
+            // mirrors __threadpool_execute_task: signal done, fire any
+            // continuation registered via then() before this submit returned.
+            stop_token tok = default;
+            if (handle != nullptr) {
+                handle->_cancelSrc.init();
+                handle->_hasCont = false;
+                tok = handle->_cancelSrc.get_token();
+            }
+            int code = fn(ctx, tok);
+            if (handle != nullptr) {
+                handle->done.release(1, () => {
+                    handle->exitCode = code;
+                    handle->failed   = code != 0;
+                });
+                // Fire continuation (registered before this submit returned).
+                if (handle->_hasCont) {
+                    handle->_hasCont = false;
+                    submit(handle->_contFn, handle->_contCtx, handle->_contHandle, handle->_contPriority);
+                }
+            }
+            return true;
+        }
         if (_workers == nullptr || _stop.stop_requested()) { return false; }
         Task t;
         t.fn     = fn;
@@ -340,6 +384,11 @@ class ThreadPool {
     // Returns false if the pool is shut down, the queue is saturated, or dep
     // already has a registered (unfired) continuation.
     bool then(TaskHandle* dep, function<int(void*, stop_token)> fn, void* ctx, TaskHandle* handle, int priority = THREADPOOL_PRIORITY_NORMAL) {
+        if (_inlineMode) {
+            // dep ran inline so it has already completed.  Fire the
+            // continuation immediately.
+            return submit(fn, ctx, handle, priority);
+        }
         if (_workers == nullptr || _stop.stop_requested()) { return false; }
         // Pre-reserve inflight: the continuation is logically pending from now.
         _inflight.increment();
@@ -425,6 +474,7 @@ class ThreadPool {
     // flight) for the duration of resize().
     //
     void resize(int newCount) {
+        if (_inlineMode) { return; }
         if (_workers == nullptr || _stop.stop_requested()) { return; }
         if (newCount <= 0 || newCount == _count) { return; }
         int oldCount = _count;
@@ -503,6 +553,7 @@ class ThreadPool {
     // number of workers currently participating (they are themselves in-flight)
     // and all queues are empty.
     void drain() {
+        if (_inlineMode) { return; }
         if (_isWorkerThread()) {
             _drainingWorkers.increment();
             while (true) {
@@ -537,6 +588,13 @@ class ThreadPool {
     // shutdown returns, the pool is back in its uninitialised state and
     // init() may be called again to restart it.
     void shutdown() {
+        if (_inlineMode) {
+            // No workers and no per-pool resources were allocated by init().
+            _inlineMode = false;
+            _count      = 0;
+            _capacity   = 0;
+            return;
+        }
         drain();
         _stop.request_stop();
         _ready.release_n(_count);
@@ -564,7 +622,7 @@ class ThreadPool {
     }
 
     ~ThreadPool() {
-        if (_workers != nullptr) { shutdown(); }
+        if (_workers != nullptr || _inlineMode) { shutdown(); }
     }
 };
 

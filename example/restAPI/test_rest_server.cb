@@ -1,6 +1,7 @@
 import "list.cb";
 import "thread.cb";
 import "stop_token.cb";
+import "threadpool.cb";
 import "test_helper.cb";
 import "network/rest_server.cb";
 import "network/http_client.cb";
@@ -58,12 +59,17 @@ extern int main()
         return 1;
     }
 
+    // Shared worker pool that handles every accepted connection.
+    ThreadPool pool;
+    pool.init(4);
+
     stop_source src;
     src.init();
 
     RestServer srv;
     srv.port      = g_rest_port;
     srv.stopToken = src.get_token();
+    srv.pool      = &pool;
     srv.get("/hello",   restHelloHandler);
     srv.post("/echo",   restEchoHandler);
     srv.put("/update",  restUpdateHandler);
@@ -159,6 +165,7 @@ extern int main()
     srv.WaitForExit();
     src.dispose();
 
+    pool.shutdown();
     Socket.shutdownNetwork();
 
     if (ok) printf("test_rest_server: all passed.\n");
