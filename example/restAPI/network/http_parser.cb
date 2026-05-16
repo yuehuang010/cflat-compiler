@@ -25,6 +25,23 @@ int HTTP_MAX_PARAMS  = 8;
 struct HttpHeader {
     i8* name  = nullptr;
     i8* value = nullptr;
+
+    // Each HttpHeader owns its own name/value buffers; freeing them belongs here
+    // so the parent containers ('headers' / '_queryParams' / '_routeParams') can
+    // call 'delete[n] arr' and let each slot clean up its own fields.
+    ~HttpHeader()
+    {
+        if (name  != nullptr) { delete name;  name  = nullptr; }
+        if (value != nullptr) { delete value; value = nullptr; }
+    }
+
+    // Free + null in place without releasing the slot's storage; lets reusable
+    // arrays (e.g. router._routeParams) reset previous matches before refilling.
+    void clear()
+    {
+        if (name  != nullptr) { delete name;  name  = nullptr; }
+        if (value != nullptr) { delete value; value = nullptr; }
+    }
 };
 
 // Parsed HTTP request. The caller owns the returned pointer and must delete it.
@@ -101,42 +118,11 @@ class HttpRequest {
         if (path    != nullptr) { delete path;    path    = nullptr; }
         if (version != nullptr) { delete version; version = nullptr; }
         if (body    != nullptr) { delete body;    body    = nullptr; }
-        if (headers != nullptr)
-        {
-            int i = 0;
-            while (i < headerCount)
-            {
-                if (headers[i].name  != nullptr) delete headers[i].name;
-                if (headers[i].value != nullptr) delete headers[i].value;
-                i++;
-            }
-            delete[_] headers;
-            headers = nullptr;
-        }
-        if (_queryParams != nullptr)
-        {
-            int i = 0;
-            while (i < _queryCount)
-            {
-                if (_queryParams[i].name  != nullptr) delete _queryParams[i].name;
-                if (_queryParams[i].value != nullptr) delete _queryParams[i].value;
-                i++;
-            }
-            delete[_] _queryParams;
-            _queryParams = nullptr;
-        }
-        if (_routeParams != nullptr)
-        {
-            int i = 0;
-            while (i < _paramCount)
-            {
-                if (_routeParams[i].name  != nullptr) delete _routeParams[i].name;
-                if (_routeParams[i].value != nullptr) delete _routeParams[i].value;
-                i++;
-            }
-            delete[_] _routeParams;
-            _routeParams = nullptr;
-        }
+        // Each HttpHeader's own destructor frees its name/value; use delete[n]
+        // so ~HttpHeader runs on every slot, then the array buffer is freed.
+        if (headers      != nullptr) { delete[headerCount] headers;     headers      = nullptr; }
+        if (_queryParams != nullptr) { delete[_queryCount]  _queryParams; _queryParams = nullptr; }
+        if (_routeParams != nullptr) { delete[_paramCount]  _routeParams; _routeParams = nullptr; }
     }
 };
 
@@ -175,18 +161,8 @@ class HttpClientResponse {
         if (version    != nullptr) { delete version;    version    = nullptr; }
         if (statusText != nullptr) { delete statusText; statusText = nullptr; }
         if (body       != nullptr) { delete body;       body       = nullptr; }
-        if (headers    != nullptr)
-        {
-            int i = 0;
-            while (i < headerCount)
-            {
-                if (headers[i].name  != nullptr) delete headers[i].name;
-                if (headers[i].value != nullptr) delete headers[i].value;
-                i++;
-            }
-            delete[_] headers;
-            headers = nullptr;
-        }
+        // ~HttpHeader frees each slot's name/value; delete[n] then drops the buffer.
+        if (headers    != nullptr) { delete[headerCount] headers; headers = nullptr; }
     }
 };
 

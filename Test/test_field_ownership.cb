@@ -1,0 +1,94 @@
+// Positive coverage for the 'delete obj->field' encapsulation rule and the
+// 'T* p = move obj.field' escape hatch. Sister tests live in
+// Test/errors/err_delete_field_outside_owner.cb and
+// Test/errors/err_move_field_borrowed_param.cb (negative cases).
+
+import "test_helper.cb";
+
+int dtorCount = 0;
+
+struct Resource
+{
+    int id = 0;
+    ~Resource() { dtorCount = dtorCount + 1; }
+};
+
+// Owner with its own destructor and an explicit reset() method - both legal
+// frees from within the owning struct.
+struct Container
+{
+    Resource* item = nullptr;
+
+    void reset()
+    {
+        if (item != nullptr) { delete item; item = nullptr; }
+    }
+
+    ~Container()
+    {
+        if (item != nullptr) delete item;
+    }
+};
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    // 1. Destructor frees its own field exactly once.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+    }
+    passed += Test("dtor_frees_own_field", dtorCount, 1);
+    total++;
+
+    // 2. Member method frees the field; destructor sees nullptr and does nothing.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+        c.reset();
+        passed += Test("method_reset_freed", dtorCount, 1);
+        total++;
+        // Scope exit: ~Container runs; c.item == nullptr so no second free.
+    }
+    passed += Test("no_double_free_after_reset", dtorCount, 1);
+    total++;
+
+    // 3. External code extracts the field via 'move' and frees the local. The
+    // owner's field is nulled by the move, so its destructor is a no-op.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+        {
+            Resource* taken = move c.item;
+            passed += Test("field_nulled_after_move", c.item == nullptr, true);
+            total++;
+            delete taken;
+        }
+        passed += Test("move_then_delete_frees_once", dtorCount, 1);
+        total++;
+        // Scope exit: ~Container runs; c.item == nullptr so dtorCount stays 1.
+    }
+    passed += Test("owner_dtor_skips_moved_field", dtorCount, 1);
+    total++;
+
+    // 4. Move from a heap-owned container pointer works the same way.
+    dtorCount = 0;
+    {
+        Container* hc = new Container();
+        hc->item = new Resource();
+        Resource* taken = move hc->item;
+        delete taken;
+        // hc->item is now nullptr; deleting hc next is harmless.
+        delete hc;
+    }
+    passed += Test("move_from_heap_container", dtorCount, 1);
+    total++;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

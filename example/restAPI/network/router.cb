@@ -23,6 +23,14 @@ struct _RouteEntry {
     i8* path     = nullptr;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
     bool hasParams = false;  // true if path contains a ':' segment
+
+    // Each route owns its method/path buffers; ~HttpRouter calls 'delete[n] _routes'
+    // which invokes this destructor on every slot.
+    ~_RouteEntry()
+    {
+        if (method != nullptr) { delete method; method = nullptr; }
+        if (path   != nullptr) { delete path;   path   = nullptr; }
+    }
 };
 
 int _ROUTER_MAX_ROUTES = 64;
@@ -62,14 +70,15 @@ bool _router_matchParams(const char* pattern, HttpRequest* req)
     if (pi < plen && pattern[pi] == '/') pi++;
     if (ri < rlen && reqPath[ri] == '/') ri++;
 
-    // Reset param count from any previous failed match attempt
+    // Reset param slots from any previous failed match attempt. HttpHeader.clear()
+    // frees its own name/value in place so the slot can be refilled without freeing
+    // the surrounding _routeParams buffer.
     if (req->_routeParams != nullptr)
     {
         int qi = 0;
         while (qi < req->_paramCount)
         {
-            if (req->_routeParams[qi].name  != nullptr) { delete req->_routeParams[qi].name;  req->_routeParams[qi].name  = nullptr; }
-            if (req->_routeParams[qi].value != nullptr) { delete req->_routeParams[qi].value; req->_routeParams[qi].value = nullptr; }
+            req->_routeParams[qi].clear();
             qi++;
         }
     }
@@ -192,17 +201,7 @@ class HttpRouter {
 
     ~HttpRouter()
     {
-        if (_routes != nullptr)
-        {
-            int i = 0;
-            while (i < _count)
-            {
-                if (_routes[i].method != nullptr) { delete _routes[i].method; _routes[i].method = nullptr; }
-                if (_routes[i].path   != nullptr) { delete _routes[i].path;   _routes[i].path   = nullptr; }
-                i++;
-            }
-            delete[_] _routes;
-            _routes = nullptr;
-        }
+        // delete[n] invokes ~_RouteEntry on each live slot, then frees the buffer.
+        if (_routes != nullptr) { delete[_count] _routes; _routes = nullptr; }
     }
 };

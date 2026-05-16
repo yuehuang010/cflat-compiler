@@ -6404,6 +6404,24 @@ public:
         return result;
     }
 
+    // If funcName is a method ("Type.method") or destructor ("~Type") whose owning
+    // struct is registered, return the struct name. Returns "" for top-level
+    // functions or unrecognized owners. Used by the delete-of-field rule to gate
+    // 'delete obj->field' on "is the current function a method of obj's type."
+    std::string SplitEnclosingStruct(const std::string& funcName, LLVMBackend* compiler) const
+    {
+        if (funcName.empty()) return "";
+        if (funcName[0] == '~')
+        {
+            std::string typeName = funcName.substr(1);
+            return compiler->IsDataStructure(typeName) ? typeName : std::string{};
+        }
+        auto dot = funcName.find('.');
+        if (dot == std::string::npos) return "";
+        std::string typeName = funcName.substr(0, dot);
+        return compiler->IsDataStructure(typeName) ? typeName : std::string{};
+    }
+
     LLVMBackend::NamedVariable ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -6466,6 +6484,25 @@ public:
                     namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName,
                     namedVar.BorrowedOrigin, namedVar.BorrowedOrigin));
                 return {};
+            }
+
+            // Error: deleting a struct field from outside the owning struct's own methods.
+            // Encapsulation: only the owner is allowed to free its own pointer fields directly.
+            // External callers must extract with 'T* p = move obj->field; delete p;' so the
+            // ownership transfer is visible at the call site and the owner sees nullptr.
+            if (!namedVar.OwningStructName.empty()
+                && namedVar.Storage != nullptr
+                && !llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+            {
+                std::string enclosing = SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler);
+                if (enclosing != namedVar.OwningStructName)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete field '{}.{}' from outside '{}'. Extract it first with "
+                        "'T* p = move expr; delete p;' so the ownership transfer is explicit.",
+                        namedVar.OwningStructName, namedVar.FieldName, namedVar.OwningStructName));
+                    return {};
+                }
             }
 
             if (namedVar.Storage)
@@ -6584,6 +6621,21 @@ public:
     {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+
+        // Reject 'move param->field' (or any field whose parent traces to a borrowed
+        // parameter): the caller still owns the parent struct and will see a nulled field
+        // it never agreed to surrender. Require the parent parameter to be declared 'move'.
+        if (!argNV.OwningStructName.empty()
+            && argNV.IsBorrowed
+            && !argNV.BorrowedOrigin.empty())
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' field '{}.{}' through borrowed parameter '{}'. Declare the "
+                "source parameter 'move {}' to transfer ownership of its fields.",
+                argNV.OwningStructName, argNV.FieldName, argNV.BorrowedOrigin, argNV.BorrowedOrigin));
+            return {};
+        }
+
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
         // move on a named struct value type: capture the value, then zero the source storage
@@ -6724,6 +6776,10 @@ public:
                                 structVar.BaseType     = sd.StructType;
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
                                 structVar.TypeAndValue.Pointer = false;
+                                // Preserve borrow-origin across the auto-deref so 'move param->field'
+                                // can detect that the parent pointer is a borrowed parameter.
+                                structVar.IsBorrowed      = namedVar.IsBorrowed;
+                                structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
                             }
                         }
                         else if (!namedVar.TypeAndValue.Pointer
@@ -6741,6 +6797,8 @@ public:
                                 structVar.Primary      = nullptr;
                                 structVar.BaseType     = sd.StructType;
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
+                                structVar.IsBorrowed      = namedVar.IsBorrowed;
+                                structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
                             }
                         }
                         break;
@@ -6999,6 +7057,14 @@ public:
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    // Mark this NamedVariable as a struct-field access so 'delete obj->field'
+                                    // can reject it when invoked outside the owning struct's own methods.
+                                    namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
+                                    namedVar.FieldName        = primaryIdentifier;
+                                    // Propagate borrow-origin so 'move param->field' can detect
+                                    // the parent pointer is a borrowed parameter.
+                                    namedVar.IsBorrowed       = structVar.IsBorrowed;
+                                    namedVar.BorrowedOrigin   = structVar.BorrowedOrigin;
                                 }
                             }
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier))

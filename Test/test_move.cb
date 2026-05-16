@@ -22,14 +22,17 @@ struct Container
     }
 };
 
-// Mirrors the per-request route-param shape from example/restAPI/network/router.cb:
-// a borrowed pointer parameter ('Bag*') whose fields/sub-element fields get freed
-// inside the helper. The compiler used to reject this through the cast-launder
-// check; the fix keeps 'delete bag' rejected but allows 'delete bag->item' and
-// 'delete bag->entries[i].name' (the field's lifetime is the caller's contract).
+// Composite-ownership shape: 'Bag' owns its 'item' (a Resource*) and an array
+// of 'RouteEntry' (each of which owns its own 'name' Resource*). Each layer's
+// destructor frees only its own fields; cross-layer cleanup happens by chained
+// destructor invocation ('delete[n] entries' calls ~RouteEntry on every slot).
 struct RouteEntry
 {
     Resource* name = nullptr;
+    ~RouteEntry()
+    {
+        if (name != nullptr) delete name;
+    }
 };
 
 struct Bag
@@ -40,35 +43,9 @@ struct Bag
     ~Bag()
     {
         if (item != nullptr) delete item;
-        if (entries != nullptr)
-        {
-            int i = 0;
-            while (i < 3)
-            {
-                if (entries[i].name != nullptr) { delete entries[i].name; entries[i].name = nullptr; }
-                i = i + 1;
-            }
-            delete[3] entries;
-        }
+        if (entries != nullptr) delete[3] entries;
     }
 };
-
-// Borrowed param: caller still owns 'b'. Freeing a field through 'b' is legal.
-void freeBagItem(Bag* b)
-{
-    if (b->item != nullptr) { delete b->item; b->item = nullptr; }
-}
-
-// Borrowed param plus array-subscript-then-field (the router.cb pattern).
-void freeBagEntryNames(Bag* b)
-{
-    int i = 0;
-    while (i < 3)
-    {
-        if (b->entries[i].name != nullptr) { delete b->entries[i].name; b->entries[i].name = nullptr; }
-        i = i + 1;
-    }
-}
 
 // Worker-style payload: pointer to an external observer slot plus a value.
 // Mirrors Test/repro_new_struct.cb but stays single-threaded so the test
@@ -380,9 +357,10 @@ extern int main()
     passed += Test("probe_borrow_freed_at_scope_exit", dtorCount, 1);
     total++;
 
-    // Test 9: 'delete borrowedParam->field' is allowed (regression for
-    // example/restAPI/network/router.cb). Both direct field access and
-    // subscript-then-field through a borrowed pointer must compile and run.
+    // Test 9: composite-ownership cleanup. Bag owns 'item' (Resource*) and
+    // 'entries' (RouteEntry[3]). Each layer's destructor frees only its own
+    // fields; ~Bag's 'delete[3] entries' invokes ~RouteEntry on every slot,
+    // which frees its own 'name'. No layer reaches into another's fields.
     dtorCount = 0;
     {
         Bag bag;
@@ -396,19 +374,11 @@ extern int main()
             bag.entries[i].name->id = i + 10;
             i = i + 1;
         }
-
-        // 4 resources alive: bag.item plus three entry names.
-        freeBagItem(&bag);
-        passed += Test("delete_field_via_borrowed_ptr", dtorCount, 1);
-        total++;
-
-        freeBagEntryNames(&bag);
-        passed += Test("delete_subscript_field_via_borrowed_ptr", dtorCount, 4);
-        total++;
-
-        // ~Bag runs at scope exit. Both fields nulled above, so no double-free.
+        // 4 Resources alive: bag.item plus three entry names.
+        // Scope exit -> ~Bag frees item, delete[3] entries -> ~RouteEntry per slot
+        // frees each name. dtorCount should reach 4.
     }
-    passed += Test("bag_dtor_after_field_deletes_no_double_free", dtorCount, 4);
+    passed += Test("composite_dtor_chain_frees_all", dtorCount, 4);
     total++;
 
     printf("\n%d / %d tests passed.\n", passed, total);

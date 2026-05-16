@@ -1,0 +1,67 @@
+// Reject 'delete obj->field' (and 'delete obj.field') from outside the owning
+// struct's own methods. The owner's destructor (or a member method) is the
+// only place that may free a field directly; external callers must extract
+// with 'T* p = move expr; delete p;' so the ownership transfer is visible
+// and the owner sees nullptr in the field afterwards.
+
+struct Resource { int id = 0; };
+
+struct Container { Resource* item = nullptr; };
+
+// Direct field delete from a non-method top-level function.
+expect_error("cannot delete field 'Container.item' from outside 'Container'") {
+    void freeContainerItem(Container* c) {
+        delete c->item;
+    }
+}
+
+// Same shape via '.' on a struct value.
+expect_error("cannot delete field 'Container.item' from outside 'Container'") {
+    int freeContainerItemValue() {
+        Container c;
+        c.item = new Resource();
+        delete c.item;
+        return 0;
+    }
+}
+
+// Method-of-another-struct does not get to reach into Container's fields.
+// Wrapper.disposeInner runs inside Wrapper, not Container - rejected.
+expect_error("cannot delete field 'Container.item' from outside 'Container'") {
+    struct Wrapper {
+        Container* inner = nullptr;
+        void disposeInner() {
+            delete inner->item;
+        }
+    };
+}
+
+// Sanity: the owner's own destructor can free its field. Must compile.
+struct OwnerOk {
+    Resource* item = nullptr;
+    ~OwnerOk()
+    {
+        if (item != nullptr) delete item;
+    }
+};
+
+// Sanity: an explicit instance method on the owner can free its field.
+struct OwnerWithReset {
+    Resource* item = nullptr;
+    void reset()
+    {
+        if (item != nullptr) { delete item; item = nullptr; }
+    }
+};
+
+// Sanity: the extract-via-move escape hatch is accepted on locally-owned
+// structs. (The borrowed-parameter shape is covered by err_move_field_borrowed_param.cb.)
+int extractAndDelete() {
+    Container c;
+    c.item = new Resource();
+    Resource* taken = move c.item;
+    delete taken;
+    return 0;
+}
+
+extern int main() { return 0; }

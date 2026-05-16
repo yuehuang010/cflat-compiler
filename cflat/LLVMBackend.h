@@ -351,6 +351,8 @@ public:
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
+        std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
+        std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
         int IdentifierLine = 0;          // source location for use-after-move error reporting
         int IdentifierColumn = 0;
 

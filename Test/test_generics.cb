@@ -1575,7 +1575,7 @@ bool testTuplePointers()
     result &= Test("tuple_ptr1_id",     tp1.item_0->id,     1);
     result &= Test("tuple_ptr1_salary", tp1.item_0->salary, 50000);
     result &= Test("tuple_ptr1_size",   tp1.size(), 1);
-    delete tp1.item_0;
+    Employee* tp1_e1 = move tp1.item_0; delete tp1_e1;
 
     // two struct pointers
     Employee* e2 = new Employee;
@@ -1592,8 +1592,8 @@ bool testTuplePointers()
     result &= Test("tuple_ptr2_id1",  tp2.item_1->id,     3);
     result &= Test("tuple_ptr2_sal1", tp2.item_1->salary, 70000);
     result &= Test("tuple_ptr2_size", tp2.size(), 2);
-    delete tp2.item_0;
-    delete tp2.item_1;
+    Employee* tp2_e2 = move tp2.item_0; delete tp2_e2;
+    Employee* tp2_e3 = move tp2.item_1; delete tp2_e3;
 
     // mixed: int* + Employee* + bool*
     int* ip = new int;
@@ -1610,9 +1610,9 @@ bool testTuplePointers()
     result &= Test("tuple_ptr_mix_emp",  tpm.item_1->id,   4);
     result &= Test("tuple_ptr_mix_bool", *tpm.item_2,      true);
     result &= Test("tuple_ptr_mix_size", tpm.size(),       3);
-    delete tpm.item_0;
-    delete tpm.item_1;
-    delete tpm.item_2;
+    int*      tpm_ip = move tpm.item_0; delete tpm_ip;
+    Employee* tpm_e4 = move tpm.item_1; delete tpm_e4;
+    bool*     tpm_bp = move tpm.item_2; delete tpm_bp;
 
     return result;
 }

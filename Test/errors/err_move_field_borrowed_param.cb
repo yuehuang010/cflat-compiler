@@ -1,0 +1,42 @@
+// Reject 'move param->field' (and 'move param.field') when 'param' is a borrowed
+// (non-move) pointer parameter. The caller still owns the parent struct and
+// will see a nulled field it never agreed to surrender. To transfer a field
+// out through a parameter, declare the parameter 'move' first.
+
+struct Resource { int id = 0; };
+struct Container { Resource* item = nullptr; };
+
+// Borrowed pointer parameter: 'move c->item' would null the caller's container.
+expect_error("cannot 'move' field 'Container.item' through borrowed parameter 'c'") {
+    void stealItem(Container* c) {
+        Resource* taken = move c->item;
+        delete taken;
+    }
+}
+
+// Chained alias: borrow taint survives a local alias and still rejects the move.
+expect_error("cannot 'move' field 'Container.item' through borrowed parameter 'c'") {
+    int stealItemViaAlias(Container* c) {
+        Container* alias = c;
+        Resource* taken = move alias->item;
+        delete taken;
+        return 0;
+    }
+}
+
+// Sanity: 'move' on the parameter authorizes 'move' on its fields.
+void stealItemOk(move Container* c) {
+    Resource* taken = move c->item;
+    delete taken;
+}
+
+// Sanity: 'move' on a local-owned container's field is fine.
+int stealLocalField() {
+    Container c;
+    c.item = new Resource();
+    Resource* taken = move c.item;
+    delete taken;
+    return 0;
+}
+
+extern int main() { return 0; }
