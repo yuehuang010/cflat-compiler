@@ -35,6 +35,11 @@
         "path": "./syntaxes/cflat.tmLanguage.json"
       }
     ],
+    "breakpoints": [
+      {
+        "language": "cflat"
+      }
+    ],
     "configuration": {
       "type": "object",
       "title": "cflat",

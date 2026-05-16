@@ -2123,8 +2123,10 @@ public:
             auto usingDecl = blockItem->usingDeclaration();
             auto destructuring = blockItem->destructuringDeclaration();
 
+            auto* compiler = Compiler(blockItem);
             if (decl != nullptr)
             {
+                compiler->SetCurrentDebugLocation(decl->getStart()->getLine());
                 ParseDeclaration(decl);
             }
             else if (statement != nullptr)
@@ -2133,10 +2135,12 @@ public:
             }
             else if (usingDecl != nullptr)
             {
+                compiler->SetCurrentDebugLocation(usingDecl->getStart()->getLine());
                 ParseUsingDeclaration(usingDecl);
             }
             else if (destructuring != nullptr)
             {
+                compiler->SetCurrentDebugLocation(destructuring->getStart()->getLine());
                 ParseDestructuringDeclaration(destructuring);
             }
         }
@@ -3332,7 +3336,10 @@ public:
             ScanAndQueueGenericTypeUses(blockItemList);
         ProcessPendingInstantiations();
 
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl);
+        size_t bodyLine = 0;
+        if (auto* body = func->compoundStatement())
+            bodyLine = body->getStart()->getLine();
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl, bodyLine);
 
         // CreateFunctionDefinition returns the existing function (without setting up
         // a fresh entry block) when a matching definition was already emitted by a

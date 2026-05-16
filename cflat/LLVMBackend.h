@@ -618,6 +618,42 @@ private:
     // function-pointer / interface fat-ptr wrappers are built on demand so the cache
     // key stays simple.
     std::unordered_map<std::string, llvm::DIType*> diTypeCache;
+    // Cache: canonical source path -> DIFile. Without this, all functions / globals
+    // emitted from imported files would be attributed to the primary diFile, causing
+    // line-number collisions across files (breakpoint at one file's line N fires on
+    // any imported function whose actual line happens to be N).
+    std::unordered_map<std::string, llvm::DIFile*> diFileCache_;
+
+    // Globals queued for deferred DI emission. We defer because a global's struct type
+    // may still be an opaque shell (typical for generic instantiations) at the moment
+    // the global is declared - emitting DI immediately would produce an unspecified
+    // type with no fields. By the time FinalizeDebugInfo runs, all struct layouts are
+    // finished and GetDIType returns the real composite.
+    struct PendingGlobalDI
+    {
+        llvm::GlobalVariable* gVar;
+        TypeAndValue typeValue;
+        llvm::DIFile* file;
+        unsigned line;
+    };
+    std::vector<PendingGlobalDI> pendingGlobalDI_;
+
+    llvm::DIFile* GetDIFileForCurrentSource()
+    {
+        if (!diBuilder) return nullptr;
+        const std::string& p = currentSourceFilePath_;
+        if (p.empty()) return diFile;
+        auto it = diFileCache_.find(p);
+        if (it != diFileCache_.end()) return it->second;
+        // Split path into directory + filename manually to avoid needing <filesystem>
+        // in this header.
+        size_t slash = p.find_last_of("/\\");
+        std::string fname = (slash == std::string::npos) ? p : p.substr(slash + 1);
+        std::string dir   = (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+        auto* f = diBuilder->createFile(fname, dir);
+        diFileCache_[p] = f;
+        return f;
+    }
 
 
 private:
@@ -1068,9 +1104,10 @@ private:
         }
 
         // Unknown / opaque - leave as unspecified so the debugger at least knows the name.
-        auto unspec = diBuilder->createUnspecifiedType(tv.TypeName);
-        diTypeCache[tv.TypeName] = unspec;
-        return unspec;
+        // Do NOT cache: a struct may be opaque now (e.g. generic instantiation processed
+        // before its body is laid out) and become a real composite later. Caching the
+        // unspecified version would poison every subsequent lookup with no struct fields.
+        return diBuilder->createUnspecifiedType(tv.TypeName);
     }
 
     // Registers the built-in `string` value type: { i8* _ptr, i32 _len }.
@@ -1785,12 +1822,27 @@ public:
         module->addModuleFlag(llvm::Module::Warning, "CodeView", 1);
         diFile = diBuilder->createFile(filename, directory);
         compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "cflat", false, "", 0);
+        // Seed cache so the primary translation unit's path resolves to the same
+        // DIFile node that the compile unit references (avoids duplicates).
+        if (!currentSourceFilePath_.empty())
+            diFileCache_[currentSourceFilePath_] = diFile;
     }
 
     void FinalizeDebugInfo()
     {
-        if (diBuilder)
-            diBuilder->finalize();
+        if (!diBuilder) return;
+        // Emit DI for all globals now that struct types are fully laid out.
+        for (auto& p : pendingGlobalDI_)
+        {
+            auto* diType = GetDIType(p.typeValue);
+            auto* diGVE = diBuilder->createGlobalVariableExpression(
+                compileUnit, p.typeValue.VariableName, p.gVar->getName(),
+                p.file, p.line, diType,
+                /*isLocalToUnit*/ false, /*isDefined*/ true);
+            p.gVar->addDebugInfo(diGVE);
+        }
+        pendingGlobalDI_.clear();
+        diBuilder->finalize();
     }
 
     void SetCurrentDebugLocation(size_t line, size_t col = 0)
@@ -2701,12 +2753,9 @@ public:
 
         if (diBuilder && diFile && !typeValue.VariableName.empty())
         {
-            auto diType = GetDIType(typeValue);
-            auto diGVE = diBuilder->createGlobalVariableExpression(
-                compileUnit, typeValue.VariableName, gVar->getName(),
-                diFile, /*lineNo*/ 0, diType,
-                /*isLocalToUnit*/ false, /*isDefined*/ true);
-            gVar->addDebugInfo(diGVE);
+            llvm::DIFile* gvFile = GetDIFileForCurrentSource();
+            if (!gvFile) gvFile = diFile;
+            pendingGlobalDI_.push_back({gVar, typeValue, gvFile, (unsigned)currentLine});
         }
 
         return gVar;
@@ -2742,7 +2791,9 @@ public:
         if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {
             auto diType = GetDIType(typeValue);
-            auto diVar = diBuilder->createAutoVariable(currentSubprogram, typeValue.VariableName, diFile, (unsigned)line, diType);
+            llvm::DIFile* locFile = currentSubprogram->getFile();
+            if (!locFile) locFile = diFile;
+            auto diVar = diBuilder->createAutoVariable(currentSubprogram, typeValue.VariableName, locFile, (unsigned)line, diType);
             diBuilder->insertDeclare(alloc, diVar, diBuilder->createExpression(),
                 llvm::DILocation::get(*context, (unsigned)line, 0, currentSubprogram),
                 builder->GetInsertBlock());
@@ -3988,7 +4039,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false)
+    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, size_t scopeLine = 0)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -4035,6 +4086,8 @@ public:
             // distinct DISubprogram and overwriting setSubprogram() leaves the prior
             // node orphaned, which the LLVM verifier rejects.
             auto sp = fn->getSubprogram();
+            llvm::DIFile* fnFile = GetDIFileForCurrentSource();
+            if (!fnFile) fnFile = diFile;
             if (!sp)
             {
                 // DWARF / CodeView subroutine type: element 0 is the return type
@@ -4050,9 +4103,10 @@ public:
 
                 auto funcDIType = diBuilder->createSubroutineType(
                     diBuilder->getOrCreateTypeArray(diTypes));
+                unsigned effectiveScopeLine = (unsigned)(scopeLine != 0 ? scopeLine : line);
                 sp = diBuilder->createFunction(
-                    diFile, functionName, fn->getName(),
-                    diFile, (unsigned)line, funcDIType, (unsigned)line,
+                    fnFile, functionName, fn->getName(),
+                    fnFile, (unsigned)line, funcDIType, effectiveScopeLine,
                     llvm::DINode::FlagPrototyped,
                     llvm::DISubprogram::SPFlagDefinition
                 );
@@ -4071,7 +4125,7 @@ public:
                 if (it != frame.functionArgument.end() && it->second.Storage != nullptr)
                 {
                     auto diParam = diBuilder->createParameterVariable(
-                        sp, a.VariableName, argNo, diFile,
+                        sp, a.VariableName, argNo, fnFile,
                         (unsigned)line, GetDIType(a), /*alwaysPreserve*/ true);
                     diBuilder->insertDeclare(
                         it->second.Storage, diParam, diBuilder->createExpression(),
