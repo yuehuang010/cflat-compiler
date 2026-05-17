@@ -371,3 +371,4 @@ FodyWeavers.xsd
 *.exe
 *.ll
 /out32/results
+*.vsix

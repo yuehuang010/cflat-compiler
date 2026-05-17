@@ -27,10 +27,23 @@ if not exist node_modules (
 )
 
 REM Compile TypeScript
-echo [2/2] Compiling TypeScript...
+echo [2/3] Compiling TypeScript...
 call npm run compile
 if errorlevel 1 (
     echo ERROR: TypeScript compilation failed.
+    exit /b 1
+)
+
+REM Install vsce if not present
+echo [3/3] Packaging extension as .vsix...
+call npx vsce --version >nul 2>&1
+if errorlevel 1 (
+    call npm install --save-dev @vscode/vsce
+    if errorlevel 1 ( echo ERROR: Failed to install vsce. & exit /b 1 )
+)
+call npx vsce package --allow-missing-repository --no-git-tag-version 2>&1
+if errorlevel 1 (
+    echo ERROR: Packaging failed.
     exit /b 1
 )
 
@@ -39,6 +52,6 @@ echo === Build successful! ===
 echo.
 echo Next steps:
 echo   launch.bat          - Open VSCode with the extension loaded (development mode)
-echo   install.bat         - Package and install as a .vsix
+echo   install.bat         - Install the .vsix into VSCode
 echo.
 endlocal
