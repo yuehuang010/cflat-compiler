@@ -19,7 +19,16 @@ Copy-Item "$releaseDir\LTO.dll"      "$publishDir\"
 Copy-Item "$releaseDir\Remarks.dll"  "$publishDir\"
 Copy-Item "$releaseDir\lld-link.exe" "$publishDir\"
 Copy-Item "$releaseDir\core"         "$publishDir\core" -Recurse
-Copy-Item "$PSScriptRoot\doc"        "$publishDir\doc"  -Recurse
+Copy-Item "$PSScriptRoot\doc"        "$publishDir\doc"     -Recurse
+
+# Copy only .cb files from example/, preserving directory structure.
+$exampleRoot = "$PSScriptRoot\example"
+Get-ChildItem -Path $exampleRoot -Filter *.cb -Recurse -File | ForEach-Object {
+    $rel  = $_.FullName.Substring($exampleRoot.Length + 1)
+    $dest = Join-Path "$publishDir\example" $rel
+    New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+    Copy-Item $_.FullName $dest
+}
 
 $vsix = Get-ChildItem "$PSScriptRoot\vscode-extension\*.vsix" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $vsix) { Write-Error "No .vsix found in vscode-extension\ - run build.bat first." }

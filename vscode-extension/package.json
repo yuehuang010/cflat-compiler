@@ -10,7 +10,12 @@
   "categories": [
     "Programming Languages"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:cflat",
+    "onDebug",
+    "onDebugResolve:cflat",
+    "onDebugDynamicConfigurations:cflat"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "languages": [
@@ -40,6 +45,86 @@
         "language": "cflat"
       }
     ],
+    "debuggers": [
+      {
+        "type": "cflat",
+        "label": "cflat",
+        "languages": [
+          "cflat"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the .cb source file to compile and debug.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "description": "Command-line arguments passed to the compiled program.",
+                "items": { "type": "string" },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the compiled program. Defaults to the directory of the output .exe.",
+                "default": "${fileDirname}"
+              },
+              "stopAtEntry": {
+                "type": "boolean",
+                "description": "Break on entry to main.",
+                "default": false
+              },
+              "console": {
+                "type": "string",
+                "enum": [ "integratedTerminal", "externalTerminal", "internalConsole" ],
+                "description": "Where to host the program's stdio.",
+                "default": "integratedTerminal"
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "cflat",
+            "request": "launch",
+            "name": "Run cflat file",
+            "program": "${file}",
+            "args": [],
+            "stopAtEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "cflat: Run current file",
+            "description": "Compile and debug the active .cb file with cppvsdbg.",
+            "body": {
+              "type": "cflat",
+              "request": "launch",
+              "name": "Run cflat file",
+              "program": "^\"\\${file}\"",
+              "args": [],
+              "stopAtEntry": false
+            }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "cflat.runDiagnostics",
+        "title": "cflat: Run Diagnostics on Current File"
+      },
+      {
+        "command": "cflat.showOutput",
+        "title": "cflat: Show Language Server Output"
+      },
+      {
+        "command": "cflat.restartServer",
+        "title": "cflat: Restart Language Server"
+      }
+    ],
     "configuration": {
       "type": "object",
       "title": "cflat",
@@ -47,7 +132,7 @@
         "cflat.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to cflat.exe. Leave blank to auto-detect from common build output locations relative to workspace."
+          "description": "Path to cflat.exe. Required - the language server will not start until this is set. Changes take effect immediately (no reload required)."
         },
         "cflat.enableDiagnostics": {
           "type": "boolean",

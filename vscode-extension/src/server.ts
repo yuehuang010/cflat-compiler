@@ -162,28 +162,6 @@ function findCompilerExecutable(settings: MycSettings, folders: string[]): strin
     if (settings.executablePath && settings.executablePath.trim() !== '') {
         return settings.executablePath.trim();
     }
-
-    const candidates = [
-        'x64\\Debug\\cflat.exe',
-        'x64\\Release\\cflat.exe',
-        'Win32\\Debug\\cflat.exe',
-        'Win32\\Release\\cflat.exe',
-        'Debug\\cflat.exe',
-        'Release\\cflat.exe',
-        'build\\cflat.exe',
-        'cflat.exe'
-    ];
-
-    for (const folder of folders) {
-        for (const candidate of candidates) {
-            const full = path.join(folder, candidate);
-            if (fs.existsSync(full)) {
-                connection.console.log(`Found cflat.exe at: ${full}`);
-                return full;
-            }
-        }
-    }
-
     return null;
 }
 
@@ -202,8 +180,7 @@ async function validateDocument(document: TextDocument): Promise<void> {
     const exePath = findCompilerExecutable(settings, workspaceFolders);
     if (!exePath) {
         connection.console.warn(
-            'cflat.exe not found. Set cflat.executablePath in settings, ' +
-            'or build the project so the executable appears in a standard output directory.'
+            'cflat.executablePath is not set. Set it in Settings to enable diagnostics.'
         );
         connection.sendDiagnostics({ uri: document.uri, diagnostics: [] });
         return;

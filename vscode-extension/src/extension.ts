@@ -1,3 +1,4 @@
+import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -8,59 +9,25 @@ import {
     TransportKind
 } from 'vscode-languageclient/node';
 
-let client: LanguageClient;
+let client: LanguageClient | undefined;
+let outputChannel: vscode.OutputChannel;
+let logFilePath: string;
 
 function findCompilerExecutable(): string | undefined {
-    // 1. Explicit setting always wins.
     const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
     if (configured && configured.trim() !== '') {
         return configured.trim();
     }
-
-    // 2. Scan common build-output locations relative to each workspace folder.
-    const candidates = [
-        path.join('x64', 'Release', 'cflat.exe'),
-        path.join('x64', 'Debug',   'cflat.exe'),
-        path.join('x86', 'Release', 'cflat.exe'),
-        path.join('x86', 'Debug',   'cflat.exe'),
-    ];
-    for (const folder of vscode.workspace.workspaceFolders ?? []) {
-        for (const rel of candidates) {
-            const full = path.join(folder.uri.fsPath, rel);
-            if (fs.existsSync(full)) {
-                return full;
-            }
-        }
-    }
-
     return undefined;
 }
 
-export function activate(context: vscode.ExtensionContext): void {
-    const outputChannel = vscode.window.createOutputChannel('cflat Language Server');
-    context.subscriptions.push(outputChannel);
-
-    outputChannel.appendLine('=== cflat Extension Activating ===');
-    outputChannel.appendLine(`Extension path : ${context.extensionPath}`);
-    outputChannel.appendLine(`Log directory  : ${context.logUri.fsPath}`);
-
-    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-    if (workspaceFolders.length === 0) {
-        outputChannel.appendLine('Workspace folders: (none)');
-    } else {
-        workspaceFolders.forEach(f => outputChannel.appendLine(`Workspace folder: ${f.uri.fsPath}`));
-    }
-
-    const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
-    outputChannel.appendLine(`cflat.executablePath setting: "${configured ?? ''}"`);
-
+async function startClient(): Promise<void> {
     const exePath = findCompilerExecutable();
     if (!exePath) {
-        outputChannel.appendLine('ERROR: cflat.exe not found - checked x64/Release, x64/Debug, x86/Release, x86/Debug relative to each workspace folder.');
+        outputChannel.appendLine('ERROR: cflat.executablePath is not set.');
         outputChannel.show(true);
         vscode.window.showWarningMessage(
-            'cflat: could not find cflat.exe. ' +
-            'Set cflat.executablePath in settings or build the project first.'
+            'cflat: cflat.executablePath is not set. Set it in Settings to enable the language server.'
         );
         return;
     }
@@ -72,11 +39,9 @@ export function activate(context: vscode.ExtensionContext): void {
     outputChannel.appendLine(`Core directory : ${coreDir} (${fs.existsSync(coreDir) ? 'exists' : 'MISSING'})`);
     outputChannel.appendLine(`runtime.cb     : ${runtimeCb} (${fs.existsSync(runtimeCb) ? 'exists' : 'MISSING'})`);
 
-    const logPath = path.join(context.logUri.fsPath, 'lsp.log');
-
     const serverOptions: ServerOptions = {
-        run:   { command: exePath, args: ['lsp'],                                      transport: TransportKind.stdio },
-        debug: { command: exePath, args: ['lsp', '--verbose', '--log-file', logPath],  transport: TransportKind.stdio }
+        run:   { command: exePath, args: ['lsp'],                                          transport: TransportKind.stdio },
+        debug: { command: exePath, args: ['lsp', '--verbose', '--log-file', logFilePath],  transport: TransportKind.stdio }
     };
 
     const clientOptions: LanguageClientOptions = {
@@ -95,14 +60,181 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     outputChannel.appendLine('Starting LSP client...');
-    client.start();
+    await client.start();
     outputChannel.appendLine('LSP client started.');
+}
+
+async function restartClient(reason: string): Promise<void> {
+    outputChannel.appendLine(`Restarting LSP client: ${reason}`);
+    if (client) {
+        try {
+            await client.stop();
+        } catch (err) {
+            outputChannel.appendLine(`Error stopping LSP client: ${err}`);
+        }
+        client = undefined;
+    }
+    await startClient();
+}
+
+// F5 on a .cb file routes to type 'cflat'; resolve compiles with -g and returns a cppvsdbg
+// config so the C/C++ extension drives the actual debug session.
+class CflatDebugConfigurationProvider implements vscode.DebugConfigurationProvider {
+    provideDebugConfigurations(): vscode.DebugConfiguration[] {
+        return [{
+            type: 'cflat',
+            request: 'launch',
+            name: 'Run cflat file',
+            program: '${file}',
+            args: [],
+            stopAtEntry: false
+        }];
+    }
+
+    async resolveDebugConfigurationWithSubstitutedVariables(
+        _folder: vscode.WorkspaceFolder | undefined,
+        config: vscode.DebugConfiguration
+    ): Promise<vscode.DebugConfiguration | undefined> {
+        // Prefer config.program; fall back to the active editor. In either case the source
+        // must end with .cb or .c - otherwise we would compile an unrelated file (e.g. the
+        // previously produced .exe if ${file} happened to resolve to it).
+        const isSource = (p: string | undefined): p is string =>
+            typeof p === 'string' && /\.(cb|c)$/i.test(p);
+
+        let source: string | undefined = isSource(config.program) ? config.program : undefined;
+        if (!source) {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && isSource(editor.document.fileName)) {
+                source = editor.document.fileName;
+            }
+        }
+        if (!source) {
+            vscode.window.showErrorMessage(
+                'cflat: no .cb / .c source file to debug. ' +
+                'Open the source file in the active editor, or set "program" in launch.json to a .cb path.'
+            );
+            return undefined;
+        }
+
+        const cflatExe = findCompilerExecutable();
+        if (!cflatExe) {
+            vscode.window.showErrorMessage(
+                'cflat: cflat.executablePath is not set. Set it in Settings to enable debugging.'
+            );
+            return undefined;
+        }
+
+        const outExe = source.replace(/\.(cb|c)$/i, '.exe');
+        const ok = await compileForDebug(cflatExe, source, outExe);
+        if (!ok) {
+            return undefined;
+        }
+
+        // Prefer cppvsdbg if cpptools is installed. Otherwise fall back to running the .exe
+        // in an integrated terminal - no breakpoints, but at least F5 still launches the program.
+        const cpptools = vscode.extensions.getExtension('ms-vscode.cpptools');
+        if (cpptools) {
+            // Force-activate to avoid racing the C/C++ extension's lazy activation, which
+            // would fail with "Couldn't find a debug adapter descriptor for 'cppvsdbg'".
+            if (!cpptools.isActive) {
+                await cpptools.activate();
+            }
+            return {
+                name: config.name ?? `cflat: ${path.basename(outExe)}`,
+                type: 'cppvsdbg',
+                request: 'launch',
+                program: outExe,
+                args: config.args ?? [],
+                cwd: config.cwd ?? path.dirname(outExe),
+                stopAtEntry: config.stopAtEntry ?? false,
+                console: config.console ?? 'integratedTerminal'
+            };
+        }
+
+        runInTerminal(outExe, config.args ?? [], config.cwd ?? path.dirname(outExe));
+        return undefined;
+    }
+}
+
+function runInTerminal(exePath: string, args: string[], cwd: string): void {
+    const name = `cflat: ${path.basename(exePath)}`;
+    const existing = vscode.window.terminals.find(t => t.name === name);
+    const terminal = existing ?? vscode.window.createTerminal({ name, cwd });
+    terminal.show(true);
+    const quoted = [exePath, ...args].map(a => /\s/.test(a) ? `"${a}"` : a).join(' ');
+    terminal.sendText(quoted);
+}
+
+function compileForDebug(cflatExe: string, source: string, outExe: string): Thenable<boolean> {
+    return vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: `cflat: compiling ${path.basename(source)}...` },
+        () => new Promise<boolean>(resolve => {
+            outputChannel.appendLine(`Compiling: ${cflatExe} "${source}" -o "${outExe}" -g`);
+            const proc = childProcess.spawn(
+                cflatExe,
+                [source, '-o', outExe, '-g'],
+                { cwd: path.dirname(source) }
+            );
+            proc.stdout.on('data', d => outputChannel.append(d.toString()));
+            proc.stderr.on('data', d => outputChannel.append(d.toString()));
+            proc.on('error', err => {
+                outputChannel.appendLine(`Compile error: ${err.message}`);
+                outputChannel.show(true);
+                vscode.window.showErrorMessage(`cflat: failed to launch compiler (${err.message}).`);
+                resolve(false);
+            });
+            proc.on('close', code => {
+                if (code === 0) {
+                    outputChannel.appendLine('Compile OK.');
+                    resolve(true);
+                } else {
+                    outputChannel.appendLine(`Compile failed (exit ${code}).`);
+                    outputChannel.show(true);
+                    vscode.window.showErrorMessage('cflat: compile failed. See "cflat Language Server" output for details.');
+                    resolve(false);
+                }
+            });
+        })
+    );
+}
+
+export function activate(context: vscode.ExtensionContext): void {
+    outputChannel = vscode.window.createOutputChannel('cflat Language Server');
+    context.subscriptions.push(outputChannel);
+
+    outputChannel.appendLine('=== cflat Extension Activating ===');
+    outputChannel.appendLine(`Extension path : ${context.extensionPath}`);
+    outputChannel.appendLine(`Log directory  : ${context.logUri.fsPath}`);
+
+    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+    if (workspaceFolders.length === 0) {
+        outputChannel.appendLine('Workspace folders: (none)');
+    } else {
+        workspaceFolders.forEach(f => outputChannel.appendLine(`Workspace folder: ${f.uri.fsPath}`));
+    }
+
+    const configured = vscode.workspace.getConfiguration('cflat').get<string>('executablePath');
+    outputChannel.appendLine(`cflat.executablePath setting: "${configured ?? ''}"`);
+
+    logFilePath = path.join(context.logUri.fsPath, 'lsp.log');
+
+    void startClient();
+
+    // Restart the LSP client when cflat.executablePath changes so the user
+    // doesn't have to reload the window.
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('cflat.executablePath')) {
+                void restartClient('cflat.executablePath changed');
+            }
+        })
+    );
 
     // Command: manually trigger diagnostics on current file
     context.subscriptions.push(
         vscode.commands.registerCommand('cflat.runDiagnostics', () => {
             const editor = vscode.window.activeTextEditor;
-            if (editor && editor.document.languageId === 'cflat') {
+            if (editor && editor.document.languageId === 'cflat' && client) {
                 client.sendNotification('cflat/runDiagnostics', {
                     uri: editor.document.uri.toString()
                 });
@@ -113,7 +245,27 @@ export function activate(context: vscode.ExtensionContext): void {
     // Command: show compiler output channel
     context.subscriptions.push(
         vscode.commands.registerCommand('cflat.showOutput', () => {
-            client.outputChannel.show();
+            (client?.outputChannel ?? outputChannel).show();
+        })
+    );
+
+    // TriggerKind.Initial is invoked when populating launch.json (snippet flow).
+    // TriggerKind.Dynamic is invoked when F5 is pressed with no launch.json - without this
+    // registration F5-no-launch.json finds no configs and silently does nothing.
+    const debugProvider = new CflatDebugConfigurationProvider();
+    context.subscriptions.push(
+        vscode.debug.registerDebugConfigurationProvider(
+            'cflat', debugProvider, vscode.DebugConfigurationProviderTriggerKind.Initial
+        ),
+        vscode.debug.registerDebugConfigurationProvider(
+            'cflat', debugProvider, vscode.DebugConfigurationProviderTriggerKind.Dynamic
+        )
+    );
+
+    // Command: manually restart the LSP client
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cflat.restartServer', () => {
+            void restartClient('user invoked cflat.restartServer');
         })
     );
 
