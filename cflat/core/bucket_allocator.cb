@@ -9,16 +9,17 @@ import "mutex.cb";
 // size blocks. A free block stores the next-free pointer in its first 8 bytes
 // (intrusive LIFO list).
 //
-// Page header (first 32 bytes of every page) carries a magic + size class so
-// dealloc can identify the page from the user pointer:
+// Ownership dispatch goes through a process-global page registry (see
+// _ba_reg_* below): every owned 64K page base maps to its owning BA. dealloc()
+// and the operator-delete hook look up ptr's page base in the registry; a hit
+// routes the free to the owning BA, a miss falls through to HeapValidate-guarded
+// CRT free. The user pointer's page header is read ONLY after the registry
+// confirms ownership, so a foreign pointer is never dereferenced.
 //
-//   _BA_PAGE_MAGIC = 0xBA63E001
-//   page_addr      = ptr & ~0xFFFF
-//   header.magic   == 0xBA63E001 → owned by some BucketAllocator
-//   header.class   ∈ [0, 7]      → push block onto _buckets[class]._free
-//
-// Pointers that don't carry our magic fall through to _freeLarge (large-alloc
-// linked list, then HeapValidate-guarded CRT free for foreign pointers).
+// Page header (first 32 bytes of every page) carries a magic + size class. Once
+// the registry confirms the page is ours, dealloc reads the header to route:
+//   _magic == 0xBA63E001  -> small-block page; class in [0,7] selects a bucket
+//   _magic == 0xBA63E002  -> large-alloc base page (see _freeLargeOwned)
 //
 // Requests > 1024 bytes go directly to vmem_alloc (large-alloc path), tracked
 // in _largeHead so cleanup can vmem_free them.
@@ -35,9 +36,10 @@ import "mutex.cb";
 
 // Page header at offset 0 of every bucket-owned 64 KB page.
 //
-// _owner is a back-pointer to the BucketAllocator that owns this page; used
-// by operator delete to route cross-allocator frees (e.g. inbox messages
-// flowing between programs) back to the owning BA without consulting TLS.
+// _magic identifies a small-block page once the global registry has confirmed
+// ownership (it is the small-vs-large discriminator read in _deallocOwned).
+// _owner is retained as a transitional cross-check; cross-allocator routing now
+// goes through the global page registry, not this back-pointer.
 struct _BA_PageHdr
 {
     u32 _magic     = 0;        // 0xBA63E001 when owned by a BucketAllocator
@@ -61,9 +63,9 @@ struct _BA_Bucket
 
 // Header prepended to every large-alloc vmem_alloc region.
 //
-// _magic distinguishes large-alloc base pages from small-block pages so the
-// shared page-masked dispatch in operator delete can identify both kinds.
-// _owner is the BucketAllocator that owns this large alloc.
+// _magic distinguishes large-alloc base pages from small-block pages in
+// _deallocOwned (read only after the registry confirms ownership). _owner is
+// retained as a transitional cross-check; routing is via the global registry.
 struct _BA_LargeHdr
 {
     u32 _magic      = 0;       // 0xBA63E002 when owned by a BucketAllocator
@@ -74,39 +76,113 @@ struct _BA_LargeHdr
     i8* _owner      = nullptr; // BucketAllocator* that owns this large alloc
 };
 
-// Page-header dispatch hook registered with memory.cb.
+// ---------------------------------------------------------------------------
+// Process-global page registry (Option B)
+// ---------------------------------------------------------------------------
 //
-// Looks up the page-aligned base address of ptr (64K-aligned because both
-// vmem_alloc-backed pages and large-alloc regions are 64K-granular). If the
-// base carries either the small-block magic (0xBA63E001) or the large-alloc
-// magic (0xBA63E002), routes the free to the owning BucketAllocator. Returns
-// true if the dispatch happened, false otherwise so operator delete can fall
-// through to __active_allocator or CRT free.
+// Maps every 64K page base owned by ANY BucketAllocator to its owning BA. The
+// router consults this registry instead of dereferencing the user pointer's
+// page base, so a free of a foreign (e.g. CRT-malloc'd) pointer never touches
+// that pointer's page header. This eliminates the wild-read AV that the old
+// magic-at-(ptr & ~0xFFFF) dispatch suffered when the rounded-down base landed
+// on reserved-but-uncommitted memory.
+//
+// Structure: a two-level radix over the 32 significant bits of a 64K-aligned
+// address (bits 16..47).
+//   idx = base >> 16
+//   hi  = (idx >> 16) & 0xFFFF   -> top-level index   (bits 32..47)
+//   lo  = idx & 0xFFFF           -> second-level index (bits 16..31)
+// Top level: 65536 dir slots (512 KB), allocated once. Each dir slot points to
+// a second-level table of 65536 owner slots (512 KB), allocated on demand for
+// each touched 4 GB address region. Tables are vmem-backed (never recurse into
+// operator new) and live for the process lifetime.
+//
+// Lookups are lock-free: every step is a pointer-sized load, atomic on x64, and
+// a missing entry reads as null. Only second-level table allocation is guarded
+// by _ba_reg_lock. x64 TSO guarantees a thread that observes a published _table
+// pointer also observes the zero-fill that preceded the publish.
+
+struct _BA_RegSlot { i8* _owner = nullptr; };                  // second-level entry
+struct _BA_RegDir  { _BA_RegSlot* _table = nullptr; };         // top-level entry
+
+_BA_RegDir* _ba_reg_top = nullptr;
+mutex       _ba_reg_lock = default;
+
+void _ba_reg_init_top()
+{
+    if (_ba_reg_top != nullptr) return;
+    _ba_reg_lock.acquire();
+    if (_ba_reg_top == nullptr)
+        _ba_reg_top = (_BA_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegDir));
+    _ba_reg_lock.release();
+}
+
+void _ba_reg_insert(i64 base, i8* owner)
+{
+    _ba_reg_init_top();
+    if (_ba_reg_top == nullptr) return;   // vmem_alloc failed - registry disabled
+
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+
+    if (_ba_reg_top[hi]._table == nullptr)
+    {
+        _ba_reg_lock.acquire();
+        if (_ba_reg_top[hi]._table == nullptr)
+            _ba_reg_top[hi]._table = (_BA_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_BA_RegSlot));
+        _ba_reg_lock.release();
+    }
+    _BA_RegSlot* tbl = _ba_reg_top[hi]._table;
+    if (tbl == nullptr) return;
+    tbl[lo]._owner = owner;
+}
+
+void _ba_reg_remove(i64 base)
+{
+    if (_ba_reg_top == nullptr) return;
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+    _BA_RegSlot* tbl = _ba_reg_top[hi]._table;
+    if (tbl == nullptr) return;
+    tbl[lo]._owner = nullptr;
+}
+
+i8* _ba_reg_lookup(i64 base)
+{
+    if (_ba_reg_top == nullptr) return nullptr;
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+    _BA_RegSlot* tbl = _ba_reg_top[hi]._table;
+    if (tbl == nullptr) return nullptr;
+    return tbl[lo]._owner;
+}
+
+// Registry-driven free router shared by the operator-delete hook and the public
+// dealloc() entry point. Looks up the owning BucketAllocator for ptr's 64K page
+// base; if found, routes the free to that BA under its lock. Reading ptr's page
+// header inside _deallocOwned is safe only because the registry already proved
+// the page is a committed, BA-owned page. Returns false for any pointer not in
+// the registry so the caller can fall through to CRT free.
+bool _ba_route_free(void* ptr)
+{
+    i64 base = (i64)ptr & ~(i64)0xFFFF;
+    if (base == (i64)0) return false;
+
+    i8* owner = _ba_reg_lookup(base);
+    if (owner == nullptr) return false;
+
+    BucketAllocator* o = (BucketAllocator*)owner;
+    o->_lockedDeallocOwned(ptr);
+    return true;
+}
+
+// Hook registered with memory.cb (see _init). Thin wrapper over the router.
 bool __BA_try_owner_dealloc(void* ptr)
 {
-    i64 page_addr = (i64)ptr & ~(i64)0xFFFF;
-    if (page_addr == (i64)0) return false;
-
-    u32* magicPtr = (u32*)page_addr;
-    u32 magic = *magicPtr;
-
-    if (magic == (u32)0xBA63E001)
-    {
-        _BA_PageHdr* hdr = (_BA_PageHdr*)page_addr;
-        BucketAllocator* owner = (BucketAllocator*)hdr->_owner;
-        if (owner == nullptr) return false;
-        owner.dealloc(ptr);
-        return true;
-    }
-    if (magic == (u32)0xBA63E002)
-    {
-        _BA_LargeHdr* hdr = (_BA_LargeHdr*)page_addr;
-        BucketAllocator* owner = (BucketAllocator*)hdr->_owner;
-        if (owner == nullptr) return false;
-        owner.dealloc(ptr);
-        return true;
-    }
-    return false;
+    return _ba_route_free(ptr);
 }
 
 class BucketAllocator : IAllocator
@@ -203,6 +279,7 @@ class BucketAllocator : IAllocator
         hdr->_next_page = _buckets[cls]._page;
         hdr->_owner     = (i8*)BucketAllocator__;
         _buckets[cls]._page = page;
+        _ba_reg_insert((i64)page, (i8*)BucketAllocator__);
         _reservedNow = _reservedNow + (i64)65536;
         if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
 
@@ -242,6 +319,9 @@ class BucketAllocator : IAllocator
         hdr->_next       = _largeHead;
         hdr->_owner      = (i8*)BucketAllocator__;
         _largeHead       = base;
+        // The user pointer (base + hdrSize) always lands in this 64K base page,
+        // so registering only the base page covers every lookup for this region.
+        _ba_reg_insert((i64)base, (i8*)BucketAllocator__);
         _largeBytes  = _largeBytes + size;
         _largeCount  = _largeCount + 1;
         _reservedNow = _reservedNow + total;
@@ -250,9 +330,9 @@ class BucketAllocator : IAllocator
         return (void*)(base + hdrSize);
     }
 
-    // Search the large-alloc list to find and free ptr; fall back to CRT free
-    // (HeapValidate-guarded) only if ptr is on the CRT heap.
-    void _freeLarge(void* ptr)
+    // Free a large alloc this BA owns. Called with _lock held after the registry
+    // confirmed ownership, so the large-alloc list is guaranteed to contain it.
+    void _freeLargeOwned(void* ptr)
     {
         i64 hdrSize = (i64)sizeof(_BA_LargeHdr);
         i8* base    = (i8*)ptr - hdrSize;
@@ -274,18 +354,16 @@ class BucketAllocator : IAllocator
                     _BA_LargeHdr* ph = (_BA_LargeHdr*)prev;
                     ph->_next = ch->_next;
                 }
+                _ba_reg_remove((i64)base);
                 vmem_free((void*)base);
                 return;
             }
             prev = cur;
             cur  = ch->_next;
         }
-
-        // Foreign pointer - only free if it's on the CRT heap. HeapValidate
-        // guards against vmem-backed blocks from other allocators that would
-        // corrupt the CRT heap.
-        if (HeapValidate(GetProcessHeap(), 0u, ptr))
-            free(ptr);
+        // Registry said we own this page but the large list didn't contain it.
+        // That is a bookkeeping inconsistency; do nothing rather than risk a bad
+        // free.
     }
 
     // -----------------------------------------------------------------------
@@ -320,24 +398,49 @@ class BucketAllocator : IAllocator
 
     void dealloc(void* ptr)
     {
+        if (ptr == nullptr) return;
+
+        // Route via the process-global registry. If some BucketAllocator owns
+        // ptr's page (this BA or another), the router frees it under that BA's
+        // lock and returns true.
+        if (_ba_route_free(ptr)) return;
+
+        // Foreign pointer - not owned by any BucketAllocator. Only free if it
+        // lives on the CRT heap; HeapValidate guards against vmem-backed blocks
+        // from other allocators that would corrupt the CRT heap. No page-header
+        // read here, so a foreign pointer is never dereferenced.
+        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+            free(ptr);
+    }
+
+    // Lock-taking entry point used by the registry router (_ba_route_free). The
+    // router has already confirmed this BA owns ptr's page; acquire our lock and
+    // free under it. A method (not a free-function field access) so the router
+    // can reach our _lock through a forward-declared BucketAllocator pointer.
+    void _lockedDeallocOwned(void* ptr)
+    {
         _lock.acquire();
-        _deallocUnsynced(ptr);
+        _deallocOwned(ptr);
         _lock.release();
     }
 
-    void _deallocUnsynced(void* ptr)
+    // Free a pointer this BA owns. MUST be called with _lock held and only after
+    // the registry confirmed ptr's 64K page belongs to this BA - that guarantee
+    // is what makes reading the page header safe (the page is committed and
+    // carries one of our headers, never a foreign/uncommitted address).
+    void _deallocOwned(void* ptr)
     {
         if (ptr == nullptr) return;
 
-        // Page-aligned address of the candidate header (64K alignment).
         i64 page_addr = ((i64)ptr) & ~(i64)0xFFFF;
-        if (page_addr == (i64)0) { _freeLarge(ptr); return; }
-
         _BA_PageHdr* hdr = (_BA_PageHdr*)page_addr;
-        if (hdr->_magic != (u32)0xBA63E001) { _freeLarge(ptr); return; }
+        u32 magic = hdr->_magic;
 
+        if (magic == (u32)0xBA63E002) { _freeLargeOwned(ptr); return; }
+
+        // Small-block page (magic is 0xBA63E001).
         int cls = (int)hdr->_class;
-        if (cls < 0 || cls >= 8) { _freeLarge(ptr); return; }
+        if (cls < 0 || cls >= 8) return;   // defensive; registry said it is ours
 
         i8* block = (i8*)ptr;
         _BA_FreeBlock* fb = (_BA_FreeBlock*)block;
@@ -463,6 +566,7 @@ class BucketAllocator : IAllocator
             {
                 _BA_PageHdr* hdr = (_BA_PageHdr*)p;
                 i8* next = hdr->_next_page;
+                _ba_reg_remove((i64)p);
                 g_page_pool.release((void*)p);
                 p = next;
             }
@@ -478,6 +582,7 @@ class BucketAllocator : IAllocator
         {
             _BA_LargeHdr* h = (_BA_LargeHdr*)cur;
             i8* next = h->_next;
+            _ba_reg_remove((i64)cur);
             vmem_free((void*)cur);
             cur = next;
         }
