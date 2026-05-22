@@ -678,6 +678,7 @@ operatorFunctionId
     : Operator (New | Delete | String
                | Plus | Minus | Star | Div | Mod
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
+               | LeftShift | Greater Greater
                | LeftBracket RightBracket
                | Not | Tilde)
     ;

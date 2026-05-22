@@ -65,8 +65,11 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->NotEqual())     return "operator!=";
     if (opId->Less())         return "operator<";
     if (opId->LessEqual())    return "operator<=";
-    if (opId->Greater())      return "operator>";
     if (opId->GreaterEqual()) return "operator>=";
+    if (opId->LeftShift())    return "operator<<";
+    // '>>' is two Greater tokens; '>' is one. Check before single-Greater.
+    if (opId->Greater().size() == 2) return "operator>>";
+    if (opId->Greater().size() == 1) return "operator>";
     if (opId->LeftBracket())  return "operator[]";
     if (opId->Not())          return "operator!";
     if (opId->Tilde())        return "operator~";
@@ -5270,6 +5273,20 @@ public:
         }
     }
 
+    // True if functionTable has an `opName` overload whose first parameter type matches
+    // typeName. Used to decide whether a shift operator should dispatch to an overload
+    // (member or free) instead of a primitive bit-shift.
+    bool HasOperatorOverloadForFirstParam(const std::string& opName, const std::string& typeName)
+    {
+        auto* compiler = Compiler();
+        auto it = compiler->functionTable.find(opName);
+        if (it == compiler->functionTable.end()) return false;
+        for (const auto& sym : it->second)
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
+                return true;
+        return false;
+    }
+
     LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx)
     {
         auto nextCtxs = ctx->additiveExpression();
@@ -5287,23 +5304,24 @@ public:
             if (op == ">" && ctx->children.size() > 2 && ctx->children[2]->getText() == ">")
                 op = ">>";
 
+            auto* compiler = Compiler(ctx);
+            std::string lhsName = TryGetSimpleIdentifier(nextCtxs[0]);
+            std::string rhsName = TryGetSimpleIdentifier(nextCtxs[1]);
+
+            auto lhsNV = lhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(lhsName);
+            if (!lhsName.empty() && lhsNV.Storage == nullptr)
+                lhsNV = compiler->GetGlobalVariableNV(lhsName);
+            auto rhsNV = rhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(rhsName);
+            if (!rhsName.empty() && rhsNV.Storage == nullptr)
+                rhsNV = compiler->GetGlobalVariableNV(rhsName);
+
+            const std::string& lhsType = lhsNV.TypeAndValue.TypeName;
+            const std::string& rhsType = rhsNV.TypeAndValue.TypeName;
+
             if (op == ">>")
             {
-                auto* compiler = Compiler(ctx);
-                std::string lhsName = TryGetSimpleIdentifier(nextCtxs[0]);
-                std::string rhsName = TryGetSimpleIdentifier(nextCtxs[1]);
-
-                auto lhsNV = lhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(lhsName);
-                if (!lhsName.empty() && lhsNV.Storage == nullptr)
-                    lhsNV = compiler->GetGlobalVariableNV(lhsName);
-                auto rhsNV = rhsName.empty() ? LLVMBackend::NamedVariable{} : compiler->GetLocalVariable(rhsName);
-                if (!rhsName.empty() && rhsNV.Storage == nullptr)
-                    rhsNV = compiler->GetGlobalVariableNV(rhsName);
-
-                const std::string& lhsType = lhsNV.TypeAndValue.TypeName;
-                const std::string& rhsType = rhsNV.TypeAndValue.TypeName;
-                llvm::Value* lhsStorage    = lhsNV.Storage;
-                llvm::Value* rhsStorage    = rhsNV.Storage;
+                llvm::Value* lhsStorage = lhsNV.Storage;
+                llvm::Value* rhsStorage = rhsNV.Storage;
 
                 bool lhsIsProgram = !lhsType.empty() && compiler->programTable.count(lhsType) > 0;
                 bool rhsIsProgram = !rhsType.empty() && compiler->programTable.count(rhsType) > 0;
@@ -5330,7 +5348,33 @@ public:
                 }
             }
 
-            auto result = Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
+            // General operator overloading for '>>' / '<<' (e.g. channel<T>::operator>>).
+            // Only dispatched when the LHS is a struct/class type with a matching operator
+            // overload, so primitive integer bit-shifts fall through to CreateOperation.
+            if (op == ">>" || op == "<<")
+            {
+                std::string opName = "operator" + op;
+                if (!lhsType.empty() && compiler->IsDataStructure(lhsType)
+                    && HasOperatorOverloadForFirstParam(opName, lhsType))
+                {
+                    LLVMBackend::NamedVariable la;
+                    la.TypeAndValue = lhsNV.TypeAndValue;
+                    la.TypeAndValue.VariableName = "";   // positional, not a named arg
+                    la.Primary      = lv.value;
+                    la.BaseType     = lv.value ? lv.value->getType() : nullptr;
+                    la.CallerName   = lhsName;
+                    LLVMBackend::NamedVariable ra;
+                    ra.TypeAndValue = rhsNV.TypeAndValue;
+                    ra.TypeAndValue.VariableName = "";   // positional, not a named arg
+                    ra.Primary      = rv.value;
+                    ra.BaseType     = rv.value ? rv.value->getType() : nullptr;
+                    ra.CallerName   = rhsName;
+                    auto* res = compiler->CreateOverloadedFunctionCall(opName, { la, ra });
+                    return { res, false };
+                }
+            }
+
+            auto result = compiler->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };
         }
 
@@ -9604,6 +9648,18 @@ public:
             return namedVar;
         }
 
+        // 'this' inside a member-function body resolves to the implicit self pointer.
+        if (name == "this")
+        {
+            auto thisVar = compiler->GetThisPointer();
+            if (thisVar.Storage != nullptr || thisVar.Primary != nullptr)
+            {
+                thisVar.IdentifierLine = (int)node->getSymbol()->getLine();
+                thisVar.IdentifierColumn = (int)node->getSymbol()->getCharPositionInLine();
+                return thisVar;
+            }
+        }
+
         namedVar = compiler->GetLocalVariable(name);
         if (namedVar.Storage != nullptr || namedVar.Primary != nullptr)
         {
@@ -9923,8 +9979,12 @@ public:
             // This is a generic type instantiation
             std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> typeArgs;
+            // Resolve via ResolveTypeArgEntry so active type-parameter substitutions are
+            // applied (e.g. channel<T> -> channel__int inside an instantiated generic body).
+            // Without this, the literal "T" is queued (channel__T), which later fails to
+            // instantiate with "unknown type 'T'". No-op for already-concrete args.
             for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                typeArgs.push_back(entry->getText());
+                typeArgs.push_back(ResolveTypeArgEntry(entry));
 
             std::string mangledName = MangledGenericName(baseName, typeArgs);
 

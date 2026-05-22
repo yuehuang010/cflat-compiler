@@ -887,6 +887,85 @@ bool testChannelMultiProducer() {
     return result;
 }
 
+// channel<T>::operator>> (pipe) + producer-refcount close protocol.
+// Borrow semantics: a >> b spawns a forwarder that drains a into b; when a's
+// last producer closes, the forwarder drains and closes b.
+
+// Single-stage pipe preserves order and count; closing src closes dst.
+bool testChannelPipeSingle() {
+    bool result = true;
+    channel<int>* src = new channel<int>();
+    channel<int>* dst = new channel<int>();
+    src.init(64);
+    dst.init(64);
+
+    src >> dst;
+
+    src.add_producer();
+    int i = 0;
+    while (i < 100) { src.push(i); i = i + 1; }
+    src.close_producer();
+
+    int expected = 0;
+    int v        = 0;
+    int count    = 0;
+    int ordered  = 1;
+    while (dst.receive(&v)) {
+        if (v != expected) { ordered = 0; }
+        expected = expected + 1;
+        count    = count + 1;
+    }
+    result &= Test("pipe_single_count", count, 100);
+    result &= Test("pipe_single_order", ordered, 1);
+    return result;
+}
+
+// Two-stage pipe src -> mid -> dst: EOF must propagate through both forwarders.
+bool testChannelPipeChained() {
+    bool result = true;
+    channel<int>* src = new channel<int>();
+    channel<int>* mid = new channel<int>();
+    channel<int>* dst = new channel<int>();
+    src.init(64);
+    mid.init(64);
+    dst.init(64);
+
+    src >> mid;
+    mid >> dst;
+
+    src.add_producer();
+    int i      = 0;
+    int sum_in = 0;
+    while (i < 50) { src.push(i); sum_in = sum_in + i; i = i + 1; }
+    src.close_producer();
+
+    int v       = 0;
+    int sum_out = 0;
+    int count   = 0;
+    while (dst.receive(&v)) { sum_out = sum_out + v; count = count + 1; }
+
+    result &= Test("pipe_chain_count", count, 50);
+    result &= Test("pipe_chain_sum", sum_out, sum_in);
+    return result;
+}
+
+// An empty source closed with no items must still close the destination.
+bool testChannelPipeEmpty() {
+    channel<int>* src = new channel<int>();
+    channel<int>* dst = new channel<int>();
+    src.init(16);
+    dst.init(16);
+
+    src >> dst;
+    src.add_producer();
+    src.close_producer();
+
+    int v     = 0;
+    int count = 0;
+    while (dst.receive(&v)) { count = count + 1; }
+    return Test("pipe_empty_count", count, 0) != 0;
+}
+
 // ---------------------------------------------------------------------------
 // spsc_queue<int> tests
 // ---------------------------------------------------------------------------
@@ -1099,6 +1178,9 @@ extern int main() {
     total++; passed += testChannelWrapAround()        ? 1 : 0;
     total++; passed += testChannelProducerConsumer()  ? 1 : 0;
     total++; passed += testChannelMultiProducer()     ? 1 : 0;
+    total++; passed += testChannelPipeSingle()        ? 1 : 0;
+    total++; passed += testChannelPipeChained()       ? 1 : 0;
+    total++; passed += testChannelPipeEmpty()         ? 1 : 0;
     total++; passed += testSpscBasic()                ? 1 : 0;
     total++; passed += testSpscWrapAround()           ? 1 : 0;
     total++; passed += testSpscThreaded()             ? 1 : 0;

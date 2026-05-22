@@ -51,6 +51,7 @@
 
 import "interfaces.cb";
 import "atomic.cb";
+import "thread.cb";
 
 class channel<T>
 {
@@ -74,6 +75,20 @@ class channel<T>
     i64 _t0 = 0; i64 _t1 = 0; i64 _t2 = 0; i64 _t3 = 0;
     i64 _t4 = 0; i64 _t5 = 0; i64 _t6 = 0;
 
+    // ── cache line 3: producer refcount + close flag ──────────────────────────
+    // producers(8) + closed(8) + 6×pad(48) = 64 bytes
+    //
+    // Rust-mpsc-style termination: each live producer registers via
+    // add_producer().  When the last one leaves (close_producer() brings the
+    // count to 0) the channel is marked closed, and the blocking
+    // receive(T* out) overload reports EOF once the buffer is drained.
+    // Channels that never register a producer never auto-close, so the legacy
+    // send/receive/push/pop paths are unaffected.
+    i64 _producers = 0;
+    i64 _closed    = 0;
+    i64 _p0 = 0; i64 _p1 = 0; i64 _p2 = 0;
+    i64 _p3 = 0; i64 _p4 = 0; i64 _p5 = 0;
+
     // ── public API ────────────────────────────────────────────────────────────
 
     void init(int cap) {
@@ -88,6 +103,30 @@ class channel<T>
         while (i < (int)_cap) { _seq[i] = (i64)i; i++; }
         __atomic_i64_store(&_head, (i64)0);
         __atomic_i64_store(&_tail, (i64)0);
+        __atomic_i64_store(&_producers, (i64)0);
+        __atomic_i64_store(&_closed, (i64)0);
+    }
+
+    // ── producer-lifetime tracking (drives blocking receive(T*) termination) ──
+
+    // Register a live producer.  Call before the first push from a new sender;
+    // pair with exactly one close_producer().
+    void add_producer() {
+        __atomic_counter_increment(&_producers);
+    }
+
+    // Retire a producer.  When the last one leaves, mark the channel closed so
+    // a blocked receive(T* out) returns false once the buffer is drained.
+    void close_producer() {
+        i64 remaining = __atomic_counter_decrement(&_producers);
+        if (remaining == (i64)0) {
+            __atomic_release_store_i64(&_closed, (i64)1);
+        }
+    }
+
+    // True once every registered producer has called close_producer().
+    bool is_closed() {
+        return __atomic_acquire_load_i64(&_closed) != (i64)0;
     }
 
     // Non-blocking send.  Returns false if the channel is full.
@@ -211,6 +250,47 @@ class channel<T>
         return sentinel;
     }
 
+    // Blocking, close-aware receive.  Writes *out and returns true when an item
+    // is available; returns false once the channel is closed AND drained.
+    // This is the consumer side of the producer-refcount termination protocol -
+    // use it (instead of the spin-forever receive()) when a forwarder or
+    // producer signals end-of-stream via close_producer().
+    //
+    // Ordering: when the slot is empty we load _closed with acquire semantics;
+    // close_producer() publishes _closed with a matching release store after the
+    // final producer's last push.  On x86/x64 (the only targets) plain loads are
+    // acquire and stores are release, so the re-check below observes any item
+    // published just before the close before concluding the channel is drained.
+    bool receive(T* out) {
+        i64 pos   = __atomic_i64_load(&_tail);
+        i64 spins = (i64)0;
+        while (true) {
+            int  slot   = (int)(pos & _mask);
+            i64* seqPtr = _seq + slot;
+            i64  seq    = __atomic_acquire_load_i64(seqPtr);
+            i64  dif    = seq - (pos + (i64)1);
+            if (dif == (i64)0) {
+                if (__atomic_i64_cas(&_tail, pos, pos + (i64)1)) {
+                    *out = _buf[slot];
+                    __atomic_release_store_i64(seqPtr, pos + _cap);
+                    return true;
+                }
+            } else if (dif < (i64)0) {
+                // Slot empty.  If all producers have left, re-check the slot once
+                // (a producer may have published right before closing); if it is
+                // still empty the channel is drained and closed.
+                if (__atomic_acquire_load_i64(&_closed) != (i64)0) {
+                    i64 seq2 = __atomic_acquire_load_i64(seqPtr);
+                    if (seq2 - (pos + (i64)1) < (i64)0) { return false; }
+                }
+            }
+            pos   = __atomic_i64_load(&_tail);
+            spins = spins + (i64)1;
+            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+        }
+        return false;
+    }
+
     void push(move T item) {
         i64 pos   = __atomic_i64_load(&_head);
         i64 spins = (i64)0;
@@ -255,6 +335,22 @@ class channel<T>
         return sentinel;
     }
 
+    // Pipe operator: drain this channel into dst on a detached forwarder thread.
+    // Borrow semantics (weak reference) - the forwarder owns neither channel.
+    // Callers must keep both alive until every producer of the source has called
+    // close_producer(): that stops the forwarder, which then calls
+    // close_producer() on dst to propagate end-of-stream downstream.
+    //   channel<int>* a = ...; channel<int>* b = ...;
+    //   a >> b;   // forward everything pushed into *a on into *b
+    void operator>>(channel<T>* dst) {
+        void** ctx = (void**)malloc((i64)16);    // {src, dst}; freed by the forwarder
+        ctx[0] = (void*)this;
+        ctx[1] = (void*)dst;
+        function<int(void*)> entry = __channel_forward<T>;
+        Thread t = default;
+        t.start(entry, (void*)ctx);              // detached fire-and-forget forwarder
+    }
+
     int capacity() { return (int)_cap; }
 
     int count() {
@@ -274,3 +370,18 @@ class channel<T>
         destroy();
     }
 };
+
+// Forwarder thread entry for channel<T>::operator>>.  ctx is a 2-slot void* array
+// {src, dst}.  Registers as a producer of dst, drains src until it is closed and
+// drained, then closes dst to propagate end-of-stream to the next stage.
+int __channel_forward<T>(void* p) {
+    void** ctx = (void**)p;
+    channel<T>* src = (channel<T>*)ctx[0];
+    channel<T>* dst = (channel<T>*)ctx[1];
+    free(p);
+    dst.add_producer();
+    T v = default;
+    while (src.receive(&v)) { dst.push(v); }
+    dst.close_producer();
+    return 0;
+}

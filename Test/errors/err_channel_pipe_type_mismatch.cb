@@ -1,0 +1,14 @@
+// channel<T>::operator>> requires both channels to have the same element type T.
+// Piping channel<int> into channel<float> must not resolve to any overload.
+import "channel.cb";
+
+extern int main()
+{
+    channel<int>*   a = new channel<int>();
+    channel<float>* b = new channel<float>();
+    a.init(8);
+    b.init(8);
+    expect_error("no overload of 'operator>>'");
+    a >> b;
+    return 0;
+}

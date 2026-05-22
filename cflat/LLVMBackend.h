@@ -5430,6 +5430,44 @@ public:
         return {};
     }
 
+    // Returns the implicit 'this' pointer NamedVariable for the innermost enclosing
+    // member-function body, or a default (Storage == nullptr) when not in a method.
+    // The result loads to the struct pointer (TypeName = struct, Pointer = true).
+    NamedVariable GetThisPointer()
+    {
+        for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            const auto& functionArguments = stackFrame.functionArgument;
+            if (functionArguments.empty())
+                continue;
+
+            // The implicit 'this' arg is named "<StructName>__" (trailing "__").
+            for (const auto& [key, nv] : functionArguments)
+            {
+                if (key.size() < 2 || key.substr(key.size() - 2) != "__")
+                    continue;
+                std::string structName = key.substr(0, key.size() - 2);
+                if (!IsDataStructure(structName))
+                    continue;
+                // Only a *method* self qualifies here: its storage is an alloca-of-pointer
+                // (the incoming this* param), so loading it yields the struct pointer.
+                // A constructor's self is an alloca-of-struct (value under construction);
+                // leave that to the existing `this`-handling path.
+                auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(nv.Storage);
+                if (!alloca || !alloca->getAllocatedType()->isPointerTy())
+                    break;
+                NamedVariable thisVar = nv;
+                thisVar.CallerName = "this";
+                thisVar.TypeAndValue.TypeName = structName;
+                thisVar.TypeAndValue.Pointer = true;
+                return thisVar;
+            }
+            // First frame with arguments but no 'this' -> not a member body.
+            break;
+        }
+        return {};
+    }
+
     NamedVariable GetFunctionArgument(std::string name)
     {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))

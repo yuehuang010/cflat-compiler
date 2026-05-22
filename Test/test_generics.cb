@@ -1756,6 +1756,91 @@ bool testImplicitStringLiteral()
     return result;
 }
 
+// =============================================================
+// Generic function references and nested generic locals
+// =============================================================
+
+int dbl<T>(T x) { return (int)x + (int)x; }
+
+// Nested generic-type local inside a generic function body (regression for the
+// QueueInstantiateGenericType substitution fix - a literal "T" used to be queued
+// and failed with "unknown type 'T'").
+int sumPair<T>(T seed)
+{
+    list<T> xs = default;
+    xs.add(seed);
+    xs.add(seed);
+    int total = 0;
+    int i = 0;
+    while (i < xs.count()) { total = total + (int)xs.get(i); i = i + 1; }
+    return total;
+}
+
+bool testGenericFnAsValue()
+{
+    bool result = true;
+    function<int(int)> fp = dbl<int>;   // generic fn instantiated as a value
+    result &= Test("genfn_value_call",  fp(21), 42);
+    result &= Test("genfn_value_call2", fp(0), 0);
+    return result;
+}
+
+bool testNestedGenericLocal()
+{
+    bool result = true;
+    result &= Test("genfn_nested_local_int", sumPair<int>(5), 10);
+    result &= Test("genfn_nested_local_i64", (int)sumPair<i64>(7), 14);
+    return result;
+}
+
+// =============================================================
+// `this` pointer in member-function bodies (plain and generic)
+// =============================================================
+
+struct SelfProbe
+{
+    int n = 0;
+    SelfProbe* self() { return this; }
+    void*      raw()  { return (void*)this; }
+    int        read() { return this.n; }
+    void       bump() { this.n = this.n + 1; }
+};
+
+class SelfBox<T>
+{
+    T val = default;
+    SelfBox<T>* me()  { return this; }
+    T           get() { return this.val; }
+};
+
+bool testThisReturnsSelf()
+{
+    SelfProbe p;
+    p.n = 7;
+    bool result = true;
+    result &= Test("this_self_eq", (int)(p.self() == &p), 1);
+    result &= Test("this_raw_eq",  (int)(p.raw() == (void*)&p), 1);
+    return result;
+}
+
+bool testThisMemberAccess()
+{
+    SelfProbe p;
+    p.n = 41;
+    p.bump();
+    return Test("this_member_rw", p.read(), 42) != 0;
+}
+
+bool testThisInGenericMethod()
+{
+    SelfBox<int> b;
+    b.val = 9;
+    bool result = true;
+    result &= Test("this_generic_eq",  (int)(b.me() == &b), 1);
+    result &= Test("this_generic_get", b.get(), 9);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1805,6 +1890,11 @@ extern int main()
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
     total++; passed += testImplicitStringLiteral()        ? 1 : 0;
+    total++; passed += testGenericFnAsValue()            ? 1 : 0;
+    total++; passed += testNestedGenericLocal()          ? 1 : 0;
+    total++; passed += testThisReturnsSelf()             ? 1 : 0;
+    total++; passed += testThisMemberAccess()            ? 1 : 0;
+    total++; passed += testThisInGenericMethod()         ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
