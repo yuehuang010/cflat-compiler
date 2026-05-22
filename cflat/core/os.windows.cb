@@ -98,6 +98,72 @@ if const (__PLATFORM__ == 32) {
     }
 }
 
+// Win32 Process Memory - PROCESS_MEMORY_COUNTERS (psapi.h).
+// SIZE_T fields are pointer-sized (win_usize). The first SIZE_T lands at offset 8
+// on both ABIs, so the two leading DWORDs need no trailing pad.
+// x64: 72 bytes; x86: 40 bytes.
+struct _ProcessMemoryCounters
+{
+    u32       _cb                         = default;  //  0 - cb (set to sizeof before the call)
+    u32       _pageFaultCount             = default;  //  4 - PageFaultCount
+    win_usize _peakWorkingSetSize         = default;  //  8 - PeakWorkingSetSize
+    win_usize _workingSetSize             = default;  // 16/12 - WorkingSetSize (current physical RAM)
+    win_usize _quotaPeakPagedPoolUsage    = default;
+    win_usize _quotaPagedPoolUsage        = default;
+    win_usize _quotaPeakNonPagedPoolUsage = default;
+    win_usize _quotaNonPagedPoolUsage     = default;
+    win_usize _pagefileUsage              = default;  // commit charge (private bytes)
+    win_usize _peakPagefileUsage          = default;
+};
+
+// GetCurrentProcess returns a pseudo-handle (must NOT be passed to CloseHandle).
+// K32GetProcessMemoryInfo is the kernel32-exported alias of psapi's
+// GetProcessMemoryInfo, so it resolves from kernel32.lib (already linked) with no
+// psapi.lib dependency. Available since Windows 7.
+extern stdcall void*    GetCurrentProcess();
+extern stdcall win_int  K32GetProcessMemoryInfo(void* process, _ProcessMemoryCounters* counters, u32 cb);
+
+// Fill 'out' with the calling process's memory counters. Sets the required 'cb'
+// field automatically. Returns nonzero on success (Win32 BOOL convention).
+win_int GetProcessMemoryInfo(_ProcessMemoryCounters* out)
+{
+    out->_cb = (u32)sizeof(_ProcessMemoryCounters);
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), out, out->_cb);
+}
+
+// Current working set (physical memory the process is using) in bytes; 0 on failure.
+u64 GetProcessWorkingSetBytes()
+{
+    _ProcessMemoryCounters c = default;
+    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+    return (u64)c._workingSetSize;
+}
+
+// Peak working set since process start, in bytes; 0 on failure.
+u64 GetProcessPeakWorkingSetBytes()
+{
+    _ProcessMemoryCounters c = default;
+    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+    return (u64)c._peakWorkingSetSize;
+}
+
+// Private commit charge (pagefile usage) in bytes; 0 on failure.
+u64 GetProcessPrivateBytes()
+{
+    _ProcessMemoryCounters c = default;
+    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+    return (u64)c._pagefileUsage;
+}
+
+// Value-returning wrapper: returns the calling process's memory counters by value.
+// On failure an all-zero struct is returned (_cb == 0 signals the query failed).
+_ProcessMemoryCounters GetProcessMemory()
+{
+    _ProcessMemoryCounters c = default;
+    if (GetProcessMemoryInfo(&c) == 0) { return default; }
+    return c;
+}
+
 // WIN32_FIND_DATAA - mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
 // FILETIME is two consecutive DWORDs; keeping them as i32 pairs avoids padding
 // that would appear if we used i64 (since ftCreationTime starts at byte offset 4).
