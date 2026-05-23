@@ -1,0 +1,14 @@
+// Verifies that real C source compiled by clang-cl links into a CFlat program.
+// 'extern' gives the CFlat compiler the signatures; cinterop.c (compiled by clang
+// and merged via lld) supplies the definitions.
+import "library/cinterop.c";
+
+extern int c_add(int a, int b);
+extern int c_square(int x);
+
+extern int main()
+{
+    if (c_add(40, 2) != 42) return 1;
+    if (c_square(7) != 49) return 2;
+    return 0;
+}

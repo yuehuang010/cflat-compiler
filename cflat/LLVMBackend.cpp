@@ -20,6 +20,8 @@
 #include "LLVMBackend.h"
 #include "MainListener.h"
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
 {
@@ -84,6 +86,9 @@ bool LLVMBackend::Compile(const ArgParser& args)
     bool debugInfo = args.hasFlag("debug-info");
     importSearchDir = args.getOption("import-dir").value_or("");
     auto platformOption = args.getOption("platform").value_or("win64");
+    // Captured for clang C compiles (imports run during parse, before EmitExecutable).
+    cOptLevel_ = args.getOptimizationLevel();
+    cDebugInfo_ = debugInfo;
 
     if (verbose)
     {
@@ -345,6 +350,36 @@ bool LLVMBackend::Compile(const ArgParser& args)
         }
     }
 
+    // Dispatch any extra positional .c files to clang and link their objects.
+    {
+        auto isCSource = [](const std::string& p) {
+            auto ext = std::filesystem::path(p).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            return ext == ".c";
+        };
+        bool anyCSource = false;
+        for (size_t i = 1; i < args.positionalCount(); ++i)
+            if (isCSource(*args.getPositional(i))) anyCSource = true;
+
+        if (anyCSource && !exePath)
+        {
+            std::cerr << "Error: C source input requires -o to link the resulting object.\n";
+            return false;
+        }
+        for (size_t i = 1; i < args.positionalCount(); ++i)
+        {
+            auto cPath = *args.getPositional(i);
+            if (!isCSource(cPath)) continue;
+            if (!std::filesystem::exists(cPath))
+            {
+                std::cerr << "Error: C source input '" << cPath << "' does not exist.\n";
+                return false;
+            }
+            if (!CompileCFile(cPath))
+                return false;
+        }
+    }
+
     if (exePath)
     {
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
@@ -436,6 +471,14 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
     // Register eagerly so any re-entrant or duplicate import is caught above.
     importedFiles.insert(canonicalStr);
+    // Real C source: hand off to clang-cl rather than the CFlat parser. The compiled
+    // object is linked by EmitExecutable; the importing .cb supplies the declarations.
+    {
+        auto ext = std::filesystem::path(canonicalStr).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        if (ext == ".c")
+            return CompileCFile(canonicalStr);
+    }
     importStack.push_back(canonicalStr);
     struct ImportGuard {
         std::vector<std::string>& stack;

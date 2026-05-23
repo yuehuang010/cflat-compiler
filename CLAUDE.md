@@ -60,7 +60,24 @@ x64/Debug/cflat.exe input.cb -o out.exe --out-lli out.ll
 x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll
 ```
 
-The compiler automatically locates `runtime.cb` next to the executable. Both `.cb` (CFlat) and `.c` (C-compatible) source files are accepted.
+The compiler automatically locates `runtime.cb` next to the executable. The CFlat source uses the `.cb` extension.
+
+### C interop (`.c` files compiled by clang)
+
+`.c` inputs are treated as **real C** and compiled by `clang-cl` into objects that are merged into the final image by `lld-link` (see `CompileCFile` and `EmitExecutable` in `LLVMBackend.h`). They are NOT parsed by the CFlat parser. clang-cl auto-detects the Windows SDK / MSVC, so no extra flags are needed; the importing `.cb` supplies the function signatures via `extern` declarations while the compiled object supplies the definitions.
+
+Two ways to bring a C file in (both require `-o`, since linking is what merges the object):
+
+```bash
+# As an extra positional input
+x64/Debug/cflat.exe app.cb util.c -o app.exe
+
+# Or via import from inside a .cb (resolved through the normal import search dirs)
+#   import "util.c";
+x64/Debug/cflat.exe app.cb -o app.exe
+```
+
+> Note: `.c` means real C. CFlat test fixtures that were historically given a `.c` extension now use `.cb` (e.g. `Test/test_c.cb`, `Test/library/stringlib.cb`, `Test/library/testmodule.cb`).
 
 **CLI flags** (see `ArgParser.h`):
 - `-o / --output`: Output native executable path (.exe)

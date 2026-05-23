@@ -1,4 +1,4 @@
-import "library/testmodule.c";
+import "library/testmodule.cb";
 import "test_helper.cb";
 import "list.cb";
 import "thread.cb";

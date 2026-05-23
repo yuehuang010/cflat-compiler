@@ -583,6 +583,11 @@ private:
     bool skipRuntimeImport = false;
     bool verbose = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
+    // C interop: temp .obj files produced by clang-cl from .c inputs, linked
+    // into the final image by EmitExecutable and then deleted.
+    std::vector<std::string> cObjectFiles_;
+    int cOptLevel_ = 0;        // optimization level applied to clang C compiles
+    bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
     int lambdaCounter = 0;
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
@@ -1554,6 +1559,64 @@ private:
         return true;
     }
 
+    // Compile a real C source file with clang-cl into a temporary object, recorded
+    // in cObjectFiles_ for EmitExecutable to link. clang-cl auto-detects the Windows
+    // SDK / MSVC, so no explicit include-dir discovery is needed here. Headers come
+    // from the .cb's own 'extern' declarations; this object supplies the definitions.
+    bool CompileCFile(const std::string& cSourcePath)
+    {
+        auto clangErr = llvm::sys::findProgramByName("clang-cl");
+        if (!clangErr)
+        {
+            LogError(std::format("clang-cl.exe not found - cannot compile C source '{}'.", cSourcePath));
+            return false;
+        }
+        const std::string clangPath = *clangErr;
+
+        // Temp object next to the system temp dir; removed after linking.
+        llvm::SmallString<256> objFile;
+        if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_c", "obj", objFile))
+        {
+            LogError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
+            return false;
+        }
+        std::string objPath = objFile.str().str();
+
+        const std::string target = (platformValue == 32)
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+        const std::string foArg = "/Fo" + objPath;
+
+        std::vector<std::string> argStrs = { clangPath, "/c", "/nologo", target, cSourcePath, foArg };
+        if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
+        else if (cOptLevel_ == 1) argStrs.push_back("/O1");
+        if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        if (verbose)
+        {
+            std::cout << "[verbose] compiling C source: " << cSourcePath << " -> " << objPath << "\n";
+            std::cout << "[verbose]   clang-cl";
+            for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
+            std::cout << "\n";
+        }
+
+        std::string clangCompileErr;
+        int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
+        if (rc != 0)
+        {
+            llvm::sys::fs::remove(objPath);
+            LogError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
+                cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            return false;
+        }
+
+        cObjectFiles_.push_back(objPath);
+        return true;
+    }
+
     bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false)
     {
         std::string triple;
@@ -1732,6 +1795,8 @@ private:
         linkArgStrs.push_back("kernel32.lib");
         linkArgStrs.push_back("ws2_32.lib");
         linkArgStrs.push_back(objPath);
+        // Merge any C objects compiled by clang-cl from .c inputs.
+        for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
 
         std::vector<llvm::StringRef> linkArgs;
         for (auto& s : linkArgStrs) linkArgs.push_back(s);
@@ -1741,6 +1806,7 @@ private:
         std::string linkErr;
         int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
         llvm::sys::fs::remove(objPath);
+        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
 
         if (rc != 0)
         {
