@@ -506,6 +506,6 @@
       <_VcpkgBinDir Condition="'$(Configuration)'=='Release'">$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\bin</_VcpkgBinDir>
       <_VcpkgToolsDir>$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\tools\llvm</_VcpkgToolsDir>
     </PropertyGroup>
-    <Copy SourceFiles="$(_VcpkgBinDir)\LTO.dll;$(_VcpkgBinDir)\Remarks.dll;$(_VcpkgToolsDir)\lld-link.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(_VcpkgBinDir)\LTO.dll;$(_VcpkgBinDir)\Remarks.dll;$(_VcpkgToolsDir)\lld-link.exe;$(_VcpkgToolsDir)\clang-cl.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

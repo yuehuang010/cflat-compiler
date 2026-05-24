@@ -64,7 +64,13 @@ The compiler automatically locates `runtime.cb` next to the executable. The CFla
 
 ### C interop (`.c` files compiled by clang)
 
-`.c` inputs are treated as **real C** and compiled by `clang-cl` into objects that are merged into the final image by `lld-link` (see `CompileCFile` and `EmitExecutable` in `LLVMBackend.h`). They are NOT parsed by the CFlat parser. clang-cl auto-detects the Windows SDK / MSVC, so no extra flags are needed; the importing `.cb` supplies the function signatures via `extern` declarations while the compiled object supplies the definitions.
+`.c` inputs are treated as **real C** and compiled by `clang-cl` into objects that are merged into the final image by `lld-link` (see `CompileCFile` and `EmitExecutable` in `LLVMBackend.h`). They are NOT parsed by the CFlat parser. clang-cl auto-detects the Windows SDK / MSVC, so no extra flags are needed; the compiled object supplies the definitions.
+
+**Auto-extern (no manual declarations needed)**: when a `.c` is brought in, the compiler runs clang's JSON AST dump (`ExtractCSignatures` in `LLVMBackend.h`) and auto-registers every externally-linkable function the `.c` *defines* as if you had written an `extern` for it - so `import "util.c";` works without hand-written prototypes. The signatures also feed the LSP symbol index, giving hover / completion / go-to-definition (jumps into the `.c`) for the C functions. Hand-written `extern` declarations still work and take precedence (first-writer-wins). Auto-extern covers the same scalar+pointer subset the extern ABI supports (`int`, sized ints, `float`/`double`, `bool`, pointers incl. opaque struct/`void*`); struct/union *by value* and >2 pointer levels are skipped (run with `-v` to see what was skipped). C `long` maps to 32-bit (Windows LLP64), `long long` to 64-bit.
+
+> Extraction results are cached process-wide (`cFileSigCache_`), keyed on the canonical `.c` path: the timestamp is checked first and the FNV-1a content hash only when the timestamp differs, so the LSP does not re-spawn clang on every keystroke. The clang spawn is serialized (`cClangSpawnMutex_`) and gated out of object emission in LSP mode (`symbolSink_`). LSP analysis runs on a worker pool inside `CrashRecoveryContext`; because a spawned child inherits handles, the worker's temp-file removal uses the non-throwing `std::filesystem::remove` overload and `WorkerLoop` wraps each analysis in try/catch so no analysis can take the server down. The server also clears `HANDLE_FLAG_INHERIT` on its JSON-RPC pipes (`LspServer.cpp`).
+
+**Toolchain deployment**: `clang-cl.exe` and `lld-link.exe` are copied next to `cflat.exe` by the `CopyLldDependencies` target in `cflat.vcxproj`. `FindClangCl()` prefers that deployed copy (resolved via `runtimeDir`, the exe's own directory) before falling back to `PATH`, so C interop is self-contained and needs nothing on `PATH`.
 
 Two ways to bring a C file in (both require `-o`, since linking is what merges the object):
 

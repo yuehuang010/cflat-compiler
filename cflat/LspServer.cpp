@@ -820,7 +820,21 @@ private:
                 backendInUse_[slot] = true;
             }
 
-            RunAnalysisOnSlot(slot, job);
+            // A single analysis must never take down the whole server: any C++ exception
+            // that escapes here would call std::terminate on this worker thread. Catch it,
+            // and always release the backend slot so the pool can't deadlock.
+            try
+            {
+                RunAnalysisOnSlot(slot, job);
+            }
+            catch (const std::exception& e)
+            {
+                if (verbose_) std::cerr << "[lsp] analysis threw on slot " << slot << ": " << e.what() << "\n";
+            }
+            catch (...)
+            {
+                if (verbose_) std::cerr << "[lsp] analysis threw on slot " << slot << " (unknown)\n";
+            }
 
             {
                 std::lock_guard<std::mutex> lock(backendMutex_);
@@ -902,7 +916,15 @@ private:
             backend->SetSymbolSink(nullptr);
         }
 
-        std::filesystem::remove(tempPath);
+        // Non-throwing remove: a child process spawned during analysis (clang-cl, for
+        // C-interop signature extraction) can transiently hold an inherited handle to a
+        // temp .cb, making removal fail with a sharing violation. The throwing overload
+        // would escape this worker thread and call std::terminate; tolerate the failure
+        // (the temp file lives in %TEMP% and is reaped later) instead of crashing.
+        {
+            std::error_code rmEc;
+            std::filesystem::remove(tempPath, rmEc);
+        }
 
         if (!filePath.empty())
         {
@@ -1023,6 +1045,19 @@ int RunLspServer(int argc, char* argv[])
     _setmode(protocolFd, _O_BINARY);
     _setmode(_fileno(stdin), _O_BINARY);
     std::cout.rdbuf(std::cerr.rdbuf());
+
+    // Prevent child processes (e.g. clang-cl spawned for C-interop signature extraction)
+    // from inheriting the JSON-RPC pipe handles. _dup and the CRT std fds are inheritable
+    // by default on Windows; an inherited protocol handle silently breaks the LSP channel
+    // when the child runs, taking the server down with it.
+    auto clearInherit = [](int fd)
+    {
+        intptr_t h = _get_osfhandle(fd);
+        if (h != -1) SetHandleInformation((HANDLE)h, HANDLE_FLAG_INHERIT, 0);
+    };
+    clearInherit(protocolFd);
+    clearInherit(_fileno(stdin));
+    clearInherit(_fileno(stdout));
 
     llvm::CrashRecoveryContext::Enable();
 

@@ -25,6 +25,8 @@
 #include <format>
 #include <unordered_set>
 #include <cstdlib>
+#include <filesystem>
+#include <mutex>
 #include <io.h>
 
 #pragma warning(push)
@@ -39,6 +41,7 @@
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <llvm\Support\FileSystem.h>
 #include <llvm\Support\MemoryBuffer.h>
+#include <llvm\Support\JSON.h>
 #include <llvm\Support\Path.h>
 #include <llvm\Support\Program.h>
 #include <llvm\Support\TargetSelect.h>
@@ -588,6 +591,35 @@ private:
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
+
+    // Cache of C function signatures extracted from a .c via clang's AST dump, so the
+    // (slow) clang spawn is skipped when the file is unchanged - important for LSP,
+    // which re-analyzes the importing .cb on every debounced edit. Process-global and
+    // mutex-guarded: the LSP runs analyses concurrently on a pool of backends, and a
+    // document is not pinned to a slot, so a per-instance cache would miss across slots.
+    // Entries hold only plain data (no LLVM/context-bound objects), so sharing is safe.
+    struct CSigEntry
+    {
+        std::string name;
+        TypeAndValue ret;
+        std::vector<TypeAndValue> params;
+        bool variadic = false;
+        int line = 1;
+        int col = 0;
+    };
+    struct CFileSigCacheEntry
+    {
+        std::filesystem::file_time_type mtime{};
+        uint64_t hash = 0;
+        std::vector<CSigEntry> sigs;
+    };
+    static inline std::mutex cFileSigCacheMutex_;
+    static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;  // key: canonical .c path
+    // Serializes clang-cl subprocess spawns. The LSP analyzes on a pool of worker
+    // threads; concurrent llvm::sys::ExecuteAndWait calls (CreateProcess with
+    // handle-inheriting redirects) race and crash the process on Windows. Spawns are
+    // rare (cache absorbs the rest), so a process-wide lock costs effectively nothing.
+    static inline std::mutex cClangSpawnMutex_;
     int lambdaCounter = 0;
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
@@ -1559,19 +1591,46 @@ private:
         return true;
     }
 
+    // Resolve clang-cl.exe, preferring the copy deployed next to cflat.exe (runtimeDir)
+    // over whatever may be on PATH - this keeps the toolchain self-contained and mirrors
+    // how lld-link is located. Returns "" if not found anywhere.
+    std::string FindClangCl() const
+    {
+        if (!runtimeDir.empty())
+        {
+            llvm::SmallString<256> candidate(runtimeDir);
+            llvm::sys::path::append(candidate, "clang-cl.exe");
+            if (llvm::sys::fs::exists(candidate))
+                return candidate.str().str();
+        }
+        if (auto p = llvm::sys::findProgramByName("clang-cl"))
+            return *p;
+        return "";
+    }
+
     // Compile a real C source file with clang-cl into a temporary object, recorded
     // in cObjectFiles_ for EmitExecutable to link. clang-cl auto-detects the Windows
     // SDK / MSVC, so no explicit include-dir discovery is needed here. Headers come
     // from the .cb's own 'extern' declarations; this object supplies the definitions.
     bool CompileCFile(const std::string& cSourcePath)
     {
-        auto clangErr = llvm::sys::findProgramByName("clang-cl");
-        if (!clangErr)
+        // Auto-discover the C function signatures so the importing .cb does not need
+        // hand-written 'extern' declarations. Best-effort: a failure here just falls
+        // back to the old behaviour (caller must declare the functions manually).
+        ExtractCSignatures(cSourcePath);
+
+        // In LSP / analysis mode we only need the signatures (already extracted above)
+        // for hover, completion and go-to-definition - not a linkable object file.
+        // symbolSink_ is set only by the LSP server, so it is a reliable mode flag.
+        if (symbolSink_ != nullptr)
+            return true;
+
+        const std::string clangPath = FindClangCl();
+        if (clangPath.empty())
         {
             LogError(std::format("clang-cl.exe not found - cannot compile C source '{}'.", cSourcePath));
             return false;
         }
-        const std::string clangPath = *clangErr;
 
         // Temp object next to the system temp dir; removed after linking.
         llvm::SmallString<256> objFile;
@@ -1614,6 +1673,379 @@ private:
         }
 
         cObjectFiles_.push_back(objPath);
+        return true;
+    }
+
+    // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
+    // Returns false for anything the extern ABI cannot faithfully pass - struct/union
+    // by value, > 2 pointer levels, or an unknown scalar - so the caller can skip the
+    // whole function rather than emit a wrong signature. This intentionally mirrors the
+    // scalar+pointer subset that GetCCompatibleType already supports for hand-written
+    // extern declarations.
+    bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out)
+    {
+        // Arrays decay to a pointer; drop the '[...]' and bump the pointer level.
+        int ptr = 0;
+        if (auto br = ctype.find('['); br != std::string::npos)
+        {
+            ptr++;
+            ctype = ctype.substr(0, br);
+        }
+        ptr += (int)std::count(ctype.begin(), ctype.end(), '*');
+        ctype.erase(std::remove(ctype.begin(), ctype.end(), '*'), ctype.end());
+
+        // Strip cv / nullability qualifiers - they do not affect the ABI here.
+        auto stripWord = [&](const char* w)
+        {
+            std::string word = w;
+            for (size_t pos; (pos = ctype.find(word)) != std::string::npos; )
+                ctype.erase(pos, word.size());
+        };
+        for (const char* q : { "const", "volatile", "restrict", "__restrict", "__restrict__",
+                               "_Nonnull", "_Nullable", "_Null_unspecified" })
+            stripWord(q);
+
+        // Collapse runs of whitespace and trim - so "unsigned   long  long" normalizes.
+        std::string base;
+        bool prevSpace = true; // leading -> skip
+        for (char c : ctype)
+        {
+            bool isSpace = (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+            if (isSpace) { if (!prevSpace) base += ' '; prevSpace = true; }
+            else { base += c; prevSpace = false; }
+        }
+        while (!base.empty() && base.back() == ' ') base.pop_back();
+
+        if (ptr > 2)
+            return false;
+
+        // enum decays to int; struct/union pointers become opaque void* (the call only
+        // needs a pointer-sized slot). A struct/union *by value* falls through to false.
+        std::string mapped;
+        if (base.rfind("enum ", 0) == 0)
+        {
+            mapped = "int";
+        }
+        else
+        {
+            static const std::unordered_map<std::string, std::string> scalarMap = {
+                { "void", "void" }, { "_Bool", "bool" }, { "bool", "bool" },
+                { "char", "char" }, { "signed char", "i8" }, { "unsigned char", "u8" },
+                { "short", "short" }, { "short int", "short" }, { "signed short", "short" },
+                { "unsigned short", "u16" }, { "unsigned short int", "u16" },
+                { "int", "int" }, { "signed", "int" }, { "signed int", "int" },
+                { "unsigned", "u32" }, { "unsigned int", "u32" },
+                // Windows is LLP64: 'long' is 32-bit, 'long long' is 64-bit.
+                { "long", "i32" }, { "long int", "i32" }, { "signed long", "i32" },
+                { "unsigned long", "u32" }, { "unsigned long int", "u32" },
+                { "long long", "i64" }, { "long long int", "i64" }, { "signed long long", "i64" },
+                { "unsigned long long", "u64" }, { "unsigned long long int", "u64" },
+                { "float", "float" }, { "double", "double" }, { "long double", "double" },
+            };
+            auto it = scalarMap.find(base);
+            if (it != scalarMap.end())
+                mapped = it->second;
+            else if (ptr > 0)
+                mapped = "void"; // unknown pointee (struct*, function ptr, ...) -> opaque ptr
+            else
+                return false;    // struct/union by value or unknown scalar
+        }
+
+        out.TypeName = mapped;
+        out.Pointer = ptr >= 1;
+        out.ElemPointer = ptr == 2;
+        return true;
+    }
+
+    // FNV-1a 64-bit hash of a file's bytes. Returns false if the file can't be read.
+    bool HashFileContents(const std::string& path, uint64_t& outHash) const
+    {
+        auto bufOrErr = llvm::MemoryBuffer::getFile(path);
+        if (!bufOrErr) return false;
+        uint64_t h = 1469598103934665603ULL; // FNV offset basis
+        for (unsigned char c : (*bufOrErr)->getBuffer())
+        {
+            h ^= c;
+            h *= 1099511628211ULL; // FNV prime
+        }
+        outHash = h;
+        return true;
+    }
+
+    // Register a set of extracted C signatures into the function table (as unmangled,
+    // C-compatible externs) and into the LSP symbol sink. Shared by the cache-hit and
+    // cache-miss paths so both behave identically.
+    void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp)
+    {
+        for (const CSigEntry& e : sigs)
+        {
+            // external=true: unmangled name + C-compatible types; cdecl on the call.
+            CreateFunctionDeclaration(e.name, e.ret, e.params, /*external=*/true, e.variadic,
+                                      /*returnsOwned=*/false, /*isMethod=*/false,
+                                      /*isStdcall=*/false, /*isCdecl=*/true);
+
+            if (auto* s = GetSymbolSink())
+            {
+                std::string sig = e.ret.TypeName + (e.ret.Pointer ? "*" : "") + " " + e.name + "(";
+                bool first = true;
+                for (const auto& p : e.params)
+                {
+                    if (!first) sig += ", ";
+                    first = false;
+                    sig += p.TypeName;
+                    if (p.Pointer) sig += "*";
+                    if (!p.VariableName.empty()) sig += " " + p.VariableName;
+                }
+                sig += ")";
+                s->Register(SymbolKind::Function, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col, sig);
+            }
+        }
+
+        if (verbose)
+            std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
+    }
+
+    // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
+    // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
+    bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
+                            std::vector<CSigEntry>& outSigs)
+    {
+        const std::string target = (platformValue == 32)
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+
+        llvm::SmallString<256> inFile, jsonFile, errFile;
+        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "in",  inFile))  return false;
+        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "json", jsonFile))
+        {
+            llvm::sys::fs::remove(inFile);
+            return false;
+        }
+        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "err", errFile))
+        {
+            llvm::sys::fs::remove(inFile);
+            llvm::sys::fs::remove(jsonFile);
+            return false;
+        }
+        const std::string inPath   = inFile.str().str();
+        const std::string jsonPath = jsonFile.str().str();
+        const std::string errPath  = errFile.str().str();
+        struct TmpRemover {
+            std::string a, b, c;
+            ~TmpRemover() { llvm::sys::fs::remove(a); llvm::sys::fs::remove(b); llvm::sys::fs::remove(c); }
+        } tmpRemover{ inPath, jsonPath, errPath };
+
+        std::vector<std::string> argStrs = {
+            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json",
+            "-fsyntax-only", cSourcePath
+        };
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        // Redirect ALL THREE std streams to dedicated files (stdin from an empty temp).
+        // In LSP mode the server's std handles are the JSON-RPC pipes; if the spawned
+        // child references any of them (which happens with STARTF_USESTDHANDLES when a
+        // redirect is left inherited), the protocol channel breaks and the server dies.
+        // stdin <- empty temp; stdout -> json; stderr -> discarded temp.
+        std::optional<llvm::StringRef> redirects[3] = {
+            llvm::StringRef(inPath), llvm::StringRef(jsonPath), llvm::StringRef(errPath)
+        };
+
+        if (verbose)
+            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (clang AST dump)\n";
+
+        std::string execErr;
+        int rc;
+        {
+            // Serialize the actual spawn: concurrent CreateProcess-with-redirects calls
+            // race on Windows and crash the LSP's worker pool.
+            std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
+            rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, redirects, 0, 0, &execErr);
+        }
+        if (rc != 0)
+        {
+            if (verbose) std::cout << "[verbose]   AST dump failed (exit " << rc << "); skipping auto-extern\n";
+            return false;
+        }
+
+        auto bufOrErr = llvm::MemoryBuffer::getFile(jsonPath);
+        if (!bufOrErr) return false;
+
+        llvm::Expected<llvm::json::Value> root = llvm::json::parse((*bufOrErr)->getBuffer());
+        if (!root) { llvm::consumeError(root.takeError()); return false; }
+
+        const llvm::json::Object* tu = root->getAsObject();
+        if (!tu) return false;
+        const llvm::json::Array* topLevel = tu->getArray("inner");
+        if (!topLevel) return true; // parsed fine, nothing to register
+
+        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string
+        {
+            if (!typeObj) return "";
+            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
+            if (auto q = typeObj->getString("qualType")) return q->str();
+            return "";
+        };
+
+        for (const llvm::json::Value& v : *topLevel)
+        {
+            const llvm::json::Object* node = v.getAsObject();
+            if (!node) continue;
+            auto kind = node->getString("kind");
+            if (!kind || *kind != "FunctionDecl") continue;
+
+            // static functions are not externally linkable - skip.
+            if (auto sc = node->getString("storageClass"); sc && *sc == "static") continue;
+
+            const llvm::json::Array* fnInner = node->getArray("inner");
+
+            // Only functions *defined* in this translation unit end up as object
+            // symbols we can link. A body means a CompoundStmt child; header-only
+            // prototypes (e.g. from <stdio.h>) have none and are skipped.
+            bool hasBody = false;
+            if (fnInner)
+                for (const auto& c : *fnInner)
+                    if (auto* co = c.getAsObject())
+                        if (auto ck = co->getString("kind"); ck && *ck == "CompoundStmt")
+                        { hasBody = true; break; }
+            if (!hasBody) continue;
+
+            auto nm = node->getString("name");
+            if (!nm || nm->empty()) continue;
+
+            CSigEntry entry;
+            entry.name = nm->str();
+
+            std::string funcQual = qualTypeOf(node->getObject("type"));
+            entry.variadic = funcQual.find("...") != std::string::npos;
+
+            // Return type = the spelling before the parameter list's '('.
+            std::string retStr = funcQual;
+            if (auto paren = funcQual.find('('); paren != std::string::npos)
+                retStr = funcQual.substr(0, paren);
+
+            if (!MapCTypeToTypeAndValue(retStr, entry.ret))
+            {
+                if (verbose) std::cout << "[verbose]   skipping '" << entry.name
+                                       << "': unsupported return type '" << retStr << "'\n";
+                continue;
+            }
+
+            bool paramsOk = true;
+            if (fnInner)
+            {
+                for (const auto& c : *fnInner)
+                {
+                    const llvm::json::Object* co = c.getAsObject();
+                    if (!co) continue;
+                    auto ck = co->getString("kind");
+                    if (!ck || *ck != "ParmVarDecl") continue;
+
+                    TypeAndValue ptv;
+                    std::string pQual = qualTypeOf(co->getObject("type"));
+                    if (!MapCTypeToTypeAndValue(pQual, ptv))
+                    {
+                        if (verbose) std::cout << "[verbose]   skipping '" << entry.name
+                                               << "': unsupported parameter type '" << pQual << "'\n";
+                        paramsOk = false;
+                        break;
+                    }
+                    if (auto pn = co->getString("name")) ptv.VariableName = pn->str();
+                    entry.params.push_back(ptv);
+                }
+            }
+            if (!paramsOk) continue;
+
+            if (auto* loc = node->getObject("loc"))
+            {
+                if (auto l = loc->getInteger("line")) entry.line = (int)*l;
+                if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
+            }
+
+            outSigs.push_back(std::move(entry));
+        }
+
+        return true;
+    }
+
+    // Auto-discover C function signatures so `import "foo.c";` needs no hand-written
+    // 'extern'. Results are cached per .c file: the (slow) clang AST dump is skipped
+    // when the file is unchanged - the timestamp is checked first, and the content hash
+    // is consulted only when the timestamp differs (e.g. touch / checkout with no real
+    // change). Feeds both the function table and the LSP symbol sink.
+    bool ExtractCSignatures(const std::string& cSourcePath)
+    {
+        // Canonical path: stable cache key + the real .c for LSP go-to-definition.
+        llvm::SmallString<256> realPath;
+        std::string fileForLsp = cSourcePath;
+        if (!llvm::sys::fs::real_path(cSourcePath, realPath))
+            fileForLsp = realPath.str().str();
+
+        // Hash the file at most once per call, and only when actually needed.
+        uint64_t currentHash = 0;
+        bool haveHash = false;
+        auto hashNow = [&]() -> uint64_t
+        {
+            if (!haveHash) { HashFileContents(fileForLsp, currentHash); haveHash = true; }
+            return currentHash;
+        };
+
+        std::error_code mtEc;
+        auto currentMtime = std::filesystem::last_write_time(fileForLsp, mtEc);
+
+        // --- Cache lookup under lock. Copy the signatures out, then register after the
+        //     lock is released, so the global cache never serializes per-backend work. ---
+        std::vector<CSigEntry> hitSigs;
+        bool hit = false;
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto cacheIt = cFileSigCache_.find(fileForLsp);
+            if (!mtEc && cacheIt != cFileSigCache_.end())
+            {
+                CFileSigCacheEntry& entry = cacheIt->second;
+                if (entry.mtime == currentMtime)
+                {
+                    if (verbose) std::cout << "[verbose] C signatures cache hit (mtime) for " << fileForLsp << "\n";
+                    hitSigs = entry.sigs;
+                    hit = true;
+                }
+                // Timestamp moved but content may be identical - only now pay for a hash.
+                else if (hashNow() == entry.hash)
+                {
+                    if (verbose) std::cout << "[verbose] C signatures cache hit (hash) for " << fileForLsp << "\n";
+                    entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
+                    hitSigs = entry.sigs;
+                    hit = true;
+                }
+            }
+        }
+        if (hit)
+        {
+            RegisterCSignatures(hitSigs, fileForLsp);
+            return true;
+        }
+
+        // Cache miss - run clang and parse (outside the lock; concurrent first-time
+        // misses for the same file just redo the work harmlessly, last writer wins).
+        const std::string clangPath = FindClangCl();
+        if (clangPath.empty())
+            return false;
+
+        std::vector<CSigEntry> sigs;
+        if (!RunClangAstExtract(clangPath, cSourcePath, sigs))
+            return false;
+
+        if (!mtEc)
+        {
+            CFileSigCacheEntry entry;
+            entry.mtime = currentMtime;
+            entry.hash  = hashNow();
+            entry.sigs  = sigs;
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            cFileSigCache_[fileForLsp] = std::move(entry);
+        }
+
+        RegisterCSignatures(sigs, fileForLsp);
         return true;
     }
 
@@ -1676,13 +2108,13 @@ private:
         dest.flush();
         dest.close();
 
-        // ---- Find lld-link (prefer vcpkg tools next to clang) ----
+        // ---- Find lld-link (prefer the copy next to clang-cl, i.e. next to cflat.exe) ----
         std::string lldLinkPath;
         {
-            auto clangErr = llvm::sys::findProgramByName("clang-cl");
-            if (clangErr)
+            std::string clangPath = FindClangCl();
+            if (!clangPath.empty())
             {
-                llvm::SmallString<256> candidate(llvm::sys::path::parent_path(*clangErr));
+                llvm::SmallString<256> candidate(llvm::sys::path::parent_path(clangPath));
                 llvm::sys::path::append(candidate, "lld-link.exe");
                 if (llvm::sys::fs::exists(candidate))
                     lldLinkPath = candidate.str().str();
