@@ -1612,12 +1612,14 @@ private:
     // in cObjectFiles_ for EmitExecutable to link. clang-cl auto-detects the Windows
     // SDK / MSVC, so no explicit include-dir discovery is needed here. Headers come
     // from the .cb's own 'extern' declarations; this object supplies the definitions.
-    bool CompileCFile(const std::string& cSourcePath)
+    bool CompileCFile(const std::string& cSourcePath, const std::string& programAlias = "")
     {
         // Auto-discover the C function signatures so the importing .cb does not need
         // hand-written 'extern' declarations. Best-effort: a failure here just falls
         // back to the old behaviour (caller must declare the functions manually).
-        ExtractCSignatures(cSourcePath);
+        // When programAlias is set ('import program "x.c" as Alias'), the C `main` is
+        // registered as `__imported_main_<Alias>` and wired into programTable here.
+        ExtractCSignatures(cSourcePath, programAlias);
 
         // In LSP / analysis mode we only need the signatures (already extracted above)
         // for hover, completion and go-to-definition - not a linkable object file.
@@ -1650,6 +1652,11 @@ private:
         if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
         else if (cOptLevel_ == 1) argStrs.push_back("/O1");
         if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
+        // For an imported program, rename the object's `main` symbol so it matches the
+        // `__imported_main_<Alias>` declaration (above) and does not collide with the
+        // CFlat program's own entry `main` at link time.
+        if (!programAlias.empty())
+            argStrs.push_back("/Dmain=__imported_main_" + programAlias);
 
         std::vector<llvm::StringRef> args;
         for (auto& s : argStrs) args.push_back(s);
@@ -1775,14 +1782,31 @@ private:
     // Register a set of extracted C signatures into the function table (as unmangled,
     // C-compatible externs) and into the LSP symbol sink. Shared by the cache-hit and
     // cache-miss paths so both behave identically.
-    void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp)
+    // programAlias non-empty: this .c is being brought in via `import program "x.c" as Alias`.
+    // The C `main` is registered under `__imported_main_<Alias>` (matching the renamed object
+    // symbol from CompileCFile's /Dmain define) and wired into programTable so the imported-
+    // program synthesis (struct + run wrapper) treats it exactly like a .cb imported program.
+    void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
+                             const std::string& programAlias = "")
     {
         for (const CSigEntry& e : sigs)
         {
+            std::string regName  = e.name;
+            bool        isProgMain = (!programAlias.empty() && e.name == "main");
+            if (isProgMain)
+                regName = "__imported_main_" + programAlias;
+
             // external=true: unmangled name + C-compatible types; cdecl on the call.
-            CreateFunctionDeclaration(e.name, e.ret, e.params, /*external=*/true, e.variadic,
+            CreateFunctionDeclaration(regName, e.ret, e.params, /*external=*/true, e.variadic,
                                       /*returnsOwned=*/false, /*isMethod=*/false,
                                       /*isStdcall=*/false, /*isCdecl=*/true);
+
+            if (isProgMain)
+            {
+                programTable[programAlias].MainFunction     = module->getFunction(regName);
+                programTable[programAlias].IsImportedProgram = true;
+                continue; // not a user-facing symbol; skip the LSP sink registration below
+            }
 
             if (auto* s = GetSymbolSink())
             {
@@ -1973,7 +1997,7 @@ private:
     // when the file is unchanged - the timestamp is checked first, and the content hash
     // is consulted only when the timestamp differs (e.g. touch / checkout with no real
     // change). Feeds both the function table and the LSP symbol sink.
-    bool ExtractCSignatures(const std::string& cSourcePath)
+    bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "")
     {
         // Canonical path: stable cache key + the real .c for LSP go-to-definition.
         llvm::SmallString<256> realPath;
@@ -2021,7 +2045,7 @@ private:
         }
         if (hit)
         {
-            RegisterCSignatures(hitSigs, fileForLsp);
+            RegisterCSignatures(hitSigs, fileForLsp, programAlias);
             return true;
         }
 
@@ -2045,7 +2069,7 @@ private:
             cFileSigCache_[fileForLsp] = std::move(entry);
         }
 
-        RegisterCSignatures(sigs, fileForLsp);
+        RegisterCSignatures(sigs, fileForLsp, programAlias);
         return true;
     }
 
@@ -6580,7 +6604,7 @@ public:
                            const std::vector<std::string>& sourceLines);
 
     bool Compile(const ArgParser& args);
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {});
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {});
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 };

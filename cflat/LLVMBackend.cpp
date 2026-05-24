@@ -228,23 +228,39 @@ bool LLVMBackend::Compile(const ArgParser& args)
                         std::string raw = imp->StringLiteral()->getText();
                         std::string importFilename = raw.substr(1, raw.size() - 2);
                         std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                        bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
+                        std::string alias = isProgram ? imp->Identifier()->getText() : "";
+                        std::string impExt = std::filesystem::path(importFilename).extension().string();
+                        std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                        bool isCProgram = isProgram && impExt == ".c";
                         if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << "\n";
-                        if (!CompileImportedFile(filename, importFilename, ns))
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : ""))
                             return false;
 
-                        // For 'import program "file.cb" as Name', rename @main to __imported_main_Name
-                        if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+                        if (isProgram)
                         {
-                            std::string alias = imp->Identifier()->getText();
-                            auto* mainFn = module->getFunction("main");
-                            if (!mainFn)
+                            if (isCProgram)
                             {
-                                LogError(std::format("import program '{}': '{}' has no 'main' function", alias, importFilename));
-                                return false;
+                                // CompileCFile already created __imported_main_<alias> and set programTable.
+                                if (!programTable[alias].MainFunction)
+                                {
+                                    LogError(std::format("import program '{}': C file '{}' has no externally-linkable 'main'", alias, importFilename));
+                                    return false;
+                                }
                             }
-                            mainFn->setName("__imported_main_" + alias);
-                            programTable[alias].IsImportedProgram = true;
-                            programTable[alias].MainFunction = mainFn;
+                            else
+                            {
+                                // For 'import program "file.cb" as Name', rename @main to __imported_main_Name
+                                auto* mainFn = module->getFunction("main");
+                                if (!mainFn)
+                                {
+                                    LogError(std::format("import program '{}': '{}' has no 'main' function", alias, importFilename));
+                                    return false;
+                                }
+                                mainFn->setName("__imported_main_" + alias);
+                                programTable[alias].IsImportedProgram = true;
+                                programTable[alias].MainFunction = mainFn;
+                            }
                         }
                     }
                 }
@@ -394,7 +410,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     return true;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -477,7 +493,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         auto ext = std::filesystem::path(canonicalStr).extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
         if (ext == ".c")
-            return CompileCFile(canonicalStr);
+            return CompileCFile(canonicalStr, programAlias);
     }
     importStack.push_back(canonicalStr);
     struct ImportGuard {
@@ -755,15 +771,20 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string raw = imp->StringLiteral()->getText();
                     std::string importFilename = raw.substr(1, raw.size() - 2);
                     std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
-                    if (!CompileImportedFile(filePath, importFilename, ns))
+                    bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
+                    std::string alias = isProgram && imp->Identifier() ? imp->Identifier()->getText() : "";
+                    std::string impExt = std::filesystem::path(importFilename).extension().string();
+                    std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                    bool isCProgram = isProgram && impExt == ".c";
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : ""))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:
                     // rename the imported 'main' so the EmitProgramRunWrapper helper
                     // path can find it under programTable[alias].MainFunction.
-                    if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
+                    // (.c programs are wired up inside CompileCFile/RegisterCSignatures.)
+                    if (isProgram && !isCProgram)
                     {
-                        std::string alias = imp->Identifier() ? imp->Identifier()->getText() : "";
                         if (auto* mainFn = module->getFunction("main"))
                         {
                             mainFn->setName("__imported_main_" + alias);

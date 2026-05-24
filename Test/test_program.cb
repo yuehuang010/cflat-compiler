@@ -4,6 +4,7 @@ import "filesystem.cb";
 import "malloc_allocator.cb";
 import "test_helper.cb";
 import program "library/hello_imported.cb" as Hello;
+import program "library/hello_c_program.c" as HelloC;
 
 // ---------------------------------------------------------------------------
 // Program definitions
@@ -1058,6 +1059,33 @@ bool testImportedProgram() {
     return ok;
 }
 
+// Same as testImportedProgram, but the imported program is a real C file
+// (compiled by clang-cl, linked by lld-link). Verifies that 'import program "x.c"'
+// wires the C main into the program runtime just like a .cb main.
+bool testImportedCProgram() {
+    bool ok = true;
+
+    // Empty args -> argc = 0
+    HelloC h0;
+    list<string> empty;
+    h0.run(empty);
+    h0.WaitForExit();
+    ok &= Test("imported C program empty args", h0.exitCode, 0);
+
+    // Two args -> argc = 2
+    HelloC h2;
+    list<string> twoArgs;
+    string s1 = "" + "hello";
+    string s2 = "" + "world";
+    twoArgs.add(s1);
+    twoArgs.add(s2);
+    h2.run(twoArgs);
+    h2.WaitForExit();
+    ok &= Test("imported C program two args", h2.exitCode, 2);
+
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1107,6 +1135,7 @@ extern int main() {
     total++; passed += testNoArgsMain()                  ? 1 : 0;
     total++; passed += testArgcArgvMain()                ? 1 : 0;
     total++; passed += testImportedProgram()             ? 1 : 0;
+    total++; passed += testImportedCProgram()            ? 1 : 0;
     total++; passed += testChildThreadInheritsAllocator() ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
