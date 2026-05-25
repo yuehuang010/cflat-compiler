@@ -2113,7 +2113,21 @@ public:
                 std::string raw = imp->StringLiteral()->getText();
                 std::string importFilename = raw.substr(1, raw.size() - 2);
                 std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
-                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns);
+                std::string explicitLib;
+                if (auto* lc = imp->libClause())
+                    if (lc->StringLiteral())
+                    {
+                        std::string lr = lc->StringLiteral()->getText();
+                        if (lr.size() >= 2) explicitLib = lr.substr(1, lr.size() - 2);
+                    }
+                std::vector<std::string> extraDefines;
+                for (auto* dc : imp->defineClause())
+                    if (dc->StringLiteral())
+                    {
+                        std::string dr = dc->StringLiteral()->getText();
+                        if (dr.size() >= 2) extraDefines.push_back(dr.substr(1, dr.size() - 2));
+                    }
+                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "", explicitLib, extraDefines);
             }
         }
 

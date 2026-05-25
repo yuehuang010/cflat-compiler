@@ -22,6 +22,13 @@ public:
 			m_optionValues[name] = defaultValue;
 	}
 
+	// Register a repeatable option that takes a value and may appear multiple times
+	// (e.g. --c-include a --c-include b). Each occurrence is appended.
+	void addMultiOption(const std::string& name, char shortName, const std::string& description)
+	{
+		m_multiOptions.push_back({ name, shortName, description, "" });
+	}
+
 	// Register a named positional argument (for usage display only)
 	void addPositional(const std::string& name, const std::string& description)
 	{
@@ -63,6 +70,15 @@ public:
 					}
 					m_optionValues[name] = argv[++i];
 				}
+				else if (isMultiOption(name))
+				{
+					if (i + 1 >= argc)
+					{
+						std::cerr << "Error: --" << name << " requires a value.\n";
+						return false;
+					}
+					m_multiOptionValues[name].push_back(argv[++i]);
+				}
 				else
 				{
 					std::cerr << "Error: unknown argument '--" << name << "'.\n";
@@ -92,6 +108,15 @@ public:
 							return false;
 						}
 						m_optionValues[name] = argv[++i];
+					}
+					else if (isMultiOption(name))
+					{
+						if (i + 1 >= argc)
+						{
+							std::cerr << "Error: -" << s << " requires a value.\n";
+							return false;
+						}
+						m_multiOptionValues[name].push_back(argv[++i]);
 					}
 				}
 				else
@@ -133,6 +158,15 @@ public:
 		return std::nullopt;
 	}
 
+	// Return all values supplied for a repeatable option (empty if none).
+	std::vector<std::string> getMultiOption(const std::string& name) const
+	{
+		auto it = m_multiOptionValues.find(name);
+		if (it != m_multiOptionValues.end())
+			return it->second;
+		return {};
+	}
+
 	std::optional<std::string> getPositional(size_t index) const
 	{
 		if (index < m_positionalValues.size())
@@ -154,7 +188,7 @@ public:
 		std::cout << "Usage: " << m_program;
 		for (const auto& p : m_positionals)
 			std::cout << " <" << p.name << ">";
-		if (!m_flags.empty() || !m_options.empty())
+		if (!m_flags.empty() || !m_options.empty() || !m_multiOptions.empty())
 			std::cout << " [options]";
 		std::cout << "\n";
 
@@ -165,7 +199,7 @@ public:
 				std::cout << "  " << p.name << "\t\t" << p.description << "\n";
 		}
 
-		if (!m_flags.empty() || !m_options.empty())
+		if (!m_flags.empty() || !m_options.empty() || !m_multiOptions.empty())
 		{
 			std::cout << "\nOptions:\n";
 			std::cout << "  -h, --help\t\tShow this help message\n";
@@ -178,6 +212,8 @@ public:
 					std::cout << " (default: " << o.defaultValue << ")";
 				std::cout << "\n";
 			}
+			for (const auto& o : m_multiOptions)
+				std::cout << "  -" << o.shortName << ", --" << o.name << " <value>\t" << o.description << " (repeatable)\n";
 		}
 	}
 
@@ -188,11 +224,13 @@ private:
 
 	std::vector<FlagDef>        m_flags;
 	std::vector<OptionDef>      m_options;
+	std::vector<OptionDef>      m_multiOptions;
 	std::vector<PositionalDef>  m_positionals;
 
-	std::unordered_map<std::string, bool>        m_flagValues;
-	std::unordered_map<std::string, std::string> m_optionValues;
-	std::vector<std::string>                     m_positionalValues;
+	std::unordered_map<std::string, bool>                     m_flagValues;
+	std::unordered_map<std::string, std::string>              m_optionValues;
+	std::unordered_map<std::string, std::vector<std::string>> m_multiOptionValues;
+	std::vector<std::string>                                  m_positionalValues;
 	std::string                                  m_program;
 	bool                                         m_showVersion = false;
 
@@ -210,11 +248,20 @@ private:
 		return false;
 	}
 
+	bool isMultiOption(const std::string& name) const
+	{
+		for (const auto& o : m_multiOptions)
+			if (o.name == name) return true;
+		return false;
+	}
+
 	std::string resolveShort(char s) const
 	{
 		for (const auto& f : m_flags)
 			if (f.shortName == s) return f.name;
 		for (const auto& o : m_options)
+			if (o.shortName == s) return o.name;
+		for (const auto& o : m_multiOptions)
 			if (o.shortName == s) return o.name;
 		return "";
 	}

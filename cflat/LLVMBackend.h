@@ -591,6 +591,15 @@ private:
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
+    // C interop (prebuilt libraries): header search dirs (--c-include) used when
+    // AST-dumping a bound header, and import libraries (--c-lib) added to the
+    // lld-link line by EmitExecutable. A sibling runtime DLL of each lib is copied
+    // next to the output exe after a successful link.
+    std::vector<std::string> cIncludeDirs_;
+    std::vector<std::string> cLinkLibs_;
+    // Preprocessor defines (--c-define) passed as /D to every clang-cl invocation:
+    // the .c object compile, the .c auto-extern AST dump, and the header AST dump.
+    std::vector<std::string> cDefines_;
 
     // Cache of C function signatures extracted from a .c via clang's AST dump, so the
     // (slow) clang spawn is skipped when the file is unchanged - important for LSP,
@@ -607,14 +616,25 @@ private:
         int line = 1;
         int col = 0;
     };
+    // A C enum constant extracted from a bound header (registered as a bare global int).
+    struct CEnumEntry
+    {
+        std::string name;
+        long long value = 0;
+        int line = 1;
+        int col = 0;
+    };
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
         uint64_t hash = 0;
         std::vector<CSigEntry> sigs;
+        std::vector<CEnumEntry> enums;
     };
     static inline std::mutex cFileSigCacheMutex_;
-    static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;  // key: canonical .c path
+    // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
+    // same header under different --c-include roots does not collide.
+    static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;
     // Serializes clang-cl subprocess spawns. The LSP analyzes on a pool of worker
     // threads; concurrent llvm::sys::ExecuteAndWait calls (CreateProcess with
     // handle-inheriting redirects) race and crash the process on Windows. Spawns are
@@ -1652,6 +1672,7 @@ private:
         if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
         else if (cOptLevel_ == 1) argStrs.push_back("/O1");
         if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
+        for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
         // For an imported program, rename the object's `main` symbol so it matches the
         // `__imported_main_<Alias>` declaration (above) and does not collide with the
         // CFlat program's own entry `main` at link time.
@@ -1829,15 +1850,14 @@ private:
             std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
     }
 
-    // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
-    // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
-    bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
-                            std::vector<CSigEntry>& outSigs)
+    // Spawn a clang JSON AST dump (argStrs[0] is the clang path) and return stdout as a
+    // string. All three std streams are redirected to temp files (stdin from an empty
+    // temp) so a spawned child never references the LSP server's JSON-RPC pipes - leaving
+    // a redirect inherited (STARTF_USESTDHANDLES) breaks the protocol channel and kills
+    // the server. The spawn is serialized because concurrent CreateProcess-with-redirects
+    // calls race on Windows and crash the LSP worker pool.
+    bool SpawnClangJson(const std::vector<std::string>& argStrs, std::string& outJson)
     {
-        const std::string target = (platformValue == 32)
-            ? "--target=i686-pc-windows-msvc"
-            : "--target=x86_64-pc-windows-msvc";
-
         llvm::SmallString<256> inFile, jsonFile, errFile;
         if (llvm::sys::fs::createTemporaryFile("cflat_ast", "in",  inFile))  return false;
         if (llvm::sys::fs::createTemporaryFile("cflat_ast", "json", jsonFile))
@@ -1859,43 +1879,55 @@ private:
             ~TmpRemover() { llvm::sys::fs::remove(a); llvm::sys::fs::remove(b); llvm::sys::fs::remove(c); }
         } tmpRemover{ inPath, jsonPath, errPath };
 
-        std::vector<std::string> argStrs = {
-            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json",
-            "-fsyntax-only", cSourcePath
-        };
         std::vector<llvm::StringRef> args;
         for (auto& s : argStrs) args.push_back(s);
 
-        // Redirect ALL THREE std streams to dedicated files (stdin from an empty temp).
-        // In LSP mode the server's std handles are the JSON-RPC pipes; if the spawned
-        // child references any of them (which happens with STARTF_USESTDHANDLES when a
-        // redirect is left inherited), the protocol channel breaks and the server dies.
-        // stdin <- empty temp; stdout -> json; stderr -> discarded temp.
         std::optional<llvm::StringRef> redirects[3] = {
             llvm::StringRef(inPath), llvm::StringRef(jsonPath), llvm::StringRef(errPath)
         };
 
-        if (verbose)
-            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (clang AST dump)\n";
-
         std::string execErr;
         int rc;
         {
-            // Serialize the actual spawn: concurrent CreateProcess-with-redirects calls
-            // race on Windows and crash the LSP's worker pool.
             std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
-            rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, redirects, 0, 0, &execErr);
+            rc = llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
         }
         if (rc != 0)
         {
-            if (verbose) std::cout << "[verbose]   AST dump failed (exit " << rc << "); skipping auto-extern\n";
+            if (verbose) std::cout << "[verbose]   AST dump failed (exit " << rc << ")\n";
             return false;
         }
 
         auto bufOrErr = llvm::MemoryBuffer::getFile(jsonPath);
         if (!bufOrErr) return false;
+        outJson = (*bufOrErr)->getBuffer().str();
+        return true;
+    }
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::parse((*bufOrErr)->getBuffer());
+    // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
+    // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
+    bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
+                            std::vector<CSigEntry>& outSigs)
+    {
+        const std::string target = (platformValue == 32)
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+
+        std::vector<std::string> argStrs = {
+            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json",
+            "-fsyntax-only"
+        };
+        for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
+        argStrs.push_back(cSourcePath);
+
+        if (verbose)
+            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (clang AST dump)\n";
+
+        std::string jsonText;
+        if (!SpawnClangJson(argStrs, jsonText))
+            return false;
+
+        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
         if (!root) { llvm::consumeError(root.takeError()); return false; }
 
         const llvm::json::Object* tu = root->getAsObject();
@@ -2005,6 +2037,11 @@ private:
         if (!llvm::sys::fs::real_path(cSourcePath, realPath))
             fileForLsp = realPath.str().str();
 
+        // Defines can gate which functions a .c defines, so fold them into the cache key
+        // (the file path alone is the LSP identity; the key is path + defines).
+        std::string cacheKey = fileForLsp;
+        for (const auto& def : cDefines_) cacheKey += "|D" + def;
+
         // Hash the file at most once per call, and only when actually needed.
         uint64_t currentHash = 0;
         bool haveHash = false;
@@ -2023,7 +2060,7 @@ private:
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            auto cacheIt = cFileSigCache_.find(fileForLsp);
+            auto cacheIt = cFileSigCache_.find(cacheKey);
             if (!mtEc && cacheIt != cFileSigCache_.end())
             {
                 CFileSigCacheEntry& entry = cacheIt->second;
@@ -2066,10 +2103,349 @@ private:
             entry.hash  = hashNow();
             entry.sigs  = sigs;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
-            cFileSigCache_[fileForLsp] = std::move(entry);
+            cFileSigCache_[cacheKey] = std::move(entry);
         }
 
         RegisterCSignatures(sigs, fileForLsp, programAlias);
+        return true;
+    }
+
+    // Depth-first search for the first node carrying an evaluated integer "value" string
+    // (clang puts the evaluated enum value on the wrapping ConstantExpr / IntegerLiteral).
+    // Returns false when the enumerator has no initializer (caller uses the running count).
+    static bool FindConstantValue(const llvm::json::Object* node, long long& out)
+    {
+        if (!node) return false;
+        if (auto v = node->getString("value"))
+        {
+            const std::string s = v->str();
+            try {
+                size_t consumed = 0;
+                long long parsed = std::stoll(s, &consumed);
+                if (consumed == s.size()) { out = parsed; return true; }
+            } catch (...) { /* not a plain decimal (e.g. a string literal) - keep searching */ }
+        }
+        if (auto* inner = node->getArray("inner"))
+            for (const auto& c : *inner)
+                if (FindConstantValue(c.getAsObject(), out)) return true;
+        return false;
+    }
+
+    // Register C enum constants as bare global int constants - matching C's flat enum
+    // scope (the user writes CURLOPT_URL, not CURLoption.CURLOPT_URL). Built directly via
+    // builder->getIntN to sidestep CreateConstant's stoi limitation on wide values.
+    void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp)
+    {
+        for (const CEnumEntry& e : enums)
+        {
+            if (e.name.empty()) continue;
+            // First writer wins: a hand-written declaration or an earlier header takes
+            // precedence over a duplicate constant name.
+            if (globalNamedVariable.count(e.name)) continue;
+
+            bool wide = (e.value < INT32_MIN || e.value > INT32_MAX);
+            TypeAndValue tv;
+            tv.TypeName     = wide ? "i64" : "int";
+            tv.VariableName = e.name;
+            tv.Pointer      = false;
+            llvm::Constant* c = wide
+                ? static_cast<llvm::Constant*>(builder->getInt64((uint64_t)e.value))
+                : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)e.value));
+            CreateGlobalVariable(tv, c);
+
+            if (auto* s = GetSymbolSink())
+                s->Register(SymbolKind::Variable, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col,
+                            tv.TypeName + " " + e.name);
+        }
+        if (verbose)
+            std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
+    }
+
+    // Spawn clang's JSON AST dump for a C *header* (via a stub TU that #includes it) and
+    // parse out the externally-linkable function *declarations* and enum constants the
+    // header itself contributes. A header pulls in the whole SDK/CRT transitively, so a
+    // source-location filter keeps only decls whose file lives under the header's own dir
+    // or one of the --c-include roots. Fills outSigs/outEnums; false on clang/parse error.
+    bool RunClangHeaderExtract(const std::string& clangPath, const std::string& headerPath,
+                               std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
+                               const std::vector<std::string>& extraDefines = {})
+    {
+        const std::string target = (platformValue == 32)
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+
+        const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
+
+        // Stub TU: #include the header by absolute path (forward slashes for the lexer).
+        llvm::SmallString<256> stubFile;
+        if (llvm::sys::fs::createTemporaryFile("cflat_hdr", "c", stubFile)) return false;
+        const std::string stubPath = stubFile.str().str();
+        struct StubRemover { std::string p; ~StubRemover() { llvm::sys::fs::remove(p); } } stubRemover{ stubPath };
+        {
+            std::error_code ec;
+            llvm::raw_fd_ostream os(stubPath, ec, llvm::sys::fs::OF_Text);
+            if (ec) return false;
+            std::string fwd = headerPath;
+            std::replace(fwd.begin(), fwd.end(), '\\', '/');
+            os << "#include \"" << fwd << "\"\n";
+            os.close();
+        }
+
+        std::vector<std::string> argStrs = {
+            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json", "-fsyntax-only"
+        };
+        argStrs.push_back("-I" + hdrDir);
+        for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
+        for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
+        // Per-import `define` clauses, appended after the process-wide --c-define.
+        for (const auto& def : extraDefines) argStrs.push_back("/D" + def);
+        argStrs.push_back(stubPath);
+
+        if (verbose)
+            std::cout << "[verbose] extracting C header: " << headerPath << " (clang AST dump)\n";
+
+        std::string jsonText;
+        if (!SpawnClangJson(argStrs, jsonText))
+            return false;
+
+        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
+        if (!root) { llvm::consumeError(root.takeError()); return false; }
+        const llvm::json::Object* tu = root->getAsObject();
+        if (!tu) return false;
+        const llvm::json::Array* topLevel = tu->getArray("inner");
+        if (!topLevel) return true;
+
+        // Normalize a path for prefix comparison: forward slashes, lowercase (Windows).
+        auto norm = [](std::string p) {
+            std::replace(p.begin(), p.end(), '\\', '/');
+            std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            return p;
+        };
+        std::vector<std::string> scopeRoots;
+        scopeRoots.push_back(norm(hdrDir));
+        for (const auto& inc : cIncludeDirs_) scopeRoots.push_back(norm(inc));
+
+        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string {
+            if (!typeObj) return "";
+            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
+            if (auto q = typeObj->getString("qualType")) return q->str();
+            return "";
+        };
+
+        // clang emits loc.file only when it changes between sibling nodes; a node with no
+        // file inherits the previous node's. Track it so the scope filter is accurate.
+        std::string lastFile;
+        auto fileOfNode = [&](const llvm::json::Object* node) -> std::string {
+            auto pick = [&](const llvm::json::Object* o) {
+                if (o)
+                    if (auto f = o->getString("file")) lastFile = f->str();
+            };
+            if (auto* loc = node->getObject("loc"))
+            {
+                pick(loc);
+                if (auto* exp = loc->getObject("expansionLoc")) pick(exp);
+                if (auto* spel = loc->getObject("spellingLoc")) pick(spel);
+            }
+            if (auto* range = node->getObject("range"))
+                if (auto* begin = range->getObject("begin"))
+                    pick(begin);
+            return lastFile;
+        };
+        auto inScope = [&](const std::string& file) -> bool {
+            if (file.empty()) return false;
+            std::string nf = norm(file);
+            for (const auto& r : scopeRoots)
+                if (!r.empty() && nf.rfind(r, 0) == 0) return true;
+            return false;
+        };
+
+        for (const llvm::json::Value& v : *topLevel)
+        {
+            const llvm::json::Object* node = v.getAsObject();
+            if (!node) continue;
+            const std::string curFile = fileOfNode(node); // updates lastFile (sticky)
+            auto kind = node->getString("kind");
+            if (!kind) continue;
+            if (!inScope(curFile)) continue; // drop SDK / CRT / builtin decls
+
+            if (*kind == "FunctionDecl")
+            {
+                if (auto sc = node->getString("storageClass"); sc && *sc == "static") continue;
+                auto nm = node->getString("name");
+                if (!nm || nm->empty()) continue;
+
+                CSigEntry entry;
+                entry.name = nm->str();
+
+                std::string funcQual = qualTypeOf(node->getObject("type"));
+                entry.variadic = funcQual.find("...") != std::string::npos;
+
+                std::string retStr = funcQual;
+                if (auto paren = funcQual.find('('); paren != std::string::npos)
+                    retStr = funcQual.substr(0, paren);
+                if (!MapCTypeToTypeAndValue(retStr, entry.ret))
+                {
+                    if (verbose) std::cout << "[verbose]   skipping '" << entry.name
+                                           << "': unsupported return type '" << retStr << "'\n";
+                    continue;
+                }
+
+                bool paramsOk = true;
+                if (auto* fnInner = node->getArray("inner"))
+                {
+                    for (const auto& c : *fnInner)
+                    {
+                        const llvm::json::Object* co = c.getAsObject();
+                        if (!co) continue;
+                        auto ck = co->getString("kind");
+                        if (!ck || *ck != "ParmVarDecl") continue;
+
+                        TypeAndValue ptv;
+                        std::string pQual = qualTypeOf(co->getObject("type"));
+                        if (!MapCTypeToTypeAndValue(pQual, ptv))
+                        {
+                            if (verbose) std::cout << "[verbose]   skipping '" << entry.name
+                                                   << "': unsupported parameter type '" << pQual << "'\n";
+                            paramsOk = false;
+                            break;
+                        }
+                        if (auto pn = co->getString("name")) ptv.VariableName = pn->str();
+                        entry.params.push_back(ptv);
+                    }
+                }
+                if (!paramsOk) continue;
+
+                if (auto* loc = node->getObject("loc"))
+                {
+                    if (auto l = loc->getInteger("line")) entry.line = (int)*l;
+                    if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
+                }
+                outSigs.push_back(std::move(entry));
+            }
+            else if (*kind == "EnumDecl")
+            {
+                long long current = 0;
+                if (auto* enumInner = node->getArray("inner"))
+                {
+                    for (const auto& c : *enumInner)
+                    {
+                        const llvm::json::Object* co = c.getAsObject();
+                        if (!co) continue;
+                        auto ck = co->getString("kind");
+                        if (!ck || *ck != "EnumConstantDecl") continue;
+                        auto en = co->getString("name");
+                        if (!en || en->empty()) continue;
+
+                        long long value = current;
+                        if (auto* eci = co->getArray("inner"))
+                            for (const auto& e : *eci)
+                            {
+                                long long parsed = 0;
+                                if (FindConstantValue(e.getAsObject(), parsed)) { value = parsed; break; }
+                            }
+
+                        CEnumEntry ee;
+                        ee.name  = en->str();
+                        ee.value = value;
+                        if (auto* loc = co->getObject("loc"))
+                        {
+                            if (auto l = loc->getInteger("line")) ee.line = (int)*l;
+                            if (auto cc = loc->getInteger("col")) ee.col = (int)*cc - 1;
+                        }
+                        outEnums.push_back(std::move(ee));
+                        current = value + 1;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // Bind a prebuilt C library by extracting its header's declarations + enum constants.
+    // No object is produced (unlike CompileCFile) - the library is linked via --c-lib in
+    // EmitExecutable. Results are cached per header+include-dir set, mirroring
+    // ExtractCSignatures. Runs in LSP mode too (registration only), so headers contribute
+    // hover / completion / go-to-definition.
+    bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {})
+    {
+        llvm::SmallString<256> realPath;
+        std::string fileForLsp = headerPath;
+        if (!llvm::sys::fs::real_path(headerPath, realPath))
+            fileForLsp = realPath.str().str();
+
+        // Fold the include-dir set and defines into the cache key: the same header under
+        // different --c-include roots or --c-define values can expose different decls.
+        // Per-import `define` clauses are folded too, so two imports of the same header
+        // with different inline defines do not collide on a stale cache entry.
+        std::string cacheKey = fileForLsp;
+        for (const auto& inc : cIncludeDirs_)  cacheKey += "|I" + inc;
+        for (const auto& def : cDefines_)      cacheKey += "|D" + def;
+        for (const auto& def : extraDefines)   cacheKey += "|d" + def;
+
+        uint64_t currentHash = 0;
+        bool haveHash = false;
+        auto hashNow = [&]() -> uint64_t {
+            if (!haveHash) { HashFileContents(fileForLsp, currentHash); haveHash = true; }
+            return currentHash;
+        };
+
+        std::error_code mtEc;
+        auto currentMtime = std::filesystem::last_write_time(fileForLsp, mtEc);
+
+        std::vector<CSigEntry> hitSigs;
+        std::vector<CEnumEntry> hitEnums;
+        bool hit = false;
+        {
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            auto cacheIt = cFileSigCache_.find(cacheKey);
+            if (!mtEc && cacheIt != cFileSigCache_.end())
+            {
+                CFileSigCacheEntry& entry = cacheIt->second;
+                if (entry.mtime == currentMtime)
+                {
+                    if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hit = true;
+                }
+                else if (hashNow() == entry.hash)
+                {
+                    if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
+                    entry.mtime = currentMtime;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hit = true;
+                }
+            }
+        }
+        if (hit)
+        {
+            RegisterCSignatures(hitSigs, fileForLsp);
+            RegisterCEnums(hitEnums, fileForLsp);
+            return true;
+        }
+
+        const std::string clangPath = FindClangCl();
+        if (clangPath.empty())
+        {
+            LogError(std::format("clang-cl.exe not found - cannot bind C header '{}'.", headerPath));
+            return false;
+        }
+
+        std::vector<CSigEntry> sigs;
+        std::vector<CEnumEntry> enums;
+        if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, extraDefines))
+            return false;
+
+        if (!mtEc)
+        {
+            CFileSigCacheEntry entry;
+            entry.mtime = currentMtime;
+            entry.hash  = hashNow();
+            entry.sigs  = sigs;
+            entry.enums = enums;
+            std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+            cFileSigCache_[cacheKey] = std::move(entry);
+        }
+
+        RegisterCSignatures(sigs, fileForLsp);
+        RegisterCEnums(enums, fileForLsp);
         return true;
     }
 
@@ -2253,6 +2629,15 @@ private:
         linkArgStrs.push_back(objPath);
         // Merge any C objects compiled by clang-cl from .c inputs.
         for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
+        // Prebuilt C import libraries (--c-lib): add each lib's directory as a search
+        // path, then the lib itself. lld-link accepts an explicit path too, but the
+        // /libpath + name form keeps behaviour uniform with the system libs above.
+        for (const auto& lib : cLinkLibs_)
+        {
+            auto libDir = std::filesystem::path(lib).parent_path().string();
+            if (!libDir.empty()) linkArgStrs.push_back("/libpath:" + libDir);
+            linkArgStrs.push_back(std::filesystem::path(lib).filename().string());
+        }
 
         std::vector<llvm::StringRef> linkArgs;
         for (auto& s : linkArgStrs) linkArgs.push_back(s);
@@ -2269,7 +2654,62 @@ private:
             std::cerr << "Error: linking failed (exit " << rc << "): " << linkErr << "\n";
             return false;
         }
+
+        // Self-contained run: copy each --c-lib's sibling runtime DLL next to the exe so
+        // the program launches without the user staging DLLs. Conan puts the DLL either
+        // beside the import lib or in a ../bin sibling; check both. Best-effort - a static
+        // lib has no DLL, which is fine.
+        CopyCRuntimeDlls(exePath);
         return true;
+    }
+
+    // For each --c-lib, find a matching runtime DLL (lib dir, or a ../bin sibling) and copy
+    // it next to the output exe. Tries <stem>.dll and the common lib<stem> / <stem>_imp
+    // import-lib naming so the right DLL is found for either layout.
+    void CopyCRuntimeDlls(const std::string& exePath)
+    {
+        namespace fs = std::filesystem;
+        auto exeDir = fs::path(exePath).parent_path();
+        for (const auto& lib : cLinkLibs_)
+        {
+            fs::path libPath(lib);
+            std::string stem = libPath.stem().string(); // e.g. "libcurl" or "libcurl_imp"
+            // Strip a trailing "_imp" (MSVC import-lib convention) to recover the DLL stem.
+            if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, "_imp") == 0)
+                stem = stem.substr(0, stem.size() - 4);
+
+            std::vector<fs::path> dirs = { libPath.parent_path() };
+            auto binSibling = libPath.parent_path().parent_path() / "bin";
+            dirs.push_back(binSibling);
+
+            std::vector<std::string> stems = { stem };
+            if (stem.rfind("lib", 0) == 0) stems.push_back(stem.substr(3)); // libcurl -> curl
+
+            bool copied = false;
+            for (const auto& dir : dirs)
+            {
+                for (const auto& s : stems)
+                {
+                    fs::path dll = dir / (s + ".dll");
+                    std::error_code ec;
+                    if (fs::exists(dll, ec))
+                    {
+                        fs::path dest = exeDir / dll.filename();
+                        fs::copy_file(dll, dest, fs::copy_options::overwrite_existing, ec);
+                        if (!ec)
+                        {
+                            if (verbose) std::cout << "[verbose]   copied runtime DLL: " << dll.string()
+                                                   << " -> " << dest.string() << "\n";
+                            copied = true;
+                        }
+                        break;
+                    }
+                }
+                if (copied) break;
+            }
+            if (!copied && verbose)
+                std::cout << "[verbose]   no runtime DLL found for " << lib << " (static lib?)\n";
+        }
     }
 
     Operation ParseOperation(std::string operationText)
@@ -6604,7 +7044,7 @@ public:
                            const std::vector<std::string>& sourceLines);
 
     bool Compile(const ArgParser& args);
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {});
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {});
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 };

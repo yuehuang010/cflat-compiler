@@ -46,6 +46,9 @@ int main(int argc, char* argv[])
     args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
     args.addFlag("nologo", 0, "Hide compiler version and completion messages");
     args.addFlag("ftime-trace", 0, "Write compilation time trace to <input>.time-trace.json");
+    args.addMultiOption("c-include", 0, "Header search directory for C library bindings (repeatable)");
+    args.addMultiOption("c-lib", 0, "Prebuilt C import library (.lib) to link (repeatable)");
+    args.addMultiOption("c-define", 0, "Preprocessor define passed to all clang-cl C compiles/dumps, e.g. NAME or NAME=val (repeatable)");
 
     if (!args.parse(argc, argv))
         return 1;

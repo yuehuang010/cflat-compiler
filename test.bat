@@ -127,6 +127,13 @@ if not exist "%OUT%\results" mkdir "%OUT%\results"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
 
+REM Pre-build the C-interop fixture library so test_c_package.cb can bind it.
+REM (Uses the clang-cl/lld-link deployed next to cflat.exe for this config.)
+if exist "%SRC%\cinterop\build_mathlib.bat" (
+    call "%SRC%\cinterop\build_mathlib.bat" %CFLAT_CONFIG% >nul 2>&1
+    if errorlevel 1 echo WARNING: failed to build cinterop fixture lib - test_c_package may fail
+)
+
 set /a LAUNCHED=0
 
 REM Launch error tests as 4 parallel groups - files distributed round-robin by test_err.bat

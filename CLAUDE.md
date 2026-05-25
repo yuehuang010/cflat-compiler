@@ -85,6 +85,21 @@ x64/Debug/cflat.exe app.cb -o app.exe
 
 > Note: `.c` means real C. CFlat test fixtures that were historically given a `.c` extension now use `.cb` (e.g. `Test/test_c.cb`, `Test/library/stringlib.cb`, `Test/library/testmodule.cb`).
 
+### Binding a prebuilt C library (header + import lib)
+
+Unlike a `.c` (which cflat *compiles*), a prebuilt library (libcurl, zlib, ...) is consumed by extracting its **header** and linking its **import lib**. Obtain both via Conan/vcpkg; cflat consumes the paths.
+
+- **Source declares what to bind**: `import package "curl/curl.h";` (or a bare `import "curl/curl.h";` - a `.h/.hpp/.hh` extension routes to the same path). The header is resolved against the `--c-include` roots. An optional inline `lib` clause names the import library to link: `import package "curl/curl.h" lib "libcurl.lib";` (resolved relative to the importing `.cb` if relative; applies to that line only). One or more inline `define` clauses add per-import preprocessor defines, scoped to that header's AST dump and appended on top of the CLI `--c-define`: `import package "curl/curl.h" lib "libcurl.lib" define "CURL_STATICLIB" define "FOO=1";` (clauses come after `lib`).
+- **CLI supplies where the files are** (machine-specific, so they stay out of source): repeatable `--c-include <dir>` (header search roots, also used as `-I` for the AST dump), `--c-lib <path>` (import library added to the `lld-link` line), and `--c-define NAME[=val]` (a preprocessor `/D` applied to *all* clang-cl invocations - the header dump, the `.c` auto-extern dump, and the `.c` object compile).
+
+```bash
+x64/Debug/cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL_STATICLIB -o app.exe
+```
+
+> The inline `lib` and `define` clauses apply only to their own import line; `--c-define` (CLI) applies process-wide to every clang-cl spawn, and per-import `define` clauses are appended after it (so the same header bound twice with different inline defines does not collide on a stale signature cache entry). `lib` and `define` are soft keywords (inline grammar literals, same mechanism as `program`).
+
+`CompileCHeader` (`LLVMBackend.h`) AST-dumps a stub that `#include`s the header and registers the externally-linkable function **declarations** plus **enum constants** (bare globals, matching C's flat enum scope - `CURLOPT_URL`, not `Type.CURLOPT_URL`). A source-location filter keeps only decls under the `--c-include` roots / the header's dir, so the transitively-included SDK/CRT is excluded. Variadics (e.g. `curl_easy_setopt`) are supported; `#define`-only constants are **not** (no macro in the AST). Same scalar+pointer subset and per-header caching as the `.c` auto-extern path. After a successful link, a sibling runtime DLL of each `--c-lib` (in the lib's dir or a `../bin` sibling, the Conan layout) is auto-copied next to the exe.
+
 **CLI flags** (see `ArgParser.h`):
 - `-o / --output`: Output native executable path (.exe)
 - `-l / --out-lli`: Output LLVM IR file path (.ll)
@@ -93,6 +108,9 @@ x64/Debug/cflat.exe app.cb -o app.exe
 - `-i / --import-dir`: Directory to search for imported modules
 - `-p / --platform`: Target platform - `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
+- `--c-include <dir>`: Header search dir for C library bindings (repeatable)
+- `--c-lib <path>`: Prebuilt C import library (.lib) to link (repeatable)
+- `--c-define <NAME[=val]>`: Preprocessor define passed to all clang-cl C compiles/dumps (repeatable)
 
 ## Testing
 - Always run `test.bat` after compiler changes to verify all tests pass before declaring work complete.

@@ -619,6 +619,21 @@ usingDeclaration
 importDeclaration
     : Import StringLiteral (As Identifier)? ';'
     | Import 'program' StringLiteral As Identifier ';'
+    | Import 'package' StringLiteral libClause? defineClause* ';'
+    ;
+
+// Optional inline import library for a header binding: import package "x.h" lib "y.lib";
+// Kept as a sub-rule so importDeclaration still has a single direct StringLiteral.
+libClause
+    : 'lib' StringLiteral
+    ;
+
+// Optional inline preprocessor define(s) for a header binding, scoped to THIS
+// import's clang AST dump and appended on top of the process-wide --c-define:
+//   import package "x.h" lib "y.lib" define "FOO" define "BAR=2";
+// Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
+defineClause
+    : 'define' StringLiteral
     ;
 
 namespaceDefinition

@@ -23,6 +23,32 @@
 #include <algorithm>
 #include <cctype>
 
+// Return the dequoted path from an inline `lib "..."` clause on an import declaration,
+// or "" if there is none. Used to wire `import package "x.h" lib "y.lib";` into the link.
+static std::string DequoteLibClause(CFlatParser::ImportDeclarationContext* imp)
+{
+    auto* lc = imp->libClause();
+    if (!lc || !lc->StringLiteral()) return "";
+    std::string raw = lc->StringLiteral()->getText();
+    if (raw.size() < 2) return "";
+    return raw.substr(1, raw.size() - 2);
+}
+
+// Inline `define "..."` clauses on an `import package` line. Each is scoped to
+// that header's clang AST dump and appended on top of the process-wide --c-define.
+static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarationContext* imp)
+{
+    std::vector<std::string> defines;
+    for (auto* dc : imp->defineClause())
+    {
+        if (!dc->StringLiteral()) continue;
+        std::string raw = dc->StringLiteral()->getText();
+        if (raw.size() < 2) continue;
+        defines.push_back(raw.substr(1, raw.size() - 2));
+    }
+    return defines;
+}
+
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
 {
     std::vector<std::string> lines;
@@ -89,6 +115,11 @@ bool LLVMBackend::Compile(const ArgParser& args)
     // Captured for clang C compiles (imports run during parse, before EmitExecutable).
     cOptLevel_ = args.getOptimizationLevel();
     cDebugInfo_ = debugInfo;
+    // C library bindings: header search dirs, prebuilt import libraries, and defines.
+    cIncludeDirs_ = args.getMultiOption("c-include");
+    for (const auto& lib : args.getMultiOption("c-lib"))
+        cLinkLibs_.push_back(lib);
+    cDefines_ = args.getMultiOption("c-define");
 
     if (verbose)
     {
@@ -233,8 +264,10 @@ bool LLVMBackend::Compile(const ArgParser& args)
                         std::string impExt = std::filesystem::path(importFilename).extension().string();
                         std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
                         bool isCProgram = isProgram && impExt == ".c";
+                        std::string explicitLib = DequoteLibClause(imp);
+                        std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
                         if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << "\n";
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : ""))
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines))
                             return false;
 
                         if (isProgram)
@@ -410,7 +443,7 @@ bool LLVMBackend::Compile(const ArgParser& args)
     return true;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -428,6 +461,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         auto searchPath = (std::filesystem::path(importSearchDir) / importFilename).lexically_normal();
         canonical = std::filesystem::canonical(searchPath, ec);
     }
+    // C library headers (e.g. "curl/curl.h") live under the --c-include roots.
+    for (const auto& inc : cIncludeDirs_)
+    {
+        if (!ec) break;
+        auto incPath = (std::filesystem::path(inc) / importFilename).lexically_normal();
+        canonical = std::filesystem::canonical(incPath, ec);
+    }
     // Implicit fallback: look in the "core" directory beside the runtime.
     if (ec && !runtimeDir.empty())
     {
@@ -440,6 +480,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                   << " (searched relative to '" << importingDir.string() << "'"
                   << (sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'")
                   << (importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'")
+                  << (cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)")
                   << (runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'")
                   << ").\n";
         return false;
@@ -494,6 +535,21 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
         if (ext == ".c")
             return CompileCFile(canonicalStr, programAlias);
+        // A C header (real C, not CFlat): extract declarations + enums via clang's
+        // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
+        if (ext == ".h" || ext == ".hpp" || ext == ".hh")
+        {
+            // Inline `lib "..."` clause: resolve relative to the importing file and add
+            // it to the link line, alongside any --c-lib libraries.
+            if (!explicitLib.empty())
+            {
+                std::filesystem::path lp(explicitLib);
+                if (lp.is_relative())
+                    lp = (std::filesystem::path(importingFilePath).parent_path() / lp).lexically_normal();
+                cLinkLibs_.push_back(lp.string());
+            }
+            return CompileCHeader(canonicalStr, extraDefines);
+        }
     }
     importStack.push_back(canonicalStr);
     struct ImportGuard {
@@ -556,8 +612,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 std::string raw = imp->StringLiteral()->getText();
                 std::string nested = raw.substr(1, raw.size() - 2);
                 std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
+                std::string nestedLib = DequoteLibClause(imp);
+                std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << "[verbose]   nested import: " << nested << (nestedNs.empty() ? "" : " as " + nestedNs) << "\n";
-                if (!CompileImportedFile(canonicalStr, nested, nestedNs))
+                if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLib, nestedDefines))
                     return false;
             }
         }
@@ -776,7 +834,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string impExt = std::filesystem::path(importFilename).extension().string();
                     std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
                     bool isCProgram = isProgram && impExt == ".c";
-                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : ""))
+                    std::string explicitLib = DequoteLibClause(imp);
+                    std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:
