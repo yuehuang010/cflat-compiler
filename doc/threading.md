@@ -188,6 +188,28 @@ ch.send(42);
 int v = ch.receive();   // 42
 ```
 
+**Piping (`operator>>`)** - `src >> dst` spawns a forwarder that drains every value from `src` into `dst`. It uses borrow semantics: when `src`'s last producer closes (`close_producer()`), the forwarder drains the remaining items and closes `dst`. Pipes can be chained, and EOF propagates through every stage:
+
+```c
+channel<int>* src = new channel<int>();
+channel<int>* mid = new channel<int>();
+channel<int>* dst = new channel<int>();
+src.init(64); mid.init(64); dst.init(64);
+
+src >> mid;             // forwarder: src -> mid
+mid >> dst;             // forwarder: mid -> dst
+
+src.add_producer();
+int i = 0;
+while (i < 50) { src.push(i); i = i + 1; }
+src.close_producer();   // EOF flows src -> mid -> dst, closing each
+
+int v = 0;
+while (dst.receive(&v)) { /* receives all 50 in order */ }
+```
+
+Both channels must have the same element type `T`; piping `channel<int>` into `channel<float>` is a compile error (no matching `operator>>` overload).
+
 ---
 
 ## Compile-Time Lock-Set Analysis

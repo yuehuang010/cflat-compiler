@@ -66,6 +66,7 @@
   - [Built-in Identifiers](#built-in-identifiers)
   - [Compile-Time Conditionals (`if const`)](#compile-time-conditionals-if-const)
 - [`program` Keyword](#program-keyword)
+- [C Interop](#c-interop) ([full reference](C_INTEROP.md))
 - [JSON](#json-libjsoncb)
 - [Debug Info](#debug-info-work-in-progress)
 - [Compiler CLI](#compiler-cli)
@@ -1174,7 +1175,7 @@ cursor += 3;           // advance 3 more bytes
 
 ### Operator Overloading
 
-Define `operator+`, `operator-`, `operator*`, `operator/`, `operator==`, `operator!=`, `operator<`, `operator>`, `operator[]`, `operator new`, `operator delete`, and `operator string` on structs:
+Define `operator+`, `operator-`, `operator*`, `operator/`, `operator==`, `operator!=`, `operator<`, `operator>`, `operator<<`, `operator>>`, `operator[]`, `operator new`, `operator delete`, and `operator string` on structs:
 
 ```c
 struct Vec2
@@ -1193,6 +1194,8 @@ Vec2 c = a + b;          // (4, 6)
 Vec2 d = a * 3.0f;       // (3, 6)
 bool eq = (a == a);      // true
 ```
+
+`operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](threading.md)).
 
 ### Bitwise and Shift Operators
 
@@ -1290,6 +1293,12 @@ extern int main()
 
 ---
 
+## C Interop
+
+CFlat can compile your own `.c` source, import another file's `main` as a program, and bind prebuilt C libraries via header extraction. See [`C_INTEROP.md`](C_INTEROP.md) for the full reference (`import "x.c"`, `import program`, `import package`, and the `--c-*` flags).
+
+---
+
 ## JSON (lib/json.cb)
 
 `json.cb` provides `JsonBuilder.toJson<T>` and `fromJson<T>`. It respects `[JsonName]` and `[Private]` annotations (requires `interfaces.cb`):
@@ -1355,7 +1364,12 @@ cflat.exe <input.cb> [options]
 | `-p / --platform <target>` | Target platform: `x64` (default) or `x86`; sets `__PLATFORM__` to 64 or 32 |
 | `-v / --verbose`        | Print detailed diagnostic messages during compilation |
 | `-O1`, `-O2`            | Set optimization level |
+| `--c-include <dir>`     | Header search dir for C library bindings (repeatable) |
+| `--c-lib <path>`        | Prebuilt C import library (`.lib`) to link (repeatable) |
+| `--c-define <NAME[=val]>` | Preprocessor define passed to all clang-cl C compiles/dumps (repeatable) |
 | `--help`                | Show usage and available options |
+
+See [C Interop](#c-interop) for how the `--c-*` flags pair with `import "x.c"` and `import package`.
 
 ---
 

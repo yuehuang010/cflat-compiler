@@ -29,4 +29,6 @@ extern int main() {
 ## Documentation
 
 - **[Language & Core Library Features](doc/LANGUAGE.md)** - Complete language reference: types, functions, generics, interfaces, namespaces, memory management, null-safety, introspection, and compiler CLI options.
+- **[C Interop](doc/C_INTEROP.md)** - Compiling `.c` source, importing a program, and binding prebuilt C libraries (`import "x.c"`, `import program`, `import package`, `--c-*` flags).
+- **[Threading & Memory Management](doc/threading.md)** - Allocators, custom `operator new`/`delete`, synchronization primitives, channels, and compile-time lock-set analysis.
 - **[Contributing to cflat](doc/CONTRIBUTING.md)** - Building the compiler, development workflow, and running tests.
