@@ -1,0 +1,37 @@
+// libcurl is the import lib for libcurl.dll; copy the DLL next to get.exe
+// before running. zlib is required for HTTP transfer decoding. TLS is provided
+// by Windows Schannel (default backend in vcpkg's curl port on Windows), so no
+// OpenSSL is needed.
+import package "curl/curl.h"
+    lib "vcpkg_installed/x64-windows/lib/libcurl.lib";
+// zlib is a runtime dep of libcurl.dll; bind it so z.dll is auto-copied
+// next to the exe.
+import package "zlib.h"
+    lib "vcpkg_installed/x64-windows/lib/z.lib";
+
+// Auto-extern skips these because CURLcode (enum) return type is not in the
+// supported scalar/pointer subset. Declare them manually; CURLcode is int-sized.
+extern int curl_easy_setopt(void* handle, int option, ...);
+extern int curl_easy_perform(void* handle);
+
+extern int main()
+{
+    void* curl = curl_easy_init();
+    if (curl == nullptr)
+    {
+        printf("curl_easy_init failed\n");
+        return 1;
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+
+    int res = curl_easy_perform(curl);
+    if (res != 0)
+    {
+        printf("curl_easy_perform failed: %d\n", res);
+    }
+
+    curl_easy_cleanup(curl);
+    return 0;
+}

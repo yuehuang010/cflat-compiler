@@ -20,37 +20,20 @@ set PASSED=0
 set FAILED=0
 set SKIPPED=0
 
+REM Space-separated list of base filenames (without .cb) to skip. Library/helper
+REM files that aren't meant to be run standalone, plus examples that need
+REM external prerequisites (e.g. get needs vcpkg-installed libcurl - run
+REM example/curl/build.bat first).
+set EXCLUDE=threadpool test_helper http_parser http_response http_json http_server http_client router rest_server get
+
 REM Helper function to try compile and run
 for /r example %%F in (*.cb) do (
     set FILE=%%F
     set FILENAME=%%~nxF
+    set BASENAME=%%~nF
 
-    REM Skip library/helper files that aren't meant to be run directly
-    if /i "!FILENAME!"=="threadpool.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="test_helper.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="http_parser.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="http_response.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="http_json.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="http_server.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="http_client.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="router.cb" (
-        set /a SKIPPED+=1
-        echo SKIP: !FILE!
-    ) else if /i "!FILENAME!"=="rest_server.cb" (
+    call :IsExcluded "!BASENAME!"
+    if errorlevel 1 (
         set /a SKIPPED+=1
         echo SKIP: !FILE!
     ) else (
@@ -96,4 +79,10 @@ for /r example %%F in (*.cb) do (
 echo.
 echo Results: !PASSED! passed, !FAILED! failed, !SKIPPED! skipped
 if !FAILED! gtr 0 exit /b 1
+exit /b 0
+
+:IsExcluded
+for %%E in (%EXCLUDE%) do (
+    if /I "%~1"=="%%E" exit /b 1
+)
 exit /b 0
