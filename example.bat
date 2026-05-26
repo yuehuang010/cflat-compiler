@@ -21,10 +21,10 @@ set FAILED=0
 set SKIPPED=0
 
 REM Space-separated list of base filenames (without .cb) to skip. Library/helper
-REM files that aren't meant to be run standalone, plus examples that need
-REM external prerequisites (e.g. get needs vcpkg-installed libcurl - run
-REM example/curl/build.bat first).
-set EXCLUDE=threadpool test_helper http_parser http_response http_json http_server http_client router rest_server get
+REM files (no int main()) that are only meant to be imported by sibling examples,
+REM plus examples with external prerequisites (e.g. get needs vcpkg-installed
+REM libcurl - run example/curl/build.bat first).
+set EXCLUDE=test_helper http_parser http_response http_json http_server http_client router rest_server get
 
 REM Helper function to try compile and run
 for /r example %%F in (*.cb) do (
@@ -54,8 +54,6 @@ for /r example %%F in (*.cb) do (
             set IMPORTED_DIRS=
         ) else if "!FILE!"=="example\missile_defender.cb" (
             set IMPORTED_DIRS=
-        ) else if "!FILE:~0,25!"=="example\threadpool\" (
-            set IMPORTED_DIRS=-i example/threadpool
         ) else if "!FILE:~0,22!"=="example\restAPI\" (
             set IMPORTED_DIRS=-i example/restAPI -i example/restAPI/network
         ) else if "!FILE:~0,15!"=="example\shell\" (

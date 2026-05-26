@@ -170,14 +170,12 @@ Examples include:
 - **Visualization**: `bitmap.cb` (sixel/half-block image renderer), `stars.cb` (ASCII art starfield)
 - **Games**: `minesweeper.cb`, `tetris.cb`, `missile_defender.cb`
 - **CLI tools**: `shell/wc.cb`, `shell/cmd_cb.cb`
-- **Concurrency**: `threadpool/benchmark.cb`
 - **HTTP/REST**: `restAPI/test_http.cb`, `restAPI/test_http_server.cb`
 
 To compile a single example manually:
 
 ```bash
 x64/Debug/cflat.exe example/bitmap.cb -o out/bitmap.exe
-x64/Debug/cflat.exe example/threadpool/benchmark.cb -i example/threadpool -o out/benchmark.exe
 ```
 
 To run a single test manually:
