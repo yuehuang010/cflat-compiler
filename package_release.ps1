@@ -18,12 +18,15 @@ Copy-Item "$releaseDir\cflat.exe"    "$publishDir\"
 Copy-Item "$releaseDir\LTO.dll"      "$publishDir\"
 Copy-Item "$releaseDir\Remarks.dll"  "$publishDir\"
 Copy-Item "$releaseDir\lld-link.exe" "$publishDir\"
+Copy-Item "$releaseDir\clang-cl.exe" "$publishDir\"
 Copy-Item "$releaseDir\core"         "$publishDir\core" -Recurse
 Copy-Item "$PSScriptRoot\doc"        "$publishDir\doc"     -Recurse
+Copy-Item "$PSScriptRoot\README.md"  "$publishDir\"
+Copy-Item "$PSScriptRoot\LICENSE"    "$publishDir\"
 
-# Copy only .cb files from example/, preserving directory structure.
+# Copy .cb sources and vcpkg.json manifests from example/, preserving directory structure.
 $exampleRoot = "$PSScriptRoot\example"
-Get-ChildItem -Path $exampleRoot -Filter *.cb -Recurse -File | ForEach-Object {
+Get-ChildItem -Path $exampleRoot -Recurse -File -Include *.cb,vcpkg.json | ForEach-Object {
     $rel  = $_.FullName.Substring($exampleRoot.Length + 1)
     $dest = Join-Path "$publishDir\example" $rel
     New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null

@@ -495,6 +495,7 @@
     <ClInclude Include="ArgParser.h" />
     <ClInclude Include="CFlatErrorListener.h" />
     <ClInclude Include="CompilerManager.h" />
+    <ClInclude Include="VcpkgResolver.h" />
     <ClInclude Include="Version.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

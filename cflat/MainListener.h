@@ -2112,6 +2112,19 @@ public:
             {
                 std::string raw = imp->StringLiteral()->getText();
                 std::string importFilename = raw.substr(1, raw.size() - 2);
+                // `import package-vcpkg "header" from "port";` inside an if-const branch.
+                if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg")
+                {
+                    std::string portSpec;
+                    if (auto* fc = imp->fromClause())
+                        if (fc->StringLiteral())
+                        {
+                            std::string fr = fc->StringLiteral()->getText();
+                            if (fr.size() >= 2) portSpec = fr.substr(1, fr.size() - 2);
+                        }
+                    Compiler()->CompileVcpkgImport(Compiler()->currentSourceFilePath_, importFilename, portSpec);
+                    continue;
+                }
                 std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                 std::string explicitLib;
                 if (auto* lc = imp->libClause())

@@ -1,5 +1,5 @@
 {
-  "name": "cflat-curl-example",
+  "name": "cflat-vcpkg-example",
   "version-string": "0.0.1",
   "dependencies": [
     "curl"

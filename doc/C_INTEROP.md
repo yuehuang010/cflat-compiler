@@ -11,6 +11,7 @@ The bundled `clang-cl.exe` / `lld-link.exe` are deployed next to `cflat.exe`, so
 - [Compiling a `.c` File (auto-extern)](#compiling-a-c-file-auto-extern)
 - [Importing a Program (`import program`)](#importing-a-program-import-program)
 - [Binding a Prebuilt C Library (`import package`)](#binding-a-prebuilt-c-library-import-package)
+- [Binding via vcpkg (`import package-vcpkg`)](#binding-via-vcpkg-import-package-vcpkg)
 
 ---
 
@@ -120,3 +121,50 @@ cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL
 | `--c-define <NAME[=val]>` | Preprocessor `/D` applied to **every** clang-cl spawn (header dump, `.c` auto-extern dump, `.c` object compile) |
 
 > `--c-define` is process-wide; an inline `define` clause applies only to its own import line and is appended after the CLI defines.
+
+## Binding via vcpkg (`import package-vcpkg`)
+
+`import package-vcpkg "<header>" from "<port>";` lets cflat do the machine-specific bookkeeping itself: it walks up from the importing `.cb` for a `vcpkg.json`, runs `vcpkg install` once, and pushes the resolved include dir, import libs, and runtime DLLs into the same accumulators the manual flags use. No `--c-include` / `--c-lib`, no sibling `build.bat`.
+
+```c
+// example/vcpkg/get.cb
+import package-vcpkg "curl/curl.h" from "curl";
+
+extern int main()
+{
+    void* curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, "https://example.com");
+    curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return 0;
+}
+```
+
+The sibling `vcpkg.json` is the source of truth for what is allowed to be imported:
+
+```json
+{
+  "name": "cflat-vcpkg-example",
+  "version-string": "0.0.1",
+  "dependencies": [ "curl" ],
+  "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc"
+}
+```
+
+How it resolves:
+
+- **Manifest discovery.** The compiler walks up from the source file's directory until it finds a `vcpkg.json`. The walk stops at a `.git` directory so it cannot escape the project root. If none is found, the compiler errors with a `vcpkg new --application` hint.
+- **Port validation.** Every `from "<port>"` must appear in the manifest's `dependencies`. A missing port produces a copy-pasteable `vcpkg add port <name>` command and aborts the build - the manifest stays authored by the user, not synthesized by the compiler.
+- **vcpkg.exe discovery.** Order: `--vcpkg-exe`, `VCPKG_ROOT`, the VS-bundled `<VS>\VC\vcpkg\vcpkg.exe` (located via `vswhere`), then `vcpkg.exe` on `PATH`.
+- **Install + resolution.** `vcpkg install --triplet <triplet>` runs in the manifest directory; the include dir, every `.lib` under `vcpkg_installed/<triplet>/lib`, and every `.dll` under `<triplet>/bin` belonging to the port closure are wired into clang-cl and `lld-link`. The DLLs are copied next to the produced `.exe` from the authoritative vcpkg list (deduped against the legacy `--c-lib` sibling-DLL probe).
+- **LSP mode.** The `vcpkg install` subprocess is gated off when the compiler is running as the language server, so keystroke-driven analyses never spawn vcpkg.
+
+The triplet defaults from `--platform` (`x64` -> `x64-windows`, `x86` -> `x86-windows`) and can be overridden:
+
+| Flag | Description |
+|------|-------------|
+| `--vcpkg-exe <path>` | Explicit `vcpkg.exe`; bypasses VS-bundled / `VCPKG_ROOT` / `PATH` discovery |
+| `--vcpkg-manifest <path>` | Explicit `vcpkg.json`; skips the upward walk |
+| `--vcpkg-triplet <triplet>` | Override the platform-derived default (e.g. `x64-windows-static`) |
+
+> `import package-vcpkg` and `import package` push into the same internal accumulators - you can mix a vcpkg-resolved port with a hand-pathed `--c-lib` in the same build. Defines from a vcpkg port's documented usage are applied automatically; add extra ones with `--c-define`.

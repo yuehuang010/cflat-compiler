@@ -620,6 +620,7 @@ importDeclaration
     : Import StringLiteral (As Identifier)? ';'
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? defineClause* ';'
+    | Import 'package-vcpkg' StringLiteral fromClause ';'
     ;
 
 // Optional inline import library for a header binding: import package "x.h" lib "y.lib";
@@ -634,6 +635,14 @@ libClause
 // Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
 defineClause
     : 'define' StringLiteral
+    ;
+
+// Required port name (with optional [features]) on an `import package-vcpkg` line:
+//   import package-vcpkg "curl/curl.h" from "curl";
+//   import package-vcpkg "curl/curl.h" from "curl[ssl]";
+// Sub-rule so importDeclaration keeps a single direct StringLiteral.
+fromClause
+    : 'from' StringLiteral
     ;
 
 namespaceDefinition

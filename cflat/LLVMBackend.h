@@ -58,6 +58,7 @@
 
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
+#include "VcpkgResolver.h"
 
 struct ExpectedErrorReceived {};
 
@@ -600,6 +601,13 @@ private:
     // Preprocessor defines (--c-define) passed as /D to every clang-cl invocation:
     // the .c object compile, the .c auto-extern AST dump, and the header AST dump.
     std::vector<std::string> cDefines_;
+    // Runtime DLLs sourced from `import package-vcpkg`. Populated by the vcpkg resolver
+    // with the authoritative list from vcpkg_installed/<triplet>/bin and copied next to
+    // the exe by CopyCRuntimeDlls. Kept separate from cLinkLibs_-based DLL probing.
+    std::vector<std::string> vcpkgRuntimeDlls_;
+    // Vcpkg integration state. Owns manifest discovery, port validation, and the one-shot
+    // `vcpkg install` invocation. See VcpkgResolver.h.
+    VcpkgResolver vcpkg_;
 
     // Cache of C function signatures extracted from a .c via clang's AST dump, so the
     // (slow) clang spawn is skipped when the file is unchanged - important for LSP,
@@ -2670,6 +2678,10 @@ private:
     {
         namespace fs = std::filesystem;
         auto exeDir = fs::path(exePath).parent_path();
+        // The legacy probe path (below) and the vcpkg authoritative list often resolve to
+        // the same DLL when --c-lib is set by the vcpkg resolver. Track dest filenames so
+        // we don't copy + log the same file twice.
+        std::unordered_set<std::string> copiedDestNames;
         for (const auto& lib : cLinkLibs_)
         {
             fs::path libPath(lib);
@@ -2698,6 +2710,7 @@ private:
                         fs::copy_file(dll, dest, fs::copy_options::overwrite_existing, ec);
                         if (!ec)
                         {
+                            copiedDestNames.insert(dest.filename().string());
                             if (verbose) std::cout << "[verbose]   copied runtime DLL: " << dll.string()
                                                    << " -> " << dest.string() << "\n";
                             copied = true;
@@ -2709,6 +2722,21 @@ private:
             }
             if (!copied && verbose)
                 std::cout << "[verbose]   no runtime DLL found for " << lib << " (static lib?)\n";
+        }
+
+        // vcpkg-resolved DLLs: paths are authoritative (taken from the .list under
+        // vcpkg_installed/<triplet>/bin) - no probing needed, just copy. Skip ones the
+        // legacy probe above already copied.
+        for (const auto& dll : vcpkgRuntimeDlls_)
+        {
+            fs::path src(dll);
+            std::error_code ec;
+            if (!fs::exists(src, ec)) continue;
+            fs::path dest = exeDir / src.filename();
+            if (copiedDestNames.count(dest.filename().string())) continue;
+            fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
+            if (!ec && verbose)
+                std::cout << "[verbose]   copied vcpkg DLL: " << src.string() << " -> " << dest.string() << "\n";
         }
     }
 
@@ -7045,6 +7073,72 @@ public:
 
     bool Compile(const ArgParser& args);
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {});
+
+    // Vcpkg integration setters - wired from CLI flags in main.cpp.
+    void SetVcpkgExe(const std::string& path)        { vcpkg_.SetExeOverride(path); }
+    void SetVcpkgManifest(const std::string& path)   { vcpkg_.SetManifestOverride(path); }
+    void SetVcpkgTriplet(const std::string& triplet) { vcpkg_.SetTripletOverride(triplet); }
+
+    // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port
+    // through the user-owned vcpkg.json, pushes the resulting include dir / libs / DLLs
+    // into the per-backend accumulators, then routes the header through CompileCHeader
+    // (the existing C-header binding path). Returns false on hard error.
+    bool CompileVcpkgImport(const std::string& importingFilePath,
+                            const std::string& header,
+                            const std::string& portSpec)
+    {
+        // Mirror LSP/non-LSP mode and verbosity into the resolver.
+        vcpkg_.SetVerbose(verbose);
+        vcpkg_.SetLspMode(symbolSink_ != nullptr);
+        vcpkg_.SetPlatform(platformValue == 32 ? "win32" : "win64");
+
+        VcpkgResolver::Resolution res;
+        std::string err;
+        if (!vcpkg_.Resolve(importingFilePath, portSpec, res, err))
+        {
+            LogError(err);
+            return false;
+        }
+
+        // Push the resolved paths into the existing accumulators. Idempotent: a second
+        // package-vcpkg import re-pushes the same include dir, which is harmless (clang-cl
+        // dedupes -I, lld-link dedupes libs).
+        if (!res.includeDir.empty())
+        {
+            bool dup = false;
+            for (const auto& d : cIncludeDirs_) if (d == res.includeDir) { dup = true; break; }
+            if (!dup) cIncludeDirs_.push_back(res.includeDir);
+        }
+        for (const auto& lib : res.libs)
+        {
+            bool dup = false;
+            for (const auto& l : cLinkLibs_) if (l == lib) { dup = true; break; }
+            if (!dup) cLinkLibs_.push_back(lib);
+        }
+        for (const auto& dll : res.dlls)
+        {
+            bool dup = false;
+            for (const auto& d : vcpkgRuntimeDlls_) if (d == dll) { dup = true; break; }
+            if (!dup) vcpkgRuntimeDlls_.push_back(dll);
+        }
+
+        // The header path in source is relative to the include dir (e.g. "curl/curl.h").
+        // Resolve it against the vcpkg include dir explicitly so CompileCHeader sees an
+        // absolute path; the source-location filter in clang's AST dump already keeps
+        // only decls under our --c-include roots, so unrelated SDK/CRT decls stay out.
+        std::filesystem::path headerAbs = std::filesystem::path(res.includeDir) / header;
+        std::error_code ec;
+        auto headerCanon = std::filesystem::canonical(headerAbs, ec);
+        if (ec)
+        {
+            LogError(std::format(
+                "import package-vcpkg: header '{}' not found under '{}'.\n"
+                "  The port may not own this header, or the install is incomplete.",
+                header, res.includeDir));
+            return false;
+        }
+        return CompileCHeader(headerCanon.string(), {});
+    }
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 };

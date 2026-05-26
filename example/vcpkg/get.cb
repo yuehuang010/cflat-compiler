@@ -1,13 +1,9 @@
-// libcurl is the import lib for libcurl.dll; copy the DLL next to get.exe
-// before running. zlib is required for HTTP transfer decoding. TLS is provided
-// by Windows Schannel (default backend in vcpkg's curl port on Windows), so no
-// OpenSSL is needed.
-import package "curl/curl.h"
-    lib "vcpkg_installed/x64-windows/lib/libcurl.lib";
-// zlib is a runtime dep of libcurl.dll; bind it so z.dll is auto-copied
-// next to the exe.
-import package "zlib.h"
-    lib "vcpkg_installed/x64-windows/lib/z.lib";
+// libcurl over vcpkg. The new `import package-vcpkg` form lets cflat run
+// `vcpkg install` itself (against sibling vcpkg.json) and auto-resolve the
+// include dir, link libs, and runtime DLLs (libcurl.dll, z.dll, etc.) for the
+// declared port plus its transitive deps. No manual build.bat, no manual lib
+// paths.
+import package-vcpkg "curl/curl.h" from "curl";
 
 // Auto-extern skips these because CURLcode (enum) return type is not in the
 // supported scalar/pointer subset. Declare them manually; CURLcode is int-sized.

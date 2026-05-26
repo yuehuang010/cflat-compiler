@@ -1295,7 +1295,7 @@ extern int main()
 
 ## C Interop
 
-CFlat can compile your own `.c` source, import another file's `main` as a program, and bind prebuilt C libraries via header extraction. See [`C_INTEROP.md`](C_INTEROP.md) for the full reference (`import "x.c"`, `import program`, `import package`, and the `--c-*` flags).
+CFlat can compile your own `.c` source, import another file's `main` as a program, and bind prebuilt C libraries via header extraction or vcpkg. See [`C_INTEROP.md`](C_INTEROP.md) for the full reference (`import "x.c"`, `import program`, `import package`, `import package-vcpkg`, and the `--c-*` / `--vcpkg-*` flags).
 
 ---
 
@@ -1367,9 +1367,12 @@ cflat.exe <input.cb> [options]
 | `--c-include <dir>`     | Header search dir for C library bindings (repeatable) |
 | `--c-lib <path>`        | Prebuilt C import library (`.lib`) to link (repeatable) |
 | `--c-define <NAME[=val]>` | Preprocessor define passed to all clang-cl C compiles/dumps (repeatable) |
+| `--vcpkg-exe <path>`    | Explicit `vcpkg.exe` (overrides VS-bundled / `VCPKG_ROOT` / `PATH` discovery) |
+| `--vcpkg-manifest <path>` | Explicit `vcpkg.json` (skips the upward walk from the source file) |
+| `--vcpkg-triplet <triplet>` | vcpkg triplet (default derived from `--platform`: `x64-windows` / `x86-windows`) |
 | `--help`                | Show usage and available options |
 
-See [C Interop](#c-interop) for how the `--c-*` flags pair with `import "x.c"` and `import package`.
+See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `import "x.c"`, `import package`, and `import package-vcpkg`.
 
 ---
 

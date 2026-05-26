@@ -49,6 +49,23 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
     return defines;
 }
 
+// True when this import line is `import package-vcpkg "..." from "...";`. Detected by
+// the second child token text - mirrors the existing `package` / `program` test.
+static bool IsPackageVcpkgImport(CFlatParser::ImportDeclarationContext* imp)
+{
+    return imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg";
+}
+
+// Dequoted port spec from `from "..."` on an import package-vcpkg line (empty if absent).
+static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
+{
+    auto* fc = imp->fromClause();
+    if (!fc || !fc->StringLiteral()) return "";
+    std::string raw = fc->StringLiteral()->getText();
+    if (raw.size() < 2) return "";
+    return raw.substr(1, raw.size() - 2);
+}
+
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
 {
     std::vector<std::string> lines;
@@ -120,6 +137,11 @@ bool LLVMBackend::Compile(const ArgParser& args)
     for (const auto& lib : args.getMultiOption("c-lib"))
         cLinkLibs_.push_back(lib);
     cDefines_ = args.getMultiOption("c-define");
+    // Vcpkg integration options: forward to the resolver. Each is optional - the
+    // resolver auto-discovers vcpkg.exe and the manifest when not overridden.
+    if (auto p = args.getOption("vcpkg-exe"))      vcpkg_.SetExeOverride(*p);
+    if (auto p = args.getOption("vcpkg-manifest")) vcpkg_.SetManifestOverride(*p);
+    if (auto p = args.getOption("vcpkg-triplet"))  vcpkg_.SetTripletOverride(*p);
 
     if (verbose)
     {
@@ -258,6 +280,16 @@ bool LLVMBackend::Compile(const ArgParser& args)
                     if (auto* imp = decl->importDeclaration()) {
                         std::string raw = imp->StringLiteral()->getText();
                         std::string importFilename = raw.substr(1, raw.size() - 2);
+                        // `import package-vcpkg "header" from "port";` - dispatch to the
+                        // vcpkg resolver and skip the regular import dedup/parse machinery.
+                        if (IsPackageVcpkgImport(imp))
+                        {
+                            std::string portSpec = DequoteFromClause(imp);
+                            if (verbose) std::cout << "[verbose] vcpkg import: " << importFilename << " from " << portSpec << "\n";
+                            if (!CompileVcpkgImport(filename, importFilename, portSpec))
+                                return false;
+                            continue;
+                        }
                         std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                         bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
                         std::string alias = isProgram ? imp->Identifier()->getText() : "";
@@ -611,6 +643,14 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             {
                 std::string raw = imp->StringLiteral()->getText();
                 std::string nested = raw.substr(1, raw.size() - 2);
+                if (IsPackageVcpkgImport(imp))
+                {
+                    std::string portSpec = DequoteFromClause(imp);
+                    if (verbose) std::cout << "[verbose]   nested vcpkg import: " << nested << " from " << portSpec << "\n";
+                    if (!CompileVcpkgImport(canonicalStr, nested, portSpec))
+                        return false;
+                    continue;
+                }
                 std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
                 std::string nestedLib = DequoteLibClause(imp);
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
@@ -828,6 +868,13 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 if (auto* imp = decl->importDeclaration()) {
                     std::string raw = imp->StringLiteral()->getText();
                     std::string importFilename = raw.substr(1, raw.size() - 2);
+                    if (IsPackageVcpkgImport(imp))
+                    {
+                        std::string portSpec = DequoteFromClause(imp);
+                        if (!CompileVcpkgImport(filePath, importFilename, portSpec))
+                            return false;
+                        continue;
+                    }
                     std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                     bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
                     std::string alias = isProgram && imp->Identifier() ? imp->Identifier()->getText() : "";
