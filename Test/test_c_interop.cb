@@ -23,6 +23,10 @@
 //                       macro becomes an `auto` generic function callable without
 //                       explicit type args; rejected bodies (calls, strings,
 //                       member access, floats) must be silently dropped.
+//   Section K (120-129): typedef chain resolution - signatures spelled with
+//                       `typedef void* HANDLE` (and multi-hop chains like
+//                       SCK -> HANDLE -> void*) must auto-register; previously
+//                       skipped as "unsupported return/parameter type".
 
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
@@ -203,6 +207,27 @@ extern int main()
 
     // Cross-type instantiation: i64 arg forces CB_MIN<int,i64> with widened return.
     if (CB_MIN(3, (i64)7) != (i64)3)     return 115;
+
+    // ---- Section K: typedef chain resolution --------------------------------
+    // c_get_handle returns C_HANDLE (typedef void* C_HANDLE). Before this fix
+    // the function was skipped with "unsupported return type 'C_HANDLE'".
+    void* h = c_get_handle();
+    if (c_handle_load(h) != 0x5A5A5A5A) return 120;
+
+    // Multi-hop typedef: SCK -> C_HANDLE -> void*. Mapper must follow >1 hop.
+    if (c_sck_load(h) != 0x5A5A5A5A)    return 121;
+
+    // Typedef'd integer chain: C_LONG_PTR -> long long -> i64.
+    if (c_lp_double((i64)21) != (i64)42) return 122;
+
+    // Pointer-sentinel macro: CB_INVALID_HANDLE = ((CB_HANDLE)(CB_LONG_PTR)-1).
+    // Pass B's __typeof__ probe recovers the type as CB_HANDLE -> void*, so the
+    // macro is registered as a void* global and compares equal to the matching
+    // pointer returned from C. Before the fix it registered as an i64 constant
+    // and the comparison was a type error.
+    void* invalid_h = c_get_invalid_handle();
+    if (invalid_h != CB_INVALID_HANDLE) return 123;
+    if (h == CB_INVALID_HANDLE)         return 124;   // real handle, not sentinel
 
     return 0;
 }

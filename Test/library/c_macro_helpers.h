@@ -14,6 +14,15 @@
 #define CB_IS_ODD(n)  ((n) & 1)
 #define CB_CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 
+/* Pointer-sentinel macro. Pass B's __typeof__ probe recovers the type as
+   CB_HANDLE -> void*, so the macro registers as a void* global rather than
+   an i64 integer constant. The cflat side compares it directly against a
+   C-returned pointer of the same bit pattern (see c_get_invalid_handle in
+   cinterop.c). */
+typedef long long CB_LONG_PTR;
+typedef void* CB_HANDLE;
+#define CB_INVALID_HANDLE ((CB_HANDLE)(CB_LONG_PTR)-1)
+
 /* Each of the following must be silently rejected by the macro translator: */
 #define CB_REJECT_CALL(x)   (some_func(x))
 #define CB_REJECT_STRING(x) (x ? "y" : "n")

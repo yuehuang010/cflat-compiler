@@ -606,6 +606,11 @@ public:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
+    // Typedef name -> qualType string from C/header AST dumps. Populated by
+    // CollectCTypedefs as a pre-pass before signature/struct walks so the
+    // function-signature mapper can chase HANDLE -> void*, SOCKET -> uintptr_t,
+    // etc. Process-wide; first-writer-wins.
+    std::unordered_map<std::string, std::string> cTypedefMap_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
@@ -683,6 +688,12 @@ private:
         std::string file;
         int line = 1;
         int col = 0;
+        // True when the macro's natural type (recovered by Pass B's __typeof__ probe)
+        // is a void* (directly or via a typedef chain like HANDLE -> void *). Such
+        // macros are sentinel pointers (INVALID_HANDLE_VALUE, MAP_FAILED, ...) and
+        // RegisterCMacros emits them as void* globals so they can be compared against
+        // pointer-returning C APIs.
+        bool isPointer = false;
     };
     // A C struct/union decl extracted from a bound header or source. Field types are kept as
     // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
@@ -1815,12 +1826,46 @@ private:
     }
 
     // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
+    // Pre-pass over a clang JSON AST: collect top-level user typedefs so the signature
+    // mapper can later chase `HANDLE` -> `void *`, `SOCKET` -> `unsigned long long`, etc.
+    // Implicit typedefs (compiler-injected like __int128_t, size_t aliases) are skipped -
+    // they pull in noise without helping resolution. First-writer-wins so a later header
+    // doesn't clobber an earlier one's spelling. Safe to call multiple times.
+    void CollectCTypedefs(const llvm::json::Array* topLevel)
+    {
+        if (!topLevel) return;
+        for (const auto& v : *topLevel)
+        {
+            const llvm::json::Object* node = v.getAsObject();
+            if (!node) continue;
+            auto kind = node->getString("kind");
+            if (!kind || *kind != "TypedefDecl") continue;
+            if (auto imp = node->getBoolean("isImplicit"); imp && *imp) continue;
+            auto name = node->getString("name");
+            if (!name) continue;
+            const llvm::json::Object* typeObj = node->getObject("type");
+            if (!typeObj) continue;
+            std::string target;
+            if (auto d = typeObj->getString("desugaredQualType")) target = d->str();
+            else if (auto q = typeObj->getString("qualType"))     target = q->str();
+            if (target.empty()) continue;
+            cTypedefMap_.emplace(name->str(), target);
+        }
+    }
+
     // Returns false for anything the extern ABI cannot faithfully pass - struct/union
     // by value, > 2 pointer levels, or an unknown scalar - so the caller can skip the
     // whole function rather than emit a wrong signature. This intentionally mirrors the
     // scalar+pointer subset that GetCCompatibleType already supports for hand-written
     // extern declarations.
     bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out)
+    {
+        std::unordered_set<std::string> visited;
+        return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited);
+    }
+
+    bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
+                                    std::unordered_set<std::string>& visited)
     {
         // Arrays decay to a pointer; drop the '[...]' and bump the pointer level.
         int ptr = 0;
@@ -1911,7 +1956,21 @@ private:
                 return true;
             }
             else
+            {
+                // Final fallback: chase a user typedef recorded by CollectCTypedefs. We
+                // append the original pointer-star count so HANDLE (ptr=0) recursing into
+                // "void *" lands at void with ptr=1. Visited-set prevents pathological
+                // self-referential typedefs from looping (clang would have errored, but
+                // be defensive).
+                auto td = cTypedefMap_.find(base);
+                if (td != cTypedefMap_.end() && visited.insert(base).second)
+                {
+                    std::string substituted = td->second;
+                    if (ptr > 0) substituted += std::string(ptr, '*');
+                    return MapCTypeToTypeAndValueImpl(std::move(substituted), out, visited);
+                }
                 return false;    // struct/union by value or unknown scalar
+            }
         }
 
         out.TypeName = mapped;
@@ -2116,6 +2175,10 @@ private:
         if (!tu) return false;
         const llvm::json::Array* topLevel = tu->getArray("inner");
         if (!topLevel) return true; // parsed fine, nothing to register
+
+        // Collect typedefs first so the signature mapper can chase pointer aliases
+        // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
+        CollectCTypedefs(topLevel);
 
         auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string
         {
@@ -2476,20 +2539,36 @@ private:
             if (m.name.empty()) continue;
             if (globalNamedVariable.count(m.name)) continue;
 
-            bool wide = (m.value < INT32_MIN || m.value > INT32_MAX);
             TypeAndValue tv;
-            tv.TypeName     = wide ? "i64" : "int";
             tv.VariableName = m.name;
-            tv.Pointer      = false;
-            llvm::Constant* c = wide
-                ? static_cast<llvm::Constant*>(builder->getInt64((uint64_t)m.value))
-                : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)m.value));
+            llvm::Constant* c = nullptr;
+            if (m.isPointer)
+            {
+                // Sentinel pointer macro (e.g. INVALID_HANDLE_VALUE). Register as a
+                // void* global initialized by reinterpreting the folded bit pattern
+                // as a pointer - matches the C macro's natural type so direct compares
+                // against a HANDLE-returning API succeed without an explicit cast.
+                tv.TypeName = "void";
+                tv.Pointer  = true;
+                llvm::Type* i8Ptr = llvm::PointerType::get(*context, 0);
+                llvm::Constant* bits = builder->getInt64((uint64_t)m.value);
+                c = llvm::ConstantExpr::getIntToPtr(bits, i8Ptr);
+            }
+            else
+            {
+                bool wide = (m.value < INT32_MIN || m.value > INT32_MAX);
+                tv.TypeName = wide ? "i64" : "int";
+                tv.Pointer  = false;
+                c = wide
+                    ? static_cast<llvm::Constant*>(builder->getInt64((uint64_t)m.value))
+                    : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)m.value));
+            }
             CreateGlobalVariable(tv, c);
             ++registered;
 
             if (auto* s = GetSymbolSink())
                 s->Register(SymbolKind::Variable, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
-                            tv.TypeName + " " + m.name);
+                            tv.TypeName + (tv.Pointer ? "* " : " ") + m.name);
         }
         if (verbose && !macros.empty())
             std::cout << "[verbose]   registered " << registered << " C macro constant(s) (of "
@@ -2907,7 +2986,15 @@ private:
             if (ec) return false;
             os << "#include \"" << fwdHeader << "\"\n";
             for (const auto& m : candidates)
+            {
+                // Value probe: folds the macro to a (long long) integer constant for value
+                // extraction. Type probe: declares a global of the macro's natural type via
+                // __typeof__ so the AST dump reports the unfolded type. The type-probe line
+                // can fail in isolation (e.g. when the macro is not an expression) without
+                // affecting the value-probe enum thanks to -ferror-limit=0 error recovery.
                 os << "enum { __cflat_m_" << m.name << " = (long long)(" << m.name << ") };\n";
+                os << "__typeof__(" << m.name << ") __cflat_t_" << m.name << ";\n";
+            }
             os.close();
         }
 
@@ -2932,24 +3019,49 @@ private:
         const llvm::json::Array* topLevel = tu->getArray("inner");
         if (!topLevel) return true;
 
-        // Walk every EnumConstantDecl in the AST (top-level enums are inlined as
-        // EnumDecl children with EnumConstantDecl inside). Names beginning with
-        // __cflat_m_ are ours; strip the prefix and merge with the discovery map.
-        const std::string prefix = "__cflat_m_";
-        std::unordered_map<std::string, long long> resolved;
+        // Walk the AST once and gather both pieces per macro:
+        //   __cflat_m_NAME (EnumConstantDecl) -> folded long long value
+        //   __cflat_t_NAME (VarDecl)          -> recovered qualType (HANDLE, void *, ...)
+        // EnumConstantDecls are nested inside EnumDecls; VarDecls live at top level.
+        // Both can fail independently (per-decl recovery via -ferror-limit=0).
+        const std::string mPrefix = "__cflat_m_";
+        const std::string tPrefix = "__cflat_t_";
+        std::unordered_map<std::string, long long>   resolvedVal;
+        std::unordered_map<std::string, std::string> resolvedType;
         std::function<void(const llvm::json::Value&)> visit = [&](const llvm::json::Value& v) {
             const llvm::json::Object* node = v.getAsObject();
             if (!node) return;
-            if (auto kind = node->getString("kind"); kind && *kind == "EnumConstantDecl")
+            if (auto kind = node->getString("kind"))
             {
-                if (auto nm = node->getString("name"))
+                if (*kind == "EnumConstantDecl")
                 {
-                    std::string n = nm->str();
-                    if (n.rfind(prefix, 0) == 0)
+                    if (auto nm = node->getString("name"))
                     {
-                        long long val = 0;
-                        if (FindConstantValue(node, val))
-                            resolved[n.substr(prefix.size())] = val;
+                        std::string n = nm->str();
+                        if (n.rfind(mPrefix, 0) == 0)
+                        {
+                            long long val = 0;
+                            if (FindConstantValue(node, val))
+                                resolvedVal[n.substr(mPrefix.size())] = val;
+                        }
+                    }
+                }
+                else if (*kind == "VarDecl")
+                {
+                    if (auto nm = node->getString("name"))
+                    {
+                        std::string n = nm->str();
+                        if (n.rfind(tPrefix, 0) == 0)
+                        {
+                            if (auto* typeObj = node->getObject("type"))
+                            {
+                                std::string t;
+                                if (auto d = typeObj->getString("desugaredQualType")) t = d->str();
+                                else if (auto q = typeObj->getString("qualType"))     t = q->str();
+                                if (!t.empty())
+                                    resolvedType[n.substr(tPrefix.size())] = std::move(t);
+                            }
+                        }
                     }
                 }
             }
@@ -2958,17 +3070,30 @@ private:
         };
         for (const auto& v : *topLevel) visit(v);
 
-        outMacros.reserve(resolved.size());
+        outMacros.reserve(resolvedVal.size());
         for (const auto& cand : candidates)
         {
-            auto it = resolved.find(cand.name);
-            if (it == resolved.end()) continue; // dropped (non-int, non-constant, string, etc.)
+            auto it = resolvedVal.find(cand.name);
+            if (it == resolvedVal.end()) continue; // dropped (non-int, non-constant, string, etc.)
             CMacroEntry e;
             e.name  = cand.name;
             e.value = it->second;
             e.file  = cand.file;
             e.line  = cand.line;
             e.col   = 0;
+            // If the type probe also succeeded, ask the signature mapper whether the
+            // recovered type chases (through cTypedefMap_) down to void*. Only that
+            // shape qualifies as a pointer sentinel under the current scope.
+            auto tt = resolvedType.find(cand.name);
+            if (tt != resolvedType.end())
+            {
+                TypeAndValue tv;
+                if (MapCTypeToTypeAndValue(tt->second, tv)
+                    && tv.Pointer && !tv.ElemPointer && tv.TypeName == "void")
+                {
+                    e.isPointer = true;
+                }
+            }
             outMacros.push_back(std::move(e));
         }
 
@@ -3032,6 +3157,10 @@ private:
         if (!tu) return false;
         const llvm::json::Array* topLevel = tu->getArray("inner");
         if (!topLevel) return true;
+
+        // Collect typedefs first so the signature mapper can chase pointer aliases
+        // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
+        CollectCTypedefs(topLevel);
 
         // Normalize a path for prefix comparison: forward slashes, lowercase (Windows).
         auto norm = [](std::string p) {
