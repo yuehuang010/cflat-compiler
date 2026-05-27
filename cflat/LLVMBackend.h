@@ -460,6 +460,32 @@ public:
         }
     };
 
+    // ABI lowering recipe for one parameter or return value when calling a C extern with
+    // struct-by-value in its signature. Each slot tells the call-site emitter how to bridge
+    // a CFlat struct value to the platform ABI:
+    //   - Direct       : no lowering (scalar / pointer); pass the value as-is
+    //   - CoerceToInt  : load the struct as an iN integer (size in {1,2,4,8} bytes) and pass
+    //                    that. For the return slot, the iN result is stored back to a temp
+    //                    alloca and reinterpreted as the struct.
+    //   - ByVal        : pass a pointer to a caller-allocated copy of the struct. The LLVM
+    //                    'byval' attribute carries the pointee struct type + alignment.
+    //   - SRetReturn   : (return only) the function returns void; the caller passes a hidden
+    //                    pointer as arg 0 with the 'sret' attribute, callee writes through it.
+    struct AbiSlot
+    {
+        enum Kind { Direct, CoerceToInt, ByVal, SRetReturn };
+        Kind kind = Direct;
+        llvm::Type* coerceTy = nullptr;     // iN type for CoerceToInt
+        llvm::StructType* structTy = nullptr; // pointee for ByVal / SRetReturn (and source of byval/sret type attrs)
+        uint64_t align = 0;                  // byval/sret alignment hint
+    };
+    struct AbiRecipe
+    {
+        bool hasLowering = false;            // true if at least one slot is non-Direct
+        AbiSlot retSlot;
+        std::vector<AbiSlot> paramSlots;
+    };
+
     class FunctionSymbol
     {
     public:
@@ -471,6 +497,7 @@ public:
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
+        AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
     };
 
     struct InterfaceMethod
@@ -632,12 +659,29 @@ private:
         int line = 1;
         int col = 0;
     };
+    // A C struct/union decl extracted from a bound header or source. Field types are kept as
+    // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
+    // all records in the same TU are registered (handles forward references between structs).
+    struct CRecordFieldEntry
+    {
+        std::string name;
+        std::string ctype;
+    };
+    struct CRecordEntry
+    {
+        std::string name;                       // tag name (e.g. "Point")
+        bool isUnion = false;                   // tagUsed == "union"
+        std::vector<CRecordFieldEntry> fields;
+        int line = 1;
+        int col = 0;
+    };
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
         uint64_t hash = 0;
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
+        std::vector<CRecordEntry> records;
     };
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -1756,11 +1800,27 @@ private:
             return false;
 
         // enum decays to int; struct/union pointers become opaque void* (the call only
-        // needs a pointer-sized slot). A struct/union *by value* falls through to false.
+        // needs a pointer-sized slot). For struct/union *by value* we look up the tag in
+        // dataStructures - the auto-registered C struct gets a CFlat TypeAndValue with that
+        // tag name and Pointer=false, so call-site ABI lowering can see the layout.
         std::string mapped;
         if (base.rfind("enum ", 0) == 0)
         {
             mapped = "int";
+        }
+        else if (ptr == 0 && (base.rfind("struct ", 0) == 0 || base.rfind("union ", 0) == 0))
+        {
+            std::string tag = (base.rfind("struct ", 0) == 0)
+                ? base.substr(7)
+                : base.substr(6);
+            // Trim any trailing whitespace (shouldn't happen post-normalize but be defensive).
+            while (!tag.empty() && tag.back() == ' ') tag.pop_back();
+            if (tag.empty() || dataStructures.find(tag) == dataStructures.end())
+                return false;
+            out.TypeName = tag;
+            out.Pointer = false;
+            out.ElemPointer = false;
+            return true;
         }
         else
         {
@@ -1783,6 +1843,15 @@ private:
                 mapped = it->second;
             else if (ptr > 0)
                 mapped = "void"; // unknown pointee (struct*, function ptr, ...) -> opaque ptr
+            else if (dataStructures.find(base) != dataStructures.end())
+            {
+                // Bare typedef-style spelling resolved to a registered C struct (e.g. clang
+                // emitted "Point" for a `typedef struct Point Point;` without the tag prefix).
+                out.TypeName = base;
+                out.Pointer = false;
+                out.ElemPointer = false;
+                return true;
+            }
             else
                 return false;    // struct/union by value or unknown scalar
         }
@@ -1915,7 +1984,8 @@ private:
     // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
     // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
     bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
-                            std::vector<CSigEntry>& outSigs)
+                            std::vector<CSigEntry>& outSigs,
+                            std::vector<CRecordEntry>& outRecords)
     {
         const std::string target = (platformValue == 32)
             ? "--target=i686-pc-windows-msvc"
@@ -1950,6 +2020,51 @@ private:
             if (auto q = typeObj->getString("qualType")) return q->str();
             return "";
         };
+
+        // First pass: collect record (struct/union) decls. Recording them up front
+        // (before function signatures) lets MapCTypeToTypeAndValue resolve struct-by-
+        // value parameter / return types against the registered structs.
+        for (const llvm::json::Value& v : *topLevel)
+        {
+            const llvm::json::Object* node = v.getAsObject();
+            if (!node) continue;
+            auto kind = node->getString("kind");
+            if (!kind || *kind != "RecordDecl") continue;
+            auto nm = node->getString("name");
+            if (!nm || nm->empty()) continue; // skip anonymous records (handled via typedef path later, if ever)
+            auto cd = node->getBoolean("completeDefinition");
+            if (!cd || !*cd) continue; // forward decls give us no layout
+            auto tag = node->getString("tagUsed");
+            CRecordEntry rec;
+            rec.name = nm->str();
+            rec.isUnion = tag && *tag == "union";
+            if (auto* inner = node->getArray("inner"))
+            {
+                for (const auto& c : *inner)
+                {
+                    const llvm::json::Object* co = c.getAsObject();
+                    if (!co) continue;
+                    auto ck = co->getString("kind");
+                    if (!ck || *ck != "FieldDecl") continue;
+                    auto fname = co->getString("name");
+                    if (!fname) continue;
+                    CRecordFieldEntry fe;
+                    fe.name = fname->str();
+                    fe.ctype = qualTypeOf(co->getObject("type"));
+                    rec.fields.push_back(std::move(fe));
+                }
+            }
+            if (auto* loc = node->getObject("loc"))
+            {
+                if (auto l = loc->getInteger("line")) rec.line = (int)*l;
+                if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
+            }
+            outRecords.push_back(std::move(rec));
+        }
+
+        // Register the records now so MapCTypeToTypeAndValue can resolve struct-by-value
+        // parameter / return types in the function-decl pass below.
+        RegisterCRecords(outRecords, cSourcePath);
 
         for (const llvm::json::Value& v : *topLevel)
         {
@@ -2065,6 +2180,7 @@ private:
         // --- Cache lookup under lock. Copy the signatures out, then register after the
         //     lock is released, so the global cache never serializes per-backend work. ---
         std::vector<CSigEntry> hitSigs;
+        std::vector<CRecordEntry> hitRecords;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -2076,6 +2192,7 @@ private:
                 {
                     if (verbose) std::cout << "[verbose] C signatures cache hit (mtime) for " << fileForLsp << "\n";
                     hitSigs = entry.sigs;
+                    hitRecords = entry.records;
                     hit = true;
                 }
                 // Timestamp moved but content may be identical - only now pay for a hash.
@@ -2084,12 +2201,16 @@ private:
                     if (verbose) std::cout << "[verbose] C signatures cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
                     hitSigs = entry.sigs;
+                    hitRecords = entry.records;
                     hit = true;
                 }
             }
         }
         if (hit)
         {
+            // Records must be registered before sigs so signatures referencing struct-by-
+            // value resolve to the same dataStructures entries on cache hits.
+            RegisterCRecords(hitRecords, fileForLsp);
             RegisterCSignatures(hitSigs, fileForLsp, programAlias);
             return true;
         }
@@ -2101,7 +2222,8 @@ private:
             return false;
 
         std::vector<CSigEntry> sigs;
-        if (!RunClangAstExtract(clangPath, cSourcePath, sigs))
+        std::vector<CRecordEntry> records;
+        if (!RunClangAstExtract(clangPath, cSourcePath, sigs, records))
             return false;
 
         if (!mtEc)
@@ -2110,10 +2232,13 @@ private:
             entry.mtime = currentMtime;
             entry.hash  = hashNow();
             entry.sigs  = sigs;
+            entry.records = records;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
 
+        // Records were already registered inside RunClangAstExtract (so it could map
+        // struct-by-value parameter types); do not re-register here.
         RegisterCSignatures(sigs, fileForLsp, programAlias);
         return true;
     }
@@ -2169,6 +2294,72 @@ private:
             std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
     }
 
+    // Auto-register C struct/union decls extracted from a header or .c source as CFlat
+    // struct types. Two passes: first creates an opaque shell for every record so fields
+    // that reference siblings (or self-pointers) can resolve, then fills each body via
+    // MapCTypeToTypeAndValue (which now accepts "struct Name" once the shell exists).
+    // First-writer-wins on dataStructures: a hand-written CFlat struct with the same name,
+    // or an earlier header's contribution, takes precedence over later C-side definitions.
+    void RegisterCRecords(const std::vector<CRecordEntry>& records, const std::string& fileForLsp)
+    {
+        if (records.empty()) return;
+
+        // Pass 1: opaque shells. Skip ones already in dataStructures so we never overwrite
+        // a CFlat-defined struct with C metadata.
+        std::vector<const CRecordEntry*> ours;
+        ours.reserve(records.size());
+        for (const auto& r : records)
+        {
+            if (r.name.empty()) continue;
+            if (r.isUnion) continue; // unions deferred - layout is non-trivial (anonymous union member of struct, etc.)
+            if (dataStructures.find(r.name) != dataStructures.end()) continue;
+            // Create the opaque shell now so a later field can refer to `struct r.name *`
+            // or to another record being registered in the same batch.
+            CreateStructType(r.name, /*typeAndValues*/{});
+            ours.push_back(&r);
+        }
+
+        // Pass 2: bodies. If any field type cannot be mapped, abandon this record and erase
+        // the shell - leaving an opaque struct around would silently miscompile any caller
+        // that tried to instantiate it.
+        for (const CRecordEntry* rp : ours)
+        {
+            const CRecordEntry& r = *rp;
+            std::vector<DeclTypeAndValue> fields;
+            fields.reserve(r.fields.size());
+            bool ok = true;
+            for (const auto& f : r.fields)
+            {
+                TypeAndValue tv;
+                if (!MapCTypeToTypeAndValue(f.ctype, tv))
+                {
+                    if (verbose) std::cout << "[verbose]   skipping C struct '" << r.name
+                                           << "': unsupported field '" << f.name
+                                           << "' of type '" << f.ctype << "'\n";
+                    ok = false;
+                    break;
+                }
+                DeclTypeAndValue d;
+                static_cast<TypeAndValue&>(d) = tv;
+                d.VariableName = f.name;
+                fields.push_back(std::move(d));
+            }
+            if (!ok || fields.empty())
+            {
+                // Leave the shell in place for !ok with no body so we don't crash on later
+                // references; the user will get a clear error if they try to use it.
+                continue;
+            }
+            CreateStructType(r.name, fields);
+            if (auto* s = GetSymbolSink())
+                s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
+                            "struct " + r.name);
+        }
+
+        if (verbose)
+            std::cout << "[verbose]   registered " << ours.size() << " C record(s) from " << fileForLsp << "\n";
+    }
+
     // Spawn clang's JSON AST dump for a C *header* (via a stub TU that #includes it) and
     // parse out the externally-linkable function *declarations* and enum constants the
     // header itself contributes. A header pulls in the whole SDK/CRT transitively, so a
@@ -2176,6 +2367,7 @@ private:
     // or one of the --c-include roots. Fills outSigs/outEnums; false on clang/parse error.
     bool RunClangHeaderExtract(const std::string& clangPath, const std::string& headerPath,
                                std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
+                               std::vector<CRecordEntry>& outRecords,
                                const std::vector<std::string>& extraDefines = {})
     {
         const std::string target = (platformValue == 32)
@@ -2266,6 +2458,69 @@ private:
                 if (!r.empty() && nf.rfind(r, 0) == 0) return true;
             return false;
         };
+
+        // Pre-pass: collect record (struct/union) decls so MapCTypeToTypeAndValue can resolve
+        // struct-by-value parameter/return types when the function-decl pass runs below. Uses
+        // its own sticky lastFile so we don't perturb the main loop's tracker.
+        {
+            std::string preLastFile;
+            auto preFileOfNode = [&](const llvm::json::Object* node) -> std::string {
+                auto pick = [&](const llvm::json::Object* o) {
+                    if (o)
+                        if (auto f = o->getString("file")) preLastFile = f->str();
+                };
+                if (auto* loc = node->getObject("loc"))
+                {
+                    pick(loc);
+                    if (auto* exp = loc->getObject("expansionLoc")) pick(exp);
+                    if (auto* spel = loc->getObject("spellingLoc")) pick(spel);
+                }
+                if (auto* range = node->getObject("range"))
+                    if (auto* begin = range->getObject("begin"))
+                        pick(begin);
+                return preLastFile;
+            };
+            for (const llvm::json::Value& v : *topLevel)
+            {
+                const llvm::json::Object* node = v.getAsObject();
+                if (!node) continue;
+                const std::string curFile = preFileOfNode(node);
+                auto kind = node->getString("kind");
+                if (!kind || *kind != "RecordDecl") continue;
+                if (!inScope(curFile)) continue;
+                auto nm = node->getString("name");
+                if (!nm || nm->empty()) continue;
+                auto cd = node->getBoolean("completeDefinition");
+                if (!cd || !*cd) continue;
+                auto tag = node->getString("tagUsed");
+                CRecordEntry rec;
+                rec.name = nm->str();
+                rec.isUnion = tag && *tag == "union";
+                if (auto* inner = node->getArray("inner"))
+                {
+                    for (const auto& c : *inner)
+                    {
+                        const llvm::json::Object* co = c.getAsObject();
+                        if (!co) continue;
+                        auto ck = co->getString("kind");
+                        if (!ck || *ck != "FieldDecl") continue;
+                        auto fname = co->getString("name");
+                        if (!fname) continue;
+                        CRecordFieldEntry fe;
+                        fe.name = fname->str();
+                        fe.ctype = qualTypeOf(co->getObject("type"));
+                        rec.fields.push_back(std::move(fe));
+                    }
+                }
+                if (auto* loc = node->getObject("loc"))
+                {
+                    if (auto l = loc->getInteger("line")) rec.line = (int)*l;
+                    if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
+                }
+                outRecords.push_back(std::move(rec));
+            }
+            RegisterCRecords(outRecords, headerPath);
+        }
 
         for (const llvm::json::Value& v : *topLevel)
         {
@@ -2402,6 +2657,7 @@ private:
 
         std::vector<CSigEntry> hitSigs;
         std::vector<CEnumEntry> hitEnums;
+        std::vector<CRecordEntry> hitRecords;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -2412,18 +2668,20 @@ private:
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime;
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hit = true;
                 }
             }
         }
         if (hit)
         {
+            // Records before sigs so struct-by-value signatures resolve to the same types.
+            RegisterCRecords(hitRecords, fileForLsp);
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             return true;
@@ -2438,7 +2696,8 @@ private:
 
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
-        if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, extraDefines))
+        std::vector<CRecordEntry> records;
+        if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
             return false;
 
         if (!mtEc)
@@ -2448,10 +2707,12 @@ private:
             entry.hash  = hashNow();
             entry.sigs  = sigs;
             entry.enums = enums;
+            entry.records = records;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
 
+        // Records were already registered inside RunClangHeaderExtract.
         RegisterCSignatures(sigs, fileForLsp);
         RegisterCEnums(enums, fileForLsp);
         return true;
@@ -5023,9 +5284,180 @@ public:
         }
     }
 
+    // True when tv refers to a C-compatible struct (or auto-registered C struct) passed by
+    // value (Pointer=false). Excludes interface fat-pointers, function pointers, strings,
+    // and any TypeName not present in dataStructures with a complete (non-opaque) body.
+    bool IsByValueStructTV(const TypeAndValue& tv) const
+    {
+        if (tv.Pointer) return false;
+        if (tv.IsInterface || tv.IsFunctionPointer) return false;
+        if (tv.TypeName.empty()) return false;
+        auto it = dataStructures.find(tv.TypeName);
+        if (it == dataStructures.end()) return false;
+        auto* st = it->second.StructType;
+        return st != nullptr && !st->isOpaque();
+    }
+
+    // Win64 / Win32 ABI classification for a single param slot. Returns Direct for scalars
+    // and pointers (the existing pipeline handles them). For struct-by-value:
+    //   - Win64: size in {1,2,4,8} -> CoerceToInt(iN); else ByVal(pointer + byval attr).
+    //   - Win32: always ByVal (cdecl pushes the whole struct on the stack).
+    AbiSlot ClassifyAbiParam(const TypeAndValue& tv)
+    {
+        AbiSlot slot;
+        if (!IsByValueStructTV(tv)) return slot; // Direct
+        auto* st = dataStructures.at(tv.TypeName).StructType;
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t size  = dl.getTypeAllocSize(st);
+        uint64_t align = dl.getABITypeAlign(st).value();
+        if (platformValue == 64 && (size == 1 || size == 2 || size == 4 || size == 8))
+        {
+            slot.kind     = AbiSlot::CoerceToInt;
+            slot.coerceTy = llvm::Type::getIntNTy(*context, (unsigned)(size * 8));
+            slot.structTy = st;
+            slot.align    = align;
+        }
+        else
+        {
+            slot.kind     = AbiSlot::ByVal;
+            slot.structTy = st;
+            // On Win32 cdecl the parameter slot is 4-byte aligned (the stack itself is
+            // S32-aligned), so byval must report align 4 even if the struct's natural
+            // alignment is larger - mirroring clang. Otherwise the callee will use
+            // aligned loads against an actually-misaligned stack slot.
+            slot.align    = (platformValue == 32) ? std::min<uint64_t>(align, 4) : align;
+        }
+        return slot;
+    }
+
+    // Win64 / Win32 ABI classification for the return slot.
+    //   - size in {1,2,4,8} -> CoerceToInt(iN) (returned in RAX / EDX:EAX as appropriate).
+    //   - otherwise         -> SRetReturn: function returns void, caller passes hidden
+    //                          pointer as arg 0 with the 'sret' attribute.
+    AbiSlot ClassifyAbiReturn(const TypeAndValue& tv)
+    {
+        AbiSlot slot;
+        if (!IsByValueStructTV(tv)) return slot; // Direct
+        auto* st = dataStructures.at(tv.TypeName).StructType;
+        const llvm::DataLayout& dl = module->getDataLayout();
+        uint64_t size  = dl.getTypeAllocSize(st);
+        uint64_t align = dl.getABITypeAlign(st).value();
+        if (size == 1 || size == 2 || size == 4 || size == 8)
+        {
+            slot.kind     = AbiSlot::CoerceToInt;
+            slot.coerceTy = llvm::Type::getIntNTy(*context, (unsigned)(size * 8));
+            slot.structTy = st;
+            slot.align    = align;
+        }
+        else
+        {
+            slot.kind     = AbiSlot::SRetReturn;
+            slot.structTy = st;
+            slot.align    = align;
+        }
+        return slot;
+    }
+
+    // Build the full lowering recipe for an extern C function signature. hasLowering is
+    // set if at least one slot is non-Direct so the call site knows whether to take the
+    // fast path (existing CreateFunctionCall) or the ABI-rewriting path.
+    AbiRecipe ComputeAbiRecipe(const TypeAndValue& retType,
+                               const std::vector<TypeAndValue>& params)
+    {
+        AbiRecipe recipe;
+        recipe.retSlot = ClassifyAbiReturn(retType);
+        recipe.paramSlots.reserve(params.size());
+        for (const auto& p : params)
+            recipe.paramSlots.push_back(ClassifyAbiParam(p));
+        recipe.hasLowering = (recipe.retSlot.kind != AbiSlot::Direct);
+        if (!recipe.hasLowering)
+            for (const auto& s : recipe.paramSlots)
+                if (s.kind != AbiSlot::Direct) { recipe.hasLowering = true; break; }
+        return recipe;
+    }
+
+    // Build the LLVM FunctionType for an extern C function with the given recipe applied.
+    // - SRetReturn ret: function returns void, prepend a ptr param for the hidden sret slot.
+    // - CoerceToInt ret: function returns iN.
+    // - Direct ret: GetCCompatibleType(retType).
+    // - ByVal param: ptr (callee sees a pointer; LLVM x86/x64 backend lowers byval correctly).
+    // - CoerceToInt param: iN.
+    // - Direct param: GetCCompatibleType(p).
+    llvm::FunctionType* BuildExternFunctionType(const TypeAndValue& retType,
+                                                const std::vector<TypeAndValue>& params,
+                                                bool varargs,
+                                                const AbiRecipe& recipe)
+    {
+        std::vector<llvm::Type*> ptypes;
+        ptypes.reserve(params.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
+
+        llvm::Type* loweredRet = nullptr;
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            loweredRet = builder->getVoidTy();
+            // Hidden sret pointer goes first.
+            ptypes.push_back(recipe.retSlot.structTy->getPointerTo());
+        }
+        else if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
+            loweredRet = recipe.retSlot.coerceTy;
+        else
+            loweredRet = GetCCompatibleType(retType);
+
+        for (size_t i = 0; i < params.size(); ++i)
+        {
+            const AbiSlot& s = recipe.paramSlots[i];
+            if (s.kind == AbiSlot::CoerceToInt)
+                ptypes.push_back(s.coerceTy);
+            else if (s.kind == AbiSlot::ByVal)
+                ptypes.push_back(s.structTy->getPointerTo());
+            else
+                ptypes.push_back(GetCCompatibleType(params[i]));
+        }
+        return llvm::FunctionType::get(loweredRet, ptypes, varargs);
+    }
+
+    // Attach byval / sret / alignment attributes on the function declaration per the recipe.
+    // These are LLVM-level hints required for correct ABI lowering (the x86/x64 backend
+    // uses them to decide register vs stack placement, byval copies, and sret semantics).
+    void ApplyAbiAttributes(llvm::Function* fn, const AbiRecipe& recipe)
+    {
+        unsigned attrIdx = 0; // LLVM param attribute indices are 0-based on the function's actual param list
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            fn->addParamAttr(attrIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
+            fn->addParamAttr(attrIdx, llvm::Attribute::NoAlias);
+            if (recipe.retSlot.align > 0)
+                fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
+            ++attrIdx;
+        }
+        for (size_t i = 0; i < recipe.paramSlots.size(); ++i, ++attrIdx)
+        {
+            const AbiSlot& s = recipe.paramSlots[i];
+            if (s.kind == AbiSlot::ByVal)
+            {
+                fn->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
+                if (s.align > 0)
+                    fn->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
+            }
+        }
+    }
+
     void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false)
     {
-        auto functionType = GetFunctionType(returnType, arguments, varargs, external);
+        // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
+        // are lowered (coerce-to-int / byval / sret) per the Win64 or Win32 MSVC ABI. If the
+        // recipe has no lowering (scalar/pointer only) the existing GetFunctionType path is used.
+        AbiRecipe recipe;
+        bool useRecipe = false;
+        if (external)
+        {
+            recipe = ComputeAbiRecipe(returnType, arguments);
+            useRecipe = recipe.hasLowering;
+        }
+
+        llvm::FunctionType* functionType = useRecipe
+            ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
+            : GetFunctionType(returnType, arguments, varargs, external);
         std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (module->getFunction(mangledName) != nullptr)
@@ -5041,6 +5473,9 @@ public:
             else if (isCdecl)
                 fn->setCallingConv(llvm::CallingConv::C);
 
+            if (useRecipe)
+                ApplyAbiAttributes(fn, recipe);
+
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,
@@ -5049,6 +5484,7 @@ public:
                 .Variadic = fn->isVarArg(),
                 .ReturnsOwned = returnsOwned,
                 .IsMethod = isMethod,
+                .Recipe = recipe,
             };
 
             for (const auto& arg : arguments)
@@ -6095,6 +6531,7 @@ public:
             }
         }
 
+
         // Check: bonded value must not be passed to a move parameter (would transfer ownership out of scope).
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
@@ -6102,7 +6539,14 @@ public:
                 LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter - bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
         }
 
-        auto* result = CreateFunctionCall(candidate.Function, argList);
+        // C-extern ABI lowering: when the resolved candidate has struct-by-value params or
+        // return, the LLVM Function was declared with the lowered signature (iN coerce /
+        // byval ptr / sret). The current argList still holds CFlat-natural struct values -
+        // EmitAbiLoweredCall rewrites it to match the recipe and reloads the struct return
+        // for the caller. Otherwise fall through to the existing call path.
+        llvm::Value* result = candidate.Recipe.hasLowering
+            ? EmitAbiLoweredCall(candidate, argList)
+            : CreateFunctionCall(candidate.Function, argList);
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
@@ -6667,6 +7111,93 @@ public:
         }
 
         return {};
+    }
+
+    // Mirror of ApplyAbiAttributes but for a CallInst. LLVM's verifier requires that the
+    // sret / byval attributes appear on both the function declaration AND every call site.
+    void ApplyAbiCallAttributes(llvm::CallInst* ci, const AbiRecipe& recipe)
+    {
+        unsigned attrIdx = 0;
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            ci->addParamAttr(attrIdx, llvm::Attribute::getWithStructRetType(*context, recipe.retSlot.structTy));
+            ci->addParamAttr(attrIdx, llvm::Attribute::NoAlias);
+            if (recipe.retSlot.align > 0)
+                ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(recipe.retSlot.align)));
+            ++attrIdx;
+        }
+        for (size_t i = 0; i < recipe.paramSlots.size(); ++i, ++attrIdx)
+        {
+            const AbiSlot& s = recipe.paramSlots[i];
+            if (s.kind == AbiSlot::ByVal)
+            {
+                ci->addParamAttr(attrIdx, llvm::Attribute::getWithByValType(*context, s.structTy));
+                if (s.align > 0)
+                    ci->addParamAttr(attrIdx, llvm::Attribute::getWithAlignment(*context, llvm::Align(s.align)));
+            }
+        }
+    }
+
+    // Emit a C-extern call when the resolved overload's signature contains struct-by-value
+    // params or return. argList holds the CFlat-natural argument values (struct values are
+    // passed as LLVM struct values). This rewrites them into the lowered ABI shape:
+    //   - CoerceToInt param: alloca + store the struct, load back as iN, pass the iN.
+    //   - ByVal param: alloca + store the struct, pass the alloca pointer (with byval attr at call site).
+    //   - SRet return: alloca a return slot, prepend its pointer as arg 0, after the call
+    //     load the struct from the slot.
+    //   - CoerceToInt return: receive the iN, store into a temp alloca, reload as struct.
+    llvm::Value* EmitAbiLoweredCall(const FunctionSymbol& candidate, std::vector<llvm::Value*>& argList)
+    {
+        const AbiRecipe& recipe = candidate.Recipe;
+        std::vector<llvm::Value*> loweredArgs;
+        loweredArgs.reserve(argList.size() + (recipe.retSlot.kind == AbiSlot::SRetReturn ? 1 : 0));
+
+        llvm::AllocaInst* sretSlot = nullptr;
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            sretSlot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "sret", recipe.retSlot.align);
+            loweredArgs.push_back(sretSlot);
+        }
+
+        for (size_t i = 0; i < argList.size() && i < recipe.paramSlots.size(); ++i)
+        {
+            const AbiSlot& s = recipe.paramSlots[i];
+            llvm::Value* v = argList[i];
+            if (s.kind == AbiSlot::Direct)
+            {
+                loweredArgs.push_back(v);
+            }
+            else if (s.kind == AbiSlot::CoerceToInt)
+            {
+                // v is a struct value. Place in an alloca, then load as iN through a
+                // bitcast - portable across all element layouts and lets LLVM coalesce.
+                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.coerce", s.align);
+                builder->CreateStore(v, slot);
+                auto* intPtr = builder->CreateBitCast(slot, s.coerceTy->getPointerTo());
+                loweredArgs.push_back(builder->CreateLoad(s.coerceTy, intPtr));
+            }
+            else // ByVal
+            {
+                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.byval", s.align);
+                builder->CreateStore(v, slot);
+                loweredArgs.push_back(slot);
+            }
+        }
+
+        auto* ci = builder->CreateCall(candidate.Function, loweredArgs);
+        ci->setCallingConv(candidate.Function->getCallingConv());
+        ApplyAbiCallAttributes(ci, recipe);
+
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+            return builder->CreateLoad(recipe.retSlot.structTy, sretSlot);
+        if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
+        {
+            auto* slot = AllocaAtEntry(recipe.retSlot.structTy, nullptr, "abi.ret", recipe.retSlot.align);
+            auto* intPtr = builder->CreateBitCast(slot, recipe.retSlot.coerceTy->getPointerTo());
+            builder->CreateStore(ci, intPtr);
+            return builder->CreateLoad(recipe.retSlot.structTy, slot);
+        }
+        return ci; // Direct return
     }
 
     llvm::Value* CreateFunctionCall(llvm::Function* func, std::vector<llvm::Value*> arg)

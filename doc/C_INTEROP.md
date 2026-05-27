@@ -47,7 +47,9 @@ import "util.c";
 extern int c_add(int a, int b);   // explicit; first-writer-wins
 ```
 
-Auto-extern covers the scalar+pointer subset of the extern ABI (`int`, sized ints, `float`/`double`, `bool`, pointers including `void*` and opaque structs). Struct/union *by value* and pointer-to-pointer-to-pointer are skipped (run with `-v` to see what was skipped). C `long` maps to 32-bit (Windows LLP64); `long long` maps to 64-bit.
+Auto-extern covers the scalar+pointer subset of the extern ABI (`int`, sized ints, `float`/`double`, `bool`, pointers including `void*` and opaque structs). C `long` maps to 32-bit (Windows LLP64); `long long` maps to 64-bit. Pointer-to-pointer-to-pointer is skipped (run with `-v` to see what was skipped).
+
+**Struct-by-value** is supported: when clang's AST dump exposes a `struct Foo { ... };` decl, cflat auto-registers `Foo` as a CFlat struct type (matching C field layout) and lowers calls that take or return `Foo` by value per the Win64 / Win32 MSVC ABI. Sizes `1, 2, 4, 8` bytes are coerced into an integer register (`i8`/`i16`/`i32`/`i64`); other sizes go through `byval` pointer (parameter) or hidden `sret` pointer (return). On Win32 the byval slot is reported at `align 4` to match the cdecl 4-byte stack alignment. Unions by value are not yet supported.
 
 > A `.c` means real C. CFlat fixtures that historically used a `.c` extension now use `.cb`.
 
