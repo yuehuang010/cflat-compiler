@@ -1,0 +1,7 @@
+// 'auto' as a function return type is only supported on generic functions in v1:
+// non-generic uses would require a type-only expression walker that does not
+// exist yet, so they are rejected with a clear diagnostic.
+
+expect_error("'auto' return type is only supported on generic functions") {
+    auto square(int x) { return x * x; }
+}

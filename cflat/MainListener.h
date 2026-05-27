@@ -470,6 +470,16 @@ private:
             name = namespaceName + "." + name;
 
         auto returnType = ParseDeclarationSpecifiers(func->declarationSpecifiers());
+        // 'auto' return type is only supported on generic function templates (already
+        // skipped above) and return-block functions. Reaching this point with auto
+        // means the user wrote a non-generic, non-return-block 'auto fn(...)' which
+        // we cannot infer in v1. Diagnose here so GetType does not fire its less
+        // helpful "unknown type 'auto'" later in this scan.
+        if (returnType.TypeName == "auto")
+        {
+            Compiler(func)->LogError("'auto' return type is only supported on generic functions (e.g. auto f<T>(T x))");
+            return;
+        }
         auto* paramTypeList = func->parameterTypeList();
         auto params = ParseParameterTypeList(paramTypeList);
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
@@ -1795,9 +1805,19 @@ public:
 
         // Save the current IRBuilder insertion point so that emitting a new
         // function definition mid-block does not corrupt the caller's block.
-        auto savedState = Compiler(templateIt->second)->SaveBuilderState();
+        auto* instCompiler = Compiler(templateIt->second);
+        auto savedState = instCompiler->SaveBuilderState();
+        // Isolate the outer function's local-variable stack: if we are
+        // instantiating mid-emission of another function, its frames are still
+        // on stackNamedVariable, and the generic body's identifier lookup would
+        // otherwise reach past its own frame and bind to the outer's locals
+        // (e.g. parameter 'a' shadowed by outer 'int a' -> cross-function load
+        // and "Instruction does not dominate all uses" verifier error).
+        auto savedStack = std::move(instCompiler->stackNamedVariable);
+        instCompiler->stackNamedVariable.clear();
         ParseFunctionDefinition(templateIt->second, {}, {}, mangledName);
-        Compiler(templateIt->second)->RestoreBuilderState(savedState);
+        instCompiler->stackNamedVariable = std::move(savedStack);
+        instCompiler->RestoreBuilderState(savedState);
 
         activeTypeSubstitutions = savedSubst;
         return mangledName;
@@ -3409,6 +3429,26 @@ public:
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
+        // 'auto' return type: only supported on generic instantiations, where param
+        // types are concrete and the body can be emitted under an auto-capture pass
+        // that records each 'return expr;' value type instead of emitting 'ret'.
+        // After body emission the function is rebuilt with the unified return type.
+        bool isAutoReturn = (returnType.TypeName == "auto");
+        if (isAutoReturn)
+        {
+            if (nameOverride.empty())
+            {
+                LogErrorContext(func, "'auto' return type is only supported on generic functions (e.g. auto f<T>(T x))");
+                return;
+            }
+            // Substitute a placeholder return type so CreateFunctionDefinition can build
+            // an LLVM function. The placeholder is replaced after body emission.
+            returnType.TypeName = "i64";
+            returnType.Pointer  = false;
+            returnType.IsMove   = false;
+            returnType.IsNullable = false;
+        }
+
         bool returnsOwned = false;
         if (returnType.TypeName == "string" && returnType.IsMove)
             returnsOwned = true;
@@ -3441,6 +3481,17 @@ public:
         compiler->InitializeBlock(&fn->front(), false);
 
         currentFunctionIsVariadic = varargs;
+
+        if (isAutoReturn)
+        {
+            // The placeholder mangled name encodes the placeholder return type, which
+            // may happen to collide with the eventual post-inference mangled name
+            // (e.g. if T=i64, both placeholder and inferred return are i64). Rename
+            // the LLVM function to a guaranteed-unique pending name so finalization
+            // can freely create the real function under the inferred mangled name.
+            fn->setName(fn->getName().str() + "$auto_pending");
+            compiler->BeginAutoReturnCapture();
+        }
 
         // Seed the lock-set from the function's RequiredLocks (covers both lock clauses and
         // positional group membership). For this.X entries, also insert the bare form X so
@@ -3505,6 +3556,13 @@ public:
             // Pop the stack
             compiler->CreateBlockBreak(nullptr, true);
             compiler->ClearCurrentSubprogram();
+        }
+
+        if (isAutoReturn)
+        {
+            auto sites = compiler->EndAutoReturnCapture();
+            compiler->FinalizeAutoReturnFunction(name, fn, sites, allParams, varargs, returnsOwned, !structName.empty());
+            return;  // auto functions do not participate in default-param overload generation in v1
         }
 
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);

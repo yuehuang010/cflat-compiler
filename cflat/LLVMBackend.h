@@ -522,6 +522,19 @@ public:
         llvm::BasicBlock* ContinuationBlock;
     };
 
+    // Capture mode for 'auto' return-type inference. While active, CreateReturnCall
+    // does NOT emit a 'ret' instruction; instead it terminates the current BB with
+    // an UnreachableInst placeholder and records (BB, value) onto AutoReturnSites.
+    // After body emission the caller unifies the value types, builds a new function
+    // with the inferred signature, splices the BBs over, replaces each placeholder
+    // terminator with the real ret, and RAUWs the old function.
+    struct AutoReturnSite
+    {
+        llvm::BasicBlock* Block;
+        llvm::Value* Value;      // nullptr for bare 'return;'
+        llvm::Instruction* Placeholder; // unreachable inst we inserted; will be replaced by ret
+    };
+
     private:
     size_t currentLine = 0;
     size_t currentColumn = 0;
@@ -732,6 +745,7 @@ private:
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
+    std::optional<std::vector<AutoReturnSite>> autoReturnCapture; // active when emitting an 'auto' generic instantiation
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
@@ -7680,6 +7694,17 @@ public:
         if (ownedStringReturnVar) ownedStringReturnVar->IsOwningString = true;
         if (ownedPtrReturnVar)    ownedPtrReturnVar->IsOwning = true;
 
+        // Auto return-type inference: record the (BB, value) pair so the caller can
+        // unify types after body emission. Terminate the BB with a placeholder
+        // 'unreachable' that will be replaced with a real 'ret' once the inferred
+        // signature is known and BBs are spliced onto the new function.
+        if (autoReturnCapture)
+        {
+            auto* placeholder = builder->CreateUnreachable();
+            autoReturnCapture->push_back({ builder->GetInsertBlock(), value, placeholder });
+            return;
+        }
+
         // If we are inlining a return-block, capture the value and branch to continuation.
         if (returnCapture)
         {
@@ -7736,6 +7761,198 @@ public:
     void EndReturnCapture()
     {
         returnCapture.reset();
+    }
+
+    void BeginAutoReturnCapture() { autoReturnCapture.emplace(); }
+    std::vector<AutoReturnSite> EndAutoReturnCapture()
+    {
+        std::vector<AutoReturnSite> sites;
+        if (autoReturnCapture) sites = std::move(*autoReturnCapture);
+        autoReturnCapture.reset();
+        return sites;
+    }
+    bool IsAutoReturnCaptureActive() const { return autoReturnCapture.has_value(); }
+
+    // Best-effort reverse mapping from an LLVM type to a CFlat TypeName, used by
+    // 'auto' return-type inference to populate the function table's ReturnType
+    // after the unified return type is known. Falls back to "i64" so the entry
+    // is never left empty.
+    TypeAndValue LlvmTypeToTypeAndValue(llvm::Type* t) const
+    {
+        TypeAndValue tv;
+        if (!t) { tv.TypeName = "void"; return tv; }
+        if (t->isVoidTy())              { tv.TypeName = "void"; return tv; }
+        if (t->isIntegerTy(1))          { tv.TypeName = "bool"; return tv; }
+        if (t->isIntegerTy(8))          { tv.TypeName = "i8";   return tv; }
+        if (t->isIntegerTy(16))         { tv.TypeName = "i16";  return tv; }
+        if (t->isIntegerTy(32))         { tv.TypeName = "int";  return tv; }
+        if (t->isIntegerTy(64))         { tv.TypeName = "i64";  return tv; }
+        if (t->isFloatTy())             { tv.TypeName = "float";  return tv; }
+        if (t->isDoubleTy())            { tv.TypeName = "double"; return tv; }
+        if (t->isPointerTy())
+        {
+            tv.TypeName = "i8";  // opaque pointer in modern LLVM; pointee is unknown here
+            tv.Pointer  = true;
+            return tv;
+        }
+        if (t->isStructTy())
+        {
+            auto* st = llvm::cast<llvm::StructType>(t);
+            if (st->hasName())
+            {
+                tv.TypeName = st->getName().str();
+                return tv;
+            }
+        }
+        tv.TypeName = "i64";
+        return tv;
+    }
+
+    // After an 'auto' generic instantiation has emitted its body under
+    // BeginAutoReturnCapture, replace the placeholder function with one whose
+    // signature uses the unified return type. Splices basic blocks from the
+    // placeholder over, rewrites each captured 'unreachable' placeholder into a
+    // real 'ret', remaps argument uses, updates the function table, and erases
+    // the old function. Returns the replacement function (or the original if
+    // unification failed - caller should treat that as already-diagnosed).
+    llvm::Function* FinalizeAutoReturnFunction(
+        const std::string& functionName,
+        llvm::Function* oldFn,
+        std::vector<AutoReturnSite>& sites,
+        std::vector<TypeAndValue> arguments,
+        bool varargs,
+        bool returnsOwned,
+        bool isMethod)
+    {
+        if (sites.empty())
+        {
+            LogError(std::format("'auto' return: function '{}' has no return statement; explicit return required for type inference", functionName));
+            return oldFn;
+        }
+
+        // Unify return value types. v1 rule: identical types accepted; otherwise
+        // pick the strictly-wider one if CompareUpconvert says it widens. No
+        // bidirectional promotion (no int+long -> long folding yet); reject with
+        // a clear message so the user knows to cast at the source level.
+        llvm::Type* unifiedTy = sites[0].Value ? sites[0].Value->getType() : builder->getVoidTy();
+        for (size_t i = 1; i < sites.size(); i++)
+        {
+            llvm::Type* siteTy = sites[i].Value ? sites[i].Value->getType() : builder->getVoidTy();
+            if (siteTy == unifiedTy) continue;
+            // Both must be non-void (cannot mix 'return;' with 'return expr;').
+            if (siteTy->isVoidTy() || unifiedTy->isVoidTy())
+            {
+                LogError(std::format("'auto' return: cannot mix 'return;' and 'return <expr>;' in function '{}'", functionName));
+                return oldFn;
+            }
+            int srcToCur = CompareUpconvert(siteTy, unifiedTy);   // widens to current?
+            int curToSrc = CompareUpconvert(unifiedTy, siteTy);   // current widens to new?
+            if (srcToCur > 0)      { /* keep unifiedTy, siteTy widens up */ }
+            else if (curToSrc > 0) { unifiedTy = siteTy; }
+            else
+            {
+                LogError(std::format("'auto' return: cannot unify return types in function '{}'", functionName));
+                return oldFn;
+            }
+        }
+
+        // Build the new function type with the same params and the unified return.
+        std::vector<llvm::Type*> paramTypes(oldFn->getFunctionType()->params().begin(),
+                                            oldFn->getFunctionType()->params().end());
+        auto* newFnTy = llvm::FunctionType::get(unifiedTy, paramTypes, varargs);
+
+        TypeAndValue newReturnType = LlvmTypeToTypeAndValue(unifiedTy);
+        std::string newMangledName = ComputeMangledName(functionName, newReturnType, arguments, varargs);
+
+        // If a function with the new mangled name already exists (e.g. another
+        // instantiation of the same template hit the same inferred type), reuse it.
+        if (auto* existing = module->getFunction(newMangledName); existing && !existing->empty())
+        {
+            // Discard the placeholder; the existing definition wins.
+            if (!oldFn->use_empty())
+                LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported", functionName));
+            oldFn->eraseFromParent();
+            return existing;
+        }
+
+        auto* newFn = llvm::Function::Create(newFnTy, llvm::Function::ExternalLinkage, newMangledName, *module);
+        newFn->addFnAttr(llvm::Attribute::NullPointerIsValid);
+        newFn->setCallingConv(oldFn->getCallingConv());
+
+        // Splice basic blocks from old to new and remap argument uses.
+        std::vector<llvm::BasicBlock*> bbs;
+        for (auto& bb : *oldFn) bbs.push_back(&bb);
+        for (auto* bb : bbs)
+        {
+            bb->removeFromParent();
+            bb->insertInto(newFn);
+        }
+        // Remap argument uses by value pointer. Do NOT setName on the new args:
+        // the spliced entry block already contains allocas named after the params
+        // (e.g. "a"), which would collide and trigger LLVM auto-suffixing in a way
+        // that misaligns subsequent load/store operands relative to their displayed
+        // names. Arg display becomes %0, %1, ... which is fine for IR validity.
+        auto oldArgIt = oldFn->arg_begin();
+        auto newArgIt = newFn->arg_begin();
+        for (; oldArgIt != oldFn->arg_end() && newArgIt != newFn->arg_end(); ++oldArgIt, ++newArgIt)
+        {
+            oldArgIt->replaceAllUsesWith(&*newArgIt);
+        }
+
+        // Replace each captured 'unreachable' placeholder with the real ret.
+        for (auto& site : sites)
+        {
+            auto* ph = site.Placeholder;
+            builder->SetInsertPoint(ph);
+            if (site.Value != nullptr)
+            {
+                llvm::Value* retVal = site.Value;
+                if (retVal->getType() != unifiedTy)
+                    retVal = Upconvert(retVal, unifiedTy);
+                builder->CreateRet(retVal);
+            }
+            else
+            {
+                builder->CreateRetVoid();
+            }
+            ph->eraseFromParent();
+        }
+
+        // Transfer the DI subprogram so debug info stays attached.
+        if (auto* sp = oldFn->getSubprogram())
+        {
+            oldFn->setSubprogram(nullptr);
+            newFn->setSubprogram(sp);
+        }
+
+        // Update the function table entry that pointed at the placeholder. We do
+        // this before erasing so the dangling pointer compare is well-defined.
+        auto it = functionTable.find(functionName);
+        if (it != functionTable.end())
+        {
+            for (auto& sym : it->second)
+            {
+                if (sym.Function == oldFn)
+                {
+                    sym.Function    = newFn;
+                    sym.UniqueName  = newMangledName;
+                    sym.ReturnType  = newReturnType;
+                    sym.ReturnsOwned = returnsOwned;
+                    sym.IsMethod    = isMethod;
+                    sym.Parameters  = arguments;
+                    sym.Variadic    = varargs;
+                    break;
+                }
+            }
+        }
+
+        // Recursion would leave uses behind (call to oldFn from inside its own body).
+        // Diagnose explicitly rather than letting LLVM's verifier complain later.
+        if (!oldFn->use_empty())
+            LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported - declare the return type explicitly", functionName));
+
+        oldFn->eraseFromParent();
+        return newFn;
     }
 
     llvm::BasicBlock* GetElseBlock()

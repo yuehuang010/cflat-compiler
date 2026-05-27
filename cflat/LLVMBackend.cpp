@@ -968,6 +968,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunction = nullptr;
     autoVaListAlloca = nullptr;
     returnCapture = std::nullopt;
+    autoReturnCapture = std::nullopt;
 
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
     // on the next Analyze() call.

@@ -1022,6 +1022,8 @@ bool testIsPointerIntrinsic()
 }
 
 // --- Templated global function (explicit type args) ---
+T ShadowPick<T>(T a, T b) { return a > b ? a : b; }
+
 T PickFirst<T>(T a, T b)
 {
     return a;
@@ -1157,6 +1159,17 @@ bool testTemplateFunctions()
     IntComparable* icPtr = InterfaceOps.WrapInterface<IntComparable>(ic);
     result &= Test("interface_template_wrap", icPtr->value, 100);
     delete icPtr;
+
+    // Regression: when a generic function is instantiated mid-emission of the
+    // outer caller, the generic body must not bind parameter names to the
+    // outer's locals. Here the outer declares `int a`, which collides with
+    // ShadowPick<T>'s parameter `a`. Pre-fix: the generic body's lookup walked
+    // past its own frame, loaded from the outer's alloca, and produced
+    // "Instruction does not dominate all uses" at LLVM verify time. Uses a
+    // fresh generic so the instantiation happens here, mid-emit of this body.
+    int a = 5;
+    result &= Test("generic_local_shadow_outer_a", a, 5);
+    result &= Test("generic_local_shadow_pick",   ShadowPick<int>(3, 7), 7);
 
     return result;
 }
