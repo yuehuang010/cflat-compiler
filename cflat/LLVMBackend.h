@@ -659,6 +659,18 @@ private:
         int line = 1;
         int col = 0;
     };
+    // An object-like C macro extracted from a bound header. Function-like macros are skipped
+    // (cflat has no preprocessor to expand them). The value is resolved by feeding the macro
+    // through an enum stub - the original source location (file/line/col) is preserved from
+    // the -dD discovery pass so the LSP can go-to-definition into the real header.
+    struct CMacroEntry
+    {
+        std::string name;
+        long long value = 0;
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
     // A C struct/union decl extracted from a bound header or source. Field types are kept as
     // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
     // all records in the same TU are registered (handles forward references between structs).
@@ -682,6 +694,7 @@ private:
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
+        std::vector<CMacroEntry> macros;
     };
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -1981,6 +1994,52 @@ private:
         return true;
     }
 
+    // Variant of SpawnClangJson that captures stdout regardless of exit code. Needed for the
+    // macro-resolution stub: one bad-apple macro produces clang errors (non-zero exit), but
+    // the other anonymous enums still land in the AST and remain usable.
+    bool SpawnClangCapture(const std::vector<std::string>& argStrs, std::string& outStdout)
+    {
+        llvm::SmallString<256> inFile, outFile, errFile;
+        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "in",  inFile))  return false;
+        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "out", outFile))
+        {
+            llvm::sys::fs::remove(inFile);
+            return false;
+        }
+        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "err", errFile))
+        {
+            llvm::sys::fs::remove(inFile);
+            llvm::sys::fs::remove(outFile);
+            return false;
+        }
+        const std::string inPath  = inFile.str().str();
+        const std::string outPath = outFile.str().str();
+        const std::string errPath = errFile.str().str();
+        struct TmpRemover {
+            std::string a, b, c;
+            ~TmpRemover() { llvm::sys::fs::remove(a); llvm::sys::fs::remove(b); llvm::sys::fs::remove(c); }
+        } tmpRemover{ inPath, outPath, errPath };
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        std::optional<llvm::StringRef> redirects[3] = {
+            llvm::StringRef(inPath), llvm::StringRef(outPath), llvm::StringRef(errPath)
+        };
+
+        std::string execErr;
+        {
+            std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
+            (void)llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
+        }
+        // Intentionally ignore rc - the caller wants whatever clang managed to produce.
+
+        auto bufOrErr = llvm::MemoryBuffer::getFile(outPath);
+        if (!bufOrErr) return false;
+        outStdout = (*bufOrErr)->getBuffer().str();
+        return true;
+    }
+
     // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
     // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
     bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
@@ -2360,6 +2419,285 @@ private:
             std::cout << "[verbose]   registered " << ours.size() << " C record(s) from " << fileForLsp << "\n";
     }
 
+    // Register object-like C macros (as resolved by ExtractCHeaderMacros) as bare global int
+    // constants - same flat-scope rule as RegisterCEnums so the user writes CURLOPT_URL, not
+    // qualified. First-writer-wins against an existing global. The LSP location points at the
+    // original #define in the real header, not the synthesized resolution stub.
+    void RegisterCMacros(const std::vector<CMacroEntry>& macros)
+    {
+        size_t registered = 0;
+        for (const CMacroEntry& m : macros)
+        {
+            if (m.name.empty()) continue;
+            if (globalNamedVariable.count(m.name)) continue;
+
+            bool wide = (m.value < INT32_MIN || m.value > INT32_MAX);
+            TypeAndValue tv;
+            tv.TypeName     = wide ? "i64" : "int";
+            tv.VariableName = m.name;
+            tv.Pointer      = false;
+            llvm::Constant* c = wide
+                ? static_cast<llvm::Constant*>(builder->getInt64((uint64_t)m.value))
+                : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)m.value));
+            CreateGlobalVariable(tv, c);
+            ++registered;
+
+            if (auto* s = GetSymbolSink())
+                s->Register(SymbolKind::Variable, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
+                            tv.TypeName + " " + m.name);
+        }
+        if (verbose && !macros.empty())
+            std::cout << "[verbose]   registered " << registered << " C macro constant(s) (of "
+                      << macros.size() << " object-like candidates)\n";
+    }
+
+    // Discover object-like macros contributed by a bound C header and resolve their integer
+    // values. Two clang spawns:
+    //   Pass A (-E -dD): preprocessed text with #define directives preserved and `# line "file"`
+    //     markers; we walk the lines, track the current header file, and collect every
+    //     #define NAME <replacement> whose source file is in scope. Function-like macros
+    //     (#define NAME(args) ...) and empty replacements are skipped.
+    //   Pass B (-ast-dump=json on a synthesized stub): for each candidate, emit an anonymous
+    //     enum { __cflat_m_NAME = (long long)(NAME) }. Per-macro isolation means a bad apple
+    //     (non-constant, string, or compound-literal macro) only invalidates its own enum;
+    //     the others still appear as EnumConstantDecls in the AST and get harvested.
+    // String/float macros and ones whose value clang cannot fold to a constant integer are
+    // dropped silently (verbose log emits a count). Caller passes the same -I/-D args used
+    // for the main header extraction so resolution sees the same view of the header.
+    bool ExtractCHeaderMacros(const std::string& clangPath, const std::string& headerPath,
+                              const std::vector<std::string>& extraDefines,
+                              std::vector<CMacroEntry>& outMacros)
+    {
+        const std::string target = (platformValue == 32)
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+
+        const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
+
+        std::string fwdHeader = headerPath;
+        std::replace(fwdHeader.begin(), fwdHeader.end(), '\\', '/');
+
+        auto norm = [](std::string p) {
+            std::replace(p.begin(), p.end(), '\\', '/');
+            std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            return p;
+        };
+        std::vector<std::string> scopeRoots;
+        scopeRoots.push_back(norm(hdrDir));
+        for (const auto& inc : cIncludeDirs_) scopeRoots.push_back(norm(inc));
+        auto inScope = [&](const std::string& file) -> bool {
+            if (file.empty()) return false;
+            std::string nf = norm(file);
+            for (const auto& r : scopeRoots)
+                if (!r.empty() && nf.rfind(r, 0) == 0) return true;
+            return false;
+        };
+
+        // --- Pass A: -dD discovery ---
+        struct MacroCand { std::string name; std::string file; int line; };
+        std::vector<MacroCand> candidates;
+        std::unordered_map<std::string, size_t> byName; // name -> index in candidates (dedupe; last #define wins, matching C)
+
+        {
+            llvm::SmallString<256> stubFile;
+            if (llvm::sys::fs::createTemporaryFile("cflat_mhdr", "c", stubFile)) return false;
+            const std::string stubPath = stubFile.str().str();
+            struct StubRemover { std::string p; ~StubRemover() { llvm::sys::fs::remove(p); } } stubRemover{ stubPath };
+            {
+                std::error_code ec;
+                llvm::raw_fd_ostream os(stubPath, ec, llvm::sys::fs::OF_Text);
+                if (ec) return false;
+                os << "#include \"" << fwdHeader << "\"\n";
+                os.close();
+            }
+
+            // clang-cl silently drops the bare driver flag `-dD`; passing it through to cc1
+            // via -Xclang is the only form that actually preserves #define directives.
+            std::vector<std::string> argStrs = {
+                clangPath, "/nologo", target, "-E", "-Xclang", "-dD"
+            };
+            argStrs.push_back("-I" + hdrDir);
+            for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
+            for (const auto& def : cDefines_)     argStrs.push_back("/D" + def);
+            for (const auto& def : extraDefines)  argStrs.push_back("/D" + def);
+            argStrs.push_back(stubPath);
+
+            if (verbose)
+                std::cout << "[verbose] discovering C macros: " << headerPath << " (clang -E -dD)\n";
+
+            std::string preText;
+            if (!SpawnClangCapture(argStrs, preText)) return false;
+
+            std::string curFile;
+            int curLine = 0;
+            std::string line;
+            line.reserve(256);
+            for (size_t i = 0; i <= preText.size(); ++i)
+            {
+                char ch = (i < preText.size()) ? preText[i] : '\n';
+                if (ch != '\n') { line.push_back(ch); continue; }
+
+                if (!line.empty() && line[0] == '#')
+                {
+                    // Line marker: `# <num> "<file>" [flags]`. Parse the number and the
+                    // double-quoted file name; ignore everything else.
+                    size_t p = 1;
+                    while (p < line.size() && line[p] == ' ') ++p;
+                    if (p < line.size() && std::isdigit((unsigned char)line[p]))
+                    {
+                        int parsed = 0;
+                        while (p < line.size() && std::isdigit((unsigned char)line[p]))
+                        { parsed = parsed * 10 + (line[p] - '0'); ++p; }
+                        while (p < line.size() && line[p] == ' ') ++p;
+                        if (p < line.size() && line[p] == '"')
+                        {
+                            size_t q = ++p;
+                            while (q < line.size() && line[q] != '"') ++q;
+                            curFile = line.substr(p, q - p);
+                            // Un-escape \\ -> \ (clang quotes Windows paths with escaped backslashes).
+                            std::string unescaped;
+                            unescaped.reserve(curFile.size());
+                            for (size_t k = 0; k < curFile.size(); ++k)
+                            {
+                                if (curFile[k] == '\\' && k + 1 < curFile.size() && curFile[k + 1] == '\\')
+                                { unescaped.push_back('\\'); ++k; }
+                                else unescaped.push_back(curFile[k]);
+                            }
+                            curFile = std::move(unescaped);
+                            curLine = parsed;
+                        }
+                    }
+                    else if (line.rfind("#define ", 0) == 0)
+                    {
+                        // #define NAME[(args)] [replacement]
+                        size_t p2 = 8; // past "#define "
+                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
+                        size_t nameStart = p2;
+                        while (p2 < line.size() &&
+                               (std::isalnum((unsigned char)line[p2]) || line[p2] == '_'))
+                            ++p2;
+                        if (p2 > nameStart && p2 < line.size())
+                        {
+                            std::string name = line.substr(nameStart, p2 - nameStart);
+                            // Function-like macro: name immediately followed by '(' (no space).
+                            if (line[p2] == '(') { /* skip */ }
+                            else
+                            {
+                                while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
+                                if (p2 < line.size() && inScope(curFile) && name.rfind("__", 0) != 0)
+                                {
+                                    auto it = byName.find(name);
+                                    if (it == byName.end())
+                                    {
+                                        byName[name] = candidates.size();
+                                        candidates.push_back({ name, curFile, curLine });
+                                    }
+                                    else
+                                    {
+                                        // Redefined - keep latest location.
+                                        candidates[it->second].file = curFile;
+                                        candidates[it->second].line = curLine;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Other directives (#pragma, #undef, etc.) ignored.
+                }
+                else
+                {
+                    // Plain source line - advances the line counter within curFile.
+                    ++curLine;
+                }
+                line.clear();
+            }
+        }
+
+        if (candidates.empty()) return true;
+
+        // --- Pass B: AST resolution. One anonymous enum per macro so per-decl errors don't
+        //     cascade. Bad apples (non-constant, string, compound) are dropped silently. ---
+        llvm::SmallString<256> resolveFile;
+        if (llvm::sys::fs::createTemporaryFile("cflat_mres", "c", resolveFile)) return false;
+        const std::string resolvePath = resolveFile.str().str();
+        struct ResolveRemover { std::string p; ~ResolveRemover() { llvm::sys::fs::remove(p); } } resolveRemover{ resolvePath };
+        {
+            std::error_code ec;
+            llvm::raw_fd_ostream os(resolvePath, ec, llvm::sys::fs::OF_Text);
+            if (ec) return false;
+            os << "#include \"" << fwdHeader << "\"\n";
+            for (const auto& m : candidates)
+                os << "enum { __cflat_m_" << m.name << " = (long long)(" << m.name << ") };\n";
+            os.close();
+        }
+
+        std::vector<std::string> argStrs = {
+            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json", "-fsyntax-only",
+            "-ferror-limit=0", "-Wno-everything"
+        };
+        argStrs.push_back("-I" + hdrDir);
+        for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
+        for (const auto& def : cDefines_)     argStrs.push_back("/D" + def);
+        for (const auto& def : extraDefines)  argStrs.push_back("/D" + def);
+        argStrs.push_back(resolvePath);
+
+        std::string jsonText;
+        if (!SpawnClangCapture(argStrs, jsonText)) return false;
+        if (jsonText.empty()) return false;
+
+        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
+        if (!root) { llvm::consumeError(root.takeError()); return false; }
+        const llvm::json::Object* tu = root->getAsObject();
+        if (!tu) return false;
+        const llvm::json::Array* topLevel = tu->getArray("inner");
+        if (!topLevel) return true;
+
+        // Walk every EnumConstantDecl in the AST (top-level enums are inlined as
+        // EnumDecl children with EnumConstantDecl inside). Names beginning with
+        // __cflat_m_ are ours; strip the prefix and merge with the discovery map.
+        const std::string prefix = "__cflat_m_";
+        std::unordered_map<std::string, long long> resolved;
+        std::function<void(const llvm::json::Value&)> visit = [&](const llvm::json::Value& v) {
+            const llvm::json::Object* node = v.getAsObject();
+            if (!node) return;
+            if (auto kind = node->getString("kind"); kind && *kind == "EnumConstantDecl")
+            {
+                if (auto nm = node->getString("name"))
+                {
+                    std::string n = nm->str();
+                    if (n.rfind(prefix, 0) == 0)
+                    {
+                        long long val = 0;
+                        if (FindConstantValue(node, val))
+                            resolved[n.substr(prefix.size())] = val;
+                    }
+                }
+            }
+            if (auto* inner = node->getArray("inner"))
+                for (const auto& c : *inner) visit(c);
+        };
+        for (const auto& v : *topLevel) visit(v);
+
+        outMacros.reserve(resolved.size());
+        for (const auto& cand : candidates)
+        {
+            auto it = resolved.find(cand.name);
+            if (it == resolved.end()) continue; // dropped (non-int, non-constant, string, etc.)
+            CMacroEntry e;
+            e.name  = cand.name;
+            e.value = it->second;
+            e.file  = cand.file;
+            e.line  = cand.line;
+            e.col   = 0;
+            outMacros.push_back(std::move(e));
+        }
+
+        if (verbose)
+            std::cout << "[verbose]   resolved " << outMacros.size() << " of "
+                      << candidates.size() << " object-like macro candidate(s) from " << headerPath << "\n";
+        return true;
+    }
+
     // Spawn clang's JSON AST dump for a C *header* (via a stub TU that #includes it) and
     // parse out the externally-linkable function *declarations* and enum constants the
     // header itself contributes. A header pulls in the whole SDK/CRT transitively, so a
@@ -2658,6 +2996,7 @@ private:
         std::vector<CSigEntry> hitSigs;
         std::vector<CEnumEntry> hitEnums;
         std::vector<CRecordEntry> hitRecords;
+        std::vector<CMacroEntry> hitMacros;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -2668,13 +3007,13 @@ private:
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hitMacros = entry.macros; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime;
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hitMacros = entry.macros; hit = true;
                 }
             }
         }
@@ -2684,6 +3023,7 @@ private:
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
+            RegisterCMacros(hitMacros);
             return true;
         }
 
@@ -2697,8 +3037,12 @@ private:
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
+        std::vector<CMacroEntry> macros;
         if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
             return false;
+        // Macro discovery is best-effort: failure here (clang missing a header path, OOM,
+        // etc.) should not invalidate the function / enum / record bindings we already got.
+        (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros);
 
         if (!mtEc)
         {
@@ -2708,6 +3052,7 @@ private:
             entry.sigs  = sigs;
             entry.enums = enums;
             entry.records = records;
+            entry.macros = macros;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
@@ -2715,6 +3060,7 @@ private:
         // Records were already registered inside RunClangHeaderExtract.
         RegisterCSignatures(sigs, fileForLsp);
         RegisterCEnums(enums, fileForLsp);
+        RegisterCMacros(macros);
         return true;
     }
 

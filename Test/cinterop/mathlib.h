@@ -32,4 +32,30 @@ enum Extra
 };
 #endif
 
+/* Object-like #define macros - extracted as bare global int/i64 constants
+ * via the enum-stub resolution pass in ExtractCHeaderMacros. Mirrors how
+ * libcurl ships CURL_* flags as macros rather than enum constants. */
+#define ML_PI_X100        314          /* decimal int */
+#define ML_MAX_NODES      0x1000       /* hex literal -> 4096 */
+#define ML_NEG_OFFSET     (-5)         /* parenthesized negative */
+#define ML_COMBINED_MASK  ((1 << 0) | (1 << 2) | (1 << 4))   /* 21 */
+#define ML_BIG_CONST      0x100000000LL                       /* > INT32_MAX -> i64 */
+
+/* Function-like macro: must be SKIPPED by the extractor (cflat has no
+ * preprocessor). Presence here ensures it does not crash extraction or
+ * leak in as a constant. */
+#define ML_SQUARE(x) ((x) * (x))
+
+/* String-valued macro: object-like but non-integer. The enum-stub
+ * resolution drops it cleanly (per-decl isolation); other macros above
+ * must still register. */
+#define ML_NAME "mathlib"
+
+/* Gated by inline `define "ML_EXTRA"` - mirrors EXTRA_FLAG but as a #define.
+ * Verifies per-import defines feed the macro extraction pass, not just the
+ * enum/decl pass. */
+#ifdef ML_EXTRA
+#define ML_EXTRA_MACRO 77
+#endif
+
 #endif /* MATHLIB_H */

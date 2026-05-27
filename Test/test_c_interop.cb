@@ -15,6 +15,10 @@
 //                       struct (size differs across Win64/Win32), composed calls.
 //   Section H (80-89) : struct-by-value ABI - register exhaustion (6 struct params
 //                       on Win64 spills past RCX/RDX/R8/R9 onto the stack).
+//   Section I (90-99) : object-like #define macro extraction - decimal, hex,
+//                       parenthesized negative, expression-folded, i64-promoted,
+//                       and define-gated; function-like / string macros must be
+//                       silently skipped without poisoning their neighbors.
 
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
@@ -151,6 +155,22 @@ extern int main()
     Pair p5 = make_pair(9,  10);
     Pair p6 = make_pair(11, 12);
     if (sum_six_pairs(p1, p2, p3, p4, p5, p6) != 78) return 80;
+
+    // ---- Section I: object-like #define macro extraction ---------------------
+    // Decimal, hex, parenthesized negative, and folded expression all resolve
+    // via the enum-stub Pass B in ExtractCHeaderMacros.
+    if (ML_PI_X100 != 314)              return 90;
+    if (ML_MAX_NODES != 4096)           return 91;   // 0x1000
+    if (ML_NEG_OFFSET != -5)            return 92;
+    if (ML_COMBINED_MASK != 21)         return 93;   // (1<<0)|(1<<2)|(1<<4)
+
+    // Value > INT32_MAX -> registered as i64 (RegisterCMacros widens automatically).
+    i64 big = ML_BIG_CONST;
+    if (big != (i64)0x100000000)        return 94;
+
+    // Gated by inline `define "ML_EXTRA"` on the import line. Verifies per-import
+    // defines reach the macro extractor, not just the decl/enum dumps.
+    if (ML_EXTRA_MACRO != 77)           return 95;
 
     return 0;
 }
