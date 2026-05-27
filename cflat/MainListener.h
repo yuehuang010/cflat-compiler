@@ -1918,6 +1918,11 @@ public:
                 if (paramTypeName == tp)
                 {
                     std::string argType = args[i].TypeAndValue.TypeName;
+                    // Free-function calls drop TypeName for signed-int args (call site only
+                    // preserves it for unsigned ints). Fall back to the LLVM BaseType so
+                    // numeric literals like 3 and (i64)10 still infer cleanly.
+                    if (argType.empty() && args[i].BaseType != nullptr)
+                        argType = Compiler()->LlvmTypeToTypeName(args[i].BaseType);
                     if (!argType.empty()) inferred[tp] = argType;
                     break;
                 }
@@ -9795,6 +9800,12 @@ public:
 
         // Return-block functions have no IR entry; they are inlined at the call site.
         if (compiler->GetReturnBlock(name) != nullptr)
+            return {};
+
+        // Generic function templates have no IR entry until instantiated.
+        // The call-site dispatch (PostfixExpression's RuleArgumentExpressionList branch)
+        // calls TryInferAndInstantiateFromArgs once the arguments are known.
+        if (genericFunctionTemplates.count(name))
             return {};
 
         // Compiler intrinsics handled at the call site - not in the function table.

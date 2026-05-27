@@ -580,7 +580,11 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                     lp = (std::filesystem::path(importingFilePath).parent_path() / lp).lexically_normal();
                 cLinkLibs_.push_back(lp.string());
             }
-            return CompileCHeader(canonicalStr, extraDefines);
+            bool ok = CompileCHeader(canonicalStr, extraDefines);
+            // Translate any queued function-like-macro source into generic templates so
+            // they are visible to the importing file's ForwardRefScanner.
+            if (ok) ProcessPendingMacroSources();
+            return ok;
         }
     }
     importStack.push_back(canonicalStr);
@@ -725,6 +729,71 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     sourceFileName = savedSourceFileName;
     currentSourceFilePath_ = savedSourceFilePath;
     return true;
+}
+
+// Drain pendingMacroSources_ (filled by RegisterCFunctionMacros during a C header import)
+// and feed each buffer through the lexer/parser/ForwardRefScanner pipeline so the auto
+// generic functions land in genericFunctionTemplates before the importing file's own
+// ForwardRefScanner runs. Parse state is kept alive in syntheticParseStates_ because
+// template ctx pointers outlive this function.
+void LLVMBackend::ProcessPendingMacroSources()
+{
+    if (pendingMacroSources_.empty()) return;
+    std::vector<PendingMacroSource> drain;
+    drain.swap(pendingMacroSources_);
+
+    for (auto& p : drain)
+    {
+        SyntheticParseState state;
+        state.label  = p.label;
+        state.input  = std::make_unique<antlr4::ANTLRInputStream>(p.source);
+        state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
+        state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
+        state.parser = std::make_unique<CFlatParser>(state.tokens.get());
+
+        // Suppress lexer/parser console spam. Translation errors here indicate a bug in
+        // our generator (since the source we synthesized is malformed); user-facing
+        // diagnostics for that would be confusing - drop the batch and log under -v.
+        state.lexer->removeErrorListeners();
+        state.parser->removeErrorListeners();
+
+        try { state.tokens->fill(); } catch (...) {
+            if (verbose) std::cout << "[verbose]   lex failed for " << state.label << ", dropping batch\n";
+            continue;
+        }
+        CFlatParser::CompilationUnitContext* cu = nullptr;
+        try { cu = state.parser->compilationUnit(); } catch (...) {
+            if (verbose) std::cout << "[verbose]   parse failed for " << state.label << ", dropping batch\n";
+            continue;
+        }
+        if (!cu) continue;
+        auto* tu = cu->translationUnit();
+        if (!tu) { syntheticParseStates_.push_back(std::move(state)); continue; }
+
+        // ForwardRefScanner::ScanFunctionDefinition explicitly skips generic templates
+        // (they get registered by MainListener's ParseFunctionDefinition at code-gen time
+        // when the importing file is walked). Our synthesized source is never walked by
+        // MainListener, so register the templates inline here from the AST.
+        size_t registered = 0;
+        for (auto* decl : tu->externalDeclaration())
+        {
+            auto* func = decl->functionDefinition();
+            if (!func) continue;
+            auto* gtps = func->genericTypeParameters();
+            if (!gtps) continue;
+            std::string name = ::getFunctionName(func);
+            std::vector<std::string> typeParams;
+            for (auto* entry : gtps->typeParameterList()->typeParameterEntry())
+                typeParams.push_back(entry->getText());
+            gts.genericFunctionTemplates[name] = func;
+            gts.genericFunctionTypeParams[name] = typeParams;
+            ++registered;
+        }
+        if (verbose)
+            std::cout << "[verbose]   registered " << registered << " C function-like macro template(s) from " << state.label << "\n";
+        // Keep parse state alive for the rest of the compilation.
+        syntheticParseStates_.push_back(std::move(state));
+    }
 }
 
 void LLVMBackend::RunBaselinePasses()

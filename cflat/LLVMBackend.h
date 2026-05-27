@@ -700,6 +700,19 @@ private:
         int line = 1;
         int col = 0;
     };
+    // A function-like C macro extracted from a bound header. Translated to a CFlat 'auto'
+    // generic function so that callers can use macro-defined helpers like MIN/MAX/KB without
+    // hand-writing them. Body is the raw replacement text; the translation pass tokenizes,
+    // filters against an allowlist of safe expression operators, and rejects anything else.
+    struct CFunctionMacroEntry
+    {
+        std::string name;
+        std::vector<std::string> params;
+        std::string body;
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
@@ -708,6 +721,7 @@ private:
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
+        std::vector<CFunctionMacroEntry> funcMacros;
     };
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -742,6 +756,23 @@ private:
         std::unique_ptr<CFlatParser> parser;
     };
     std::vector<ImportedParseState> importedParseStates;
+    // Synthesized CFlat source (from C function-like macro translation) lives here.
+    // The parser ecosystem must outlive instantiation since genericFunctionTemplates
+    // stores raw FunctionDefinitionContext pointers into these trees.
+    struct SyntheticParseState
+    {
+        std::string label;                                          // for diagnostics
+        std::unique_ptr<antlr4::ANTLRInputStream> input;
+        std::unique_ptr<CFlatLexer> lexer;
+        std::unique_ptr<antlr4::CommonTokenStream> tokens;
+        std::unique_ptr<CFlatParser> parser;
+    };
+    std::vector<SyntheticParseState> syntheticParseStates_;
+    // Queued CFlat source generated from C function-like macros, drained after each
+    // C-header import by ProcessPendingMacroSources (defined in LLVMBackend.cpp).
+    struct PendingMacroSource { std::string label; std::string source; };
+    std::vector<PendingMacroSource> pendingMacroSources_;
+    void ProcessPendingMacroSources();
     std::unordered_map<std::string, std::string> namespaceAliasTable;
     std::unordered_map<std::string, ReturnBlockEntry> returnBlockTable;
     std::optional<ReturnCaptureContext> returnCapture;
@@ -2465,6 +2496,186 @@ private:
                       << macros.size() << " object-like candidates)\n";
     }
 
+    // Tokenize a function-like macro body and verify every token is on a safe allowlist:
+    // integer literals (suffix stripped), parameter references, parens, and the operators
+    // + - * / % & | ^ ~ ! << >> < <= > >= == != && || ? : . The translated body is
+    // returned via 'out' on success. Rejections (calls into other macros, string/char
+    // literals, member access, casts, '#'/'##', float literals, the comma operator, ...)
+    // return false and the macro is dropped.
+    bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const
+    {
+        std::unordered_set<std::string> paramSet(m.params.begin(), m.params.end());
+        out.clear();
+        out.reserve(m.body.size());
+        const std::string& s = m.body;
+        size_t i = 0;
+        bool hasContent = false;
+
+        while (i < s.size())
+        {
+            char c = s[i];
+            if (std::isspace((unsigned char)c)) { out += c; ++i; continue; }
+
+            // Block comment: /* ... */ allowed (and stripped); line comments rejected.
+            if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') return false;
+            if (c == '/' && i + 1 < s.size() && s[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < s.size() && !(s[i] == '*' && s[i + 1] == '/')) ++i;
+                if (i + 1 < s.size()) i += 2;
+                continue;
+            }
+
+            // Identifier: must be a parameter (no calls, casts, or references to other macros).
+            if (std::isalpha((unsigned char)c) || c == '_')
+            {
+                size_t start = i;
+                while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+                std::string ident = s.substr(start, i - start);
+                if (!paramSet.count(ident)) return false;
+                out += ident;
+                hasContent = true;
+                continue;
+            }
+
+            // Numeric literal: integers only (decimal or hex). Suffixes U/L/UL/LL/ULL are stripped
+            // because cflat's lexer does not accept them. Float literals (presence of '.') are
+            // rejected via the general '.' reject below.
+            if (std::isdigit((unsigned char)c))
+            {
+                size_t start = i;
+                if (c == '0' && i + 1 < s.size() && (s[i + 1] == 'x' || s[i + 1] == 'X'))
+                {
+                    i += 2;
+                    while (i < s.size() && std::isxdigit((unsigned char)s[i])) ++i;
+                }
+                else
+                {
+                    while (i < s.size() && std::isdigit((unsigned char)s[i])) ++i;
+                }
+                out += s.substr(start, i - start);
+                while (i < s.size() && (s[i] == 'u' || s[i] == 'U' || s[i] == 'l' || s[i] == 'L')) ++i;
+                hasContent = true;
+                continue;
+            }
+
+            // String/char literals and disallowed punctuation.
+            if (c == '"' || c == '\'')                     return false;
+            if (c == '#' || c == '[' || c == ']' || c == '.' || c == ',' || c == ';') return false;
+            if (c == '-' && i + 1 < s.size() && s[i + 1] == '>') return false; // ->
+
+            // Two-char operators kept intact.
+            if (i + 1 < s.size())
+            {
+                std::string two = s.substr(i, 2);
+                static const std::unordered_set<std::string> twoChar = {
+                    "<=", ">=", "==", "!=", "&&", "||", "<<", ">>"
+                };
+                if (twoChar.count(two)) { out += two; i += 2; hasContent = true; continue; }
+            }
+
+            // Single-character operators / grouping.
+            static const std::string allowedSingle = "+-*/%&|^~!<>?:()";
+            if (allowedSingle.find(c) != std::string::npos)
+            {
+                out += c;
+                ++i;
+                hasContent = true;
+                continue;
+            }
+
+            return false; // anything else: reject
+        }
+
+        if (!hasContent) return false;
+        while (!out.empty() && std::isspace((unsigned char)out.back())) out.pop_back();
+        if (out.empty()) return false;
+
+        // Defensive parens like '(n)' in macro bodies become C-style casts in CFlat
+        // (`castExpression : '(' typeName ')' castExpression`), e.g. '(n) * 1024'
+        // parses as 'cast n of *1024'. Strip parens around bare identifiers - they
+        // are redundant in a real function and unblock the multiply/binary-op cases.
+        size_t pos = 0;
+        while ((pos = out.find('(', pos)) != std::string::npos)
+        {
+            size_t inner = pos + 1;
+            while (inner < out.size() && std::isspace((unsigned char)out[inner])) ++inner;
+            if (inner >= out.size() ||
+                !(std::isalpha((unsigned char)out[inner]) || out[inner] == '_'))
+            {
+                ++pos; continue;
+            }
+            size_t identEnd = inner;
+            while (identEnd < out.size() &&
+                   (std::isalnum((unsigned char)out[identEnd]) || out[identEnd] == '_'))
+                ++identEnd;
+            size_t after = identEnd;
+            while (after < out.size() && std::isspace((unsigned char)out[after])) ++after;
+            if (after >= out.size() || out[after] != ')') { ++pos; continue; }
+            out.replace(pos, after + 1 - pos, out.substr(inner, identEnd - inner));
+            // Stay at pos: the rewrite may expose another stripping opportunity.
+        }
+        return true;
+    }
+
+    // Translate function-like C macros into CFlat 'auto' generic functions and queue
+    // the synthesized source for parsing. Rejected macros are dropped silently (verbose
+    // log emits the reason). Generated source shape per macro:
+    //     auto NAME<T0,T1,...>(T0 p0, T1 p1, ...) { return (BODY); }
+    void RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>& funcMacros,
+                                 const std::string& fileForLsp)
+    {
+        if (funcMacros.empty()) return;
+
+        std::string generated;
+        size_t accepted = 0, rejected = 0, skipped = 0;
+
+        for (const auto& m : funcMacros)
+        {
+            // Skip if a real symbol with this name already exists (extern function,
+            // existing generic template, or even a bound C macro constant). First writer
+            // wins, matching the existing object-like macro path.
+            if (functionTable.count(m.name) ||
+                globalNamedVariable.count(m.name))
+            {
+                ++skipped;
+                if (verbose) std::cout << "[verbose]   skip macro " << m.name << ": name already defined\n";
+                continue;
+            }
+
+            std::string translatedBody;
+            if (!TranslateMacroBody(m, translatedBody))
+            {
+                ++rejected;
+                if (verbose) std::cout << "[verbose]   reject macro " << m.name << ": body uses unsupported tokens\n";
+                continue;
+            }
+
+            generated += "auto " + m.name + "<";
+            for (size_t i = 0; i < m.params.size(); ++i)
+            {
+                if (i) generated += ", ";
+                generated += "T" + std::to_string(i);
+            }
+            generated += ">(";
+            for (size_t i = 0; i < m.params.size(); ++i)
+            {
+                if (i) generated += ", ";
+                generated += "T" + std::to_string(i) + " " + m.params[i];
+            }
+            generated += ") { return (" + translatedBody + "); }\n";
+            ++accepted;
+        }
+
+        if (verbose)
+            std::cout << "[verbose]   function-like C macros: " << accepted << " translated, "
+                      << rejected << " rejected, " << skipped << " skipped (already defined) from "
+                      << fileForLsp << "\n";
+
+        if (!generated.empty())
+            pendingMacroSources_.push_back({ fileForLsp + "@cmacros", std::move(generated) });
+    }
+
     // Discover object-like macros contributed by a bound C header and resolve their integer
     // values. Two clang spawns:
     //   Pass A (-E -dD): preprocessed text with #define directives preserved and `# line "file"`
@@ -2480,7 +2691,8 @@ private:
     // for the main header extraction so resolution sees the same view of the header.
     bool ExtractCHeaderMacros(const std::string& clangPath, const std::string& headerPath,
                               const std::vector<std::string>& extraDefines,
-                              std::vector<CMacroEntry>& outMacros)
+                              std::vector<CMacroEntry>& outMacros,
+                              std::vector<CFunctionMacroEntry>& outFuncMacros)
     {
         const std::string target = (platformValue == 32)
             ? "--target=i686-pc-windows-msvc"
@@ -2511,6 +2723,8 @@ private:
         struct MacroCand { std::string name; std::string file; int line; };
         std::vector<MacroCand> candidates;
         std::unordered_map<std::string, size_t> byName; // name -> index in candidates (dedupe; last #define wins, matching C)
+        std::vector<CFunctionMacroEntry> funcCandidates;
+        std::unordered_map<std::string, size_t> funcByName; // dedupe for function-like macros
 
         {
             llvm::SmallString<256> stubFile;
@@ -2594,7 +2808,55 @@ private:
                         {
                             std::string name = line.substr(nameStart, p2 - nameStart);
                             // Function-like macro: name immediately followed by '(' (no space).
-                            if (line[p2] == '(') { /* skip */ }
+                            if (line[p2] == '(')
+                            {
+                                if (!inScope(curFile) || name.rfind("__", 0) == 0) { /* drop */ }
+                                else
+                                {
+                                    // Parse comma-separated param list until matching ')'. Variadic
+                                    // (`...`) or empty-name params disqualify the macro.
+                                    ++p2; // past '('
+                                    std::vector<std::string> params;
+                                    bool ok = true;
+                                    while (p2 < line.size() && line[p2] != ')')
+                                    {
+                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
+                                        size_t s = p2;
+                                        while (p2 < line.size() &&
+                                               (std::isalnum((unsigned char)line[p2]) || line[p2] == '_'))
+                                            ++p2;
+                                        if (p2 == s) { ok = false; break; } // empty/variadic
+                                        params.push_back(line.substr(s, p2 - s));
+                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
+                                        if (p2 < line.size() && line[p2] == ',') ++p2;
+                                        else break;
+                                    }
+                                    if (ok && p2 < line.size() && line[p2] == ')')
+                                    {
+                                        ++p2;
+                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
+                                        std::string body = (p2 < line.size()) ? line.substr(p2) : "";
+                                        // Body-less macros (no replacement text) are useless to translate.
+                                        if (!body.empty())
+                                        {
+                                            auto it = funcByName.find(name);
+                                            if (it == funcByName.end())
+                                            {
+                                                funcByName[name] = funcCandidates.size();
+                                                funcCandidates.push_back({ name, std::move(params), std::move(body), curFile, curLine, 0 });
+                                            }
+                                            else
+                                            {
+                                                // Redefined - keep latest definition.
+                                                funcCandidates[it->second].params = std::move(params);
+                                                funcCandidates[it->second].body   = std::move(body);
+                                                funcCandidates[it->second].file   = curFile;
+                                                funcCandidates[it->second].line   = curLine;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             else
                             {
                                 while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
@@ -2626,6 +2888,10 @@ private:
                 line.clear();
             }
         }
+
+        // Function-like macros need no AST resolution; emit them now so an early return
+        // from the object-like Pass B does not drop them.
+        outFuncMacros = funcCandidates;
 
         if (candidates.empty()) return true;
 
@@ -3011,6 +3277,7 @@ private:
         std::vector<CEnumEntry> hitEnums;
         std::vector<CRecordEntry> hitRecords;
         std::vector<CMacroEntry> hitMacros;
+        std::vector<CFunctionMacroEntry> hitFuncMacros;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -3021,13 +3288,15 @@ private:
                 if (entry.mtime == currentMtime)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hitMacros = entry.macros; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime;
-                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records; hitMacros = entry.macros; hit = true;
+                    hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hit = true;
                 }
             }
         }
@@ -3038,6 +3307,7 @@ private:
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
+            RegisterCFunctionMacros(hitFuncMacros, fileForLsp);
             return true;
         }
 
@@ -3052,11 +3322,12 @@ private:
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
+        std::vector<CFunctionMacroEntry> funcMacros;
         if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
             return false;
         // Macro discovery is best-effort: failure here (clang missing a header path, OOM,
         // etc.) should not invalidate the function / enum / record bindings we already got.
-        (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros);
+        (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros, funcMacros);
 
         if (!mtEc)
         {
@@ -3067,6 +3338,7 @@ private:
             entry.enums = enums;
             entry.records = records;
             entry.macros = macros;
+            entry.funcMacros = funcMacros;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
@@ -3075,6 +3347,7 @@ private:
         RegisterCSignatures(sigs, fileForLsp);
         RegisterCEnums(enums, fileForLsp);
         RegisterCMacros(macros);
+        RegisterCFunctionMacros(funcMacros, fileForLsp);
         return true;
     }
 
@@ -7777,6 +8050,14 @@ public:
     // 'auto' return-type inference to populate the function table's ReturnType
     // after the unified return type is known. Falls back to "i64" so the entry
     // is never left empty.
+    // Convenience: just the CFlat type name from an LLVM type. Useful for generic
+    // argument inference where the argument's TypeName has been stripped but its
+    // LLVM type still describes the underlying primitive.
+    std::string LlvmTypeToTypeName(llvm::Type* t) const
+    {
+        return LlvmTypeToTypeAndValue(t).TypeName;
+    }
+
     TypeAndValue LlvmTypeToTypeAndValue(llvm::Type* t) const
     {
         TypeAndValue tv;
@@ -8231,7 +8512,9 @@ public:
                 header, res.includeDir));
             return false;
         }
-        return CompileCHeader(headerCanon.string(), {});
+        bool ok = CompileCHeader(headerCanon.string(), {});
+        if (ok) ProcessPendingMacroSources();
+        return ok;
     }
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();

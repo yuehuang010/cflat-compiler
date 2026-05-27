@@ -19,10 +19,15 @@
 //                       parenthesized negative, expression-folded, i64-promoted,
 //                       and define-gated; function-like / string macros must be
 //                       silently skipped without poisoning their neighbors.
+//   Section J (100-115): function-like #define macro translation - each accepted
+//                       macro becomes an `auto` generic function callable without
+//                       explicit type args; rejected bodies (calls, strings,
+//                       member access, floats) must be silently dropped.
 
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
+import "library/c_macro_helpers.h";
 
 // Section B: hand-written extern alongside auto-extern. Same signatures the auto-
 // extern path infers; first-writer-wins resolves the duplicate without diagnostic.
@@ -171,6 +176,33 @@ extern int main()
     // Gated by inline `define "ML_EXTRA"` on the import line. Verifies per-import
     // defines reach the macro extractor, not just the decl/enum dumps.
     if (ML_EXTRA_MACRO != 77)           return 95;
+
+    // ---- Section J: function-like macro translation -------------------------
+    // Each accepted macro from c_macro_helpers.h is translated into an `auto`
+    // generic function and called without explicit type arguments.
+    if (CB_MIN(3, 7) != 3)               return 100;
+    if (CB_MIN(9, 2) != 2)               return 101;
+    if (CB_MAX(3, 7) != 7)               return 102;
+    if (CB_MAX(9, 2) != 9)               return 103;
+
+    if (CB_KB(2) != 2048)                return 104;
+    if (CB_KB(0) != 0)                   return 105;
+
+    if (CB_LOWORD(0x12345678) != 0x5678) return 106;
+    if (CB_HIWORD(0x12345678) != 0x1234) return 107;
+
+    if (CB_ABS(-9) != 9)                 return 108;
+    if (CB_ABS(9)  != 9)                 return 109;
+
+    if (CB_IS_ODD(5) != 1)               return 110;
+    if (CB_IS_ODD(4) != 0)               return 111;
+
+    if (CB_CLAMP(5, 0, 10) != 5)         return 112;
+    if (CB_CLAMP(-3, 0, 10) != 0)        return 113;
+    if (CB_CLAMP(99, 0, 10) != 10)       return 114;
+
+    // Cross-type instantiation: i64 arg forces CB_MIN<int,i64> with widened return.
+    if (CB_MIN(3, (i64)7) != (i64)3)     return 115;
 
     return 0;
 }
