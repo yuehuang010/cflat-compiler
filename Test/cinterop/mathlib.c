@@ -41,6 +41,27 @@ int ml_pun_int_bits_of(float f)
     return u.as_int;
 }
 
+#include <stdlib.h>
+
+int*** ml_make_ppp(int v)
+{
+    int*   leaf  = (int*)malloc(sizeof(int));
+    *leaf = v;
+    int**  pp    = (int**)malloc(sizeof(int*));
+    *pp = leaf;
+    int*** ppp   = (int***)malloc(sizeof(int**));
+    *ppp = pp;
+    return ppp;
+}
+int  ml_ppp_load(int*** p)            { return ***p; }
+void ml_ppp_set (int*** p, int v)     { ***p = v; }
+void ml_ppp_free(int*** p)
+{
+    free(**p);
+    free(*p);
+    free(p);
+}
+
 _Bool       ml_bool_not   (_Bool x)              { return !x; }
 _Bool       ml_bool_and   (_Bool a, _Bool b)     { return a && b; }
 void        ml_bool_store (_Bool* out, _Bool v)  { *out = v; }

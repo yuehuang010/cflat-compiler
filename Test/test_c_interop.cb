@@ -364,5 +364,16 @@ extern int main()
     ml_ld_store(&dout, 7.125);
     if (dout != 7.125)                           return 147;
 
+    // ---- Section P: 3+ levels of pointer indirection -----------------------
+    // mathlib.h declares helpers taking `int***`. The C-interop mapper collapses
+    // ptr > 2 to opaque `void**` (TypeAndValue has only Pointer + ElemPointer);
+    // CFlat holds the chain as an opaque handle and threads it back through C.
+    // Functions that were previously skipped per the `ptr > 2` guard now bind.
+    void** chain = ml_make_ppp(123);
+    if (ml_ppp_load(chain) != 123)               return 160;
+    ml_ppp_set(chain, 456);
+    if (ml_ppp_load(chain) != 456)               return 161;
+    ml_ppp_free(chain);
+
     return 0;
 }

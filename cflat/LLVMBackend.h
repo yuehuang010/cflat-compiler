@@ -2035,8 +2035,19 @@ private:
         }
         while (!base.empty() && base.back() == ' ') base.pop_back();
 
+        // Three-or-more levels of indirection (e.g. `char***`, `void****`) collapse to an
+        // opaque `void**`. CFlat's TypeAndValue exposes at most two pointer levels
+        // (Pointer + ElemPointer), and any pointer is the same ABI size on x64/x86, so
+        // the call still links correctly. Direct dereference of the third+ level is not
+        // available from CFlat - the user holds the handle and threads it back through C
+        // (e.g. allocate / free helpers on the C side that hide the inner indirection).
         if (ptr > 2)
-            return false;
+        {
+            out.TypeName = "void";
+            out.Pointer = true;
+            out.ElemPointer = true;
+            return true;
+        }
 
         // enum decays to int; struct/union pointers become opaque void* (the call only
         // needs a pointer-sized slot). For struct/union *by value* we look up the tag in

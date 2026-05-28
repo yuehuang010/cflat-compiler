@@ -140,6 +140,16 @@ struct ML_Overlap
  * These helpers lock the mappings in via pass-by-value and pointer-out shapes.
  * stdbool.h's `bool` macro expands to `_Bool`; clang canonicalizes the qualType
  * to `_Bool` in the AST dump, which is what the extractor sees. */
+/* Three-level indirection - the mapper collapses `int***` to opaque `void**`
+ * (the deepest two CFlat pointer levels CFlat can express). C owns the chain
+ * (allocates and frees); CFlat threads the opaque handle through. The function
+ * pointer is one machine word regardless of declared depth, so the call still
+ * links correctly. */
+int*** ml_make_ppp   (int v);            /* returns malloc'd int*** chain */
+int    ml_ppp_load   (int*** p);         /* ***p */
+void   ml_ppp_set    (int*** p, int v);  /* ***p = v */
+void   ml_ppp_free   (int*** p);
+
 _Bool       ml_bool_not    (_Bool x);
 _Bool       ml_bool_and    (_Bool a, _Bool b);
 void        ml_bool_store  (_Bool* out, _Bool v);
