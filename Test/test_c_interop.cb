@@ -40,6 +40,7 @@ extern int c_add(int a, int b);
 extern int c_square(int x);
 
 extern void printf(const char* fmt, ...);
+extern int  strcmp(const char* a, const char* b);
 
 extern int main()
 {
@@ -191,6 +192,14 @@ extern int main()
     // Float-suffixed source literal: precision lost in float->double round-trip
     // is still well inside our 0.01 tolerance.
     if (ML_FLOAT_F < 2.49 || ML_FLOAT_F > 2.51)         return 119;
+
+    // String-literal macros - routed through Pass B's __typeof__ probe (recovered
+    // type is char[N]) and resolved by the string-literal probe. Registered as
+    // CFlat `char*` globals interned in the string pool; the C call-site ABI
+    // treats them as `const char*`.
+    if (strcmp(ML_NAME, "mathlib") != 0)                 return 125;
+    if (strcmp(ML_VERSION, "1.2.3") != 0)                return 126;
+    if (strcmp(ML_GREETING, "hello\nworld") != 0)        return 127;
 
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`

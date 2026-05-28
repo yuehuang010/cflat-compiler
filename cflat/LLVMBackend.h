@@ -701,6 +701,12 @@ private:
         // successful double-fold alone) is intentional: `(double)(0x100000000)`
         // folds fine but the macro is an integer constant, not a float.
         bool isFloat = false;
+        // True when the macro expands to a string literal (e.g. #define VERSION "1.2.3").
+        // stringValue holds the decoded characters; RegisterCMacros interns it via
+        // CreateGlobalString and emits a `char*` global. Routed via Pass B's
+        // __typeof__ probe so `(int)"x"` stays on the integer path.
+        bool isString = false;
+        std::string stringValue;
     };
     // A C struct/union decl extracted from a bound header or source. Field types are kept as
     // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
@@ -2549,7 +2555,18 @@ private:
             TypeAndValue tv;
             tv.VariableName = m.name;
             llvm::Constant* c = nullptr;
-            if (m.isFloat)
+            if (m.isString)
+            {
+                // String-literal macro (e.g. #define VERSION "1.2.3"). Intern the literal
+                // in the string pool and register a `char*` global pointing at it. CFlat's
+                // `char*` matches C's `const char*` ABI; callers can pass directly to any C
+                // function taking const char* without an explicit cast.
+                tv.TypeName = "char";
+                tv.Pointer  = true;
+                llvm::Value* strGv = CreateGlobalString(".cmacro." + m.name, m.stringValue);
+                c = llvm::cast<llvm::Constant>(strGv);
+            }
+            else if (m.isFloat)
             {
                 // Float/double macro (e.g. M_PI). Always register as `double` - CFlat
                 // narrows at use site if assigned to a `float`, and double matches C's
@@ -3015,6 +3032,13 @@ private:
                 // integer macros stay on the integer path even though this probe also
                 // folds them.
                 os << "static const double __cflat_f_" << m.name << " = (double)(" << m.name << ");\n";
+                // String probe: if the macro is a string literal, this VarDecl carries the
+                // initializer as a StringLiteral node we can harvest verbatim. For non-string
+                // macros the line fails compilation in isolation (no effect on neighbors
+                // under -ferror-limit=0) and resolvedString simply has no entry. Routing
+                // below keys on the __typeof__ result, not on a successful string probe,
+                // so things like `(int)"x"` (typeof = int) stay on the integer path.
+                os << "static const char* __cflat_s_" << m.name << " = (" << m.name << ");\n";
             }
             os.close();
         }
@@ -3048,9 +3072,11 @@ private:
         const std::string mPrefix = "__cflat_m_";
         const std::string tPrefix = "__cflat_t_";
         const std::string fPrefix = "__cflat_f_";
+        const std::string sPrefix = "__cflat_s_";
         std::unordered_map<std::string, long long>   resolvedVal;
         std::unordered_map<std::string, std::string> resolvedType;
         std::unordered_map<std::string, double>      resolvedFloat;
+        std::unordered_map<std::string, std::string> resolvedString;
 
         // Evaluate a constant-expression AST node to a double. Clang in C mode does
         // not pre-fold `static const double x = ...;` initializers, so the float-fold
@@ -3125,6 +3151,80 @@ private:
             return false;
         };
 
+        // Locate the first StringLiteral anywhere inside a VarDecl's subtree and decode
+        // its `value` (clang emits the literal in C source form, including surrounding
+        // quotes and \-escapes). For adjacent literal concatenation (`"a" "b"`) clang
+        // already folds into a single StringLiteral by the time we see it.
+        std::function<bool(const llvm::json::Object*, std::string&)> findString =
+            [&](const llvm::json::Object* node, std::string& out) -> bool {
+            if (!node) return false;
+            if (auto kind = node->getString("kind"))
+            {
+                if (*kind == "StringLiteral")
+                {
+                    if (auto v = node->getString("value"))
+                    {
+                        // clang emits the literal in source form: a leading optional
+                        // encoding prefix (L/u/U/u8), then the quoted body with C
+                        // escape sequences preserved. Strip the prefix + quotes and
+                        // decode the escapes we care about (the same set CFlat uses
+                        // for its own string literals - \n \t \r \0 \\ \" \' plus
+                        // \xHH and \ooo for completeness).
+                        std::string s = v->str();
+                        size_t i = 0;
+                        while (i < s.size() && (s[i] == 'L' || s[i] == 'u' || s[i] == 'U'))
+                        {
+                            // u8"..." prefix is two characters.
+                            if (s[i] == 'u' && i + 1 < s.size() && s[i + 1] == '8') { i += 2; }
+                            else { ++i; }
+                        }
+                        if (i >= s.size() || s[i] != '"') return false;
+                        ++i; // skip opening quote
+                        std::string decoded;
+                        decoded.reserve(s.size());
+                        while (i < s.size() && s[i] != '"')
+                        {
+                            char c = s[i];
+                            if (c == '\\' && i + 1 < s.size())
+                            {
+                                char e = s[i + 1];
+                                switch (e)
+                                {
+                                    case 'n':  decoded += '\n'; i += 2; continue;
+                                    case 't':  decoded += '\t'; i += 2; continue;
+                                    case 'r':  decoded += '\r'; i += 2; continue;
+                                    case '0':  decoded += '\0'; i += 2; continue;
+                                    case '\\': decoded += '\\'; i += 2; continue;
+                                    case '"':  decoded += '"';  i += 2; continue;
+                                    case '\'': decoded += '\''; i += 2; continue;
+                                    case 'a':  decoded += '\a'; i += 2; continue;
+                                    case 'b':  decoded += '\b'; i += 2; continue;
+                                    case 'f':  decoded += '\f'; i += 2; continue;
+                                    case 'v':  decoded += '\v'; i += 2; continue;
+                                    default: break;
+                                }
+                                // Anything fancier (\xHH, \uXXXX, multi-digit octal)
+                                // would require more state; rather than half-implement,
+                                // bail out and drop the macro. Real-world version-style
+                                // macros don't use these escapes.
+                                return false;
+                            }
+                            decoded += c;
+                            ++i;
+                        }
+                        if (i >= s.size() || s[i] != '"') return false;
+                        out = std::move(decoded);
+                        return true;
+                    }
+                    return false;
+                }
+            }
+            if (auto* inner = node->getArray("inner"))
+                for (const auto& c : *inner)
+                    if (findString(c.getAsObject(), out)) return true;
+            return false;
+        };
+
         std::function<void(const llvm::json::Value&)> visit = [&](const llvm::json::Value& v) {
             const llvm::json::Object* node = v.getAsObject();
             if (!node) return;
@@ -3165,6 +3265,12 @@ private:
                             if (findFloat(node, d))
                                 resolvedFloat[n.substr(fPrefix.size())] = d;
                         }
+                        else if (n.rfind(sPrefix, 0) == 0)
+                        {
+                            std::string s;
+                            if (findString(node, s))
+                                resolvedString[n.substr(sPrefix.size())] = std::move(s);
+                        }
                     }
                 }
             }
@@ -3176,10 +3282,11 @@ private:
         outMacros.reserve(resolvedVal.size() + resolvedFloat.size());
         for (const auto& cand : candidates)
         {
-            // Route by the __typeof__ probe's recovered C type. Float/double goes to
-            // the FP path (preserves precision); void* to the pointer-sentinel path;
-            // everything else to the integer path.
-            bool typeIsFloat = false;
+            // Route by the __typeof__ probe's recovered C type. String -> char* path
+            // (literal interned in the string pool); float/double -> FP path (preserves
+            // precision); void* -> pointer-sentinel path; everything else -> integer.
+            bool typeIsFloat  = false;
+            bool typeIsString = false;
             auto tt = resolvedType.find(cand.name);
             if (tt != resolvedType.end())
             {
@@ -3189,6 +3296,15 @@ private:
                 {
                     typeIsFloat = true;
                 }
+                // __typeof__("foo") is `char[N]`; const char* / char* arise when the
+                // macro expands to a const char* expression (less common but valid).
+                else if (t.rfind("char[", 0) == 0
+                    || t.rfind("const char[", 0) == 0
+                    || t == "char *"      || t == "const char *"
+                    || t == "char *const" || t == "const char *const")
+                {
+                    typeIsString = true;
+                }
             }
 
             CMacroEntry e;
@@ -3196,6 +3312,16 @@ private:
             e.file  = cand.file;
             e.line  = cand.line;
             e.col   = 0;
+
+            if (typeIsString)
+            {
+                auto its = resolvedString.find(cand.name);
+                if (its == resolvedString.end()) continue; // string type but the literal probe failed - drop
+                e.isString    = true;
+                e.stringValue = its->second;
+                outMacros.push_back(std::move(e));
+                continue;
+            }
 
             if (typeIsFloat)
             {

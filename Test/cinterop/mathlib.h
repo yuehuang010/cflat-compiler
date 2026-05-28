@@ -56,10 +56,12 @@ enum Extra
  * leak in as a constant. */
 #define ML_SQUARE(x) ((x) * (x))
 
-/* String-valued macro: object-like but non-integer. The enum-stub
- * resolution drops it cleanly (per-decl isolation); other macros above
- * must still register. */
-#define ML_NAME "mathlib"
+/* String-valued macros - routed via Pass B's __typeof__ probe (type is
+ * `char[N]`) and resolved by the string-literal probe. Registered as
+ * CFlat `char*` globals interned in the string pool. */
+#define ML_NAME      "mathlib"
+#define ML_VERSION   "1.2.3"
+#define ML_GREETING  "hello\nworld"  /* escape sequences must round-trip */
 
 /* Gated by inline `define "ML_EXTRA"` - mirrors EXTRA_FLAG but as a #define.
  * Verifies per-import defines feed the macro extraction pass, not just the
