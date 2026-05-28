@@ -517,6 +517,78 @@ bool testShortCircuitIf()
     return result;
 }
 
+// ---- Bitfields ----
+// Unsigned 1-bit fields use u32 so 1 stays as 1 (signed 1-bit only holds 0 or -1).
+struct BfFlags
+{
+    u32 ready    : 1;
+    u32 mode     : 3;
+    u32 reserved : 4;
+    u32 count    : 24;
+};
+
+struct BfSigned
+{
+    int a : 4;   // -8 .. 7, sign-extended on read
+    int b : 4;
+};
+
+struct BfMixed
+{
+    u8  small   : 5;
+    u8  padding : 0;   // width-0 closes the u8 unit
+    u8  tail    : 3;   // fresh u8 unit
+    int big     : 20;  // new i32 unit (different underlying type)
+};
+
+bool testBitfields()
+{
+    bool result = true;
+
+    BfFlags f = default;
+    result &= Test("bf_default_ready",    (int)f.ready, 0);
+    result &= Test("bf_default_mode",     (int)f.mode, 0);
+    result &= Test("bf_default_count",    (int)f.count, 0);
+
+    f.ready = 1;
+    f.mode = 5;
+    f.reserved = 12;
+    f.count = 1234567;
+    result &= Test("bf_set_ready",        (int)f.ready, 1);
+    result &= Test("bf_set_mode",         (int)f.mode, 5);
+    result &= Test("bf_set_reserved",     (int)f.reserved, 12);
+    result &= Test("bf_set_count",        (int)f.count, 1234567);
+
+    // RMW through compound expression.
+    f.count = f.count + 1;
+    result &= Test("bf_rmw_count",        (int)f.count, 1234568);
+
+    // Overflow: high bits dropped (unsigned wrap).
+    BfFlags g = default;
+    g.mode = 9;                       // 1001 - low 3 bits = 001
+    result &= Test("bf_overflow_mode",    (int)g.mode, 1);
+
+    // Signed sign-extension: 4-bit 12 reads back as -4 (1100 two's complement).
+    BfSigned s = default;
+    s.a = 7;
+    s.b = 12;
+    result &= Test("bf_signed_a",         s.a, 7);
+    result &= Test("bf_signed_b_neg",     s.b, -4);
+    s.a = -3;
+    result &= Test("bf_signed_a_neg",     s.a, -3);
+
+    // Width-0 boundary marker and type change open new storage units.
+    BfMixed m = default;
+    m.small = 17;
+    m.tail = 6;
+    m.big = -100;
+    result &= Test("bf_mixed_small",      (int)m.small, 17);
+    result &= Test("bf_mixed_tail",       (int)m.tail, 6);
+    result &= Test("bf_mixed_big",        m.big, -100);
+
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // Test the tests
@@ -569,6 +641,7 @@ extern int main(int argc, char** argv)
     result &= Test("switch_fall3",     switchFallthrough(3),  3);
     result &= Test("testUpconvert",          testUpconvert(), true);
     result &= Test("testShortCircuitIf",     testShortCircuitIf(), true);
+    result &= Test("testBitfields",          testBitfields(), true);
 
     if (result)
     {

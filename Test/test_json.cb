@@ -33,6 +33,14 @@ struct Employee {
     Address addr = default;
 };
 
+struct BfPacket {
+    u32 ready    : 1;
+    u32 mode     : 3;
+    u32 count    : 24;
+    i32 delta    : 8;
+    bool flag    : 1;
+};
+
 struct Level3 { int val = 0; };
 struct Level2 { Level3 deep = default; int mid = 0; };
 struct Level1 { Level2 inner = default; string top = default; };
@@ -106,6 +114,16 @@ extern int main()
     e.addr.zip = 12345;
     total++; passed += Test("toJson_nested", JsonBuilder.toJson(e),
         "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
+
+    // -- bitfield struct - toJson ---------------------------------------------
+    BfPacket bp = default;
+    bp.ready = 1;
+    bp.mode = 5;
+    bp.count = 12345;
+    bp.delta = -7;
+    bp.flag = true;
+    total++; passed += Test("toJson_bitfields", JsonBuilder.toJson(bp),
+        "{\"ready\":1,\"mode\":5,\"count\":12345,\"delta\":-7,\"flag\":true}");
 
     // ── deeply nested - toJson ───────────────────────────────────────────────
     Level1 l1;

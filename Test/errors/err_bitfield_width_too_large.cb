@@ -1,0 +1,5 @@
+// A bitfield wider than its underlying type must be rejected.
+
+expect_error("width 9 exceeds underlying type 'u8'") {
+    struct S { u8 x : 9; };
+}

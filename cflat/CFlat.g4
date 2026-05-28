@@ -240,7 +240,8 @@ initDeclaratorList
     ;
 
 initDeclarator
-    : declarator ('=' initializer)?
+    : declarator ':' constantExpression ('=' initializer)?   // bitfield: int flags : 3 = 0;  (width 0 closes the unit)
+    | declarator ('=' initializer)?
     | declarator '{' initializerList? ','? '}'
     ;
 

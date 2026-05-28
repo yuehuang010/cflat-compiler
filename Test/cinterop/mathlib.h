@@ -162,6 +162,24 @@ float ml_overlap_read_float  (struct ML_Overlap* o);
 int   ml_overlap_header_of   (struct ML_Overlap* o);
 int   ml_overlap_trailer_of  (struct ML_Overlap* o);
 
+/* C bitfields - the Win32 PE/COFF flag-byte shape. CFlat replicates MSVC's
+ * LSB-first packing so a struct with adjacent same-type bitfields lays out
+ * the same bits in the same storage word on both sides. The reader/writer
+ * helpers below cross the C/CFlat ABI boundary by-pointer so we can confirm
+ * the bits agree without having to dump raw memory. */
+struct ML_Flags
+{
+    unsigned int ready    : 1;
+    unsigned int mode     : 3;
+    unsigned int reserved : 4;
+    unsigned int count    : 24;
+};
+
+void ml_flags_init     (struct ML_Flags* f);
+unsigned ml_flags_word (struct ML_Flags* f);              /* raw 32-bit view */
+void ml_flags_set_count(struct ML_Flags* f, unsigned c);
+unsigned ml_flags_get_count(struct ML_Flags* f);
+
 /* Function-pointer typedef - the comparator-style callback shape used by qsort,
  * libcurl's CURLOPT_WRITEFUNCTION, etc. clang spells the qualType as
  *   "int (*)(int, int)"

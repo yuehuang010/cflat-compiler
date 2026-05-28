@@ -1,0 +1,8 @@
+// Bitfields are not byte-addressable - &s.bf must be rejected.
+
+struct Flags { u32 ready : 1; u32 mode : 3; };
+
+expect_error("cannot take the address of bitfield 'ready'") {
+    Flags f = default;
+    u32* p = &f.ready;
+}

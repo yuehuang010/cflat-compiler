@@ -74,6 +74,21 @@ float ml_overlap_read_float (struct ML_Overlap* o) { return o->as_float; }
 int   ml_overlap_header_of  (struct ML_Overlap* o) { return o->header; }
 int   ml_overlap_trailer_of (struct ML_Overlap* o) { return o->trailer; }
 
+void ml_flags_init(struct ML_Flags* f)
+{
+    f->ready    = 1;
+    f->mode     = 5;
+    f->reserved = 12;
+    f->count    = 1234567;
+}
+unsigned ml_flags_word(struct ML_Flags* f)
+{
+    unsigned* w = (unsigned*)f;
+    return *w;
+}
+void ml_flags_set_count(struct ML_Flags* f, unsigned c) { f->count = c; }
+unsigned ml_flags_get_count(struct ML_Flags* f) { return f->count; }
+
 int ml_apply(ML_BinaryOp op, int a, int b) { return op(a, b); }
 
 static int ml_op_add(int a, int b) { return a + b; }

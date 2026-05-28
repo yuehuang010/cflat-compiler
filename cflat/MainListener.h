@@ -3656,6 +3656,29 @@ public:
                     typeAndValue.Initializer = initializer;
                     typeAndValue.Annotations = annotations;
 
+                    // Bitfield: `int flags : 3 = 0;` - the constantExpression after ':'
+                    // is the declared width in bits. Set IsBitfield + BitWidth here;
+                    // the packing pass (LayoutBitfields in LLVMBackend.h) fills in
+                    // BitOffset and StorageFieldIndex before CreateStructType.
+                    if (auto* widthExpr = initDecl->constantExpression())
+                    {
+                        llvm::Value* widthVal = ParseConditionalExpression(widthExpr->conditionalExpression());
+                        auto* widthCi = llvm::dyn_cast_or_null<llvm::ConstantInt>(widthVal);
+                        if (!widthCi)
+                        {
+                            LogErrorContext(widthExpr, "bitfield width must be a compile-time constant integer");
+                        }
+                        else
+                        {
+                            int64_t w = widthCi->getSExtValue();
+                            if (w < 0)
+                                LogErrorContext(widthExpr, "bitfield width must be non-negative");
+                            else
+                                typeAndValue.BitWidth = (unsigned)w;
+                            typeAndValue.IsBitfield = true;
+                        }
+                    }
+
                     result.push_back(typeAndValue);  // Copy
                 }
             }
@@ -4411,13 +4434,55 @@ public:
                     && !llvm::isa<llvm::GetElementPtrInst>(destination);
             };
             auto derefLoad = [&]() -> llvm::Value* {
+                // Bitfield: the extracted value was already computed at field-access time.
+                if (namedVar.BitfieldStorage)
+                    return namedVar.Primary;
                 if (namedVar.UnionFieldType)
                     return compiler->CreateLoad(namedVar.UnionFieldType, destination);
                 return isDerefStorage()
                     ? compiler->CreateLoad(namedVar.BaseType, destination)
                     : compiler->CreateLoad(destination);
             };
-            auto derefAssign = [&](llvm::Value* val, bool isUnsigned) {
+            // Bitfield read-modify-write: ((word & ~window) | ((val & valMask) << off)).
+            // Returns the truncated/sign-extended bitfield value so the assignment
+            // expression's result matches the bitfield's declared type.
+            auto bitfieldAssign = [&](llvm::Value* val) -> llvm::Value* {
+                auto* storageTy = namedVar.BitfieldStorageType;
+                unsigned storageBits = (unsigned)storageTy->getIntegerBitWidth();
+                unsigned w = namedVar.BitfieldWidth;
+                unsigned off = namedVar.BitfieldOffset;
+                uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                uint64_t windowMask = valMask << off;
+
+                // Cast the incoming value to the storage word's integer width.
+                // Third arg of CreateCast is isSigned (used only when widening); flip
+                // BitfieldUnsigned to get sign-extension for signed bitfields.
+                auto* valAsStorage = compiler->CreateCast(val, storageTy, !namedVar.BitfieldUnsigned);
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, llvm::ConstantInt::get(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, off));
+                auto* word = compiler->CreateLoad(storageTy, namedVar.BitfieldStorage);
+                auto* cleared = compiler->builder->CreateAnd(word, llvm::ConstantInt::get(storageTy, ~windowMask));
+                auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
+                compiler->builder->CreateStore(newWord, namedVar.BitfieldStorage);
+
+                // Recompute the extracted bitfield value (post-store) so this expression's
+                // result is the value actually stored, with width/sign correctly applied.
+                llvm::Value* result;
+                if (namedVar.BitfieldUnsigned)
+                {
+                    result = valMasked;  // already masked to width, zero-extended
+                }
+                else
+                {
+                    unsigned leftShift = storageBits - w;
+                    auto* shl = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, leftShift));
+                    result = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(storageTy, leftShift));
+                }
+                return result;
+            };
+            auto derefAssign = [&](llvm::Value* val, bool isUnsigned) -> llvm::Value* {
+                if (namedVar.BitfieldStorage)
+                    return bitfieldAssign(val);
                 if (namedVar.UnionFieldType)
                     return compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType);
                 return isDerefStorage()
@@ -6125,6 +6190,12 @@ public:
 
             if (opText == "&")
             {
+                if (namedVar.BitfieldStorage)
+                {
+                    LogErrorContext(ctx, std::format(
+                        "cannot take the address of bitfield '{}' - bitfields are not byte-addressable",
+                        namedVar.FieldName));
+                }
                 if (!namedVar.Storage)
                 {
                     LogErrorContext(ctx, "Unable to get an Address-of an object without a Storage.");
@@ -6432,6 +6503,37 @@ public:
             if (!seen.insert(fieldName).second)
             {
                 LogErrorContext(fi, std::format("Duplicate field initializer for '{}'", fieldName));
+                continue;
+            }
+
+            // Bitfield seeded-init: `Point p = {ready: 1}`. Resolve through the
+            // side-table; emit a RMW into the storage slot. No address-of, no GEP
+            // of the field name itself.
+            const LLVMBackend::BitfieldInfo* bfHit = nullptr;
+            for (const auto& b : sd.Bitfields)
+                if (b.Name == fieldName) { bfHit = &b; break; }
+            if (bfHit)
+            {
+                auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression());
+                llvm::Value* val = LoadNamedVariable(rightNV);
+                if (!val) continue;
+
+                const auto& storageField = sd.StructFields[bfHit->StorageFieldIndex];
+                auto* storageTy = compiler->GetType(storageField);
+                auto* storagePtr = compiler->builder->CreateStructGEP(
+                    sd.StructType, structPtr, bfHit->StorageFieldIndex, fieldName + "_bf");
+
+                unsigned w = bfHit->BitWidth;
+                unsigned off = bfHit->BitOffset;
+                uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                uint64_t windowMask = valMask << off;
+                auto* valAsStorage = compiler->CreateCast(val, storageTy, !bfHit->IsUnsigned);
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, llvm::ConstantInt::get(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, off));
+                auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
+                auto* cleared = compiler->builder->CreateAnd(word, llvm::ConstantInt::get(storageTy, ~windowMask));
+                auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
+                compiler->builder->CreateStore(newWord, storagePtr);
                 continue;
             }
 
@@ -7199,6 +7301,73 @@ public:
                         {
                             primaryIdentifier = terminal->getText();
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
+
+                            // Bitfield access path: side-table lookup, GEP to the storage word,
+                            // emit shift+mask for the read, remember enough on the NamedVariable
+                            // that write-side codegen can do a read-modify-write later.
+                            const LLVMBackend::BitfieldInfo* bfHit = nullptr;
+                            for (const auto& b : dataStructure.Bitfields)
+                                if (b.Name == primaryIdentifier) { bfHit = &b; break; }
+                            if (bfHit && !structVar.Storage)
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "bitfield '{}' has no addressable storage in this context", primaryIdentifier));
+                            }
+                            if (bfHit && structVar.Storage)
+                            {
+                                auto* compiler = Compiler(ctx);
+                                const auto& storageField = dataStructure.StructFields[bfHit->StorageFieldIndex];
+                                auto* storageTy = compiler->GetType(storageField);
+                                auto* storagePtr = compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, bfHit->StorageFieldIndex);
+                                auto* word = compiler->CreateLoad(storageTy, storagePtr);
+
+                                unsigned w = bfHit->BitWidth;
+                                unsigned off = bfHit->BitOffset;
+                                unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
+                                // Sign-aware extraction: ((word << (storageBits-w-off)) >> (storageBits-w))
+                                // works for both signed (arithmetic shift) and unsigned (logical shift).
+                                llvm::Value* shifted;
+                                if (bfHit->IsUnsigned || bfHit->TypeName == "bool")
+                                {
+                                    // word >> off  &  ((1<<w)-1)
+                                    auto* shr = compiler->builder->CreateLShr(word, llvm::ConstantInt::get(word->getType(), off));
+                                    uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                                    shifted = compiler->builder->CreateAnd(shr, llvm::ConstantInt::get(word->getType(), mask));
+                                }
+                                else
+                                {
+                                    // Signed: shift left to put the bitfield's MSB at the word MSB,
+                                    // then arithmetic shift right by (storageBits-w) to sign-extend.
+                                    unsigned leftShift = storageBits - w - off;
+                                    auto* shl = compiler->builder->CreateShl(word, llvm::ConstantInt::get(word->getType(), leftShift));
+                                    shifted = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(word->getType(), storageBits - w));
+                                }
+
+                                // Reconstruct a DeclTypeAndValue describing the bitfield as its declared type.
+                                LLVMBackend::DeclTypeAndValue bfType{};
+                                bfType.TypeName = bfHit->TypeName;
+                                bfType.VariableName = bfHit->Name;
+                                bfType.IsBitfield = true;
+                                bfType.BitWidth = bfHit->BitWidth;
+                                bfType.BitOffset = bfHit->BitOffset;
+                                bfType.StorageFieldIndex = bfHit->StorageFieldIndex;
+
+                                namedVar = {};
+                                namedVar.Primary = shifted;
+                                namedVar.BaseType = shifted->getType();
+                                namedVar.Storage = nullptr;  // bitfields have no addressable storage
+                                namedVar.TypeAndValue = bfType;
+                                namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
+                                namedVar.FieldName = primaryIdentifier;
+                                namedVar.BitfieldStorage = storagePtr;
+                                namedVar.BitfieldStorageType = storageTy;
+                                namedVar.BitfieldOffset = bfHit->BitOffset;
+                                namedVar.BitfieldWidth = bfHit->BitWidth;
+                                namedVar.BitfieldUnsigned = bfHit->IsUnsigned || bfHit->TypeName == "bool";
+                                continue;
+                            }
+
                             uint32_t fieldIndex = 0;
 
                             for (const auto& field : dataStructure.StructFields)
@@ -7779,6 +7948,10 @@ public:
                                 {
                                     const auto& field = sd.StructFields[i];
 
+                                    // Synthetic bitfield storage slots (`__bfN`) are not user-visible;
+                                    // the named bitfields they pack are emitted from sd.Bitfields below.
+                                    if (field.IsBitfieldStorage) continue;
+
                                     // Skip [Private] fields
                                     bool isPrivate = false;
                                     for (const auto& ann : field.Annotations)
@@ -7964,6 +8137,69 @@ public:
                                         compiler->builder->CreateBr(mergeBB);
                                         // merge
                                         compiler->builder->SetInsertPoint(mergeBB);
+                                    }
+                                }
+
+                                // Named bitfields live in a side-table, not StructFields.
+                                // Extract each one from its storage word with a sign-aware shift+mask.
+                                for (const auto& bf : sd.Bitfields)
+                                {
+                                    bool bfPrivate = false;
+                                    for (const auto& ann : bf.Annotations)
+                                        if (ann.Name == "Private") { bfPrivate = true; break; }
+                                    if (bfPrivate) continue;
+
+                                    std::string displayName = bf.Name;
+                                    for (const auto& ann : bf.Annotations)
+                                        if (ann.Name == "JsonName" && !ann.Value.empty()) { displayName = ann.Value; break; }
+
+                                    const auto& storageField = sd.StructFields[bf.StorageFieldIndex];
+                                    auto* storageTy = compiler->GetType(storageField);
+                                    auto* storagePtr = compiler->builder->CreateStructGEP(sd.StructType, objPtr,
+                                        bf.StorageFieldIndex, bf.Name + "_bf_ptr");
+                                    auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
+
+                                    unsigned w = bf.BitWidth;
+                                    unsigned off = bf.BitOffset;
+                                    unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
+
+                                    llvm::Value* extracted;
+                                    if (bf.IsUnsigned || bf.TypeName == "bool")
+                                    {
+                                        auto* shr = compiler->builder->CreateLShr(word,
+                                            llvm::ConstantInt::get(word->getType(), off));
+                                        uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                                        extracted = compiler->builder->CreateAnd(shr,
+                                            llvm::ConstantInt::get(word->getType(), mask));
+                                    }
+                                    else
+                                    {
+                                        unsigned leftShift = storageBits - w - off;
+                                        auto* shl = compiler->builder->CreateShl(word,
+                                            llvm::ConstantInt::get(word->getType(), leftShift));
+                                        extracted = compiler->builder->CreateAShr(shl,
+                                            llvm::ConstantInt::get(word->getType(), storageBits - w));
+                                    }
+
+                                    auto nameNV = compiler->MakeStringLiteralNV(displayName);
+
+                                    if (bf.TypeName == "bool")
+                                    {
+                                        auto* asBool = compiler->builder->CreateICmpNE(extracted,
+                                            llvm::ConstantInt::get(extracted->getType(), 0));
+                                        LLVMBackend::NamedVariable bNV;
+                                        bNV.Primary = asBool;
+                                        bNV.TypeAndValue.TypeName = "bool";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool", {nameNV, bNV});
+                                    }
+                                    else
+                                    {
+                                        auto* widened = compiler->Upconvert(extracted,
+                                            compiler->builder->getInt32Ty(), bf.IsUnsigned);
+                                        LLVMBackend::NamedVariable iNV;
+                                        iNV.Primary = widened;
+                                        iNV.TypeAndValue.TypeName = "int";
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, iNV});
                                     }
                                 }
                             };
@@ -10352,6 +10588,16 @@ public:
         if (compiler->IsVerbose())
             std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
 
+        // Bitfield packing: collapse runs of same-type bitfields into shared
+        // storage slots BEFORE the constructor loop runs - the default ctor
+        // emits one initializer per declList entry and the LLVM struct body
+        // must match. The side-table goes into StructData.Bitfields.
+        std::vector<LLVMBackend::BitfieldInfo> packedBitfields;
+        bool anyBitfields = false;
+        for (const auto& tv : declList) { if (tv.IsBitfield) { anyBitfields = true; break; } }
+        if (anyBitfields)
+            declList = compiler->PackBitfields(declList, packedBitfields);
+
         // Build the struct body before opening the constructor function so that
         // GetFunctionType can resolve the (sized) return type.  Initializer
         // expressions are evaluated later inside the constructor body.
@@ -10371,7 +10617,8 @@ public:
             uint64_t userAlign = 0;
             if (auto* alignSpec = ctx->alignmentSpecifier())
                 userAlign = ParseAlignmentSpecifier(alignSpec);
-            structType = compiler->CreateStructType(structName, declList, userAlign);
+            structType = compiler->CreateStructType(structName, declList, userAlign,
+                anyBitfields ? &packedBitfields : nullptr);
             // A struct with zero fields still needs a sized (non-opaque) type
             // so that alloca/sizeof work correctly (e.g. when passed via interface).
             if (structType->isOpaque())
@@ -10456,6 +10703,12 @@ public:
                             rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {});
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
+                    }
+                    // Synthesized bitfield storage slot: always zero so packed
+                    // bitfields read as 0 after `S s = default;`.
+                    if (rvalue == nullptr && declList[structIndex].IsBitfieldStorage)
+                    {
+                        rvalue = llvm::Constant::getNullValue(destType);
                     }
                     if (rvalue != nullptr)
                     {

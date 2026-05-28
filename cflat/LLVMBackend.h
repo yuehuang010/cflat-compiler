@@ -338,6 +338,24 @@ public:
         // parse time.
         uint64_t UserAlignValue = 0;
 
+        // Bitfield support (struct/union fields only; 0 = not a bitfield).
+        // Layout (set by the packing pass before CreateStructType):
+        //   BitWidth          - width in bits, as written (1..N where N = sizeof(underlying)*8)
+        //                       0 with no name is the C "width-0 boundary" marker
+        //   BitOffset         - LSB-first offset within the storage unit (MSVC ordering)
+        //   StorageFieldIndex - LLVM struct element index of the underlying storage unit;
+        //                       multiple packed bitfields share the same index.
+        //   IsBitfield        - true for both named bitfields and width-0 padding markers;
+        //                       width-0 entries are dropped from StructFields after packing.
+        unsigned BitWidth = 0;
+        unsigned BitOffset = 0;
+        unsigned StorageFieldIndex = 0;
+        bool IsBitfield = false;
+        // True on the synthesized storage slot produced by PackBitfields. The
+        // default constructor uses this to zero-initialize the slot even when
+        // the user wrote no per-bitfield initializer.
+        bool IsBitfieldStorage = false;
+
         std::vector<AnnotationValue> Annotations;
     };
 
@@ -362,6 +380,14 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
+        // Bitfield access metadata. Non-null BitfieldStorage means the variable
+        // is a bitfield view onto a storage word; reads compute shift+mask, and
+        // writes do a read-modify-write on this pointer.
+        llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
+        llvm::Type*  BitfieldStorageType = nullptr; // the storage word's LLVM type (e.g. i32)
+        unsigned BitfieldOffset = 0;
+        unsigned BitfieldWidth  = 0;
+        bool BitfieldUnsigned   = false;
         int IdentifierLine = 0;          // source location for use-after-move error reporting
         int IdentifierColumn = 0;
 
@@ -390,6 +416,20 @@ public:
         explicit operator bool()  const { return value != nullptr; }
     };
 
+    // One named bitfield. Multiple BitfieldInfo entries may share the same
+    // StorageFieldIndex when the packing pass groups adjacent bitfields of the
+    // same underlying type into a single storage unit (MSVC LSB-first layout).
+    struct BitfieldInfo
+    {
+        std::string Name;
+        std::string TypeName;        // declared underlying type ("int", "u8", ...)
+        bool IsUnsigned = false;
+        unsigned StorageFieldIndex = 0;  // index into StructType / StructFields (storage slot)
+        unsigned BitOffset = 0;          // LSB-first offset within the storage unit
+        unsigned BitWidth = 0;           // bits the user wrote after ':'
+        std::vector<AnnotationValue> Annotations;
+    };
+
     struct StructData
     {
         llvm::StructType* StructType;
@@ -403,6 +443,11 @@ public:
         // 0 means unset. When set, the struct's effective alignment is max of
         // this and the ABI alignment LLVM derived from the field types.
         uint64_t UserRequestedAlignment = 0;
+        // Bitfield side-table. Field-name lookup checks this BEFORE StructFields
+        // so that a packed run of bitfields surfaces through their declared names.
+        // StructFields itself contains the (synthetic) storage slots produced by
+        // the packing pass; they have names like `__bf0` and are not user-visible.
+        std::vector<BitfieldInfo> Bitfields;
     };
 
     struct ProgramData
@@ -722,6 +767,13 @@ private:
     {
         std::string name;
         std::string ctype;
+        // Bitfield support. When isBitfield is true, the C field is a bitfield
+        // and bitWidth holds the user-written width (1..N). bitOffset is the
+        // LSB-first offset within the containing storage unit, as resolved by
+        // RegisterCRecords using MSVC ABI rules; we do NOT rely on clang's
+        // reported offset since CFlat replicates the layout itself.
+        bool isBitfield = false;
+        unsigned bitWidth = 0;
     };
     struct CRecordEntry
     {
@@ -2370,7 +2422,52 @@ private:
                 }
                 else
                 {
-                    continue; // unnamed FieldDecl with no matching nested record - skip
+                    // Anonymous bitfield (no name, no nested record): bitWidth is
+                    // recorded so RegisterCRecords can treat it as a boundary marker
+                    // (width 0) or width-stealing padding.
+                    auto isBit = co->getBoolean("isBitfield");
+                    if (isBit && *isBit)
+                    {
+                        fe.name.clear();
+                        fe.ctype = qualTypeOf(co->getObject("type"));
+                        fe.isBitfield = true;
+                        if (auto* inner = co->getArray("inner"))
+                        {
+                            for (const auto& iv : *inner)
+                            {
+                                if (auto* io = iv.getAsObject())
+                                {
+                                    if (auto val = io->getString("value"))
+                                    {
+                                        fe.bitWidth = (unsigned)std::strtoul(val->str().c_str(), nullptr, 10);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        recOut.fields.push_back(std::move(fe));
+                    }
+                    continue;
+                }
+                // Bitfield extraction: isBitfield + inner[0] ConstantExpr.value.
+                auto isBit = co->getBoolean("isBitfield");
+                if (isBit && *isBit)
+                {
+                    fe.isBitfield = true;
+                    if (auto* inner = co->getArray("inner"))
+                    {
+                        for (const auto& iv : *inner)
+                        {
+                            if (auto* io = iv.getAsObject())
+                            {
+                                if (auto val = io->getString("value"))
+                                {
+                                    fe.bitWidth = (unsigned)std::strtoul(val->str().c_str(), nullptr, 10);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 recOut.fields.push_back(std::move(fe));
             }
@@ -2732,6 +2829,11 @@ private:
                 DeclTypeAndValue d;
                 static_cast<TypeAndValue&>(d) = tv;
                 d.VariableName = f.name;
+                if (f.isBitfield)
+                {
+                    d.IsBitfield = true;
+                    d.BitWidth = f.bitWidth;
+                }
                 fields.push_back(std::move(d));
             }
             if (!ok || fields.empty())
@@ -2740,10 +2842,20 @@ private:
                 // references; the user will get a clear error if they try to use it.
                 continue;
             }
+            // Bitfield packing for C structs uses the same MSVC LSB-first layout
+            // as native CFlat bitfields. The packing pass produces synthetic
+            // storage slots; CreateStructType consumes them and stores the
+            // BitfieldInfo side-table on the StructData.
+            std::vector<BitfieldInfo> packedBitfields;
+            bool anyBitfields = false;
+            for (const auto& tv : fields) { if (tv.IsBitfield) { anyBitfields = true; break; } }
+            if (anyBitfields)
+                fields = PackBitfields(fields, packedBitfields);
             if (r.isUnion)
                 CreateUnionType(r.name, fields);
             else
-                CreateStructType(r.name, fields);
+                CreateStructType(r.name, fields, 0,
+                    anyBitfields ? &packedBitfields : nullptr);
             if (auto* s = GetSymbolSink())
                 s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
                             (r.isUnion ? "union " : "struct ") + r.name);
@@ -5177,6 +5289,10 @@ public:
         {
             const auto& field = sd.StructFields[i];
 
+            // Synthetic bitfield storage slots (`__bfN`) are not user-visible;
+            // the named bitfields they pack are emitted from sd.Bitfields below.
+            if (field.IsBitfieldStorage) continue;
+
             // Skip [Private] fields
             bool isPrivate = false;
             for (const auto& ann : field.Annotations)
@@ -5308,6 +5424,71 @@ public:
                 compiler->builder->SetInsertPoint(mergeBB);
             }
             // list<T>*, dictionary<K,V>*, void*, function, interface => skip (Phase 2+)
+        }
+
+        // Emit named bitfields from the side-table. These are not in StructFields
+        // (only their __bfN storage slots are), so they need their own pass.
+        for (const auto& bf : sd.Bitfields)
+        {
+            // Skip [Private] bitfields
+            bool isPrivate = false;
+            for (const auto& ann : bf.Annotations)
+            {
+                if (ann.Name == "Private") { isPrivate = true; break; }
+            }
+            if (isPrivate) continue;
+
+            const auto& storageField = sd.StructFields[bf.StorageFieldIndex];
+            auto* storageTy = compiler->GetType(storageField);
+            auto* storagePtr = compiler->builder->CreateStructGEP(sd.StructType, objPtr,
+                bf.StorageFieldIndex, bf.Name + "_bf_ptr");
+            auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
+
+            unsigned w = bf.BitWidth;
+            unsigned off = bf.BitOffset;
+            unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
+
+            llvm::Value* extracted;
+            if (bf.IsUnsigned || bf.TypeName == "bool")
+            {
+                auto* shr = compiler->builder->CreateLShr(word,
+                    llvm::ConstantInt::get(word->getType(), off));
+                uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                extracted = compiler->builder->CreateAnd(shr,
+                    llvm::ConstantInt::get(word->getType(), mask));
+            }
+            else
+            {
+                unsigned leftShift = storageBits - w - off;
+                auto* shl = compiler->builder->CreateShl(word,
+                    llvm::ConstantInt::get(word->getType(), leftShift));
+                extracted = compiler->builder->CreateAShr(shl,
+                    llvm::ConstantInt::get(word->getType(), storageBits - w));
+            }
+
+            auto nameNV = compiler->MakeStringLiteralNV(bf.Name);
+
+            if (bf.TypeName == "bool")
+            {
+                // Truncate to i1 for visitBool.
+                auto* asBool = compiler->builder->CreateICmpNE(extracted,
+                    llvm::ConstantInt::get(extracted->getType(), 0));
+                NamedVariable boolNV;
+                boolNV.Primary = asBool;
+                boolNV.TypeAndValue.TypeName = "bool";
+                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitBool",
+                    {nameNV, boolNV});
+            }
+            else
+            {
+                auto* widened = compiler->Upconvert(extracted,
+                    compiler->builder->getInt32Ty(), bf.IsUnsigned);
+                NamedVariable intNV;
+                intNV.Primary = widened;
+                intNV.TypeAndValue.TypeName = "int";
+                compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt",
+                    {nameNV, intNV});
+            }
         }
 
         // Emit return
@@ -5801,9 +5982,144 @@ public:
         return builder->CreateCast(op, value, destType);
     }
 
-    // Create StructType or OpaqueStruct
-    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0)
+    // Returns the bit width of a bitfield's underlying integer type, or 0 if the
+    // type is not a permitted bitfield base. C permits any integer type (plus
+    // _Bool / bool); CFlat mirrors that and adds the sized integer aliases.
+    static unsigned BitfieldStorageBits(const std::string& typeName)
     {
+        if (typeName == "bool")  return 8;   // CFlat bool is i8 in storage
+        if (typeName == "char" || typeName == "i8"  || typeName == "u8")  return 8;
+        if (typeName == "short"|| typeName == "i16" || typeName == "u16") return 16;
+        if (typeName == "int"  || typeName == "i32" || typeName == "u32") return 32;
+        if (typeName == "long" || typeName == "i64" || typeName == "u64") return 64;
+        return 0;
+    }
+
+    // MSVC LSB-first bitfield packing. Consumes the user's declList; groups
+    // consecutive bitfields with the same underlying type into one storage
+    // slot each, populates outBitfields, and returns the storage-slot list
+    // that CreateStructType uses to emit the LLVM struct body.
+    //
+    // Rules (matching MSVC ABI):
+    // - A bitfield of width W with the same TypeName as the current run fits if
+    //   bitOffset + W <= storageBits; otherwise it starts a new storage unit.
+    // - A bitfield with a different TypeName always starts a new unit.
+    // - Width-0 unnamed bitfield closes the current unit (next bitfield, even of
+    //   the same type, starts a fresh unit).
+    // - A bitfield wider than the underlying type is a hard error.
+    // - Non-bitfield fields end any open run and pass through as their own slot.
+    std::vector<DeclTypeAndValue> PackBitfields(
+        const std::vector<DeclTypeAndValue>& in,
+        std::vector<BitfieldInfo>& outBitfields)
+    {
+        std::vector<DeclTypeAndValue> out;
+        outBitfields.clear();
+        int synthIdx = 0;
+        size_t i = 0;
+        while (i < in.size())
+        {
+            const auto& cur = in[i];
+            if (!cur.IsBitfield)
+            {
+                out.push_back(cur);
+                i++;
+                continue;
+            }
+
+            unsigned storageBits = BitfieldStorageBits(cur.TypeName);
+            if (storageBits == 0)
+            {
+                LogError("bitfield '" + cur.VariableName + "' has unsupported underlying type '" + cur.TypeName + "' (must be an integer or bool type)");
+                i++;
+                continue;
+            }
+            if (cur.BitWidth > storageBits)
+            {
+                LogError("bitfield '" + cur.VariableName + "' width " + std::to_string(cur.BitWidth)
+                       + " exceeds underlying type '" + cur.TypeName + "' width " + std::to_string(storageBits));
+                i++;
+                continue;
+            }
+
+            // Width-0 acts as a boundary marker; close any open run (here means
+            // do not start one). A name is permitted but inaccessible (it has
+            // zero bits) - mirrors MSVC's lenient interpretation rather than the
+            // strict C standard which only allows the unnamed form.
+            if (cur.BitWidth == 0)
+            {
+                i++;
+                continue;
+            }
+
+            // Open a new storage unit using the underlying type of the first bitfield.
+            unsigned storageIdx = (unsigned)out.size();
+            unsigned bitOffset = 0;
+            DeclTypeAndValue storage = cur;
+            storage.VariableName = "__bf" + std::to_string(synthIdx++);
+            storage.IsBitfield = false;     // the storage slot itself isn't a bitfield
+            storage.IsBitfieldStorage = true;
+            storage.BitWidth = 0;
+            storage.BitOffset = 0;
+            storage.StorageFieldIndex = 0;
+            storage.Initializer = nullptr;  // zeroed by default; per-bitfield init handled at field-init time
+            storage.Annotations.clear();
+            storage.GuardedBy.clear();
+            out.push_back(storage);
+
+            // Greedily attach this and subsequent same-type bitfields that fit.
+            while (i < in.size() && in[i].IsBitfield && in[i].TypeName == cur.TypeName)
+            {
+                const auto& bf = in[i];
+                if (bf.BitWidth == 0)
+                {
+                    // Width-0 marker closes the current unit; consume and stop.
+                    i++;
+                    break;
+                }
+                if (bf.BitWidth > storageBits)
+                {
+                    LogError("bitfield '" + bf.VariableName + "' width " + std::to_string(bf.BitWidth)
+                           + " exceeds underlying type '" + bf.TypeName + "' width " + std::to_string(storageBits));
+                    i++;
+                    continue;
+                }
+                if (bitOffset + bf.BitWidth > storageBits)
+                {
+                    // Doesn't fit - leave it for the outer loop to start a new unit.
+                    break;
+                }
+                if (!bf.VariableName.empty())
+                {
+                    BitfieldInfo info;
+                    info.Name = bf.VariableName;
+                    info.TypeName = bf.TypeName;
+                    info.IsUnsigned = (bf.IsUnsignedInteger() != -1) || bf.TypeName == "bool";
+                    info.StorageFieldIndex = storageIdx;
+                    info.BitOffset = bitOffset;
+                    info.BitWidth = bf.BitWidth;
+                    info.Annotations = bf.Annotations;
+                    outBitfields.push_back(info);
+                }
+                // Anonymous (no name) bitfield reserves bits but is unreachable.
+                bitOffset += bf.BitWidth;
+                i++;
+            }
+            // Outer-loop continue: next iteration handles whatever didn't fit.
+        }
+        return out;
+    }
+
+    // Create StructType or OpaqueStruct
+    //
+    // Bitfield contract: if any entry in `typeAndValues` has IsBitfield=true,
+    // the caller MUST have already run PackBitfields and passed the storage
+    // entries (synthetic `__bfN` slots) here, together with the BitfieldInfo
+    // side-table delivered via `bitfields`. CreateStructType itself does NOT
+    // pack - the default-ctor path needs the packed list before this call to
+    // emit one initializer per LLVM struct element.
+    llvm::StructType* CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign = 0, std::vector<BitfieldInfo>* bitfields = nullptr)
+    {
+
         if (typeAndValues.size() > 0)
         {
             std::vector<llvm::Type*> types;
@@ -5835,6 +6151,8 @@ public:
                 llvm::StructType* myStruct = llvm::StructType::create(types, name);
                 dataStructures[name].StructType = myStruct;
                 dataStructures[name].StructFields = typeAndValues;
+                if (bitfields && !bitfields->empty())
+                    dataStructures[name].Bitfields = *bitfields;
                 dataStructures[name].typeDescriptor = new llvm::GlobalVariable(
                     *module, builder->getInt8Ty(), true,
                     llvm::GlobalValue::InternalLinkage,
@@ -5849,6 +6167,8 @@ public:
             // existing struct;
             auto& structData = mystuct->second;
             structData.StructFields = typeAndValues;
+            if (bitfields && !bitfields->empty())
+                structData.Bitfields = *bitfields;
             if (structData.StructType->isOpaque())
                 structData.StructType->setBody(types);
             if (userAlign > 1)

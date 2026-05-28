@@ -63,6 +63,78 @@ class DebugReflector : IReflector {
 };
 
 // =============================================================
+// Bitfield reflection tests
+// =============================================================
+
+struct BfReflect {
+    u32 ready    : 1;
+    u32 mode     : 3;
+    u32 count    : 24;
+    i32 delta    : 8;   // signed - sign-extension exercised
+    bool flag    : 1;
+};
+
+class BfCollector : IReflector {
+    int intName0Sum = 0;
+    int intCount = 0;
+    int boolCount = 0;
+    int lastInt = 0;
+    string lastName = default;
+    int sawReady = 0;
+    int sawMode = 0;
+    int sawCount = 0;
+    int sawDelta = 0;
+    int sawFlag = 0;
+
+    void visitInt(string name, int value) {
+        intCount = intCount + 1;
+        lastInt = value;
+        if (name == "ready") { sawReady = value + 1; }
+        else if (name == "mode") { sawMode = value + 1; }
+        else if (name == "count") { sawCount = value; }
+        else if (name == "delta") { sawDelta = value; }
+    }
+    void visitBool(string name, bool value) {
+        boolCount = boolCount + 1;
+        if (name == "flag") { sawFlag = (int)value + 1; }
+    }
+    void visitFloat(string name, float value) { }
+    void visitString(string name, string value) { }
+    void visitNull(string name) { }
+    void beginObject(string name) { }
+    void endObject() { }
+    void beginArray(string name) { }
+    void endArray() { }
+};
+
+bool testBitfieldReflect()
+{
+    bool result = true;
+
+    BfReflect b = default;
+    b.ready = 1;
+    b.mode = 5;
+    b.count = 12345;
+    b.delta = -7;
+    b.flag = true;
+
+    BfCollector c;
+    IReflector v = c;
+    reflect(b, v);
+
+    // sawX is offset by +1 so we can distinguish "not visited" (0) from "visited with value 0".
+    result &= Test("bf reflect ready", c.sawReady, 2);     // 1 + 1
+    result &= Test("bf reflect mode",  c.sawMode,  6);     // 5 + 1
+    result &= Test("bf reflect count", c.sawCount, 12345);
+    result &= Test("bf reflect delta (signed)", c.sawDelta, -7);
+    result &= Test("bf reflect flag (bool)", c.sawFlag, 2); // true=1 + 1
+    result &= Test("bf reflect int visits", c.intCount, 4);
+    result &= Test("bf reflect bool visits", c.boolCount, 1);
+
+    return result;
+}
+
+// =============================================================
 // Annotation tests
 // =============================================================
 
@@ -159,6 +231,9 @@ extern int main()
     printf("\n");
 
     if (!testAnnotations())
+        return 1;
+
+    if (!testBitfieldReflect())
         return 1;
 
     printf("All reflect/annotation tests completed.\n");
