@@ -44,6 +44,7 @@
 #include <llvm\Support\JSON.h>
 #include <llvm\Support\Path.h>
 #include <llvm\Support\Program.h>
+#include <llvm\Support\TimeProfiler.h>
 #include <llvm\Support\TargetSelect.h>
 #include <llvm\Target\TargetMachine.h>
 #include <llvm\MC\TargetRegistry.h>
@@ -1920,7 +1921,11 @@ private:
         }
 
         std::string clangCompileErr;
-        int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
+        int rc;
+        {
+            llvm::TimeTraceScope spawnScope("ClangCompileC", cSourcePath);
+            rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
+        }
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
@@ -2318,6 +2323,9 @@ private:
         std::string execErr;
         int rc;
         {
+            // The clang-cl subprocess itself - separated from the surrounding cflat-side
+            // JSON parse/walk so the trace shows how much time is clang vs. cflat.
+            llvm::TimeTraceScope spawnScope("ClangSpawn");
             std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
             rc = llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
         }
@@ -2368,6 +2376,8 @@ private:
 
         std::string execErr;
         {
+            // The clang-cl subprocess itself (see SpawnClangJson for the rationale).
+            llvm::TimeTraceScope spawnScope("ClangSpawn");
             std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
             (void)llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
         }
@@ -3258,6 +3268,8 @@ private:
             std::string preText;
             if (!SpawnClangCapture(argStrs, preText)) return false;
 
+            // cflat-side scan of clang's -dD preprocessor output for #define directives.
+            llvm::TimeTraceScope scanScope("ScanMacroDirectives", headerPath);
             std::string curFile;
             int curLine = 0;
             std::string line;
@@ -3447,12 +3459,19 @@ private:
         if (!SpawnClangCapture(argStrs, jsonText)) return false;
         if (jsonText.empty()) return false;
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
+        llvm::Expected<llvm::json::Value> root = llvm::json::Value(nullptr);
+        {
+            llvm::TimeTraceScope parseScope("ParseMacroJson", std::format("{} bytes", jsonText.size()));
+            root = llvm::json::parse(jsonText);
+        }
         if (!root) { llvm::consumeError(root.takeError()); return false; }
         const llvm::json::Object* tu = root->getAsObject();
         if (!tu) return false;
         const llvm::json::Array* topLevel = tu->getArray("inner");
         if (!topLevel) return true;
+
+        // cflat-side walk of the macro-resolution AST.
+        llvm::TimeTraceScope walkScope("WalkMacroJson", headerPath);
 
         // Walk the AST once and gather both pieces per macro:
         //   __cflat_m_NAME (EnumConstantDecl) -> folded long long value
@@ -3800,16 +3819,26 @@ private:
         if (verbose)
             std::cout << "[verbose] extracting C header: " << headerPath << " (clang AST dump)\n";
 
+        // The clang spawn is timed inside SpawnClangJson ("ClangSpawn"). The expensive part
+        // for a big header (curl.h) is not clang (~2s) but parsing/walking the very large AST
+        // JSON it prints - the two scopes below make that split visible in the trace.
         std::string jsonText;
         if (!SpawnClangJson(argStrs, jsonText))
             return false;
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
+        llvm::Expected<llvm::json::Value> root = llvm::json::Value(nullptr);
+        {
+            llvm::TimeTraceScope parseScope("ParseAstJson", std::format("{} bytes", jsonText.size()));
+            root = llvm::json::parse(jsonText);
+        }
         if (!root) { llvm::consumeError(root.takeError()); return false; }
         const llvm::json::Object* tu = root->getAsObject();
         if (!tu) return false;
         const llvm::json::Array* topLevel = tu->getArray("inner");
         if (!topLevel) return true;
+
+        // Everything from here is the in-process AST walk over the (potentially huge) JSON.
+        llvm::TimeTraceScope walkScope("WalkAstJson", headerPath);
 
         // Collect typedefs first so the signature mapper can chase pointer aliases
         // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
@@ -4090,11 +4119,17 @@ private:
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
-        if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
-            return false;
+        {
+            llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
+            if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
+                return false;
+        }
         // Macro discovery is best-effort: failure here (clang missing a header path, OOM,
         // etc.) should not invalidate the function / enum / record bindings we already got.
-        (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros, funcMacros);
+        {
+            llvm::TimeTraceScope macroScope("CHeaderMacros", headerPath);
+            (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros, funcMacros);
+        }
 
         if (!mtEc)
         {
@@ -9624,6 +9659,7 @@ public:
         if (ok) ProcessPendingMacroSources();
         return ok;
     }
+
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
 };
