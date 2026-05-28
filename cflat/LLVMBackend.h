@@ -1859,10 +1859,21 @@ private:
             const llvm::json::Object* typeObj = node->getObject("type");
             if (!typeObj) continue;
             std::string target;
-            if (auto d = typeObj->getString("desugaredQualType")) target = d->str();
-            else if (auto q = typeObj->getString("qualType"))     target = q->str();
+            std::string desugared = typeObj->getString("desugaredQualType").value_or("").str();
+            std::string qual      = typeObj->getString("qualType").value_or("").str();
+            // Prefer desugaredQualType (chases HANDLE -> void *), but fall back to
+            // qualType when the desugared form is the typedef's own name. clang emits
+            // that self-referential form for `typedef enum { ... } X;` (the anonymous
+            // enum inherits the typedef name as its tag, so the desugared spelling is
+            // just "X"). Without the fallback we'd store X -> X and the recursive
+            // resolver would bail via the visited-set, leaving any signature spelled
+            // with X unresolved.
+            const std::string& self = name->str();
+            if (!desugared.empty() && desugared != self) target = desugared;
+            else if (!qual.empty())                     target = qual;
+            else                                        target = desugared;
             if (target.empty()) continue;
-            cTypedefMap_.emplace(name->str(), target);
+            cTypedefMap_.emplace(self, target);
         }
     }
 

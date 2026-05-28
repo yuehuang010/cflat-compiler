@@ -201,6 +201,29 @@ extern int main()
     if (strcmp(ML_VERSION, "1.2.3") != 0)                return 126;
     if (strcmp(ML_GREETING, "hello\nworld") != 0)        return 127;
 
+    // Anonymous enum: constants are still registered as bare globals (no type
+    // name to bind to). The EnumDecl walker is name-agnostic for the constants.
+    if (ML_ANON_LOW != 50)                               return 130;
+    if (ML_ANON_HIGH != 60)                              return 131;
+
+    // Typedef of anonymous enum: clang reports desugaredQualType as the typedef
+    // name itself (self-reference), so CollectCTypedefs falls back to qualType
+    // ("enum ML_Mode") to keep the chain resolvable. Without the fallback the
+    // signatures below would skip with "unsupported parameter type 'ML_Mode'".
+    if (ML_FAST != 1)                                    return 132;
+    if (ML_SLOW != 2)                                    return 133;
+    if (ml_mode_value(ML_FAST) != 1)                     return 134;
+    if (ml_mode_value(ML_AUTO) != 3)                     return 135;
+    if (ml_pick_mode(1) != 1)                            return 136;  // ML_FAST
+    if (ml_pick_mode(2) != 2)                            return 137;  // ML_SLOW
+    if (ml_pick_mode(9) != 3)                            return 138;  // ML_AUTO
+
+    // Typedef of named enum where alias differs from the tag (ML_PriorityAlias
+    // -> enum ML_PriorityTag -> int). Constants register as bare globals; the
+    // typedef-as-type would resolve to int via the enum-strip path.
+    if (ML_LOW_PRI != 10)                                return 139;
+    if (ML_HIGH_PRI != 20)                               return 140;
+
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`
     // generic function and called without explicit type arguments.

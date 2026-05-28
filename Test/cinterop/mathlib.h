@@ -21,6 +21,31 @@ enum Color
     WHITE = 100
 };
 
+/* Anonymous enum - constants are still registered as bare globals; there is
+ * no type-name to bind. Exercises the EnumDecl walker's name-agnostic path. */
+enum
+{
+    ML_ANON_LOW  = 50,
+    ML_ANON_HIGH = 60
+};
+
+/* Typedef of anonymous enum - clang names the anonymous enum after the typedef
+ * and lists desugaredQualType as the typedef itself (self-reference). The
+ * CollectCTypedefs fallback maps ML_Mode -> "enum ML_Mode" so signatures using
+ * ML_Mode resolve to int via the enum-strip path. */
+typedef enum { ML_FAST = 1, ML_SLOW = 2, ML_AUTO = 3 } ML_Mode;
+
+/* Typedef of named enum where the tag and alias differ. Exercises the
+ * MapCTypeToTypeAndValue lookup of `ML_PriorityAlias` -> `enum ML_PriorityTag`
+ * -> int. */
+typedef enum ML_PriorityTag { ML_LOW_PRI = 10, ML_HIGH_PRI = 20 } ML_PriorityAlias;
+
+/* Function consuming a typedef'd enum as a parameter and returning one - used
+ * to verify the signature resolves end-to-end (was previously skipped with
+ * "unsupported parameter type 'ML_Mode'"). */
+int     ml_mode_value(ML_Mode m);
+ML_Mode ml_pick_mode(int pick);
+
 /* Gated behind a preprocessor define, to exercise the inline `define` clause:
  *   import package "mathlib.h" define "ML_EXTRA";
  * Without ML_EXTRA, EXTRA_FLAG is invisible and referencing it fails to compile.
