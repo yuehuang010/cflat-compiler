@@ -135,6 +135,18 @@ struct ML_Overlap
     int trailer;
 };
 
+/* `_Bool` (C99) and `long double` (MSVC: 8-byte alias of double) - the C-interop
+ * mapper aliases `_Bool` -> CFlat `bool` and `long double` -> CFlat `double`.
+ * These helpers lock the mappings in via pass-by-value and pointer-out shapes.
+ * stdbool.h's `bool` macro expands to `_Bool`; clang canonicalizes the qualType
+ * to `_Bool` in the AST dump, which is what the extractor sees. */
+_Bool       ml_bool_not    (_Bool x);
+_Bool       ml_bool_and    (_Bool a, _Bool b);
+void        ml_bool_store  (_Bool* out, _Bool v);
+long double ml_ld_identity (long double x);
+long double ml_ld_add      (long double a, long double b);
+void        ml_ld_store    (long double* out, long double v);
+
 int   ml_overlap_read_int    (struct ML_Overlap* o);
 float ml_overlap_read_float  (struct ML_Overlap* o);
 int   ml_overlap_header_of   (struct ML_Overlap* o);

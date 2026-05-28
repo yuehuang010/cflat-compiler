@@ -41,6 +41,13 @@ int ml_pun_int_bits_of(float f)
     return u.as_int;
 }
 
+_Bool       ml_bool_not   (_Bool x)              { return !x; }
+_Bool       ml_bool_and   (_Bool a, _Bool b)     { return a && b; }
+void        ml_bool_store (_Bool* out, _Bool v)  { *out = v; }
+long double ml_ld_identity(long double x)        { return x; }
+long double ml_ld_add     (long double a, long double b) { return a + b; }
+void        ml_ld_store   (long double* out, long double v) { *out = v; }
+
 int   ml_overlap_read_int   (struct ML_Overlap* o) { return o->as_int; }
 float ml_overlap_read_float (struct ML_Overlap* o) { return o->as_float; }
 int   ml_overlap_header_of  (struct ML_Overlap* o) { return o->header; }

@@ -346,5 +346,23 @@ extern int main()
     o.__anon0.as_float = 3.14159274f;
     if (o.__anon0.as_int != ref2)                return 134;
 
+    // ---- Section O: _Bool and long double round-trip -----------------------
+    // _Bool (C99) maps to CFlat bool; long double on MSVC is an 8-byte alias of
+    // double, so it maps to CFlat double. Both pass-by-value and pointer-out
+    // shapes must round-trip cleanly.
+    if (ml_bool_not(true)  != false)             return 140;
+    if (ml_bool_not(false) != true)              return 141;
+    if (ml_bool_and(true, false) != false)       return 142;
+    if (ml_bool_and(true, true)  != true)        return 143;
+    bool bout = false;
+    ml_bool_store(&bout, true);
+    if (bout != true)                            return 144;
+
+    if (ml_ld_identity(2.5) != 2.5)              return 145;
+    if (ml_ld_add(1.25, 2.5) != 3.75)            return 146;
+    double dout = 0.0;
+    ml_ld_store(&dout, 7.125);
+    if (dout != 7.125)                           return 147;
+
     return 0;
 }
