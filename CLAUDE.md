@@ -108,6 +108,7 @@ x64/Debug/cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-d
 - `-i / --import-dir`: Directory to search for imported modules
 - `-p / --platform`: Target platform - `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
+- `--check`: Check one or more source files for errors without emitting any output. Treats *every* positional as an independent `.cb` source, compiling each in its own fresh backend (no `-o`/`--out-lli`/`--bitcode`, no linking). A failing file does not abort the batch; the process exit code is non-zero if any file failed. Used by `test_err.bat` to batch the `err_*.cb` negative tests into one process and amortize the per-process spawn cost.
 - `--c-include <dir>`: Header search dir for C library bindings (repeatable)
 - `--c-lib <path>`: Prebuilt C import library (.lib) to link (repeatable)
 - `--c-define <NAME[=val]>`: Preprocessor define passed to all clang-cl C compiles/dumps (repeatable)

@@ -2089,7 +2089,7 @@ public:
                 if (compilerLLVM->diagnosticSink_)
                     throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
                 else
-                    exit(1);
+                    compilerLLVM->FailCompilation("expected error did not occur");
             }
         }
 
@@ -3167,7 +3167,7 @@ public:
                         if (compilerLLVM->diagnosticSink_)
                             throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
                         else
-                            exit(1);
+                            compilerLLVM->FailCompilation("expected error did not occur");
                     }
                 }
             }

@@ -618,8 +618,18 @@ public:
                 throw ExpectedErrorReceived{};
             }
             std::cout << std::format("FAIL: expected error '{}' but got '{}'\n", expectedError, message);
-            exit(1);
+            FailCompilation(message);
         }
+        FailCompilation(message);
+    }
+
+    // Terminate the current compilation. In batch / --check mode this throws so
+    // the batch loop can record the failure and continue with the next file;
+    // otherwise it preserves the historical hard exit(1).
+    [[noreturn]] void FailCompilation(const std::string& message) const
+    {
+        if (batchMode_)
+            throw CompilerAbortException{ message, sourceFileName, currentLine, currentColumn };
         exit(1);
     }
 
@@ -676,6 +686,9 @@ private:
     // When true, disables auto-import of core/runtime.cb
     bool skipRuntimeImport = false;
     bool verbose = false;
+    // When true (--check / batch mode), a fatal compile error throws instead of
+    // calling exit(1), so the batch loop can record the failure and move on.
+    bool batchMode_ = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
     // C interop: temp .obj files produced by clang-cl from .c inputs, linked
     // into the final image by EmitExecutable and then deleted.
@@ -6896,7 +6909,7 @@ public:
                 std::cout << std::format("FAIL: expected error '{}' did not occur\n", expectedError);
                 expectedError.clear();
                 expectedErrorScopeDepth = SIZE_MAX;
-                exit(1);
+                FailCompilation("expected error did not occur");
             }
             EmitDestructorsForScope(stackNamedVariable.back());
             stackNamedVariable.pop_back();
@@ -9458,6 +9471,7 @@ public:
     void SetSourceFileDir(const std::string& dir) { sourceFileDir_ = dir; }
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
+    void SetBatchMode(bool v) { batchMode_ = v; }
 
     using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg)>;
     void SetDiagnosticSink(DiagnosticSink sink) { diagnosticSink_ = std::move(sink); }
@@ -9468,7 +9482,9 @@ public:
     void ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
                            const std::vector<std::string>& sourceLines);
 
-    bool Compile(const ArgParser& args);
+    // inputOverride, when non-empty, replaces positional(0) as the file to compile.
+    // Used by batch / --check mode to compile each positional file independently.
+    bool Compile(const ArgParser& args, const std::string& inputOverride = {});
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {});
 
     // Vcpkg integration setters - wired from CLI flags in main.cpp.

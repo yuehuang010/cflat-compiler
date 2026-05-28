@@ -110,9 +110,11 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
     }
 }
 
-bool LLVMBackend::Compile(const ArgParser& args)
+bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverride)
 {
-    auto filename = args.getPositional(0).value_or("");
+    // --check: parse and codegen for diagnostics only, emitting no outputs.
+    bool checkOnly = args.hasFlag("check");
+    auto filename = inputOverride.empty() ? args.getPositional(0).value_or("") : inputOverride;
     sourceFileName = std::filesystem::path(filename).filename().string();
     llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
@@ -123,9 +125,11 @@ bool LLVMBackend::Compile(const ArgParser& args)
         std::vector<std::string>& stack;
         ~RootGuard() { stack.pop_back(); }
     } rootGuard{importStack};
-    auto exePath = args.getOption("output");
-    auto lliPath = args.getOption("out-lli");
-    auto bitcodePath = args.getOption("bitcode").value_or("");
+    // In check mode all positionals are independent source files (handled by the
+    // batch loop), so no output is emitted and no extra positional is linked.
+    auto exePath = checkOnly ? std::optional<std::string>{} : args.getOption("output");
+    auto lliPath = checkOnly ? std::optional<std::string>{} : args.getOption("out-lli");
+    auto bitcodePath = checkOnly ? std::string{} : args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
     importSearchDir = args.getOption("import-dir").value_or("");
     auto platformOption = args.getOption("platform").value_or("win64");
@@ -432,6 +436,8 @@ bool LLVMBackend::Compile(const ArgParser& args)
     }
 
     // Dispatch any extra positional .c files to clang and link their objects.
+    // Skipped in check mode: extra positionals are independent source files there.
+    if (!checkOnly)
     {
         auto isCSource = [](const std::string& p) {
             auto ext = std::filesystem::path(p).extension().string();

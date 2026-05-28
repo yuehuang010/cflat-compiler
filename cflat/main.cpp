@@ -42,6 +42,7 @@ int main(int argc, char* argv[])
     args.addFlag("O0", '0', "No optimization (default)");
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
+    args.addFlag("check", 0, "Check one or more source files for errors without emitting any output (batch)");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
     args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
     args.addFlag("nologo", 0, "Hide compiler version and completion messages");
@@ -78,6 +79,43 @@ int main(int argc, char* argv[])
     char* pgmptr = nullptr;
     _get_pgmptr(&pgmptr);
     std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+
+    // --check: compile every positional source file in its own fresh backend,
+    // emitting no output. One process amortizes the spawn cost across many files
+    // (used by test.bat to batch the err_*.cb negative tests). A failing file does
+    // not abort the batch; the overall exit code is non-zero if any file failed.
+    if (args.hasFlag("check"))
+    {
+        int failures = 0;
+        for (size_t i = 0; i < args.positionalCount(); ++i)
+        {
+            std::string file = *args.getPositional(i);
+            LLVMBackend compiler;
+            compiler.SetRuntimeDir(runtimeDir);
+            compiler.SetVerbose(args.hasFlag("verbose"));
+            compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
+            compiler.SetBatchMode(true);
+            bool fileOk = false;
+            try
+            {
+                fileOk = compiler.Compile(args, file);
+            }
+            catch (const CompilerAbortException&) { fileOk = false; }
+            catch (const ExpectedErrorReceived&)  { fileOk = false; }
+            if (fileOk)
+            {
+                if (showLogo) std::cout << std::format("PASS: {}\n", file);
+            }
+            else
+            {
+                std::cerr << std::format("FAIL: {}\n", file);
+                ++failures;
+            }
+        }
+        if (showLogo)
+            std::cout << std::format("Checked {} file(s), {} failed.\n", args.positionalCount(), failures);
+        return failures == 0 ? 0 : 1;
+    }
 
     bool ftimeTrace = args.hasFlag("ftime-trace");
     if (ftimeTrace)

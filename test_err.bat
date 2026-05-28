@@ -64,14 +64,23 @@ call :RunModuloGroup 3 4
 exit /b
 
 :RunModuloGroup
-REM Runs every err_*.cb whose index mod %~2 == %~1
+REM Checks every err_*.cb whose index mod %~2 == %~1 in a SINGLE compiler
+REM invocation (--check) to amortize the per-process spawn cost. Each file is
+REM compiled in its own fresh backend and emits no output; the batch exit code
+REM is non-zero if any file failed its expect_error contract.
 set /a MOD_REM=%~1
 set /a MOD_DIV=%~2
 set /a CTR=0
+set "GROUPFILES="
 for %%F in (%SRC%\errors\err_*.cb) do (
     set /a MOD=CTR %% MOD_DIV
-    if !MOD!==!MOD_REM! call :RunErrorTest %%~nxF
+    if !MOD!==!MOD_REM! set "GROUPFILES=!GROUPFILES! %SRC%\errors\%%~nxF"
     set /a CTR+=1
+)
+if defined GROUPFILES (
+    echo === error group %~1 of %~2 ===
+    %COMPILER% --check -i %LIB% --nologo!GROUPFILES!
+    if !ERRORLEVEL! neq 0 set /a ERRORS+=1
 )
 exit /b
 
@@ -84,16 +93,6 @@ if %ERRORS% EQU 0 (
     exit /b 1
 )
 exit /b 0
-
-:RunErrorTest
-set ERRFILE=%~1
-echo === %ERRFILE% ===
-%COMPILER% %SRC%\errors\%ERRFILE% -i %LIB% --nologo
-if %ERRORLEVEL% neq 0 (
-    echo FAILED: %ERRFILE%
-    set /a ERRORS+=1
-)
-exit /b
 
 :RunCircularTest
 set CIRC_FILE=%~1
