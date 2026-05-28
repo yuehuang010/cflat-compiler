@@ -257,6 +257,25 @@ extern int main()
     sentinel = ml_pick_op(0);
     if (sentinel(10, 32) != 42)                          return 146;
 
+    // ---- Section M: C-interop named union ------------------------------------
+    // mathlib.h declares `union ML_IntFloat { int as_int; float as_float; }`.
+    // RegisterCRecords routes this through CreateUnionType so both fields share
+    // offset 0 (max-size slot, no FieldIndex GEPs). Pass-by-pointer to a C helper
+    // exercises that the union resolves end-to-end through the auto-extern path
+    // and that field access on a `union ML_IntFloat *` GEPs to offset 0.
+    ML_IntFloat u = default;
+    ml_pun_write_int(&u, 0x40490FDB);                    // ~ pi as float bits (IEEE-754)
+    int ref_bits = ml_pun_int_bits_of(3.14159274f);      // reference bit pattern
+    // Field overlap: writing as_int and reading as_float must see the same bytes.
+    float f = ml_pun_read_float(&u);
+    if (ml_pun_int_bits_of(f) != ref_bits)               return 150;
+    // Field overlap from the cflat side: write as_float, read as_int.
+    u.as_float = 3.14159274f;
+    if (u.as_int != ref_bits)                            return 151;
+    // Round-trip the other direction.
+    u.as_int = 42;
+    if (u.as_int != 42)                                  return 152;
+
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`
     // generic function and called without explicit type arguments.
@@ -304,6 +323,28 @@ extern int main()
     void* invalid_h = c_get_invalid_handle();
     if (invalid_h != CB_INVALID_HANDLE) return 123;
     if (h == CB_INVALID_HANDLE)         return 124;   // real handle, not sentinel
+
+    // ---- Section N: anonymous union inside struct (C11) ---------------------
+    // mathlib.h declares `struct ML_Overlap { int header; union { int as_int;
+    // float as_float; }; int trailer; }`. The C-interop extractor synthesizes a
+    // tag (`ML_Overlap__anon0`) for the inner union, registers it as a sibling
+    // record, and rewrites the materializing unnamed field to a synthetic name
+    // `__anon0`. CFlat reaches the inner members via `o.__anon0.as_int`.
+    ML_Overlap o = default;
+    o.header  = 0x11111111;
+    o.trailer = 0x22222222;
+    o.__anon0.as_int = 0x40490FDB;                       // pi-as-float bit pattern
+    int ref2 = ml_pun_int_bits_of(3.14159274f);
+    if (ml_overlap_read_int(&o) != 0x40490FDB)   return 130;
+    // Field overlap inside the anon union: writing as_int and reading as_float
+    // through the C helper must see the same bytes.
+    if (ml_pun_int_bits_of(ml_overlap_read_float(&o)) != ref2) return 131;
+    // Surrounding fields are unaffected by the union write.
+    if (ml_overlap_header_of(&o)  != 0x11111111) return 132;
+    if (ml_overlap_trailer_of(&o) != 0x22222222) return 133;
+    // Symmetric write from cflat: write as_float through the anon, read as_int.
+    o.__anon0.as_float = 3.14159274f;
+    if (o.__anon0.as_int != ref2)                return 134;
 
     return 0;
 }

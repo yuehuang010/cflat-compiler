@@ -2280,6 +2280,93 @@ private:
         return true;
     }
 
+    // Walks a clang RecordDecl's `inner` array to populate `recOut.fields`. Nested anonymous
+    // RecordDecl children (the C11 anonymous-struct / anonymous-union shape) are emitted as
+    // separate CRecordEntry records with a synthetic tag `<parentTag>__anon<N>` appended to
+    // `outRecords`. The unnamed FieldDecl that materializes the nested record in the parent
+    // is rewritten to reference that synthetic tag with a synthetic field name `__anon<N>`,
+    // so CFlat code can reach the inner members via `s.__anon0.a`. IndirectFieldDecl nodes
+    // (clang's transparent-access forwarders) are skipped; CFlat does not replicate C's
+    // anonymous-member transparency at the language level.
+    void CollectRecordFieldsAndNested(const llvm::json::Object* recordNode,
+                                      const std::string& parentTag,
+                                      CRecordEntry& recOut,
+                                      std::vector<CRecordEntry>& outRecords)
+    {
+        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string {
+            if (!typeObj) return "";
+            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
+            if (auto q = typeObj->getString("qualType")) return q->str();
+            return "";
+        };
+        const llvm::json::Array* inner = recordNode->getArray("inner");
+        if (!inner) return;
+
+        // Anonymous nested records and their materializing unnamed FieldDecl come in pairs
+        // (RecordDecl then FieldDecl) in clang's emission order. Queue the synthesized
+        // (typeSpelling, fieldName) so the next unnamed FieldDecl picks it up.
+        struct PendingAnon { std::string typeSpelling; std::string fieldName; };
+        std::deque<PendingAnon> pending;
+        int anonIndex = 0;
+
+        for (const auto& c : *inner)
+        {
+            const llvm::json::Object* co = c.getAsObject();
+            if (!co) continue;
+            auto ck = co->getString("kind");
+            if (!ck) continue;
+
+            if (*ck == "RecordDecl")
+            {
+                auto nm = co->getString("name");
+                if (nm && !nm->empty()) continue; // named nested record - clang emits it at top level too
+                auto cd = co->getBoolean("completeDefinition");
+                if (!cd || !*cd) continue;
+                auto tag = co->getString("tagUsed");
+
+                const int idx = anonIndex++;
+                const std::string synTag = parentTag + "__anon" + std::to_string(idx);
+                CRecordEntry nested;
+                nested.name = synTag;
+                nested.isUnion = (tag && *tag == "union");
+                if (auto* loc = co->getObject("loc"))
+                {
+                    if (auto l = loc->getInteger("line")) nested.line = (int)*l;
+                    if (auto cc = loc->getInteger("col")) nested.col = (int)*cc - 1;
+                }
+                CollectRecordFieldsAndNested(co, synTag, nested, outRecords);
+                outRecords.push_back(std::move(nested));
+
+                PendingAnon pa;
+                pa.typeSpelling = (tag && *tag == "union" ? "union " : "struct ") + synTag;
+                pa.fieldName = "__anon" + std::to_string(idx);
+                pending.push_back(std::move(pa));
+            }
+            else if (*ck == "FieldDecl")
+            {
+                auto fname = co->getString("name");
+                CRecordFieldEntry fe;
+                if (fname && !fname->empty())
+                {
+                    fe.name = fname->str();
+                    fe.ctype = qualTypeOf(co->getObject("type"));
+                }
+                else if (!pending.empty())
+                {
+                    fe.name = std::move(pending.front().fieldName);
+                    fe.ctype = std::move(pending.front().typeSpelling);
+                    pending.pop_front();
+                }
+                else
+                {
+                    continue; // unnamed FieldDecl with no matching nested record - skip
+                }
+                recOut.fields.push_back(std::move(fe));
+            }
+            // IndirectFieldDecl etc. - skip.
+        }
+    }
+
     // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
     // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
     bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
@@ -2341,22 +2428,7 @@ private:
             CRecordEntry rec;
             rec.name = nm->str();
             rec.isUnion = tag && *tag == "union";
-            if (auto* inner = node->getArray("inner"))
-            {
-                for (const auto& c : *inner)
-                {
-                    const llvm::json::Object* co = c.getAsObject();
-                    if (!co) continue;
-                    auto ck = co->getString("kind");
-                    if (!ck || *ck != "FieldDecl") continue;
-                    auto fname = co->getString("name");
-                    if (!fname) continue;
-                    CRecordFieldEntry fe;
-                    fe.name = fname->str();
-                    fe.ctype = qualTypeOf(co->getObject("type"));
-                    rec.fields.push_back(std::move(fe));
-                }
-            }
+            CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
             if (auto* loc = node->getObject("loc"))
             {
                 if (auto l = loc->getInteger("line")) rec.line = (int)*l;
@@ -2608,23 +2680,26 @@ private:
         if (records.empty()) return;
 
         // Pass 1: opaque shells. Skip ones already in dataStructures so we never overwrite
-        // a CFlat-defined struct with C metadata.
+        // a CFlat-defined struct/union with C metadata. Anonymous records (no tag) are
+        // skipped - they have no name to bind to, and clang inlines their fields into the
+        // enclosing struct at the JSON layer anyway.
         std::vector<const CRecordEntry*> ours;
         ours.reserve(records.size());
         for (const auto& r : records)
         {
             if (r.name.empty()) continue;
-            if (r.isUnion) continue; // unions deferred - layout is non-trivial (anonymous union member of struct, etc.)
             if (dataStructures.find(r.name) != dataStructures.end()) continue;
-            // Create the opaque shell now so a later field can refer to `struct r.name *`
-            // or to another record being registered in the same batch.
+            // Create the opaque shell now so a later field can refer to the record via
+            // `struct r.name *` / `union r.name *` or to another record being registered
+            // in the same batch. CreateUnionType handles the opaque-shell case identically
+            // to CreateStructType, so the union branch can also start from an opaque shell.
             CreateStructType(r.name, /*typeAndValues*/{});
             ours.push_back(&r);
         }
 
-        // Pass 2: bodies. If any field type cannot be mapped, abandon this record and erase
-        // the shell - leaving an opaque struct around would silently miscompile any caller
-        // that tried to instantiate it.
+        // Pass 2: bodies. If any field type cannot be mapped, abandon this record and leave
+        // the opaque shell in place - a later reference will then surface a clear error
+        // rather than crash on a partially-typed struct.
         for (const CRecordEntry* rp : ours)
         {
             const CRecordEntry& r = *rp;
@@ -2636,7 +2711,8 @@ private:
                 TypeAndValue tv;
                 if (!MapCTypeToTypeAndValue(f.ctype, tv))
                 {
-                    if (verbose) std::cout << "[verbose]   skipping C struct '" << r.name
+                    if (verbose) std::cout << "[verbose]   skipping C " << (r.isUnion ? "union" : "struct")
+                                           << " '" << r.name
                                            << "': unsupported field '" << f.name
                                            << "' of type '" << f.ctype << "'\n";
                     ok = false;
@@ -2653,10 +2729,13 @@ private:
                 // references; the user will get a clear error if they try to use it.
                 continue;
             }
-            CreateStructType(r.name, fields);
+            if (r.isUnion)
+                CreateUnionType(r.name, fields);
+            else
+                CreateStructType(r.name, fields);
             if (auto* s = GetSymbolSink())
                 s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
-                            "struct " + r.name);
+                            (r.isUnion ? "union " : "struct ") + r.name);
         }
 
         if (verbose)
@@ -3658,22 +3737,7 @@ private:
                 CRecordEntry rec;
                 rec.name = nm->str();
                 rec.isUnion = tag && *tag == "union";
-                if (auto* inner = node->getArray("inner"))
-                {
-                    for (const auto& c : *inner)
-                    {
-                        const llvm::json::Object* co = c.getAsObject();
-                        if (!co) continue;
-                        auto ck = co->getString("kind");
-                        if (!ck || *ck != "FieldDecl") continue;
-                        auto fname = co->getString("name");
-                        if (!fname) continue;
-                        CRecordFieldEntry fe;
-                        fe.name = fname->str();
-                        fe.ctype = qualTypeOf(co->getObject("type"));
-                        rec.fields.push_back(std::move(fe));
-                    }
-                }
+                CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
                 if (auto* loc = node->getObject("loc"))
                 {
                     if (auto l = loc->getInteger("line")) rec.line = (int)*l;

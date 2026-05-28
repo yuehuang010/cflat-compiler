@@ -24,6 +24,28 @@ ML_Mode ml_pick_mode(int pick)
     return ML_AUTO;
 }
 
+void ml_pun_write_int(union ML_IntFloat* u, int v)
+{
+    u->as_int = v;
+}
+
+float ml_pun_read_float(union ML_IntFloat* u)
+{
+    return u->as_float;
+}
+
+int ml_pun_int_bits_of(float f)
+{
+    union ML_IntFloat u;
+    u.as_float = f;
+    return u.as_int;
+}
+
+int   ml_overlap_read_int   (struct ML_Overlap* o) { return o->as_int; }
+float ml_overlap_read_float (struct ML_Overlap* o) { return o->as_float; }
+int   ml_overlap_header_of  (struct ML_Overlap* o) { return o->header; }
+int   ml_overlap_trailer_of (struct ML_Overlap* o) { return o->trailer; }
+
 int ml_apply(ML_BinaryOp op, int a, int b) { return op(a, b); }
 
 static int ml_op_add(int a, int b) { return a + b; }

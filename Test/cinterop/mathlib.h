@@ -101,6 +101,45 @@ enum Extra
  * The sentinel value isn't meant to be invoked - only compared. */
 #define ML_NULL_OP ((int (*)(int, int))0)
 
+/* Named union - the classic int/float type-pun shape. Exercises the C-interop
+ * extractor routing unions through CreateUnionType (single max-sized slot, all
+ * fields share offset 0). Field access is the same `u.field` syntax as structs;
+ * the IsUnion flag in the struct descriptor drives offset 0 instead of
+ * FieldIndex GEPs. Nested anonymous structs/unions are NOT in scope here -
+ * anonymous records have no name to bind and are skipped by RegisterCRecords. */
+union ML_IntFloat
+{
+    int   as_int;
+    float as_float;
+};
+
+/* Pass-by-pointer is the most common shape for C union APIs - exercises that
+ * `union ML_IntFloat *` resolves and that GEP-to-field still hits offset 0. */
+void  ml_pun_write_int   (union ML_IntFloat* u, int v);
+float ml_pun_read_float  (union ML_IntFloat* u);
+int   ml_pun_int_bits_of (float f);  /* helper: returns the reference bit pattern */
+
+/* Anonymous union inside a struct (C11) - the OVERLAPPED / LARGE_INTEGER shape from
+ * the Win32 SDK. The C-interop extractor synthesizes a tag (`ML_Overlap__anon0`)
+ * for the inner union and rewrites the materializing unnamed field to a synthetic
+ * name `__anon0`, so CFlat code reaches the inner members via `o.__anon0.as_int`.
+ * Field overlap at offset 0 is preserved by the regular CreateUnionType codegen. */
+struct ML_Overlap
+{
+    int header;
+    union
+    {
+        int   as_int;
+        float as_float;
+    };
+    int trailer;
+};
+
+int   ml_overlap_read_int    (struct ML_Overlap* o);
+float ml_overlap_read_float  (struct ML_Overlap* o);
+int   ml_overlap_header_of   (struct ML_Overlap* o);
+int   ml_overlap_trailer_of  (struct ML_Overlap* o);
+
 /* Function-pointer typedef - the comparator-style callback shape used by qsort,
  * libcurl's CURLOPT_WRITEFUNCTION, etc. clang spells the qualType as
  *   "int (*)(int, int)"
