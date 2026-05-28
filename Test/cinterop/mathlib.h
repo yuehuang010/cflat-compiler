@@ -95,6 +95,12 @@ enum Extra
 #define ML_EXTRA_MACRO 77
 #endif
 
+/* Function-pointer sentinel macro - the SIG_IGN/SIG_DFL shape from <signal.h>.
+ * Pass B's __typeof__ probe sees `int (*)(int, int)`; the value-fold yields 0.
+ * Registered as a CFlat function<int(int,int)> global with env = intToPtr(0).
+ * The sentinel value isn't meant to be invoked - only compared. */
+#define ML_NULL_OP ((int (*)(int, int))0)
+
 /* Function-pointer typedef - the comparator-style callback shape used by qsort,
  * libcurl's CURLOPT_WRITEFUNCTION, etc. clang spells the qualType as
  *   "int (*)(int, int)"

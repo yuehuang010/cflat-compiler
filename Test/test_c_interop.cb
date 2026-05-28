@@ -236,6 +236,27 @@ extern int main()
     if (ml_apply(my_add_cb, 10, 32) != 42)               return 141;
     if (ml_apply(my_sub_cb, 50,  8) != 42)               return 142;
 
+    // Function-pointer return value: ml_pick_op returns ML_BinaryOp. CFlat
+    // receives a fat-struct function<int(int,int)> and calls it through the
+    // indirect-call path.
+    function<int(int,int)> op_add = ml_pick_op(0);
+    function<int(int,int)> op_mul = ml_pick_op(1);
+    function<int(int,int)> op_sub = ml_pick_op(2);
+    if (op_add(10, 32) != 42)                            return 143;
+    if (op_mul(6, 7)  != 42)                             return 144;
+    if (op_sub(50, 8) != 42)                             return 145;
+
+    // Function-pointer macro constant: ML_NULL_OP = ((int(*)(int,int))0). Pass B
+    // recognizes the (*) shape in __typeof__ output and registers the macro as a
+    // function<int(int,int)> global, env=intToPtr(0). The interesting bit is that
+    // the assignment compiles - the macro resolves to the constant fat struct
+    // and the storage matches function<int(int,int)>. We don't invoke (env=0
+    // would AV); we also don't compare (closure fat structs aren't icmp-able).
+    function<int(int,int)> sentinel = ML_NULL_OP;
+    // Reassign from a live callback to confirm the variable behaves as function<T>.
+    sentinel = ml_pick_op(0);
+    if (sentinel(10, 32) != 42)                          return 146;
+
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`
     // generic function and called without explicit type arguments.

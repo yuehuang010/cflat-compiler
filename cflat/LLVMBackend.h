@@ -707,6 +707,13 @@ private:
         // __typeof__ probe so `(int)"x"` stays on the integer path.
         bool isString = false;
         std::string stringValue;
+        // True when the macro's natural type is a C function-pointer (e.g.
+        // #define SIG_IGN ((void(*)(int))1)). value carries the folded integer
+        // bit pattern; funcPtrTV carries the parsed signature. RegisterCMacros
+        // emits a function<R(P...)> global initialized to a constant fat struct
+        // {thunk, env=intToPtr(value)} - same wire as a C-returned fn ptr.
+        bool isFuncPtr = false;
+        TypeAndValue funcPtrTV;
     };
     // A C struct/union decl extracted from a bound header or source. Field types are kept as
     // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
@@ -2691,6 +2698,35 @@ private:
                 tv.Pointer  = false;
                 c = llvm::ConstantFP::get(builder->getDoubleTy(), m.floatValue);
             }
+            else if (m.isFuncPtr)
+            {
+                // Function-pointer constant macro (e.g. SIG_IGN). Register as a
+                // function<R(P...)> global initialized to a constant fat struct
+                // {thunk_const, env=intToPtr(value)} - same wire shape as a
+                // C-returned function pointer, just frozen at link time.
+                tv = m.funcPtrTV;
+                tv.VariableName = m.name;
+
+                // Build the C-side LLVM FunctionType for the thunk lookup.
+                std::vector<llvm::Type*> paramTypes;
+                for (const auto& p : tv.FuncPtrParams)
+                {
+                    TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+                    paramTypes.push_back(GetType(pTV));
+                }
+                TypeAndValue retTV;
+                retTV.TypeName = tv.FuncPtrReturnTypeName;
+                retTV.Pointer  = tv.FuncPtrReturnPointer;
+                auto* cFnTy = llvm::FunctionType::get(GetType(retTV), paramTypes, false);
+                auto* thunk = GetOrCreateCFuncPtrThunk(cFnTy);
+
+                auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+                auto* closureTy = GetClosureFatPtrType();
+                llvm::Constant* thunkC = llvm::ConstantExpr::getBitCast(thunk, i8PtrTy);
+                llvm::Constant* envC = llvm::ConstantExpr::getIntToPtr(
+                    builder->getInt64((uint64_t)m.value), i8PtrTy);
+                c = llvm::ConstantStruct::get(closureTy, { thunkC, envC });
+            }
             else if (m.isPointer)
             {
                 // Sentinel pointer macro (e.g. INVALID_HANDLE_VALUE). Register as a
@@ -3454,15 +3490,23 @@ private:
             e.value = it->second;
 
             // If the type probe also succeeded, ask the signature mapper whether the
-            // recovered type chases (through cTypedefMap_) down to void*. Only that
-            // shape qualifies as a pointer sentinel under the current scope.
+            // recovered type chases (through cTypedefMap_) down to void* or to a
+            // function-pointer signature. void* -> pointer sentinel; (*)(args) ->
+            // function-pointer constant (e.g. #define SIG_IGN ((void(*)(int))1)).
             if (tt != resolvedType.end())
             {
                 TypeAndValue tv;
-                if (MapCTypeToTypeAndValue(tt->second, tv)
-                    && tv.Pointer && !tv.ElemPointer && tv.TypeName == "void")
+                if (MapCTypeToTypeAndValue(tt->second, tv))
                 {
-                    e.isPointer = true;
+                    if (tv.IsFunctionPointer)
+                    {
+                        e.isFuncPtr  = true;
+                        e.funcPtrTV  = std::move(tv);
+                    }
+                    else if (tv.Pointer && !tv.ElemPointer && tv.TypeName == "void")
+                    {
+                        e.isPointer = true;
+                    }
                 }
             }
             outMacros.push_back(std::move(e));
@@ -4403,6 +4447,78 @@ public:
             b.CreateRet(b.CreateCall(origTy, original, callArgs));
         }
         return shim;
+    }
+
+    // Thunk used to wrap a bare C function pointer (returned from an extern C call) as a
+    // closure {thunk, env=cfnptr}. The thunk's `env` slot carries the real C function
+    // pointer at runtime; CreateIndirectCall passes env as the first arg, so the thunk
+    // reads env back, bitcasts it to the C signature, and tail-calls through it.
+    // One thunk per signature - keyed by the C-compatible LLVM FunctionType.
+    llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
+    {
+        // Build a stable signature key (mangled function type) so we share thunks across
+        // identical signatures (e.g. multiple `int(int,int)` callbacks).
+        std::string key;
+        llvm::raw_string_ostream os(key);
+        os << "__c_fnptr_thunk_";
+        cFnTy->getReturnType()->print(os);
+        for (auto* pt : cFnTy->params()) { os << "_"; pt->print(os); }
+        os.flush();
+        // LLVM may emit punctuation; sanitize to identifier-friendly chars.
+        for (char& c : key) if (!std::isalnum((unsigned char)c)) c = '_';
+
+        if (auto* existing = module->getFunction(key)) return existing;
+
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        std::vector<llvm::Type*> thunkParams = { i8PtrTy };
+        for (auto* pt : cFnTy->params()) thunkParams.push_back(pt);
+        auto* thunkTy = llvm::FunctionType::get(cFnTy->getReturnType(), thunkParams, false);
+
+        auto* thunk = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage, key, *module);
+
+        llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", thunk));
+        auto* envArg = thunk->getArg(0);
+        auto* fnPtr  = b.CreateBitCast(envArg, cFnTy->getPointerTo(), "cfn");
+        std::vector<llvm::Value*> callArgs;
+        for (unsigned i = 1; i < thunk->arg_size(); ++i) callArgs.push_back(thunk->getArg(i));
+        if (cFnTy->getReturnType()->isVoidTy())
+        {
+            b.CreateCall(cFnTy, fnPtr, callArgs);
+            b.CreateRetVoid();
+        }
+        else
+        {
+            b.CreateRet(b.CreateCall(cFnTy, fnPtr, callArgs));
+        }
+        return thunk;
+    }
+
+    // Wraps a C-returned bare function pointer in a {thunk, cfnptr-as-env} fat struct
+    // so CFlat's indirect-call machinery (which always passes env first) routes through
+    // the thunk and reaches the real C function with the right argument layout.
+    llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
+    {
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        // Build the C-side LLVM FunctionType from the TypeAndValue (no env arg).
+        std::vector<llvm::Type*> paramTypes;
+        for (const auto& p : fpTV.FuncPtrParams)
+        {
+            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            paramTypes.push_back(GetType(pTV));
+        }
+        TypeAndValue retTV;
+        retTV.TypeName = fpTV.FuncPtrReturnTypeName;
+        retTV.Pointer  = fpTV.FuncPtrReturnPointer;
+        auto* cFnTy = llvm::FunctionType::get(GetType(retTV), paramTypes, false);
+
+        auto* thunk    = GetOrCreateCFuncPtrThunk(cFnTy);
+        auto* thunkI8  = builder->CreateBitCast(thunk, i8PtrTy, "thunk_i8");
+        auto* envI8    = builder->CreateBitCast(cFnPtrValue, i8PtrTy, "cfnret_i8");
+        auto* closureTy = GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(closureTy);
+        fat = builder->CreateInsertValue(fat, thunkI8, {0u});
+        fat = builder->CreateInsertValue(fat, envI8,   {1u});
+        return fat;
     }
 
     // Wraps a named function in a {shim_i8ptr, null} closure fat struct value.
@@ -7680,6 +7796,17 @@ public:
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
+
+        // Extern C function returning a function pointer: the LLVM-level return type is a
+        // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.
+        // Wrap via a per-signature thunk so the indirect-call path (which always prepends
+        // env to the args) reaches the real C function correctly.
+        if (candidate.ReturnType.IsFunctionPointer
+            && result != nullptr
+            && result->getType()->isPointerTy())
+        {
+            result = WrapCFuncPtrAsFatStruct(result, candidate.ReturnType);
+        }
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
