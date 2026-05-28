@@ -53,6 +53,7 @@
 #include <antlr4-runtime.h>
 #include <CFlatParser.h>
 #include <CFlatLexer.h>
+#include <nlohmann/json.hpp>
 #include <fstream>
 #include "ArgParser.h"
 #include "CompilerManager.h"
@@ -1944,19 +1945,91 @@ private:
     // Implicit typedefs (compiler-injected like __int128_t, size_t aliases) are skipped -
     // they pull in noise without helping resolution. First-writer-wins so a later header
     // doesn't clobber an earlier one's spelling. Safe to call multiple times.
-    void CollectCTypedefs(const llvm::json::Array* topLevel)
+    // A non-owning view over an nlohmann::json node exposing the small subset of the
+    // llvm::json::Object/Array/Value API that the C-interop AST walk uses. We parse clang's
+    // AST dumps with nlohmann because its DOM parse is ~24x faster than llvm::json on these
+    // very large dumps (131 MB curl.h: 1.1s vs 26s); this view lets the existing walk keep
+    // its `node->getString(...)` shape unchanged. It points into a root nlohmann::json that
+    // must outlive the view (the parse roots are function locals that live across the walk).
+    struct JRef
+    {
+        const nlohmann::json* n = nullptr;
+
+        explicit operator bool() const { return n != nullptr; }
+        const JRef* operator->() const { return this; }   // node->getX() reads unchanged
+        JRef        operator*()  const { return *this; }   // *arr in range-for / (*arr)[i]
+
+        // Value -> Object.
+        JRef getAsObject() const { return (n && n->is_object()) ? *this : JRef{}; }
+
+        // Object field access (every call site passes a string-literal key).
+        std::optional<llvm::StringRef> getString(const char* key) const
+        {
+            if (!n || !n->is_object()) return std::nullopt;
+            auto it = n->find(key);
+            if (it != n->end() && it->is_string())
+                return llvm::StringRef(it->get_ref<const nlohmann::json::string_t&>());
+            return std::nullopt;
+        }
+        JRef getObject(const char* key) const
+        {
+            if (!n || !n->is_object()) return JRef{};
+            auto it = n->find(key);
+            return (it != n->end() && it->is_object()) ? JRef{ &*it } : JRef{};
+        }
+        JRef getArray(const char* key) const
+        {
+            if (!n || !n->is_object()) return JRef{};
+            auto it = n->find(key);
+            return (it != n->end() && it->is_array()) ? JRef{ &*it } : JRef{};
+        }
+        std::optional<bool> getBoolean(const char* key) const
+        {
+            if (!n || !n->is_object()) return std::nullopt;
+            auto it = n->find(key);
+            if (it != n->end() && it->is_boolean()) return it->get<bool>();
+            return std::nullopt;
+        }
+        std::optional<int64_t> getInteger(const char* key) const
+        {
+            if (!n || !n->is_object()) return std::nullopt;
+            auto it = n->find(key);
+            if (it == n->end()) return std::nullopt;
+            if (it->is_number_integer())  return it->get<int64_t>();
+            if (it->is_number_unsigned()) return (int64_t)it->get<uint64_t>();
+            return std::nullopt;
+        }
+
+        // Array operations.
+        bool   empty() const { return !n || n->empty(); }
+        size_t size()  const { return n ? n->size() : 0; }
+        JRef   front() const { return (n && !n->empty()) ? JRef{ &n->front() } : JRef{}; }
+        JRef   operator[](size_t i) const { return (n && i < n->size()) ? JRef{ &(*n)[i] } : JRef{}; }
+
+        struct iterator
+        {
+            nlohmann::json::const_iterator it;
+            JRef operator*() const { return JRef{ &*it }; }
+            iterator& operator++() { ++it; return *this; }
+            bool operator!=(const iterator& o) const { return it != o.it; }
+        };
+        iterator begin() const { return iterator{ n->begin() }; }
+        iterator end()   const { return iterator{ n->end() }; }
+    };
+
+    void CollectCTypedefs(JRef topLevel)
     {
         if (!topLevel) return;
         for (const auto& v : *topLevel)
         {
-            const llvm::json::Object* node = v.getAsObject();
+            JRef node = v.getAsObject();
             if (!node) continue;
             auto kind = node->getString("kind");
             if (!kind || *kind != "TypedefDecl") continue;
             if (auto imp = node->getBoolean("isImplicit"); imp && *imp) continue;
             auto name = node->getString("name");
             if (!name) continue;
-            const llvm::json::Object* typeObj = node->getObject("type");
+            JRef typeObj = node->getObject("type");
             if (!typeObj) continue;
             std::string target;
             std::string desugared = typeObj->getString("desugaredQualType").value_or("").str();
@@ -2397,18 +2470,18 @@ private:
     // so CFlat code can reach the inner members via `s.__anon0.a`. IndirectFieldDecl nodes
     // (clang's transparent-access forwarders) are skipped; CFlat does not replicate C's
     // anonymous-member transparency at the language level.
-    void CollectRecordFieldsAndNested(const llvm::json::Object* recordNode,
+    void CollectRecordFieldsAndNested(JRef recordNode,
                                       const std::string& parentTag,
                                       CRecordEntry& recOut,
                                       std::vector<CRecordEntry>& outRecords)
     {
-        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string {
+        auto qualTypeOf = [](JRef typeObj) -> std::string {
             if (!typeObj) return "";
             if (auto d = typeObj->getString("desugaredQualType")) return d->str();
             if (auto q = typeObj->getString("qualType")) return q->str();
             return "";
         };
-        const llvm::json::Array* inner = recordNode->getArray("inner");
+        JRef inner = recordNode->getArray("inner");
         if (!inner) return;
 
         // Anonymous nested records and their materializing unnamed FieldDecl come in pairs
@@ -2420,7 +2493,7 @@ private:
 
         for (const auto& c : *inner)
         {
-            const llvm::json::Object* co = c.getAsObject();
+            JRef co = c.getAsObject();
             if (!co) continue;
             auto ck = co->getString("kind");
             if (!ck) continue;
@@ -2438,7 +2511,7 @@ private:
                 CRecordEntry nested;
                 nested.name = synTag;
                 nested.isUnion = (tag && *tag == "union");
-                if (auto* loc = co->getObject("loc"))
+                if (auto loc = co->getObject("loc"))
                 {
                     if (auto l = loc->getInteger("line")) nested.line = (int)*l;
                     if (auto cc = loc->getInteger("col")) nested.col = (int)*cc - 1;
@@ -2477,11 +2550,11 @@ private:
                         fe.name.clear();
                         fe.ctype = qualTypeOf(co->getObject("type"));
                         fe.isBitfield = true;
-                        if (auto* inner = co->getArray("inner"))
+                        if (auto inner = co->getArray("inner"))
                         {
                             for (const auto& iv : *inner)
                             {
-                                if (auto* io = iv.getAsObject())
+                                if (auto io = iv.getAsObject())
                                 {
                                     if (auto val = io->getString("value"))
                                     {
@@ -2500,11 +2573,11 @@ private:
                 if (isBit && *isBit)
                 {
                     fe.isBitfield = true;
-                    if (auto* inner = co->getArray("inner"))
+                    if (auto inner = co->getArray("inner"))
                     {
                         for (const auto& iv : *inner)
                         {
-                            if (auto* io = iv.getAsObject())
+                            if (auto io = iv.getAsObject())
                             {
                                 if (auto val = io->getString("value"))
                                 {
@@ -2545,19 +2618,20 @@ private:
         if (!SpawnClangJson(argStrs, jsonText))
             return false;
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::parse(jsonText);
-        if (!root) { llvm::consumeError(root.takeError()); return false; }
+        nlohmann::json rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
+        if (rootDoc.is_discarded()) return false;
+        JRef root{ &rootDoc };
 
-        const llvm::json::Object* tu = root->getAsObject();
+        JRef tu = root->getAsObject();
         if (!tu) return false;
-        const llvm::json::Array* topLevel = tu->getArray("inner");
+        JRef topLevel = tu->getArray("inner");
         if (!topLevel) return true; // parsed fine, nothing to register
 
         // Collect typedefs first so the signature mapper can chase pointer aliases
         // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
         CollectCTypedefs(topLevel);
 
-        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string
+        auto qualTypeOf = [](JRef typeObj) -> std::string
         {
             if (!typeObj) return "";
             if (auto d = typeObj->getString("desugaredQualType")) return d->str();
@@ -2568,9 +2642,9 @@ private:
         // First pass: collect record (struct/union) decls. Recording them up front
         // (before function signatures) lets MapCTypeToTypeAndValue resolve struct-by-
         // value parameter / return types against the registered structs.
-        for (const llvm::json::Value& v : *topLevel)
+        for (const JRef& v : *topLevel)
         {
-            const llvm::json::Object* node = v.getAsObject();
+            JRef node = v.getAsObject();
             if (!node) continue;
             auto kind = node->getString("kind");
             if (!kind || *kind != "RecordDecl") continue;
@@ -2583,7 +2657,7 @@ private:
             rec.name = nm->str();
             rec.isUnion = tag && *tag == "union";
             CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
-            if (auto* loc = node->getObject("loc"))
+            if (auto loc = node->getObject("loc"))
             {
                 if (auto l = loc->getInteger("line")) rec.line = (int)*l;
                 if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
@@ -2595,9 +2669,9 @@ private:
         // parameter / return types in the function-decl pass below.
         RegisterCRecords(outRecords, cSourcePath);
 
-        for (const llvm::json::Value& v : *topLevel)
+        for (const JRef& v : *topLevel)
         {
-            const llvm::json::Object* node = v.getAsObject();
+            JRef node = v.getAsObject();
             if (!node) continue;
             auto kind = node->getString("kind");
             if (!kind || *kind != "FunctionDecl") continue;
@@ -2605,7 +2679,7 @@ private:
             // static functions are not externally linkable - skip.
             if (auto sc = node->getString("storageClass"); sc && *sc == "static") continue;
 
-            const llvm::json::Array* fnInner = node->getArray("inner");
+            JRef fnInner = node->getArray("inner");
 
             // Only functions *defined* in this translation unit end up as object
             // symbols we can link. A body means a CompoundStmt child; header-only
@@ -2613,7 +2687,7 @@ private:
             bool hasBody = false;
             if (fnInner)
                 for (const auto& c : *fnInner)
-                    if (auto* co = c.getAsObject())
+                    if (auto co = c.getAsObject())
                         if (auto ck = co->getString("kind"); ck && *ck == "CompoundStmt")
                         { hasBody = true; break; }
             if (!hasBody) continue;
@@ -2644,7 +2718,7 @@ private:
             {
                 for (const auto& c : *fnInner)
                 {
-                    const llvm::json::Object* co = c.getAsObject();
+                    JRef co = c.getAsObject();
                     if (!co) continue;
                     auto ck = co->getString("kind");
                     if (!ck || *ck != "ParmVarDecl") continue;
@@ -2664,7 +2738,7 @@ private:
             }
             if (!paramsOk) continue;
 
-            if (auto* loc = node->getObject("loc"))
+            if (auto loc = node->getObject("loc"))
             {
                 if (auto l = loc->getInteger("line")) entry.line = (int)*l;
                 if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
@@ -2775,7 +2849,7 @@ private:
     // Depth-first search for the first node carrying an evaluated integer "value" string
     // (clang puts the evaluated enum value on the wrapping ConstantExpr / IntegerLiteral).
     // Returns false when the enumerator has no initializer (caller uses the running count).
-    static bool FindConstantValue(const llvm::json::Object* node, long long& out)
+    static bool FindConstantValue(JRef node, long long& out)
     {
         if (!node) return false;
         if (auto v = node->getString("value"))
@@ -2787,7 +2861,7 @@ private:
                 if (consumed == s.size()) { out = parsed; return true; }
             } catch (...) { /* not a plain decimal (e.g. a string literal) - keep searching */ }
         }
-        if (auto* inner = node->getArray("inner"))
+        if (auto inner = node->getArray("inner"))
             for (const auto& c : *inner)
                 if (FindConstantValue(c.getAsObject(), out)) return true;
         return false;
@@ -3459,15 +3533,16 @@ private:
         if (!SpawnClangCapture(argStrs, jsonText)) return false;
         if (jsonText.empty()) return false;
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::Value(nullptr);
+        nlohmann::json rootDoc;
         {
             llvm::TimeTraceScope parseScope("ParseMacroJson", std::format("{} bytes", jsonText.size()));
-            root = llvm::json::parse(jsonText);
+            rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
         }
-        if (!root) { llvm::consumeError(root.takeError()); return false; }
-        const llvm::json::Object* tu = root->getAsObject();
+        if (rootDoc.is_discarded()) return false;
+        JRef root{ &rootDoc };
+        JRef tu = root->getAsObject();
         if (!tu) return false;
-        const llvm::json::Array* topLevel = tu->getArray("inner");
+        JRef topLevel = tu->getArray("inner");
         if (!topLevel) return true;
 
         // cflat-side walk of the macro-resolution AST.
@@ -3493,8 +3568,8 @@ private:
         // real-header macros use: literals, paren/cast wrappers, unary +/-, and the
         // four arithmetic binary ops. Anything else yields false and the macro is
         // dropped (same outcome as a non-constant integer macro).
-        std::function<bool(const llvm::json::Object*, double&)> evalDouble =
-            [&](const llvm::json::Object* n, double& out) -> bool {
+        std::function<bool(JRef, double&)> evalDouble =
+            [&](JRef n, double& out) -> bool {
             if (!n) return false;
             auto kind = n->getString("kind");
             if (!kind) return false;
@@ -3514,7 +3589,7 @@ private:
             if (*kind == "ParenExpr" || *kind == "ImplicitCastExpr"
                 || *kind == "CStyleCastExpr" || *kind == "ConstantExpr")
             {
-                if (auto* inner = n->getArray("inner"))
+                if (auto inner = n->getArray("inner"))
                     for (const auto& c : *inner)
                         if (evalDouble(c.getAsObject(), out)) return true;
                 return false;
@@ -3522,7 +3597,7 @@ private:
             if (*kind == "UnaryOperator")
             {
                 auto op = n->getString("opcode");
-                auto* inner = n->getArray("inner");
+                auto inner = n->getArray("inner");
                 if (!op || !inner || inner->empty()) return false;
                 double v;
                 if (!evalDouble(inner->front().getAsObject(), v)) return false;
@@ -3533,7 +3608,7 @@ private:
             if (*kind == "BinaryOperator")
             {
                 auto op = n->getString("opcode");
-                auto* inner = n->getArray("inner");
+                auto inner = n->getArray("inner");
                 if (!op || !inner || inner->size() < 2) return false;
                 double l = 0.0, r = 0.0;
                 if (!evalDouble((*inner)[0].getAsObject(), l)) return false;
@@ -3550,11 +3625,11 @@ private:
         // Find the first evaluable double expression anywhere inside the VarDecl's
         // subtree. evalDouble recurses through wrappers itself; this fallback skips
         // VarDecl-specific decoration nodes (annotations, attrs) to reach the init.
-        std::function<bool(const llvm::json::Object*, double&)> findFloat =
-            [&](const llvm::json::Object* node, double& out) -> bool {
+        std::function<bool(JRef, double&)> findFloat =
+            [&](JRef node, double& out) -> bool {
             if (!node) return false;
             if (evalDouble(node, out)) return true;
-            if (auto* inner = node->getArray("inner"))
+            if (auto inner = node->getArray("inner"))
                 for (const auto& c : *inner)
                     if (findFloat(c.getAsObject(), out)) return true;
             return false;
@@ -3564,8 +3639,8 @@ private:
         // its `value` (clang emits the literal in C source form, including surrounding
         // quotes and \-escapes). For adjacent literal concatenation (`"a" "b"`) clang
         // already folds into a single StringLiteral by the time we see it.
-        std::function<bool(const llvm::json::Object*, std::string&)> findString =
-            [&](const llvm::json::Object* node, std::string& out) -> bool {
+        std::function<bool(JRef, std::string&)> findString =
+            [&](JRef node, std::string& out) -> bool {
             if (!node) return false;
             if (auto kind = node->getString("kind"))
             {
@@ -3628,14 +3703,14 @@ private:
                     return false;
                 }
             }
-            if (auto* inner = node->getArray("inner"))
+            if (auto inner = node->getArray("inner"))
                 for (const auto& c : *inner)
                     if (findString(c.getAsObject(), out)) return true;
             return false;
         };
 
-        std::function<void(const llvm::json::Value&)> visit = [&](const llvm::json::Value& v) {
-            const llvm::json::Object* node = v.getAsObject();
+        std::function<void(const JRef&)> visit = [&](const JRef& v) {
+            JRef node = v.getAsObject();
             if (!node) return;
             if (auto kind = node->getString("kind"))
             {
@@ -3659,7 +3734,7 @@ private:
                         std::string n = nm->str();
                         if (n.rfind(tPrefix, 0) == 0)
                         {
-                            if (auto* typeObj = node->getObject("type"))
+                            if (auto typeObj = node->getObject("type"))
                             {
                                 std::string t;
                                 if (auto d = typeObj->getString("desugaredQualType")) t = d->str();
@@ -3683,7 +3758,7 @@ private:
                     }
                 }
             }
-            if (auto* inner = node->getArray("inner"))
+            if (auto inner = node->getArray("inner"))
                 for (const auto& c : *inner) visit(c);
         };
         for (const auto& v : *topLevel) visit(v);
@@ -3826,15 +3901,16 @@ private:
         if (!SpawnClangJson(argStrs, jsonText))
             return false;
 
-        llvm::Expected<llvm::json::Value> root = llvm::json::Value(nullptr);
+        nlohmann::json rootDoc;
         {
             llvm::TimeTraceScope parseScope("ParseAstJson", std::format("{} bytes", jsonText.size()));
-            root = llvm::json::parse(jsonText);
+            rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
         }
-        if (!root) { llvm::consumeError(root.takeError()); return false; }
-        const llvm::json::Object* tu = root->getAsObject();
+        if (rootDoc.is_discarded()) return false;
+        JRef root{ &rootDoc };
+        JRef tu = root->getAsObject();
         if (!tu) return false;
-        const llvm::json::Array* topLevel = tu->getArray("inner");
+        JRef topLevel = tu->getArray("inner");
         if (!topLevel) return true;
 
         // Everything from here is the in-process AST walk over the (potentially huge) JSON.
@@ -3854,7 +3930,7 @@ private:
         scopeRoots.push_back(norm(hdrDir));
         for (const auto& inc : cIncludeDirs_) scopeRoots.push_back(norm(inc));
 
-        auto qualTypeOf = [](const llvm::json::Object* typeObj) -> std::string {
+        auto qualTypeOf = [](JRef typeObj) -> std::string {
             if (!typeObj) return "";
             if (auto d = typeObj->getString("desugaredQualType")) return d->str();
             if (auto q = typeObj->getString("qualType")) return q->str();
@@ -3864,19 +3940,19 @@ private:
         // clang emits loc.file only when it changes between sibling nodes; a node with no
         // file inherits the previous node's. Track it so the scope filter is accurate.
         std::string lastFile;
-        auto fileOfNode = [&](const llvm::json::Object* node) -> std::string {
-            auto pick = [&](const llvm::json::Object* o) {
+        auto fileOfNode = [&](JRef node) -> std::string {
+            auto pick = [&](JRef o) {
                 if (o)
                     if (auto f = o->getString("file")) lastFile = f->str();
             };
-            if (auto* loc = node->getObject("loc"))
+            if (auto loc = node->getObject("loc"))
             {
                 pick(loc);
-                if (auto* exp = loc->getObject("expansionLoc")) pick(exp);
-                if (auto* spel = loc->getObject("spellingLoc")) pick(spel);
+                if (auto exp = loc->getObject("expansionLoc")) pick(exp);
+                if (auto spel = loc->getObject("spellingLoc")) pick(spel);
             }
-            if (auto* range = node->getObject("range"))
-                if (auto* begin = range->getObject("begin"))
+            if (auto range = node->getObject("range"))
+                if (auto begin = range->getObject("begin"))
                     pick(begin);
             return lastFile;
         };
@@ -3893,25 +3969,25 @@ private:
         // its own sticky lastFile so we don't perturb the main loop's tracker.
         {
             std::string preLastFile;
-            auto preFileOfNode = [&](const llvm::json::Object* node) -> std::string {
-                auto pick = [&](const llvm::json::Object* o) {
+            auto preFileOfNode = [&](JRef node) -> std::string {
+                auto pick = [&](JRef o) {
                     if (o)
                         if (auto f = o->getString("file")) preLastFile = f->str();
                 };
-                if (auto* loc = node->getObject("loc"))
+                if (auto loc = node->getObject("loc"))
                 {
                     pick(loc);
-                    if (auto* exp = loc->getObject("expansionLoc")) pick(exp);
-                    if (auto* spel = loc->getObject("spellingLoc")) pick(spel);
+                    if (auto exp = loc->getObject("expansionLoc")) pick(exp);
+                    if (auto spel = loc->getObject("spellingLoc")) pick(spel);
                 }
-                if (auto* range = node->getObject("range"))
-                    if (auto* begin = range->getObject("begin"))
+                if (auto range = node->getObject("range"))
+                    if (auto begin = range->getObject("begin"))
                         pick(begin);
                 return preLastFile;
             };
-            for (const llvm::json::Value& v : *topLevel)
+            for (const JRef& v : *topLevel)
             {
-                const llvm::json::Object* node = v.getAsObject();
+                JRef node = v.getAsObject();
                 if (!node) continue;
                 const std::string curFile = preFileOfNode(node);
                 auto kind = node->getString("kind");
@@ -3926,7 +4002,7 @@ private:
                 rec.name = nm->str();
                 rec.isUnion = tag && *tag == "union";
                 CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
-                if (auto* loc = node->getObject("loc"))
+                if (auto loc = node->getObject("loc"))
                 {
                     if (auto l = loc->getInteger("line")) rec.line = (int)*l;
                     if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
@@ -3936,9 +4012,9 @@ private:
             RegisterCRecords(outRecords, headerPath);
         }
 
-        for (const llvm::json::Value& v : *topLevel)
+        for (const JRef& v : *topLevel)
         {
-            const llvm::json::Object* node = v.getAsObject();
+            JRef node = v.getAsObject();
             if (!node) continue;
             const std::string curFile = fileOfNode(node); // updates lastFile (sticky)
             auto kind = node->getString("kind");
@@ -3968,11 +4044,11 @@ private:
                 }
 
                 bool paramsOk = true;
-                if (auto* fnInner = node->getArray("inner"))
+                if (auto fnInner = node->getArray("inner"))
                 {
                     for (const auto& c : *fnInner)
                     {
-                        const llvm::json::Object* co = c.getAsObject();
+                        JRef co = c.getAsObject();
                         if (!co) continue;
                         auto ck = co->getString("kind");
                         if (!ck || *ck != "ParmVarDecl") continue;
@@ -3992,7 +4068,7 @@ private:
                 }
                 if (!paramsOk) continue;
 
-                if (auto* loc = node->getObject("loc"))
+                if (auto loc = node->getObject("loc"))
                 {
                     if (auto l = loc->getInteger("line")) entry.line = (int)*l;
                     if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
@@ -4002,11 +4078,11 @@ private:
             else if (*kind == "EnumDecl")
             {
                 long long current = 0;
-                if (auto* enumInner = node->getArray("inner"))
+                if (auto enumInner = node->getArray("inner"))
                 {
                     for (const auto& c : *enumInner)
                     {
-                        const llvm::json::Object* co = c.getAsObject();
+                        JRef co = c.getAsObject();
                         if (!co) continue;
                         auto ck = co->getString("kind");
                         if (!ck || *ck != "EnumConstantDecl") continue;
@@ -4014,7 +4090,7 @@ private:
                         if (!en || en->empty()) continue;
 
                         long long value = current;
-                        if (auto* eci = co->getArray("inner"))
+                        if (auto eci = co->getArray("inner"))
                             for (const auto& e : *eci)
                             {
                                 long long parsed = 0;
@@ -4024,7 +4100,7 @@ private:
                         CEnumEntry ee;
                         ee.name  = en->str();
                         ee.value = value;
-                        if (auto* loc = co->getObject("loc"))
+                        if (auto loc = co->getObject("loc"))
                         {
                             if (auto l = loc->getInteger("line")) ee.line = (int)*l;
                             if (auto cc = loc->getInteger("col")) ee.col = (int)*cc - 1;
