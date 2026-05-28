@@ -41,6 +41,16 @@ enum Extra
 #define ML_COMBINED_MASK  ((1 << 0) | (1 << 2) | (1 << 4))   /* 21 */
 #define ML_BIG_CONST      0x100000000LL                       /* > INT32_MAX -> i64 */
 
+/* Float/double macros - routed via Pass B's __typeof__ probe (type is `double`
+ * for unsuffixed literals, `float` for f-suffixed) and resolved by the
+ * double-fold probe. Integer fold would truncate, so type-based routing is
+ * required.  Registered as CFlat `double` globals. */
+#define ML_PI             3.14159265358979323846   /* double, unsuffixed */
+#define ML_HALF           0.5                      /* simple round number */
+#define ML_NEG_FLOAT      (-1.25)                  /* parenthesized negative */
+#define ML_TWO_PI         (2.0 * 3.14159265358979323846)  /* folded expression */
+#define ML_FLOAT_F        2.5f                     /* float-suffixed -> still routes to double */
+
 /* Function-like macro: must be SKIPPED by the extractor (cflat has no
  * preprocessor). Presence here ensures it does not crash extraction or
  * leak in as a constant. */

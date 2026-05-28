@@ -17,8 +17,9 @@
 //                       on Win64 spills past RCX/RDX/R8/R9 onto the stack).
 //   Section I (90-99) : object-like #define macro extraction - decimal, hex,
 //                       parenthesized negative, expression-folded, i64-promoted,
-//                       and define-gated; function-like / string macros must be
-//                       silently skipped without poisoning their neighbors.
+//                       define-gated, and float/double (routed via __typeof__);
+//                       function-like / string macros must be silently skipped
+//                       without poisoning their neighbors.
 //   Section J (100-115): function-like #define macro translation - each accepted
 //                       macro becomes an `auto` generic function callable without
 //                       explicit type args; rejected bodies (calls, strings,
@@ -180,6 +181,16 @@ extern int main()
     // Gated by inline `define "ML_EXTRA"` on the import line. Verifies per-import
     // defines reach the macro extractor, not just the decl/enum dumps.
     if (ML_EXTRA_MACRO != 77)           return 95;
+
+    // Float/double macros - routed through the double-fold probe based on the
+    // __typeof__ recovered C type. Registered as CFlat `double` globals.
+    if (ML_PI < 3.1415 || ML_PI > 3.1416)               return 96;
+    if (ML_HALF < 0.49 || ML_HALF > 0.51)               return 97;
+    if (ML_NEG_FLOAT < -1.26 || ML_NEG_FLOAT > -1.24)   return 98;
+    if (ML_TWO_PI < 6.28 || ML_TWO_PI > 6.29)           return 99;
+    // Float-suffixed source literal: precision lost in float->double round-trip
+    // is still well inside our 0.01 tolerance.
+    if (ML_FLOAT_F < 2.49 || ML_FLOAT_F > 2.51)         return 119;
 
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`

@@ -685,6 +685,7 @@ private:
     {
         std::string name;
         long long value = 0;
+        double floatValue = 0.0;
         std::string file;
         int line = 1;
         int col = 0;
@@ -694,6 +695,12 @@ private:
         // RegisterCMacros emits them as void* globals so they can be compared against
         // pointer-returning C APIs.
         bool isPointer = false;
+        // True when the macro's natural type is float / double / long double. The
+        // double-fold probe (__cflat_f_NAME) supplies the value; RegisterCMacros
+        // emits the macro as a CFlat `double` global. Routing on type (not on a
+        // successful double-fold alone) is intentional: `(double)(0x100000000)`
+        // folds fine but the macro is an integer constant, not a float.
+        bool isFloat = false;
     };
     // A C struct/union decl extracted from a bound header or source. Field types are kept as
     // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
@@ -2542,7 +2549,16 @@ private:
             TypeAndValue tv;
             tv.VariableName = m.name;
             llvm::Constant* c = nullptr;
-            if (m.isPointer)
+            if (m.isFloat)
+            {
+                // Float/double macro (e.g. M_PI). Always register as `double` - CFlat
+                // narrows at use site if assigned to a `float`, and double matches C's
+                // default FP promotion in expressions.
+                tv.TypeName = "double";
+                tv.Pointer  = false;
+                c = llvm::ConstantFP::get(builder->getDoubleTy(), m.floatValue);
+            }
+            else if (m.isPointer)
             {
                 // Sentinel pointer macro (e.g. INVALID_HANDLE_VALUE). Register as a
                 // void* global initialized by reinterpreting the folded bit pattern
@@ -2994,6 +3010,11 @@ private:
                 // affecting the value-probe enum thanks to -ferror-limit=0 error recovery.
                 os << "enum { __cflat_m_" << m.name << " = (long long)(" << m.name << ") };\n";
                 os << "__typeof__(" << m.name << ") __cflat_t_" << m.name << ";\n";
+                // Double-fold probe: lets float/double macros (e.g. M_PI) carry full
+                // precision through Pass B. Routed via the __typeof__ result below so
+                // integer macros stay on the integer path even though this probe also
+                // folds them.
+                os << "static const double __cflat_f_" << m.name << " = (double)(" << m.name << ");\n";
             }
             os.close();
         }
@@ -3026,8 +3047,84 @@ private:
         // Both can fail independently (per-decl recovery via -ferror-limit=0).
         const std::string mPrefix = "__cflat_m_";
         const std::string tPrefix = "__cflat_t_";
+        const std::string fPrefix = "__cflat_f_";
         std::unordered_map<std::string, long long>   resolvedVal;
         std::unordered_map<std::string, std::string> resolvedType;
+        std::unordered_map<std::string, double>      resolvedFloat;
+
+        // Evaluate a constant-expression AST node to a double. Clang in C mode does
+        // not pre-fold `static const double x = ...;` initializers, so the float-fold
+        // probe emits a full expression tree we must evaluate ourselves. Covers what
+        // real-header macros use: literals, paren/cast wrappers, unary +/-, and the
+        // four arithmetic binary ops. Anything else yields false and the macro is
+        // dropped (same outcome as a non-constant integer macro).
+        std::function<bool(const llvm::json::Object*, double&)> evalDouble =
+            [&](const llvm::json::Object* n, double& out) -> bool {
+            if (!n) return false;
+            auto kind = n->getString("kind");
+            if (!kind) return false;
+
+            if (*kind == "FloatingLiteral" || *kind == "IntegerLiteral" || *kind == "CharacterLiteral")
+            {
+                if (auto v = n->getString("value"))
+                {
+                    try {
+                        size_t consumed = 0;
+                        double d = std::stod(v->str(), &consumed);
+                        if (consumed == v->str().size()) { out = d; return true; }
+                    } catch (...) {}
+                }
+                return false;
+            }
+            if (*kind == "ParenExpr" || *kind == "ImplicitCastExpr"
+                || *kind == "CStyleCastExpr" || *kind == "ConstantExpr")
+            {
+                if (auto* inner = n->getArray("inner"))
+                    for (const auto& c : *inner)
+                        if (evalDouble(c.getAsObject(), out)) return true;
+                return false;
+            }
+            if (*kind == "UnaryOperator")
+            {
+                auto op = n->getString("opcode");
+                auto* inner = n->getArray("inner");
+                if (!op || !inner || inner->empty()) return false;
+                double v;
+                if (!evalDouble(inner->front().getAsObject(), v)) return false;
+                if (*op == "-") { out = -v; return true; }
+                if (*op == "+") { out =  v; return true; }
+                return false;
+            }
+            if (*kind == "BinaryOperator")
+            {
+                auto op = n->getString("opcode");
+                auto* inner = n->getArray("inner");
+                if (!op || !inner || inner->size() < 2) return false;
+                double l = 0.0, r = 0.0;
+                if (!evalDouble((*inner)[0].getAsObject(), l)) return false;
+                if (!evalDouble((*inner)[1].getAsObject(), r)) return false;
+                if (*op == "+") { out = l + r; return true; }
+                if (*op == "-") { out = l - r; return true; }
+                if (*op == "*") { out = l * r; return true; }
+                if (*op == "/") { if (r == 0.0) return false; out = l / r; return true; }
+                return false;
+            }
+            return false;
+        };
+
+        // Find the first evaluable double expression anywhere inside the VarDecl's
+        // subtree. evalDouble recurses through wrappers itself; this fallback skips
+        // VarDecl-specific decoration nodes (annotations, attrs) to reach the init.
+        std::function<bool(const llvm::json::Object*, double&)> findFloat =
+            [&](const llvm::json::Object* node, double& out) -> bool {
+            if (!node) return false;
+            if (evalDouble(node, out)) return true;
+            if (auto* inner = node->getArray("inner"))
+                for (const auto& c : *inner)
+                    if (findFloat(c.getAsObject(), out)) return true;
+            return false;
+        };
+
         std::function<void(const llvm::json::Value&)> visit = [&](const llvm::json::Value& v) {
             const llvm::json::Object* node = v.getAsObject();
             if (!node) return;
@@ -3062,6 +3159,12 @@ private:
                                     resolvedType[n.substr(tPrefix.size())] = std::move(t);
                             }
                         }
+                        else if (n.rfind(fPrefix, 0) == 0)
+                        {
+                            double d = 0.0;
+                            if (findFloat(node, d))
+                                resolvedFloat[n.substr(fPrefix.size())] = d;
+                        }
                     }
                 }
             }
@@ -3070,21 +3173,47 @@ private:
         };
         for (const auto& v : *topLevel) visit(v);
 
-        outMacros.reserve(resolvedVal.size());
+        outMacros.reserve(resolvedVal.size() + resolvedFloat.size());
         for (const auto& cand : candidates)
         {
-            auto it = resolvedVal.find(cand.name);
-            if (it == resolvedVal.end()) continue; // dropped (non-int, non-constant, string, etc.)
+            // Route by the __typeof__ probe's recovered C type. Float/double goes to
+            // the FP path (preserves precision); void* to the pointer-sentinel path;
+            // everything else to the integer path.
+            bool typeIsFloat = false;
+            auto tt = resolvedType.find(cand.name);
+            if (tt != resolvedType.end())
+            {
+                const std::string& t = tt->second;
+                if (t == "float" || t == "double" || t == "long double"
+                    || t == "const float" || t == "const double" || t == "const long double")
+                {
+                    typeIsFloat = true;
+                }
+            }
+
             CMacroEntry e;
             e.name  = cand.name;
-            e.value = it->second;
             e.file  = cand.file;
             e.line  = cand.line;
             e.col   = 0;
+
+            if (typeIsFloat)
+            {
+                auto itf = resolvedFloat.find(cand.name);
+                if (itf == resolvedFloat.end()) continue; // float type but fold failed - drop rather than register a corrupted int
+                e.isFloat    = true;
+                e.floatValue = itf->second;
+                outMacros.push_back(std::move(e));
+                continue;
+            }
+
+            auto it = resolvedVal.find(cand.name);
+            if (it == resolvedVal.end()) continue; // dropped (non-int, non-constant, string, etc.)
+            e.value = it->second;
+
             // If the type probe also succeeded, ask the signature mapper whether the
             // recovered type chases (through cTypedefMap_) down to void*. Only that
             // shape qualifies as a pointer sentinel under the current scope.
-            auto tt = resolvedType.find(cand.name);
             if (tt != resolvedType.end())
             {
                 TypeAndValue tv;
