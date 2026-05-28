@@ -840,18 +840,41 @@ private:
         std::string type;  // "int", "string", etc.
     };
     std::unordered_map<std::string, CompileTimeMacro> compileTimeMacros;
-    // Keep imported parse state alive: generic template ctx pointers point into
-    // these ANTLR parse trees and are accessed later during main-file instantiation.
-    struct ImportedParseState
+    // Parse-tree cache for imported files. The ANTLR ecosystem (input/lexer/tokens/
+    // parser) is kept alive so generic-template ctx pointers stay valid, AND the whole
+    // entry is reused across compiles when the file's content is unchanged - parsing the
+    // standard-library closure (runtime.cb + transitive core imports) is by far the most
+    // expensive part of a small compile, so amortizing it across batch --check files and
+    // LSP re-analyses is a large win. The cache deliberately survives ResetForReanalysis.
+    //
+    // Per-backend (not process-global): an LSP backend slot is only ever used by one
+    // worker thread at a time, so no locking is needed and walked trees are never shared
+    // across threads.
+    struct CachedParseTree
     {
-        std::string canonicalPath;   // absolute canonical path, used to identify core vs user imports
-        std::unique_ptr<std::ifstream> stream;
+        std::string canonicalPath;                 // absolute canonical path
+        std::filesystem::file_time_type writeTime; // for staleness validation
         std::unique_ptr<antlr4::ANTLRInputStream> input;
         std::unique_ptr<CFlatLexer> lexer;
         std::unique_ptr<antlr4::CommonTokenStream> tokens;
         std::unique_ptr<CFlatParser> parser;
+        CFlatParser::CompilationUnitContext* unit = nullptr;  // owned by `parser`
     };
-    std::vector<ImportedParseState> importedParseStates;
+    // Persistent cache, keyed by canonical path - populated ONLY for implicit core-library
+    // imports (files under runtimeDir/core), whose content is stable for the process. User
+    // imports are deliberately excluded: they change during editing, and bounding the cache
+    // to core keeps staleness handling trivial.
+    std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
+    // Per-compile lifetime anchor for NON-core imported parse trees (generic-template ctx
+    // pointers point into them). Cleared by ResetForReanalysis; parseTreeCache_ is not.
+    std::vector<std::unique_ptr<CachedParseTree>> importedParseStates;
+
+    // Parse `canonicalPath` into a CFlat tree. When `isCore` is true the tree is reused
+    // from / stored in parseTreeCache_ (validated by last-write time); otherwise it is
+    // parsed fresh and owned by importedParseStates for this compile only. Returns nullptr
+    // (and reports diagnostics) on a parse error; a failed parse is never cached.
+    // `displayName` is used in TimeTraceScope/logs.
+    CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName, bool isCore);
     // Synthesized CFlat source (from C function-like macro translation) lives here.
     // The parser ecosystem must outlive instantiation since genericFunctionTemplates
     // stores raw FunctionDefinitionContext pointers into these trees.

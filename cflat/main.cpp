@@ -80,21 +80,42 @@ int main(int argc, char* argv[])
     _get_pgmptr(&pgmptr);
     std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
 
-    // --check: compile every positional source file in its own fresh backend,
-    // emitting no output. One process amortizes the spawn cost across many files
-    // (used by test.bat to batch the err_*.cb negative tests). A failing file does
-    // not abort the batch; the overall exit code is non-zero if any file failed.
+    // --ftime-trace is a top-level switch: initialize the profiler up front so every
+    // code path below (single compile or --check batch) is captured, and write the trace
+    // at the matching exit. The TimeTraceScope annotations inside Compile feed it.
+    bool ftimeTrace = args.hasFlag("ftime-trace");
+    if (ftimeTrace)
+        llvm::timeTraceProfilerInitialize(500, "cflat");
+    auto writeTimeTrace = [&](const std::string& tracePath)
+    {
+        if (!ftimeTrace) return;
+        if (auto err = llvm::timeTraceProfilerWrite(tracePath, ""))
+            llvm::consumeError(std::move(err));
+        else if (showLogo)
+            std::cout << "Time trace written to " << tracePath << "\n";
+        llvm::timeTraceProfilerCleanup();
+    };
+
+    // --check: compile every positional source file for diagnostics only, emitting no
+    // output (used by test.bat to batch the err_*.cb negative tests). A single backend is
+    // reused across files - ResetForReanalysis clears per-file state between them while the
+    // core-library parse cache persists, so runtime.cb and its transitive imports are
+    // parsed once for the whole batch. A failing file does not abort the batch; the overall
+    // exit code is non-zero if any file failed.
     if (args.hasFlag("check"))
     {
+        LLVMBackend compiler;
+        compiler.SetRuntimeDir(runtimeDir);
+        compiler.SetVerbose(args.hasFlag("verbose"));
+        compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
+        compiler.SetBatchMode(true);
+
         int failures = 0;
         for (size_t i = 0; i < args.positionalCount(); ++i)
         {
             std::string file = *args.getPositional(i);
-            LLVMBackend compiler;
-            compiler.SetRuntimeDir(runtimeDir);
-            compiler.SetVerbose(args.hasFlag("verbose"));
-            compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
-            compiler.SetBatchMode(true);
+            if (i > 0)
+                compiler.ResetForReanalysis();  // clear per-file state; keep the core parse cache
             bool fileOk = false;
             try
             {
@@ -114,12 +135,10 @@ int main(int argc, char* argv[])
         }
         if (showLogo)
             std::cout << std::format("Checked {} file(s), {} failed.\n", args.positionalCount(), failures);
+
+        writeTimeTrace("check.time-trace.json");
         return failures == 0 ? 0 : 1;
     }
-
-    bool ftimeTrace = args.hasFlag("ftime-trace");
-    if (ftimeTrace)
-        llvm::timeTraceProfilerInitialize(500, "cflat");
 
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
@@ -127,15 +146,7 @@ int main(int argc, char* argv[])
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
     bool ok = compiler.Compile(args);
 
-    if (ftimeTrace)
-    {
-        auto tracePath = std::filesystem::path(*filename).stem().string() + ".time-trace.json";
-        if (auto err = llvm::timeTraceProfilerWrite(tracePath, ""))
-            llvm::consumeError(std::move(err));
-        else if (showLogo)
-            std::cout << "Time trace written to " << tracePath << "\n";
-        llvm::timeTraceProfilerCleanup();
-    }
+    writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");
 
     if (!ok)
     {

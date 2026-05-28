@@ -481,6 +481,79 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     return true;
 }
 
+LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& canonicalPath, const std::string& displayName, bool isCore)
+{
+    // Reuse a previously parsed core tree when the file on disk is unchanged.
+    if (isCore)
+    {
+        auto it = parseTreeCache_.find(canonicalPath);
+        if (it != parseTreeCache_.end())
+        {
+            std::error_code tec;
+            auto wt = std::filesystem::last_write_time(canonicalPath, tec);
+            if (!tec && wt == it->second->writeTime)
+            {
+                if (verbose) std::cout << "[verbose]   parse cache hit: " << displayName << "\n";
+                return it->second.get();
+            }
+            parseTreeCache_.erase(it);  // stale - re-parse below
+        }
+    }
+
+    auto entry = std::make_unique<CachedParseTree>();
+    entry->canonicalPath = canonicalPath;
+
+    std::ifstream stream(canonicalPath);
+    if (!stream.is_open())
+    {
+        std::cerr << "Error: failed to open imported file '" << canonicalPath << "'.\n";
+        return nullptr;
+    }
+    auto sourceLines = ReadFileToLines(stream);  // also rewinds the stream to the start
+
+    entry->input  = std::make_unique<antlr4::ANTLRInputStream>(stream);
+    entry->lexer  = std::make_unique<CFlatLexer>(entry->input.get());
+    entry->tokens = std::make_unique<antlr4::CommonTokenStream>(entry->lexer.get());
+    entry->parser = std::make_unique<CFlatParser>(entry->tokens.get());
+
+    CFlatErrorListener errorListener(canonicalPath, sourceLines);
+    entry->lexer->removeErrorListeners();
+    entry->lexer->addErrorListener(&errorListener);
+    entry->parser->removeErrorListeners();
+    entry->parser->addErrorListener(&errorListener);
+
+    {
+        llvm::TimeTraceScope parseScope("Parse", displayName);
+        entry->tokens->fill();
+        entry->unit = entry->parser->compilationUnit();
+    }
+    if (verbose) std::cout << "[verbose]   parse complete (" << entry->tokens->getTokens().size() << " tokens)\n";
+
+    if (errorListener.hasErrors())
+    {
+        ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
+        return nullptr;  // never cache a failed parse
+    }
+
+    // errorListener is a stack object about to be destroyed; the parser never parses
+    // again, but drop the now-dangling listener pointers so nothing can dereference them.
+    entry->lexer->removeErrorListeners();
+    entry->parser->removeErrorListeners();
+
+    CachedParseTree* raw = entry.get();
+    if (isCore)
+    {
+        std::error_code tec;
+        entry->writeTime = std::filesystem::last_write_time(canonicalPath, tec);
+        parseTreeCache_[canonicalPath] = std::move(entry);
+    }
+    else
+    {
+        importedParseStates.push_back(std::move(entry));
+    }
+    return raw;
+}
+
 bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
@@ -602,47 +675,32 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
     llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
-    // Persist parse state for the lifetime of the compiler - generic template
-    // ctx pointers from imported files must remain valid when instantiated later
-    // during the main-file walk.
-    ImportedParseState state;
-    state.stream = std::make_unique<std::ifstream>();
-    state.stream->open(canonicalStr);
-    if (!state.stream->is_open())
+    // Implicit core-library imports (files under runtimeDir/core) have stable content for
+    // the process, so their parse trees are cached and reused across compiles and LSP
+    // re-analyses. User imports are parsed fresh and anchored for this compile only.
+    bool isCoreImport = false;
+    if (!runtimeDir.empty())
     {
-        std::cerr << "Error: failed to open imported file '" << canonicalStr << "'.\n";
+        std::error_code cec;
+        auto coreDir = std::filesystem::canonical(std::filesystem::path(runtimeDir) / "core", cec);
+        if (!cec)
+        {
+            auto coreStr = coreDir.string();
+            isCoreImport = canonicalStr.size() > coreStr.size()
+                && canonicalStr.compare(0, coreStr.size(), coreStr) == 0;
+        }
+    }
+
+    // Get-or-parse the tree (cached for core, freshly parsed otherwise). Generic-template
+    // ctx pointers point into this tree; its owner (parseTreeCache_ for core,
+    // importedParseStates for user files) keeps it alive long enough to stay valid.
+    CachedParseTree* tree = GetOrParseFile(canonicalStr, importFilename, isCoreImport);
+    if (!tree)
         return false;
-    }
-    auto importSourceLines = ReadFileToLines(*state.stream);
-    state.input  = std::make_unique<antlr4::ANTLRInputStream>(*state.stream);
-    state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
-    state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
-    state.parser = std::make_unique<CFlatParser>(state.tokens.get());
 
-    CFlatErrorListener importErrorListener(canonicalStr, importSourceLines);
-    state.lexer->removeErrorListeners();
-    state.lexer->addErrorListener(&importErrorListener);
-    state.parser->removeErrorListeners();
-    state.parser->addErrorListener(&importErrorListener);
-
-    CFlatParser::CompilationUnitContext* computeUnit;
-    {
-        llvm::TimeTraceScope parseScope("Parse", importFilename);
-        state.tokens->fill();
-        computeUnit = state.parser->compilationUnit();
-    }
-    if (verbose) std::cout << "[verbose]   parse complete (" << state.tokens->getTokens().size() << " tokens)\n";
-
-    if (importErrorListener.hasErrors())
-    {
-        ReportParseErrors(importErrorListener.getDiagnostics(), importSourceLines);
-        return false;
-    }
-
-    auto* parserPtr = state.parser.get();
-    auto* tokensPtr = state.tokens.get();
-    state.canonicalPath = canonicalStr;
-    importedParseStates.push_back(std::move(state));
+    auto* computeUnit = tree->unit;
+    auto* parserPtr   = tree->parser.get();
+    auto* tokensPtr   = tree->tokens.get();
 
     // Recursively process nested imports before scanning this file's declarations
     if (auto* tu = computeUnit->translationUnit())
@@ -1044,6 +1102,20 @@ void LLVMBackend::ResetForReanalysis()
     autoVaListAlloca = nullptr;
     returnCapture = std::nullopt;
     autoReturnCapture = std::nullopt;
+
+    // Transient per-call / per-expression result state. These are normally produced and
+    // consumed within a single statement, but an aborted compile (e.g. an expect_error that
+    // fires mid-assignment, before the bond flag is consumed) can leave them set. Clearing
+    // them here prevents stale state from leaking into the next file's analysis - notably a
+    // stale lastCallIsBonded would raise a spurious bond error on the next assignment.
+    lastCallReturnType = TypeAndValue{};
+    lastCallReturnsOwned = false;
+    lastOwningResult = false;
+    currentFunctionReturnsOwned = false;
+    lastCallIsBonded = false;
+    lastCallBondedSources.clear();
+    lastCallRequiredLocks.clear();
+    lastCallParameterNames.clear();
 
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
     // on the next Analyze() call.

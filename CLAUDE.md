@@ -108,7 +108,7 @@ x64/Debug/cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-d
 - `-i / --import-dir`: Directory to search for imported modules
 - `-p / --platform`: Target platform - `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
-- `--check`: Check one or more source files for errors without emitting any output. Treats *every* positional as an independent `.cb` source, compiling each in its own fresh backend (no `-o`/`--out-lli`/`--bitcode`, no linking). A failing file does not abort the batch; the process exit code is non-zero if any file failed. Used by `test_err.bat` to batch the `err_*.cb` negative tests into one process and amortize the per-process spawn cost.
+- `--check`: Check one or more source files for errors without emitting any output. Treats *every* positional as an independent `.cb` source (no `-o`/`--out-lli`/`--bitcode`, no linking). A single backend is reused across the files - `ResetForReanalysis` clears per-file state between them while the core-library parse cache persists, so `runtime.cb` and its transitive core imports are parsed once for the whole batch. A failing file does not abort the batch; the process exit code is non-zero if any file failed. Used by `test_err.bat` to batch the `err_*.cb` negative tests into one process (amortizes both process-spawn and standard-library parsing).
 - `--c-include <dir>`: Header search dir for C library bindings (repeatable)
 - `--c-lib <path>`: Prebuilt C import library (.lib) to link (repeatable)
 - `--c-define <NAME[=val]>`: Preprocessor define passed to all clang-cl C compiles/dumps (repeatable)
@@ -270,6 +270,7 @@ Both passes share `ParseDeclarationSpecifiers()` - any change to type parsing mu
 - `returnBlockTable`: Inlined return-block function bodies
 - `builder / module / context`: LLVM IR generation state
 - `diBuilder`: DWARF debug info builder (active with `-g`)
+- `parseTreeCache_`: timestamp-validated cache of parsed ANTLR trees for **implicit core-library imports only** (files under `runtimeDir/core`). Reused across compiles and LSP re-analyses since core content is stable; deliberately **not** cleared by `ResetForReanalysis` (parsing the stdlib closure dominates a small compile, so amortizing it is the big win for `--check` batches and LSP responsiveness). User imports are parsed fresh into `importedParseStates` (per-compile, cleared on reset). `ResetForReanalysis` must clear *all* transient per-call state (e.g. `lastCallIsBonded`) or a value left set by an aborted compile leaks into the next file's analysis.
 
 `NamedVariable` has an `IsOwning` flag; `TypeAndValue` has an `IsMove` flag - both drive the ownership/lifetime system.
 
