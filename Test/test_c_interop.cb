@@ -42,6 +42,11 @@ extern int c_square(int x);
 extern void printf(const char* fmt, ...);
 extern int  strcmp(const char* a, const char* b);
 
+// CFlat function used as a callback into the C library through the function-pointer
+// typedef ML_BinaryOp (declared in mathlib.h as `typedef int (*ML_BinaryOp)(int,int)`).
+int my_add_cb(int a, int b) { return a + b; }
+int my_sub_cb(int a, int b) { return a - b; }
+
 extern int main()
 {
     // ---- Section A: auto-extern of .c source ---------------------------------
@@ -223,6 +228,13 @@ extern int main()
     // typedef-as-type would resolve to int via the enum-strip path.
     if (ML_LOW_PRI != 10)                                return 139;
     if (ML_HIGH_PRI != 20)                               return 140;
+
+    // Function-pointer typedef: ML_BinaryOp = `int (*)(int,int)`. clang's
+    // qualType for the typedef is "int (*)(int, int)"; CollectCTypedefs stores
+    // that spelling, MapCTypeToTypeAndValue's ParseCFunctionPointerSpelling
+    // turns it into a CFlat IsFunctionPointer TypeAndValue.
+    if (ml_apply(my_add_cb, 10, 32) != 42)               return 141;
+    if (ml_apply(my_sub_cb, 50,  8) != 42)               return 142;
 
     // ---- Section J: function-like macro translation -------------------------
     // Each accepted macro from c_macro_helpers.h is translated into an `auto`

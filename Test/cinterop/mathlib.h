@@ -95,4 +95,16 @@ enum Extra
 #define ML_EXTRA_MACRO 77
 #endif
 
+/* Function-pointer typedef - the comparator-style callback shape used by qsort,
+ * libcurl's CURLOPT_WRITEFUNCTION, etc. clang spells the qualType as
+ *   "int (*)(int, int)"
+ * which the MapCTypeToTypeAndValue path detects via the "(*)" token and parses
+ * into a CFlat function<int(int,int)> TypeAndValue. */
+typedef int (*ML_BinaryOp)(int a, int b);
+
+/* Function-pointer-typed parameter and return - exercises the typedef name being
+ * used in C function signatures (not just as a top-level typedef). */
+int         ml_apply(ML_BinaryOp op, int a, int b);
+ML_BinaryOp ml_pick_op(int which);
+
 #endif /* MATHLIB_H */

@@ -1888,9 +1888,114 @@ private:
         return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited);
     }
 
+    // Recognises clang's spelling for a bare function-pointer type:
+    //   "int (*)(const char *, int)"   ->   IsFunctionPointer with return=int, params=[char*, int]
+    // The leading return type is whatever appears before the literal "(*)" token; the
+    // parenthesised argument list follows. Nested function-pointer arguments are rejected
+    // (depth-counted top-level commas only) - matches the >2 pointer-levels limit.
+    bool ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
+                                       std::unordered_set<std::string>& visited)
+    {
+        // Locate "(*)" possibly with whitespace around the star.
+        size_t markerPos = std::string::npos;
+        for (size_t i = 0; i + 2 < s.size(); ++i)
+        {
+            if (s[i] != '(') continue;
+            size_t j = i + 1;
+            while (j < s.size() && std::isspace((unsigned char)s[j])) ++j;
+            if (j >= s.size() || s[j] != '*') continue;
+            ++j;
+            while (j < s.size() && std::isspace((unsigned char)s[j])) ++j;
+            if (j < s.size() && s[j] == ')') { markerPos = i; break; }
+        }
+        if (markerPos == std::string::npos) return false;
+
+        std::string retSpelling = s.substr(0, markerPos);
+        while (!retSpelling.empty() && std::isspace((unsigned char)retSpelling.back()))
+            retSpelling.pop_back();
+
+        // After "(*)" the next non-space char must be '('.
+        size_t after = s.find(')', markerPos) + 1;
+        while (after < s.size() && std::isspace((unsigned char)s[after])) ++after;
+        if (after >= s.size() || s[after] != '(') return false;
+        size_t argOpen = after;
+        size_t argClose = std::string::npos;
+        int depth = 0;
+        for (size_t i = argOpen; i < s.size(); ++i)
+        {
+            if (s[i] == '(') ++depth;
+            else if (s[i] == ')') { --depth; if (depth == 0) { argClose = i; break; } }
+        }
+        if (argClose == std::string::npos) return false;
+
+        std::string argList = s.substr(argOpen + 1, argClose - argOpen - 1);
+
+        // Resolve the return type via the same recursive resolver.
+        TypeAndValue retTV;
+        if (!MapCTypeToTypeAndValueImpl(retSpelling, retTV, visited)) return false;
+        // Function pointers returning function pointers are not supported here.
+        if (retTV.IsFunctionPointer) return false;
+
+        out = TypeAndValue();
+        out.IsFunctionPointer = true;
+        out.FuncPtrReturnTypeName = retTV.TypeName;
+        out.FuncPtrReturnPointer = retTV.Pointer;
+
+        // Split argList on top-level commas. Bail on nested fn-ptr arg or variadic.
+        if (argList.find("...") != std::string::npos) return false;
+
+        auto trim = [](std::string v) {
+            size_t a = 0; while (a < v.size() && std::isspace((unsigned char)v[a])) ++a;
+            size_t b = v.size(); while (b > a && std::isspace((unsigned char)v[b-1])) --b;
+            return v.substr(a, b - a);
+        };
+
+        // Empty arg list or "void" -> zero params.
+        std::string normArgs = trim(argList);
+        if (normArgs.empty() || normArgs == "void")
+            return true;
+
+        std::vector<std::string> parts;
+        {
+            int d = 0;
+            std::string cur;
+            for (char c : argList)
+            {
+                if (c == '(') { ++d; cur += c; }
+                else if (c == ')') { --d; cur += c; }
+                else if (c == ',' && d == 0) { parts.push_back(cur); cur.clear(); }
+                else cur += c;
+            }
+            if (!cur.empty()) parts.push_back(cur);
+        }
+        for (auto& p : parts)
+        {
+            TypeAndValue ptv;
+            if (!MapCTypeToTypeAndValueImpl(trim(p), ptv, visited)) return false;
+            if (ptv.IsFunctionPointer) return false; // nested fn-ptr arg not supported
+            TypeAndValue::FuncPtrParam fp;
+            fp.TypeName = ptv.TypeName;
+            fp.Pointer = ptv.Pointer;
+            out.FuncPtrParams.push_back(fp);
+        }
+        return true;
+    }
+
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited)
     {
+        // Detect function-pointer spelling before the generic '*'-strip path mangles it.
+        // clang spells these as "R (*)(args)" - the "(*)" token disambiguates from a
+        // function declaration (which would have a name between the parens).
+        if (ctype.find("(*)") != std::string::npos)
+        {
+            if (ParseCFunctionPointerSpelling(ctype, out, visited))
+                return true;
+            // Fall through only if the parse failed - lets unknown shapes hit the normal
+            // "return false" path below instead of being silently accepted.
+            return false;
+        }
+
         // Arrays decay to a pointer; drop the '[...]' and bump the pointer level.
         int ptr = 0;
         if (auto br = ctype.find('['); br != std::string::npos)
