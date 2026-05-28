@@ -146,6 +146,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (auto p = args.getOption("vcpkg-exe"))      vcpkg_.SetExeOverride(*p);
     if (auto p = args.getOption("vcpkg-manifest")) vcpkg_.SetManifestOverride(*p);
     if (auto p = args.getOption("vcpkg-triplet"))  vcpkg_.SetTripletOverride(*p);
+    vcpkg_.SetNoInstall(args.hasFlag("vcpkg-no-install"));
 
     if (verbose)
     {
@@ -290,7 +291,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         {
                             std::string portSpec = DequoteFromClause(imp);
                             if (verbose) std::cout << "[verbose] vcpkg import: " << importFilename << " from " << portSpec << "\n";
-                            if (!CompileVcpkgImport(filename, importFilename, portSpec))
+                            if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec))
                                 return false;
                             continue;
                         }
@@ -1004,7 +1005,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (IsPackageVcpkgImport(imp))
                     {
                         std::string portSpec = DequoteFromClause(imp);
-                        if (!CompileVcpkgImport(filePath, importFilename, portSpec))
+                        if (!CompileVcpkgImport(RootVcpkgImportPath(filePath), importFilename, portSpec))
                             return false;
                         continue;
                     }

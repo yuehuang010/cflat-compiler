@@ -9515,6 +9515,22 @@ public:
     void SetVcpkgManifest(const std::string& path)   { vcpkg_.SetManifestOverride(path); }
     void SetVcpkgTriplet(const std::string& triplet) { vcpkg_.SetTripletOverride(triplet); }
 
+    // Manifest-walk origin for a `import package-vcpkg` on the ROOT file under compilation.
+    // In LSP mode the analyzed file is a temp copy in %TEMP% (see LspServer's
+    // RunAnalysisOnSlot), so walking up from it would never find the project's vcpkg.json;
+    // sourceFileDir_ carries the file's real on-disk directory and is used as the origin.
+    // In CLI mode sourceFileDir_ is empty and the real analyzed path is returned unchanged.
+    // Only for the root file - transitive .cb imports pass their own real path and must keep
+    // walking from there (nearest vcpkg.json wins). The returned path is synthetic (only its
+    // parent directory is consulted by the resolver), so the basename is irrelevant.
+    std::string RootVcpkgImportPath(const std::string& analyzedPath) const
+    {
+        if (sourceFileDir_.empty())
+            return analyzedPath;
+        return (std::filesystem::path(sourceFileDir_) /
+                std::filesystem::path(analyzedPath).filename()).string();
+    }
+
     // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port
     // through the user-owned vcpkg.json, pushes the resulting include dir / libs / DLLs
     // into the per-backend accumulators, then routes the header through CompileCHeader
@@ -9567,6 +9583,37 @@ public:
         auto headerCanon = std::filesystem::canonical(headerAbs, ec);
         if (ec)
         {
+            // In LSP mode `vcpkg install` is skipped (RunVcpkgInstall is a no-op), so if the
+            // package has not been built yet the whole vcpkg_installed/<triplet>/include tree
+            // is absent. Flagging the import line then would put a spurious error on a file
+            // that compiles cleanly once the user runs a build. Degrade to a silent skip: the
+            // C symbols just stay unindexed until the package is installed. The CLI build
+            // (which actually ran the install) still reports the precise error. A header
+            // missing *under an existing* include dir is a real mistake (typo / wrong port)
+            // and is surfaced even in LSP mode.
+            const bool lspMode = symbolSink_ != nullptr;
+            std::error_code dirEc;
+            const bool includeDirPresent =
+                !res.includeDir.empty() && std::filesystem::exists(res.includeDir, dirEc);
+            if (lspMode && !includeDirPresent)
+            {
+                if (verbose)
+                    std::cout << "[verbose] vcpkg: package not installed (no '" << res.includeDir
+                              << "'); skipping header '" << header << "' for LSP analysis\n";
+                return true;
+            }
+            // CLI: a missing header is a hard error. If `vcpkg install` was suppressed
+            // (--vcpkg-no-install) and the include tree is absent, say so precisely instead
+            // of the generic "install is incomplete" hint.
+            if (vcpkg_.InstallSuppressed() && !includeDirPresent)
+            {
+                LogError(std::format(
+                    "import package-vcpkg: port for header '{}' is not installed (no '{}'), "
+                    "and 'vcpkg install' is disabled (--vcpkg-no-install).\n"
+                    "  Run 'vcpkg install' yourself, or drop --vcpkg-no-install to let cflat install it.",
+                    header, res.includeDir));
+                return false;
+            }
             LogError(std::format(
                 "import package-vcpkg: header '{}' not found under '{}'.\n"
                 "  The port may not own this header, or the install is incomplete.",

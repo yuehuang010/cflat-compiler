@@ -53,6 +53,7 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-exe", 0, "Explicit path to vcpkg.exe (overrides VS-bundled / VCPKG_ROOT / PATH discovery)");
     args.addOption("vcpkg-manifest", 0, "Explicit vcpkg.json path (skips upward walk from the source file)");
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
+    args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
 
     if (!args.parse(argc, argv))
         return 1;

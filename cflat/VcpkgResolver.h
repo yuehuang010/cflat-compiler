@@ -45,6 +45,11 @@ public:
     void SetPlatform(const std::string& p)            { platform_ = p; }   // "win64" / "win32"
     void SetVerbose(bool v)                           { verbose_ = v; }
     void SetLspMode(bool v)                           { lspMode_ = v; }
+    void SetNoInstall(bool v)                         { noInstall_ = v; } // skip `vcpkg install`
+
+    // True when `vcpkg install` is suppressed (LSP mode or --vcpkg-no-install). Lets the
+    // caller phrase a more accurate "package not installed" diagnostic.
+    bool InstallSuppressed() const { return lspMode_ || noInstall_; }
 
     // Validate that 'portSpec' (e.g. "curl" or "curl[ssl]") is declared in the manifest.
     // On success, populates 'out' with the include dir / libs / dlls for the resolved
@@ -293,11 +298,14 @@ private:
     bool RunVcpkgInstall(const std::string& triplet, std::string& errorMsg)
     {
         // LSP must never block on a network/build subprocess. The first non-LSP compile
-        // populates vcpkg_installed/; LSP queries piggy-back on that state.
-        if (lspMode_)
+        // populates vcpkg_installed/; LSP queries piggy-back on that state. `--vcpkg-no-install`
+        // opts a CLI build into the same skip: it consumes an already-installed tree and lets
+        // the downstream header-resolution check error out if the package is missing.
+        if (lspMode_ || noInstall_)
         {
             if (verbose_)
-                std::cout << "[verbose] vcpkg: LSP mode, skipping `vcpkg install`\n";
+                std::cout << "[verbose] vcpkg: skipping `vcpkg install` ("
+                          << (lspMode_ ? "LSP mode" : "--vcpkg-no-install") << ")\n";
             return true;
         }
 
@@ -395,6 +403,7 @@ private:
     std::string platform_ = "win64";
     bool verbose_ = false;
     bool lspMode_ = false;
+    bool noInstall_ = false;
 
     bool manifestResolved_ = false;
     std::filesystem::path manifestPath_;

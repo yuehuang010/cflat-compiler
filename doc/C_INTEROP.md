@@ -158,8 +158,9 @@ How it resolves:
 - **Manifest discovery.** The compiler walks up from the source file's directory until it finds a `vcpkg.json`. The walk stops at a `.git` directory so it cannot escape the project root. If none is found, the compiler errors with a `vcpkg new --application` hint.
 - **Port validation.** Every `from "<port>"` must appear in the manifest's `dependencies`. A missing port produces a copy-pasteable `vcpkg add port <name>` command and aborts the build - the manifest stays authored by the user, not synthesized by the compiler.
 - **vcpkg.exe discovery.** Order: `--vcpkg-exe`, `VCPKG_ROOT`, the VS-bundled `<VS>\VC\vcpkg\vcpkg.exe` (located via `vswhere`), then `vcpkg.exe` on `PATH`.
-- **Install + resolution.** `vcpkg install --triplet <triplet>` runs in the manifest directory; the include dir, every `.lib` under `vcpkg_installed/<triplet>/lib`, and every `.dll` under `<triplet>/bin` belonging to the port closure are wired into clang-cl and `lld-link`. The DLLs are copied next to the produced `.exe` from the authoritative vcpkg list (deduped against the legacy `--c-lib` sibling-DLL probe).
-- **LSP mode.** The `vcpkg install` subprocess is gated off when the compiler is running as the language server, so keystroke-driven analyses never spawn vcpkg.
+- **Install + resolution.** `vcpkg install --triplet <triplet>` runs in the manifest directory; the include dir, every `.lib` under `vcpkg_installed/<triplet>/lib`, and every `.dll` under `<triplet>/bin` belonging to the port closure are wired into clang-cl and `lld-link`. The DLLs are copied next to the produced `.exe` from the authoritative vcpkg list (deduped against the legacy `--c-lib` sibling-DLL probe). The install is watermark-gated (re-runs only when `vcpkg.json` is newer than `vcpkg_installed/vcpkg/status`), so incremental builds don't re-spawn vcpkg.
+- **Skipping the install.** `--vcpkg-no-install` suppresses the `vcpkg install` spawn for a CLI build: cflat consumes an already-populated `vcpkg_installed/<triplet>/` tree and **errors out** if the port isn't present (useful for offline / locked-down or CI builds where packages are pre-provisioned). This is the same skip the LSP always applies, but in CLI mode a missing package is a hard error rather than a silent skip.
+- **LSP mode.** The `vcpkg install` subprocess is gated off when the compiler is running as the language server, so keystroke-driven analyses never spawn vcpkg. A package that isn't installed yet is skipped silently (no error diagnostic) - the symbols simply stay unindexed until a CLI build populates the tree.
 
 The triplet defaults from `--platform` (`x64` -> `x64-windows`, `x86` -> `x86-windows`) and can be overridden:
 
@@ -168,5 +169,6 @@ The triplet defaults from `--platform` (`x64` -> `x64-windows`, `x86` -> `x86-wi
 | `--vcpkg-exe <path>` | Explicit `vcpkg.exe`; bypasses VS-bundled / `VCPKG_ROOT` / `PATH` discovery |
 | `--vcpkg-manifest <path>` | Explicit `vcpkg.json`; skips the upward walk |
 | `--vcpkg-triplet <triplet>` | Override the platform-derived default (e.g. `x64-windows-static`) |
+| `--vcpkg-no-install` | Do not run `vcpkg install`; consume the existing `vcpkg_installed/` tree and error out if a port is missing |
 
 > `import package-vcpkg` and `import package` push into the same internal accumulators - you can mix a vcpkg-resolved port with a hand-pathed `--c-lib` in the same build. Defines from a vcpkg port's documented usage are applied automatically; add extra ones with `--c-define`.
