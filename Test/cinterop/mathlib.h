@@ -58,7 +58,7 @@ enum Extra
 #endif
 
 /* Object-like #define macros - extracted as bare global int/i64 constants
- * via the enum-stub resolution pass in ExtractCHeaderMacros. Mirrors how
+ * via the probe-stub resolution pass in ResolveCHeaderMacroValues. Mirrors how
  * libcurl ships CURL_* flags as macros rather than enum constants. */
 #define ML_PI_X100        314          /* decimal int */
 #define ML_MAX_NODES      0x1000       /* hex literal -> 4096 */

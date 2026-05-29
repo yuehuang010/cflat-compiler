@@ -174,7 +174,7 @@ extern int main()
 
     // ---- Section I: object-like #define macro extraction ---------------------
     // Decimal, hex, parenthesized negative, and folded expression all resolve
-    // via the enum-stub Pass B in ExtractCHeaderMacros.
+    // via the probe-stub value fold in ResolveCHeaderMacroValues.
     if (ML_PI_X100 != 314)              return 90;
     if (ML_MAX_NODES != 4096)           return 91;   // 0x1000
     if (ML_NEG_OFFSET != -5)            return 92;

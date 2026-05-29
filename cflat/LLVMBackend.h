@@ -811,6 +811,14 @@ private:
         int line = 1;
         int col = 0;
     };
+    // An object-like macro name discovered during the header parse, awaiting value resolution
+    // (the resolve pass folds each name's integer / float / string / pointer value).
+    struct CMacroNameCand
+    {
+        std::string name;
+        std::string file;
+        int line = 1;
+    };
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
@@ -825,11 +833,6 @@ private:
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
     // same header under different --c-include roots does not collide.
     static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;
-    // Serializes clang-cl subprocess spawns. The LSP analyzes on a pool of worker
-    // threads; concurrent llvm::sys::ExecuteAndWait calls (CreateProcess with
-    // handle-inheriting redirects) race and crash the process on Windows. Spawns are
-    // rare (cache absorbs the rest), so a process-wide lock costs effectively nothing.
-    static inline std::mutex cClangSpawnMutex_;
     int lambdaCounter = 0;
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
@@ -2249,59 +2252,6 @@ private:
             std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
     }
 
-    // Spawn a clang-cl subprocess (argStrs[0] is the clang path) and capture stdout as a
-    // string, regardless of exit code. Used for the macro-discovery preprocess pass (clang
-    // -E -dD), whose output is still useful even when a header emits warnings. All three std
-    // streams are redirected to temp files (stdin from an empty temp) so a spawned child never
-    // references the LSP server's JSON-RPC pipes - leaving a redirect inherited
-    // (STARTF_USESTDHANDLES) breaks the protocol channel and kills the server. The spawn is
-    // serialized because concurrent CreateProcess-with-redirects calls race on Windows and
-    // crash the LSP worker pool.
-    bool SpawnClangCapture(const std::vector<std::string>& argStrs, std::string& outStdout)
-    {
-        llvm::SmallString<256> inFile, outFile, errFile;
-        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "in",  inFile))  return false;
-        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "out", outFile))
-        {
-            llvm::sys::fs::remove(inFile);
-            return false;
-        }
-        if (llvm::sys::fs::createTemporaryFile("cflat_cap", "err", errFile))
-        {
-            llvm::sys::fs::remove(inFile);
-            llvm::sys::fs::remove(outFile);
-            return false;
-        }
-        const std::string inPath  = inFile.str().str();
-        const std::string outPath = outFile.str().str();
-        const std::string errPath = errFile.str().str();
-        struct TmpRemover {
-            std::string a, b, c;
-            ~TmpRemover() { llvm::sys::fs::remove(a); llvm::sys::fs::remove(b); llvm::sys::fs::remove(c); }
-        } tmpRemover{ inPath, outPath, errPath };
-
-        std::vector<llvm::StringRef> args;
-        for (auto& s : argStrs) args.push_back(s);
-
-        std::optional<llvm::StringRef> redirects[3] = {
-            llvm::StringRef(inPath), llvm::StringRef(outPath), llvm::StringRef(errPath)
-        };
-
-        std::string execErr;
-        {
-            // The clang-cl subprocess itself, timed separately from the cflat-side scan.
-            llvm::TimeTraceScope spawnScope("ClangSpawn");
-            std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
-            (void)llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
-        }
-        // Intentionally ignore rc - the caller wants whatever clang managed to produce.
-
-        auto bufOrErr = llvm::MemoryBuffer::getFile(outPath);
-        if (!bufOrErr) return false;
-        outStdout = (*bufOrErr)->getBuffer().str();
-        return true;
-    }
-
     // ---- libclang in-process AST traversal -------------------------------------------
     // C interop binds against C headers / sources by walking clang's AST. Rather than
     // spawning clang-cl to print a (huge) -ast-dump=json blob and parsing it back, we
@@ -2937,7 +2887,7 @@ private:
             std::cout << "[verbose]   registered " << ours.size() << " C record(s) from " << fileForLsp << "\n";
     }
 
-    // Register object-like C macros (as resolved by ExtractCHeaderMacros) as bare global int
+    // Register object-like C macros (as resolved by ResolveCHeaderMacroValues) as bare global int
     // constants - same flat-scope rule as RegisterCEnums so the user writes CURLOPT_URL, not
     // qualified. First-writer-wins against an existing global. The LSP location points at the
     // original #define in the real header, not the synthesized resolution stub.
@@ -3214,231 +3164,29 @@ private:
             pendingMacroSources_.push_back({ fileForLsp + "@cmacros", std::move(generated) });
     }
 
-    // Discover object-like macros contributed by a bound C header and resolve their integer
-    // values. Two clang spawns:
-    //   Pass A (-E -dD): preprocessed text with #define directives preserved and `# line "file"`
-    //     markers; we walk the lines, track the current header file, and collect every
-    //     #define NAME <replacement> whose source file is in scope. Function-like macros
-    //     (#define NAME(args) ...) and empty replacements are skipped.
-    //   Pass B (-ast-dump=json on a synthesized stub): for each candidate, emit an anonymous
-    //     enum { __cflat_m_NAME = (long long)(NAME) }. Per-macro isolation means a bad apple
-    //     (non-constant, string, or compound-literal macro) only invalidates its own enum;
-    //     the others still appear as EnumConstantDecls in the AST and get harvested.
-    // String/float macros and ones whose value clang cannot fold to a constant integer are
-    // dropped silently (verbose log emits a count). Caller passes the same -I/-D args used
-    // for the main header extraction so resolution sees the same view of the header.
-    bool ExtractCHeaderMacros(const std::string& clangPath, const std::string& headerPath,
-                              const std::vector<std::string>& extraDefines,
-                              std::vector<CMacroEntry>& outMacros,
-                              std::vector<CFunctionMacroEntry>& outFuncMacros)
+    // Resolve the integer / float / string / pointer value of each object-like macro name that
+    // RunClangHeaderExtract discovered. A synthesized stub probes every candidate; clang's
+    // per-decl error recovery (-ferror-limit=0) lets one bad-apple probe fail without poisoning
+    // its neighbors. String / float macros and ones clang cannot fold to a constant are dropped
+    // silently (verbose log emits a count). Caller passes the same -I/-D args used for the main
+    // header extraction so resolution sees the same view of the header. No clang-cl involved.
+    bool ResolveCHeaderMacroValues(const std::string& headerPath,
+                                   const std::vector<CMacroNameCand>& candidates,
+                                   const std::vector<std::string>& extraDefines,
+                                   std::vector<CMacroEntry>& outMacros)
     {
-        const std::string target = (platformValue == 32)
-            ? "--target=i686-pc-windows-msvc"
-            : "--target=x86_64-pc-windows-msvc";
+        if (candidates.empty()) return true;
 
         const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
 
         std::string fwdHeader = headerPath;
         std::replace(fwdHeader.begin(), fwdHeader.end(), '\\', '/');
 
-        auto norm = [](std::string p) {
-            std::replace(p.begin(), p.end(), '\\', '/');
-            std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            return p;
-        };
-        std::vector<std::string> scopeRoots;
-        scopeRoots.push_back(norm(hdrDir));
-        for (const auto& inc : cIncludeDirs_) scopeRoots.push_back(norm(inc));
-        auto inScope = [&](const std::string& file) -> bool {
-            if (file.empty()) return false;
-            std::string nf = norm(file);
-            for (const auto& r : scopeRoots)
-                if (!r.empty() && nf.rfind(r, 0) == 0) return true;
-            return false;
-        };
-
-        // --- Pass A: -dD discovery ---
-        struct MacroCand { std::string name; std::string file; int line; };
-        std::vector<MacroCand> candidates;
-        std::unordered_map<std::string, size_t> byName; // name -> index in candidates (dedupe; last #define wins, matching C)
-        std::vector<CFunctionMacroEntry> funcCandidates;
-        std::unordered_map<std::string, size_t> funcByName; // dedupe for function-like macros
-
-        {
-            llvm::SmallString<256> stubFile;
-            if (llvm::sys::fs::createTemporaryFile("cflat_mhdr", "c", stubFile)) return false;
-            const std::string stubPath = stubFile.str().str();
-            struct StubRemover { std::string p; ~StubRemover() { llvm::sys::fs::remove(p); } } stubRemover{ stubPath };
-            {
-                std::error_code ec;
-                llvm::raw_fd_ostream os(stubPath, ec, llvm::sys::fs::OF_Text);
-                if (ec) return false;
-                os << "#include \"" << fwdHeader << "\"\n";
-                os.close();
-            }
-
-            // clang-cl silently drops the bare driver flag `-dD`; passing it through to cc1
-            // via -Xclang is the only form that actually preserves #define directives.
-            std::vector<std::string> argStrs = {
-                clangPath, "/nologo", target, "-E", "-Xclang", "-dD"
-            };
-            argStrs.push_back("-I" + hdrDir);
-            for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
-            for (const auto& def : cDefines_)     argStrs.push_back("/D" + def);
-            for (const auto& def : extraDefines)  argStrs.push_back("/D" + def);
-            argStrs.push_back(stubPath);
-
-            if (verbose)
-                std::cout << "[verbose] discovering C macros: " << headerPath << " (clang -E -dD)\n";
-
-            std::string preText;
-            if (!SpawnClangCapture(argStrs, preText)) return false;
-
-            // cflat-side scan of clang's -dD preprocessor output for #define directives.
-            llvm::TimeTraceScope scanScope("ScanMacroDirectives", headerPath);
-            std::string curFile;
-            int curLine = 0;
-            std::string line;
-            line.reserve(256);
-            for (size_t i = 0; i <= preText.size(); ++i)
-            {
-                char ch = (i < preText.size()) ? preText[i] : '\n';
-                if (ch != '\n') { line.push_back(ch); continue; }
-
-                if (!line.empty() && line[0] == '#')
-                {
-                    // Line marker: `# <num> "<file>" [flags]`. Parse the number and the
-                    // double-quoted file name; ignore everything else.
-                    size_t p = 1;
-                    while (p < line.size() && line[p] == ' ') ++p;
-                    if (p < line.size() && std::isdigit((unsigned char)line[p]))
-                    {
-                        int parsed = 0;
-                        while (p < line.size() && std::isdigit((unsigned char)line[p]))
-                        { parsed = parsed * 10 + (line[p] - '0'); ++p; }
-                        while (p < line.size() && line[p] == ' ') ++p;
-                        if (p < line.size() && line[p] == '"')
-                        {
-                            size_t q = ++p;
-                            while (q < line.size() && line[q] != '"') ++q;
-                            curFile = line.substr(p, q - p);
-                            // Un-escape \\ -> \ (clang quotes Windows paths with escaped backslashes).
-                            std::string unescaped;
-                            unescaped.reserve(curFile.size());
-                            for (size_t k = 0; k < curFile.size(); ++k)
-                            {
-                                if (curFile[k] == '\\' && k + 1 < curFile.size() && curFile[k + 1] == '\\')
-                                { unescaped.push_back('\\'); ++k; }
-                                else unescaped.push_back(curFile[k]);
-                            }
-                            curFile = std::move(unescaped);
-                            curLine = parsed;
-                        }
-                    }
-                    else if (line.rfind("#define ", 0) == 0)
-                    {
-                        // #define NAME[(args)] [replacement]
-                        size_t p2 = 8; // past "#define "
-                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
-                        size_t nameStart = p2;
-                        while (p2 < line.size() &&
-                               (std::isalnum((unsigned char)line[p2]) || line[p2] == '_'))
-                            ++p2;
-                        if (p2 > nameStart && p2 < line.size())
-                        {
-                            std::string name = line.substr(nameStart, p2 - nameStart);
-                            // Function-like macro: name immediately followed by '(' (no space).
-                            if (line[p2] == '(')
-                            {
-                                if (!inScope(curFile) || name.rfind("__", 0) == 0) { /* drop */ }
-                                else
-                                {
-                                    // Parse comma-separated param list until matching ')'. Variadic
-                                    // (`...`) or empty-name params disqualify the macro.
-                                    ++p2; // past '('
-                                    std::vector<std::string> params;
-                                    bool ok = true;
-                                    while (p2 < line.size() && line[p2] != ')')
-                                    {
-                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
-                                        size_t s = p2;
-                                        while (p2 < line.size() &&
-                                               (std::isalnum((unsigned char)line[p2]) || line[p2] == '_'))
-                                            ++p2;
-                                        if (p2 == s) { ok = false; break; } // empty/variadic
-                                        params.push_back(line.substr(s, p2 - s));
-                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
-                                        if (p2 < line.size() && line[p2] == ',') ++p2;
-                                        else break;
-                                    }
-                                    if (ok && p2 < line.size() && line[p2] == ')')
-                                    {
-                                        ++p2;
-                                        while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
-                                        std::string body = (p2 < line.size()) ? line.substr(p2) : "";
-                                        // Body-less macros (no replacement text) are useless to translate.
-                                        if (!body.empty())
-                                        {
-                                            auto it = funcByName.find(name);
-                                            if (it == funcByName.end())
-                                            {
-                                                funcByName[name] = funcCandidates.size();
-                                                funcCandidates.push_back({ name, std::move(params), std::move(body), curFile, curLine, 0 });
-                                            }
-                                            else
-                                            {
-                                                // Redefined - keep latest definition.
-                                                funcCandidates[it->second].params = std::move(params);
-                                                funcCandidates[it->second].body   = std::move(body);
-                                                funcCandidates[it->second].file   = curFile;
-                                                funcCandidates[it->second].line   = curLine;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            else
-                            {
-                                while (p2 < line.size() && (line[p2] == ' ' || line[p2] == '\t')) ++p2;
-                                if (p2 < line.size() && inScope(curFile) && name.rfind("__", 0) != 0)
-                                {
-                                    auto it = byName.find(name);
-                                    if (it == byName.end())
-                                    {
-                                        byName[name] = candidates.size();
-                                        candidates.push_back({ name, curFile, curLine });
-                                    }
-                                    else
-                                    {
-                                        // Redefined - keep latest location.
-                                        candidates[it->second].file = curFile;
-                                        candidates[it->second].line = curLine;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Other directives (#pragma, #undef, etc.) ignored.
-                }
-                else
-                {
-                    // Plain source line - advances the line counter within curFile.
-                    ++curLine;
-                }
-                line.clear();
-            }
-        }
-
-        // Function-like macros need no AST resolution; emit them now so an early return
-        // from the object-like Pass B does not drop them.
-        outFuncMacros = funcCandidates;
-
-        if (candidates.empty()) return true;
-
-        // --- Pass B: in-process resolution. One anonymous enum per macro folds its integer
-        //     value; a __typeof__ var recovers the macro's natural type; double / string
-        //     probes carry float and string-literal macros. clang's per-decl error recovery
-        //     (-ferror-limit=0) lets one bad-apple probe fail without poisoning its neighbors. ---
+        // In-process resolution: a synthesized stub probes every candidate macro. For each, a
+        //   const long long folds the integer value (not an enum - a C enumerator past INT_MAX
+        //   is truncated); a __typeof__ var recovers the natural type; a double and a const char*
+        //   probe carry float and string-literal macros. clang's per-decl error recovery
+        //   (-ferror-limit=0) lets one bad-apple probe fail without poisoning its neighbors.
         std::string stub = "#include \"" + fwdHeader + "\"\n";
         for (const auto& m : candidates)
         {
@@ -3633,18 +3381,86 @@ private:
         return true;
     }
 
-    // Spawn clang's JSON AST dump for a C *header* (via a stub TU that #includes it) and
-    // parse out the externally-linkable function *declarations* and enum constants the
-    // header itself contributes. A header pulls in the whole SDK/CRT transitively, so a
-    // source-location filter keeps only decls whose file lives under the header's own dir
-    // or one of the --c-include roots. Fills outSigs/outEnums; false on clang/parse error.
+    // Reconstruct a function-like macro's parameter list and replacement body by tokenizing
+    // the macro-definition cursor's extent. Mirrors the old -dD text scan's drops: a variadic
+    // macro, a non-identifier / empty parameter, or an empty replacement body returns false
+    // (the macro is dropped). Inter-token spacing is irrelevant - TranslateMacroBody re-scans
+    // the body character by character - so the body is the remaining token spellings joined by
+    // single spaces.
+    bool ReconstructFuncMacro(CXTranslationUnit tu, CXCursor c, const std::string& name,
+                              std::vector<std::string>& outParams, std::string& outBody) const
+    {
+        CXSourceRange extent = clang_getCursorExtent(c);
+        unsigned endOff = 0;
+        clang_getFileLocation(clang_getRangeEnd(extent), nullptr, nullptr, nullptr, &endOff);
+
+        CXToken* toks = nullptr;
+        unsigned n = 0;
+        clang_tokenize(tu, extent, &toks, &n);
+        if (!toks || n == 0) { if (toks) clang_disposeTokens(tu, toks, n); return false; }
+
+        // clang_tokenize can return one stray token past the requested range; drop any token
+        // whose start offset is at/after the macro definition's end.
+        std::vector<std::string> spell;
+        spell.reserve(n);
+        for (unsigned i = 0; i < n; ++i)
+        {
+            unsigned off = 0;
+            clang_getFileLocation(clang_getTokenLocation(tu, toks[i]), nullptr, nullptr, nullptr, &off);
+            if (endOff && off >= endOff) break;
+            spell.push_back(CXToString(clang_getTokenSpelling(tu, toks[i])));
+        }
+        clang_disposeTokens(tu, toks, n);
+
+        // The extent may or may not include the leading `#define`; anchor on the macro name.
+        size_t idx = 0;
+        while (idx < spell.size() && spell[idx] != name) ++idx;
+        if (idx >= spell.size()) return false;
+        ++idx; // past name
+
+        // Function-like requires `(` immediately following the name.
+        if (idx >= spell.size() || spell[idx] != "(") return false;
+        ++idx; // past '('
+
+        outParams.clear();
+        while (idx < spell.size() && spell[idx] != ")")
+        {
+            const std::string& t = spell[idx];
+            if (t == ",") { ++idx; continue; }
+            if (t == "...") return false;                                   // variadic - drop
+            if (t.empty() || !(std::isalpha((unsigned char)t[0]) || t[0] == '_'))
+                return false;                                               // garbled param - drop
+            outParams.push_back(t);
+            ++idx;
+        }
+        if (idx >= spell.size()) return false;                              // no closing ')'
+        ++idx; // past ')'
+
+        outBody.clear();
+        for (; idx < spell.size(); ++idx)
+        {
+            if (!outBody.empty()) outBody += ' ';
+            outBody += spell[idx];
+        }
+        return !outBody.empty();
+    }
+
+    // Parse a C *header* in-process (via a stub TU that #includes it) and bind the
+    // externally-linkable function *declarations*, enum constants, struct/union records, AND
+    // the names of object-like / function-like macros it defines. A header pulls in the whole
+    // SDK/CRT transitively, so a source-location filter keeps only decls/macros whose file
+    // lives under the header's own dir or a --c-include root. Object-like macro names land in
+    // outObjMacros for later value resolution; function-like macros are reconstructed in full
+    // here (params + body). false on parse error.
     bool RunClangHeaderExtract(const std::string& headerPath,
                                std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                                std::vector<CRecordEntry>& outRecords,
+                               std::vector<CMacroNameCand>& outObjMacros,
+                               std::vector<CFunctionMacroEntry>& outFuncMacros,
                                const std::vector<std::string>& extraDefines = {})
     {
-        // The header is parsed in-process by libclang; clang-cl is only needed by the
-        // separate macro-discovery pass (ExtractCHeaderMacros).
+        // The header is parsed in-process by libclang; no clang-cl is involved - macro names
+        // come from the detailed preprocessing record built into this same parse.
         const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
 
         // In-memory stub TU: #include the header by absolute path (forward slashes for the
@@ -3660,9 +3476,12 @@ private:
 
         LibclangTU tu;
         {
+            // DetailedPreprocessingRecord surfaces #define directives as MacroDefinition cursors
+            // so macro discovery folds into this parse (no separate clang-cl -E -dD spawn).
             llvm::TimeTraceScope parseScope("LibclangParseHeader", headerPath);
             if (!ParseLibclangTU("cflat_hdr_stub.c", stub.c_str(), args,
-                                 CXTranslationUnit_SkipFunctionBodies, tu))
+                                 CXTranslationUnit_SkipFunctionBodies
+                                     | CXTranslationUnit_DetailedPreprocessingRecord, tu))
                 return false;
         }
 
@@ -3699,18 +3518,55 @@ private:
         struct Ctx
         {
             LLVMBackend* self;
+            CXTranslationUnit tu;
             std::vector<CSigEntry>* outSigs;
             std::vector<CEnumEntry>* outEnums;
+            std::vector<CMacroNameCand>* outObjMacros;
+            std::vector<CFunctionMacroEntry>* outFuncMacros;
             const std::function<bool(const std::string&)>* inScope;
-        } ctx{ this, &outSigs, &outEnums, &inScope };
+        } ctx{ this, tu.tu, &outSigs, &outEnums, &outObjMacros, &outFuncMacros, &inScope };
 
         clang_visitChildren(root,
             [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
             {
                 Ctx& ctx = *static_cast<Ctx*>(d);
                 CXCursorKind k = clang_getCursorKind(c);
-                if (k != CXCursor_FunctionDecl && k != CXCursor_EnumDecl) return CXChildVisit_Continue;
-                if (!(*ctx.inScope)(CursorFile(c))) return CXChildVisit_Continue; // drop SDK / CRT
+                if (k != CXCursor_FunctionDecl && k != CXCursor_EnumDecl
+                    && k != CXCursor_MacroDefinition) return CXChildVisit_Continue;
+                if (!(*ctx.inScope)(CursorFile(c))) return CXChildVisit_Continue; // drop SDK / CRT / builtins
+
+                if (k == CXCursor_MacroDefinition)
+                {
+                    // DetailedPreprocessingRecord surfaces every #define as a MacroDefinition
+                    // cursor (in source order). Drop compiler builtins and __-prefixed names,
+                    // matching the old -dD text scan. Object-like names are folded later by
+                    // ResolveCHeaderMacroValues; function-like macros are reconstructed in full.
+                    std::string name = CXToString(clang_getCursorSpelling(c));
+                    if (name.empty() || name.rfind("__", 0) == 0 || clang_Cursor_isMacroBuiltin(c))
+                        return CXChildVisit_Continue;
+                    unsigned line = 0;
+                    clang_getFileLocation(clang_getCursorLocation(c), nullptr, &line, nullptr, nullptr);
+                    if (clang_Cursor_isMacroFunctionLike(c))
+                    {
+                        CFunctionMacroEntry fm;
+                        if (ctx.self->ReconstructFuncMacro(ctx.tu, c, name, fm.params, fm.body))
+                        {
+                            fm.name = std::move(name);
+                            fm.file = CursorFile(c);
+                            fm.line = line ? (int)line : 1;
+                            ctx.outFuncMacros->push_back(std::move(fm));
+                        }
+                    }
+                    else
+                    {
+                        CMacroNameCand mc;
+                        mc.name = std::move(name);
+                        mc.file = CursorFile(c);
+                        mc.line = line ? (int)line : 1;
+                        ctx.outObjMacros->push_back(std::move(mc));
+                    }
+                    return CXChildVisit_Continue;
+                }
 
                 if (k == CXCursor_FunctionDecl)
                 {
@@ -3744,6 +3600,20 @@ private:
                     }, &ec);
                 return CXChildVisit_Continue;
             }, &ctx);
+
+        // #define redefinition: C keeps the last definition. The raw lists are in source
+        // order, so dedupe by name keeping each name's latest occurrence.
+        auto dedupeKeepLast = [](auto& vec) {
+            std::unordered_map<std::string, size_t> last;
+            for (size_t i = 0; i < vec.size(); ++i) last[vec[i].name] = i;
+            std::remove_reference_t<decltype(vec)> dedup;
+            dedup.reserve(last.size());
+            for (size_t i = 0; i < vec.size(); ++i)
+                if (last[vec[i].name] == i) dedup.push_back(std::move(vec[i]));
+            vec = std::move(dedup);
+        };
+        dedupeKeepLast(outObjMacros);
+        dedupeKeepLast(outFuncMacros);
 
         return true;
     }
@@ -3822,23 +3692,19 @@ private:
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
+        std::vector<CMacroNameCand> objMacroNames;
         {
-            // Function / enum / record binding is in-process via libclang (no clang-cl).
+            // Function / enum / record binding AND macro-name discovery are all in-process via
+            // libclang (no clang-cl); the detailed preprocessing record yields macro names from
+            // the same parse. Object-like names are resolved to values just below.
             llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
-            if (!RunClangHeaderExtract(headerPath, sigs, enums, records, extraDefines))
+            if (!RunClangHeaderExtract(headerPath, sigs, enums, records, objMacroNames, funcMacros, extraDefines))
                 return false;
         }
-        // #define macro discovery still shells out to clang-cl (-E -dD); it is best-effort,
-        // so a missing toolchain or header path leaves the decls already bound above intact.
-        if (const std::string clangPath = FindClangCl(); !clangPath.empty())
+        if (!objMacroNames.empty())
         {
             llvm::TimeTraceScope macroScope("CHeaderMacros", headerPath);
-            (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros, funcMacros);
-        }
-        else if (verbose)
-        {
-            std::cout << "[verbose] clang-cl not found; binding '" << headerPath
-                      << "' decls only (skipping #define macro extraction)\n";
+            (void)ResolveCHeaderMacroValues(headerPath, objMacroNames, extraDefines, macros);
         }
 
         if (!mtEc)
