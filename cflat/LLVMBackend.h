@@ -53,7 +53,7 @@
 #include <antlr4-runtime.h>
 #include <CFlatParser.h>
 #include <CFlatLexer.h>
-#include <nlohmann/json.hpp>
+#include <clang-c/Index.h>
 #include <fstream>
 #include "ArgParser.h"
 #include "CompilerManager.h"
@@ -663,8 +663,8 @@ public:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
-    // Typedef name -> qualType string from C/header AST dumps. Populated by
-    // CollectCTypedefs as a pre-pass before signature/struct walks so the
+    // Typedef name -> type spelling from C/header AST traversal. Populated by
+    // CollectCTypedefsLibclang as a pre-pass before signature/struct walks so the
     // function-signature mapper can chase HANDLE -> void*, SOCKET -> uintptr_t,
     // etc. Process-wide; first-writer-wins.
     std::unordered_map<std::string, std::string> cTypedefMap_;
@@ -1940,115 +1940,7 @@ private:
     }
 
     // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
-    // Pre-pass over a clang JSON AST: collect top-level user typedefs so the signature
-    // mapper can later chase `HANDLE` -> `void *`, `SOCKET` -> `unsigned long long`, etc.
-    // Implicit typedefs (compiler-injected like __int128_t, size_t aliases) are skipped -
-    // they pull in noise without helping resolution. First-writer-wins so a later header
-    // doesn't clobber an earlier one's spelling. Safe to call multiple times.
-    // A non-owning view over an nlohmann::json node exposing the small subset of the
-    // llvm::json::Object/Array/Value API that the C-interop AST walk uses. We parse clang's
-    // AST dumps with nlohmann because its DOM parse is ~24x faster than llvm::json on these
-    // very large dumps (131 MB curl.h: 1.1s vs 26s); this view lets the existing walk keep
-    // its `node->getString(...)` shape unchanged. It points into a root nlohmann::json that
-    // must outlive the view (the parse roots are function locals that live across the walk).
-    struct JRef
-    {
-        const nlohmann::json* n = nullptr;
 
-        explicit operator bool() const { return n != nullptr; }
-        const JRef* operator->() const { return this; }   // node->getX() reads unchanged
-        JRef        operator*()  const { return *this; }   // *arr in range-for / (*arr)[i]
-
-        // Value -> Object.
-        JRef getAsObject() const { return (n && n->is_object()) ? *this : JRef{}; }
-
-        // Object field access (every call site passes a string-literal key).
-        std::optional<llvm::StringRef> getString(const char* key) const
-        {
-            if (!n || !n->is_object()) return std::nullopt;
-            auto it = n->find(key);
-            if (it != n->end() && it->is_string())
-                return llvm::StringRef(it->get_ref<const nlohmann::json::string_t&>());
-            return std::nullopt;
-        }
-        JRef getObject(const char* key) const
-        {
-            if (!n || !n->is_object()) return JRef{};
-            auto it = n->find(key);
-            return (it != n->end() && it->is_object()) ? JRef{ &*it } : JRef{};
-        }
-        JRef getArray(const char* key) const
-        {
-            if (!n || !n->is_object()) return JRef{};
-            auto it = n->find(key);
-            return (it != n->end() && it->is_array()) ? JRef{ &*it } : JRef{};
-        }
-        std::optional<bool> getBoolean(const char* key) const
-        {
-            if (!n || !n->is_object()) return std::nullopt;
-            auto it = n->find(key);
-            if (it != n->end() && it->is_boolean()) return it->get<bool>();
-            return std::nullopt;
-        }
-        std::optional<int64_t> getInteger(const char* key) const
-        {
-            if (!n || !n->is_object()) return std::nullopt;
-            auto it = n->find(key);
-            if (it == n->end()) return std::nullopt;
-            if (it->is_number_integer())  return it->get<int64_t>();
-            if (it->is_number_unsigned()) return (int64_t)it->get<uint64_t>();
-            return std::nullopt;
-        }
-
-        // Array operations.
-        bool   empty() const { return !n || n->empty(); }
-        size_t size()  const { return n ? n->size() : 0; }
-        JRef   front() const { return (n && !n->empty()) ? JRef{ &n->front() } : JRef{}; }
-        JRef   operator[](size_t i) const { return (n && i < n->size()) ? JRef{ &(*n)[i] } : JRef{}; }
-
-        struct iterator
-        {
-            nlohmann::json::const_iterator it;
-            JRef operator*() const { return JRef{ &*it }; }
-            iterator& operator++() { ++it; return *this; }
-            bool operator!=(const iterator& o) const { return it != o.it; }
-        };
-        iterator begin() const { return iterator{ n->begin() }; }
-        iterator end()   const { return iterator{ n->end() }; }
-    };
-
-    void CollectCTypedefs(JRef topLevel)
-    {
-        if (!topLevel) return;
-        for (const auto& v : *topLevel)
-        {
-            JRef node = v.getAsObject();
-            if (!node) continue;
-            auto kind = node->getString("kind");
-            if (!kind || *kind != "TypedefDecl") continue;
-            if (auto imp = node->getBoolean("isImplicit"); imp && *imp) continue;
-            auto name = node->getString("name");
-            if (!name) continue;
-            JRef typeObj = node->getObject("type");
-            if (!typeObj) continue;
-            std::string target;
-            std::string desugared = typeObj->getString("desugaredQualType").value_or("").str();
-            std::string qual      = typeObj->getString("qualType").value_or("").str();
-            // Prefer desugaredQualType (chases HANDLE -> void *), but fall back to
-            // qualType when the desugared form is the typedef's own name. clang emits
-            // that self-referential form for `typedef enum { ... } X;` (the anonymous
-            // enum inherits the typedef name as its tag, so the desugared spelling is
-            // just "X"). Without the fallback we'd store X -> X and the recursive
-            // resolver would bail via the visited-set, leaving any signature spelled
-            // with X unresolved.
-            const std::string& self = name->str();
-            if (!desugared.empty() && desugared != self) target = desugared;
-            else if (!qual.empty())                     target = qual;
-            else                                        target = desugared;
-            if (target.empty()) continue;
-            cTypedefMap_.emplace(self, target);
-        }
-    }
 
     // Returns false for anything the extern ABI cannot faithfully pass - struct/union
     // by value, > 2 pointer levels, or an unknown scalar - so the caller can skip the
@@ -2270,7 +2162,7 @@ private:
             }
             else
             {
-                // Final fallback: chase a user typedef recorded by CollectCTypedefs. We
+                // Final fallback: chase a user typedef recorded by CollectCTypedefsLibclang. We
                 // append the original pointer-star count so HANDLE (ptr=0) recursing into
                 // "void *" lands at void with ptr=1. Visited-set prevents pathological
                 // self-referential typedefs from looping (clang would have errored, but
@@ -2357,66 +2249,14 @@ private:
             std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
     }
 
-    // Spawn a clang JSON AST dump (argStrs[0] is the clang path) and return stdout as a
-    // string. All three std streams are redirected to temp files (stdin from an empty
-    // temp) so a spawned child never references the LSP server's JSON-RPC pipes - leaving
-    // a redirect inherited (STARTF_USESTDHANDLES) breaks the protocol channel and kills
-    // the server. The spawn is serialized because concurrent CreateProcess-with-redirects
-    // calls race on Windows and crash the LSP worker pool.
-    bool SpawnClangJson(const std::vector<std::string>& argStrs, std::string& outJson)
-    {
-        llvm::SmallString<256> inFile, jsonFile, errFile;
-        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "in",  inFile))  return false;
-        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "json", jsonFile))
-        {
-            llvm::sys::fs::remove(inFile);
-            return false;
-        }
-        if (llvm::sys::fs::createTemporaryFile("cflat_ast", "err", errFile))
-        {
-            llvm::sys::fs::remove(inFile);
-            llvm::sys::fs::remove(jsonFile);
-            return false;
-        }
-        const std::string inPath   = inFile.str().str();
-        const std::string jsonPath = jsonFile.str().str();
-        const std::string errPath  = errFile.str().str();
-        struct TmpRemover {
-            std::string a, b, c;
-            ~TmpRemover() { llvm::sys::fs::remove(a); llvm::sys::fs::remove(b); llvm::sys::fs::remove(c); }
-        } tmpRemover{ inPath, jsonPath, errPath };
-
-        std::vector<llvm::StringRef> args;
-        for (auto& s : argStrs) args.push_back(s);
-
-        std::optional<llvm::StringRef> redirects[3] = {
-            llvm::StringRef(inPath), llvm::StringRef(jsonPath), llvm::StringRef(errPath)
-        };
-
-        std::string execErr;
-        int rc;
-        {
-            // The clang-cl subprocess itself - separated from the surrounding cflat-side
-            // JSON parse/walk so the trace shows how much time is clang vs. cflat.
-            llvm::TimeTraceScope spawnScope("ClangSpawn");
-            std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
-            rc = llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
-        }
-        if (rc != 0)
-        {
-            if (verbose) std::cout << "[verbose]   AST dump failed (exit " << rc << ")\n";
-            return false;
-        }
-
-        auto bufOrErr = llvm::MemoryBuffer::getFile(jsonPath);
-        if (!bufOrErr) return false;
-        outJson = (*bufOrErr)->getBuffer().str();
-        return true;
-    }
-
-    // Variant of SpawnClangJson that captures stdout regardless of exit code. Needed for the
-    // macro-resolution stub: one bad-apple macro produces clang errors (non-zero exit), but
-    // the other anonymous enums still land in the AST and remain usable.
+    // Spawn a clang-cl subprocess (argStrs[0] is the clang path) and capture stdout as a
+    // string, regardless of exit code. Used for the macro-discovery preprocess pass (clang
+    // -E -dD), whose output is still useful even when a header emits warnings. All three std
+    // streams are redirected to temp files (stdin from an empty temp) so a spawned child never
+    // references the LSP server's JSON-RPC pipes - leaving a redirect inherited
+    // (STARTF_USESTDHANDLES) breaks the protocol channel and kills the server. The spawn is
+    // serialized because concurrent CreateProcess-with-redirects calls race on Windows and
+    // crash the LSP worker pool.
     bool SpawnClangCapture(const std::vector<std::string>& argStrs, std::string& outStdout)
     {
         llvm::SmallString<256> inFile, outFile, errFile;
@@ -2449,7 +2289,7 @@ private:
 
         std::string execErr;
         {
-            // The clang-cl subprocess itself (see SpawnClangJson for the rationale).
+            // The clang-cl subprocess itself, timed separately from the cflat-side scan.
             llvm::TimeTraceScope spawnScope("ClangSpawn");
             std::lock_guard<std::mutex> spawnLock(cClangSpawnMutex_);
             (void)llvm::sys::ExecuteAndWait(argStrs[0], args, std::nullopt, redirects, 0, 0, &execErr);
@@ -2462,290 +2302,424 @@ private:
         return true;
     }
 
-    // Walks a clang RecordDecl's `inner` array to populate `recOut.fields`. Nested anonymous
-    // RecordDecl children (the C11 anonymous-struct / anonymous-union shape) are emitted as
-    // separate CRecordEntry records with a synthetic tag `<parentTag>__anon<N>` appended to
-    // `outRecords`. The unnamed FieldDecl that materializes the nested record in the parent
-    // is rewritten to reference that synthetic tag with a synthetic field name `__anon<N>`,
-    // so CFlat code can reach the inner members via `s.__anon0.a`. IndirectFieldDecl nodes
-    // (clang's transparent-access forwarders) are skipped; CFlat does not replicate C's
-    // anonymous-member transparency at the language level.
-    void CollectRecordFieldsAndNested(JRef recordNode,
-                                      const std::string& parentTag,
-                                      CRecordEntry& recOut,
-                                      std::vector<CRecordEntry>& outRecords)
+    // ---- libclang in-process AST traversal -------------------------------------------
+    // C interop binds against C headers / sources by walking clang's AST. Rather than
+    // spawning clang-cl to print a (huge) -ast-dump=json blob and parsing it back, we
+    // drive libclang in-process: parse the translation unit once, walk cursors directly,
+    // and read types/values via the C API. This eliminates the subprocess, the multi-
+    // hundred-MB JSON serialize+parse round trip, and the DOM memory spike. libclang ships
+    // its own LLVM inside libclang.dll, so its state is fully isolated from cflat's own
+    // statically linked LLVM in this process.
+
+    static std::string CXToString(CXString s)
     {
-        auto qualTypeOf = [](JRef typeObj) -> std::string {
-            if (!typeObj) return "";
-            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
-            if (auto q = typeObj->getString("qualType")) return q->str();
-            return "";
-        };
-        JRef inner = recordNode->getArray("inner");
-        if (!inner) return;
+        const char* c = clang_getCString(s);
+        std::string out = c ? c : "";
+        clang_disposeString(s);
+        return out;
+    }
 
-        // Anonymous nested records and their materializing unnamed FieldDecl come in pairs
-        // (RecordDecl then FieldDecl) in clang's emission order. Queue the synthesized
-        // (typeSpelling, fieldName) so the next unnamed FieldDecl picks it up.
-        struct PendingAnon { std::string typeSpelling; std::string fieldName; };
-        std::deque<PendingAnon> pending;
-        int anonIndex = 0;
+    // The spelling clang's -ast-dump prints as `desugaredQualType` when it differs from
+    // `qualType`, else `qualType`. MapCTypeToTypeAndValue was written against that string
+    // contract, so producing the same spelling lets the type mapper stay unchanged: the
+    // fully-canonical form chases typedef chains (HANDLE -> void *) the same way the JSON
+    // desugaredQualType did.
+    static std::string DesugaredSpelling(CXType t)
+    {
+        std::string qual  = CXToString(clang_getTypeSpelling(t));
+        std::string canon = CXToString(clang_getTypeSpelling(clang_getCanonicalType(t)));
+        return (!canon.empty() && canon != qual) ? canon : qual;
+    }
 
-        for (const auto& c : *inner)
+    // The absolute path of the file a cursor lives in (empty for builtins / command line).
+    static std::string CursorFile(CXCursor c)
+    {
+        CXSourceLocation loc = clang_getCursorLocation(c);
+        CXFile file; unsigned line = 0, col = 0, off = 0;
+        clang_getFileLocation(loc, &file, &line, &col, &off);
+        if (!file) return "";
+        return CXToString(clang_getFileName(file));
+    }
+
+    // Decode a C string literal in clang's source form (optional encoding prefix, quotes,
+    // C escape sequences) into raw bytes. Returns false for escapes we do not handle
+    // (\xHH, \uXXXX, multi-digit octal) so the caller drops the macro - matching the prior
+    // JSON-path string decoder exactly. Real-world version-style macros do not use these.
+    static bool DecodeCStringLiteral(const std::string& s, std::string& out)
+    {
+        size_t i = 0;
+        while (i < s.size() && (s[i] == 'L' || s[i] == 'u' || s[i] == 'U'))
         {
-            JRef co = c.getAsObject();
-            if (!co) continue;
-            auto ck = co->getString("kind");
-            if (!ck) continue;
-
-            if (*ck == "RecordDecl")
-            {
-                auto nm = co->getString("name");
-                if (nm && !nm->empty()) continue; // named nested record - clang emits it at top level too
-                auto cd = co->getBoolean("completeDefinition");
-                if (!cd || !*cd) continue;
-                auto tag = co->getString("tagUsed");
-
-                const int idx = anonIndex++;
-                const std::string synTag = parentTag + "__anon" + std::to_string(idx);
-                CRecordEntry nested;
-                nested.name = synTag;
-                nested.isUnion = (tag && *tag == "union");
-                if (auto loc = co->getObject("loc"))
-                {
-                    if (auto l = loc->getInteger("line")) nested.line = (int)*l;
-                    if (auto cc = loc->getInteger("col")) nested.col = (int)*cc - 1;
-                }
-                CollectRecordFieldsAndNested(co, synTag, nested, outRecords);
-                outRecords.push_back(std::move(nested));
-
-                PendingAnon pa;
-                pa.typeSpelling = (tag && *tag == "union" ? "union " : "struct ") + synTag;
-                pa.fieldName = "__anon" + std::to_string(idx);
-                pending.push_back(std::move(pa));
-            }
-            else if (*ck == "FieldDecl")
-            {
-                auto fname = co->getString("name");
-                CRecordFieldEntry fe;
-                if (fname && !fname->empty())
-                {
-                    fe.name = fname->str();
-                    fe.ctype = qualTypeOf(co->getObject("type"));
-                }
-                else if (!pending.empty())
-                {
-                    fe.name = std::move(pending.front().fieldName);
-                    fe.ctype = std::move(pending.front().typeSpelling);
-                    pending.pop_front();
-                }
-                else
-                {
-                    // Anonymous bitfield (no name, no nested record): bitWidth is
-                    // recorded so RegisterCRecords can treat it as a boundary marker
-                    // (width 0) or width-stealing padding.
-                    auto isBit = co->getBoolean("isBitfield");
-                    if (isBit && *isBit)
-                    {
-                        fe.name.clear();
-                        fe.ctype = qualTypeOf(co->getObject("type"));
-                        fe.isBitfield = true;
-                        if (auto inner = co->getArray("inner"))
-                        {
-                            for (const auto& iv : *inner)
-                            {
-                                if (auto io = iv.getAsObject())
-                                {
-                                    if (auto val = io->getString("value"))
-                                    {
-                                        fe.bitWidth = (unsigned)std::strtoul(val->str().c_str(), nullptr, 10);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        recOut.fields.push_back(std::move(fe));
-                    }
-                    continue;
-                }
-                // Bitfield extraction: isBitfield + inner[0] ConstantExpr.value.
-                auto isBit = co->getBoolean("isBitfield");
-                if (isBit && *isBit)
-                {
-                    fe.isBitfield = true;
-                    if (auto inner = co->getArray("inner"))
-                    {
-                        for (const auto& iv : *inner)
-                        {
-                            if (auto io = iv.getAsObject())
-                            {
-                                if (auto val = io->getString("value"))
-                                {
-                                    fe.bitWidth = (unsigned)std::strtoul(val->str().c_str(), nullptr, 10);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                recOut.fields.push_back(std::move(fe));
-            }
-            // IndirectFieldDecl etc. - skip.
+            if (s[i] == 'u' && i + 1 < s.size() && s[i + 1] == '8') i += 2;
+            else ++i;
         }
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        std::string decoded;
+        decoded.reserve(s.size());
+        while (i < s.size() && s[i] != '"')
+        {
+            char c = s[i];
+            if (c == '\\' && i + 1 < s.size())
+            {
+                switch (s[i + 1])
+                {
+                    case 'n':  decoded += '\n'; i += 2; continue;
+                    case 't':  decoded += '\t'; i += 2; continue;
+                    case 'r':  decoded += '\r'; i += 2; continue;
+                    case '0':  decoded += '\0'; i += 2; continue;
+                    case '\\': decoded += '\\'; i += 2; continue;
+                    case '"':  decoded += '"';  i += 2; continue;
+                    case '\'': decoded += '\''; i += 2; continue;
+                    case 'a':  decoded += '\a'; i += 2; continue;
+                    case 'b':  decoded += '\b'; i += 2; continue;
+                    case 'f':  decoded += '\f'; i += 2; continue;
+                    case 'v':  decoded += '\v'; i += 2; continue;
+                    default: break;
+                }
+                return false; // \xHH / \uXXXX / multi-digit octal - bail and drop the macro
+            }
+            decoded += c;
+            ++i;
+        }
+        if (i >= s.size() || s[i] != '"') return false;
+        out = std::move(decoded);
+        return true;
+    }
+
+    // RAII owner for a libclang index + translation unit.
+    struct LibclangTU
+    {
+        CXIndex index = nullptr;
+        CXTranslationUnit tu = nullptr;
+        LibclangTU() = default;
+        LibclangTU(const LibclangTU&) = delete;
+        LibclangTU& operator=(const LibclangTU&) = delete;
+        ~LibclangTU()
+        {
+            if (tu)    clang_disposeTranslationUnit(tu);
+            if (index) clang_disposeIndex(index);
+        }
+        CXCursor root() const { return clang_getTranslationUnitCursor(tu); }
+    };
+
+    // Parse a translation unit in-process. When unsavedSource is non-null, fileName names a
+    // virtual in-memory file holding that content (used for the `#include "header"` stubs);
+    // otherwise fileName is a real path on disk (the .c auto-extern path). Returns false only
+    // on a hard failure to create a TU - a TU produced with diagnostics still returns true,
+    // matching the per-decl error recovery (-ferror-limit=0) the macro pass relies on.
+    bool ParseLibclangTU(const std::string& fileName, const char* unsavedSource,
+                         const std::vector<std::string>& args, unsigned options, LibclangTU& out)
+    {
+        std::vector<const char*> cargs;
+        cargs.reserve(args.size());
+        for (const auto& a : args) cargs.push_back(a.c_str());
+
+        CXUnsavedFile unsaved;
+        CXUnsavedFile* unsavedPtr = nullptr;
+        unsigned unsavedCount = 0;
+        if (unsavedSource)
+        {
+            unsaved.Filename = fileName.c_str();
+            unsaved.Contents = unsavedSource;
+            unsaved.Length   = (unsigned long)std::strlen(unsavedSource);
+            unsavedPtr = &unsaved;
+            unsavedCount = 1;
+        }
+
+        out.index = clang_createIndex(/*excludeDeclsFromPCH*/ 0, /*displayDiagnostics*/ 0);
+        CXErrorCode err = clang_parseTranslationUnit2(
+            out.index, fileName.c_str(),
+            cargs.empty() ? nullptr : cargs.data(), (int)cargs.size(),
+            unsavedPtr, unsavedCount, options, &out.tu);
+        return err == CXError_Success && out.tu != nullptr;
+    }
+
+    // Build the clang driver args shared by the libclang extraction paths. headerDir, when
+    // non-empty, is added as the first -I (the bound header's own directory). errorRecovery
+    // enables the macro pass's per-decl recovery so one bad probe does not poison the rest.
+    std::vector<std::string> BuildLibclangArgs(const std::string& headerDir,
+                                               const std::vector<std::string>& extraDefines,
+                                               bool errorRecovery) const
+    {
+        std::vector<std::string> args;
+        args.push_back(platformValue == 32 ? "--target=i686-pc-windows-msvc"
+                                           : "--target=x86_64-pc-windows-msvc");
+        args.push_back("-fsyntax-only");
+        args.push_back("-x");
+        args.push_back("c");
+        if (errorRecovery)
+        {
+            args.push_back("-ferror-limit=0");
+            args.push_back("-Wno-everything");
+        }
+        if (!headerDir.empty()) args.push_back("-I" + headerDir);
+        for (const auto& inc : cIncludeDirs_) args.push_back("-I" + inc);
+        for (const auto& def : cDefines_)      args.push_back("-D" + def);
+        for (const auto& def : extraDefines)   args.push_back("-D" + def);
+        return args;
+    }
+
+    // Record every `typedef X Name;` in the TU as Name -> spelling(X) so the type mapper can
+    // chase aliases (HANDLE -> void *, SOCKET -> unsigned long long, ...). Prefers the
+    // canonical spelling, falling back to the sugared one when canonical is the typedef's own
+    // name (the `typedef enum {} X;` self-referential shape clang emits).
+    void CollectCTypedefsLibclang(CXCursor tuCursor)
+    {
+        clang_visitChildren(tuCursor,
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
+            {
+                if (clang_getCursorKind(c) != CXCursor_TypedefDecl) return CXChildVisit_Continue;
+                LLVMBackend* self = static_cast<LLVMBackend*>(d);
+                std::string name = CXToString(clang_getCursorSpelling(c));
+                if (name.empty()) return CXChildVisit_Continue;
+                CXType under = clang_getTypedefDeclUnderlyingType(c);
+                std::string qual  = CXToString(clang_getTypeSpelling(under));
+                std::string canon = CXToString(clang_getTypeSpelling(clang_getCanonicalType(under)));
+                std::string target;
+                if (!canon.empty() && canon != name) target = canon;
+                else if (!qual.empty())              target = qual;
+                else                                 target = canon;
+                if (!target.empty()) self->cTypedefMap_.emplace(name, target);
+                return CXChildVisit_Continue;
+            }, this);
+    }
+
+    // Populate recOut.fields from a struct/union cursor. C11 transparent anonymous members
+    // (anonymous record decls with no materializing field) become a synthetic
+    // `<parentTag>__anon<N>` record plus a synthetic field referencing it - libclang folds the
+    // unnamed FieldDecl away, so we emit that field ourselves. Named nested records are emitted
+    // at top level and skipped here. Anonymous bitfields (no name) are recorded as width markers.
+    void CollectRecordFieldsLibclang(CXCursor recordCursor, const std::string& parentTag,
+                                     CRecordEntry& recOut, std::vector<CRecordEntry>& outRecords)
+    {
+        struct Ctx
+        {
+            LLVMBackend* self;
+            const std::string* parentTag;
+            CRecordEntry* recOut;
+            std::vector<CRecordEntry>* outRecords;
+            int anonIndex;
+        } ctx{ this, &parentTag, &recOut, &outRecords, 0 };
+
+        clang_visitChildren(recordCursor,
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
+            {
+                Ctx& ctx = *static_cast<Ctx*>(d);
+                LLVMBackend* self = ctx.self;
+                CXCursorKind k = clang_getCursorKind(c);
+
+                if (k == CXCursor_StructDecl || k == CXCursor_UnionDecl)
+                {
+                    // Named nested record: clang emits it at top level too -> handled there.
+                    if (!clang_Cursor_isAnonymous(c)) return CXChildVisit_Continue;
+                    // Only C11 transparent members (no materializing named field) get a
+                    // synthetic field here; an anonymous type that is the declared type of a
+                    // following named field is carried by that field's canonical spelling.
+                    if (!clang_Cursor_isAnonymousRecordDecl(c)) return CXChildVisit_Continue;
+                    if (!clang_isCursorDefinition(c)) return CXChildVisit_Continue;
+
+                    const int idx = ctx.anonIndex++;
+                    const std::string synTag = *ctx.parentTag + "__anon" + std::to_string(idx);
+                    const bool isUnion = (k == CXCursor_UnionDecl);
+
+                    CRecordEntry nested;
+                    nested.name = synTag;
+                    nested.isUnion = isUnion;
+                    CXSourceLocation loc = clang_getCursorLocation(c);
+                    unsigned line = 0, col = 0;
+                    clang_getFileLocation(loc, nullptr, &line, &col, nullptr);
+                    nested.line = (int)line;
+                    nested.col  = col ? (int)col - 1 : 0;
+                    self->CollectRecordFieldsLibclang(c, synTag, nested, *ctx.outRecords);
+                    ctx.outRecords->push_back(std::move(nested));
+
+                    CRecordFieldEntry fe;
+                    fe.name  = "__anon" + std::to_string(idx);
+                    fe.ctype = (isUnion ? "union " : "struct ") + synTag;
+                    ctx.recOut->fields.push_back(std::move(fe));
+                    return CXChildVisit_Continue;
+                }
+
+                if (k == CXCursor_FieldDecl)
+                {
+                    std::string fname = CXToString(clang_getCursorSpelling(c));
+                    const bool isBit = clang_Cursor_isBitField(c) != 0;
+                    if (!fname.empty())
+                    {
+                        CRecordFieldEntry fe;
+                        fe.name  = std::move(fname);
+                        fe.ctype = DesugaredSpelling(clang_getCursorType(c));
+                        if (isBit)
+                        {
+                            fe.isBitfield = true;
+                            int w = clang_getFieldDeclBitWidth(c);
+                            fe.bitWidth = w > 0 ? (unsigned)w : 0;
+                        }
+                        ctx.recOut->fields.push_back(std::move(fe));
+                    }
+                    else if (isBit)
+                    {
+                        // Anonymous bitfield: width 0 is a storage-unit boundary marker.
+                        CRecordFieldEntry fe;
+                        fe.isBitfield = true;
+                        fe.ctype = DesugaredSpelling(clang_getCursorType(c));
+                        int w = clang_getFieldDeclBitWidth(c);
+                        fe.bitWidth = w > 0 ? (unsigned)w : 0;
+                        ctx.recOut->fields.push_back(std::move(fe));
+                    }
+                    // Unnamed non-bitfield field: nothing to record.
+                }
+                return CXChildVisit_Continue;
+            }, &ctx);
     }
 
     // Spawn clang's JSON AST dump for a C source and parse out every externally-linkable
     // function it *defines*. Fills outSigs; returns false on any clang / parse failure.
-    bool RunClangAstExtract(const std::string& clangPath, const std::string& cSourcePath,
+    // Build a CSigEntry from a FunctionDecl cursor. Returns false (leaving entry in an
+    // unspecified state) when the return type or any parameter falls outside the extern ABI
+    // subset MapCTypeToTypeAndValue accepts, so the caller skips the whole function. Shared
+    // by the .c auto-extern path and the header-binding path.
+    bool BuildCSigFromCursor(CXCursor c, CSigEntry& entry)
+    {
+        std::string name = CXToString(clang_getCursorSpelling(c));
+        if (name.empty()) return false;
+
+        entry = CSigEntry();
+        entry.name = name;
+
+        CXType fnType = clang_getCursorType(c);
+        entry.variadic = clang_isFunctionTypeVariadic(fnType) != 0;
+
+        std::string retStr = DesugaredSpelling(clang_getResultType(fnType));
+        if (!MapCTypeToTypeAndValue(retStr, entry.ret))
+        {
+            if (verbose) std::cout << "[verbose]   skipping '" << name
+                                   << "': unsupported return type '" << retStr << "'\n";
+            return false;
+        }
+
+        int nargs = clang_Cursor_getNumArguments(c);
+        for (int i = 0; i < nargs; ++i)
+        {
+            CXCursor arg = clang_Cursor_getArgument(c, i);
+            TypeAndValue ptv;
+            std::string pStr = DesugaredSpelling(clang_getCursorType(arg));
+            if (!MapCTypeToTypeAndValue(pStr, ptv))
+            {
+                if (verbose) std::cout << "[verbose]   skipping '" << name
+                                       << "': unsupported parameter type '" << pStr << "'\n";
+                return false;
+            }
+            ptv.VariableName = CXToString(clang_getCursorSpelling(arg));
+            entry.params.push_back(std::move(ptv));
+        }
+
+        CXSourceLocation loc = clang_getCursorLocation(c);
+        unsigned line = 0, col = 0;
+        clang_getFileLocation(loc, nullptr, &line, &col, nullptr);
+        entry.line = line ? (int)line : 1;
+        entry.col  = col ? (int)col - 1 : 0;
+        return true;
+    }
+
+    // Walk a libclang TU's top-level record decls into outRecords. When requireInScope is
+    // set, only records whose file lives under one of scopeRoots are kept (header binding
+    // excludes the transitively-included SDK/CRT); the .c path keeps every named record.
+    void CollectRecordsLibclang(CXCursor tuCursor, std::vector<CRecordEntry>& outRecords,
+                                bool requireInScope,
+                                const std::function<bool(const std::string&)>& inScope)
+    {
+        struct Ctx
+        {
+            LLVMBackend* self;
+            std::vector<CRecordEntry>* outRecords;
+            bool requireInScope;
+            const std::function<bool(const std::string&)>* inScope;
+        } ctx{ this, &outRecords, requireInScope, &inScope };
+
+        clang_visitChildren(tuCursor,
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
+            {
+                Ctx& ctx = *static_cast<Ctx*>(d);
+                CXCursorKind k = clang_getCursorKind(c);
+                if (k != CXCursor_StructDecl && k != CXCursor_UnionDecl) return CXChildVisit_Continue;
+                if (!clang_isCursorDefinition(c)) return CXChildVisit_Continue; // forward decl -> no layout
+                std::string nm = CXToString(clang_getCursorSpelling(c));
+                if (nm.empty()) return CXChildVisit_Continue; // anonymous -> reached via its field
+                if (ctx.requireInScope && !(*ctx.inScope)(CursorFile(c))) return CXChildVisit_Continue;
+
+                CRecordEntry rec;
+                rec.name = nm;
+                rec.isUnion = (k == CXCursor_UnionDecl);
+                ctx.self->CollectRecordFieldsLibclang(c, rec.name, rec, *ctx.outRecords);
+                CXSourceLocation loc = clang_getCursorLocation(c);
+                unsigned line = 0, col = 0;
+                clang_getFileLocation(loc, nullptr, &line, &col, nullptr);
+                rec.line = line ? (int)line : 1;
+                rec.col  = col ? (int)col - 1 : 0;
+                ctx.outRecords->push_back(std::move(rec));
+                return CXChildVisit_Continue;
+            }, &ctx);
+    }
+
+    // Extract every externally-linkable function a C source *defines* via in-process
+    // libclang traversal. Fills outSigs / outRecords; returns false on a hard parse failure.
+    bool RunClangAstExtract(const std::string& cSourcePath,
                             std::vector<CSigEntry>& outSigs,
                             std::vector<CRecordEntry>& outRecords)
     {
-        const std::string target = (platformValue == 32)
-            ? "--target=i686-pc-windows-msvc"
-            : "--target=x86_64-pc-windows-msvc";
-
-        std::vector<std::string> argStrs = {
-            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json",
-            "-fsyntax-only"
+        // Parsed in-process by libclang - no clang-cl needed here (the .obj compile in
+        // CompileCFile is what requires clang-cl). target + defines, no extra include roots.
+        std::vector<std::string> args = {
+            platformValue == 32 ? "--target=i686-pc-windows-msvc"
+                                : "--target=x86_64-pc-windows-msvc",
+            "-fsyntax-only", "-x", "c"
         };
-        for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
-        argStrs.push_back(cSourcePath);
+        for (const auto& def : cDefines_) args.push_back("-D" + def);
 
         if (verbose)
-            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (clang AST dump)\n";
+            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (libclang)\n";
 
-        std::string jsonText;
-        if (!SpawnClangJson(argStrs, jsonText))
-            return false;
-
-        nlohmann::json rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
-        if (rootDoc.is_discarded()) return false;
-        JRef root{ &rootDoc };
-
-        JRef tu = root->getAsObject();
-        if (!tu) return false;
-        JRef topLevel = tu->getArray("inner");
-        if (!topLevel) return true; // parsed fine, nothing to register
-
-        // Collect typedefs first so the signature mapper can chase pointer aliases
-        // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
-        CollectCTypedefs(topLevel);
-
-        auto qualTypeOf = [](JRef typeObj) -> std::string
+        LibclangTU tu;
         {
-            if (!typeObj) return "";
-            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
-            if (auto q = typeObj->getString("qualType")) return q->str();
-            return "";
-        };
-
-        // First pass: collect record (struct/union) decls. Recording them up front
-        // (before function signatures) lets MapCTypeToTypeAndValue resolve struct-by-
-        // value parameter / return types against the registered structs.
-        for (const JRef& v : *topLevel)
-        {
-            JRef node = v.getAsObject();
-            if (!node) continue;
-            auto kind = node->getString("kind");
-            if (!kind || *kind != "RecordDecl") continue;
-            auto nm = node->getString("name");
-            if (!nm || nm->empty()) continue; // skip anonymous records (handled via typedef path later, if ever)
-            auto cd = node->getBoolean("completeDefinition");
-            if (!cd || !*cd) continue; // forward decls give us no layout
-            auto tag = node->getString("tagUsed");
-            CRecordEntry rec;
-            rec.name = nm->str();
-            rec.isUnion = tag && *tag == "union";
-            CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
-            if (auto loc = node->getObject("loc"))
-            {
-                if (auto l = loc->getInteger("line")) rec.line = (int)*l;
-                if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
-            }
-            outRecords.push_back(std::move(rec));
+            llvm::TimeTraceScope parseScope("LibclangParseC", cSourcePath);
+            // Do NOT skip function bodies here: only functions *defined* in this TU produce a
+            // linkable object symbol, and clang_isCursorDefinition relies on the body being
+            // parsed to mark the decl as a definition.
+            if (!ParseLibclangTU(cSourcePath, /*unsavedSource*/ nullptr, args,
+                                 CXTranslationUnit_None, tu))
+                return false;
         }
 
-        // Register the records now so MapCTypeToTypeAndValue can resolve struct-by-value
-        // parameter / return types in the function-decl pass below.
+        llvm::TimeTraceScope walkScope("WalkCTU", cSourcePath);
+        CXCursor root = tu.root();
+
+        // Typedefs first so the signature mapper can chase pointer aliases during the walk.
+        CollectCTypedefsLibclang(root);
+
+        // Records up front (the .c path keeps every named record), then register so the
+        // function pass can resolve struct-by-value parameter / return types.
+        CollectRecordsLibclang(root, outRecords, /*requireInScope*/ false, {});
         RegisterCRecords(outRecords, cSourcePath);
 
-        for (const JRef& v : *topLevel)
-        {
-            JRef node = v.getAsObject();
-            if (!node) continue;
-            auto kind = node->getString("kind");
-            if (!kind || *kind != "FunctionDecl") continue;
-
-            // static functions are not externally linkable - skip.
-            if (auto sc = node->getString("storageClass"); sc && *sc == "static") continue;
-
-            JRef fnInner = node->getArray("inner");
-
-            // Only functions *defined* in this translation unit end up as object
-            // symbols we can link. A body means a CompoundStmt child; header-only
-            // prototypes (e.g. from <stdio.h>) have none and are skipped.
-            bool hasBody = false;
-            if (fnInner)
-                for (const auto& c : *fnInner)
-                    if (auto co = c.getAsObject())
-                        if (auto ck = co->getString("kind"); ck && *ck == "CompoundStmt")
-                        { hasBody = true; break; }
-            if (!hasBody) continue;
-
-            auto nm = node->getString("name");
-            if (!nm || nm->empty()) continue;
-
-            CSigEntry entry;
-            entry.name = nm->str();
-
-            std::string funcQual = qualTypeOf(node->getObject("type"));
-            entry.variadic = funcQual.find("...") != std::string::npos;
-
-            // Return type = the spelling before the parameter list's '('.
-            std::string retStr = funcQual;
-            if (auto paren = funcQual.find('('); paren != std::string::npos)
-                retStr = funcQual.substr(0, paren);
-
-            if (!MapCTypeToTypeAndValue(retStr, entry.ret))
+        struct FnCtx { LLVMBackend* self; std::vector<CSigEntry>* outSigs; } fnCtx{ this, &outSigs };
+        clang_visitChildren(root,
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
             {
-                if (verbose) std::cout << "[verbose]   skipping '" << entry.name
-                                       << "': unsupported return type '" << retStr << "'\n";
-                continue;
-            }
+                FnCtx& ctx = *static_cast<FnCtx*>(d);
+                if (clang_getCursorKind(c) != CXCursor_FunctionDecl) return CXChildVisit_Continue;
+                // static functions are not externally linkable.
+                if (clang_Cursor_getStorageClass(c) == CX_SC_Static) return CXChildVisit_Continue;
+                // Only functions *defined* here produce a linkable object symbol; header-only
+                // prototypes (e.g. from <stdio.h>) are skipped.
+                if (!clang_isCursorDefinition(c)) return CXChildVisit_Continue;
 
-            bool paramsOk = true;
-            if (fnInner)
-            {
-                for (const auto& c : *fnInner)
-                {
-                    JRef co = c.getAsObject();
-                    if (!co) continue;
-                    auto ck = co->getString("kind");
-                    if (!ck || *ck != "ParmVarDecl") continue;
-
-                    TypeAndValue ptv;
-                    std::string pQual = qualTypeOf(co->getObject("type"));
-                    if (!MapCTypeToTypeAndValue(pQual, ptv))
-                    {
-                        if (verbose) std::cout << "[verbose]   skipping '" << entry.name
-                                               << "': unsupported parameter type '" << pQual << "'\n";
-                        paramsOk = false;
-                        break;
-                    }
-                    if (auto pn = co->getString("name")) ptv.VariableName = pn->str();
-                    entry.params.push_back(ptv);
-                }
-            }
-            if (!paramsOk) continue;
-
-            if (auto loc = node->getObject("loc"))
-            {
-                if (auto l = loc->getInteger("line")) entry.line = (int)*l;
-                if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
-            }
-
-            outSigs.push_back(std::move(entry));
-        }
+                CSigEntry entry;
+                if (ctx.self->BuildCSigFromCursor(c, entry))
+                    ctx.outSigs->push_back(std::move(entry));
+                return CXChildVisit_Continue;
+            }, &fnCtx);
 
         return true;
     }
@@ -2818,15 +2792,14 @@ private:
             return true;
         }
 
-        // Cache miss - run clang and parse (outside the lock; concurrent first-time
-        // misses for the same file just redo the work harmlessly, last writer wins).
-        const std::string clangPath = FindClangCl();
-        if (clangPath.empty())
-            return false;
-
+        // Cache miss - parse and extract (outside the lock; concurrent first-time misses for
+        // the same file just redo the work harmlessly, last writer wins). Extraction is in-
+        // process via libclang and needs no clang-cl; the object compile (CompileCFile) is
+        // what requires it, and it reports its own error if the toolchain is missing. This
+        // also lets LSP .c indexing work when only libclang (not clang-cl) is available.
         std::vector<CSigEntry> sigs;
         std::vector<CRecordEntry> records;
-        if (!RunClangAstExtract(clangPath, cSourcePath, sigs, records))
+        if (!RunClangAstExtract(cSourcePath, sigs, records))
             return false;
 
         if (!mtEc)
@@ -2844,27 +2817,6 @@ private:
         // struct-by-value parameter types); do not re-register here.
         RegisterCSignatures(sigs, fileForLsp, programAlias);
         return true;
-    }
-
-    // Depth-first search for the first node carrying an evaluated integer "value" string
-    // (clang puts the evaluated enum value on the wrapping ConstantExpr / IntegerLiteral).
-    // Returns false when the enumerator has no initializer (caller uses the running count).
-    static bool FindConstantValue(JRef node, long long& out)
-    {
-        if (!node) return false;
-        if (auto v = node->getString("value"))
-        {
-            const std::string s = v->str();
-            try {
-                size_t consumed = 0;
-                long long parsed = std::stoll(s, &consumed);
-                if (consumed == s.size()) { out = parsed; return true; }
-            } catch (...) { /* not a plain decimal (e.g. a string literal) - keep searching */ }
-        }
-        if (auto inner = node->getArray("inner"))
-            for (const auto& c : *inner)
-                if (FindConstantValue(c.getAsObject(), out)) return true;
-        return false;
     }
 
     // Register C enum constants as bare global int constants - matching C's flat enum
@@ -3483,285 +3435,116 @@ private:
 
         if (candidates.empty()) return true;
 
-        // --- Pass B: AST resolution. One anonymous enum per macro so per-decl errors don't
-        //     cascade. Bad apples (non-constant, string, compound) are dropped silently. ---
-        llvm::SmallString<256> resolveFile;
-        if (llvm::sys::fs::createTemporaryFile("cflat_mres", "c", resolveFile)) return false;
-        const std::string resolvePath = resolveFile.str().str();
-        struct ResolveRemover { std::string p; ~ResolveRemover() { llvm::sys::fs::remove(p); } } resolveRemover{ resolvePath };
+        // --- Pass B: in-process resolution. One anonymous enum per macro folds its integer
+        //     value; a __typeof__ var recovers the macro's natural type; double / string
+        //     probes carry float and string-literal macros. clang's per-decl error recovery
+        //     (-ferror-limit=0) lets one bad-apple probe fail without poisoning its neighbors. ---
+        std::string stub = "#include \"" + fwdHeader + "\"\n";
+        for (const auto& m : candidates)
         {
-            std::error_code ec;
-            llvm::raw_fd_ostream os(resolvePath, ec, llvm::sys::fs::OF_Text);
-            if (ec) return false;
-            os << "#include \"" << fwdHeader << "\"\n";
-            for (const auto& m : candidates)
-            {
-                // Value probe: folds the macro to a (long long) integer constant for value
-                // extraction. Type probe: declares a global of the macro's natural type via
-                // __typeof__ so the AST dump reports the unfolded type. The type-probe line
-                // can fail in isolation (e.g. when the macro is not an expression) without
-                // affecting the value-probe enum thanks to -ferror-limit=0 error recovery.
-                os << "enum { __cflat_m_" << m.name << " = (long long)(" << m.name << ") };\n";
-                os << "__typeof__(" << m.name << ") __cflat_t_" << m.name << ";\n";
-                // Double-fold probe: lets float/double macros (e.g. M_PI) carry full
-                // precision through Pass B. Routed via the __typeof__ result below so
-                // integer macros stay on the integer path even though this probe also
-                // folds them.
-                os << "static const double __cflat_f_" << m.name << " = (double)(" << m.name << ");\n";
-                // String probe: if the macro is a string literal, this VarDecl carries the
-                // initializer as a StringLiteral node we can harvest verbatim. For non-string
-                // macros the line fails compilation in isolation (no effect on neighbors
-                // under -ferror-limit=0) and resolvedString simply has no entry. Routing
-                // below keys on the __typeof__ result, not on a successful string probe,
-                // so things like `(int)"x"` (typeof = int) stay on the integer path.
-                os << "static const char* __cflat_s_" << m.name << " = (" << m.name << ");\n";
-            }
-            os.close();
+            // Value probe: folds the macro to a 64-bit integer constant (a const long long,
+            // not an enum - a C enumerator past INT_MAX is truncated). Type probe (__typeof__
+            // var): recovers the unfolded natural type. Double probe: preserves full precision
+            // for float macros. String probe: carries a string-literal macro for harvesting.
+            stub += "static const long long __cflat_m_" + m.name + " = (long long)(" + m.name + ");\n";
+            stub += "__typeof__(" + m.name + ") __cflat_t_" + m.name + ";\n";
+            stub += "static const double __cflat_f_" + m.name + " = (double)(" + m.name + ");\n";
+            stub += "static const char* __cflat_s_" + m.name + " = (" + m.name + ");\n";
         }
 
-        std::vector<std::string> argStrs = {
-            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json", "-fsyntax-only",
-            "-ferror-limit=0", "-Wno-everything"
-        };
-        argStrs.push_back("-I" + hdrDir);
-        for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
-        for (const auto& def : cDefines_)     argStrs.push_back("/D" + def);
-        for (const auto& def : extraDefines)  argStrs.push_back("/D" + def);
-        argStrs.push_back(resolvePath);
+        std::vector<std::string> args = BuildLibclangArgs(hdrDir, extraDefines, /*errorRecovery*/ true);
 
-        std::string jsonText;
-        if (!SpawnClangCapture(argStrs, jsonText)) return false;
-        if (jsonText.empty()) return false;
-
-        nlohmann::json rootDoc;
+        LibclangTU tu;
         {
-            llvm::TimeTraceScope parseScope("ParseMacroJson", std::format("{} bytes", jsonText.size()));
-            rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
+            llvm::TimeTraceScope parseScope("LibclangParseMacros", headerPath);
+            if (!ParseLibclangTU("cflat_mres.c", stub.c_str(), args,
+                                 CXTranslationUnit_SkipFunctionBodies, tu))
+                return false;
         }
-        if (rootDoc.is_discarded()) return false;
-        JRef root{ &rootDoc };
-        JRef tu = root->getAsObject();
-        if (!tu) return false;
-        JRef topLevel = tu->getArray("inner");
-        if (!topLevel) return true;
 
         // cflat-side walk of the macro-resolution AST.
-        llvm::TimeTraceScope walkScope("WalkMacroJson", headerPath);
+        llvm::TimeTraceScope walkScope("WalkMacroTU", headerPath);
 
-        // Walk the AST once and gather both pieces per macro:
-        //   __cflat_m_NAME (EnumConstantDecl) -> folded long long value
-        //   __cflat_t_NAME (VarDecl)          -> recovered qualType (HANDLE, void *, ...)
-        // EnumConstantDecls are nested inside EnumDecls; VarDecls live at top level.
-        // Both can fail independently (per-decl recovery via -ferror-limit=0).
-        const std::string mPrefix = "__cflat_m_";
-        const std::string tPrefix = "__cflat_t_";
-        const std::string fPrefix = "__cflat_f_";
-        const std::string sPrefix = "__cflat_s_";
+        // Walk the macro-resolution TU once, gathering per macro:
+        //   __cflat_m_NAME (EnumConstantDecl) -> folded integer value
+        //   __cflat_t_NAME (VarDecl)          -> recovered type spelling (HANDLE, void *, ...)
+        //   __cflat_f_NAME (VarDecl)          -> folded double (float / double macros)
+        //   __cflat_s_NAME (VarDecl)          -> decoded string literal
+        // Each probe resolves independently (per-decl recovery via -ferror-limit=0); a probe
+        // that failed to compile simply leaves no entry. All probe prefixes are 10 chars.
         std::unordered_map<std::string, long long>   resolvedVal;
         std::unordered_map<std::string, std::string> resolvedType;
         std::unordered_map<std::string, double>      resolvedFloat;
         std::unordered_map<std::string, std::string> resolvedString;
 
-        // Evaluate a constant-expression AST node to a double. Clang in C mode does
-        // not pre-fold `static const double x = ...;` initializers, so the float-fold
-        // probe emits a full expression tree we must evaluate ourselves. Covers what
-        // real-header macros use: literals, paren/cast wrappers, unary +/-, and the
-        // four arithmetic binary ops. Anything else yields false and the macro is
-        // dropped (same outcome as a non-constant integer macro).
-        std::function<bool(JRef, double&)> evalDouble =
-            [&](JRef n, double& out) -> bool {
-            if (!n) return false;
-            auto kind = n->getString("kind");
-            if (!kind) return false;
+        struct MacroCtx
+        {
+            std::unordered_map<std::string, long long>*   resolvedVal;
+            std::unordered_map<std::string, std::string>* resolvedType;
+            std::unordered_map<std::string, double>*      resolvedFloat;
+            std::unordered_map<std::string, std::string>* resolvedString;
+        } mctx{ &resolvedVal, &resolvedType, &resolvedFloat, &resolvedString };
 
-            if (*kind == "FloatingLiteral" || *kind == "IntegerLiteral" || *kind == "CharacterLiteral")
+        clang_visitChildren(tu.root(),
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
             {
-                if (auto v = n->getString("value"))
+                MacroCtx& m = *static_cast<MacroCtx*>(d);
+                CXCursorKind k = clang_getCursorKind(c);
+                if (k != CXCursor_VarDecl) return CXChildVisit_Continue; // all four probes are VarDecls
+
+                std::string name = CXToString(clang_getCursorSpelling(c));
+                if (name.rfind("__cflat_", 0) != 0 || name.size() < 10) return CXChildVisit_Continue;
+                const std::string suffix = name.substr(10); // strip the 10-char probe prefix
+
+                if (name.rfind("__cflat_m_", 0) == 0)
                 {
-                    try {
-                        size_t consumed = 0;
-                        double d = std::stod(v->str(), &consumed);
-                        if (consumed == v->str().size()) { out = d; return true; }
-                    } catch (...) {}
-                }
-                return false;
-            }
-            if (*kind == "ParenExpr" || *kind == "ImplicitCastExpr"
-                || *kind == "CStyleCastExpr" || *kind == "ConstantExpr")
-            {
-                if (auto inner = n->getArray("inner"))
-                    for (const auto& c : *inner)
-                        if (evalDouble(c.getAsObject(), out)) return true;
-                return false;
-            }
-            if (*kind == "UnaryOperator")
-            {
-                auto op = n->getString("opcode");
-                auto inner = n->getArray("inner");
-                if (!op || !inner || inner->empty()) return false;
-                double v;
-                if (!evalDouble(inner->front().getAsObject(), v)) return false;
-                if (*op == "-") { out = -v; return true; }
-                if (*op == "+") { out =  v; return true; }
-                return false;
-            }
-            if (*kind == "BinaryOperator")
-            {
-                auto op = n->getString("opcode");
-                auto inner = n->getArray("inner");
-                if (!op || !inner || inner->size() < 2) return false;
-                double l = 0.0, r = 0.0;
-                if (!evalDouble((*inner)[0].getAsObject(), l)) return false;
-                if (!evalDouble((*inner)[1].getAsObject(), r)) return false;
-                if (*op == "+") { out = l + r; return true; }
-                if (*op == "-") { out = l - r; return true; }
-                if (*op == "*") { out = l * r; return true; }
-                if (*op == "/") { if (r == 0.0) return false; out = l / r; return true; }
-                return false;
-            }
-            return false;
-        };
-
-        // Find the first evaluable double expression anywhere inside the VarDecl's
-        // subtree. evalDouble recurses through wrappers itself; this fallback skips
-        // VarDecl-specific decoration nodes (annotations, attrs) to reach the init.
-        std::function<bool(JRef, double&)> findFloat =
-            [&](JRef node, double& out) -> bool {
-            if (!node) return false;
-            if (evalDouble(node, out)) return true;
-            if (auto inner = node->getArray("inner"))
-                for (const auto& c : *inner)
-                    if (findFloat(c.getAsObject(), out)) return true;
-            return false;
-        };
-
-        // Locate the first StringLiteral anywhere inside a VarDecl's subtree and decode
-        // its `value` (clang emits the literal in C source form, including surrounding
-        // quotes and \-escapes). For adjacent literal concatenation (`"a" "b"`) clang
-        // already folds into a single StringLiteral by the time we see it.
-        std::function<bool(JRef, std::string&)> findString =
-            [&](JRef node, std::string& out) -> bool {
-            if (!node) return false;
-            if (auto kind = node->getString("kind"))
-            {
-                if (*kind == "StringLiteral")
-                {
-                    if (auto v = node->getString("value"))
+                    // clang folds the `(long long)(MACRO)` initializer to a constant integer.
+                    if (CXEvalResult r = clang_Cursor_Evaluate(c))
                     {
-                        // clang emits the literal in source form: a leading optional
-                        // encoding prefix (L/u/U/u8), then the quoted body with C
-                        // escape sequences preserved. Strip the prefix + quotes and
-                        // decode the escapes we care about (the same set CFlat uses
-                        // for its own string literals - \n \t \r \0 \\ \" \' plus
-                        // \xHH and \ooo for completeness).
-                        std::string s = v->str();
-                        size_t i = 0;
-                        while (i < s.size() && (s[i] == 'L' || s[i] == 'u' || s[i] == 'U'))
-                        {
-                            // u8"..." prefix is two characters.
-                            if (s[i] == 'u' && i + 1 < s.size() && s[i + 1] == '8') { i += 2; }
-                            else { ++i; }
-                        }
-                        if (i >= s.size() || s[i] != '"') return false;
-                        ++i; // skip opening quote
-                        std::string decoded;
-                        decoded.reserve(s.size());
-                        while (i < s.size() && s[i] != '"')
-                        {
-                            char c = s[i];
-                            if (c == '\\' && i + 1 < s.size())
-                            {
-                                char e = s[i + 1];
-                                switch (e)
-                                {
-                                    case 'n':  decoded += '\n'; i += 2; continue;
-                                    case 't':  decoded += '\t'; i += 2; continue;
-                                    case 'r':  decoded += '\r'; i += 2; continue;
-                                    case '0':  decoded += '\0'; i += 2; continue;
-                                    case '\\': decoded += '\\'; i += 2; continue;
-                                    case '"':  decoded += '"';  i += 2; continue;
-                                    case '\'': decoded += '\''; i += 2; continue;
-                                    case 'a':  decoded += '\a'; i += 2; continue;
-                                    case 'b':  decoded += '\b'; i += 2; continue;
-                                    case 'f':  decoded += '\f'; i += 2; continue;
-                                    case 'v':  decoded += '\v'; i += 2; continue;
-                                    default: break;
-                                }
-                                // Anything fancier (\xHH, \uXXXX, multi-digit octal)
-                                // would require more state; rather than half-implement,
-                                // bail out and drop the macro. Real-world version-style
-                                // macros don't use these escapes.
-                                return false;
-                            }
-                            decoded += c;
-                            ++i;
-                        }
-                        if (i >= s.size() || s[i] != '"') return false;
-                        out = std::move(decoded);
-                        return true;
-                    }
-                    return false;
-                }
-            }
-            if (auto inner = node->getArray("inner"))
-                for (const auto& c : *inner)
-                    if (findString(c.getAsObject(), out)) return true;
-            return false;
-        };
-
-        std::function<void(const JRef&)> visit = [&](const JRef& v) {
-            JRef node = v.getAsObject();
-            if (!node) return;
-            if (auto kind = node->getString("kind"))
-            {
-                if (*kind == "EnumConstantDecl")
-                {
-                    if (auto nm = node->getString("name"))
-                    {
-                        std::string n = nm->str();
-                        if (n.rfind(mPrefix, 0) == 0)
-                        {
-                            long long val = 0;
-                            if (FindConstantValue(node, val))
-                                resolvedVal[n.substr(mPrefix.size())] = val;
-                        }
+                        if (clang_EvalResult_getKind(r) == CXEval_Int)
+                            (*m.resolvedVal)[suffix] = clang_EvalResult_getAsLongLong(r);
+                        clang_EvalResult_dispose(r);
                     }
                 }
-                else if (*kind == "VarDecl")
+                else if (name.rfind("__cflat_t_", 0) == 0)
                 {
-                    if (auto nm = node->getString("name"))
+                    std::string t = DesugaredSpelling(clang_getCursorType(c));
+                    if (!t.empty()) (*m.resolvedType)[suffix] = std::move(t);
+                }
+                else if (name.rfind("__cflat_f_", 0) == 0)
+                {
+                    // clang folds the `(double)(MACRO)` initializer for us; an integer macro
+                    // also folds here but is routed back to the integer path by its __typeof__.
+                    if (CXEvalResult r = clang_Cursor_Evaluate(c))
                     {
-                        std::string n = nm->str();
-                        if (n.rfind(tPrefix, 0) == 0)
-                        {
-                            if (auto typeObj = node->getObject("type"))
-                            {
-                                std::string t;
-                                if (auto d = typeObj->getString("desugaredQualType")) t = d->str();
-                                else if (auto q = typeObj->getString("qualType"))     t = q->str();
-                                if (!t.empty())
-                                    resolvedType[n.substr(tPrefix.size())] = std::move(t);
-                            }
-                        }
-                        else if (n.rfind(fPrefix, 0) == 0)
-                        {
-                            double d = 0.0;
-                            if (findFloat(node, d))
-                                resolvedFloat[n.substr(fPrefix.size())] = d;
-                        }
-                        else if (n.rfind(sPrefix, 0) == 0)
-                        {
-                            std::string s;
-                            if (findString(node, s))
-                                resolvedString[n.substr(sPrefix.size())] = std::move(s);
-                        }
+                        CXEvalResultKind ek = clang_EvalResult_getKind(r);
+                        if (ek == CXEval_Float)
+                            (*m.resolvedFloat)[suffix] = clang_EvalResult_getAsDouble(r);
+                        else if (ek == CXEval_Int)
+                            (*m.resolvedFloat)[suffix] = (double)clang_EvalResult_getAsLongLong(r);
+                        clang_EvalResult_dispose(r);
                     }
                 }
-            }
-            if (auto inner = node->getArray("inner"))
-                for (const auto& c : *inner) visit(c);
-        };
-        for (const auto& v : *topLevel) visit(v);
+                else if (name.rfind("__cflat_s_", 0) == 0)
+                {
+                    // clang_Cursor_Evaluate does not fold a `const char*` to its string, so
+                    // locate the StringLiteral in the initializer and decode its source form
+                    // (the same form clang's JSON `value` carried).
+                    struct StrCtx { std::string out; bool found; } sctx{ std::string(), false };
+                    clang_visitChildren(c,
+                        [](CXCursor sc, CXCursor, CXClientData sd) -> CXChildVisitResult
+                        {
+                            StrCtx& s = *static_cast<StrCtx*>(sd);
+                            if (clang_getCursorKind(sc) != CXCursor_StringLiteral)
+                                return CXChildVisit_Recurse;
+                            std::string src = CXToString(clang_getCursorSpelling(sc));
+                            if (DecodeCStringLiteral(src, s.out)) { s.found = true; return CXChildVisit_Break; }
+                            return CXChildVisit_Recurse;
+                        }, &sctx);
+                    if (sctx.found) (*m.resolvedString)[suffix] = std::move(sctx.out);
+                }
+                return CXChildVisit_Continue;
+            }, &mctx);
 
         outMacros.reserve(resolvedVal.size() + resolvedFloat.size());
         for (const auto& cand : candidates)
@@ -3855,72 +3638,43 @@ private:
     // header itself contributes. A header pulls in the whole SDK/CRT transitively, so a
     // source-location filter keeps only decls whose file lives under the header's own dir
     // or one of the --c-include roots. Fills outSigs/outEnums; false on clang/parse error.
-    bool RunClangHeaderExtract(const std::string& clangPath, const std::string& headerPath,
+    bool RunClangHeaderExtract(const std::string& headerPath,
                                std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                                std::vector<CRecordEntry>& outRecords,
                                const std::vector<std::string>& extraDefines = {})
     {
-        const std::string target = (platformValue == 32)
-            ? "--target=i686-pc-windows-msvc"
-            : "--target=x86_64-pc-windows-msvc";
-
+        // The header is parsed in-process by libclang; clang-cl is only needed by the
+        // separate macro-discovery pass (ExtractCHeaderMacros).
         const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
 
-        // Stub TU: #include the header by absolute path (forward slashes for the lexer).
-        llvm::SmallString<256> stubFile;
-        if (llvm::sys::fs::createTemporaryFile("cflat_hdr", "c", stubFile)) return false;
-        const std::string stubPath = stubFile.str().str();
-        struct StubRemover { std::string p; ~StubRemover() { llvm::sys::fs::remove(p); } } stubRemover{ stubPath };
-        {
-            std::error_code ec;
-            llvm::raw_fd_ostream os(stubPath, ec, llvm::sys::fs::OF_Text);
-            if (ec) return false;
-            std::string fwd = headerPath;
-            std::replace(fwd.begin(), fwd.end(), '\\', '/');
-            os << "#include \"" << fwd << "\"\n";
-            os.close();
-        }
+        // In-memory stub TU: #include the header by absolute path (forward slashes for the
+        // lexer). No temp file - the content is handed to libclang as an unsaved file.
+        std::string fwd = headerPath;
+        std::replace(fwd.begin(), fwd.end(), '\\', '/');
+        const std::string stub = "#include \"" + fwd + "\"\n";
 
-        std::vector<std::string> argStrs = {
-            clangPath, "/nologo", target, "-Xclang", "-ast-dump=json", "-fsyntax-only"
-        };
-        argStrs.push_back("-I" + hdrDir);
-        for (const auto& inc : cIncludeDirs_) argStrs.push_back("-I" + inc);
-        for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
-        // Per-import `define` clauses, appended after the process-wide --c-define.
-        for (const auto& def : extraDefines) argStrs.push_back("/D" + def);
-        argStrs.push_back(stubPath);
+        std::vector<std::string> args = BuildLibclangArgs(hdrDir, extraDefines, /*errorRecovery*/ false);
 
         if (verbose)
-            std::cout << "[verbose] extracting C header: " << headerPath << " (clang AST dump)\n";
+            std::cout << "[verbose] extracting C header: " << headerPath << " (libclang)\n";
 
-        // The clang spawn is timed inside SpawnClangJson ("ClangSpawn"). The expensive part
-        // for a big header (curl.h) is not clang (~2s) but parsing/walking the very large AST
-        // JSON it prints - the two scopes below make that split visible in the trace.
-        std::string jsonText;
-        if (!SpawnClangJson(argStrs, jsonText))
-            return false;
-
-        nlohmann::json rootDoc;
+        LibclangTU tu;
         {
-            llvm::TimeTraceScope parseScope("ParseAstJson", std::format("{} bytes", jsonText.size()));
-            rootDoc = nlohmann::json::parse(jsonText, nullptr, /*allow_exceptions*/ false);
+            llvm::TimeTraceScope parseScope("LibclangParseHeader", headerPath);
+            if (!ParseLibclangTU("cflat_hdr_stub.c", stub.c_str(), args,
+                                 CXTranslationUnit_SkipFunctionBodies, tu))
+                return false;
         }
-        if (rootDoc.is_discarded()) return false;
-        JRef root{ &rootDoc };
-        JRef tu = root->getAsObject();
-        if (!tu) return false;
-        JRef topLevel = tu->getArray("inner");
-        if (!topLevel) return true;
 
-        // Everything from here is the in-process AST walk over the (potentially huge) JSON.
-        llvm::TimeTraceScope walkScope("WalkAstJson", headerPath);
+        llvm::TimeTraceScope walkScope("WalkHeaderTU", headerPath);
+        CXCursor root = tu.root();
 
         // Collect typedefs first so the signature mapper can chase pointer aliases
         // (HANDLE -> void *, SOCKET -> uintptr_t, etc.) during the function walk.
-        CollectCTypedefs(topLevel);
+        CollectCTypedefsLibclang(root);
 
-        // Normalize a path for prefix comparison: forward slashes, lowercase (Windows).
+        // A header pulls in the whole SDK/CRT transitively; a source-location filter keeps
+        // only decls whose file lives under the header's own dir or a --c-include root.
         auto norm = [](std::string p) {
             std::replace(p.begin(), p.end(), '\\', '/');
             std::transform(p.begin(), p.end(), p.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -3929,34 +3683,7 @@ private:
         std::vector<std::string> scopeRoots;
         scopeRoots.push_back(norm(hdrDir));
         for (const auto& inc : cIncludeDirs_) scopeRoots.push_back(norm(inc));
-
-        auto qualTypeOf = [](JRef typeObj) -> std::string {
-            if (!typeObj) return "";
-            if (auto d = typeObj->getString("desugaredQualType")) return d->str();
-            if (auto q = typeObj->getString("qualType")) return q->str();
-            return "";
-        };
-
-        // clang emits loc.file only when it changes between sibling nodes; a node with no
-        // file inherits the previous node's. Track it so the scope filter is accurate.
-        std::string lastFile;
-        auto fileOfNode = [&](JRef node) -> std::string {
-            auto pick = [&](JRef o) {
-                if (o)
-                    if (auto f = o->getString("file")) lastFile = f->str();
-            };
-            if (auto loc = node->getObject("loc"))
-            {
-                pick(loc);
-                if (auto exp = loc->getObject("expansionLoc")) pick(exp);
-                if (auto spel = loc->getObject("spellingLoc")) pick(spel);
-            }
-            if (auto range = node->getObject("range"))
-                if (auto begin = range->getObject("begin"))
-                    pick(begin);
-            return lastFile;
-        };
-        auto inScope = [&](const std::string& file) -> bool {
+        std::function<bool(const std::string&)> inScope = [&](const std::string& file) -> bool {
             if (file.empty()) return false;
             std::string nf = norm(file);
             for (const auto& r : scopeRoots)
@@ -3964,153 +3691,60 @@ private:
             return false;
         };
 
-        // Pre-pass: collect record (struct/union) decls so MapCTypeToTypeAndValue can resolve
-        // struct-by-value parameter/return types when the function-decl pass runs below. Uses
-        // its own sticky lastFile so we don't perturb the main loop's tracker.
+        // Records first (in-scope only), then register so the function pass can resolve
+        // struct-by-value parameter / return types against them.
+        CollectRecordsLibclang(root, outRecords, /*requireInScope*/ true, inScope);
+        RegisterCRecords(outRecords, headerPath);
+
+        struct Ctx
         {
-            std::string preLastFile;
-            auto preFileOfNode = [&](JRef node) -> std::string {
-                auto pick = [&](JRef o) {
-                    if (o)
-                        if (auto f = o->getString("file")) preLastFile = f->str();
-                };
-                if (auto loc = node->getObject("loc"))
-                {
-                    pick(loc);
-                    if (auto exp = loc->getObject("expansionLoc")) pick(exp);
-                    if (auto spel = loc->getObject("spellingLoc")) pick(spel);
-                }
-                if (auto range = node->getObject("range"))
-                    if (auto begin = range->getObject("begin"))
-                        pick(begin);
-                return preLastFile;
-            };
-            for (const JRef& v : *topLevel)
+            LLVMBackend* self;
+            std::vector<CSigEntry>* outSigs;
+            std::vector<CEnumEntry>* outEnums;
+            const std::function<bool(const std::string&)>* inScope;
+        } ctx{ this, &outSigs, &outEnums, &inScope };
+
+        clang_visitChildren(root,
+            [](CXCursor c, CXCursor, CXClientData d) -> CXChildVisitResult
             {
-                JRef node = v.getAsObject();
-                if (!node) continue;
-                const std::string curFile = preFileOfNode(node);
-                auto kind = node->getString("kind");
-                if (!kind || *kind != "RecordDecl") continue;
-                if (!inScope(curFile)) continue;
-                auto nm = node->getString("name");
-                if (!nm || nm->empty()) continue;
-                auto cd = node->getBoolean("completeDefinition");
-                if (!cd || !*cd) continue;
-                auto tag = node->getString("tagUsed");
-                CRecordEntry rec;
-                rec.name = nm->str();
-                rec.isUnion = tag && *tag == "union";
-                CollectRecordFieldsAndNested(node, rec.name, rec, outRecords);
-                if (auto loc = node->getObject("loc"))
+                Ctx& ctx = *static_cast<Ctx*>(d);
+                CXCursorKind k = clang_getCursorKind(c);
+                if (k != CXCursor_FunctionDecl && k != CXCursor_EnumDecl) return CXChildVisit_Continue;
+                if (!(*ctx.inScope)(CursorFile(c))) return CXChildVisit_Continue; // drop SDK / CRT
+
+                if (k == CXCursor_FunctionDecl)
                 {
-                    if (auto l = loc->getInteger("line")) rec.line = (int)*l;
-                    if (auto cc = loc->getInteger("col")) rec.col = (int)*cc - 1;
-                }
-                outRecords.push_back(std::move(rec));
-            }
-            RegisterCRecords(outRecords, headerPath);
-        }
-
-        for (const JRef& v : *topLevel)
-        {
-            JRef node = v.getAsObject();
-            if (!node) continue;
-            const std::string curFile = fileOfNode(node); // updates lastFile (sticky)
-            auto kind = node->getString("kind");
-            if (!kind) continue;
-            if (!inScope(curFile)) continue; // drop SDK / CRT / builtin decls
-
-            if (*kind == "FunctionDecl")
-            {
-                if (auto sc = node->getString("storageClass"); sc && *sc == "static") continue;
-                auto nm = node->getString("name");
-                if (!nm || nm->empty()) continue;
-
-                CSigEntry entry;
-                entry.name = nm->str();
-
-                std::string funcQual = qualTypeOf(node->getObject("type"));
-                entry.variadic = funcQual.find("...") != std::string::npos;
-
-                std::string retStr = funcQual;
-                if (auto paren = funcQual.find('('); paren != std::string::npos)
-                    retStr = funcQual.substr(0, paren);
-                if (!MapCTypeToTypeAndValue(retStr, entry.ret))
-                {
-                    if (verbose) std::cout << "[verbose]   skipping '" << entry.name
-                                           << "': unsupported return type '" << retStr << "'\n";
-                    continue;
+                    // Header binding registers declarations (no body required); skip statics.
+                    if (clang_Cursor_getStorageClass(c) == CX_SC_Static) return CXChildVisit_Continue;
+                    CSigEntry entry;
+                    if (ctx.self->BuildCSigFromCursor(c, entry))
+                        ctx.outSigs->push_back(std::move(entry));
+                    return CXChildVisit_Continue;
                 }
 
-                bool paramsOk = true;
-                if (auto fnInner = node->getArray("inner"))
-                {
-                    for (const auto& c : *fnInner)
+                // EnumDecl (named or anonymous): every constant becomes a bare global int.
+                // libclang reports the resolved value directly, so no running counter.
+                struct EnumCtx { std::vector<CEnumEntry>* outEnums; } ec{ ctx.outEnums };
+                clang_visitChildren(c,
+                    [](CXCursor ec, CXCursor, CXClientData ed) -> CXChildVisitResult
                     {
-                        JRef co = c.getAsObject();
-                        if (!co) continue;
-                        auto ck = co->getString("kind");
-                        if (!ck || *ck != "ParmVarDecl") continue;
-
-                        TypeAndValue ptv;
-                        std::string pQual = qualTypeOf(co->getObject("type"));
-                        if (!MapCTypeToTypeAndValue(pQual, ptv))
-                        {
-                            if (verbose) std::cout << "[verbose]   skipping '" << entry.name
-                                                   << "': unsupported parameter type '" << pQual << "'\n";
-                            paramsOk = false;
-                            break;
-                        }
-                        if (auto pn = co->getString("name")) ptv.VariableName = pn->str();
-                        entry.params.push_back(ptv);
-                    }
-                }
-                if (!paramsOk) continue;
-
-                if (auto loc = node->getObject("loc"))
-                {
-                    if (auto l = loc->getInteger("line")) entry.line = (int)*l;
-                    if (auto cc = loc->getInteger("col")) entry.col = (int)*cc - 1;
-                }
-                outSigs.push_back(std::move(entry));
-            }
-            else if (*kind == "EnumDecl")
-            {
-                long long current = 0;
-                if (auto enumInner = node->getArray("inner"))
-                {
-                    for (const auto& c : *enumInner)
-                    {
-                        JRef co = c.getAsObject();
-                        if (!co) continue;
-                        auto ck = co->getString("kind");
-                        if (!ck || *ck != "EnumConstantDecl") continue;
-                        auto en = co->getString("name");
-                        if (!en || en->empty()) continue;
-
-                        long long value = current;
-                        if (auto eci = co->getArray("inner"))
-                            for (const auto& e : *eci)
-                            {
-                                long long parsed = 0;
-                                if (FindConstantValue(e.getAsObject(), parsed)) { value = parsed; break; }
-                            }
-
+                        if (clang_getCursorKind(ec) != CXCursor_EnumConstantDecl) return CXChildVisit_Continue;
+                        std::string en = CXToString(clang_getCursorSpelling(ec));
+                        if (en.empty()) return CXChildVisit_Continue;
                         CEnumEntry ee;
-                        ee.name  = en->str();
-                        ee.value = value;
-                        if (auto loc = co->getObject("loc"))
-                        {
-                            if (auto l = loc->getInteger("line")) ee.line = (int)*l;
-                            if (auto cc = loc->getInteger("col")) ee.col = (int)*cc - 1;
-                        }
-                        outEnums.push_back(std::move(ee));
-                        current = value + 1;
-                    }
-                }
-            }
-        }
+                        ee.name  = std::move(en);
+                        ee.value = clang_getEnumConstantDeclValue(ec);
+                        CXSourceLocation loc = clang_getCursorLocation(ec);
+                        unsigned line = 0, col = 0;
+                        clang_getFileLocation(loc, nullptr, &line, &col, nullptr);
+                        ee.line = line ? (int)line : 1;
+                        ee.col  = col ? (int)col - 1 : 0;
+                        static_cast<EnumCtx*>(ed)->outEnums->push_back(std::move(ee));
+                        return CXChildVisit_Continue;
+                    }, &ec);
+                return CXChildVisit_Continue;
+            }, &ctx);
+
         return true;
     }
 
@@ -4183,28 +3817,28 @@ private:
             return true;
         }
 
-        const std::string clangPath = FindClangCl();
-        if (clangPath.empty())
-        {
-            LogError(std::format("clang-cl.exe not found - cannot bind C header '{}'.", headerPath));
-            return false;
-        }
-
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         {
+            // Function / enum / record binding is in-process via libclang (no clang-cl).
             llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
-            if (!RunClangHeaderExtract(clangPath, headerPath, sigs, enums, records, extraDefines))
+            if (!RunClangHeaderExtract(headerPath, sigs, enums, records, extraDefines))
                 return false;
         }
-        // Macro discovery is best-effort: failure here (clang missing a header path, OOM,
-        // etc.) should not invalidate the function / enum / record bindings we already got.
+        // #define macro discovery still shells out to clang-cl (-E -dD); it is best-effort,
+        // so a missing toolchain or header path leaves the decls already bound above intact.
+        if (const std::string clangPath = FindClangCl(); !clangPath.empty())
         {
             llvm::TimeTraceScope macroScope("CHeaderMacros", headerPath);
             (void)ExtractCHeaderMacros(clangPath, headerPath, extraDefines, macros, funcMacros);
+        }
+        else if (verbose)
+        {
+            std::cout << "[verbose] clang-cl not found; binding '" << headerPath
+                      << "' decls only (skipping #define macro extraction)\n";
         }
 
         if (!mtEc)
