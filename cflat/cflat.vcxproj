@@ -147,7 +147,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;libclang.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;version.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -168,7 +168,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;libclang.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;version.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -177,6 +177,8 @@
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClInclude Include="LLVMBackend.h" />
+    <ClCompile Include="CClangExtract.cpp" />
+    <ClInclude Include="CClangExtract.h" />
     <ClInclude Include="MainListener.h" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="JsonRpcLoop.cpp" />
@@ -507,6 +509,6 @@
       <_VcpkgBinDir Condition="'$(Configuration)'=='Release'">$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\bin</_VcpkgBinDir>
       <_VcpkgToolsDir>$(VcpkgManifestRoot)\vcpkg_installed\$(VcpkgTriplet)\$(VcpkgTriplet)\tools\llvm</_VcpkgToolsDir>
     </PropertyGroup>
-    <Copy SourceFiles="$(_VcpkgBinDir)\LTO.dll;$(_VcpkgBinDir)\Remarks.dll;$(_VcpkgBinDir)\libclang.dll;$(_VcpkgToolsDir)\lld-link.exe;$(_VcpkgToolsDir)\clang-cl.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(_VcpkgBinDir)\LTO.dll;$(_VcpkgBinDir)\Remarks.dll;$(_VcpkgToolsDir)\lld-link.exe;$(_VcpkgToolsDir)\clang-cl.exe" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
   </Target>
 </Project>
