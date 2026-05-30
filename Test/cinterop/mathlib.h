@@ -65,6 +65,8 @@ enum Extra
 #define ML_NEG_OFFSET     (-5)         /* parenthesized negative */
 #define ML_COMBINED_MASK  ((1 << 0) | (1 << 2) | (1 << 4))   /* 21 */
 #define ML_BIG_CONST      0x100000000LL                       /* > INT32_MAX -> i64 */
+#define ML_UINT_ALL       0xFFFFFFFFU                          /* unsigned int max; must stay positive (not sign-extended to -1) */
+#define ML_UMAX64         (~(unsigned long long)0)             /* unsigned 64-bit max; bit-reinterp to i64(-1) */
 
 /* Float/double macros - routed via Pass B's __typeof__ probe (type is `double`
  * for unsuffixed literals, `float` for f-suffixed) and resolved by the

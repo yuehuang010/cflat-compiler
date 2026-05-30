@@ -4841,7 +4841,7 @@ public:
         {
             // Integer literal initializer for a float/double field (e.g. float x = 0)
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
-                return llvm::ConstantFP::get(destType, (double)constInt->getSExtValue());
+                return llvm::ConstantFP::get(destType, (double)(int64_t)constInt->getZExtValue());
             return builder->CreateSIToFP(value, destType);
         }
         else if (srcType->isIntegerTy() && destType->isPointerTy())
@@ -5870,7 +5870,8 @@ public:
 
     llvm::ConstantInt* CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType)
     {
-        return llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(switchType), val->getSExtValue(), true);
+        // getZExtValue avoids the isRepresentableByInt64 assert for constants > INT64_MAX.
+        return llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(switchType), val->getZExtValue(), false);
     }
 
     llvm::Function* GetOrDeclareStrcmp()

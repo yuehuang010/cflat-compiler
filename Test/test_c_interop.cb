@@ -184,6 +184,18 @@ extern int main()
     i64 big = ML_BIG_CONST;
     if (big != (i64)0x100000000)        return 94;
 
+    // Unsigned 32-bit max (0xFFFFFFFFU). getZExtValue gives 4294967295 (positive i64).
+    // A wrong implementation using getSExtValue on an unsigned APSInt would
+    // sign-extend to -1, making the value negative - detectable in Release.
+    i64 uall = ML_UINT_ALL;
+    if (uall <= 0)                      return 116;   // 4294967295 > 0 always
+
+    // Unsigned 64-bit max (~0ULL). Correct extraction bit-reinterprets to i64(-1).
+    // The old code triggered an isRepresentableByInt64 assert in Debug LLVM builds
+    // for this exact shape; this test catches any regression.
+    i64 umax64 = ML_UMAX64;
+    if (umax64 != (i64)-1)              return 117;
+
     // Gated by inline `define "ML_EXTRA"` on the import line. Verifies per-import
     // defines reach the macro extractor, not just the decl/enum dumps.
     if (ML_EXTRA_MACRO != 77)           return 95;
