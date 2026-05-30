@@ -64,6 +64,21 @@
 
 struct ExpectedErrorReceived {};
 
+// Resolved paths for lld-link and the MSVC / Windows SDK lib directories.
+// Persisted to %USERPROFILE%\.cflat\linker_paths_<arch>.json by --init and
+// loaded from there by EmitExecutable before falling back to live discovery.
+struct LinkerPaths {
+    std::string lldLink;
+    std::string msvcLib;
+    std::string ucrtLib;
+    std::string umLib;
+    bool AllExist() const
+    {
+        auto e = [](const std::string& p) { return p.empty() || llvm::sys::fs::exists(p); };
+        return !lldLink.empty() && llvm::sys::fs::exists(lldLink) && e(msvcLib) && e(ucrtLib) && e(umLib);
+    }
+};
+
 // Per-backend generic template state. Holds the ANTLR contexts and metadata for
 // all generic struct/class/interface/function templates seen during one analysis,
 // plus the queue of pending instantiations. Lives on LLVMBackend so multiple
@@ -1862,6 +1877,26 @@ private:
         return "";
     }
 
+    // --- Linker path helpers (cache-first; static so --init can call without a compile) ---
+
+    // Returns %USERPROFILE%\.cflat, or "" if USERPROFILE is unset.
+    static std::string GetCflatCacheDir();
+
+    // Run vswhere + directory scan and return the resolved paths for the given arch ("x64"/"x86").
+    // runtimeDir is the directory of cflat.exe, used to locate the deployed lld-link/clang-cl.
+    static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir);
+
+    // Try to load previously cached paths from ~/.cflat/linker_paths_<arch>.json.
+    // Returns nullopt if the file is missing, malformed, or any stored path no longer exists.
+    static std::optional<LinkerPaths> LoadLinkerPathsFromCache(const std::string& arch);
+
+    // Persist paths to ~/.cflat/linker_paths_<arch>.json (creates the directory if needed).
+    static bool SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths);
+
+    // Cache-first lookup: load from disk, fall back to DiscoverLinkerPaths, and write the
+    // cache on a miss so subsequent compiles skip discovery.
+    static LinkerPaths FindLinkerPaths(const std::string& arch, const std::string& runtimeDir);
+
     // Compile a real C source file with clang-cl into a temporary object, recorded
     // in cObjectFiles_ for EmitExecutable to link. clang-cl auto-detects the Windows
     // SDK / MSVC, so no explicit include-dir discovery is needed here. Headers come
@@ -3159,90 +3194,17 @@ private:
             dest.close();
         }
 
-        // ---- Find lld-link (prefer the copy next to clang-cl, i.e. next to cflat.exe) ----
-        std::string lldLinkPath;
-        std::string msvcLibPath, ucrtLibPath, umLibPath;
+        // ---- Find lld-link and MSVC / Windows SDK lib paths (cache-first) ----
         const std::string arch = (platform == "win32") ? "x86" : "x64";
+        LinkerPaths linkerPaths_;
         {
             llvm::TimeTraceScope pathScope("FindLinkerPaths", exePath);
-
-            {
-                std::string clangPath = FindClangCl();
-                if (!clangPath.empty())
-                {
-                    llvm::SmallString<256> candidate(llvm::sys::path::parent_path(clangPath));
-                    llvm::sys::path::append(candidate, "lld-link.exe");
-                    if (llvm::sys::fs::exists(candidate))
-                        lldLinkPath = candidate.str().str();
-                }
-                if (lldLinkPath.empty())
-                {
-                    auto err = llvm::sys::findProgramByName("lld-link");
-                    if (err) lldLinkPath = *err;
-                }
-            }
-
-            // ---- Find VS install path via vswhere ----
-            std::string vsPath;
-            {
-                const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-                if (llvm::sys::fs::exists(vswhereFixed))
-                {
-                    llvm::SmallString<256> outFile;
-                    llvm::sys::path::system_temp_directory(true, outFile);
-                    int outFD;
-                    if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
-                    {
-                        _close(outFD);
-                        std::string outFileStr = outFile.str().str();
-
-                        std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
-                        std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                        llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
-
-                        if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
-                            vsPath = buf.get()->getBuffer().trim().str();
-                        llvm::sys::fs::remove(outFile);
-                    }
-                }
-            }
-
-            // ---- Find latest MSVC lib path ----
-            if (!vsPath.empty())
-            {
-                std::string msvcRoot = vsPath + "\\VC\\Tools\\MSVC";
-                std::string latestVer;
-                std::error_code ec;
-                for (auto it = llvm::sys::fs::directory_iterator(msvcRoot, ec);
-                     it != llvm::sys::fs::directory_iterator(); it.increment(ec))
-                {
-                    if (ec) break;
-                    auto ver = llvm::sys::path::filename(it->path()).str();
-                    if (ver > latestVer) latestVer = ver;
-                }
-                if (!latestVer.empty())
-                    msvcLibPath = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
-            }
-
-            // ---- Find latest Windows SDK lib paths ----
-            {
-                std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
-                std::string latestSDK;
-                std::error_code ec;
-                for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
-                     it != llvm::sys::fs::directory_iterator(); it.increment(ec))
-                {
-                    if (ec) break;
-                    auto ver = llvm::sys::path::filename(it->path()).str();
-                    if (ver > latestSDK) latestSDK = ver;
-                }
-                if (!latestSDK.empty())
-                {
-                    ucrtLibPath = wkLib + "\\" + latestSDK + "\\ucrt\\" + arch;
-                    umLibPath   = wkLib + "\\" + latestSDK + "\\um\\"   + arch;
-                }
-            }
+            linkerPaths_ = FindLinkerPaths(arch, runtimeDir);
         }
+        const std::string& lldLinkPath = linkerPaths_.lldLink;
+        const std::string& msvcLibPath = linkerPaths_.msvcLib;
+        const std::string& ucrtLibPath = linkerPaths_.ucrtLib;
+        const std::string& umLibPath   = linkerPaths_.umLib;
 
         if (lldLinkPath.empty())
         {
@@ -8619,6 +8581,10 @@ public:
 
     bool Analyze(const std::string& filePath, const std::string& importDir, const std::string& runtimeDirPath);
     void ResetForReanalysis();
+
+    // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.
+    // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
+    static bool RunInit(const std::string& runtimeDir, bool verbose);
 };
 
 // Defined here so LLVMBackend is fully declared before DumpState() is called.

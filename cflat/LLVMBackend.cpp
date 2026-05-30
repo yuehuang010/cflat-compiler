@@ -1134,3 +1134,202 @@ void LLVMBackend::ResetForReanalysis()
     // so it must exist before any core file is compiled.
     RegisterBuiltinString();
 }
+
+// ---- Linker path cache helpers ----
+
+std::string LLVMBackend::GetCflatCacheDir()
+{
+    char buf[260] = {};
+    size_t len = 0;
+    if (getenv_s(&len, buf, sizeof(buf), "USERPROFILE") != 0 || len == 0)
+        return {};
+    return std::string(buf) + "\\.cflat";
+}
+
+LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir)
+{
+    LinkerPaths result;
+
+    // Find lld-link: prefer the copy next to clang-cl (which lives next to cflat.exe).
+    {
+        std::string clangPath;
+        if (!runtimeDir.empty())
+        {
+            llvm::SmallString<256> c(runtimeDir);
+            llvm::sys::path::append(c, "clang-cl.exe");
+            if (llvm::sys::fs::exists(c))
+                clangPath = c.str().str();
+        }
+        if (clangPath.empty())
+        {
+            if (auto p = llvm::sys::findProgramByName("clang-cl"))
+                clangPath = *p;
+        }
+        if (!clangPath.empty())
+        {
+            llvm::SmallString<256> candidate(llvm::sys::path::parent_path(clangPath));
+            llvm::sys::path::append(candidate, "lld-link.exe");
+            if (llvm::sys::fs::exists(candidate))
+                result.lldLink = candidate.str().str();
+        }
+        if (result.lldLink.empty())
+        {
+            if (auto p = llvm::sys::findProgramByName("lld-link"))
+                result.lldLink = *p;
+        }
+    }
+
+    // Find VS install path via vswhere.
+    std::string vsPath;
+    {
+        const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+        if (llvm::sys::fs::exists(vswhereFixed))
+        {
+            llvm::SmallString<256> outFile;
+            llvm::sys::path::system_temp_directory(true, outFile);
+            int outFD;
+            if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
+            {
+                _close(outFD);
+                std::string outFileStr = outFile.str().str();
+                std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
+                std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
+                llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
+                if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
+                    vsPath = buf.get()->getBuffer().trim().str();
+                llvm::sys::fs::remove(outFile);
+            }
+        }
+    }
+
+    // Find the latest MSVC lib directory.
+    if (!vsPath.empty())
+    {
+        std::string msvcRoot = vsPath + "\\VC\\Tools\\MSVC";
+        std::string latestVer;
+        std::error_code ec;
+        for (auto it = llvm::sys::fs::directory_iterator(msvcRoot, ec);
+             it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+        {
+            if (ec) break;
+            auto ver = llvm::sys::path::filename(it->path()).str();
+            if (ver > latestVer) latestVer = ver;
+        }
+        if (!latestVer.empty())
+            result.msvcLib = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
+    }
+
+    // Find the latest Windows SDK lib directories.
+    {
+        std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+        std::string latestSDK;
+        std::error_code ec;
+        for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
+             it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+        {
+            if (ec) break;
+            auto ver = llvm::sys::path::filename(it->path()).str();
+            if (ver > latestSDK) latestSDK = ver;
+        }
+        if (!latestSDK.empty())
+        {
+            result.ucrtLib = wkLib + "\\" + latestSDK + "\\ucrt\\" + arch;
+            result.umLib   = wkLib + "\\" + latestSDK + "\\um\\"   + arch;
+        }
+    }
+
+    return result;
+}
+
+std::optional<LinkerPaths> LLVMBackend::LoadLinkerPathsFromCache(const std::string& arch)
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty()) return std::nullopt;
+
+    std::string jsonPath = cacheDir + "\\linker_paths_" + arch + ".json";
+    auto buf = llvm::MemoryBuffer::getFile(jsonPath);
+    if (!buf) return std::nullopt;
+
+    auto parsed = llvm::json::parse(buf.get()->getBuffer());
+    if (!parsed) return std::nullopt;
+
+    auto* obj = parsed->getAsObject();
+    if (!obj) return std::nullopt;
+
+    LinkerPaths paths;
+    if (auto v = obj->getString("lld_link")) paths.lldLink = v->str();
+    if (auto v = obj->getString("msvc_lib")) paths.msvcLib = v->str();
+    if (auto v = obj->getString("ucrt_lib")) paths.ucrtLib = v->str();
+    if (auto v = obj->getString("um_lib"))   paths.umLib   = v->str();
+
+    if (!paths.AllExist()) return std::nullopt;
+    return paths;
+}
+
+bool LLVMBackend::SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths)
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty()) return false;
+
+    if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
+        return false;
+
+    llvm::json::Object obj;
+    obj["lld_link"] = paths.lldLink;
+    obj["msvc_lib"] = paths.msvcLib;
+    obj["ucrt_lib"] = paths.ucrtLib;
+    obj["um_lib"]   = paths.umLib;
+
+    std::string jsonPath = cacheDir + "\\linker_paths_" + arch + ".json";
+    std::error_code fec;
+    llvm::raw_fd_ostream out(jsonPath, fec);
+    if (fec) return false;
+
+    out << llvm::json::Value(std::move(obj));
+    return true;
+}
+
+LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::string& runtimeDir)
+{
+    if (auto cached = LoadLinkerPathsFromCache(arch))
+        return *cached;
+
+    LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
+    SaveLinkerPathsToCache(arch, paths);
+    return paths;
+}
+
+bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
+{
+    std::string cacheDir = GetCflatCacheDir();
+    if (cacheDir.empty())
+    {
+        std::cerr << "Error: USERPROFILE environment variable is not set.\n";
+        return false;
+    }
+
+    if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
+    {
+        std::cerr << "Error: could not create " << cacheDir << ": " << ec.message() << "\n";
+        return false;
+    }
+    std::cout << "Cache directory: " << cacheDir << "\n";
+
+    for (const char* arch : {"x64", "x86"})
+    {
+        std::cout << "Discovering linker paths for " << arch << "...\n";
+        LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
+
+        std::cout << "  lld-link: " << (paths.lldLink.empty() ? "(not found)" : paths.lldLink) << "\n";
+        std::cout << "  msvc-lib: " << (paths.msvcLib.empty() ? "(not found)" : paths.msvcLib) << "\n";
+        std::cout << "  ucrt-lib: " << (paths.ucrtLib.empty() ? "(not found)" : paths.ucrtLib) << "\n";
+        std::cout << "  um-lib:   " << (paths.umLib.empty() ? "(not found)" : paths.umLib) << "\n";
+
+        if (SaveLinkerPathsToCache(arch, paths))
+            std::cout << "  Saved linker_paths_" << arch << ".json\n";
+        else
+            std::cerr << "  Warning: could not write cache file for " << arch << ".\n";
+    }
+
+    return true;
+}

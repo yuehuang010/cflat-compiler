@@ -54,6 +54,7 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-manifest", 0, "Explicit vcpkg.json path (skips upward walk from the source file)");
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
     args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
+    args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths for x64 and x86, then exit");
 
     if (!args.parse(argc, argv))
         return 1;
@@ -62,6 +63,17 @@ int main(int argc, char* argv[])
     {
         std::cout << std::format("{}.{}\n", MAJOR_VERSION, MINOR_VERSION);
         return 0;
+    }
+
+    // Locate runtime.cb next to this executable (needed for lld-link discovery too).
+    char* pgmptr = nullptr;
+    _get_pgmptr(&pgmptr);
+    std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+
+    if (args.hasFlag("init"))
+    {
+        bool ok = LLVMBackend::RunInit(runtimeDir, args.hasFlag("verbose"));
+        return ok ? 0 : 1;
     }
 
     auto filename = args.getPositional(0);
@@ -75,11 +87,6 @@ int main(int argc, char* argv[])
     bool showLogo = !args.hasFlag("nologo");
     if (showLogo)
         std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
-
-    // Locate runtime.cb next to this executable.
-    char* pgmptr = nullptr;
-    _get_pgmptr(&pgmptr);
-    std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
 
     // --ftime-trace is a top-level switch: initialize the profiler up front so every
     // code path below (single compile or --check batch) is captured, and write the trace
