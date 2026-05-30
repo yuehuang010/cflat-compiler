@@ -2402,35 +2402,52 @@ private:
             return false;
         }
 
-        AdoptRawTypedefs(raw);
+        {
+            llvm::TimeTraceScope adoptScope("AdoptTypedefs", headerPath);
+            AdoptRawTypedefs(raw);
+        }
 
         // Records first, then register, so struct-by-value param/return types resolve.
-        MapRawRecords(raw, outRecords);
-        RegisterCRecords(outRecords, headerPath);
+        {
+            llvm::TimeTraceScope recordScope("RegisterCRecords", headerPath);
+            MapRawRecords(raw, outRecords);
+            RegisterCRecords(outRecords, headerPath);
+        }
 
-        for (const auto& rs : raw.sigs)
         {
-            CSigEntry e;
-            if (MapRawSig(rs, e)) outSigs.push_back(std::move(e));
+            llvm::TimeTraceScope sigScope("MapSignatures", headerPath);
+            for (const auto& rs : raw.sigs)
+            {
+                CSigEntry e;
+                if (MapRawSig(rs, e)) outSigs.push_back(std::move(e));
+            }
         }
-        for (const auto& re : raw.enums)
+
         {
-            CEnumEntry e;
-            e.name = re.name; e.value = re.value;
-            e.line = re.line ? re.line : 1; e.col = re.col < 0 ? 0 : re.col;
-            outEnums.push_back(std::move(e));
+            llvm::TimeTraceScope enumScope("MapEnums", headerPath);
+            for (const auto& re : raw.enums)
+            {
+                CEnumEntry e;
+                e.name = re.name; e.value = re.value;
+                e.line = re.line ? re.line : 1; e.col = re.col < 0 ? 0 : re.col;
+                outEnums.push_back(std::move(e));
+            }
         }
-        for (const auto& rm : raw.macros)
+
         {
-            CMacroEntry e;
-            if (ClassifyRawMacro(rm, e)) outMacros.push_back(std::move(e));
-        }
-        for (const auto& rf : raw.funcMacros)
-        {
-            CFunctionMacroEntry e;
-            e.name = rf.name; e.params = rf.params; e.body = rf.body;
-            e.file = rf.file; e.line = rf.line ? rf.line : 1; e.col = rf.col < 0 ? 0 : rf.col;
-            outFuncMacros.push_back(std::move(e));
+            llvm::TimeTraceScope macroScope("MapMacros", headerPath);
+            for (const auto& rm : raw.macros)
+            {
+                CMacroEntry e;
+                if (ClassifyRawMacro(rm, e)) outMacros.push_back(std::move(e));
+            }
+            for (const auto& rf : raw.funcMacros)
+            {
+                CFunctionMacroEntry e;
+                e.name = rf.name; e.params = rf.params; e.body = rf.body;
+                e.file = rf.file; e.line = rf.line ? rf.line : 1; e.col = rf.col < 0 ? 0 : rf.col;
+                outFuncMacros.push_back(std::move(e));
+            }
         }
 
         if (verbose)
@@ -2445,6 +2462,8 @@ private:
     bool ExtractCFileClang(const std::string& cSourcePath,
                            std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords)
     {
+        llvm::TimeTraceScope extractScope("CFileExtract", cSourcePath);
+
         cflat_cinterop::ExtractRequest req;
         req.realPath        = cSourcePath;     // parsed from disk
         req.args            = BuildClangDriverArgs(/*headerDir*/ "", /*extraDefines*/ {}, /*errorRecovery*/ true);
@@ -2463,14 +2482,22 @@ private:
             return false;
         }
 
-        AdoptRawTypedefs(raw);
-        MapRawRecords(raw, outRecords);
-        RegisterCRecords(outRecords, cSourcePath);
-
-        for (const auto& rs : raw.sigs)
         {
-            CSigEntry e;
-            if (MapRawSig(rs, e)) outSigs.push_back(std::move(e));
+            llvm::TimeTraceScope adoptScope("AdoptTypedefs", cSourcePath);
+            AdoptRawTypedefs(raw);
+        }
+        {
+            llvm::TimeTraceScope recordScope("RegisterCRecords", cSourcePath);
+            MapRawRecords(raw, outRecords);
+            RegisterCRecords(outRecords, cSourcePath);
+        }
+        {
+            llvm::TimeTraceScope sigScope("MapSignatures", cSourcePath);
+            for (const auto& rs : raw.sigs)
+            {
+                CSigEntry e;
+                if (MapRawSig(rs, e)) outSigs.push_back(std::move(e));
+            }
         }
         return true;
     }
@@ -3119,103 +3146,109 @@ private:
             return false;
         }
 
-        llvm::legacy::PassManager pass;
-        if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
         {
-            std::cerr << "Error: target does not support object file emission\n";
-            return false;
+            llvm::TimeTraceScope codegenScope("ObjectCodegen", exePath);
+            llvm::legacy::PassManager pass;
+            if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
+            {
+                std::cerr << "Error: target does not support object file emission\n";
+                return false;
+            }
+            pass.run(*module);
+            dest.flush();
+            dest.close();
         }
-        pass.run(*module);
-        dest.flush();
-        dest.close();
 
         // ---- Find lld-link (prefer the copy next to clang-cl, i.e. next to cflat.exe) ----
         std::string lldLinkPath;
+        std::string msvcLibPath, ucrtLibPath, umLibPath;
+        const std::string arch = (platform == "win32") ? "x86" : "x64";
         {
-            std::string clangPath = FindClangCl();
-            if (!clangPath.empty())
+            llvm::TimeTraceScope pathScope("FindLinkerPaths", exePath);
+
             {
-                llvm::SmallString<256> candidate(llvm::sys::path::parent_path(clangPath));
-                llvm::sys::path::append(candidate, "lld-link.exe");
-                if (llvm::sys::fs::exists(candidate))
-                    lldLinkPath = candidate.str().str();
+                std::string clangPath = FindClangCl();
+                if (!clangPath.empty())
+                {
+                    llvm::SmallString<256> candidate(llvm::sys::path::parent_path(clangPath));
+                    llvm::sys::path::append(candidate, "lld-link.exe");
+                    if (llvm::sys::fs::exists(candidate))
+                        lldLinkPath = candidate.str().str();
+                }
+                if (lldLinkPath.empty())
+                {
+                    auto err = llvm::sys::findProgramByName("lld-link");
+                    if (err) lldLinkPath = *err;
+                }
             }
-            if (lldLinkPath.empty())
+
+            // ---- Find VS install path via vswhere ----
+            std::string vsPath;
             {
-                auto err = llvm::sys::findProgramByName("lld-link");
-                if (err) lldLinkPath = *err;
+                const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
+                if (llvm::sys::fs::exists(vswhereFixed))
+                {
+                    llvm::SmallString<256> outFile;
+                    llvm::sys::path::system_temp_directory(true, outFile);
+                    int outFD;
+                    if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
+                    {
+                        _close(outFD);
+                        std::string outFileStr = outFile.str().str();
+
+                        std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
+                        std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
+                        llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
+
+                        if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
+                            vsPath = buf.get()->getBuffer().trim().str();
+                        llvm::sys::fs::remove(outFile);
+                    }
+                }
+            }
+
+            // ---- Find latest MSVC lib path ----
+            if (!vsPath.empty())
+            {
+                std::string msvcRoot = vsPath + "\\VC\\Tools\\MSVC";
+                std::string latestVer;
+                std::error_code ec;
+                for (auto it = llvm::sys::fs::directory_iterator(msvcRoot, ec);
+                     it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+                {
+                    if (ec) break;
+                    auto ver = llvm::sys::path::filename(it->path()).str();
+                    if (ver > latestVer) latestVer = ver;
+                }
+                if (!latestVer.empty())
+                    msvcLibPath = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
+            }
+
+            // ---- Find latest Windows SDK lib paths ----
+            {
+                std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+                std::string latestSDK;
+                std::error_code ec;
+                for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
+                     it != llvm::sys::fs::directory_iterator(); it.increment(ec))
+                {
+                    if (ec) break;
+                    auto ver = llvm::sys::path::filename(it->path()).str();
+                    if (ver > latestSDK) latestSDK = ver;
+                }
+                if (!latestSDK.empty())
+                {
+                    ucrtLibPath = wkLib + "\\" + latestSDK + "\\ucrt\\" + arch;
+                    umLibPath   = wkLib + "\\" + latestSDK + "\\um\\"   + arch;
+                }
             }
         }
+
         if (lldLinkPath.empty())
         {
             llvm::sys::fs::remove(objPath);
             std::cerr << "Error: lld-link.exe not found\n";
             return false;
-        }
-
-        const std::string arch = (platform == "win32") ? "x86" : "x64";
-
-        // ---- Find VS install path via vswhere ----
-        std::string vsPath;
-        {
-            const char* vswhereFixed = "C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe";
-            if (llvm::sys::fs::exists(vswhereFixed))
-            {
-                llvm::SmallString<256> outFile;
-                llvm::sys::path::system_temp_directory(true, outFile);
-                int outFD;
-                if (!llvm::sys::fs::createTemporaryFile("cflat_vswhere", "txt", outFD, outFile))
-                {
-                    _close(outFD);
-                    std::string outFileStr = outFile.str().str();
-
-                    std::vector<llvm::StringRef> vsArgs = { vswhereFixed, "-latest", "-property", "installationPath" };
-                    std::optional<llvm::StringRef> vsRedirects[3] = { std::nullopt, llvm::StringRef(outFileStr), std::nullopt };
-                    llvm::sys::ExecuteAndWait(vswhereFixed, vsArgs, std::nullopt, vsRedirects);
-
-                    if (auto buf = llvm::MemoryBuffer::getFile(outFileStr))
-                        vsPath = buf.get()->getBuffer().trim().str();
-                    llvm::sys::fs::remove(outFile);
-                }
-            }
-        }
-
-        // ---- Find latest MSVC lib path ----
-        std::string msvcLibPath;
-        if (!vsPath.empty())
-        {
-            std::string msvcRoot = vsPath + "\\VC\\Tools\\MSVC";
-            std::string latestVer;
-            std::error_code ec;
-            for (auto it = llvm::sys::fs::directory_iterator(msvcRoot, ec);
-                 it != llvm::sys::fs::directory_iterator(); it.increment(ec))
-            {
-                if (ec) break;
-                auto ver = llvm::sys::path::filename(it->path()).str();
-                if (ver > latestVer) latestVer = ver;
-            }
-            if (!latestVer.empty())
-                msvcLibPath = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
-        }
-
-        // ---- Find latest Windows SDK lib paths ----
-        std::string ucrtLibPath, umLibPath;
-        {
-            std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
-            std::string latestSDK;
-            std::error_code ec;
-            for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
-                 it != llvm::sys::fs::directory_iterator(); it.increment(ec))
-            {
-                if (ec) break;
-                auto ver = llvm::sys::path::filename(it->path()).str();
-                if (ver > latestSDK) latestSDK = ver;
-            }
-            if (!latestSDK.empty())
-            {
-                ucrtLibPath = wkLib + "\\" + latestSDK + "\\ucrt\\" + arch;
-                umLibPath   = wkLib + "\\" + latestSDK + "\\um\\"   + arch;
-            }
         }
 
         // ---- Invoke lld-link directly with explicit lib paths ----
@@ -3265,22 +3298,28 @@ private:
 
         std::cout << "Linking (" << arch << "): " << exePath << "\n";
 
-        std::string linkErr;
-        int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
-        llvm::sys::fs::remove(objPath);
-        for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
-
-        if (rc != 0)
         {
-            std::cerr << "Error: linking failed (exit " << rc << "): " << linkErr << "\n";
-            return false;
+            llvm::TimeTraceScope linkScope("Link", exePath);
+            std::string linkErr;
+            int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
+            llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+
+            if (rc != 0)
+            {
+                std::cerr << "Error: linking failed (exit " << rc << "): " << linkErr << "\n";
+                return false;
+            }
         }
 
         // Self-contained run: copy each --c-lib's sibling runtime DLL next to the exe so
         // the program launches without the user staging DLLs. Conan puts the DLL either
         // beside the import lib or in a ../bin sibling; check both. Best-effort - a static
         // lib has no DLL, which is fine.
-        CopyCRuntimeDlls(exePath);
+        {
+            llvm::TimeTraceScope dllScope("CopyCRuntimeDlls", exePath);
+            CopyCRuntimeDlls(exePath);
+        }
         return true;
     }
 

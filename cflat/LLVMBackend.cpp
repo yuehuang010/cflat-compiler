@@ -494,6 +494,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
             auto wt = std::filesystem::last_write_time(canonicalPath, tec);
             if (!tec && wt == it->second->writeTime)
             {
+                llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
                 if (verbose) std::cout << "[verbose]   parse cache hit: " << displayName << "\n";
                 return it->second.get();
             }

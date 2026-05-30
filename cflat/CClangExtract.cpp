@@ -32,6 +32,8 @@
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include "llvm/Support/TimeProfiler.h"
+
 #include <algorithm>
 
 namespace cflat_cinterop
@@ -386,12 +388,16 @@ namespace cflat_cinterop
             llvm::IntrusiveRefCntPtr<DiagnosticsEngine> diags(
                 new DiagnosticsEngine(diagIDs, diagOpts, new IgnoringDiagConsumer(), /*own*/ true));
 
-            CreateInvocationOptions civOpts;
-            civOpts.Diags = diags;
-            civOpts.RecoverOnError = true;
-            std::unique_ptr<CompilerInvocation> invocationUP = createInvocation(cargs, civOpts);
-            if (!invocationUP) { err = "createInvocation failed"; return false; }
-            std::shared_ptr<CompilerInvocation> invocation(std::move(invocationUP));
+            std::shared_ptr<CompilerInvocation> invocation;
+            {
+                llvm::TimeTraceScope invScope("CreateInvocation", inputName);
+                CreateInvocationOptions civOpts;
+                civOpts.Diags = diags;
+                civOpts.RecoverOnError = true;
+                std::unique_ptr<CompilerInvocation> invocationUP = createInvocation(cargs, civOpts);
+                if (!invocationUP) { err = "createInvocation failed"; return false; }
+                invocation.reset(invocationUP.release());
+            }
 
             CompilerInstance ci;
             ci.setInvocation(invocation);
@@ -404,7 +410,10 @@ namespace cflat_cinterop
                 ci.getPreprocessorOpts().addRemappedFile(req.mainFileName, buf.release());
             }
 
-            if (!ci.ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
+            {
+                llvm::TimeTraceScope execScope("ExecuteFrontend", inputName);
+                if (!ci.ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
+            }
             return true;
         }
     } // namespace
@@ -417,26 +426,35 @@ namespace cflat_cinterop
         std::string fullSource = req.source;
         if (req.wantMacros && !req.source.empty())
         {
-            PrepassAction prepass(st);
-            if (!RunAction(req, req.source, prepass, err)) return false;
+            {
+                llvm::TimeTraceScope prepassScope("MacroPrepass", req.mainFileName);
+                PrepassAction prepass(st);
+                if (!RunAction(req, req.source, prepass, err)) return false;
+            }
 
             // Append a value/type probe per discovered object-like macro to the main stub.
-            std::string probes;
-            probes.reserve(st.probes.size() * 48);
-            for (size_t i = 0; i < st.probes.size(); ++i)
             {
-                probes += "static const __auto_type ";
-                probes += kProbePrefix;
-                probes += std::to_string(i);
-                probes += " = (";
-                probes += st.probes[i].name;
-                probes += ");\n";
+                llvm::TimeTraceScope probeScope("BuildMacroProbes", req.mainFileName);
+                std::string probes;
+                probes.reserve(st.probes.size() * 48);
+                for (size_t i = 0; i < st.probes.size(); ++i)
+                {
+                    probes += "static const __auto_type ";
+                    probes += kProbePrefix;
+                    probes += std::to_string(i);
+                    probes += " = (";
+                    probes += st.probes[i].name;
+                    probes += ");\n";
+                }
+                fullSource = req.source + probes;
             }
-            fullSource = req.source + probes;
         }
 
         // Stage 2: the single full parse - harvests decls and reads the probe VarDecls.
-        ExtractAction extract(st);
-        return RunAction(req, fullSource, extract, err);
+        {
+            llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
+            ExtractAction extract(st);
+            return RunAction(req, fullSource, extract, err);
+        }
     }
 }
