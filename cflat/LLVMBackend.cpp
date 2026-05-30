@@ -5,12 +5,15 @@
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
+#include <llvm\Bitcode\BitcodeReader.h>
+#include <llvm\Linker\Linker.h>
 #include <llvm\Passes\PassBuilder.h>
 #include <llvm\Transforms\Utils\Mem2Reg.h>
 #include <llvm\Transforms\Scalar\SROA.h>
 #include <llvm\Transforms\InstCombine\InstCombine.h>
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
 #include <llvm\Support\TimeProfiler.h>
+#include <llvm\Support\JSON.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -189,10 +192,28 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     platformValue = (platformOption == "win32") ? 32 : 64;
     if (verbose) std::cout << "[verbose] __PLATFORM__ = " << platformValue << "\n";
 
-    // Set the module data layout now so sizeof/alignof produce correct sizes during
-    // codegen (the final target-machine layout is set again in EmitExecutable).
+    // Try to load core bitcode cache BEFORE setting up the module, because
+    // LoadCoreBitcodeIfFresh replaces context/module/builder with a fresh LLVM
+    // context loaded from the bitcode file.  This avoids named-type conflicts with
+    // the %string type pre-created by RegisterBuiltinString in Init().
+    bool bitcodeLoaded = false;
+    if (!batchMode_ && !runtimeDir.empty() && !skipRuntimeImport)
+    {
+        std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
+        if (!bcCacheDir.empty())
+        {
+            llvm::TimeTraceScope bcScope("RuntimeImport", "core.bc");
+            bitcodeLoaded = LoadCoreBitcodeIfFresh(bcCacheDir, platformOption);
+            if (verbose)
+                std::cout << "[verbose] core bitcode cache: " << (bitcodeLoaded ? "hit" : "miss") << "\n";
+        }
+    }
+
+    // Set the module data layout when not loading from cache.
+    // Cache path: the module already has the correct layout from the bitcode.
     // Must precede InitDebugInfo so pointer-width queries during DI construction
     // see the real layout instead of the LLVM default.
+    if (!bitcodeLoaded)
     {
         // Win32: 32-bit pointers; Win64: 64-bit pointers. Both little-endian MSVC.
         const char* dl = (platformValue == 32)
@@ -234,15 +255,17 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
 
-    if (!runtimeDir.empty() && !skipRuntimeImport)
+    if (!bitcodeLoaded && !runtimeDir.empty() && !skipRuntimeImport)
     {
-        llvm::TimeTraceScope runtimeScope("RuntimeImport", "runtime.cb");
-        auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
-        if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
-        if (std::filesystem::exists(runtimePath))
-            CompileImportedFile(runtimePath.string(), "runtime.cb");
-        else if (verbose)
-            std::cout << "[verbose]   runtime.cb not found, skipping\n";
+        {
+            llvm::TimeTraceScope runtimeScope("RuntimeImport", "runtime.cb");
+            auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+            if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
+            if (std::filesystem::exists(runtimePath))
+                CompileImportedFile(runtimePath.string(), "runtime.cb");
+            else if (verbose)
+                std::cout << "[verbose]   runtime.cb not found, skipping\n";
+        }
     }
 
     {
@@ -1330,6 +1353,934 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
         else
             std::cerr << "  Warning: could not write cache file for " << arch << ".\n";
     }
+
+    // Build core bitcode cache for win64 (win32 has pre-existing compilation issues).
+    for (const char* platform : {"win64"})
+    {
+        std::cout << "Building core bitcode cache for " << platform << "...\n";
+        LLVMBackend coreCompiler;
+        coreCompiler.SetRuntimeDir(runtimeDir);
+        coreCompiler.SetVerbose(verbose);
+        if (!coreCompiler.CompileCoreOnly(platform))
+        {
+            std::cerr << "  Warning: core compilation failed for " << platform << ".\n";
+            continue;
+        }
+        std::string bcCacheDir = LLVMBackend::GetRuntimeBitcodeDir(runtimeDir);
+        if (bcCacheDir.empty())
+        {
+            std::cerr << "  Warning: could not determine bitcode cache dir.\n";
+            continue;
+        }
+        if (std::error_code ec = llvm::sys::fs::create_directories(bcCacheDir); ec)
+        {
+            std::cerr << "  Warning: could not create " << bcCacheDir << ": " << ec.message() << "\n";
+            continue;
+        }
+        if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
+            std::cout << "  Saved core_" << platform << ".bc + .meta.json\n";
+        else
+            std::cerr << "  Warning: could not write core bitcode cache for " << platform << ".\n";
+    }
+
+    return true;
+}
+
+// ---- Core bitcode cache helpers ----
+
+static uint64_t FnvHash64(const void* data, size_t len)
+{
+    uint64_t h = 14695981039346656037ULL;
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// FNV-1a hash over all .cb file modification times in runtimeDir/core, sorted by path.
+// Returns a 16-hex-char string. Returns "" if the core dir is inaccessible.
+static std::string ComputeCoreHash(const std::string& runtimeDir)
+{
+    auto coreDir = std::filesystem::path(runtimeDir) / "core";
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (auto& e : std::filesystem::directory_iterator(coreDir, ec))
+        if (e.path().extension() == ".cb") files.push_back(e.path());
+    if (ec) return {};
+    std::sort(files.begin(), files.end());
+
+    uint64_t h = 14695981039346656037ULL;
+    for (auto& f : files)
+    {
+        auto wt = std::filesystem::last_write_time(f, ec);
+        if (ec) continue;
+        auto ns = wt.time_since_epoch().count();
+        h ^= FnvHash64(&ns, sizeof(ns));
+        h *= 1099511628211ULL;
+    }
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+// Returns %USERPROFILE%\.cflat\runtime\<hash>  or "" on failure.
+std::string LLVMBackend::GetRuntimeBitcodeDir(const std::string& runtimeDir)
+{
+    std::string base = GetCflatCacheDir();
+    if (base.empty()) return {};
+    std::string hash = ComputeCoreHash(runtimeDir);
+    if (hash.empty()) return {};
+    return base + "\\runtime\\" + hash;
+}
+
+// ---- Serialization helpers (file-scope) ----
+
+using TAV  = LLVMBackend::TypeAndValue;
+using DTAV = LLVMBackend::DeclTypeAndValue;
+using BFI  = LLVMBackend::BitfieldInfo;
+using ANN  = LLVMBackend::AnnotationValue;
+using FS   = LLVMBackend::FunctionSymbol;
+using IM   = LLVMBackend::InterfaceMethod;
+
+static llvm::json::Object SerializeTav(const TAV& t)
+{
+    llvm::json::Object o;
+    o["t"] = t.TypeName;
+    if (!t.VariableName.empty())  o["n"]   = t.VariableName;
+    if (t.Pointer)                o["p"]   = true;
+    if (t.ElemPointer)            o["ep"]  = true;
+    if (t.IsInterface)            o["if"]  = true;
+    if (t.IsInterfacePointer)     o["ifp"] = true;
+    if (t.IsNullable)             o["nl"]  = true;
+    if (t.IsMove)                 o["mv"]  = true;
+    if (t.IsBond)                 o["bd"]  = true;
+    if (t.IsStdcall)              o["sc"]  = true;
+    if (t.IsCdecl)                o["cc"]  = true;
+    if (t.LockThis)               o["lt"]  = true;
+    if (!t.GuardedBy.empty())     o["gb"]  = t.GuardedBy;
+    if (t.IsFunctionPointer)
+    {
+        o["fp"]  = true;
+        o["fpr"] = t.FuncPtrReturnTypeName;
+        if (t.FuncPtrReturnPointer) o["fprp"] = true;
+        llvm::json::Array fps;
+        for (auto& p : t.FuncPtrParams)
+        {
+            llvm::json::Object po;
+            po["t"] = p.TypeName;
+            if (p.Pointer) po["p"] = true;
+            if (p.IsMove)  po["mv"] = true;
+            fps.push_back(std::move(po));
+        }
+        o["fpp"] = std::move(fps);
+    }
+    if (t.ConstArraySize > 0)
+    {
+        o["as"] = static_cast<int64_t>(t.ConstArraySize);
+        if (!t.ConstInnerDimensions.empty())
+        {
+            llvm::json::Array dims;
+            for (auto d : t.ConstInnerDimensions) dims.push_back(static_cast<int64_t>(d));
+            o["aid"] = std::move(dims);
+        }
+    }
+    return o;
+}
+
+static TAV DeserializeTav(const llvm::json::Object& o)
+{
+    TAV t;
+    if (auto v = o.getString("t"))   t.TypeName = v->str();
+    if (auto v = o.getString("n"))   t.VariableName = v->str();
+    if (auto v = o.getBoolean("p"))  t.Pointer = *v;
+    if (auto v = o.getBoolean("ep")) t.ElemPointer = *v;
+    if (auto v = o.getBoolean("if")) t.IsInterface = *v;
+    if (auto v = o.getBoolean("ifp"))t.IsInterfacePointer = *v;
+    if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
+    if (auto v = o.getBoolean("mv")) t.IsMove = *v;
+    if (auto v = o.getBoolean("bd")) t.IsBond = *v;
+    if (auto v = o.getBoolean("sc")) t.IsStdcall = *v;
+    if (auto v = o.getBoolean("cc")) t.IsCdecl = *v;
+    if (auto v = o.getBoolean("lt")) t.LockThis = *v;
+    if (auto v = o.getString("gb"))  t.GuardedBy = v->str();
+    if (auto v = o.getBoolean("fp")) t.IsFunctionPointer = *v;
+    if (t.IsFunctionPointer)
+    {
+        if (auto v = o.getString("fpr"))   t.FuncPtrReturnTypeName = v->str();
+        if (auto v = o.getBoolean("fprp")) t.FuncPtrReturnPointer = *v;
+        if (auto* fps = o.getArray("fpp"))
+            for (auto& elem : *fps)
+                if (auto* po = elem.getAsObject())
+                {
+                    TAV::FuncPtrParam p;
+                    if (auto v = po->getString("t"))  p.TypeName = v->str();
+                    if (auto v = po->getBoolean("p")) p.Pointer = *v;
+                    if (auto v = po->getBoolean("mv"))p.IsMove = *v;
+                    t.FuncPtrParams.push_back(std::move(p));
+                }
+    }
+    if (auto v = o.getInteger("as")) t.ConstArraySize = static_cast<uint64_t>(*v);
+    if (auto* dims = o.getArray("aid"))
+        for (auto& d : *dims)
+            if (auto v = d.getAsInteger()) t.ConstInnerDimensions.push_back(static_cast<uint64_t>(*v));
+    return t;
+}
+
+static llvm::json::Array SerializeAnnotations(const std::vector<ANN>& anns)
+{
+    llvm::json::Array arr;
+    for (auto& a : anns)
+    {
+        llvm::json::Object ao;
+        ao["n"] = a.Name;
+        if (!a.Value.empty()) ao["v"] = a.Value;
+        arr.push_back(std::move(ao));
+    }
+    return arr;
+}
+
+static std::vector<ANN> DeserializeAnnotations(const llvm::json::Array* arr)
+{
+    std::vector<ANN> out;
+    if (!arr) return out;
+    for (auto& elem : *arr)
+        if (auto* ao = elem.getAsObject())
+        {
+            ANN a;
+            if (auto v = ao->getString("n")) a.Name = v->str();
+            if (auto v = ao->getString("v")) a.Value = v->str();
+            out.push_back(std::move(a));
+        }
+    return out;
+}
+
+static llvm::json::Object SerializeDtav(const DTAV& d)
+{
+    auto o = SerializeTav(d);
+    if (d.external)    o["ext"] = true;
+    if (d.threadLocal) o["tl"]  = true;
+    if (d.IsBitfield)
+    {
+        o["bf"]   = true;
+        o["bfw"]  = static_cast<int64_t>(d.BitWidth);
+        o["bfo"]  = static_cast<int64_t>(d.BitOffset);
+        o["bfsi"] = static_cast<int64_t>(d.StorageFieldIndex);
+        if (d.IsBitfieldStorage) o["bfs"] = true;
+    }
+    if (d.UserAlignValue > 0) o["ua"] = static_cast<int64_t>(d.UserAlignValue);
+    if (!d.Annotations.empty()) o["ann"] = SerializeAnnotations(d.Annotations);
+    return o;
+}
+
+static DTAV DeserializeDtav(const llvm::json::Object& o)
+{
+    DTAV d;
+    static_cast<TAV&>(d) = DeserializeTav(o);
+    if (auto v = o.getBoolean("ext")) d.external = *v;
+    if (auto v = o.getBoolean("tl"))  d.threadLocal = *v;
+    if (auto v = o.getBoolean("bf"))
+    {
+        d.IsBitfield = *v;
+        if (auto w = o.getInteger("bfw"))  d.BitWidth = static_cast<unsigned>(*w);
+        if (auto w = o.getInteger("bfo"))  d.BitOffset = static_cast<unsigned>(*w);
+        if (auto w = o.getInteger("bfsi")) d.StorageFieldIndex = static_cast<unsigned>(*w);
+        if (auto w = o.getBoolean("bfs"))  d.IsBitfieldStorage = *w;
+    }
+    if (auto v = o.getInteger("ua")) d.UserAlignValue = static_cast<uint64_t>(*v);
+    d.Annotations = DeserializeAnnotations(o.getArray("ann"));
+    return d;
+}
+
+static llvm::json::Object SerializeBfi(const BFI& b)
+{
+    llvm::json::Object o;
+    o["n"]  = b.Name;
+    o["t"]  = b.TypeName;
+    o["si"] = static_cast<int64_t>(b.StorageFieldIndex);
+    o["bo"] = static_cast<int64_t>(b.BitOffset);
+    o["bw"] = static_cast<int64_t>(b.BitWidth);
+    if (b.IsUnsigned) o["u"] = true;
+    if (!b.Annotations.empty()) o["ann"] = SerializeAnnotations(b.Annotations);
+    return o;
+}
+
+static BFI DeserializeBfi(const llvm::json::Object& o)
+{
+    BFI b;
+    if (auto v = o.getString("n"))   b.Name = v->str();
+    if (auto v = o.getString("t"))   b.TypeName = v->str();
+    if (auto v = o.getInteger("si")) b.StorageFieldIndex = static_cast<unsigned>(*v);
+    if (auto v = o.getInteger("bo")) b.BitOffset = static_cast<unsigned>(*v);
+    if (auto v = o.getInteger("bw")) b.BitWidth = static_cast<unsigned>(*v);
+    if (auto v = o.getBoolean("u"))  b.IsUnsigned = *v;
+    b.Annotations = DeserializeAnnotations(o.getArray("ann"));
+    return b;
+}
+
+static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
+{
+    llvm::json::Object o;
+    o["k"] = key;
+    o["u"] = s.UniqueName;
+    o["r"] = SerializeTav(s.ReturnType);
+    llvm::json::Array ps;
+    for (auto& p : s.Parameters) ps.push_back(SerializeTav(p));
+    o["ps"] = std::move(ps);
+    if (s.Variadic)     o["va"] = true;
+    if (s.ReturnsOwned) o["ro"] = true;
+    if (s.IsMethod)     o["m"]  = true;
+    if (!s.RequiredLocks.empty())
+    {
+        llvm::json::Array rl;
+        for (auto& l : s.RequiredLocks) rl.push_back(l);
+        o["rl"] = std::move(rl);
+    }
+    return o;
+}
+
+static llvm::json::Object SerializeIfaceMethod(const IM& m)
+{
+    llvm::json::Object o;
+    o["n"] = m.Name;
+    o["r"] = SerializeTav(m.ReturnType);
+    llvm::json::Array ps;
+    for (auto& p : m.Parameters) ps.push_back(SerializeTav(p));
+    o["ps"] = std::move(ps);
+    return o;
+}
+
+static IM DeserializeIfaceMethod(const llvm::json::Object& o)
+{
+    IM m;
+    if (auto v = o.getString("n")) m.Name = v->str();
+    if (auto* r = o.getObject("r")) m.ReturnType = DeserializeTav(*r);
+    if (auto* ps = o.getArray("ps"))
+        for (auto& elem : *ps)
+            if (auto* po = elem.getAsObject()) m.Parameters.push_back(DeserializeTav(*po));
+    return m;
+}
+
+static llvm::json::Object SerializeConstraints(
+    const std::unordered_map<std::string, std::vector<std::string>>& c)
+{
+    llvm::json::Object o;
+    for (auto& [tp, ifaces] : c)
+    {
+        llvm::json::Array arr;
+        for (auto& i : ifaces) arr.push_back(i);
+        o[tp] = std::move(arr);
+    }
+    return o;
+}
+
+static std::unordered_map<std::string, std::vector<std::string>>
+DeserializeConstraints(const llvm::json::Object* o)
+{
+    std::unordered_map<std::string, std::vector<std::string>> out;
+    if (!o) return out;
+    for (auto& kv : *o)
+    {
+        std::vector<std::string> ifaces;
+        if (auto* arr = kv.second.getAsArray())
+            for (auto& elem : *arr)
+                if (auto v = elem.getAsString()) ifaces.push_back(v->str());
+        out[kv.first.str()] = std::move(ifaces);
+    }
+    return out;
+}
+
+bool LLVMBackend::CompileCoreOnly(const std::string& platform)
+{
+    platformValue = (platform == "win32") ? 32 : 64;
+    const char* dl = (platformValue == 32)
+        ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
+        : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+
+    // Reinitialize the LLVM module with the correct platform data layout BEFORE
+    // RegisterBuiltinString creates pointer types, so %string fields have the right size.
+    // The Init()-created module used the LLVM default layout which differs on Win32.
+    {
+        builder.reset();
+        module.reset();
+        functionTable.clear();
+        dataStructures.clear();
+        context = std::make_unique<llvm::LLVMContext>();
+        module  = std::make_unique<llvm::Module>("cflat", *context);
+        builder = std::make_unique<llvm::IRBuilder<>>(*context);
+    }
+    module->setDataLayout(llvm::DataLayout(dl));
+    module->setTargetTriple((platformValue == 32) ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
+    RegisterBuiltinString();
+
+    auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
+    SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
+    auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
+    SetCompileTimeMacro("__WIN64__", win64Const, "int");
+    auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
+    SetCompileTimeMacro("__WIN32__", win32Const, "int");
+    auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+    SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
+
+    if (runtimeDir.empty()) return false;
+    auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
+    if (!std::filesystem::exists(runtimePath))
+    {
+        std::cerr << "Error: runtime.cb not found in " << runtimeDir << "/core\n";
+        return false;
+    }
+    if (!CompileImportedFile(runtimePath.string(), "runtime.cb"))
+        return false;
+    // Force lazy-registered functions into the bitcode so they are available
+    // when the cache is loaded without re-running EnsureStr*/EnsureString*.
+    EnsureStrConcatRegistered();
+    EnsureStringDtorRegistered();
+    return true;
+}
+
+bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string& platform) const
+{
+    std::string prefix = cacheDir + "\\core_" + platform;
+
+    // Write LLVM bitcode.
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream bcOut(prefix + ".bc", ec);
+        if (ec) return false;
+        llvm::WriteBitcodeToFile(*module, bcOut);
+    }
+
+    // Build metadata JSON.
+    llvm::json::Object root;
+    root["version"]   = 1;
+    root["platform"]  = platform;
+    root["core_hash"] = ComputeCoreHash(runtimeDir);
+
+    // importedFiles
+    {
+        llvm::json::Array arr;
+        for (auto& f : importedFiles) arr.push_back(f);
+        root["imported_files"] = std::move(arr);
+    }
+
+    // namespaceTable
+    {
+        llvm::json::Array arr;
+        for (auto& ns : namespaceTable) arr.push_back(ns);
+        root["namespaces"] = std::move(arr);
+    }
+
+    // typeAliases
+    {
+        llvm::json::Object obj;
+        for (auto& [k, v] : typeAliases) obj[k] = v;
+        root["type_aliases"] = std::move(obj);
+    }
+
+    // enumBackingTypes
+    {
+        llvm::json::Object obj;
+        for (auto& [k, v] : enumBackingTypes) obj[k] = v;
+        root["enum_backing_types"] = std::move(obj);
+    }
+
+    // functionTable
+    {
+        llvm::json::Array arr;
+        for (auto& [key, overloads] : functionTable)
+            for (auto& sym : overloads)
+                arr.push_back(SerializeFuncSym(key, sym));
+        root["functions"] = std::move(arr);
+    }
+
+    // dataStructures
+    {
+        llvm::json::Array arr;
+        for (auto& [name, sd] : dataStructures)
+        {
+            llvm::json::Object so;
+            so["name"]      = name;
+            so["llvm_type"] = sd.StructType ? std::string(sd.StructType->getName()) : "";
+            so["is_union"]  = sd.IsUnion;
+            if (sd.UserRequestedAlignment > 0)
+                so["user_align"] = static_cast<int64_t>(sd.UserRequestedAlignment);
+            if (sd.Destructor)
+                so["destructor"] = std::string(sd.Destructor->getName());
+            if (sd.typeDescriptor)
+                so["type_desc"] = std::string(sd.typeDescriptor->getName());
+
+            llvm::json::Array fields;
+            for (auto& f : sd.StructFields) fields.push_back(SerializeDtav(f));
+            so["fields"] = std::move(fields);
+
+            llvm::json::Array ifaces;
+            for (auto& i : sd.Interfaces) ifaces.push_back(i);
+            so["interfaces"] = std::move(ifaces);
+
+            llvm::json::Object vtabs;
+            for (auto& [iname, gv] : sd.VTables)
+                vtabs[iname] = std::string(gv->getName());
+            so["vtables"] = std::move(vtabs);
+
+            llvm::json::Array bfs;
+            for (auto& b : sd.Bitfields) bfs.push_back(SerializeBfi(b));
+            so["bitfields"] = std::move(bfs);
+
+            arr.push_back(std::move(so));
+        }
+        root["structs"] = std::move(arr);
+    }
+
+    // interfaceTable + interfaceParents
+    {
+        llvm::json::Array arr;
+        for (auto& [name, methods] : interfaceTable)
+        {
+            llvm::json::Object io;
+            io["name"] = name;
+            llvm::json::Array parents;
+            if (auto it = interfaceParents.find(name); it != interfaceParents.end())
+                for (auto& p : it->second) parents.push_back(p);
+            io["parents"] = std::move(parents);
+            llvm::json::Array ms;
+            for (auto& m : methods) ms.push_back(SerializeIfaceMethod(m));
+            io["methods"] = std::move(ms);
+            arr.push_back(std::move(io));
+        }
+        root["interfaces"] = std::move(arr);
+    }
+
+    // globalNamedVariable + globalVariableTypes
+    {
+        llvm::json::Array arr;
+        for (auto& [name, gv] : globalNamedVariable)
+        {
+            auto tit = globalVariableTypes.find(name);
+            if (tit == globalVariableTypes.end()) continue;
+            llvm::json::Object go;
+            go["name"]      = name;
+            go["llvm_name"] = std::string(gv->getName());
+            go["type"]      = SerializeTav(tit->second);
+            arr.push_back(std::move(go));
+        }
+        root["globals"] = std::move(arr);
+    }
+
+    // Generic struct templates: source text + type params + constraints
+    {
+        llvm::json::Array arr;
+        for (auto& [name, ctx] : gts.genericStructTemplates)
+        {
+            auto* start = ctx->getStart();
+            auto* stop  = ctx->getStop();
+            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
+            std::string src = start->getInputStream()->getText(iv);
+            llvm::json::Object to;
+            to["name"]   = name;
+            to["source"] = src;
+            llvm::json::Array tps;
+            if (auto it = gts.genericStructTypeParams.find(name); it != gts.genericStructTypeParams.end())
+                for (auto& tp : it->second) tps.push_back(tp);
+            to["type_params"] = std::move(tps);
+            if (auto pit = gts.genericStructPackIndex.find(name); pit != gts.genericStructPackIndex.end())
+                to["pack_index"] = static_cast<int64_t>(pit->second);
+            if (auto cit = gts.genericStructConstraints.find(name); cit != gts.genericStructConstraints.end())
+                to["constraints"] = SerializeConstraints(cit->second);
+            arr.push_back(std::move(to));
+        }
+        root["generic_structs"] = std::move(arr);
+    }
+
+    // Generic class templates
+    {
+        llvm::json::Array arr;
+        for (auto& [name, ctx] : gts.genericClassTemplates)
+        {
+            auto* start = ctx->getStart();
+            auto* stop  = ctx->getStop();
+            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
+            std::string src = start->getInputStream()->getText(iv);
+            llvm::json::Object to;
+            to["name"]   = name;
+            to["source"] = src;
+            llvm::json::Array tps;
+            if (auto it = gts.genericStructTypeParams.find(name); it != gts.genericStructTypeParams.end())
+                for (auto& tp : it->second) tps.push_back(tp);
+            to["type_params"] = std::move(tps);
+            if (auto pit = gts.genericClassPackIndex.find(name); pit != gts.genericClassPackIndex.end())
+                to["pack_index"] = static_cast<int64_t>(pit->second);
+            if (auto cit = gts.genericClassConstraints.find(name); cit != gts.genericClassConstraints.end())
+                to["constraints"] = SerializeConstraints(cit->second);
+            arr.push_back(std::move(to));
+        }
+        root["generic_classes"] = std::move(arr);
+    }
+
+    // Generic interface templates
+    {
+        llvm::json::Array arr;
+        for (auto& [name, ctx] : gts.genericInterfaceTemplates)
+        {
+            auto* start = ctx->getStart();
+            auto* stop  = ctx->getStop();
+            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
+            std::string src = start->getInputStream()->getText(iv);
+            llvm::json::Object to;
+            to["name"]   = name;
+            to["source"] = src;
+            llvm::json::Array tps;
+            if (auto it = gts.genericInterfaceTypeParams.find(name); it != gts.genericInterfaceTypeParams.end())
+                for (auto& tp : it->second) tps.push_back(tp);
+            to["type_params"] = std::move(tps);
+            if (auto pit = gts.genericInterfacePackIndex.find(name); pit != gts.genericInterfacePackIndex.end())
+                to["pack_index"] = static_cast<int64_t>(pit->second);
+            arr.push_back(std::move(to));
+        }
+        root["generic_interfaces"] = std::move(arr);
+    }
+
+    // Generic function templates
+    {
+        llvm::json::Array arr;
+        for (auto& [name, ctx] : gts.genericFunctionTemplates)
+        {
+            auto* start = ctx->getStart();
+            auto* stop  = ctx->getStop();
+            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
+            std::string src = start->getInputStream()->getText(iv);
+            llvm::json::Object to;
+            to["name"]   = name;
+            to["source"] = src;
+            llvm::json::Array tps;
+            if (auto it = gts.genericFunctionTypeParams.find(name); it != gts.genericFunctionTypeParams.end())
+                for (auto& tp : it->second) tps.push_back(tp);
+            to["type_params"] = std::move(tps);
+            if (auto pit = gts.genericFunctionPackIndex.find(name); pit != gts.genericFunctionPackIndex.end())
+                to["pack_index"] = static_cast<int64_t>(pit->second);
+            if (auto cit = gts.genericFunctionConstraints.find(name); cit != gts.genericFunctionConstraints.end())
+                to["constraints"] = SerializeConstraints(cit->second);
+            arr.push_back(std::move(to));
+        }
+        root["generic_functions"] = std::move(arr);
+    }
+
+    // instantiatedGenerics / instantiatedInterfaces / instantiatedGenericFunctions
+    {
+        llvm::json::Array arr;
+        for (auto& s : gts.instantiatedGenerics) arr.push_back(s);
+        root["instantiated_generics"] = std::move(arr);
+    }
+    {
+        llvm::json::Array arr;
+        for (auto& s : gts.instantiatedInterfaces) arr.push_back(s);
+        root["instantiated_interfaces"] = std::move(arr);
+    }
+    {
+        llvm::json::Array arr;
+        for (auto& s : gts.instantiatedGenericFunctions) arr.push_back(s);
+        root["instantiated_generic_functions"] = std::move(arr);
+    }
+
+    // Write JSON.
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream jsonOut(prefix + ".meta.json", ec);
+        if (ec) return false;
+        jsonOut << llvm::json::Value(std::move(root));
+    }
+    return true;
+}
+
+bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std::string& platform)
+{
+    std::string prefix   = cacheDir + "\\core_" + platform;
+    std::string bcPath   = prefix + ".bc";
+    std::string jsonPath = prefix + ".meta.json";
+
+    if (!std::filesystem::exists(bcPath) || !std::filesystem::exists(jsonPath))
+        return false;
+
+    // Load and validate JSON metadata.
+    auto jsonBuf = llvm::MemoryBuffer::getFile(jsonPath);
+    if (!jsonBuf) return false;
+    auto parsed = llvm::json::parse((*jsonBuf)->getBuffer());
+    if (!parsed) return false;
+    auto* root = parsed->getAsObject();
+    if (!root) return false;
+
+    auto ver      = root->getInteger("version");
+    auto storedPl = root->getString("platform");
+    auto storedH  = root->getString("core_hash");
+    if (!ver || *ver != 1) return false;
+    if (!storedPl || storedPl->str() != platform) return false;
+    if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
+
+    // Load bitcode into a FRESH LLVMContext so named types (e.g. %string) from
+    // RegisterBuiltinString don't conflict with the bitcode's versions.  After
+    // loading we replace context/module/builder with the fresh ones.
+    auto freshCtx = std::make_unique<llvm::LLVMContext>();
+    auto bcBuf = llvm::MemoryBuffer::getFile(bcPath);
+    if (!bcBuf) return false;
+    auto parsedMod = llvm::parseBitcodeFile((*bcBuf)->getMemBufferRef(), *freshCtx);
+    if (!parsedMod)
+    {
+        llvm::consumeError(parsedMod.takeError());
+        return false;
+    }
+
+    // Replace the current LLVM state.  Destroy builder/module before context.
+    builder.reset();
+    module.reset();
+    context = std::move(freshCtx);
+    module  = std::move(*parsedMod);
+    builder = std::make_unique<llvm::IRBuilder<>>(*context);
+
+    // Clear tables populated by Init()/RegisterBuiltinString() whose LLVM pointers
+    // now dangle (they pointed into the old module/context we just destroyed).
+    functionTable.clear();
+    dataStructures.clear();
+    interfaceTable.clear();
+    interfaceParents.clear();
+    globalNamedVariable.clear();
+    globalVariableTypes.clear();
+    namespaceTable.clear();
+    typeAliases.clear();
+    enumBackingTypes.clear();
+    // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
+    // verifies the functions are present in the bitcode.
+
+    // Restore symbol tables from JSON.
+
+    // importedFiles
+    if (auto* arr = root->getArray("imported_files"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) importedFiles.insert(v->str());
+
+    // namespaceTable
+    if (auto* arr = root->getArray("namespaces"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) namespaceTable.insert(v->str());
+
+    // typeAliases
+    if (auto* obj = root->getObject("type_aliases"))
+        for (auto& kv : *obj)
+            if (auto v = kv.second.getAsString()) typeAliases[kv.first.str()] = v->str();
+
+    // enumBackingTypes
+    if (auto* obj = root->getObject("enum_backing_types"))
+        for (auto& kv : *obj)
+            if (auto v = kv.second.getAsString()) enumBackingTypes[kv.first.str()] = v->str();
+
+    // functionTable
+    if (auto* arr = root->getArray("functions"))
+        for (auto& elem : *arr)
+        {
+            auto* fo = elem.getAsObject();
+            if (!fo) continue;
+            auto key  = fo->getString("k");
+            auto uniq = fo->getString("u");
+            if (!key || !uniq) continue;
+            FS sym;
+            sym.UniqueName = uniq->str();
+            sym.Function   = module->getFunction(sym.UniqueName);
+            if (!sym.Function) continue;
+            if (auto* r = fo->getObject("r")) sym.ReturnType = DeserializeTav(*r);
+            if (auto* ps = fo->getArray("ps"))
+                for (auto& pe : *ps)
+                    if (auto* po = pe.getAsObject()) sym.Parameters.push_back(DeserializeTav(*po));
+            if (auto v = fo->getBoolean("va")) sym.Variadic = *v;
+            if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
+            if (auto v = fo->getBoolean("m"))  sym.IsMethod = *v;
+            if (auto* rl = fo->getArray("rl"))
+                for (auto& le : *rl)
+                    if (auto v = le.getAsString()) sym.RequiredLocks.push_back(v->str());
+            functionTable[key->str()].push_back(std::move(sym));
+        }
+
+    // dataStructures
+    if (auto* arr = root->getArray("structs"))
+        for (auto& elem : *arr)
+        {
+            auto* so = elem.getAsObject();
+            if (!so) continue;
+            auto name = so->getString("name");
+            if (!name) continue;
+            std::string sname = name->str();
+
+            LLVMBackend::StructData sd;
+            if (auto v = so->getString("llvm_type"))
+                sd.StructType = llvm::StructType::getTypeByName(*context, v->str());
+            if (!sd.StructType) continue;
+            if (auto v = so->getBoolean("is_union"))    sd.IsUnion = *v;
+            if (auto v = so->getInteger("user_align"))  sd.UserRequestedAlignment = static_cast<uint64_t>(*v);
+            if (auto v = so->getString("destructor"))   sd.Destructor = module->getFunction(v->str());
+            if (auto v = so->getString("type_desc"))    sd.typeDescriptor = module->getNamedGlobal(v->str());
+
+            if (auto* fields = so->getArray("fields"))
+                for (auto& fe : *fields)
+                    if (auto* fo = fe.getAsObject()) sd.StructFields.push_back(DeserializeDtav(*fo));
+
+            if (auto* ifaces = so->getArray("interfaces"))
+                for (auto& ie : *ifaces)
+                    if (auto v = ie.getAsString()) sd.Interfaces.push_back(v->str());
+
+            if (auto* vtabs = so->getObject("vtables"))
+                for (auto& kv : *vtabs)
+                    if (auto v = kv.second.getAsString())
+                        if (auto* gv = module->getNamedGlobal(v->str()))
+                            sd.VTables[kv.first.str()] = gv;
+
+            if (auto* bfs = so->getArray("bitfields"))
+                for (auto& be : *bfs)
+                    if (auto* bo = be.getAsObject()) sd.Bitfields.push_back(DeserializeBfi(*bo));
+
+            dataStructures[sname] = std::move(sd);
+        }
+
+    // interfaceTable + interfaceParents
+    if (auto* arr = root->getArray("interfaces"))
+        for (auto& elem : *arr)
+        {
+            auto* io = elem.getAsObject();
+            if (!io) continue;
+            auto name = io->getString("name");
+            if (!name) continue;
+            std::string iname = name->str();
+            if (auto* parents = io->getArray("parents"))
+            {
+                std::vector<std::string> plist;
+                for (auto& pe : *parents)
+                    if (auto v = pe.getAsString()) plist.push_back(v->str());
+                interfaceParents[iname] = std::move(plist);
+            }
+            std::vector<IM> methods;
+            if (auto* ms = io->getArray("methods"))
+                for (auto& me : *ms)
+                    if (auto* mo = me.getAsObject()) methods.push_back(DeserializeIfaceMethod(*mo));
+            interfaceTable[iname] = std::move(methods);
+        }
+
+    // globalNamedVariable + globalVariableTypes
+    if (auto* arr = root->getArray("globals"))
+        for (auto& elem : *arr)
+        {
+            auto* go = elem.getAsObject();
+            if (!go) continue;
+            auto gname = go->getString("name");
+            auto llvmn = go->getString("llvm_name");
+            if (!gname || !llvmn) continue;
+            auto* gv = module->getNamedGlobal(llvmn->str());
+            if (!gv) continue;
+            globalNamedVariable[gname->str()] = gv;
+            if (auto* to = go->getObject("type"))
+                globalVariableTypes[gname->str()] = DeserializeTav(*to);
+        }
+
+    // Load generic templates: re-parse source text via SyntheticParseState.
+    auto loadGenericTemplates = [&](const char* key,
+        auto& templateMap, auto& typeParamsMap, auto& constraintsMap, auto& packIndexMap,
+        auto extractCtx)
+    {
+        auto* arr = root->getArray(key);
+        if (!arr) return;
+        for (auto& elem : *arr)
+        {
+            auto* to = elem.getAsObject();
+            if (!to) continue;
+            auto tname   = to->getString("name");
+            auto tsource = to->getString("source");
+            if (!tname || !tsource) continue;
+
+            std::vector<std::string> tps;
+            if (auto* tpsArr = to->getArray("type_params"))
+                for (auto& tp : *tpsArr)
+                    if (auto v = tp.getAsString()) tps.push_back(v->str());
+
+            SyntheticParseState state;
+            state.label  = "cached:" + tname->str();
+            state.input  = std::make_unique<antlr4::ANTLRInputStream>(tsource->str());
+            state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
+            state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
+            state.parser = std::make_unique<CFlatParser>(state.tokens.get());
+            state.parser->removeErrorListeners();
+            state.tokens->fill();
+            auto* cu = state.parser->compilationUnit();
+
+            auto* ctx = extractCtx(cu);
+            if (ctx)
+            {
+                templateMap[tname->str()] = ctx;
+                typeParamsMap[tname->str()] = std::move(tps);
+                if (auto* cobj = to->getObject("constraints"))
+                    constraintsMap[tname->str()] = DeserializeConstraints(cobj);
+                if (auto v = to->getInteger("pack_index"))
+                    packIndexMap[tname->str()] = static_cast<size_t>(*v);
+            }
+            syntheticParseStates_.push_back(std::move(state));
+        }
+    };
+
+    loadGenericTemplates("generic_structs",
+        gts.genericStructTemplates, gts.genericStructTypeParams,
+        gts.genericStructConstraints, gts.genericStructPackIndex,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::StructDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* sd = decl->structDefinition())
+                    if (sd->genericTypeParameters()) return sd;
+            return nullptr;
+        });
+
+    loadGenericTemplates("generic_classes",
+        gts.genericClassTemplates, gts.genericStructTypeParams,
+        gts.genericClassConstraints, gts.genericClassPackIndex,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::ClassDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* cd = decl->classDefinition())
+                    if (cd->genericTypeParameters()) return cd;
+            return nullptr;
+        });
+
+    // Interfaces have no constraints map; use a local dummy to satisfy the lambda signature.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> ifaceConstraintsDummy;
+    loadGenericTemplates("generic_interfaces",
+        gts.genericInterfaceTemplates, gts.genericInterfaceTypeParams,
+        ifaceConstraintsDummy, gts.genericInterfacePackIndex,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::InterfaceDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* id = decl->interfaceDefinition())
+                    if (id->genericIdentifier() && id->genericIdentifier()->genericTypeParameters())
+                        return id;
+            return nullptr;
+        });
+
+    loadGenericTemplates("generic_functions",
+        gts.genericFunctionTemplates, gts.genericFunctionTypeParams,
+        gts.genericFunctionConstraints, gts.genericFunctionPackIndex,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::FunctionDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* fd = decl->functionDefinition())
+                    if (fd->genericTypeParameters()) return fd;
+            return nullptr;
+        });
+
+    // Restore pre-instantiated generic sets.
+    if (auto* arr = root->getArray("instantiated_generics"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) gts.instantiatedGenerics.insert(v->str());
+    if (auto* arr = root->getArray("instantiated_interfaces"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) gts.instantiatedInterfaces.insert(v->str());
+    if (auto* arr = root->getArray("instantiated_generic_functions"))
+        for (auto& elem : *arr)
+            if (auto v = elem.getAsString()) gts.instantiatedGenericFunctions.insert(v->str());
+
+    // Mark lazy-registered functions as done if they were deserialized from the cache.
+    // This prevents EnsureStrConcatRegistered / EnsureStringDtorRegistered from creating
+    // duplicate LLVM functions that conflict with the ones already in the loaded bitcode.
+    if (!functionTable["__strconcat"].empty()) strConcatRegistered = true;
+    if (dataStructures.count("string") && dataStructures["string"].Destructor) stringDtorRegistered = true;
 
     return true;
 }

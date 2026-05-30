@@ -5377,9 +5377,9 @@ public:
         if (it != stringPool.end())
             return it->second;
 
-        auto* gv = builder->CreateGlobalString(text, name);
-        // In LLVM 18 opaque-pointer mode the GlobalVariable* is already a ptr -
-        // no ConstantExpr GEP needed.
+        // Pass module explicitly so CreateGlobalString doesn't dereference the builder's
+        // (possibly null) insertion point to find the module.
+        auto* gv = builder->CreateGlobalString(text, name, 0, module.get());
         stringPool[text] = gv;
         stringLiteralLenByPtr[gv] = (int32_t)text.size();
         return gv;
@@ -8585,6 +8585,21 @@ public:
     // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.
     // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
     static bool RunInit(const std::string& runtimeDir, bool verbose);
+
+    // Core bitcode cache: returns %USERPROFILE%\.cflat\runtime\<hash> or "" on failure.
+    // The hash is derived from the modification times of all .cb files in runtimeDir/core.
+    static std::string GetRuntimeBitcodeDir(const std::string& runtimeDir);
+
+    // Initialize the module for the given platform and run RuntimeImport.
+    // Used by RunInit to pre-compile core libraries for the bitcode cache.
+    bool CompileCoreOnly(const std::string& platform);
+
+    // Serialize the compiled core module and symbol tables to cacheDir/core_<platform>.{bc,meta.json}.
+    bool SaveCoreBitcode(const std::string& cacheDir, const std::string& platform) const;
+
+    // Load the core bitcode cache from cacheDir/core_<platform>.{bc,meta.json}.
+    // Populates module, symbol tables, and generic templates. Returns false if absent or stale.
+    bool LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std::string& platform);
 };
 
 // Defined here so LLVMBackend is fully declared before DumpState() is called.
