@@ -775,26 +775,6 @@ public:
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
             if (!ruleCtx) continue;
 
-            // Skip generic template definitions entirely - their bodies contain
-            // unbound type parameters (e.g. T) that are not valid type names.
-            if (auto* structDef = dynamic_cast<CFlatParser::StructDefinitionContext*>(ruleCtx))
-            {
-                if (structDef->genericTypeParameters() != nullptr)
-                    continue;
-            }
-            if (auto* classDef = dynamic_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx))
-            {
-                if (classDef->genericTypeParameters() != nullptr)
-                    continue;
-            }
-
-            // Skip generic function template definitions for the same reason.
-            if (auto* funcDef = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx))
-            {
-                if (funcDef->genericTypeParameters() != nullptr)
-                    continue;
-            }
-
             auto tryPreDeclare = [&](const std::string& baseName, CFlatParser::GenericTypeParametersContext* genericParams)
             {
                 auto* compiler = Compiler(genericParams);
@@ -806,37 +786,59 @@ public:
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
             };
 
-            if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx))
+            // Use getRuleIndex() (integer compare) instead of dynamic_cast for each node type
+            // to avoid the RTTI hierarchy walk (FindSITargetTypeInstance) on every tree node.
+            switch (ruleCtx->getRuleIndex())
             {
-                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
-                    tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
-
-                // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
-                if (typeSpec->tupleTypeSpecifier() != nullptr)
+            case CFlatParser::RuleStructDefinition:
+                // Skip generic template definitions - bodies contain unbound type parameters (e.g. T).
+                if (static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
+                    continue;
+                break;
+            case CFlatParser::RuleClassDefinition:
+                if (static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
+                    continue;
+                break;
+            case CFlatParser::RuleFunctionDefinition:
+                // Skip generic function template definitions for the same reason.
+                if (static_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
+                    continue;
+                break;
+            case CFlatParser::RuleTypeSpecifier:
                 {
-                    auto* tts = typeSpec->tupleTypeSpecifier();
-                    // Pack-only form (T...) resolved during instantiation - skip forward-declare here
-                    if (tts->tupleTypePackEntry() == nullptr)
-                    {
-                        std::string mangledName = "tuple";
-                        for (auto* entry : tts->tupleTypeEntry())
-                        {
-                            std::string argName = entry->typeSpecifier()->getText();
-                            if (entry->pointer() != nullptr) argName += "*";
-                            mangledName += "__" + MangleTypeArg(argName);
-                        }
-                        auto* c = Compiler(tts);
-                        c->CreateStructType(mangledName, {});
-                        LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
-                        c->CreateFunctionDeclaration(mangledName, rt, {});
-                    }
-                }
-            }
+                    auto* typeSpec = static_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx);
+                    if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
+                        tryPreDeclare(typeSpec->genericIdentifier()->Identifier()->getText(), typeSpec->genericIdentifier()->genericTypeParameters());
 
-            if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
-            {
-                if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
-                    tryPreDeclare(primaryExpr->genericIdentifier()->Identifier()->getText(), primaryExpr->genericIdentifier()->genericTypeParameters());
+                    // Tuple type sugar: (T1, T2) -> pre-declare tuple__T1__T2
+                    if (typeSpec->tupleTypeSpecifier() != nullptr)
+                    {
+                        auto* tts = typeSpec->tupleTypeSpecifier();
+                        // Pack-only form (T...) resolved during instantiation - skip forward-declare here
+                        if (tts->tupleTypePackEntry() == nullptr)
+                        {
+                            std::string mangledName = "tuple";
+                            for (auto* entry : tts->tupleTypeEntry())
+                            {
+                                std::string argName = entry->typeSpecifier()->getText();
+                                if (entry->pointer() != nullptr) argName += "*";
+                                mangledName += "__" + MangleTypeArg(argName);
+                            }
+                            auto* c = Compiler(tts);
+                            c->CreateStructType(mangledName, {});
+                            LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
+                            c->CreateFunctionDeclaration(mangledName, rt, {});
+                        }
+                    }
+                    break;
+                }
+            case CFlatParser::RulePrimaryExpression:
+                {
+                    auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
+                    if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
+                        tryPreDeclare(primaryExpr->genericIdentifier()->Identifier()->getText(), primaryExpr->genericIdentifier()->genericTypeParameters());
+                    break;
+                }
             }
 
             ScanGenericTypeUses(ruleCtx);
@@ -10205,67 +10207,71 @@ public:
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
             if (!ruleCtx) continue;
 
-            // Skip generic template struct/class definition bodies (contain unbound T)
-            if (auto* structDef = dynamic_cast<CFlatParser::StructDefinitionContext*>(ruleCtx))
+            // Use getRuleIndex() (integer compare) instead of dynamic_cast for each node type.
+            switch (ruleCtx->getRuleIndex())
             {
-                if (structDef->genericTypeParameters() != nullptr)
+            case CFlatParser::RuleStructDefinition:
+                // Skip generic template struct/class definition bodies (contain unbound T)
+                if (static_cast<CFlatParser::StructDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
                     continue;
-            }
-            if (auto* classDef = dynamic_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx))
-            {
-                if (classDef->genericTypeParameters() != nullptr)
+                break;
+            case CFlatParser::RuleClassDefinition:
+                if (static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
                     continue;
-            }
-
-            // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
-            // Apply type substitutions for generic parameters.
-            if (auto* typeSpec = dynamic_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx))
-            {
-                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
+                break;
+            case CFlatParser::RuleTypeSpecifier:
                 {
-                    std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
-                    std::vector<std::string> typeArgs;
-                    for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
+                    // Apply type substitutions for generic parameters.
+                    auto* typeSpec = static_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx);
+                    if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr && typeSpec->genericIdentifier()->Identifier() != nullptr)
                     {
-                        std::string arg = entry->getText();
-                        // Apply active type substitutions to each type argument
-                        auto it = activeTypeSubstitutions.find(arg);
-                        if (it != activeTypeSubstitutions.end())
-                            arg = it->second;
-                        typeArgs.push_back(arg);
+                        std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+                        std::vector<std::string> typeArgs;
+                        for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        {
+                            std::string arg = entry->getText();
+                            // Apply active type substitutions to each type argument
+                            auto it = activeTypeSubstitutions.find(arg);
+                            if (it != activeTypeSubstitutions.end())
+                                arg = it->second;
+                            typeArgs.push_back(arg);
+                        }
+                        std::string mangledName = MangledGenericName(baseName, typeArgs);
+                        if (!instantiatedGenerics.count(mangledName))
+                        {
+                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            instantiatedGenerics.insert(mangledName);
+                        }
                     }
-                    std::string mangledName = MangledGenericName(baseName, typeArgs);
-                    if (!instantiatedGenerics.count(mangledName))
-                    {
-                        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
-                        instantiatedGenerics.insert(mangledName);
-                    }
+                    break;
                 }
-            }
-
-            // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
-            // Apply type substitutions for generic parameters.
-            if (auto* primaryExpr = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx))
-            {
-                if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
+            case CFlatParser::RulePrimaryExpression:
                 {
-                    std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
-                    std::vector<std::string> typeArgs;
-                    for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                    // primaryExpression with generic params: e.g. the "Box<MyInt>" in "Box<MyInt>()"
+                    // Apply type substitutions for generic parameters.
+                    auto* primaryExpr = static_cast<CFlatParser::PrimaryExpressionContext*>(ruleCtx);
+                    if (primaryExpr->genericIdentifier() != nullptr && primaryExpr->genericIdentifier()->genericTypeParameters() != nullptr && primaryExpr->genericIdentifier()->Identifier() != nullptr)
                     {
-                        std::string arg = entry->getText();
-                        // Apply active type substitutions to each type argument
-                        auto it = activeTypeSubstitutions.find(arg);
-                        if (it != activeTypeSubstitutions.end())
-                            arg = it->second;
-                        typeArgs.push_back(arg);
+                        std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
+                        std::vector<std::string> typeArgs;
+                        for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                        {
+                            std::string arg = entry->getText();
+                            // Apply active type substitutions to each type argument
+                            auto it = activeTypeSubstitutions.find(arg);
+                            if (it != activeTypeSubstitutions.end())
+                                arg = it->second;
+                            typeArgs.push_back(arg);
+                        }
+                        std::string mangledName = MangledGenericName(baseName, typeArgs);
+                        if (!instantiatedGenerics.count(mangledName))
+                        {
+                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            instantiatedGenerics.insert(mangledName);
+                        }
                     }
-                    std::string mangledName = MangledGenericName(baseName, typeArgs);
-                    if (!instantiatedGenerics.count(mangledName))
-                    {
-                        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
-                        instantiatedGenerics.insert(mangledName);
-                    }
+                    break;
                 }
             }
 
