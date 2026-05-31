@@ -2149,7 +2149,7 @@ public:
                             std::string fr = fc->StringLiteral()->getText();
                             if (fr.size() >= 2) portSpec = fr.substr(1, fr.size() - 2);
                         }
-                    Compiler()->CompileVcpkgImport(Compiler()->currentSourceFilePath_, importFilename, portSpec);
+                    Compiler()->CompileVcpkgImport(Compiler()->RootVcpkgImportPath(Compiler()->currentSourceFilePath_), importFilename, portSpec);
                     continue;
                 }
                 std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";

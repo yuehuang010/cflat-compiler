@@ -62,6 +62,16 @@ x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll
 
 The compiler automatically locates `runtime.cb` next to the executable. The CFlat source uses the `.cb` extension.
 
+### Compiler cache (`--init`)
+
+Run once after installing or updating cflat to populate `%USERPROFILE%\.cflat\`:
+
+```bash
+x64/Debug/cflat.exe --init
+```
+
+This pre-compiles all 20 core `.cb` libraries to LLVM bitcode and caches the resolved linker paths (MSVC lib dirs, Windows SDK dirs). Subsequent compiles load the bitcode instead of re-parsing, cutting cold-start time by ~44% (~820ms -> ~460ms for the parse+codegen phase). The cache is keyed on the modification times of the core `.cb` files and auto-invalidates when any of them change. See [`doc/CACHING.md`](doc/CACHING.md) for the full design and troubleshooting.
+
 ### C interop (`.c` files compiled by clang)
 
 `.c` inputs are treated as **real C** and compiled by `clang-cl` into objects that are merged into the final image by `lld-link` (see `CompileCFile` and `EmitExecutable` in `LLVMBackend.h`). They are NOT parsed by the CFlat parser. clang-cl auto-detects the Windows SDK / MSVC, so no extra flags are needed; the compiled object supplies the definitions.
@@ -109,6 +119,7 @@ x64/Debug/cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-d
 - `-p / --platform`: Target platform - `x64` (default) or `x86`
 - `-v / --verbose`: Print detailed diagnostic messages during compilation
 - `--check`: Check one or more source files for errors without emitting any output. Treats *every* positional as an independent `.cb` source (no `-o`/`--out-lli`/`--bitcode`, no linking). A single backend is reused across the files - `ResetForReanalysis` clears per-file state between them while the core-library parse cache persists, so `runtime.cb` and its transitive core imports are parsed once for the whole batch. A failing file does not abort the batch; the process exit code is non-zero if any file failed. Used by `test_err.bat` to batch the `err_*.cb` negative tests into one process (amortizes both process-spawn and standard-library parsing).
+- `--init`: Pre-build the compiler cache in `%USERPROFILE%\.cflat\` and exit. Caches linker paths (x64 and x86) and pre-compiles all core `.cb` libraries to LLVM bitcode for win64. Run once after installing or updating cflat; subsequent compiles load from cache instead of re-parsing core libraries (~44% faster cold-start). See [`doc/CACHING.md`](doc/CACHING.md).
 - `--c-include <dir>`: Header search dir for C library bindings (repeatable)
 - `--c-lib <path>`: Prebuilt C import library (.lib) to link (repeatable)
 - `--c-define <NAME[=val]>`: Preprocessor define passed to all clang-cl C compiles/dumps (repeatable)

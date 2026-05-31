@@ -197,7 +197,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // context loaded from the bitcode file.  This avoids named-type conflicts with
     // the %string type pre-created by RegisterBuiltinString in Init().
     bool bitcodeLoaded = false;
-    if (!batchMode_ && !runtimeDir.empty() && !skipRuntimeImport)
+    if (!batchMode_ && !noCache_ && !runtimeDir.empty() && !skipRuntimeImport)
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (!bcCacheDir.empty())
@@ -1754,10 +1754,29 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
-    // importedFiles
+    // importedFiles - store paths relative to runtimeDir so the cache is
+    // portable between Debug and Release builds that share core/*.cb files.
     {
         llvm::json::Array arr;
-        for (auto& f : importedFiles) arr.push_back(f);
+        std::string rdPrefix = runtimeDir;
+        // Normalize to lowercase backslash for consistent prefix matching.
+        std::replace(rdPrefix.begin(), rdPrefix.end(), '/', '\\');
+        for (auto& f : importedFiles)
+        {
+            std::string norm = f;
+            std::replace(norm.begin(), norm.end(), '/', '\\');
+            if (norm.size() > rdPrefix.size() &&
+                _strnicmp(norm.c_str(), rdPrefix.c_str(), rdPrefix.size()) == 0 &&
+                (norm[rdPrefix.size()] == '\\' || norm[rdPrefix.size()] == '/'))
+            {
+                // Store relative path (skip separator after prefix).
+                arr.push_back(norm.substr(rdPrefix.size() + 1));
+            }
+            else
+            {
+                arr.push_back(f);
+            }
+        }
         root["imported_files"] = std::move(arr);
     }
 
@@ -2049,10 +2068,20 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 
     // Restore symbol tables from JSON.
 
-    // importedFiles
+    // importedFiles - paths may be relative to runtimeDir (new format) or
+    // absolute (old format). Resolve relative paths against current runtimeDir
+    // so the dedup check works even when Debug and Release builds share a cache.
     if (auto* arr = root->getArray("imported_files"))
         for (auto& elem : *arr)
-            if (auto v = elem.getAsString()) importedFiles.insert(v->str());
+            if (auto v = elem.getAsString())
+            {
+                std::filesystem::path p(v->str());
+                if (p.is_relative())
+                    importedFiles.insert(std::filesystem::weakly_canonical(
+                        std::filesystem::path(runtimeDir) / p).string());
+                else
+                    importedFiles.insert(v->str());
+            }
 
     // namespaceTable
     if (auto* arr = root->getArray("namespaces"))

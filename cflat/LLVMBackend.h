@@ -706,6 +706,7 @@ private:
     // When true (--check / batch mode), a fatal compile error throws instead of
     // calling exit(1), so the batch loop can record the failure and move on.
     bool batchMode_ = false;
+    bool noCache_ = false;
     int platformValue = 64;  // 64 for win64, 32 for win32
     // C interop: temp .obj files produced by clang-cl from .c inputs, linked
     // into the final image by EmitExecutable and then deleted.
@@ -8449,6 +8450,7 @@ public:
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
     void SetBatchMode(bool v) { batchMode_ = v; }
+    void SetNoCache(bool v) { noCache_ = v; }
 
     using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg)>;
     void SetDiagnosticSink(DiagnosticSink sink) { diagnosticSink_ = std::move(sink); }

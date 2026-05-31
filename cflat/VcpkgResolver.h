@@ -151,9 +151,11 @@ private:
         else
         {
             std::error_code ec;
-            fs::path start = fs::path(importingFilePath).parent_path();
+            // Absolutize first so that a bare filename ("get.cb", no directory component)
+            // resolves relative to CWD rather than giving an empty parent_path that
+            // silently falls back to CWD one level too high.
+            fs::path start = fs::absolute(fs::path(importingFilePath), ec).parent_path();
             if (start.empty()) start = fs::current_path(ec);
-            start = fs::absolute(start, ec);
 
             // Walk up from 'start' looking for vcpkg.json. Stop at a .git boundary
             // (directory or file - submodules use a .git file) so we don't accidentally

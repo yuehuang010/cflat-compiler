@@ -55,6 +55,7 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
     args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
     args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths for x64 and x86, then exit");
+    args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
 
     if (!args.parse(argc, argv))
         return 1;
@@ -117,6 +118,7 @@ int main(int argc, char* argv[])
         compiler.SetVerbose(args.hasFlag("verbose"));
         compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
         compiler.SetBatchMode(true);
+        compiler.SetNoCache(args.hasFlag("no-cache"));
 
         int failures = 0;
         for (size_t i = 0; i < args.positionalCount(); ++i)
@@ -152,6 +154,7 @@ int main(int argc, char* argv[])
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
+    compiler.SetNoCache(args.hasFlag("no-cache"));
     bool ok = compiler.Compile(args);
 
     writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");
