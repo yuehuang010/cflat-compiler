@@ -1,11 +1,13 @@
 import "test_helper.cb";
 import "list.cb";
+import "json.cb";
+import "xml.cb";
 
 annotation Private   { };
 annotation JsonName  { string value; };
 annotation MaxLength { int value; };
 
-// ── Test structs ─────────────────────────────────────────────────────────────
+// -- Structs ------------------------------------------------------------------
 
 struct Point {
     int x = 0;
@@ -29,8 +31,74 @@ struct ItemCollection {
     list<int> items = default;
 };
 
-// ── Minimal IReflector implementation ────────────────────────────────────────
-// Logs method calls to stdout in a testable format.
+struct AllPrimitives {
+    int    i = 0;
+    bool   b = false;
+    float  f = 0;
+    string s = default;
+};
+
+struct Address {
+    [JsonName("street_name")]
+    string street = default;
+    int zip = 0;
+};
+
+struct Employee {
+    [JsonName("full_name")]
+    string name = default;
+    int id = 0;
+    [Private]
+    string _token = default;
+    Address addr = default;
+};
+
+struct BfReflect {
+    u32 ready : 1;
+    u32 mode  : 3;
+    u32 count : 24;
+    i32 delta : 8;
+    bool flag : 1;
+};
+
+struct BfPacket {
+    u32 ready : 1;
+    u32 mode  : 3;
+    u32 count : 24;
+    i32 delta : 8;
+    bool flag : 1;
+};
+
+struct Level3 { int val = 0; };
+struct Level2 { Level3 deep = default; int mid = 0; };
+struct Level1 { Level2 inner = default; string top = default; };
+
+struct AnnotatedPerson {
+    [JsonName("first_name")]
+    string firstName = default;
+
+    [Private]
+    string _token = default;
+
+    [JsonName("age_years")]
+    [MaxLength(3)]
+    int age = 0;
+
+    string lastName = default;
+};
+
+// -- Class --------------------------------------------------------------------
+
+class Config {
+    [JsonName("max_retries")]
+    int maxRetries = 0;
+    bool enabled = false;
+    [Private]
+    string secretKey = default;
+    float threshold = 0;
+};
+
+// -- Reflect visitor ----------------------------------------------------------
 
 class DebugReflector : IReflector {
     void visitInt(string name, int value) {
@@ -62,24 +130,9 @@ class DebugReflector : IReflector {
     }
 };
 
-// =============================================================
-// Bitfield reflection tests
-// =============================================================
-
-struct BfReflect {
-    u32 ready    : 1;
-    u32 mode     : 3;
-    u32 count    : 24;
-    i32 delta    : 8;   // signed - sign-extension exercised
-    bool flag    : 1;
-};
-
 class BfCollector : IReflector {
-    int intName0Sum = 0;
     int intCount = 0;
     int boolCount = 0;
-    int lastInt = 0;
-    string lastName = default;
     int sawReady = 0;
     int sawMode = 0;
     int sawCount = 0;
@@ -88,7 +141,6 @@ class BfCollector : IReflector {
 
     void visitInt(string name, int value) {
         intCount = intCount + 1;
-        lastInt = value;
         if (name == "ready") { sawReady = value + 1; }
         else if (name == "mode") { sawMode = value + 1; }
         else if (name == "count") { sawCount = value; }
@@ -107,79 +159,36 @@ class BfCollector : IReflector {
     void endArray() { }
 };
 
-bool testBitfieldReflect()
+// -- Helpers ------------------------------------------------------------------
+
+// Verify that '{' and '}' in string literals are not treated as interpolation.
+string buildBraces()
 {
-    bool result = true;
-
-    BfReflect b = default;
-    b.ready = 1;
-    b.mode = 5;
-    b.count = 12345;
-    b.delta = -7;
-    b.flag = true;
-
-    BfCollector c;
-    IReflector v = c;
-    reflect(b, v);
-
-    // sawX is offset by +1 so we can distinguish "not visited" (0) from "visited with value 0".
-    result &= Test("bf reflect ready", c.sawReady, 2);     // 1 + 1
-    result &= Test("bf reflect mode",  c.sawMode,  6);     // 5 + 1
-    result &= Test("bf reflect count", c.sawCount, 12345);
-    result &= Test("bf reflect delta (signed)", c.sawDelta, -7);
-    result &= Test("bf reflect flag (bool)", c.sawFlag, 2); // true=1 + 1
-    result &= Test("bf reflect int visits", c.intCount, 4);
-    result &= Test("bf reflect bool visits", c.boolCount, 1);
-
-    return result;
+    stringbuilder sb;
+    sb.append("{");
+    sb.append("}");
+    return sb.toString();
 }
 
-// =============================================================
-// Annotation tests
-// =============================================================
-
-struct AnnotatedPerson {
-    [JsonName("first_name")]
-    string firstName = default;
-
-    [Private]
-    string _token = default;
-
-    [JsonName("age_years")]
-    [MaxLength(3)]
-    int age = 0;
-
-    string lastName = default;
-};
-
-bool testAnnotations()
+bool floatNear(float a, float b)
 {
-    bool result = true;
-
-    string fn = annotationof(AnnotatedPerson, "firstName", "JsonName");
-    result &= Test("JsonName on firstName", fn.data(), "first_name");
-
-    string priv = annotationof(AnnotatedPerson, "_token", "Private");
-    result &= Test("Private on _token", priv.data(), "1");
-
-    string maxLen = annotationof(AnnotatedPerson, "age", "MaxLength");
-    result &= Test("MaxLength on age", maxLen.data(), "3");
-
-    string ageName = annotationof(AnnotatedPerson, "age", "JsonName");
-    result &= Test("JsonName on age", ageName.data(), "age_years");
-
-    string none = annotationof(AnnotatedPerson, "lastName", "JsonName");
-    result &= Test("no annotation on lastName", none.length(), 0);
-
-    return result;
+    float diff = a - b;
+    if (diff < 0) diff = -diff;
+    return diff < 0.001f;
 }
 
 extern int main()
 {
+    int passed = 0;
+    int total  = 0;
+
+    // =========================================================================
+    // reflect() visitor tests
+    // =========================================================================
+
     DebugReflector r;
     IReflector visitor = r;
 
-    // ── Test 1: flat struct (Point) with two int fields ──────────────────────
     printf("TEST1:");
     Point p;
     p.x = 3;
@@ -187,7 +196,6 @@ extern int main()
     reflect(p, visitor);
     printf("\n");
 
-    // ── Test 2: struct with string, int, float + [Private] ──────────────────
     printf("TEST2:");
     Person person;
     person.name = "Alice";
@@ -197,7 +205,6 @@ extern int main()
     reflect(person, visitor);
     printf("\n");
 
-    // ── Test 3: nested struct (value type) ────────────────────────────────────
     printf("TEST3:");
     Container c;
     c.origin.x = 1;
@@ -206,7 +213,6 @@ extern int main()
     reflect(c, visitor);
     printf("\n");
 
-    // ── Test 4: pointer to struct (non-null) ─────────────────────────────────
     printf("TEST4:");
     Point* pp = new Point();
     pp.x = 10;
@@ -215,13 +221,11 @@ extern int main()
     printf("\n");
     delete pp;
 
-    // ── Test 5: pointer to struct (null) ──────────────────────────────────────
     printf("TEST5:");
     Point* nullPtr = nullptr;
     reflect(nullPtr, visitor);
     printf("\n");
 
-    // ── Test 6: list field with int elements ──────────────────────────────────
     printf("TEST6:");
     ItemCollection ic;
     ic.items.add(10);
@@ -230,12 +234,261 @@ extern int main()
     reflect(ic, visitor);
     printf("\n");
 
-    if (!testAnnotations())
-        return 1;
+    // =========================================================================
+    // Annotation tests
+    // =========================================================================
 
-    if (!testBitfieldReflect())
-        return 1;
+    string fn = annotationof(AnnotatedPerson, "firstName", "JsonName");
+    total++; passed += Test("JsonName on firstName", fn.data(), "first_name");
 
-    printf("All reflect/annotation tests completed.\n");
-    return 0;
+    string priv = annotationof(AnnotatedPerson, "_token", "Private");
+    total++; passed += Test("Private on _token", priv.data(), "1");
+
+    string maxLen = annotationof(AnnotatedPerson, "age", "MaxLength");
+    total++; passed += Test("MaxLength on age", maxLen.data(), "3");
+
+    string ageName = annotationof(AnnotatedPerson, "age", "JsonName");
+    total++; passed += Test("JsonName on age", ageName.data(), "age_years");
+
+    string none = annotationof(AnnotatedPerson, "lastName", "JsonName");
+    total++; passed += Test("no annotation on lastName", none.length(), 0);
+
+    // =========================================================================
+    // Bitfield reflect tests
+    // =========================================================================
+
+    BfReflect bf = default;
+    bf.ready = 1;
+    bf.mode = 5;
+    bf.count = 12345;
+    bf.delta = -7;
+    bf.flag = true;
+
+    BfCollector bfc;
+    IReflector bfv = bfc;
+    reflect(bf, bfv);
+
+    total++; passed += Test("bf reflect ready", bfc.sawReady, 2);
+    total++; passed += Test("bf reflect mode",  bfc.sawMode,  6);
+    total++; passed += Test("bf reflect count", bfc.sawCount, 12345);
+    total++; passed += Test("bf reflect delta (signed)", bfc.sawDelta, -7);
+    total++; passed += Test("bf reflect flag (bool)", bfc.sawFlag, 2);
+    total++; passed += Test("bf reflect int visits", bfc.intCount, 4);
+    total++; passed += Test("bf reflect bool visits", bfc.boolCount, 1);
+
+    // =========================================================================
+    // JSON tests
+    // =========================================================================
+
+    total++; passed += Test("curly_braces", buildBraces(), "{}");
+
+    total++; passed += Test("toJson_flat", JsonBuilder.toJson(p), "{\"x\":3,\"y\":7}");
+
+    AllPrimitives ap;
+    ap.i = 42;
+    ap.b = true;
+    ap.f = 1.5f;
+    ap.s = "hello";
+    string apJson = JsonBuilder.toJson(ap);
+    total++; passed += Test("toJson_primitives", apJson, "{\"i\":42,\"b\":true,\"f\":1.5,\"s\":\"hello\"}");
+
+    AllPrimitives apFalse;
+    apFalse.i = -7;
+    apFalse.b = false;
+    apFalse.f = 0;
+    apFalse.s = "";
+    total++; passed += Test("toJson_bool_false", JsonBuilder.toJson(apFalse), "{\"i\":-7,\"b\":false,\"f\":0,\"s\":\"\"}");
+
+    Employee e;
+    e.name = "Alice";
+    e.id = 42;
+    e._token = "secret";
+    e.addr.street = "Main St";
+    e.addr.zip = 12345;
+    total++; passed += Test("toJson_nested", JsonBuilder.toJson(e),
+        "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
+
+    BfPacket bp = default;
+    bp.ready = 1;
+    bp.mode = 5;
+    bp.count = 12345;
+    bp.delta = -7;
+    bp.flag = true;
+    total++; passed += Test("toJson_bitfields", JsonBuilder.toJson(bp),
+        "{\"ready\":1,\"mode\":5,\"count\":12345,\"delta\":-7,\"flag\":true}");
+
+    Level1 l1;
+    l1.top = "root";
+    l1.inner.mid = 99;
+    l1.inner.deep.val = 7;
+    total++; passed += Test("toJson_deep", JsonBuilder.toJson(l1),
+        "{\"inner\":{\"deep\":{\"val\":7},\"mid\":99},\"top\":\"root\"}");
+
+    Config cfg;
+    cfg.maxRetries = 3;
+    cfg.enabled = true;
+    cfg.secretKey = "hidden";
+    cfg.threshold = 0.5f;
+    total++; passed += Test("toJson_class", JsonBuilder.toJson(cfg),
+        "{\"max_retries\":3,\"enabled\":true,\"threshold\":0.5}");
+
+    Point jp2 = JsonBuilder.fromJson<Point>("{\"x\":3,\"y\":7}");
+    total++; passed += Test("fromJson_flat_x", jp2.x, 3);
+    total++; passed += Test("fromJson_flat_y", jp2.y, 7);
+
+    AllPrimitives jap2 = JsonBuilder.fromJson<AllPrimitives>("{\"i\":42,\"b\":true,\"f\":1.5,\"s\":\"hello\"}");
+    total++; passed += Test("fromJson_int",    jap2.i, 42);
+    total++; passed += Test("fromJson_bool",   jap2.b, true);
+    total++; passed += Test("fromJson_string", jap2.s, "hello");
+    total++;
+    if (!floatNear(jap2.f, 1.5f)) { printf("fromJson_float MISMATCH (expected 1.5 got %f)\n", jap2.f); }
+    else { passed++; if (printOnPass) printf("fromJson_float passed.\n"); }
+
+    AllPrimitives jap3 = JsonBuilder.fromJson<AllPrimitives>("{\"i\":-7,\"b\":false,\"f\":0,\"s\":\"\"}");
+    total++; passed += Test("fromJson_neg_int",    jap3.i, -7);
+    total++; passed += Test("fromJson_bool_false", jap3.b, false);
+    total++; passed += Test("fromJson_empty_str",  jap3.s, "");
+
+    Employee je2 = JsonBuilder.fromJson<Employee>(
+        "{\"full_name\":\"Alice\",\"id\":42,\"addr\":{\"street_name\":\"Main St\",\"zip\":12345}}");
+    total++; passed += Test("fromJson_name",   je2.name,        "Alice");
+    total++; passed += Test("fromJson_id",     je2.id,          42);
+    total++; passed += Test("fromJson_street", je2.addr.street, "Main St");
+    total++; passed += Test("fromJson_zip",    je2.addr.zip,    12345);
+    total++; passed += Test("fromJson_private_skipped", je2._token, "");
+
+    Config jcfg2 = JsonBuilder.fromJson<Config>(
+        "{\"max_retries\":5,\"enabled\":false,\"secretKey\":\"attempt\",\"threshold\":0.75}");
+    total++; passed += Test("fromJson_class_retries", jcfg2.maxRetries, 5);
+    total++; passed += Test("fromJson_class_enabled", jcfg2.enabled,    false);
+    total++; passed += Test("fromJson_class_private", jcfg2.secretKey,  "");
+    total++;
+    if (!floatNear(jcfg2.threshold, 0.75f)) { printf("fromJson_class_threshold MISMATCH (expected 0.75 got %f)\n", jcfg2.threshold); }
+    else { passed++; if (printOnPass) printf("fromJson_class_threshold passed.\n"); }
+
+    Level1 jl2 = JsonBuilder.fromJson<Level1>(
+        "{\"inner\":{\"deep\":{\"val\":7},\"mid\":99},\"top\":\"root\"}");
+    total++; passed += Test("fromJson_deep_top", jl2.top,            "root");
+    total++; passed += Test("fromJson_deep_mid", jl2.inner.mid,      99);
+    total++; passed += Test("fromJson_deep_val", jl2.inner.deep.val, 7);
+
+    Employee je3 = JsonBuilder.fromJson<Employee>(JsonBuilder.toJson(e));
+    total++; passed += Test("json_roundtrip_name",   je3.name,        e.name);
+    total++; passed += Test("json_roundtrip_id",     je3.id,          e.id);
+    total++; passed += Test("json_roundtrip_street", je3.addr.street, e.addr.street);
+    total++; passed += Test("json_roundtrip_zip",    je3.addr.zip,    e.addr.zip);
+
+    AllPrimitives jap4 = JsonBuilder.fromJson<AllPrimitives>(JsonBuilder.toJson(ap));
+    total++; passed += Test("json_roundtrip_prim_int",    jap4.i, ap.i);
+    total++; passed += Test("json_roundtrip_prim_bool",   jap4.b, ap.b);
+    total++; passed += Test("json_roundtrip_prim_string", jap4.s, ap.s);
+    total++;
+    if (!floatNear(jap4.f, ap.f)) { printf("json_roundtrip_prim_float MISMATCH (expected %f got %f)\n", ap.f, jap4.f); }
+    else { passed++; if (printOnPass) printf("json_roundtrip_prim_float passed.\n"); }
+
+    Point jp0;
+    Point jp0rt = JsonBuilder.fromJson<Point>(JsonBuilder.toJson(jp0));
+    total++; passed += Test("json_roundtrip_zero_x", jp0rt.x, 0);
+    total++; passed += Test("json_roundtrip_zero_y", jp0rt.y, 0);
+
+    // =========================================================================
+    // XML tests
+    // =========================================================================
+
+    total++; passed += Test("toXml_flat", XmlBuilder.toXml(p, "Point"), "<Point><x>3</x><y>7</y></Point>");
+
+    total++; passed += Test("toXml_primitives", XmlBuilder.toXml(ap, "AllPrimitives"),
+        "<AllPrimitives><i>42</i><b>true</b><f>1.5</f><s>hello</s></AllPrimitives>");
+
+    total++; passed += Test("toXml_bool_false", XmlBuilder.toXml(apFalse, "AllPrimitives"),
+        "<AllPrimitives><i>-7</i><b>false</b><f>0</f><s></s></AllPrimitives>");
+
+    total++; passed += Test("toXml_nested", XmlBuilder.toXml(e, "Employee"),
+        "<Employee><full_name>Alice</full_name><id>42</id><addr><street_name>Main St</street_name><zip>12345</zip></addr></Employee>");
+
+    total++; passed += Test("toXml_deep", XmlBuilder.toXml(l1, "Level1"),
+        "<Level1><inner><deep><val>7</val></deep><mid>99</mid></inner><top>root</top></Level1>");
+
+    total++; passed += Test("toXml_class", XmlBuilder.toXml(cfg, "Config"),
+        "<Config><max_retries>3</max_retries><enabled>true</enabled><threshold>0.5</threshold></Config>");
+
+    AllPrimitives xesc;
+    xesc.i = 0;
+    xesc.b = false;
+    xesc.f = 0;
+    xesc.s = "a&b<c>d";
+    total++; passed += Test("toXml_escape", XmlBuilder.toXml(xesc, "AllPrimitives"),
+        "<AllPrimitives><i>0</i><b>false</b><f>0</f><s>a&amp;b&lt;c&gt;d</s></AllPrimitives>");
+
+    string xmlFlat = "<Point><x>3</x><y>7</y></Point>";
+    Point xp2 = XmlBuilder.fromXml<Point>(xmlFlat);
+    total++; passed += Test("fromXml_flat_x", xp2.x, 3);
+    total++; passed += Test("fromXml_flat_y", xp2.y, 7);
+
+    string xmlPrim = "<AllPrimitives><i>42</i><b>true</b><f>1.5</f><s>hello</s></AllPrimitives>";
+    AllPrimitives xap2 = XmlBuilder.fromXml<AllPrimitives>(xmlPrim);
+    total++; passed += Test("fromXml_int",    xap2.i, 42);
+    total++; passed += Test("fromXml_bool",   xap2.b, true);
+    total++; passed += Test("fromXml_string", xap2.s, "hello");
+    total++;
+    if (!floatNear(xap2.f, 1.5f)) { printf("fromXml_float MISMATCH (expected 1.5 got %f)\n", xap2.f); }
+    else { passed++; if (printOnPass) printf("fromXml_float passed.\n"); }
+
+    string xmlNeg = "<AllPrimitives><i>-7</i><b>false</b><f>0</f><s></s></AllPrimitives>";
+    AllPrimitives xap3 = XmlBuilder.fromXml<AllPrimitives>(xmlNeg);
+    total++; passed += Test("fromXml_neg_int",    xap3.i, -7);
+    total++; passed += Test("fromXml_bool_false", xap3.b, false);
+    total++; passed += Test("fromXml_empty_str",  xap3.s, "");
+
+    string xmlEmp = "<Employee><full_name>Alice</full_name><id>42</id><addr><street_name>Main St</street_name><zip>12345</zip></addr></Employee>";
+    Employee xe2 = XmlBuilder.fromXml<Employee>(xmlEmp);
+    total++; passed += Test("fromXml_name",   xe2.name,        "Alice");
+    total++; passed += Test("fromXml_id",     xe2.id,          42);
+    total++; passed += Test("fromXml_street", xe2.addr.street, "Main St");
+    total++; passed += Test("fromXml_zip",    xe2.addr.zip,    12345);
+    total++; passed += Test("fromXml_private_skipped", xe2._token, "");
+
+    string xmlCfg = "<Config><max_retries>5</max_retries><enabled>false</enabled><secretKey>attempt</secretKey><threshold>0.75</threshold></Config>";
+    Config xcfg2 = XmlBuilder.fromXml<Config>(xmlCfg);
+    total++; passed += Test("fromXml_class_retries", xcfg2.maxRetries, 5);
+    total++; passed += Test("fromXml_class_enabled", xcfg2.enabled,    false);
+    total++; passed += Test("fromXml_class_private", xcfg2.secretKey,  "");
+    total++;
+    if (!floatNear(xcfg2.threshold, 0.75f)) { printf("fromXml_class_threshold MISMATCH (expected 0.75 got %f)\n", xcfg2.threshold); }
+    else { passed++; if (printOnPass) printf("fromXml_class_threshold passed.\n"); }
+
+    string xmlDeep = "<Level1><inner><deep><val>7</val></deep><mid>99</mid></inner><top>root</top></Level1>";
+    Level1 xl2 = XmlBuilder.fromXml<Level1>(xmlDeep);
+    total++; passed += Test("fromXml_deep_top", xl2.top,            "root");
+    total++; passed += Test("fromXml_deep_mid", xl2.inner.mid,      99);
+    total++; passed += Test("fromXml_deep_val", xl2.inner.deep.val, 7);
+
+    string xmlEsc = "<AllPrimitives><i>0</i><b>false</b><f>0</f><s>a&amp;b&lt;c&gt;d</s></AllPrimitives>";
+    AllPrimitives xap4 = XmlBuilder.fromXml<AllPrimitives>(xmlEsc);
+    total++; passed += Test("fromXml_unescape", xap4.s, "a&b<c>d");
+
+    string xmlE3 = XmlBuilder.toXml(e, "Employee");
+    Employee xe3 = XmlBuilder.fromXml<Employee>(xmlE3);
+    total++; passed += Test("xml_roundtrip_name",   xe3.name,        e.name);
+    total++; passed += Test("xml_roundtrip_id",     xe3.id,          e.id);
+    total++; passed += Test("xml_roundtrip_street", xe3.addr.street, e.addr.street);
+    total++; passed += Test("xml_roundtrip_zip",    xe3.addr.zip,    e.addr.zip);
+
+    string xmlAp5 = XmlBuilder.toXml(ap, "AllPrimitives");
+    AllPrimitives xap5 = XmlBuilder.fromXml<AllPrimitives>(xmlAp5);
+    total++; passed += Test("xml_roundtrip_prim_int",    xap5.i, ap.i);
+    total++; passed += Test("xml_roundtrip_prim_bool",   xap5.b, ap.b);
+    total++; passed += Test("xml_roundtrip_prim_string", xap5.s, ap.s);
+    total++;
+    if (!floatNear(xap5.f, ap.f)) { printf("xml_roundtrip_prim_float MISMATCH (expected %f got %f)\n", ap.f, xap5.f); }
+    else { passed++; if (printOnPass) printf("xml_roundtrip_prim_float passed.\n"); }
+
+    Point xp0;
+    string xmlP0 = XmlBuilder.toXml(xp0, "Point");
+    Point xp0rt = XmlBuilder.fromXml<Point>(xmlP0);
+    total++; passed += Test("xml_roundtrip_zero_x", xp0rt.x, 0);
+    total++; passed += Test("xml_roundtrip_zero_y", xp0rt.y, 0);
+
+    printf("%d/%d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
 }
