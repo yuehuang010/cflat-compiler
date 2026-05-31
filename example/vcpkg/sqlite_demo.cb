@@ -1,0 +1,45 @@
+// SQLite3 via vcpkg. Uses `import package-vcpkg` to auto-resolve the include
+// dir, link lib, and runtime DLL. No manual paths needed.
+import package-vcpkg "sqlite3.h" from "sqlite3";
+
+int row_callback(void* unused, int col_count, char** values, char** col_names)
+{
+    int i = 0;
+    while (i < col_count)
+    {
+        printf("  %s = %s\n", col_names[i], values[i]);
+        i++;
+    }
+    return 0;
+}
+
+extern int main()
+{
+    void* db = nullptr;
+    int rc = sqlite3_open(":memory:", &db);
+    if (rc != 0)
+    {
+        printf("Failed to open DB: %d\n", rc);
+        return 1;
+    }
+    printf("Opened in-memory SQLite DB (version %s)\n", sqlite3_libversion());
+
+    char* errmsg = nullptr;
+
+    rc = sqlite3_exec(db, "CREATE TABLE people (id INTEGER, name TEXT);", nullptr, nullptr, &errmsg);
+    if (rc != 0) { printf("CREATE failed: %s\n", errmsg); sqlite3_free(errmsg); sqlite3_close(db); return 1; }
+
+    rc = sqlite3_exec(db, "INSERT INTO people VALUES (1, 'Alice');", nullptr, nullptr, &errmsg);
+    if (rc != 0) { printf("INSERT failed: %s\n", errmsg); sqlite3_free(errmsg); sqlite3_close(db); return 1; }
+
+    rc = sqlite3_exec(db, "INSERT INTO people VALUES (2, 'Bob');", nullptr, nullptr, &errmsg);
+    if (rc != 0) { printf("INSERT failed: %s\n", errmsg); sqlite3_free(errmsg); sqlite3_close(db); return 1; }
+
+    printf("SELECT * FROM people:\n");
+    rc = sqlite3_exec(db, "SELECT * FROM people ORDER BY id;", row_callback, nullptr, &errmsg);
+    if (rc != 0) { printf("SELECT failed: %s\n", errmsg); sqlite3_free(errmsg); sqlite3_close(db); return 1; }
+
+    sqlite3_close(db);
+    printf("Done.\n");
+    return 0;
+}
