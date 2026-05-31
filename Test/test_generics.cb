@@ -1854,6 +1854,50 @@ bool testThisInGenericMethod()
     return result;
 }
 
+// =============================================================
+// auto return-type inference on generic functions
+// =============================================================
+
+auto square<T>(T v)         { return v * v; }
+auto identity<T>(T v)       { return v; }
+auto pick_max<T>(T lhs, T rhs) { return lhs > rhs ? lhs : rhs; }
+auto is_positive<T>(T v)    { return v > (T)0; }
+auto abs_val<T>(T v)
+{
+    if (v < (T)0) return -v;
+    return v;
+}
+
+bool testAutoReturn()
+{
+    bool result = true;
+    result &= Test("auto_square_int",     square<int>(5),         25);
+    result &= Test("auto_square_i64",     square<i64>(7),         (i64)49);
+    double d = square<double>(2.5);
+    result &= Test("auto_square_double",  (int)(d > 6.24 && d < 6.26), 1);
+    result &= Test("auto_identity_int",   identity<int>(42),      42);
+    result &= Test("auto_pick_max_7",     pick_max<int>(3, 7),    7);
+    result &= Test("auto_pick_max_9",     pick_max<int>(9, 2),    9);
+    result &= Test("auto_is_pos_false",   is_positive<int>(-3),   false);
+    result &= Test("auto_is_pos_true",    is_positive<int>(5),    true);
+    result &= Test("auto_abs_neg",        abs_val<int>(-4),       4);
+    result &= Test("auto_abs_pos",        abs_val<int>(4),        4);
+    return result;
+}
+
+// -- generic argument inference --
+
+auto pick<T>(T a, T b) { return a > b ? a : b; }
+
+bool testGenericArgInference()
+{
+    bool result = true;
+    result &= Test("pick_int_max",  pick(3, 7),                  7);
+    result &= Test("pick_int_min",  pick(9, 2),                  9);
+    result &= Test("pick_i64_max",  pick((i64)10, (i64)20), (i64)20);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -1908,6 +1952,8 @@ extern int main()
     total++; passed += testThisReturnsSelf()             ? 1 : 0;
     total++; passed += testThisMemberAccess()            ? 1 : 0;
     total++; passed += testThisInGenericMethod()         ? 1 : 0;
+    total++; passed += testGenericArgInference()         ? 1 : 0;
+    total++; passed += testAutoReturn()                  ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

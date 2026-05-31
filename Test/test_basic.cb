@@ -1924,6 +1924,13 @@ extern int main()
     total++; passed += testDoWhile()                     ? 1 : 0;
     total++; passed += testAndShortCircuit()             ? 1 : 0;
     total++; passed += testInterfaceNullCheck()          ? 1 : 0;
+    total++; passed += testSizeof()                      ? 1 : 0;
+    total++; passed += testFieldInit()                   ? 1 : 0;
+    total++; passed += testStructInlineArrays()          ? 1 : 0;
+    total++; passed += testPointerArrays()               ? 1 : 0;
+    total++; passed += testArrayDefaultInit()            ? 1 : 0;
+    total++; passed += testArrayFieldInit()              ? 1 : 0;
+    total++; passed += testAlignas()                     ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -2294,6 +2301,220 @@ bool testAndShortCircuit()
 }
 
 // =============================================================
+// sizeof / alignof intrinsics
+// =============================================================
+
+struct SizeofPoint      { int x = default; int y = default; };
+struct SizeofComplex    { char a = default; int b = default; double c = default; SizeofPoint p = default; };
+struct SizeofEmpty      { };
+struct SizeofSingle     { i64 value = default; };
+struct SizeofPtrFields  { int* ptr = nullptr; char* str_ptr = nullptr; };
+struct SizeofNested     { SizeofPoint outer = default; SizeofComplex inner = default; };
+struct SizeofUnder      { int x = default; int y = default; };
+struct SizeofDunder     { void* a = nullptr; void* b = nullptr; };
+struct SizeofFuncField  { function<int(void*)> fn = nullptr; void* ctx = nullptr; };
+
+bool testSizeof()
+{
+    bool r = true;
+
+    // Primitive sizes
+    if (sizeof(int)    != 4) r = false;
+    if (sizeof(char)   != 1) r = false;
+    if (sizeof(double) != 8) r = false;
+    if (sizeof(bool)   != 1) r = false;
+    if (sizeof(i8)     != 1) r = false;
+    if (sizeof(i16)    != 2) r = false;
+    if (sizeof(i32)    != 4) r = false;
+    if (sizeof(i64)    != 8) r = false;
+    if (sizeof(u8)     != 1) r = false;
+    if (sizeof(u16)    != 2) r = false;
+    if (sizeof(u32)    != 4) r = false;
+    if (sizeof(u64)    != 8) r = false;
+    if (sizeof(float)  != 4) r = false;
+
+    // Pointer sizes
+    if const (__PLATFORM__ == 64) {
+        if (sizeof(int*)    != 8) r = false;
+        if (sizeof(char*)   != 8) r = false;
+        if (sizeof(double*) != 8) r = false;
+    } else {
+        if (sizeof(int*)    != 4) r = false;
+        if (sizeof(char*)   != 4) r = false;
+        if (sizeof(double*) != 4) r = false;
+    }
+
+    // Struct sizes
+    if (sizeof(SizeofPoint)  != 8) r = false;
+    if (sizeof(SizeofSingle) != 8) r = false;
+    if const (__PLATFORM__ == 64) {
+        if (sizeof(SizeofPtrFields) != 16) r = false;
+    } else {
+        if (sizeof(SizeofPtrFields) != 8)  r = false;
+    }
+
+    // alignof must return positive
+    if (alignof(int)    <= 0) r = false;
+    if (alignof(char)   <= 0) r = false;
+    if (alignof(double) <= 0) r = false;
+    if (alignof(i64)    <= 0) r = false;
+    if (alignof(SizeofPoint) <= 0) r = false;
+
+    // Pointer type sizeof/alignof
+    if const (__PLATFORM__ == 64) {
+        if (sizeof(SizeofPoint*)  != 8) r = false;
+        if (alignof(SizeofPoint*) != 8) r = false;
+    } else {
+        if (sizeof(SizeofPoint*)  != 4) r = false;
+        if (alignof(SizeofPoint*) != 4) r = false;
+    }
+
+    // Arithmetic on results
+    i64 total3 = sizeof(int) + sizeof(char) + sizeof(double);
+    if (total3 != (4 + 1 + 8)) r = false;
+    if (sizeof(i64) < sizeof(int)) r = false;
+
+    // Underscore struct names
+    if (sizeof(SizeofUnder) != 8) r = false;
+    if const (__PLATFORM__ == 64) {
+        if (sizeof(SizeofDunder) != 16) r = false;
+    } else {
+        if (sizeof(SizeofDunder) != 8)  r = false;
+    }
+
+    // Struct with function<T> field: {i8*,i8*}+void* = 24 on x64, 12 on x86
+    if const (__PLATFORM__ == 64) {
+        if (sizeof(SizeofFuncField) != 24) r = false;
+    } else {
+        if (sizeof(SizeofFuncField) != 12) r = false;
+    }
+
+    return r;
+}
+
+// =============================================================
+// Field initializer syntax and struct-inline fixed arrays
+// =============================================================
+
+struct FieldInitPoint  { int x = 0; int y = 0; };
+struct FieldInitPerson { int age = 0; int score = 0; };
+
+int sumFieldInitPoint(FieldInitPoint p = { x=1, y=2 }) { return p.x + p.y; }
+
+bool testFieldInit()
+{
+    bool result = true;
+
+    FieldInitPoint p = { x=10, y=20 };
+    result &= Test("field_init_xy",   p.x + p.y, 30);
+
+    FieldInitPoint q = { x=5 };
+    result &= Test("field_init_partial", q.x, 5);
+    result &= Test("field_init_default", q.y, 0);
+
+    FieldInitPerson person = { age=30, score=100, };
+    result &= Test("field_init_person_age",   person.age,   30);
+    result &= Test("field_init_person_score", person.score, 100);
+
+    FieldInitPoint* hp = new FieldInitPoint { x=7, y=8 };
+    result &= Test("field_init_heap_x", hp->x, 7);
+    result &= Test("field_init_heap_y", hp->y, 8);
+    delete hp;
+
+    result &= Test("field_init_default_param",  sumFieldInitPoint(), 3);
+    result &= Test("field_init_positional_arg",  sumFieldInitPoint({ x=3, y=4 }), 7);
+    result &= Test("field_init_named_arg",       sumFieldInitPoint(p: { x=5, y=6 }), 11);
+
+    return result;
+}
+
+struct FieldInitPacket { char data[64]; int length = 0; };
+
+bool testStructInlineArrays()
+{
+    bool result = true;
+
+    char[8] buf;
+    buf[0] = (char)10; buf[1] = (char)20; buf[2] = (char)30;
+    result &= Test("inline_arr_sum", buf[0] + buf[1] + buf[2], 60);
+
+    FieldInitPacket pkt;
+    pkt.data[0] = (char)'H';
+    pkt.data[1] = (char)'i';
+    pkt.data[2] = (char)0;
+    pkt.length = 2;
+    result &= Test("struct_arr_elem0", pkt.data[0], 'H');
+    result &= Test("struct_arr_elem1", pkt.data[1], 'i');
+
+    FieldInitPoint[3] pts;
+    pts[0].x = 1; pts[1].x = 2; pts[2].x = 3;
+    result &= Test("struct_arr_sum", pts[0].x + pts[1].x + pts[2].x, 6);
+
+    return result;
+}
+
+bool testPointerArrays()
+{
+    bool result = true;
+
+    char*[3] words;
+    words[0] = "alpha";
+    words[1] = "beta";
+    words[2] = "gamma";
+
+    result &= Test("ptr_arr_strlen0", strlen(words[0]), 5);
+    result &= Test("ptr_arr_strlen1", strlen(words[1]), 4);
+    result &= Test("ptr_arr_strlen2", strlen(words[2]), 5);
+
+    int i = 0;
+    int total_len = 0;
+    while (i < 3) { total_len = total_len + strlen(words[i]); i++; }
+    result &= Test("ptr_arr_total", total_len, 14);
+
+    return result;
+}
+
+// =============================================================
+// Array value-init: T[N] name {} and T[N] name {field=v,...}
+// =============================================================
+
+struct ArrayInitCounter {
+    int count = 0;
+    int step  = 1;
+
+    ArrayInitCounter() {
+        count = 100;
+        step  = 5;
+    }
+};
+
+bool testArrayDefaultInit()
+{
+    bool result = true;
+
+    ArrayInitCounter[3] ctrs {};
+    result &= Test("arr_init_0_count", ctrs[0].count, 100);
+    result &= Test("arr_init_0_step",  ctrs[0].step,  5);
+    result &= Test("arr_init_1_count", ctrs[1].count, 100);
+    result &= Test("arr_init_2_count", ctrs[2].count, 100);
+
+    return result;
+}
+
+bool testArrayFieldInit()
+{
+    bool result = true;
+
+    ArrayInitCounter[2] seeded {count=42, step=7};
+    result &= Test("arr_seed_0_count", seeded[0].count, 42);
+    result &= Test("arr_seed_0_step",  seeded[0].step,  7);
+    result &= Test("arr_seed_1_count", seeded[1].count, 42);
+    result &= Test("arr_seed_1_step",  seeded[1].step,  7);
+
+    return result;
+}
+
+// =============================================================
 // Interface nullptr comparison tests
 // =============================================================
 
@@ -2344,5 +2565,49 @@ bool testInterfaceNullCheck()
     result &= Test("iface_param_nonnull", checkIfaceNotNull(nullIface), false);
 
     delete sc;
+    return result;
+}
+
+// =============================================================
+// alignas tests
+// =============================================================
+
+struct alignas(64) AlignCL { int x = 0; };
+class alignas(32) AlignPaddedPair { int a = 0; int b = 0; };
+struct AlignPlain { int v = 0; };
+
+alignas(64) i64 g_align_counter = 0;
+alignas(64) AlignCL g_align_cl = default;
+
+bool testAlignas()
+{
+    bool result = true;
+
+    result &= Test("sizeof(AlignCL)==64",         (int)sizeof(AlignCL),         64);
+    result &= Test("alignof(AlignCL)==64",        (int)alignof(AlignCL),        64);
+    result &= Test("sizeof(AlignPaddedPair)==32",  (int)sizeof(AlignPaddedPair), 32);
+    result &= Test("alignof(AlignPaddedPair)==32", (int)alignof(AlignPaddedPair),32);
+    result &= Test("sizeof(AlignPlain)==4",        (int)sizeof(AlignPlain),      4);
+    result &= Test("alignof(AlignPlain)==4",       (int)alignof(AlignPlain),     4);
+
+    AlignCL local_cl;
+    AlignPaddedPair local_pp;
+    alignas(32) int local_int = 0;
+    result &= Test("local AlignCL addr%64",    (int)(((i64)&local_cl)  & 63), 0);
+    result &= Test("local AlignPaddedPair%32", (int)(((i64)&local_pp)  & 31), 0);
+    result &= Test("local alignas(32) int%32", (int)(((i64)&local_int) & 31), 0);
+
+    result &= Test("global alignas(64) i64%64", (int)(((i64)&g_align_counter) & 63), 0);
+    result &= Test("global AlignCL%64",         (int)(((i64)&g_align_cl)      & 63), 0);
+
+    AlignCL[4] arr;
+    result &= Test("AlignCL[4] stride==64",   (int)(((i64)&arr[1]) - ((i64)&arr[0])), 64);
+    result &= Test("AlignCL[4] base%64",      (int)(((i64)&arr[0]) & 63), 0);
+    result &= Test("AlignCL[4] arr[2]%64",    (int)(((i64)&arr[2]) & 63), 0);
+
+    AlignCL* p = new AlignCL;
+    result &= Test("new AlignCL%64", (int)(((i64)p) & 63), 0);
+    delete p;
+
     return result;
 }

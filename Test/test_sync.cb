@@ -1119,6 +1119,60 @@ bool testEmbeddedAtomicCounterInitialized() {
 }
 
 // ---------------------------------------------------------------------------
+// Lock annotation positive tests (field group, lock clause, struct methods)
+// ---------------------------------------------------------------------------
+
+struct LockCounter {
+    mutex mtx = default;
+    lock(mtx) {
+        int value = default;
+    }
+};
+
+struct LockRwData {
+    rwlock rw = default;
+    lock(rw) {
+        int data = default;
+    }
+};
+
+void lockIncrement(LockCounter* a, int n) lock(a.mtx) {
+    a.value = a.value + n;
+}
+
+struct LockAccount {
+    mutex mtx = default;
+    lock(mtx) {
+        int balance = default;
+        void deposit(int n) { balance = balance + n; }
+        int getBalance()    { return balance; }
+    }
+};
+
+bool testLockAnnotations()
+{
+    bool result = true;
+    LockCounter c;
+    lock(c.mtx) { c.value = 42; }
+    lock(c.mtx) { lockIncrement(&c, 10); }
+
+    LockCounter c2;
+    lock(c.mtx, c2.mtx) { c.value = c.value + c2.value; }
+    lock(c.mtx) { result &= Test("lock_counter",  c.value, 52); }
+
+    LockRwData rd;
+    lock(rd.rw) { rd.data = 100; }
+    lock(rd.rw) { result &= Test("lock_rwdata",   rd.data, 100); }
+
+    LockAccount acct;
+    lock(acct.mtx) {
+        acct.deposit(100);
+        result &= Test("lock_account", acct.getBalance(), 100);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1187,6 +1241,7 @@ extern int main() {
 
     total++; passed += testAtomicFlagReleaseAcquire()     ? 1 : 0;
     total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
+    total++; passed += testLockAnnotations()              ? 1 : 0;
 
     printf("Thread/Sync tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -15,6 +15,12 @@ struct Resource
 struct Container
 {
     Resource* item = nullptr;
+
+    void reset()
+    {
+        if (item != nullptr) { delete item; item = nullptr; }
+    }
+
     ~Container()
     {
         if (item != nullptr)
@@ -204,6 +210,59 @@ int testListStringMove()
     return passed;
 }
 
+int testFieldOwnership()
+{
+    int passed = 0;
+
+    // Destructor frees its own field exactly once.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+    }
+    passed += Test("dtor_frees_own_field", dtorCount, 1);
+
+    // Member method frees the field; destructor sees nullptr and does nothing.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+        c.reset();
+        passed += Test("method_reset_freed", dtorCount, 1);
+        // Scope exit: ~Container runs; c.item == nullptr so no second free.
+    }
+    passed += Test("no_double_free_after_reset", dtorCount, 1);
+
+    // External code extracts the field via 'move' and frees the local. The
+    // owner's field is nulled by the move, so its destructor is a no-op.
+    dtorCount = 0;
+    {
+        Container c;
+        c.item = new Resource();
+        {
+            Resource* taken = move c.item;
+            passed += Test("field_nulled_after_move", c.item == nullptr, true);
+            delete taken;
+        }
+        passed += Test("move_then_delete_frees_once", dtorCount, 1);
+        // Scope exit: ~Container runs; c.item == nullptr so dtorCount stays 1.
+    }
+    passed += Test("owner_dtor_skips_moved_field", dtorCount, 1);
+
+    // Move from a heap-owned container pointer works the same way.
+    dtorCount = 0;
+    {
+        Container* hc = new Container();
+        hc->item = new Resource();
+        Resource* taken = move hc->item;
+        delete taken;
+        delete hc;
+    }
+    passed += Test("move_from_heap_container", dtorCount, 1);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -380,6 +439,9 @@ extern int main()
     }
     passed += Test("composite_dtor_chain_frees_all", dtorCount, 4);
     total++;
+
+    passed += testFieldOwnership();
+    total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

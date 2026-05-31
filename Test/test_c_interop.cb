@@ -33,6 +33,7 @@ import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
+import "library/float_macros.h";
 
 // Section B: hand-written extern alongside auto-extern. Same signatures the auto-
 // extern path infers; first-writer-wins resolves the duplicate without diagnostic.
@@ -46,6 +47,63 @@ extern int  strcmp(const char* a, const char* b);
 // typedef ML_BinaryOp (declared in mathlib.h as `typedef int (*ML_BinaryOp)(int,int)`).
 int my_add_cb(int a, int b) { return a + b; }
 int my_sub_cb(int a, int b) { return a - b; }
+
+// Section L: float/double #define macro extraction.
+static bool near(double actual, double expected, double tol)
+{
+    double diff = actual - expected;
+    if (diff < 0.0) { diff = -diff; }
+    return diff <= tol;
+}
+
+static bool testFloatMacros()
+{
+    bool r = true;
+    // A. Plain literals
+    r &= near(FM_DOUBLE_PLAIN,  1.5,   1e-12);
+    r &= near(FM_FLOAT_SUFFIX,  2.5,   1e-6);
+    r &= near(FM_LONG_DOUBLE,   3.5,   1e-12);
+    // B. Sign / parens
+    r &= near(FM_NEG,          -1.25,  1e-12);
+    r &= near(FM_NEG_PAREN,    -2.75,  1e-12);
+    r &= near(FM_DOUBLE_NEG,    4.125, 1e-12);
+    r &= near(FM_UNARY_PLUS,    0.75,  1e-12);
+    // C. Scientific notation
+    r &= near(FM_SCI_POS,       1500.0,  1e-9);
+    r &= near(FM_SCI_NEG_EXP,   0.00025, 1e-12);
+    r &= near(FM_SCI_LEAD_DOT,  25.0,    1e-12);
+    r &= near(FM_SCI_TRAIL_DOT, 40.0,    1e-12);
+    r &= near(FM_SCI_CAP_E,     625.0,   1e-12);
+    // D. Hex floats - exact binary
+    r &= FM_HEX_FLOAT     == 12.0;
+    r &= FM_HEX_FLOAT_NEG == -2.5;
+    // E. Arithmetic - dyadic rationals, exact
+    r &= FM_ADD        ==  2.0;
+    r &= FM_SUB        == 10.0;
+    r &= FM_MUL        == 10.0;
+    r &= FM_DIV        ==  0.25;
+    r &= FM_NESTED     == 12.0;
+    r &= FM_PRECEDENCE == 14.0;
+    // F. Mixed int+float
+    r &= FM_MIX_INT_FLOAT == 1.5;
+    r &= FM_MIX_DIV_INT   == 0.5;
+    // G. Casts
+    r &= FM_CAST_DOUBLE         == 42.0;
+    r &= FM_CAST_FLOAT          ==  7.0;
+    r &= FM_CAST_FROM_INT_MACRO == 101.0;
+    // H. Magnitude - proportional tolerance
+    r &= near(FM_TINY, 1e-300, 1e-310);
+    r &= near(FM_HUGE, 1e300,  1e290);
+    // I. Macro chaining
+    r &= FM_BASE    ==  2.0;
+    r &= FM_DERIVED == 10.0;
+    // J. Zero / negative zero
+    r &= FM_ZERO     == 0.0;
+    r &= FM_NEG_ZERO == 0.0;
+    // K. Negative: int cast of float recovers as int 3
+    r &= FM_INT_CAST_OF_FLOAT == 3;
+    return r;
+}
 
 extern int main()
 {
@@ -415,6 +473,9 @@ extern int main()
     // C-side write via helper, CFlat-side read.
     ml_flags_set_count(&qg, 8675309);
     if (qg.count != 8675309)                    return 176;
+
+    // ---- Section L: float/double #define macro extraction -------------------
+    if (!testFloatMacros())                     return 200;
 
     return 0;
 }
