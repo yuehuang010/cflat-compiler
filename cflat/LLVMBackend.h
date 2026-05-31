@@ -8487,6 +8487,271 @@ public:
                 std::filesystem::path(analyzedPath).filename()).string();
     }
 
+    // ---- Vcpkg header disk cache ----
+    // Cache lives in vcpkg_installed/.cflat-cache/<key>.json, co-located with the
+    // installed packages so it invalidates naturally when vcpkg rewrites them.
+    // Key: FNV-1a of the canonical header path + --c-define values.
+    // Concurrent-write safety: atomic temp-file + rename; treat any read failure
+    // as a cache miss (benign - just re-runs clang).
+
+    static uint64_t VcpkgDiskCacheKey(const std::string& fileForLsp,
+                                       const std::vector<std::string>& defines)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char c : fileForLsp) { h ^= c; h *= 1099511628211ULL; }
+        for (const auto& d : defines) for (unsigned char c : d) { h ^= c; h *= 1099511628211ULL; }
+        return h;
+    }
+
+    static nlohmann::json TvToJson(const TypeAndValue& tv)
+    {
+        nlohmann::json j;
+        j["t"] = tv.TypeName;
+        if (tv.Pointer)        j["p"]   = true;
+        if (tv.ElemPointer)    j["ep"]  = true;
+        if (tv.IsMove)         j["mv"]  = true;
+        if (tv.IsStdcall)      j["sc"]  = true;
+        if (tv.IsCdecl)        j["cd"]  = true;
+        if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
+        if (!tv.ConstInnerDimensions.empty()) j["idims"] = tv.ConstInnerDimensions;
+        if (tv.IsFunctionPointer)
+        {
+            j["fp"]  = true;
+            j["fpr"] = tv.FuncPtrReturnTypeName;
+            if (tv.FuncPtrReturnPointer) j["fprp"] = true;
+            nlohmann::json fps = nlohmann::json::array();
+            for (const auto& p : tv.FuncPtrParams)
+            {
+                nlohmann::json pj;
+                pj["t"] = p.TypeName;
+                if (p.Pointer) pj["p"]  = true;
+                if (p.IsMove)  pj["mv"] = true;
+                fps.push_back(pj);
+            }
+            j["fps"] = fps;
+        }
+        return j;
+    }
+    static TypeAndValue TvFromJson(const nlohmann::json& j)
+    {
+        TypeAndValue tv;
+        tv.TypeName       = j.value("t",   std::string{});
+        tv.Pointer        = j.value("p",   false);
+        tv.ElemPointer    = j.value("ep",  false);
+        tv.IsMove         = j.value("mv",  false);
+        tv.IsStdcall      = j.value("sc",  false);
+        tv.IsCdecl        = j.value("cd",  false);
+        tv.ConstArraySize = j.value("arr", uint64_t{0});
+        if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].get<std::vector<uint64_t>>();
+        tv.IsFunctionPointer = j.value("fp", false);
+        if (tv.IsFunctionPointer)
+        {
+            tv.FuncPtrReturnTypeName = j.value("fpr",  std::string{});
+            tv.FuncPtrReturnPointer  = j.value("fprp", false);
+            if (j.contains("fps"))
+                for (const auto& pj : j["fps"])
+                {
+                    TypeAndValue::FuncPtrParam p;
+                    p.TypeName = pj.value("t",  std::string{});
+                    p.Pointer  = pj.value("p",  false);
+                    p.IsMove   = pj.value("mv", false);
+                    tv.FuncPtrParams.push_back(p);
+                }
+        }
+        return tv;
+    }
+
+    static nlohmann::json SigToJson(const CSigEntry& e)
+    {
+        nlohmann::json ps = nlohmann::json::array();
+        for (const auto& p : e.params) ps.push_back(TvToJson(p));
+        return {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
+                {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
+    }
+    static CSigEntry SigFromJson(const nlohmann::json& j)
+    {
+        CSigEntry e;
+        e.name     = j.value("n",  std::string{});
+        e.ret      = TvFromJson(j.at("r"));
+        e.variadic = j.value("va", false);
+        e.line     = j.value("ln", 1);
+        e.col      = j.value("co", 0);
+        if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
+        return e;
+    }
+
+    static nlohmann::json EnumToJson(const CEnumEntry& e)
+    {
+        return {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
+    }
+    static CEnumEntry EnumFromJson(const nlohmann::json& j)
+    {
+        return {j.value("n", std::string{}), j.value("v", 0LL), j.value("ln", 1), j.value("co", 0)};
+    }
+
+    static nlohmann::json FieldToJson(const CRecordFieldEntry& f)
+    {
+        nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
+        if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
+        return j;
+    }
+    static CRecordFieldEntry FieldFromJson(const nlohmann::json& j)
+    {
+        CRecordFieldEntry f;
+        f.name      = j.value("n",  std::string{});
+        f.ctype     = j.value("ct", std::string{});
+        f.isBitfield = j.value("bf", false);
+        f.bitWidth   = j.value("bw", 0u);
+        return f;
+    }
+
+    static nlohmann::json RecordToJson(const CRecordEntry& r)
+    {
+        nlohmann::json fs = nlohmann::json::array();
+        for (const auto& f : r.fields) fs.push_back(FieldToJson(f));
+        nlohmann::json j = {{"n", r.name}, {"fs", fs}, {"ln", r.line}, {"co", r.col}};
+        if (r.isUnion) j["u"] = true;
+        return j;
+    }
+    static CRecordEntry RecordFromJson(const nlohmann::json& j)
+    {
+        CRecordEntry r;
+        r.name    = j.value("n", std::string{});
+        r.isUnion = j.value("u", false);
+        r.line    = j.value("ln", 1);
+        r.col     = j.value("co", 0);
+        if (j.contains("fs")) for (const auto& f : j["fs"]) r.fields.push_back(FieldFromJson(f));
+        return r;
+    }
+
+    static nlohmann::json MacroToJson(const CMacroEntry& m)
+    {
+        nlohmann::json j = {{"n", m.name}, {"v", m.value}, {"f", m.file},
+                            {"ln", m.line}, {"co", m.col}};
+        if (m.isPointer) j["isp"]  = true;
+        if (m.isFloat)  { j["isf"]  = true; j["fv"]   = m.floatValue; }
+        if (m.isString) { j["iss"]  = true; j["sv"]   = m.stringValue; }
+        if (m.isFuncPtr){ j["isfp"] = true; j["fptv"] = TvToJson(m.funcPtrTV); }
+        return j;
+    }
+    static CMacroEntry MacroFromJson(const nlohmann::json& j)
+    {
+        CMacroEntry m;
+        m.name      = j.value("n",   std::string{});
+        m.value     = j.value("v",   0LL);
+        m.file      = j.value("f",   std::string{});
+        m.line      = j.value("ln",  1);
+        m.col       = j.value("co",  0);
+        m.isPointer = j.value("isp", false);
+        m.isFloat   = j.value("isf", false);
+        if (m.isFloat)  m.floatValue  = j.value("fv", 0.0);
+        m.isString  = j.value("iss",  false);
+        if (m.isString) m.stringValue = j.value("sv", std::string{});
+        m.isFuncPtr = j.value("isfp", false);
+        if (m.isFuncPtr && j.contains("fptv")) m.funcPtrTV = TvFromJson(j["fptv"]);
+        return m;
+    }
+
+    static nlohmann::json FuncMacroToJson(const CFunctionMacroEntry& m)
+    {
+        return {{"n", m.name}, {"ps", m.params}, {"b", m.body},
+                {"f", m.file}, {"ln", m.line},   {"co", m.col}};
+    }
+    static CFunctionMacroEntry FuncMacroFromJson(const nlohmann::json& j)
+    {
+        CFunctionMacroEntry m;
+        m.name = j.value("n",  std::string{});
+        m.body = j.value("b",  std::string{});
+        m.file = j.value("f",  std::string{});
+        m.line = j.value("ln", 1);
+        m.col  = j.value("co", 0);
+        if (j.contains("ps")) m.params = j["ps"].get<std::vector<std::string>>();
+        return m;
+    }
+
+    static bool TryLoadVcpkgHeaderDiskCache(
+        const std::filesystem::path& cacheDir,
+        uint64_t diskKey,
+        std::filesystem::file_time_type mtime,
+        uint64_t contentHash,
+        CFileSigCacheEntry& out)
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
+        if (!fs::exists(cachePath, ec)) return false;
+
+        std::ifstream f(cachePath);
+        if (!f.is_open()) return false;
+        nlohmann::json j;
+        try { f >> j; } catch (...) { return false; }
+
+        if (j.value("version", 0) != 1) return false;
+
+        // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
+        auto storedMtime = j.value("mtime", int64_t{-1});
+        auto storedHash  = j.value("hash",  uint64_t{0});
+        bool mtimeOk = (storedMtime == (int64_t)mtime.time_since_epoch().count());
+        bool hashOk  = (storedHash  == contentHash);
+        if (!mtimeOk && !hashOk) return false;
+
+        CFileSigCacheEntry entry;
+        entry.mtime = mtime;
+        entry.hash  = contentHash;
+        if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));
+        if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
+        if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
+        if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
+        if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
+        out = std::move(entry);
+        return true;
+    }
+
+    static void WriteVcpkgHeaderDiskCache(
+        const std::filesystem::path& cacheDir,
+        uint64_t diskKey,
+        std::filesystem::file_time_type mtime,
+        uint64_t contentHash,
+        const CFileSigCacheEntry& entry)
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::create_directories(cacheDir, ec);
+        if (ec) return;
+
+        nlohmann::json j;
+        j["version"] = 1;
+        j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
+        j["hash"]    = contentHash;
+
+        nlohmann::json sigs = nlohmann::json::array();
+        for (const auto& s : entry.sigs) sigs.push_back(SigToJson(s));
+        j["sigs"] = sigs;
+        nlohmann::json enums = nlohmann::json::array();
+        for (const auto& e : entry.enums) enums.push_back(EnumToJson(e));
+        j["enums"] = enums;
+        nlohmann::json records = nlohmann::json::array();
+        for (const auto& r : entry.records) records.push_back(RecordToJson(r));
+        j["records"] = records;
+        nlohmann::json macros = nlohmann::json::array();
+        for (const auto& m : entry.macros) macros.push_back(MacroToJson(m));
+        j["macros"] = macros;
+        nlohmann::json funcMacros = nlohmann::json::array();
+        for (const auto& m : entry.funcMacros) funcMacros.push_back(FuncMacroToJson(m));
+        j["funcMacros"] = funcMacros;
+
+        // Atomic write: PID-stamped temp file renamed over the target.
+        auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
+        auto destPath = cacheDir / std::format("{:016x}.json", diskKey);
+        {
+            std::ofstream f(tmpPath);
+            if (!f.is_open()) return;
+            f << j;
+        }
+        fs::rename(tmpPath, destPath, ec);
+        if (ec) fs::remove(tmpPath, ec);
+    }
+
     // Handle `import package-vcpkg "header" from "port[features]";`. Resolves the port
     // through the user-owned vcpkg.json, pushes the resulting include dir / libs / DLLs
     // into the per-backend accumulators, then routes the header through CompileCHeader
@@ -8576,7 +8841,56 @@ public:
                 header, res.includeDir));
             return false;
         }
+        // Disk cache for vcpkg headers, stored in vcpkg_installed/.cflat-cache/.
+        // On hit we preload the in-memory cache so CompileCHeader skips clang entirely.
+        // On miss we write after CompileCHeader so the next build is a hit.
+        std::filesystem::path vcpkgCacheDir =
+            std::filesystem::path(res.includeDir).parent_path().parent_path() / ".cflat-cache";
+
+        // Derive the same in-memory key CompileCHeader builds internally.
+        llvm::SmallString<256> realPathBuf;
+        std::string fileForLsp = headerCanon.string();
+        if (!llvm::sys::fs::real_path(fileForLsp, realPathBuf))
+            fileForLsp = realPathBuf.str().str();
+        std::string inMemKey = fileForLsp;
+        for (const auto& inc : cIncludeDirs_) inMemKey += "|I" + inc;
+        for (const auto& def : cDefines_)     inMemKey += "|D" + def;
+
+        uint64_t diskKey     = VcpkgDiskCacheKey(fileForLsp, cDefines_);
+        uint64_t contentHash = 0;
+        bool haveHash        = HashFileContents(fileForLsp, contentHash);
+        std::error_code mtEc;
+        auto headerMtime     = std::filesystem::last_write_time(fileForLsp, mtEc);
+
+        bool diskHit = false;
+        if (haveHash && !mtEc)
+        {
+            CFileSigCacheEntry diskEntry;
+            if (TryLoadVcpkgHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
+            {
+                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                cFileSigCache_[inMemKey] = std::move(diskEntry);
+                diskHit = true;
+                if (verbose)
+                    std::cout << "[verbose] vcpkg header disk cache hit: " << fileForLsp << "\n";
+            }
+        }
+
         bool ok = CompileCHeader(headerCanon.string(), {});
+
+        if (ok && !diskHit && haveHash && !mtEc)
+        {
+            CFileSigCacheEntry entryToWrite;
+            bool haveEntry = false;
+            {
+                std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                auto it = cFileSigCache_.find(inMemKey);
+                if (it != cFileSigCache_.end()) { entryToWrite = it->second; haveEntry = true; }
+            }
+            if (haveEntry)
+                WriteVcpkgHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
+        }
+
         if (ok) ProcessPendingMacroSources();
         return ok;
     }
