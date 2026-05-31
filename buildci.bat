@@ -50,8 +50,27 @@ if errorlevel 1 (
 exit /b 0
 
 :Main
-call :RunConfig Debug
 call :RunConfig Release
+
+echo.
+echo =========================================================================
+echo BUILD: vscode-extension
+echo =========================================================================
+call "%~dp0vscode-extension\build.bat"
+if errorlevel 1 (
+    echo BUILD FAILED: vscode-extension
+    set /a OVERALL_ERRORS+=1
+)
+
+echo.
+echo =========================================================================
+echo PUBLISH: copying artifacts to drop\
+echo =========================================================================
+call :Publish
+if errorlevel 1 (
+    echo PUBLISH FAILED
+    set /a OVERALL_ERRORS+=1
+)
 
 echo.
 echo =========================================================================
@@ -63,6 +82,10 @@ if !OVERALL_ERRORS! EQU 0 (
     echo CI FAILED: !OVERALL_ERRORS! stages failed.
     exit /b 1
 )
+
+:Publish
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0package_release.ps1"
+exit /b %ERRORLEVEL%
 
 :ElapsedTime
 setlocal
