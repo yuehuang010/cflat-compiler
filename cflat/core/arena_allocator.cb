@@ -1,0 +1,591 @@
+import "vmem.cb";
+import "page_pool.cb";
+import "mutex.cb";
+import "interfaces.cb";
+
+// arena_allocator.cb - mixed-size bump arena backed by g_page_pool, with a
+// per-chunk live-byte count that lets individual blocks be freed and whole
+// chunks recycled once drained.
+//
+// Each 64 KB chunk is a bump region holding mixed-size blocks back to back. The
+// chunk header carries a `_live_bytes` counter (the only per-chunk bookkeeping):
+// alloc adds the block's total size, free subtracts it, and when it reaches zero
+// the chunk is reset (if it is the active chunk) or released back to g_page_pool.
+//
+// Each block carries an 8-byte header storing its total size so free knows how
+// many bytes to subtract. The returned pointer is 8-byte aligned. Over-aligned
+// requests route through alloc_aligned, which computes its own alignment.
+//
+// Chunk tracking uses a vmem-backed open-addressed set (_AR_ChunkSet) instead of
+// an intrusive linked list. vmem_alloc is used (not new/malloc) so growing the
+// set never routes back through operator new - which, when this allocator is the
+// installed default, would re-enter alloc() and deadlock on the non-recursive
+// _lock.
+//
+// Ownership dispatch goes through a process-global page registry (_ar_reg_*):
+// every owned 64K base maps to its owning ArenaAllocator. dealloc() and the
+// operator-delete hook look up ptr's base; a hit routes to the owner, a miss
+// falls through to HeapValidate-guarded CRT free. The chunk header is read ONLY
+// after the registry confirms ownership, so a foreign pointer is never touched.
+//
+// Requests larger than a chunk's usable space go directly to vmem_alloc (large
+// path), tracked in _largeHead for cleanup.
+//
+// Usage:
+//   ArenaAllocator ar;
+//   void* p = ar.alloc(48);
+//   ar.dealloc(p);
+//   ar.cleanup();
+
+// Chunk header at offset 0 of every 64 KB arena chunk (24 bytes; block data
+// starts at offset 32, kept 16-aligned).
+struct _AR_ChunkHdr
+{
+    u32 _magic      = 0;   // 0xA4E70A01 when owned by an ArenaAllocator
+    u32 _pad        = 0;
+    i64 _live_bytes = 0;   // live (header+payload) bytes still allocated in this chunk
+    i64 _bump       = 0;   // next free offset within the chunk
+};
+
+// Per-block header, immediately before each returned pointer (8 bytes).
+struct _AR_BlockHdr { i64 _size = 0; };   // total block size incl. this header
+
+// Header prepended to every large-alloc vmem_alloc region.
+struct _AR_LargeHdr
+{
+    u32 _magic      = 0;   // 0xA4E70A02 when owned by an ArenaAllocator
+    u32 _pad        = 0;
+    i64 _userSize   = 0;
+    i64 _regionSize = 0;
+    i8* _next       = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Chunk set - vmem-backed open-addressed set of 64 KB chunk base addresses.
+// ---------------------------------------------------------------------------
+//
+// Keys are 64K-aligned chunk bases, so they are never 0 or 1: 0 marks an empty
+// slot, 1 marks a tombstone. Backing array comes from vmem_alloc (zeroed), grown
+// by doubling; the old array is vmem_free'd. _cap is always a power of two so the
+// probe wrap is a mask. Never allocates through new/malloc, so it cannot re-enter
+// the owning allocator.
+struct _AR_ChunkSet
+{
+    i64* _keys  = nullptr;
+    i64  _count = 0;
+    i64  _tomb  = 0;
+    i64  _cap   = 0;
+
+    void _alloc_table(i64 cap)
+    {
+        _keys  = (i64*)vmem_alloc(cap * (i64)8);   // zeroed -> every slot empty
+        _cap   = cap;
+        _count = 0;
+        _tomb  = 0;
+    }
+
+    i64 _slot(i64 base)
+    {
+        // Fibonacci-style mix on the 64K-aligned base; mask to cap (power of two).
+        i64 h = (base >> (i64)16) * (i64)2654435761;
+        return h & (_cap - (i64)1);
+    }
+
+    void _rehash(i64 newCap)
+    {
+        i64* old    = _keys;
+        i64  oldCap = _cap;
+        _alloc_table(newCap);
+        i64 i = (i64)0;
+        while (i < oldCap)
+        {
+            i64 k = old[i];
+            if (k > (i64)1) add(k);   // live key (skip empty/tombstone)
+            i = i + (i64)1;
+        }
+        if (old != nullptr) vmem_free((void*)old);
+    }
+
+    void add(i64 base)
+    {
+        if (_cap == (i64)0) _alloc_table((i64)64);
+
+        // Grow when load (live + tombstones) crosses 3/4. Doubles when live
+        // entries are dense; otherwise rehashes in place to flush tombstones,
+        // which prevents a probe from never finding an empty slot.
+        if ((_count + _tomb) * (i64)4 >= _cap * (i64)3)
+        {
+            i64 newCap = _cap;
+            if (_count * (i64)4 >= _cap * (i64)3) newCap = _cap * (i64)2;
+            _rehash(newCap);
+        }
+
+        i64 slot      = _slot(base);
+        i64 firstTomb = (i64)-1;
+        while (_keys[slot] != (i64)0)
+        {
+            if (_keys[slot] == base) return;   // already present
+            if (_keys[slot] == (i64)1 && firstTomb == (i64)-1) firstTomb = slot;
+            slot = (slot + (i64)1) & (_cap - (i64)1);
+        }
+        i64 ins = slot;
+        if (firstTomb != (i64)-1) { ins = firstTomb; _tomb = _tomb - (i64)1; }
+        _keys[ins] = base;
+        _count     = _count + (i64)1;
+    }
+
+    void remove(i64 base)
+    {
+        if (_cap == (i64)0) return;
+        i64 slot = _slot(base);
+        while (_keys[slot] != (i64)0)
+        {
+            if (_keys[slot] == base)
+            {
+                _keys[slot] = (i64)1;   // tombstone
+                _count = _count - (i64)1;
+                _tomb  = _tomb + (i64)1;
+                return;
+            }
+            slot = (slot + (i64)1) & (_cap - (i64)1);
+        }
+    }
+
+    void free_table()
+    {
+        if (_keys != nullptr) vmem_free((void*)_keys);
+        _keys  = nullptr;
+        _cap   = (i64)0;
+        _count = (i64)0;
+        _tomb  = (i64)0;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Process-global page registry (page base -> owning ArenaAllocator).
+// ---------------------------------------------------------------------------
+//
+// Two-level radix over the 32 significant bits of a 64K-aligned address
+// (bits 16..47); same structure as bucket_allocator.cb's registry but keyed to
+// ArenaAllocator owners. Lets the free router confirm ownership without ever
+// dereferencing a foreign pointer's would-be header. vmem-backed; never recurses
+// into operator new. Lookups are lock-free; only second-level table allocation
+// is guarded by _ar_reg_lock.
+struct _AR_RegSlot { i8* _owner = nullptr; };
+struct _AR_RegDir  { _AR_RegSlot* _table = nullptr; };
+
+_AR_RegDir* _ar_reg_top  = nullptr;
+mutex       _ar_reg_lock = default;
+
+void _ar_reg_init_top()
+{
+    if (_ar_reg_top != nullptr) return;
+    _ar_reg_lock.acquire();
+    if (_ar_reg_top == nullptr)
+        _ar_reg_top = (_AR_RegDir*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegDir));
+    _ar_reg_lock.release();
+}
+
+void _ar_reg_insert(i64 base, i8* owner)
+{
+    _ar_reg_init_top();
+    if (_ar_reg_top == nullptr) return;
+
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+
+    if (_ar_reg_top[hi]._table == nullptr)
+    {
+        _ar_reg_lock.acquire();
+        if (_ar_reg_top[hi]._table == nullptr)
+            _ar_reg_top[hi]._table = (_AR_RegSlot*)vmem_alloc((i64)65536 * (i64)sizeof(_AR_RegSlot));
+        _ar_reg_lock.release();
+    }
+    _AR_RegSlot* tbl = _ar_reg_top[hi]._table;
+    if (tbl == nullptr) return;
+    tbl[lo]._owner = owner;
+}
+
+void _ar_reg_remove(i64 base)
+{
+    if (_ar_reg_top == nullptr) return;
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+    _AR_RegSlot* tbl = _ar_reg_top[hi]._table;
+    if (tbl == nullptr) return;
+    tbl[lo]._owner = nullptr;
+}
+
+i8* _ar_reg_lookup(i64 base)
+{
+    if (_ar_reg_top == nullptr) return nullptr;
+    i64 idx = base >> (i64)16;
+    i64 hi  = (idx >> (i64)16) & (i64)0xFFFF;
+    i64 lo  = idx & (i64)0xFFFF;
+    _AR_RegSlot* tbl = _ar_reg_top[hi]._table;
+    if (tbl == nullptr) return nullptr;
+    return tbl[lo]._owner;
+}
+
+// Registry-driven free router shared by the operator-delete hook and dealloc().
+// Returns false for any pointer not owned by an ArenaAllocator.
+bool _ar_route_free(void* ptr)
+{
+    i64 base = (i64)ptr & ~(i64)0xFFFF;
+    if (base == (i64)0) return false;
+
+    i8* owner = _ar_reg_lookup(base);
+    if (owner == nullptr) return false;
+
+    ArenaAllocator* o = (ArenaAllocator*)owner;
+    o->_lockedDeallocOwned(ptr);
+    return true;
+}
+
+// Hook registered with memory.cb. Thin wrapper over the router.
+//
+// NOTE: memory.cb exposes a single __try_owner_dealloc hook. Only one
+// owner-routing allocator (BucketAllocator or ArenaAllocator) can be active per
+// process - whichever initializes first installs the hook. Mixing the two as
+// cross-thread default allocators in one process is unsupported.
+bool __AR_try_owner_dealloc(void* ptr)
+{
+    return _ar_route_free(ptr);
+}
+
+class ArenaAllocator : IAllocator
+{
+    _AR_ChunkSet _chunks = default;   // set of owned 64 KB chunk bases
+    i8*  _current      = nullptr;     // active bump chunk
+    i64  _liveBytes    = 0;           // allocator-wide live total (small blocks)
+
+    i8*  _largeHead    = nullptr;
+    i64  _largeBytes   = 0;
+    i64  _largeCount   = 0;
+
+    i64  _reservedNow  = 0;
+    i64  _peakReserved = 0;
+    bool _initialized  = false;
+
+    // Child allocators spawned for child threads; parent owns their lifetime.
+    ArenaAllocator* _first_child  = nullptr;
+    ArenaAllocator* _next_sibling = nullptr;
+
+    mutex _lock = default;
+
+    // -----------------------------------------------------------------------
+    // Layout constants
+    // -----------------------------------------------------------------------
+
+    i64 _dataOff() { return (i64)32; }                 // 16-aligned, past 24-byte header
+    i64 _usable()  { return (i64)65536 - _dataOff(); } // max single small block incl. header
+
+    // -----------------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------------
+
+    void _init()
+    {
+        _initialized = true;
+        if (__try_owner_dealloc == nullptr)
+            __try_owner_dealloc = __AR_try_owner_dealloc;
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk management
+    // -----------------------------------------------------------------------
+
+    void _newChunk()
+    {
+        i8* page = (i8*)g_page_pool.acquire();
+        if (page == nullptr) { _current = nullptr; return; }
+
+        _AR_ChunkHdr* ch = (_AR_ChunkHdr*)page;
+        ch->_magic      = (u32)0xA4E70A01;
+        ch->_live_bytes = (i64)0;
+        ch->_bump       = _dataOff();
+
+        _chunks.add((i64)page);
+        _ar_reg_insert((i64)page, (i8*)ArenaAllocator__);
+        _current = page;
+
+        _reservedNow = _reservedNow + (i64)65536;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
+    }
+
+    // -----------------------------------------------------------------------
+    // Large-allocation path (> chunk usable space)
+    // -----------------------------------------------------------------------
+
+    void* _allocLarge(i64 size)
+    {
+        i64 hdrSize = (i64)sizeof(_AR_LargeHdr);
+        i64 gran    = (i64)0x10000;
+        i64 total   = (hdrSize + size + gran - (i64)1) / gran * gran;
+
+        i8* base = (i8*)vmem_alloc(total);
+        if (base == nullptr) return nullptr;
+
+        _AR_LargeHdr* hdr = (_AR_LargeHdr*)base;
+        hdr->_magic      = (u32)0xA4E70A02;
+        hdr->_userSize   = size;
+        hdr->_regionSize = total;
+        hdr->_next       = _largeHead;
+        _largeHead       = base;
+
+        _ar_reg_insert((i64)base, (i8*)ArenaAllocator__);
+        _largeBytes  = _largeBytes + size;
+        _largeCount  = _largeCount + (i64)1;
+        _reservedNow = _reservedNow + total;
+        if (_reservedNow > _peakReserved) _peakReserved = _reservedNow;
+
+        return (void*)(base + hdrSize);
+    }
+
+    void _freeLargeOwned(void* ptr)
+    {
+        i64 hdrSize = (i64)sizeof(_AR_LargeHdr);
+        i8* base    = (i8*)ptr - hdrSize;
+
+        i8* prev = nullptr;
+        i8* cur  = _largeHead;
+        while (cur != nullptr)
+        {
+            _AR_LargeHdr* ch = (_AR_LargeHdr*)cur;
+            if (cur == base)
+            {
+                _largeBytes  = _largeBytes - ch->_userSize;
+                _largeCount  = _largeCount - (i64)1;
+                _reservedNow = _reservedNow - ch->_regionSize;
+                if (prev == nullptr)
+                    _largeHead = ch->_next;
+                else
+                {
+                    _AR_LargeHdr* ph = (_AR_LargeHdr*)prev;
+                    ph->_next = ch->_next;
+                }
+                _ar_reg_remove((i64)base);
+                vmem_free((void*)base);
+                return;
+            }
+            prev = cur;
+            cur  = ch->_next;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // IAllocator
+    // -----------------------------------------------------------------------
+
+    void* alloc(i64 size)
+    {
+        _lock.acquire();
+        void* r = _allocUnsynced(size);
+        _lock.release();
+        return r;
+    }
+
+    void* _allocUnsynced(i64 size)
+    {
+        if (size <= (i64)0) return nullptr;
+        if (!_initialized) _init();
+
+        // Align payload to 8 and add the 8-byte block header.
+        i64 need = ((size + (i64)7) & ~(i64)7) + (i64)8;
+        if (need > _usable()) return _allocLarge(size);
+
+        if (_current == nullptr) { _newChunk(); if (_current == nullptr) return nullptr; }
+        _AR_ChunkHdr* ch = (_AR_ChunkHdr*)_current;
+        if (ch->_bump + need > (i64)65536)
+        {
+            _newChunk();
+            if (_current == nullptr) return nullptr;
+            ch = (_AR_ChunkHdr*)_current;
+        }
+
+        i8* block = _current + ch->_bump;
+        _AR_BlockHdr* bh = (_AR_BlockHdr*)block;
+        bh->_size = need;
+
+        ch->_bump       = ch->_bump + need;
+        ch->_live_bytes = ch->_live_bytes + need;
+        _liveBytes      = _liveBytes + need;
+        return (void*)(block + (i64)8);
+    }
+
+    void dealloc(void* ptr)
+    {
+        if (ptr == nullptr) return;
+
+        // Route via the global registry. A hit frees under the owning arena's
+        // lock; a miss means the pointer is not ours.
+        if (_ar_route_free(ptr)) return;
+
+        // Foreign pointer - only CRT-free if it lives on the CRT heap. No header
+        // read here, so a foreign pointer is never dereferenced.
+        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+            free(ptr);
+    }
+
+    void _lockedDeallocOwned(void* ptr)
+    {
+        _lock.acquire();
+        _deallocOwned(ptr);
+        _lock.release();
+    }
+
+    // Free a pointer this arena owns. MUST be called with _lock held and only
+    // after the registry confirmed ptr's 64K base belongs to this arena - that
+    // guarantee is what makes reading the chunk header safe.
+    void _deallocOwned(void* ptr)
+    {
+        if (ptr == nullptr) return;
+
+        i64 base = ((i64)ptr) & ~(i64)0xFFFF;
+        _AR_ChunkHdr* ch = (_AR_ChunkHdr*)base;
+        u32 magic = ch->_magic;
+
+        if (magic == (u32)0xA4E70A02) { _freeLargeOwned(ptr); return; }
+
+        // Small block (magic is 0xA4E70A01).
+        _AR_BlockHdr* bh = (_AR_BlockHdr*)((i8*)ptr - (i64)8);
+        i64 sz = bh->_size;
+
+        ch->_live_bytes = ch->_live_bytes - sz;
+        _liveBytes      = _liveBytes - sz;
+
+        if (ch->_live_bytes <= (i64)0)
+        {
+            if (base == (i64)_current)
+            {
+                // Active chunk fully drained - reset and keep bumping into it.
+                ch->_bump       = _dataOff();
+                ch->_live_bytes = (i64)0;
+            }
+            else
+            {
+                // Full chunk drained - recycle the whole page.
+                _chunks.remove(base);
+                _ar_reg_remove(base);
+                _reservedNow = _reservedNow - (i64)65536;
+                g_page_pool.release((void*)base);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Over-aligned allocation
+    // -----------------------------------------------------------------------
+
+    void* alloc_aligned(i64 size, i64 align)
+    {
+        if (align <= (i64)8) return alloc(size);   // alloc already returns 8-aligned
+        i64 total = size + align - (i64)1 + (i64)16;
+        i8* raw = (i8*)alloc(total);
+        if (raw == nullptr) return nullptr;
+        i64 base = ((i64)raw + (i64)16 + align - (i64)1) & ~(align - (i64)1);
+        i8* aligned = (i8*)base;
+        void** stash = (void**)(aligned - (i64)16);
+        stash[0] = (void*)raw;
+        return (void*)aligned;
+    }
+
+    void dealloc_aligned(void* ptr)
+    {
+        if (ptr == nullptr) return;
+        void** stash = (void**)((i8*)ptr - (i64)16);
+        dealloc(stash[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Stats / diagnostics
+    // -----------------------------------------------------------------------
+
+    i64 usedBytes()   { if (!_initialized) return (i64)0; return _liveBytes + _largeBytes; }
+    i64 totalBytes()  { return _reservedNow; }
+    i64 peakReserve() { return _peakReserved; }
+
+    void printUsage()
+    {
+        if (!_initialized) { printf("ArenaAllocator: not initialized\n"); return; }
+        printf("ArenaAllocator (page-pool backed):\n");
+        printf("  chunks=%lld  live=%lld bytes\n", _chunks._count, _liveBytes);
+        printf("  large: count=%lld  bytes=%lld\n", _largeCount, _largeBytes);
+        printf("  reserved=%lld  peak=%lld\n", _reservedNow, _peakReserved);
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_child
+    // -----------------------------------------------------------------------
+
+    IAllocator spawn_child()
+    {
+        ArenaAllocator* child = (ArenaAllocator*)malloc((i64)sizeof(ArenaAllocator));
+        i8* raw = (i8*)child;
+        i64 i = (i64)0;
+        while (i < (i64)sizeof(ArenaAllocator)) { raw[i] = (i8)0; i = i + (i64)1; }
+
+        _lock.acquire();
+        child->_next_sibling = _first_child;
+        _first_child         = child;
+        _lock.release();
+
+        IAllocator child_iface = child;
+        return child_iface;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+
+    void cleanup()
+    {
+        // Release every tracked chunk back to the pool.
+        i64 i = (i64)0;
+        while (i < _chunks._cap)
+        {
+            i64 k = _chunks._keys[i];
+            if (k > (i64)1)
+            {
+                _ar_reg_remove(k);
+                g_page_pool.release((void*)k);
+            }
+            i = i + (i64)1;
+        }
+        _chunks.free_table();
+        _current   = nullptr;
+        _liveBytes = (i64)0;
+
+        // Vmem-free every large allocation.
+        i8* cur = _largeHead;
+        while (cur != nullptr)
+        {
+            _AR_LargeHdr* h = (_AR_LargeHdr*)cur;
+            i8* next = h->_next;
+            _ar_reg_remove((i64)cur);
+            vmem_free((void*)cur);
+            cur = next;
+        }
+        _largeHead   = nullptr;
+        _largeBytes  = (i64)0;
+        _largeCount  = (i64)0;
+        _reservedNow = (i64)0;
+        _initialized = false;
+    }
+
+    ~ArenaAllocator()
+    {
+        ArenaAllocator* c = _first_child;
+        while (c != nullptr)
+        {
+            ArenaAllocator* next = c->_next_sibling;
+            c->cleanup();
+            free((void*)c);
+            c = next;
+        }
+        _first_child = nullptr;
+        cleanup();
+    }
+};

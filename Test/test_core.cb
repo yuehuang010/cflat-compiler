@@ -9,6 +9,7 @@ import "stack.cb";
 import "queue.cb";
 import "interfaces.cb";
 import "array.cb";
+import "bucket_allocator.cb";
 
 // ── array<T> ─────────────────────────────────────────────────────────────────
 
@@ -160,6 +161,62 @@ int testList()
     passed += Test("list count after 20 adds", l.count(), 20);
     passed += Test("list growth get[0]",  l.get(0),  0);
     passed += Test("list growth get[19]", l.get(19), 19);
+
+    return passed;
+}
+
+// ── list<T> ICopyable (copy / copy(IAllocator)) ──────────────────────────────
+
+int testListCopy()
+{
+    int passed = 0;
+
+    // list<int>: value copy is an independent list.
+    list<int> li;
+    li.add(1); li.add(2); li.add(3);
+    list<int> lic = li.copy();
+    passed += Test("list<int> copy count", lic.count(), 3);
+    passed += Test("list<int> copy[0]",    lic.get(0), 1);
+    passed += Test("list<int> copy[2]",    lic.get(2), 3);
+    lic.set(0, 99);                                  // mutate copy
+    passed += Test("list<int> copy mutate isolates source", li.get(0), 1);
+    li.set(2, 77);                                   // mutate source
+    passed += Test("list<int> source mutate isolates copy", lic.get(2), 3);
+
+    // list<string>: copy is a deep copy with its own buffers.
+    list<string> ls;
+    ls.add("alpha"); ls.add("bravo"); ls.add("charlie");
+    list<string> lsc = ls.copy();
+    passed += Test("list<string> copy count", lsc.count(), 3);
+    passed += Test("list<string> copy[0]",    lsc.get(0), "alpha");
+    passed += Test("list<string> copy[1]",    lsc.get(1), "bravo");
+    passed += Test("list<string> copy[2]",    lsc.get(2), "charlie");
+
+    // deep: each element owns a distinct buffer (not aliased to the source).
+    bool deep0 = ls.get(0).data() != lsc.get(0).data();
+    bool deep2 = ls.get(2).data() != lsc.get(2).data();
+    passed += Test("list<string> copy deep buf[0]", deep0, true);
+    passed += Test("list<string> copy deep buf[2]", deep2, true);
+
+    // mutating the source does not disturb the copy.
+    ls.set(0, "ZZZ");
+    passed += Test("list<string> source mutate isolates copy", lsc.get(0), "alpha");
+
+    // copy(IAllocator): backing array and string buffers come from the allocator.
+    BucketAllocator ba;
+    IAllocator alloc = ba;
+    {
+        list<string> owned = ls.copy(alloc);         // ls == ["ZZZ","bravo","charlie"]
+        passed += Test("list<string> copy(alloc) count", owned.count(), 3);
+        passed += Test("list<string> copy(alloc)[1]",    owned.get(1), "bravo");
+        passed += Test("list<string> copy(alloc) routed to allocator",
+                       ba.usedBytes() > (i64)0, true);
+    }   // owned freed here, while ba is still alive
+
+    // empty list copies to an empty list.
+    list<int> empty;
+    list<int> emptyDup = empty.copy();
+    passed += Test("list<int> empty copy count", emptyDup.count(), 0);
 
     return passed;
 }
@@ -1027,6 +1084,7 @@ extern int main()
 
     r = testArray();            passed += r; total += 14;
     r = testList();             passed += r; total += 15;
+    r = testListCopy();         passed += r; total += 16;
     r = testHashset();          passed += r; total += 19;
     r = testHashsetNegative();  passed += r; total += 12;
     r = testHashsetTombstone(); passed += r; total += 7;

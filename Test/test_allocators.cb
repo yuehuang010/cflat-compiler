@@ -3,6 +3,7 @@ import "block_allocator.cb";
 import "entry_allocator.cb";
 import "fit_allocator.cb";
 import "bucket_allocator.cb";
+import "arena_allocator.cb";
 import "page_pool.cb";
 import "thread.cb";
 import "arena_channel.cb";
@@ -598,6 +599,159 @@ bool testBucketPrintUsage()
 }
 
 // =============================================================
+// ArenaAllocator tests
+// =============================================================
+//
+// usedBytes() reports allocator-side live bytes, which include each block's
+// 8-byte header and the 8-byte payload rounding. For a request of `s`, a block
+// consumes `roundup8(s) + 8` bytes.
+
+bool testArenaBasic()
+{
+    ArenaAllocator ar;
+
+    void* p1 = ar.alloc(64);
+    if (p1 == nullptr) return false;
+
+    void* p2 = ar.alloc(64);
+    if (p2 == nullptr) return false;
+    if (p1 == p2)      return false;
+
+    // Each 64-byte request consumes 64 + 8 (header) = 72 bytes.
+    if (ar.usedBytes() != 144) return false;
+
+    ar.dealloc(p1);
+    if (ar.usedBytes() != 72) return false;
+
+    ar.dealloc(p2);
+    if (ar.usedBytes() != 0) return false;
+
+    // The active chunk drained to zero, so its bump pointer reset: the next
+    // allocation reuses the very first block address.
+    void* p3 = ar.alloc(64);
+    if (p3 != p1) return false;
+
+    ar.dealloc(p3);
+    return true;
+}
+
+bool testArenaMixedSizes()
+{
+    ArenaAllocator ar;
+
+    void* a = ar.alloc(8);
+    void* b = ar.alloc(40);
+    void* c = ar.alloc(100);
+    void* d = ar.alloc(7);
+    if (a == nullptr) return false;
+    if (b == nullptr) return false;
+    if (c == nullptr) return false;
+    if (d == nullptr) return false;
+
+    // roundup8+8: 16 + 48 + 112 + 16 = 192
+    if (ar.usedBytes() != 192) return false;
+
+    ar.dealloc(a);
+    ar.dealloc(b);
+    ar.dealloc(c);
+    ar.dealloc(d);
+    if (ar.usedBytes() != 0) return false;
+
+    return true;
+}
+
+bool testArenaWriteRead()
+{
+    ArenaAllocator ar;
+
+    i32* nums = (i32*)ar.alloc(32);
+    if (nums == nullptr) return false;
+    nums[0] = 10; nums[1] = 20; nums[2] = 30; nums[3] = 40;
+    if (nums[0] != 10) return false;
+    if (nums[1] != 20) return false;
+    if (nums[2] != 30) return false;
+    if (nums[3] != 40) return false;
+
+    ar.dealloc((void*)nums);
+    if (ar.usedBytes() != 0) return false;
+    return true;
+}
+
+bool testArenaLargeAlloc()
+{
+    ArenaAllocator ar;
+
+    // Exceeds a chunk's usable space (~65504 bytes) -> large vmem path.
+    void* p = ar.alloc(100000);
+    if (p == nullptr) return false;
+    if (ar.usedBytes() != 100000) return false;
+
+    i32* arr = (i32*)p;
+    arr[0] = 111; arr[1] = 222; arr[2] = 333;
+    if (arr[0] != 111) return false;
+    if (arr[1] != 222) return false;
+    if (arr[2] != 333) return false;
+
+    ar.dealloc(p);
+    if (ar.usedBytes() != 0) return false;
+
+    return true;
+}
+
+bool testArenaManyChunks()
+{
+    ArenaAllocator ar;
+
+    // Allocate enough 512-byte blocks to span many 64 KB chunks, then free
+    // them all - exercises the chunk hashset add/remove and whole-chunk recycle
+    // back to g_page_pool.
+    int N = 2000;
+    list<i64> ptrs;
+
+    int i = 0;
+    while (i < N)
+    {
+        void* p = ar.alloc(512);
+        if (p == nullptr) return false;
+        ptrs.add((i64)p);
+        i = i + 1;
+    }
+    // 512 + 8 = 520 bytes per block.
+    if (ar.usedBytes() != (i64)N * 520) return false;
+
+    i = 0;
+    while (i < N)
+    {
+        ar.dealloc((void*)ptrs.get(i));
+        i = i + 1;
+    }
+    if (ar.usedBytes() != 0) return false;
+
+    return true;
+}
+
+bool testArenaEdgeCases()
+{
+    ArenaAllocator ar;
+
+    void* p = ar.alloc(0);
+    if (p != nullptr) return false;
+
+    ar.dealloc(nullptr);  // must not crash
+    return true;
+}
+
+bool testArenaPrintUsage()
+{
+    ArenaAllocator ar;
+    ar.alloc(8);
+    ar.alloc(1024);
+    ar.alloc(100000);
+    ar.printUsage();
+    return true;
+}
+
+// =============================================================
 // PagePool tests
 // =============================================================
 
@@ -886,6 +1040,13 @@ extern int main()
     total++; passed += testBucketWriteRead()              ? 1 : 0;
     total++; passed += testBucketEdgeCases()              ? 1 : 0;
     total++; passed += testBucketPrintUsage()             ? 1 : 0;
+    total++; passed += testArenaBasic()                   ? 1 : 0;
+    total++; passed += testArenaMixedSizes()              ? 1 : 0;
+    total++; passed += testArenaWriteRead()               ? 1 : 0;
+    total++; passed += testArenaLargeAlloc()              ? 1 : 0;
+    total++; passed += testArenaManyChunks()              ? 1 : 0;
+    total++; passed += testArenaEdgeCases()               ? 1 : 0;
+    total++; passed += testArenaPrintUsage()              ? 1 : 0;
     total++; passed += testPagePoolAcquireZeroed()        ? 1 : 0;
     total++; passed += testPagePoolRecycle()              ? 1 : 0;
     total++; passed += testPagePoolSoftCap()              ? 1 : 0;

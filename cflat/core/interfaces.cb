@@ -77,6 +77,16 @@ interface IAllocator
     void  dealloc_aligned(void* ptr);
 };
 
+// A type that can produce an independent deep copy of itself, optionally into a
+// specific allocator. TSelf is the implementing type (e.g. list<T> implements
+// ICopyable<list<T>>). copy() returns an owning value, so implementers use
+// `return move ...` to transfer ownership to the caller without a double-free.
+interface ICopyable<TSelf>
+{
+    move TSelf copy();
+    move TSelf copy(IAllocator alloc);
+};
+
 interface IQueue<T>
 {
     void push(move T item);       // blocking send; ownership transferred for pointer types

@@ -119,6 +119,51 @@ string operator+(string a, IString b)
     return a + b->ToString();
 }
 
+// ── string.copy ───────────────────────────────────────────────────────────────
+// Deep copy using the active allocator (`new`). Returns an owning string that is
+// freed by whatever allocator is active at the call site.
+string copy(string self)
+{
+    i32 len = self.length();
+    i8* buf = new i8[len + 1];
+    i8* src = self.data();
+    i32 i = 0;
+    while (i < len)
+    {
+        buf[i] = src[i];
+        i = i + 1;
+    }
+    buf[len] = 0;
+
+    string result;
+    result._ptr = buf;
+    result._len = len;
+    return result;
+}
+
+// Deep copy: allocate a fresh null-terminated buffer from `alloc` and copy the
+// bytes into it, returning an owning string. Used to re-home a string into a
+// specific allocator - e.g. a program copying borrowed args into its own
+// allocator so the copy is freed by the allocator that owns it.
+string copy(string self, IAllocator alloc)
+{
+    i32 len  = self.length();
+    i8* buf  = (i8*)alloc.alloc((i64)len + 1);
+    i8* src  = self.data();
+    i32 i = 0;
+    while (i < len)
+    {
+        buf[i] = src[i];
+        i = i + 1;
+    }
+    buf[len] = 0;
+
+    string result;
+    result._ptr = buf;
+    result._len = len;
+    return result;
+}
+
 // ── string_view ───────────────────────────────────────────────────────────────
 // Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
 struct string_view

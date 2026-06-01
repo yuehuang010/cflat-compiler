@@ -1,0 +1,172 @@
+// Benchmark: allocation-order traversal locality.
+//
+// Each allocator builds a singly-linked list of N nodes by calling `new LNode`
+// in a loop and chaining them in allocation order, then walks the list `passes`
+// times following `_next`. Because traversal order equals allocation order, an
+// allocator that lays nodes out contiguously (ArenaAllocator's bump regions,
+// BucketAllocator's size-class pages) walks sequential memory - cache and
+// prefetch friendly - while a scattered allocator pays cache misses per hop.
+//
+// The list is held entirely in the nodes themselves (each node stores `_next`),
+// so no external pointer array perturbs the layout being measured.
+//
+// Two numbers are reported: build (sequential `new`) and traverse (the
+// locality-sensitive pointer chase). The traverse `ops` count is N*passes.
+//
+// Note: pointer variables are declared BEFORE the loops so their allocas are
+// hoisted to the function entry block (see perf_alloc_throughput.cb).
+
+import "list.cb";
+import "thread.cb";
+import "interfaces.cb";
+import "time.cb";
+import "malloc_allocator.cb";
+import "block_allocator.cb";
+import "bucket_allocator.cb";
+import "arena_allocator.cb";
+import "fit_allocator.cb";
+import "entry_allocator.cb";
+import "perf_framework.cb";
+
+struct LNode
+{
+    i64    _value = 0;
+    LNode* _next  = nullptr;
+};
+
+program BenchLocality
+{
+    int count    = 0;
+    int passes   = 0;
+    i64 buildUs  = 0;
+    i64 walkUs   = 0;
+    i64 checksum = 0;
+
+    int main(move list<string> args)
+    {
+        Stopwatch sw;
+
+        // Build: `count` nodes chained in allocation order.
+        sw.start();
+        LNode* head = nullptr;
+        LNode* tail = nullptr;
+        LNode* node = nullptr;
+        int i = 0;
+        while (i < count)
+        {
+            node = new LNode;
+            node->_value = (i64)i;
+            node->_next  = nullptr;
+            if (head == nullptr) head = node;
+            else                 tail->_next = node;
+            tail = node;
+            i++;
+        }
+        sw.stop();
+        buildUs = (i64)sw.elapsed().microseconds();
+
+        // Traverse: `passes` full walks following _next.
+        sw.start();
+        i64 sum = 0;
+        LNode* cur = nullptr;
+        int p = 0;
+        while (p < passes)
+        {
+            cur = head;
+            while (cur != nullptr)
+            {
+                sum = sum + cur->_value;
+                cur = cur->_next;
+            }
+            p++;
+        }
+        sw.stop();
+        walkUs   = (i64)sw.elapsed().microseconds();
+        checksum = sum;   // stored so the sum is not dead-code eliminated
+
+        // Free the list.
+        LNode* nxt = nullptr;
+        cur = head;
+        while (cur != nullptr) { nxt = cur->_next; delete cur; cur = nxt; }
+        return 0;
+    }
+};
+
+extern int main()
+{
+    int N = 2000000;   // 2M nodes (~32-48 MB live) - exceeds L3 on most machines
+    int P = 5;         // traversal passes
+
+    // run() moves its args list, so each program instance needs its own.
+    list<string> aM;
+    list<string> aB;
+    list<string> aBk;
+    list<string> aAr;
+    list<string> aF;
+    list<string> aE;
+
+    BenchLocality bm;
+    bm.count = N; bm.passes = P;
+    bm._allocator = new MallocAllocator;
+    bm.run(aM);
+    bm.WaitForExit();
+
+    BenchLocality bl;
+    bl.count = N; bl.passes = P;
+    bl._allocator = new BlockAllocator;
+    bl.run(aB);
+    bl.WaitForExit();
+    PerfCheckLeak("BlockAllocator", bl._allocator.usedBytes());
+
+    BenchLocality bb;
+    bb.count = N; bb.passes = P;
+    bb._allocator = new BucketAllocator;
+    bb.run(aBk);
+    bb.WaitForExit();
+    PerfCheckLeak("BucketAllocator", bb._allocator.usedBytes());
+
+    BenchLocality ba;
+    ba.count = N; ba.passes = P;
+    ba._allocator = new ArenaAllocator;
+    ba.run(aAr);
+    ba.WaitForExit();
+    PerfCheckLeak("ArenaAllocator", ba._allocator.usedBytes());
+
+    BenchLocality bf;
+    bf.count = N; bf.passes = P;
+    bf._allocator = new FitAllocator;
+    bf.run(aF);
+    bf.WaitForExit();
+    PerfCheckLeak("FitAllocator", bf._allocator.usedBytes());
+
+    BenchLocality be;
+    be.count = N; be.passes = P;
+    be._allocator = new EntryAllocator;
+    be.run(aE);
+    be.WaitForExit();
+    PerfCheckLeak("EntryAllocator", be._allocator.usedBytes());
+
+    // Sanity: every allocator must compute the same checksum.
+    i64 expected = (i64)N * ((i64)N - (i64)1) / (i64)2 * (i64)P;
+    if (bm.checksum != expected || bl.checksum != expected || bb.checksum != expected ||
+        ba.checksum != expected || bf.checksum != expected || be.checksum != expected)
+        printf("  [ERROR] checksum mismatch (expected %lld)\n", expected);
+
+    PerfHeader("Locality: Build (new LNode x N, N=2000000)");
+    PerfPrint("MallocAllocator", (i64)N, bm.buildUs, bm._allocator.peakReserve());
+    PerfPrint("BlockAllocator",  (i64)N, bl.buildUs, bl._allocator.peakReserve());
+    PerfPrint("BucketAllocator", (i64)N, bb.buildUs, bb._allocator.peakReserve());
+    PerfPrint("ArenaAllocator",  (i64)N, ba.buildUs, ba._allocator.peakReserve());
+    PerfPrint("FitAllocator",    (i64)N, bf.buildUs, bf._allocator.peakReserve());
+    PerfPrint("EntryAllocator",  (i64)N, be.buildUs, be._allocator.peakReserve());
+
+    PerfHeader("Locality: Traverse (5 passes, allocation-order walk)");
+    PerfPrint("MallocAllocator", (i64)N * (i64)P, bm.walkUs, bm._allocator.peakReserve());
+    PerfPrint("BlockAllocator",  (i64)N * (i64)P, bl.walkUs, bl._allocator.peakReserve());
+    PerfPrint("BucketAllocator", (i64)N * (i64)P, bb.walkUs, bb._allocator.peakReserve());
+    PerfPrint("ArenaAllocator",  (i64)N * (i64)P, ba.walkUs, ba._allocator.peakReserve());
+    PerfPrint("FitAllocator",    (i64)N * (i64)P, bf.walkUs, bf._allocator.peakReserve());
+    PerfPrint("EntryAllocator",  (i64)N * (i64)P, be.walkUs, be._allocator.peakReserve());
+
+    return 0;
+}

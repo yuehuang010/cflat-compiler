@@ -8576,6 +8576,30 @@ public:
                             break;
                         }
 
+                        // Compile-time intrinsic: is_string(T) - returns 1 if T resolves to the
+                        // built-in `string` value type, 0 otherwise. Use with `if const` to deep-copy
+                        // string elements in generic containers (string owns a heap buffer, so a
+                        // shallow element copy would alias the buffer and double-free).
+                        if (functionName == "is_string")
+                        {
+                            bool isStr = false;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (!namedArgCtx.empty())
+                                {
+                                    std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                                    auto substIt = activeTypeSubstitutions.find(argText);
+                                    if (substIt != activeTypeSubstitutions.end())
+                                        isStr = (substIt->second == "string");
+                                }
+                            }
+                            namedVar.Primary = llvm::ConstantInt::get(
+                                llvm::Type::getInt1Ty(*Compiler(ctx)->context), isStr ? 1 : 0);
+                            namedVar.TypeAndValue.TypeName = "int";
+                            break;
+                        }
+
                         // Handle va_start / va_end - pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
@@ -10048,7 +10072,7 @@ public:
 
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
-            "va_start", "va_end", "is_pointer", "is_primitive", "annotationof",
+            "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
             "reflect", "reflect_set",
         };
         if (kIntrinsics.count(name))
@@ -11352,7 +11376,26 @@ public:
             auto* cleanupBB = llvm::BasicBlock::Create(*compiler->context, "seh_cleanup", trampolineFn);
 
             // Load list__string args by value from the packet
-            auto* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
+            llvm::Value* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
+
+            // Re-home the args into the program allocator (which is now the active
+            // allocator). The caller built the args under its own allocator (CRT on
+            // the main thread); main(move list<string>) would otherwise free those
+            // foreign buffers under the program allocator. __prog_adopt_args deep-
+            // copies them into the program allocator and frees the originals under
+            // the CRT, so main owns a list the program allocator actually allocated.
+            // Only the list<string> form owns the list; the argc/argv form reads the
+            // string pointers into a separate argv array, so it is left untouched.
+            if (isListArgs)
+            {
+                auto* adoptFn = compiler->GetFunction("__prog_adopt_args");
+                if (adoptFn)
+                    argsVal = compiler->builder->CreateCall(
+                        adoptFn->getFunctionType(), adoptFn, {argsVal}, "adopted_args");
+                else
+                    compiler->LogError(std::format(
+                        "program '{}': __prog_adopt_args not found - program.cb must be imported", name));
+            }
 
             // exitCodeGEP must dominate all paths - compute in the entry block.
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(

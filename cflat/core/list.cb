@@ -1,7 +1,9 @@
 // list<T> - mutable growable owning array (similar to vector<T>).
 // Supports any value type T.
 
-class list<T> : IEnumerable<T>, IList<T>
+import "memory.cb";   // __active_allocator (for copy(IAllocator))
+
+class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 {
     T*  _data     = nullptr;
     int _size     = 0;
@@ -98,6 +100,46 @@ class list<T> : IEnumerable<T>, IList<T>
             }
         }
         _size = 0;
+    }
+
+    // ── ICopyable ──────────────────────────────────────────────────────────
+    // Return an independent copy of this list using the active allocator.
+    // string elements are deep-copied (string owns a heap buffer, so a shallow
+    // element copy would alias the buffer and double-free); primitive and
+    // pointer elements are copied by value (a list of pointers shares pointees).
+    move list<T> copy()
+    {
+        list<T> result;
+        int i = 0;
+        while (i < _size)
+        {
+            if const (is_string(T)) result.add(_data[i].copy());
+            else                    result.add(_data[i]);
+            i++;
+        }
+        return move result;
+    }
+
+    // Return an independent copy whose backing array and (string) element
+    // buffers are all allocated from `alloc`, so the copy is owned - and freed -
+    // by that allocator. Routes the internal `new` allocations through `alloc`
+    // by temporarily installing it as the active allocator.
+    move list<T> copy(IAllocator alloc)
+    {
+        IAllocator saved = __active_allocator;
+        __active_allocator = alloc;
+
+        list<T> result;
+        int i = 0;
+        while (i < _size)
+        {
+            if const (is_string(T)) result.add(_data[i].copy());
+            else                    result.add(_data[i]);
+            i++;
+        }
+
+        __active_allocator = saved;
+        return move result;
     }
 
     // Lomuto partition: pivot at _data[hi], returns final pivot index.

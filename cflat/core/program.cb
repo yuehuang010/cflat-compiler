@@ -1,5 +1,7 @@
 import "cruntime.cb";
 import "list.cb";
+import "string.cb";
+import "memory.cb";
 import "thread.cb";
 import "block_allocator.cb";
 import "bucket_allocator.cb";
@@ -7,4 +9,34 @@ import "malloc_allocator.cb";
 import "stop_token.cb";
 import "channel.cb";
 import "stream.cb";
+
+// ── program args re-home ───────────────────────────────────────────────────
+// A program's args list<string> is built by the caller (typically the main
+// thread, where the active allocator is null -> CRT malloc) and then moved into
+// the program. Because main(move list<string> args) owns the list, it would free
+// those CRT buffers under the program's allocator - a cross-allocator free.
+//
+// The trampoline (EmitProgramRunWrapper) calls __prog_adopt_args right after it
+// installs the program allocator: it deep-copies the args into the program
+// allocator and frees the originals under the CRT, so main owns - and frees - a
+// list that the program allocator actually allocated. Keeping the move API
+// (run() still takes ownership) but re-homing the contents.
+
+// Free a list<string> under the currently-active allocator (the move-param
+// destructor releases the buffers + backing array at scope exit).
+void __prog_drop_args(move list<string> s) { }
+
+// Deep-copy src into the active (program) allocator, free the originals under
+// the CRT, and return the program-owned copy.
+move list<string> __prog_adopt_args(move list<string> src)
+{
+    list<string> dst = src.copy();          // active == program allocator -> dst owned by it
+
+    IAllocator saved = __active_allocator;
+    __active_allocator = nullptr;
+    __prog_drop_args(move src);             // free the caller's (CRT) buffers
+    __active_allocator = saved;
+
+    return move dst;
+}
 

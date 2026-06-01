@@ -15,6 +15,7 @@ import "time.cb";
 import "malloc_allocator.cb";
 import "block_allocator.cb";
 import "bucket_allocator.cb";
+import "arena_allocator.cb";
 import "fit_allocator.cb";
 import "entry_allocator.cb";
 import "perf_framework.cb";
@@ -50,6 +51,7 @@ extern int main()
     list<string> argsM;
     list<string> argsB;
     list<string> argsBk;
+    list<string> argsAr;
     list<string> argsF;
     list<string> argsE;
     PerfHeader("Alloc/Dealloc Throughput (N=500000, new int / delete)");
@@ -76,6 +78,14 @@ extern int main()
     bs.WaitForExit();
     PerfPrint("BucketAllocator", (i64)N, bs.measuredUs, bs._allocator.peakReserve());
     PerfCheckLeak("BucketAllocator", bs._allocator.usedBytes());
+
+    BenchThroughput ba;
+    ba.iters = N;
+    ba._allocator = new ArenaAllocator;
+    ba.run(argsAr);
+    ba.WaitForExit();
+    PerfPrint("ArenaAllocator", (i64)N, ba.measuredUs, ba._allocator.peakReserve());
+    PerfCheckLeak("ArenaAllocator", ba._allocator.usedBytes());
 
     BenchThroughput bf;
     bf.iters = N;
