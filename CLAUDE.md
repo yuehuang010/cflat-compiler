@@ -9,6 +9,9 @@ cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) -
 ## Git
 Do not commit to git.  Stash is allowed.  
 
+## Dependencies
+Do not modify the root `./vcpkg.json` without explicit permission.
+
 ## Text Output
 
 - Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.

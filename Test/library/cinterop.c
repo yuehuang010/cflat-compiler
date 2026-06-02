@@ -1,6 +1,11 @@
 /* Real C (clang-compilable) fixture for the C-interop test.
    Compiled by clang-cl when imported from a .cb; the object is linked by lld. */
 
+/* Externally-linkable global - the .c auto-extern path binds this as a
+   declaration-only, mutable CFlat global. (c_handle_payload below is static,
+   so it must NOT be bound - validates the internal-linkage skip.) */
+int c_global_counter = 1000;
+
 int c_add(int a, int b)
 {
     return a + b;

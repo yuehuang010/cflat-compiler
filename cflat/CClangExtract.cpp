@@ -35,6 +35,7 @@
 #include "llvm/Support/TimeProfiler.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace cflat_cinterop
 {
@@ -84,6 +85,7 @@ namespace cflat_cinterop
             const ExtractRequest& req;
             ExtractResult& out;
             std::vector<MacroProbe> probes;   // index == probe slot
+            std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o) {}
         };
 
@@ -306,6 +308,33 @@ namespace cflat_cinterop
                 return true;
             }
 
+            // Harvest an externally-linkable file-scope global variable - a header `extern int x;`
+            // declaration or a .c-defined `int x = 5;`. Skips statics (internal linkage), locals,
+            // and (in definitionsOnly / .c mode) pure declarations with no definition in this TU.
+            // Dedups redeclarations by name. Returns true (continue traversal) unconditionally.
+            bool HarvestGlobalVar(VarDecl* vd)
+            {
+                if (!vd->isFileVarDecl()) return true;            // locals, params, members
+                if (vd->getStorageClass() == SC_Static) return true;  // internal linkage
+                if (!vd->hasExternalFormalLinkage()) return true;
+                if (vd->getType()->isFunctionType()) return true; // not a data symbol
+                // .c auto-extern mode: only globals this TU actually defines.
+                if (st.req.definitionsOnly && !vd->isThisDeclarationADefinition()) return true;
+
+                std::string file; int line = 1, col = 0;
+                if (!LocOf(vd, file, line, col)) return true;
+
+                std::string name = vd->getNameAsString();
+                if (!st.emittedGlobals.insert(name).second) return true;  // already emitted
+
+                RawGlobalVar g;
+                g.name = name;
+                g.ctype = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
+                g.file = file; g.line = line; g.col = col;
+                st.out.globals.push_back(std::move(g));
+                return true;
+            }
+
             // Read a macro probe variable (`__cflat_macro_<i> = (MACRO)`): the deduced type and
             // constant-folded initializer give the macro's natural type and value.
             bool VisitVarDecl(VarDecl* vd)
@@ -313,7 +342,7 @@ namespace cflat_cinterop
                 const IdentifierInfo* ii = vd->getIdentifier();
                 if (!ii) return true;
                 StringRef nm = ii->getName();
-                if (!nm.starts_with(kProbePrefix)) return true;
+                if (!nm.starts_with(kProbePrefix)) return HarvestGlobalVar(vd);
                 unsigned idx = 0;
                 if (nm.drop_front(sizeof(kProbePrefix) - 1).getAsInteger(10, idx)) return true;
                 if (idx >= st.probes.size()) return true;

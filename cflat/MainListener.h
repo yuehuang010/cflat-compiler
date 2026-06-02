@@ -4191,7 +4191,12 @@ public:
                     right = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
                 }
 
-                if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0)
+                // An `extern` global with no initializer is a declaration of a symbol defined
+                // elsewhere (another TU or a C library); skip default-init / the not-initialized
+                // warning - there is nothing to construct here.
+                bool externDeclOnly = global_scope && typeAndValue.external && right == nullptr;
+
+                if (right == nullptr && !typeAndValue.Pointer && typeAndValue.ConstArraySize == 0 && !externDeclOnly)
                 {
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
@@ -4207,7 +4212,7 @@ public:
                 if (global_scope)
                 {
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
-                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue);
+                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
                     // Record the variable's declaration site so LSP go-to-definition
                     // on the variable name lands on the global itself, not on its
                     // (possibly unregistered, e.g. generic-instantiation) type.

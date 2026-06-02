@@ -1,6 +1,13 @@
 #include "mathlib.h"
 #include <stdarg.h>
 
+/* Definitions for the extern globals declared in mathlib.h. */
+int         ml_global_int    = 4242;
+double      ml_global_double = 2.5;
+const char* ml_global_name   = "mathlib-global";
+/* Internal linkage: must be skipped by the global harvester. */
+static int  ml_global_static = 999;
+
 int ml_add(int a, int b) { return a + b; }
 int ml_mul(int a, int b) { return a * b; }
 

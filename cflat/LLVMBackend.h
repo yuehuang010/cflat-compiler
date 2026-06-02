@@ -753,6 +753,16 @@ private:
         int line = 1;
         int col = 0;
     };
+    // An externally-linkable C global variable - a header `extern int x;` declaration or a
+    // .c-defined global. Bound as a declaration-only, mutable CFlat global (external reference
+    // resolved by the linker against the C library / object). ret carries the mapped CFlat type.
+    struct CGlobalEntry
+    {
+        std::string name;
+        TypeAndValue type;
+        int line = 1;
+        int col = 0;
+    };
     // An object-like C macro extracted from a bound header. Function-like macros are skipped
     // (cflat has no preprocessor to expand them). The value is resolved by feeding the macro
     // through an enum stub - the original source location (file/line/col) is preserved from
@@ -844,6 +854,7 @@ private:
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
+        std::vector<CGlobalEntry> globals;
     };
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -2349,6 +2360,33 @@ private:
         return true;
     }
 
+    // Map one extracted global variable to a CGlobalEntry. Returns false (skips the global) when
+    // its type is outside the extern ABI subset. Array-typed globals are skipped: the string
+    // mapper decays `T[N]` to a pointer, which would mistype the symbol's storage as holding a
+    // pointer rather than being the array data - a silent miscompile. The user threads such
+    // symbols through C-side accessors instead.
+    bool MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e)
+    {
+        if (r.ctype.find('[') != std::string::npos)
+        {
+            if (verbose) std::cout << "[verbose]   skipping global '" << r.name
+                                   << "': array type '" << r.ctype << "' is not bindable\n";
+            return false;
+        }
+        e = CGlobalEntry();
+        e.name = r.name;
+        e.line = r.line ? r.line : 1;
+        e.col  = r.col < 0 ? 0 : r.col;
+        if (!MapCTypeToTypeAndValue(r.ctype, e.type))
+        {
+            if (verbose) std::cout << "[verbose]   skipping global '" << r.name
+                                   << "': unsupported type '" << r.ctype << "'\n";
+            return false;
+        }
+        e.type.VariableName = r.name;
+        return true;
+    }
+
     // Classify a folded object-like macro into a CMacroEntry. An int macro whose natural type
     // chases (via the mapper) to a function pointer or void* becomes a funcptr / pointer
     // sentinel; otherwise it is a plain int / float / string. Returns false for Skip macros.
@@ -2412,6 +2450,7 @@ private:
                              std::vector<CRecordEntry>& outRecords,
                              std::vector<CMacroEntry>& outMacros,
                              std::vector<CFunctionMacroEntry>& outFuncMacros,
+                             std::vector<CGlobalEntry>& outGlobals,
                              const std::vector<std::string>& extraDefines = {})
     {
         const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
@@ -2486,17 +2525,28 @@ private:
             }
         }
 
+        {
+            llvm::TimeTraceScope globalScope("MapGlobals", headerPath);
+            for (const auto& rg : raw.globals)
+            {
+                CGlobalEntry e;
+                if (MapRawGlobal(rg, e)) outGlobals.push_back(std::move(e));
+            }
+        }
+
         if (verbose)
             std::cout << "[verbose]   header bind: " << outSigs.size() << " sig(s), "
                       << outEnums.size() << " enum(s), " << outRecords.size() << " record(s), "
-                      << outMacros.size() << " macro(s), " << outFuncMacros.size() << " func-macro(s)\n";
+                      << outMacros.size() << " macro(s), " << outFuncMacros.size() << " func-macro(s), "
+                      << outGlobals.size() << " global(s)\n";
         return true;
     }
 
     // Extract externally-linkable functions a .c file DEFINES, via the clang C++ API. Records
     // are registered up front (struct-by-value). Used by the .c auto-extern path.
     bool ExtractCFileClang(const std::string& cSourcePath,
-                           std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords)
+                           std::vector<CSigEntry>& outSigs, std::vector<CRecordEntry>& outRecords,
+                           std::vector<CGlobalEntry>& outGlobals)
     {
         llvm::TimeTraceScope extractScope("CFileExtract", cSourcePath);
 
@@ -2533,6 +2583,14 @@ private:
             {
                 CSigEntry e;
                 if (MapRawSig(rs, e)) outSigs.push_back(std::move(e));
+            }
+        }
+        {
+            llvm::TimeTraceScope globalScope("MapGlobals", cSourcePath);
+            for (const auto& rg : raw.globals)
+            {
+                CGlobalEntry e;
+                if (MapRawGlobal(rg, e)) outGlobals.push_back(std::move(e));
             }
         }
         return true;
@@ -2572,6 +2630,7 @@ private:
         //     lock is released, so the global cache never serializes per-backend work. ---
         std::vector<CSigEntry> hitSigs;
         std::vector<CRecordEntry> hitRecords;
+        std::vector<CGlobalEntry> hitGlobals;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -2584,6 +2643,7 @@ private:
                     if (verbose) std::cout << "[verbose] C signatures cache hit (mtime) for " << fileForLsp << "\n";
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
+                    hitGlobals = entry.globals;
                     hit = true;
                 }
                 // Timestamp moved but content may be identical - only now pay for a hash.
@@ -2593,6 +2653,7 @@ private:
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
+                    hitGlobals = entry.globals;
                     hit = true;
                 }
             }
@@ -2603,6 +2664,7 @@ private:
             // value resolve to the same dataStructures entries on cache hits.
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterCSignatures(hitSigs, fileForLsp, programAlias);
+            RegisterCGlobals(hitGlobals, fileForLsp);
             return true;
         }
 
@@ -2613,7 +2675,8 @@ private:
         // This also lets LSP .c indexing work when clang-cl is unavailable.
         std::vector<CSigEntry> sigs;
         std::vector<CRecordEntry> records;
-        if (!ExtractCFileClang(cSourcePath, sigs, records))
+        std::vector<CGlobalEntry> globals;
+        if (!ExtractCFileClang(cSourcePath, sigs, records, globals))
             return false;
 
         if (!mtEc)
@@ -2623,6 +2686,7 @@ private:
             entry.hash  = hashNow();
             entry.sigs  = sigs;
             entry.records = records;
+            entry.globals = globals;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
@@ -2630,6 +2694,7 @@ private:
         // Records were already registered inside ExtractCFileClang (so it could map
         // struct-by-value parameter types); do not re-register here.
         RegisterCSignatures(sigs, fileForLsp, programAlias);
+        RegisterCGlobals(globals, fileForLsp);
         return true;
     }
 
@@ -2661,6 +2726,29 @@ private:
         }
         if (verbose)
             std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
+    }
+
+    // Register externally-linkable C globals as declaration-only, mutable CFlat globals (external
+    // references the linker resolves against the C library / object). First-writer-wins against an
+    // existing global, matching RegisterCEnums.
+    void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp)
+    {
+        for (const CGlobalEntry& e : globals)
+        {
+            if (e.name.empty()) continue;
+            if (globalNamedVariable.count(e.name)) continue;  // first writer wins
+
+            TypeAndValue tv = e.type;
+            tv.VariableName = e.name;
+            CreateGlobalVariable(tv, /*initValue*/ nullptr, /*threadLocal*/ false,
+                                 /*userAlign*/ 0, /*externalDecl*/ true);
+
+            if (auto* s = GetSymbolSink())
+                s->Register(SymbolKind::Variable, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col,
+                            tv.TypeName + (tv.Pointer ? "*" : "") + " " + e.name);
+        }
+        if (verbose)
+            std::cout << "[verbose]   registered " << globals.size() << " C global(s) from " << fileForLsp << "\n";
     }
 
     // Auto-register C struct/union decls extracted from a header or .c source as CFlat
@@ -3064,6 +3152,7 @@ private:
         std::vector<CRecordEntry> hitRecords;
         std::vector<CMacroEntry> hitMacros;
         std::vector<CFunctionMacroEntry> hitFuncMacros;
+        std::vector<CGlobalEntry> hitGlobals;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -3075,14 +3164,14 @@ private:
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
-                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hit = true;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime;
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
-                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hit = true;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals; hit = true;
                 }
             }
         }
@@ -3094,6 +3183,7 @@ private:
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
             RegisterCFunctionMacros(hitFuncMacros, fileForLsp);
+            RegisterCGlobals(hitGlobals, fileForLsp);
             return true;
         }
 
@@ -3102,12 +3192,13 @@ private:
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
+        std::vector<CGlobalEntry> globals;
         {
             // Functions / enums / records / object-like macro values / function-like macros are
             // all produced by the clang C++ API extractor in one full parse (+ a cheap
             // preprocess-only prepass for macro names). No clang-cl, no libclang.
             llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
-            if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, extraDefines))
+            if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, globals, extraDefines))
                 return false;
         }
 
@@ -3121,6 +3212,7 @@ private:
             entry.records = records;
             entry.macros = macros;
             entry.funcMacros = funcMacros;
+            entry.globals = globals;
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
@@ -3130,6 +3222,7 @@ private:
         RegisterCEnums(enums, fileForLsp);
         RegisterCMacros(macros);
         RegisterCFunctionMacros(funcMacros, fileForLsp);
+        RegisterCGlobals(globals, fileForLsp);
         return true;
     }
 
@@ -4494,7 +4587,11 @@ public:
         return fn;
     }
 
-    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0)
+    // externalDecl=true emits a declaration-only global (null initializer + ExternalLinkage):
+    // an external reference the linker resolves to a definition elsewhere (a C library symbol,
+    // or a CFlat `extern` global defined in another translation unit). Mutable, C-style - the
+    // global is NOT zero-initialized here (that would emit a conflicting definition).
+    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0, bool externalDecl = false)
     {
         llvm::Type* destinationType = GetType(typeValue);
         if (initValue)
@@ -4520,11 +4617,13 @@ public:
                 initValue = llvm::Constant::getNullValue(destinationType);
             }
         }
-        else
+        else if (!externalDecl)
         {
             // Zero-initialize - works for all types: primitives, pointers, structs, fat-ptrs.
             initValue = llvm::Constant::getNullValue(destinationType);
         }
+        // externalDecl with no initValue: leave initValue null so the GlobalVariable below is a
+        // declaration (external reference), not a definition.
 
         auto gVar = new llvm::GlobalVariable(
             *module,
@@ -4552,7 +4651,7 @@ public:
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
 
-        if (diBuilder && diFile && !typeValue.VariableName.empty())
+        if (diBuilder && diFile && !typeValue.VariableName.empty() && !externalDecl)
         {
             llvm::DIFile* gvFile = GetDIFileForCurrentSource();
             if (!gvFile) gvFile = diFile;
@@ -8589,6 +8688,20 @@ public:
         return {j.value("n", std::string{}), j.value("v", 0LL), j.value("ln", 1), j.value("co", 0)};
     }
 
+    static nlohmann::json GlobalToJson(const CGlobalEntry& g)
+    {
+        return {{"n", g.name}, {"t", TvToJson(g.type)}, {"ln", g.line}, {"co", g.col}};
+    }
+    static CGlobalEntry GlobalFromJson(const nlohmann::json& j)
+    {
+        CGlobalEntry g;
+        g.name = j.value("n", std::string{});
+        g.type = TvFromJson(j.at("t"));
+        g.line = j.value("ln", 1);
+        g.col  = j.value("co", 0);
+        return g;
+    }
+
     static nlohmann::json FieldToJson(const CRecordFieldEntry& f)
     {
         nlohmann::json j = {{"n", f.name}, {"ct", f.ctype}};
@@ -8703,6 +8816,7 @@ public:
         if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
         if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
         if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
+        if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
         out = std::move(entry);
         return true;
     }
@@ -8739,6 +8853,9 @@ public:
         nlohmann::json funcMacros = nlohmann::json::array();
         for (const auto& m : entry.funcMacros) funcMacros.push_back(FuncMacroToJson(m));
         j["funcMacros"] = funcMacros;
+        nlohmann::json globals = nlohmann::json::array();
+        for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
+        j["globals"] = globals;
 
         // Atomic write: PID-stamped temp file renamed over the target.
         auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());

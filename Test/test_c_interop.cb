@@ -474,6 +474,22 @@ extern int main()
     ml_flags_set_count(&qg, 8675309);
     if (qg.count != 8675309)                    return 176;
 
+    // ---- Section R: extern global variables (header-bind + .c auto-extern) ---
+    // mathlib.h declares `extern int/double/const char*` globals; the import-package
+    // path binds them as declaration-only, mutable CFlat globals resolved against
+    // mathlib.lib. cinterop.c defines `int c_global_counter` bound via .c auto-extern.
+    // Reads come straight from the linked C definitions; writes prove mutability.
+    if (ml_global_int != 4242)                   return 180;
+    if (ml_global_double < 2.49 || ml_global_double > 2.51) return 181;
+    if (strcmp(ml_global_name, "mathlib-global") != 0)      return 182;
+    if (c_global_counter != 1000)                return 183;
+
+    // Mutability (C style): assign through the bound global, read back.
+    ml_global_int = 7;
+    if (ml_global_int != 7)                      return 184;
+    c_global_counter = c_global_counter + 5;
+    if (c_global_counter != 1005)                return 185;
+
     // ---- Section L: float/double #define macro extraction -------------------
     if (!testFloatMacros())                     return 200;
 

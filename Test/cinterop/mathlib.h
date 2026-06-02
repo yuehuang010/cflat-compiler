@@ -182,6 +182,15 @@ unsigned ml_flags_word (struct ML_Flags* f);              /* raw 32-bit view */
 void ml_flags_set_count(struct ML_Flags* f, unsigned c);
 unsigned ml_flags_get_count(struct ML_Flags* f);
 
+/* Externally-linkable global variables. The C-interop extractor binds these as
+ * declaration-only, MUTABLE CFlat globals (external references resolved by the
+ * linker against mathlib.lib). Scalar, double, and pointer shapes are covered.
+ * `ml_global_static` is internal-linkage and must NOT be bound (it has no
+ * external symbol to link against). */
+extern int         ml_global_int;       /* defined = 4242 */
+extern double      ml_global_double;    /* defined = 2.5  */
+extern const char* ml_global_name;      /* defined = "mathlib-global" */
+
 /* Function-pointer typedef - the comparator-style callback shape used by qsort,
  * libcurl's CURLOPT_WRITEFUNCTION, etc. clang spells the qualType as
  *   "int (*)(int, int)"

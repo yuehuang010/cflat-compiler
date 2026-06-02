@@ -83,6 +83,18 @@ namespace cflat_cinterop
         int col = 0;
     };
 
+    // An externally-linkable global variable a header declares (`extern int x;`) or a .c file
+    // defines (`int x = 5;`). ctype is the canonical C spelling of the variable's type, consumed
+    // by the same string-based mapper as RawSig param/return types. Bound mutable, C-style.
+    struct RawGlobalVar
+    {
+        std::string name;
+        std::string ctype;
+        std::string file;
+        int line = 1;
+        int col = 0;
+    };
+
     struct RawFuncMacro
     {
         std::string name;
@@ -116,6 +128,7 @@ namespace cflat_cinterop
         std::vector<RawEnum> enums;
         std::vector<RawRecord> records;
         std::vector<RawTypedef> typedefs;
+        std::vector<RawGlobalVar> globals;
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
     };
