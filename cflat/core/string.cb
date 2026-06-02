@@ -121,8 +121,10 @@ string operator+(string a, IString b)
 
 // ── string.copy ───────────────────────────────────────────────────────────────
 // Deep copy using the active allocator (`new`). Returns an owning string that is
-// freed by whatever allocator is active at the call site.
-string copy(string self)
+// freed by whatever allocator is active at the call site. `move` marks the return
+// as owned so the caller's local gets a scope-exit destructor (without it the
+// fresh buffer leaks - only operator+/move-string returns were flagged owned).
+move string copy(string self)
 {
     i32 len = self.length();
     i8* buf = new i8[len + 1];
@@ -145,7 +147,7 @@ string copy(string self)
 // bytes into it, returning an owning string. Used to re-home a string into a
 // specific allocator - e.g. a program copying borrowed args into its own
 // allocator so the copy is freed by the allocator that owns it.
-string copy(string self, IAllocator alloc)
+move string copy(string self, IAllocator alloc)
 {
     i32 len  = self.length();
     i8* buf  = (i8*)alloc.alloc((i64)len + 1);

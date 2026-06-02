@@ -4322,11 +4322,45 @@ public:
         return allocList;
     }
 
+    // True when the NamedVariable's value is the `string` value type.
+    bool NamedVarIsString(const LLVMBackend::NamedVariable& nv)
+    {
+        if (nv.TypeAndValue.TypeName == "string") return true;
+        if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType))
+            return st->getName() == "string";
+        return false;
+    }
+
+    // Stamp owned-string ownership onto an expression result and restore the
+    // "last call returns owned" flag for downstream consumers. `savedOwned` is the
+    // flag value captured before this expression was evaluated. If the expression
+    // ended in a call that returns an owned heap string (e.g. copy() / operator+),
+    // mark the result IsOwningString so passing it directly as a `move string`
+    // argument skips the defensive re-copy in CreateOverloadedFunctionCall (which
+    // would clone the buffer and orphan the freshly returned one - a leak). The
+    // flag is left reflecting this expression's own call when it made one, else
+    // restored to the prior value so existing consumers see unchanged semantics.
+    LLVMBackend::NamedVariable FinishAssignmentExpressionNamed(
+        LLVMBackend::NamedVariable nv, bool savedOwned)
+    {
+        bool exprOwned = compilerLLVM->lastCallReturnsOwned;
+        if (exprOwned && NamedVarIsString(nv))
+            nv.IsOwningString = true;
+        compilerLLVM->lastCallReturnsOwned = exprOwned ? true : savedOwned;
+        return nv;
+    }
+
     // Returns a NamedVariable (preserving TypeName) for simple single-child expression chains.
     // Used by ParseDeclaration to get the struct TypeName for struct->interface upcasting.
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx)
     {
+        // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
+        // can tell whether THIS expression (not a stale prior call) ended in an
+        // owned-string-returning call.
+        bool savedOwned = compilerLLVM->lastCallReturnsOwned;
+        compilerLLVM->lastCallReturnsOwned = false;
+
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
             && !condCtx->Question() && !condCtx->QuestionQuestion())
@@ -4367,7 +4401,8 @@ public:
                                                     auto muls = adds[0]->castExpression();
                                                     if (muls.size() == 1)
                                                     {
-                                                        return ParseCastExpression(muls[0]);
+                                                        return FinishAssignmentExpressionNamed(
+                                                            ParseCastExpression(muls[0]), savedOwned);
                                                     }
                                                 }
                                             }
@@ -4407,7 +4442,7 @@ public:
                 result.Primary = ParseAssignmentExpression(ctx);
                 if (result.Primary) result.BaseType = result.Primary->getType();
             }
-            return result;
+            return FinishAssignmentExpressionNamed(result, savedOwned);
         }
     }
 

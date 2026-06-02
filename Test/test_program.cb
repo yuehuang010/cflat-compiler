@@ -745,6 +745,73 @@ bool testListStringNoLeaks() {
     return result;
 }
 
+// ListStringCopyOwnership: builds a list<string> whose elements are heap-OWNING
+// copies (inline `.copy()`), unlike ListStringOwnership which only adds literals
+// (no owned buffers). This is the exact shape that used to leak: an owning-string
+// temporary passed straight into list.add(move string) hit a defensive re-copy
+// that cloned the buffer and orphaned the freshly returned one. The list
+// destructor frees each element, so a balanced allocator returns to zero.
+program ListStringCopyOwnership {
+    int count = 0;
+
+    int main(move list<string> args) {
+        list<string> items;
+        int i = 0;
+        while (i < count) {
+            string seed = "element";
+            items.add(seed.copy());   // owning-string temporary -> move string param
+            i++;
+        }
+        return 0;
+    }
+};
+
+bool testListStringCopyNoLeaks() {
+    bool result = true;
+    ListStringCopyOwnership p;
+    p.count = 8;
+    p._allocator = new MallocAllocator;   // no block-size cap; tracks live bytes
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("list<string> copy exit code", p.exitCode, 0);
+    result &= Test("list<string> copy no leaks", p._allocator.usedBytes(), 0);
+    return result;
+}
+
+// ListStringConcatOwnership: same leak shape as ListStringCopyOwnership but the
+// owning-string temporary comes from `operator+` (concatenation) instead of
+// copy(). Inline operator+ args leaked identically pre-fix: the owning temporary
+// was re-copied by the defensive move-string path and the original orphaned.
+program ListStringConcatOwnership {
+    int count = 0;
+
+    int main(move list<string> args) {
+        list<string> items;
+        int i = 0;
+        while (i < count) {
+            string a = "el";
+            string b = "ement";
+            items.add(a + b);   // operator+ owning temporary -> move string param
+            i++;
+        }
+        return 0;
+    }
+};
+
+bool testListStringConcatNoLeaks() {
+    bool result = true;
+    ListStringConcatOwnership p;
+    p.count = 8;
+    p._allocator = new MallocAllocator;   // no block-size cap; tracks live bytes
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("list<string> concat exit code", p.exitCode, 0);
+    result &= Test("list<string> concat no leaks", p._allocator.usedBytes(), 0);
+    return result;
+}
+
 bool testListOwnershipNoLeaks() {
     bool result = true;
     ListOwnership p;
@@ -1108,6 +1175,8 @@ extern int main() {
     total++; passed += testTwoDifferentPrograms()        ? 1 : 0;
     total++; passed += testProgramHeapStressLarge()      ? 1 : 0;
     total++; passed += testListStringNoLeaks()           ? 1 : 0;
+    total++; passed += testListStringCopyNoLeaks()       ? 1 : 0;
+    total++; passed += testListStringConcatNoLeaks()     ? 1 : 0;
     total++; passed += testListOwnershipNoLeaks()        ? 1 : 0;
     total++; passed += testWaitForExitWithToken()        ? 1 : 0;
     total++; passed += testWaitForExitCancelled()        ? 1 : 0;
