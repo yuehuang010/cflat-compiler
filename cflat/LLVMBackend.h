@@ -2937,11 +2937,15 @@ private:
     }
 
     // Tokenize a function-like macro body and verify every token is on a safe allowlist:
-    // integer literals (suffix stripped), parameter references, parens, and the operators
-    // + - * / % & | ^ ~ ! << >> < <= > >= == != && || ? : . The translated body is
-    // returned via 'out' on success. Rejections (calls into other macros, string/char
-    // literals, member access, casts, '#'/'##', float literals, the comma operator, ...)
-    // return false and the macro is dropped.
+    // integer + decimal-float literals (int suffix stripped, float suffix kept), char
+    // literals, parameter references, parens, the operators + - * / % & | ^ ~ ! << >> <
+    // <= > >= == != && || ? : , calls into already-known C functions, and bare references
+    // to known global / enum constants. The translated body is returned via 'out' on
+    // success. Unknown identifiers, strings, member access ('.', '->'), hex floats, casts,
+    // '#'/'##', '['/']', and the comma operator outside a call return false and the macro
+    // is dropped (silently, so binding a header never spews errors for macros cflat cannot
+    // express). Identifier resolution is validated against functionTable / globalNamedVariable
+    // here so the generated source only ever references symbols that already resolve.
     bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const
     {
         std::unordered_set<std::string> paramSet(m.params.begin(), m.params.end());
@@ -2950,6 +2954,12 @@ private:
         const std::string& s = m.body;
         size_t i = 0;
         bool hasContent = false;
+
+        // Paren-context stack: 'c' = argument list of a validated call (',' allowed),
+        // 'g' = a grouping paren (',' would be the comma operator - rejected). A call
+        // identifier sets pendingCallParen so the next '(' becomes a 'c' context.
+        std::vector<char> parenCtx;
+        bool pendingCallParen = false;
 
         while (i < s.size())
         {
@@ -2966,43 +2976,125 @@ private:
                 continue;
             }
 
-            // Identifier: must be a parameter (no calls, casts, or references to other macros).
+            // Identifier: a parameter, a call into a known function, or a bare reference to
+            // a known global / enum constant. Anything else (unknown name) drops the macro.
             if (std::isalpha((unsigned char)c) || c == '_')
             {
                 size_t start = i;
                 while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
                 std::string ident = s.substr(start, i - start);
-                if (!paramSet.count(ident)) return false;
+                if (paramSet.count(ident)) { out += ident; hasContent = true; continue; }
+
+                // Peek past whitespace: an identifier followed by '(' is a call.
+                size_t j = i;
+                while (j < s.size() && std::isspace((unsigned char)s[j])) ++j;
+                bool isCall = (j < s.size() && s[j] == '(');
+                if (isCall)
+                {
+                    if (!functionTable.count(ident)) return false;   // unknown callee: drop
+                    pendingCallParen = true;
+                }
+                else if (!globalNamedVariable.count(ident))
+                {
+                    return false;   // unknown bare identifier (not a constant): drop
+                }
                 out += ident;
                 hasContent = true;
                 continue;
             }
 
-            // Numeric literal: integers only (decimal or hex). Suffixes U/L/UL/LL/ULL are stripped
-            // because cflat's lexer does not accept them. Float literals (presence of '.') are
-            // rejected via the general '.' reject below.
-            if (std::isdigit((unsigned char)c))
+            // Numeric literal. Decimal integers and decimal floats are supported; integer
+            // suffixes (u/U/l/L) are stripped (cflat's lexer rejects them) while float
+            // suffixes (f/F/l/L) are kept (cflat accepts them). Hex integers are supported;
+            // hex floats (a '.'/'p'/'P' after the hex digits) are dropped.
+            if (std::isdigit((unsigned char)c) ||
+                (c == '.' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1])))
             {
                 size_t start = i;
-                if (c == '0' && i + 1 < s.size() && (s[i + 1] == 'x' || s[i + 1] == 'X'))
+                bool isHex = (c == '0' && i + 1 < s.size() && (s[i + 1] == 'x' || s[i + 1] == 'X'));
+                if (isHex)
                 {
                     i += 2;
                     while (i < s.size() && std::isxdigit((unsigned char)s[i])) ++i;
+                    if (i < s.size() && (s[i] == '.' || s[i] == 'p' || s[i] == 'P'))
+                        return false;   // hex float: drop
+                    out += s.substr(start, i - start);
+                    while (i < s.size() && (s[i] == 'u' || s[i] == 'U' || s[i] == 'l' || s[i] == 'L')) ++i;
+                    hasContent = true;
+                    continue;
                 }
-                else
+
+                bool isFloat = false;
+                while (i < s.size() && std::isdigit((unsigned char)s[i])) ++i;
+                if (i < s.size() && s[i] == '.')
                 {
+                    isFloat = true;
+                    ++i;
                     while (i < s.size() && std::isdigit((unsigned char)s[i])) ++i;
                 }
+                if (i < s.size() && (s[i] == 'e' || s[i] == 'E'))
+                {
+                    size_t save = i;
+                    ++i;
+                    if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+                    if (i < s.size() && std::isdigit((unsigned char)s[i]))
+                    {
+                        isFloat = true;
+                        while (i < s.size() && std::isdigit((unsigned char)s[i])) ++i;
+                    }
+                    else { i = save; }   // a stray 'e' that is not an exponent
+                }
                 out += s.substr(start, i - start);
-                while (i < s.size() && (s[i] == 'u' || s[i] == 'U' || s[i] == 'l' || s[i] == 'L')) ++i;
+                if (isFloat)
+                    while (i < s.size() && (s[i] == 'f' || s[i] == 'F' || s[i] == 'l' || s[i] == 'L'))
+                        { out += s[i]; ++i; }
+                else
+                    while (i < s.size() && (s[i] == 'u' || s[i] == 'U' || s[i] == 'l' || s[i] == 'L')) ++i;
                 hasContent = true;
                 continue;
             }
 
-            // String/char literals and disallowed punctuation.
-            if (c == '"' || c == '\'')                     return false;
-            if (c == '#' || c == '[' || c == ']' || c == '.' || c == ',' || c == ';') return false;
+            // Char literal: 'x' / '\n' etc. - cflat accepts the same C escape forms. The
+            // closing quote must be found (respecting backslash escapes) or the macro drops.
+            if (c == '\'')
+            {
+                size_t start = i;
+                ++i;
+                while (i < s.size() && s[i] != '\'')
+                {
+                    if (s[i] == '\\' && i + 1 < s.size()) i += 2;
+                    else ++i;
+                }
+                if (i >= s.size()) return false;   // unterminated
+                ++i;                                // closing quote
+                out += s.substr(start, i - start);
+                hasContent = true;
+                continue;
+            }
+
+            // String literals and disallowed punctuation.
+            if (c == '"')                                        return false;
+            if (c == '#' || c == '[' || c == ']' || c == '.' || c == ';') return false;
             if (c == '-' && i + 1 < s.size() && s[i + 1] == '>') return false; // ->
+
+            // Parens: track call vs grouping context so ',' is only allowed in a call's
+            // argument list.
+            if (c == '(')
+            {
+                parenCtx.push_back(pendingCallParen ? 'c' : 'g');
+                pendingCallParen = false;
+                out += c; ++i; hasContent = true; continue;
+            }
+            if (c == ')')
+            {
+                if (!parenCtx.empty()) parenCtx.pop_back();
+                out += c; ++i; hasContent = true; continue;
+            }
+            if (c == ',')
+            {
+                if (parenCtx.empty() || parenCtx.back() != 'c') return false; // comma operator: drop
+                out += c; ++i; hasContent = true; continue;
+            }
 
             // Two-char operators kept intact.
             if (i + 1 < s.size())
@@ -3014,8 +3106,8 @@ private:
                 if (twoChar.count(two)) { out += two; i += 2; hasContent = true; continue; }
             }
 
-            // Single-character operators / grouping.
-            static const std::string allowedSingle = "+-*/%&|^~!<>?:()";
+            // Single-character operators.
+            static const std::string allowedSingle = "+-*/%&|^~!<>?:";
             if (allowedSingle.find(c) != std::string::npos)
             {
                 out += c;
@@ -3035,9 +3127,16 @@ private:
         // (`castExpression : '(' typeName ')' castExpression`), e.g. '(n) * 1024'
         // parses as 'cast n of *1024'. Strip parens around bare identifiers - they
         // are redundant in a real function and unblock the multiply/binary-op cases.
+        // A '(' immediately preceded by an identifier char is a CALL's argument paren
+        // (e.g. ml_add(x)); never strip those or the call would be mangled.
         size_t pos = 0;
         while ((pos = out.find('(', pos)) != std::string::npos)
         {
+            if (pos > 0)
+            {
+                char prev = out[pos - 1];
+                if (std::isalnum((unsigned char)prev) || prev == '_') { ++pos; continue; }
+            }
             size_t inner = pos + 1;
             while (inner < out.size() && std::isspace((unsigned char)out[inner])) ++inner;
             if (inner >= out.size() ||

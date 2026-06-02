@@ -373,6 +373,15 @@ extern int main()
     // Cross-type instantiation: i64 arg forces CB_MIN<int,i64> with widened return.
     if (CB_MIN(3, (i64)7) != (i64)3)     return 115;
 
+    // Richer macro bodies: decimal float literal (int*1.5 widens to double),
+    // char literals, and a call into an already-known C function (c_add).
+    if (!near(CB_SCALE(2), 3.0, 1e-12)) return 210;
+    if (!near(CB_SCALE(5), 7.5, 1e-12)) return 211;
+    if (CB_IS_DIGIT('5') != true)        return 212;
+    if (CB_IS_DIGIT('a') != false)       return 213;
+    if (CB_CALL_ADD(40, 2) != 42)        return 214;
+    if (CB_CALL_ADD(100, -1) != 99)      return 215;
+
     // ---- Section K: typedef chain resolution --------------------------------
     // c_get_handle returns C_HANDLE (typedef void* C_HANDLE). Before this fix
     // the function was skipped with "unsupported return type 'C_HANDLE'".
