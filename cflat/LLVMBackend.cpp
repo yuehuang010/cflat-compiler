@@ -579,6 +579,39 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     return raw;
 }
 
+// Detect the Windows SDK "um"/"shared"/"ucrt"/"winrt" include dirs (latest installed version) so a
+// bare `import "windows.h"` (and other system headers) resolves without the user passing
+// --c-include. Used only as a last-resort resolution fallback in CompileImportedFile; the parse
+// itself relies on clang's in-process MSVC toolchain auto-detection. Scanned once and cached.
+static const std::vector<std::string>& WindowsSdkIncludeDirs()
+{
+    static const std::vector<std::string> dirs = [] {
+        std::vector<std::string> out;
+        const std::string incRoot = "C:\\Program Files (x86)\\Windows Kits\\10\\Include";
+        std::error_code ec;
+        std::string latest;
+        for (auto it = std::filesystem::directory_iterator(incRoot, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+        {
+            if (!it->is_directory(ec)) continue;
+            auto name = it->path().filename().string();
+            if (name > latest && std::filesystem::exists(it->path() / "um", ec))
+                latest = name;
+        }
+        if (!latest.empty())
+        {
+            std::filesystem::path base = std::filesystem::path(incRoot) / latest;
+            for (const char* sub : { "um", "shared", "ucrt", "winrt" })
+            {
+                auto p = base / sub;
+                if (std::filesystem::exists(p, ec)) out.push_back(p.string());
+            }
+        }
+        return out;
+    }();
+    return dirs;
+}
+
 bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
@@ -609,6 +642,18 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     {
         auto corePath = (std::filesystem::path(runtimeDir) / "core" / importFilename).lexically_normal();
         canonical = std::filesystem::canonical(corePath, ec);
+    }
+    // System headers (e.g. windows.h) live in the Windows SDK include dirs. Fall back to the
+    // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
+    // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
+    if (ec)
+    {
+        for (const auto& inc : WindowsSdkIncludeDirs())
+        {
+            if (!ec) break;
+            auto incPath = (std::filesystem::path(inc) / importFilename).lexically_normal();
+            canonical = std::filesystem::canonical(incPath, ec);
+        }
     }
     if (ec)
     {

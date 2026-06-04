@@ -2819,6 +2819,25 @@ private:
                 // references; the user will get a clear error if they try to use it.
                 continue;
             }
+            // A by-value aggregate field whose LLVM type is still an opaque shell (an inner
+            // record we abandoned above, or a forward declaration never completed) has no
+            // size. Sizing it in CreateStructType/CreateUnionType would assert ("Cannot
+            // getTypeInfo() on a type that is unsized"). Abandon this record too, leaving the
+            // opaque shell - same graceful path as an unmapped field.
+            for (const auto& d : fields)
+            {
+                if (d.Pointer) continue;            // pointers are always sized
+                auto* ft = GetType(d);
+                if (ft && !ft->isSized())
+                {
+                    if (verbose) std::cout << "[verbose]   skipping C " << (r.isUnion ? "union" : "struct")
+                                           << " '" << r.name << "': field '" << d.VariableName
+                                           << "' has incomplete (unsized) type '" << d.TypeName << "'\n";
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
             // Bitfield packing for C structs uses the same MSVC LSB-first layout
             // as native CFlat bitfields. The packing pass produces synthetic
             // storage slots; CreateStructType consumes them and stores the
@@ -5399,6 +5418,10 @@ public:
         for (const auto& tv : typeAndValues)
         {
             auto* t = GetType(tv);
+            // An unsized member (opaque shell / incomplete type) has no layout; sizing it
+            // would assert. Callers (RegisterCRecords) abandon such records before reaching
+            // here, but guard defensively so this never crashes the compiler.
+            if (!t || !t->isSized()) continue;
             uint64_t sz = module->getDataLayout().getTypeAllocSize(t);
             llvm::Align al = module->getDataLayout().getABITypeAlign(t);
             if (sz > maxSize) maxSize = sz;

@@ -55,7 +55,17 @@ namespace cflat_cinterop
             std::replace(p.begin(), p.end(), '\\', '/');
             std::transform(p.begin(), p.end(), p.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            return p;
+            // Collapse repeated separators. Clang's MSVC toolchain detection emits paths with
+            // doubled separators (e.g. "Windows Kits/10//include/.../um/foo.h"); without this the
+            // prefix compare in PathInScope fails to match the single-separator in-scope dir.
+            std::string out;
+            out.reserve(p.size());
+            for (char c : p)
+            {
+                if (c == '/' && !out.empty() && out.back() == '/') continue;
+                out.push_back(c);
+            }
+            return out;
         }
 
         bool PathInScope(const std::string& path, const std::vector<std::string>& dirs)
@@ -65,7 +75,11 @@ namespace cflat_cinterop
             for (const auto& d : dirs)
             {
                 std::string nd = NormPath(d);
-                if (!nd.empty() && np.compare(0, nd.size(), nd) == 0) return true;
+                while (!nd.empty() && nd.back() == '/') nd.pop_back();
+                if (nd.empty() || np.size() < nd.size()) continue;
+                if (np.compare(0, nd.size(), nd) != 0) continue;
+                // Require a separator boundary so ".../um" does not match ".../umbra/...".
+                if (np.size() == nd.size() || np[nd.size()] == '/') return true;
             }
             return false;
         }

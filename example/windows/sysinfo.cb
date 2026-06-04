@@ -1,0 +1,36 @@
+// Win32 interop smoke test: import the system <windows.h> header directly and call a
+// handful of Win32 API functions. cflat auto-detects the Windows SDK include directory,
+// so no --c-include flag is needed; the matching kernel32 import library is linked
+// automatically from the cached SDK linker paths.
+//
+// Build & run:
+//   x64/Debug/cflat.exe example/windows/sysinfo.cb -o out/sysinfo.exe
+//   out\sysinfo.exe
+import "windows.h";
+import "string.cb";
+
+// STD_OUTPUT_HANDLE is a #define (-11); windows.h object-like macros are not folded into
+// the AST, so spell the value directly rather than relying on the macro.
+const i32 STD_OUTPUT = -11;
+
+extern int main()
+{
+    u32 pid  = GetCurrentProcessId();
+    u32 tick = GetTickCount();
+
+    // Write a line straight to the console via the Win32 handle (no CRT printf).
+    void* out = GetStdHandle((u32)STD_OUTPUT);
+    string banner = "Hello from windows.h via cflat C-interop!\n";
+    u32 written = 0;
+    WriteConsoleA(out, banner.data(), (u32)banner.length(), &written, nullptr);
+
+    printf("process id : %u\n", pid);
+    printf("uptime tick: %u ms\n", tick);
+
+    // Sleep briefly, then show the tick advanced - proves the call really ran.
+    Sleep(50);
+    u32 tick2 = GetTickCount();
+    printf("after 50ms : %u ms (delta %u)\n", tick2, tick2 - tick);
+
+    return 0;
+}

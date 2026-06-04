@@ -1,0 +1,31 @@
+// Win32 C-interop regression test. Importing the system <windows.h> header exercises two
+// compiler paths that previously failed:
+//   1. Function decls reached via clang's auto-detected SDK toolchain (whose presumed paths
+//      carry doubled separators) must pass the in-scope filter - otherwise GetCurrentProcessId
+//      and friends resolve as "Undefined variable".
+//   2. windows.h registers C unions whose members are records cflat had to abandon (an
+//      unsupported field type leaves an opaque, unsized shell). Sizing such a union used to
+//      assert ("Cannot getTypeInfo() on a type that is unsized"); it must now be skipped.
+// cflat auto-resolves the Windows SDK include dir, so no --c-include flag is required.
+import "test_helper.cb";
+import "windows.h";
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    u32 pid = GetCurrentProcessId();
+    total++; passed += Test("GetCurrentProcessId nonzero", pid != 0, true);
+
+    void* out = GetStdHandle((u32)-11);  // STD_OUTPUT_HANDLE
+    total++; passed += Test("GetStdHandle non-null", out != nullptr, true);
+
+    u32 tick1 = GetTickCount();
+    Sleep(1);
+    u32 tick2 = GetTickCount();
+    total++; passed += Test("GetTickCount monotonic", tick2 >= tick1, true);
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

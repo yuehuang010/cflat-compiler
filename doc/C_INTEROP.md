@@ -110,6 +110,10 @@ extern int main()
 
 A source-location filter keeps only declarations under the `--c-include` roots / the header's own directory, so the transitively-included SDK/CRT is excluded. Variadics are supported; `#define`-only constants are **not** (there is no macro in the AST). After a successful link, a sibling runtime DLL of each `--c-lib` is auto-copied next to the exe.
 
+### System headers (e.g. `windows.h`)
+
+A bare `import "windows.h";` binds the system header with **no `--c-include` flag**: cflat auto-detects the latest installed Windows SDK include directory (`...\Windows Kits\10\Include\<ver>\um`, plus `shared`/`ucrt`/`winrt`) and uses it to resolve the header. The header's own directory then becomes the in-scope root, so its declarations are kept while the transitively-included CRT/MSVC headers are still filtered out. The parse itself relies on clang's in-process MSVC toolchain auto-detection, so the MSVC/UCRT/shared headers do not need to be named. `kernel32.lib` is already on the default link line; functions from other system libraries (e.g. `user32.lib` for `MessageBoxA`) still need an explicit `--c-lib`. See `example/windows/sysinfo.cb`.
+
 The matching CLI flags supply the machine-specific paths (all repeatable):
 
 ```bash
