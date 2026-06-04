@@ -95,6 +95,31 @@ bool testStreamSmallBuffer() {
     return result;
 }
 
+// Direct `producer >> consumer` with no explicit stream in the middle. The compiler
+// synthesizes the stream, wires stdout->stdin, and the producer's run() trampoline
+// auto-closes it after main() returns - so there is no hand-written s.init()/s.close().
+bool testStreamDirectPipe() {
+    bool result = true;
+
+    StreamProducer p1;
+    StreamConsumer p2;
+    p2.lineCount = 3;
+
+    p1 >> p2;   // auto-synthesized + auto-closed stream
+
+    list<string> args1;
+    list<string> args2;
+    p1.run(args1);
+    p2.run(args2);
+
+    p1.WaitForExit();
+    p2.WaitForExit();
+
+    result &= Test("stream direct pipe totalLen", p2.totalLen, 17);
+    result &= Test("stream direct pipe producer exit", p1.exitCode, 0);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Primitive type tests - int, negative int, large int, float
 // ---------------------------------------------------------------------------
@@ -455,6 +480,7 @@ extern int main() {
 
     total++; passed += testStreamBasicPipe()    ? 1 : 0;
     total++; passed += testStreamSmallBuffer()  ? 1 : 0;
+    total++; passed += testStreamDirectPipe()   ? 1 : 0;
     total++; passed += testStreamPrimitives()   ? 1 : 0;
     total++; passed += testStreamStringType()   ? 1 : 0;
     total++; passed += testStreamCharPtr()      ? 1 : 0;

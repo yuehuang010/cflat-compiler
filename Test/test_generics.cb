@@ -2134,6 +2134,38 @@ bool testGenericArgInference()
     return result;
 }
 
+// Regression: an outer generic's method calls a method on an INNER generic type
+// instantiated with the same type arg. When the inner is instantiated standalone
+// (queued first) before any top-level call to its methods, its member bodies must
+// still be reachable from the outer's body (forward-declared before the dependency
+// flush). Previously failed with "Unknown identifier" on the inner method.
+class GInner<T> where T : IMessage
+{
+    i64 _v = default;
+    void bump() { _v = _v + (i64)1; }
+};
+
+class GOuter<T> where T : IMessage
+{
+    GInner<T>* make()
+    {
+        GInner<T>* a = new GInner<T>[1];
+        a.bump();
+        a.bump();
+        return a;
+    }
+};
+
+bool testNestedGenericInnerMethod()
+{
+    bool result = true;
+    GOuter<IMessage> o = default;
+    GInner<IMessage>* a = o.make();
+    result &= Test("nested generic inner-method call", (int)a._v, 2);
+    delete[1] a;
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2189,6 +2221,7 @@ extern int main()
     total++; passed += testThisMemberAccess()            ? 1 : 0;
     total++; passed += testThisInGenericMethod()         ? 1 : 0;
     total++; passed += testGenericArgInference()         ? 1 : 0;
+    total++; passed += testNestedGenericInnerMethod()    ? 1 : 0;
     total++; passed += testAutoReturn()                  ? 1 : 0;
     total++; passed += testSortInt()                     ? 1 : 0;
     total++; passed += testSortFloat()                   ? 1 : 0;

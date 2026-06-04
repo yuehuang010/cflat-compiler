@@ -1,0 +1,15 @@
+// A program's ~Name() gets the builtin field teardown appended at the end, so the
+// user body must fall off the end. Ending with an explicit `return;` would skip the
+// builtin cleanup and is rejected.
+import "list.cb";
+import "thread.cb";
+
+expect_error("must not end with an explicit 'return;'") {
+    program BadDtor {
+        int main(move list<string> args) { return 0; }
+
+        ~BadDtor() {
+            return;
+        }
+    };
+}

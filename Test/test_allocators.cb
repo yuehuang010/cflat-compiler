@@ -828,19 +828,19 @@ bool testPagePoolSoftCap()
 // arena_channel tests
 // =============================================================
 
-struct ChannelPayload
+class ChannelPayload : IMessage
 {
     int   _value = 0;
     int*  _data  = nullptr;
     int   _count = 0;
 };
 
-struct ProgramPayload
+class ProgramPayload : IMessage
 {
     int _value = 0;
 };
 
-arena_channel g_ac_chan = default;
+arena_channel<IMessage> g_ac_chan = default;
 int g_chan_errors = 0;
 
 int producer(void* unused)
@@ -848,13 +848,13 @@ int producer(void* unused)
     int i = 0;
     while (i < 1000)
     {
-        page_arena* pa = g_ac_chan.acquire_arena();
+        page_arena<IMessage>* pa = g_ac_chan.acquire_arena();
 
         ChannelPayload* msg = (ChannelPayload*)pa->alloc(sizeof(ChannelPayload));
-        pa->_root       = (void*)msg;
         msg->_value     = i;
         msg->_count     = 10;
         msg->_data      = (int*)pa->alloc(10 * sizeof(int));
+        pa->_root       = msg;
 
         int j = 0;
         while (j < 10)
@@ -874,10 +874,11 @@ int consumer(void* unused)
 {
     while (true)
     {
-        page_arena* pa = g_ac_chan.recv();
+        page_arena<IMessage>* pa = g_ac_chan.recv();
         if (pa == nullptr) break;
 
-        ChannelPayload* msg = (ChannelPayload*)pa->_root;
+        IMessage root = pa->_root;
+        ChannelPayload* msg = root as ChannelPayload;
 
         int j = 0;
         while (j < msg->_count)
@@ -914,7 +915,7 @@ bool testArenaChannel()
     return g_chan_errors == 0;
 }
 
-arena_channel g_ac_prog = default;
+arena_channel<IMessage> g_ac_prog = default;
 
 program ArenaConsumerGlobal
 {
@@ -924,10 +925,11 @@ program ArenaConsumerGlobal
     {
         while (true)
         {
-            page_arena* pa = g_ac_prog.recv();
+            page_arena<IMessage>* pa = g_ac_prog.recv();
             if (pa == nullptr) break;
 
-            ProgramPayload* msg = (ProgramPayload*)pa->_root;
+            IMessage root = pa->_root;
+            ProgramPayload* msg = root as ProgramPayload;
             total = total + msg->_value;
             g_ac_prog.release_arena(pa);
         }
@@ -946,11 +948,11 @@ bool testArenaProgram()
     int i = 0;
     while (i < 100)
     {
-        page_arena* pa = g_ac_prog.acquire_arena();
+        page_arena<IMessage>* pa = g_ac_prog.acquire_arena();
 
         ProgramPayload* msg = (ProgramPayload*)pa->alloc(sizeof(ProgramPayload));
-        pa->_root   = (void*)msg;
         msg->_value = i + 1;
+        pa->_root   = msg;
 
         g_ac_prog.send(pa);
         i = i + 1;
@@ -965,17 +967,18 @@ bool testArenaProgram()
 
 program ArenaConsumerField
 {
-    arena_channel ac = default;
+    arena_channel<IMessage> ac = default;
     int total = 0;
 
     int main(move list<string> args)
     {
         while (true)
         {
-            page_arena* pa = ac.recv();
+            page_arena<IMessage>* pa = ac.recv();
             if (pa == nullptr) break;
 
-            ProgramPayload* msg = (ProgramPayload*)pa->_root;
+            IMessage root = pa->_root;
+            ProgramPayload* msg = root as ProgramPayload;
             total = total + msg->_value;
             ac.release_arena(pa);
         }
@@ -994,11 +997,11 @@ bool testArenaProgramField()
     int i = 0;
     while (i < 100)
     {
-        page_arena* pa = w.ac.acquire_arena();
+        page_arena<IMessage>* pa = w.ac.acquire_arena();
 
         ProgramPayload* msg = (ProgramPayload*)pa->alloc(sizeof(ProgramPayload));
-        pa->_root   = (void*)msg;
         msg->_value = i + 1;
+        pa->_root   = msg;
 
         w.ac.send(pa);
         i = i + 1;

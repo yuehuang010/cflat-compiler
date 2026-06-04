@@ -128,9 +128,9 @@ int raw_consumer(void* ctx)
 // Consumer try_recvs; exits when producer sets g_ac_done and ring drains.
 // Measures the full zero-copy pipeline: acquire → alloc → send → recv → release.
 
-struct AcPayload { int _value = 0; };
+class AcPayload : IMessage { int _value = 0; };
 
-arena_channel* g_ac_perf    = nullptr;
+arena_channel<IMessage>* g_ac_perf = nullptr;
 i64            g_ac_count   = 0;
 int            g_ac_done    = 0;
 
@@ -139,10 +139,10 @@ int ac_perf_producer(void* ctx)
     int val = 0;
     while (__atomic_i32_load(&g_raw_stop) == 0)
     {
-        page_arena* pa = g_ac_perf->acquire_arena();
+        page_arena<IMessage>* pa = g_ac_perf->acquire_arena();
         AcPayload*  msg = (AcPayload*)pa->alloc((i64)sizeof(AcPayload));
-        pa->_root = (void*)msg;
         msg->_value = val;
+        pa->_root = msg;
         if (g_ac_perf->try_send(pa))
             val = val + 1;
         else
@@ -157,7 +157,7 @@ int ac_perf_consumer(void* ctx)
     i64 count = (i64)0;
     while (true)
     {
-        page_arena* pa = g_ac_perf->try_recv();
+        page_arena<IMessage>* pa = g_ac_perf->try_recv();
         if (pa != nullptr)
         {
             g_ac_perf->release_arena(pa);
@@ -336,7 +336,7 @@ extern int main()
 
     // variant 6: arena_channel + raw Thread
     printf("[6/7] arena_ch  + raw Thread\n");
-    arena_channel ac = default;
+    arena_channel<IMessage> ac = default;
     ac.init(4096, (i64)65536);
     g_ac_perf = &ac;
     __atomic_i32_store(&g_raw_stop, 0);

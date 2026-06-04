@@ -1287,7 +1287,23 @@ extern int main()
 | `exitCode` | `int` | Exit code returned by `main`; valid after `WaitForExit()` |
 | `onStdout` | `function<void(string)>` | Called for each line printed to stdout inside `main` |
 | `onStderr` | `function<void(string)>` | Called for each line printed to stderr inside `main` |
-| `inbox` | `channel<IMessage*>` | Actor-model mailbox; send messages from outside, read inside `main` |
+| `inbox` / `outbox` | `arena_channel<IMessage>*` | Zero-copy messaging mailbox; wire with `producer >> consumer`, then send via `outbox` and receive via `inbox` inside `main` (requires `import "arena_channel.cb"` and `useChannel = true` on both) |
+| `useChannel` | `int` (0/1) | Opt-in flag: `producer >> consumer` only wires the arena mailbox when **both** programs set `useChannel = true` before the `>>`. Defaults to 0, so a pipe used only for stdout pays nothing for an arena channel. |
+
+**Piping two programs**: `producer >> consumer` wires up to two paths in one step:
+- **stdout -> stdin stream (always)**: the compiler synthesizes a `stream`, connects the producer's stdout to the consumer's stdin, and auto-closes it after the producer's `main` returns. So `printf` in the producer is read by `fgets` in the consumer - no hand-written `stream`/`close()`. (Equivalent to the explicit `producer >> s; s >> consumer;` form, which you use when you want to configure `bufferSize` or close manually.)
+- **arena mailbox (opt-in)**: when **both** programs set `useChannel = true` before `>>`, the consumer's `inbox` is bound to the producer's `outbox` for structured `IMessage` passing. Without it, no arena channel is allocated.
+
+```cflat
+Producer p; Consumer c;
+p.useChannel = true;   // both sides must opt in for the mailbox
+c.useChannel = true;
+p >> c;                // stdout->stdin wired always; arena mailbox wired here
+c.run(a2); p.run(a1);  // run the consumer first (it blocks on inbox.recv())
+p.WaitForExit(); c.WaitForExit();
+```
+
+Run the consumer and producer, then `WaitForExit()` on both; the synthesized stream is cleaned up at scope exit.
 
 **Requirements**: `import "list.cb"` and `import "thread.cb"` must appear before the `program` definition.
 

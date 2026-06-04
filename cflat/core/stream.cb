@@ -39,6 +39,10 @@ struct stream {
     int   _pendingLen  = 0;        // byte count of _pendingFull (set alongside _pendingFull)
     char* _emptyPool   = nullptr;  // empty buffer returned by consumer (nullptr = none ready)
     bool  _eof         = false;
+    bool  _autoClose   = false;    // set by `producer >> consumer` direct piping: the producer's
+                                   // run() trampoline calls close() after main() returns, so the
+                                   // user does not hand-write s.close() (the explicit `p >> s; s >> q`
+                                   // form leaves this false and closes manually).
 
     void init() {
         _bufA = (char*)malloc((i64)bufferSize);

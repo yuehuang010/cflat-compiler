@@ -482,11 +482,13 @@ public:
         unsigned OnStdoutFieldIndex = 0;               // struct field index of onStdout (function<void(char*)>)
         unsigned OnStdinFieldIndex = 0;                // struct field index of onStdin (function<char*()>)
         unsigned OnStdinReturnFieldIndex = 0;          // struct field index of onStdinReturn (function<void(char*)>)
-        unsigned InboxFieldIndex = 0;                  // struct field index of inbox (channel<IMessage>)
         unsigned StopSourceFieldIndex = 0;             // struct field index of _stop_source (stop_source)
         unsigned TrackHandlesFieldIndex = 0;           // struct field index of trackHandles (bool)
+        unsigned UseChannelFieldIndex = 0;             // struct field index of useChannel (int, 0/1). User opt-in: `p1 >> p2` only wires the arena channel when BOTH programs have useChannel set. Stream piping is always wired.
         unsigned OutFieldIndex      = (unsigned)-1;     // struct field index of _out (stream*); -1 when stream.cb not imported
         unsigned InStreamFieldIndex = (unsigned)-1;     // struct field index of _in  (stream*); -1 when stream.cb not imported
+        unsigned InboxArenaFieldIndex = (unsigned)-1;   // struct field index of inbox (arena_channel*); -1 when arena_channel.cb not imported. Consumer owns it; lazily allocated by `>>`.
+        unsigned OutboxFieldIndex     = (unsigned)-1;   // struct field index of outbox (arena_channel*); -1 when arena_channel.cb not imported. Producer handle bound by `>>` to a consumer's inbox.
         bool IsImportedProgram      = false;            // true when created via 'import program "file.cb" as Name'
         std::vector<std::string> Interfaces;            // interfaces declared with ': IFoo, IBar'
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // cached vtables keyed by interface name
@@ -861,6 +863,7 @@ private:
     // same header under different --c-include roots does not collide.
     static inline std::unordered_map<std::string, CFileSigCacheEntry> cFileSigCache_;
     int lambdaCounter = 0;
+    int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
 
@@ -4329,6 +4332,12 @@ public:
 
     bool TypeImplementsInterface(const std::string& typeName, const std::string& ifaceName) const
     {
+        // An interface trivially satisfies a constraint to itself: `T : IMessage`
+        // is met by T == IMessage. This lets a generic constrained to a marker
+        // interface be instantiated with that interface as the default payload
+        // (e.g. arena_channel<IMessage>).
+        if (typeName == ifaceName && interfaceTable.count(typeName)) return true;
+
         auto it = dataStructures.find(typeName);
         if (it == dataStructures.end()) return false;
         const auto& ifaces = it->second.Interfaces;

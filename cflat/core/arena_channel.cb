@@ -2,33 +2,37 @@
 //
 // Three main types:
 //
-//   block_pool    - program thread allocator (IAllocator) backed by BucketAllocator.
-//                   Also spawns transferable page_arena units via acquire_arena().
+//   block_pool<T> - program thread allocator (IAllocator) backed by BucketAllocator.
+//                   Also spawns transferable page_arena<T> units via acquire_arena().
 //
-//   page_arena    - self-contained bump-allocation region (IAllocator).
+//   page_arena<T> - self-contained bump-allocation region (IAllocator). Carries the
+//                   typed message root in `_root` (a T fat pointer; T : IMessage).
 //                   Unique ownership: one thread at a time. All sub-allocations
 //                   live within the arena, so the receiver can use all pointers
 //                   immediately after recv() with no copy.
 //
-//   arena_channel - block_pool + channel<page_arena*>; zero-copy messaging.
+//   arena_channel<T> - block_pool<T> + channel<i64>; zero-copy typed messaging.
+//                      T is the message interface (T : IMessage); the arena's
+//                      _root field carries the typed fat pointer {type, data}.
 //
 // Pointer safety invariant: every allocation stored in a transferred message
 // must come from pa->alloc(). Enforced by convention, not at runtime.
 //
-// Usage:
-//   arena_channel ac;
+// Usage (T = IMessage; MyMsg is a class implementing IMessage):
+//   arena_channel<IMessage> ac;
 //   ac.init(64, 65536);
 //
 //   // Producer thread:
-//   page_arena* pa = ac.acquire_arena();
+//   page_arena<IMessage>* pa = ac.acquire_arena();
 //   MyMsg* msg = (MyMsg*)pa->alloc(sizeof(MyMsg));
-//   pa->_root = msg;
 //   msg->value = 42;
-//   ac.send(move pa);                  // zero-copy ownership transfer
+//   pa->_root = msg;                   // MyMsg* -> IMessage upcast (typed root)
+//   ac.send(pa);                       // zero-copy ownership transfer
 //
 //   // Consumer thread:
-//   page_arena* pa = ac.recv();
-//   MyMsg* msg = (MyMsg*)pa->_root;    // valid immediately
+//   page_arena<IMessage>* pa = ac.recv();
+//   IMessage root = pa->_root;         // typed; valid immediately
+//   MyMsg* msg = root as MyMsg;        // downcast to the concrete message
 //   ac.release_arena(pa);              // recycle to pool
 
 import "interfaces.cb";
@@ -42,7 +46,7 @@ import "page_arena.cb";
 // acquire_arena() spawns a page_arena drawing chunks from the same bucket.
 // Maintains a lock-free Treiber stack of recycled page_arena* for fast reuse.
 
-class block_pool
+class block_pool<T> where T : IMessage
 {
     BucketAllocator _bucket    = default;
 
@@ -75,15 +79,15 @@ class block_pool
 
     // ── Treiber stack pop (lock-free) ─────────────────────────────────────────
 
-    page_arena* _pop()
+    page_arena<T>* _pop()
     {
         i64 old = __atomic_i64_load(&_top);
         while (true)
         {
             i64 ptr = _raw_ptr(old);
             if (ptr == (i64)0) return nullptr;
-            page_arena* node = (page_arena*)ptr;
-            page_arena* next = (page_arena*)node->_next;   // _next is void*
+            page_arena<T>* node = (page_arena<T>*)ptr;
+            page_arena<T>* next = (page_arena<T>*)node->_next;   // _next is void*
             i64 new_tag = (_raw_tag(old) + (i64)1) & (i64)0x1FFFF;
             if (__atomic_i64_cas(&_top, old, _encode((i64)next, new_tag)))
             {
@@ -97,7 +101,7 @@ class block_pool
 
     // ── Treiber stack push (lock-free) ────────────────────────────────────────
 
-    void _push(page_arena* node)
+    void _push(page_arena<T>* node)
     {
         i64 old = __atomic_i64_load(&_top);
         while (true)
@@ -120,12 +124,12 @@ class block_pool
     // ── Arena lifecycle ───────────────────────────────────────────────────────
 
     // Return a fresh or recycled page_arena ready for bump allocation.
-    page_arena* acquire_arena()
+    page_arena<T>* acquire_arena()
     {
-        page_arena* pa = _pop();
+        page_arena<T>* pa = _pop();
         if (pa == nullptr)
         {
-            pa = new page_arena[1];
+            pa = new page_arena<T>[1];
         }
         pa->_chunkSize = _chunkSize;
         pa->reset();
@@ -133,7 +137,7 @@ class block_pool
     }
 
     // Return a used arena to the free-list; chunks are retained for reuse.
-    void release_arena(page_arena* pa)
+    void release_arena(page_arena<T>* pa)
     {
         _push(pa);
     }
@@ -144,10 +148,10 @@ class block_pool
     {
         i64 raw = __atomic_i64_load(&_top);
         __atomic_i64_store(&_top, (i64)0);
-        page_arena* node = (page_arena*)_raw_ptr(raw);
+        page_arena<T>* node = (page_arena<T>*)_raw_ptr(raw);
         while (node != nullptr)
         {
-            page_arena* next = (page_arena*)node->_next;   // _next is void*
+            page_arena<T>* next = (page_arena<T>*)node->_next;   // _next is void*
             delete[1] node;   // ~page_arena() calls free_chunks()
             node = next;
         }
@@ -158,10 +162,10 @@ class block_pool
 // Composes a block_pool (thread allocator + arena spawner) with a bounded MPMC
 // ring for zero-copy page_arena transfer between threads.
 
-class arena_channel
+class arena_channel<T> where T : IMessage
 {
-    block_pool     _pool   = default;
-    channel<i64>   _ring   = default;   // stores page_arena* cast to i64; avoids ptr-type channel issues
+    block_pool<T>  _pool   = default;
+    channel<i64>   _ring   = default;   // stores page_arena<T>* cast to i64; avoids ptr-type channel issues
     atomic_counter _nextId = default;
 
     void init(int ringCap, i64 chunkSize)
@@ -181,39 +185,39 @@ class arena_channel
     void  dealloc(void* ptr) { _pool.dealloc(ptr); }
 
     // Return a fresh (or recycled) page_arena ready for use.
-    page_arena* acquire_arena()
+    page_arena<T>* acquire_arena()
     {
-        page_arena* pa = _pool.acquire_arena();
+        page_arena<T>* pa = _pool.acquire_arena();
         pa->_id = _nextId.increment();
         return pa;
     }
 
     // Transfer ownership of pa to the consumer (blocks if ring is full).
-    void send(page_arena* pa)          { _ring.send((i64)pa); }
+    void send(page_arena<T>* pa)          { _ring.send((i64)pa); }
 
     // Non-blocking send; returns false if ring is full. Caller retains pa.
-    bool try_send(page_arena* pa)      { return _ring.try_push((i64)pa); }
+    bool try_send(page_arena<T>* pa)      { return _ring.try_push((i64)pa); }
 
     // Block until an arena is available; caller receives exclusive ownership.
-    page_arena* recv()                 { return (page_arena*)_ring.receive(); }
+    page_arena<T>* recv()                 { return (page_arena<T>*)_ring.receive(); }
 
     // Non-blocking receive; returns nullptr if ring is empty.
-    page_arena* try_recv()
+    page_arena<T>* try_recv()
     {
         i64 raw = 0;
-        if (_ring.try_receive(&raw)) return (page_arena*)raw;
+        if (_ring.try_receive(&raw)) return (page_arena<T>*)raw;
         return nullptr;
     }
 
     // Return a used arena to the pool for reuse.
-    void release_arena(page_arena* pa) { _pool.release_arena(pa); }
+    void release_arena(page_arena<T>* pa) { _pool.release_arena(pa); }
 
     // Drain the ring, destroy all pooled arenas, and release slab memory.
     // Call only after all producer threads have finished and the ring is drained.
     void destroy()
     {
         i64 raw = 0;
-        while (_ring.try_receive(&raw)) { _pool.release_arena((page_arena*)raw); raw = 0; }
+        while (_ring.try_receive(&raw)) { _pool.release_arena((page_arena<T>*)raw); raw = 0; }
         _ring.destroy();
         _pool.destroy_arenas();
         _pool.cleanup();

@@ -5,6 +5,11 @@
 // to the consumer via arena_channel.send(); the consumer reads all pointers
 // directly - no copy needed, because every allocation lives within the arena.
 //
+// page_arena<T> is generic over the message interface T (T : IMessage). The
+// producer stores the message root in the typed `_root` field (a `T` fat
+// pointer, upcast from the concrete message); the consumer reads `pa->_root`
+// and downcasts with `as`. The data chunks themselves stay untyped.
+//
 // Ownership is unique: exactly one thread holds a page_arena at a time.
 // dealloc() and cleanup() are no-ops; use arena_channel.release_arena() to
 // recycle the arena back to the shared pool.
@@ -14,6 +19,7 @@
 // free_chunks() dispatches based on chunk size: page-sized chunks return to
 // the pool, oversize chunks vmem_free directly.
 
+import "interfaces.cb";
 import "cruntime.cb";
 import "page_pool.cb";
 
@@ -30,14 +36,14 @@ struct _pa_chunk
 
 // ── page_arena ────────────────────────────────────────────────────────────────
 
-struct page_arena
+struct page_arena<T> where T : IMessage
 {
     void*      _pool      = nullptr;   // reserved for future pool back-pointer
     _pa_chunk* _head      = nullptr;
     i64        _chunkSize = 65536;
     i64        _id        = 0;
     void*      _next      = nullptr;   // intrusive free-list link (used by block_pool)
-    void*      _root      = nullptr;   // producer sets this to the message root
+    T          _root      = default;   // producer sets this to the typed message root
 
     // ── Bump allocation ───────────────────────────────────────────────────────
 

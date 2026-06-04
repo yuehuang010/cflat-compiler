@@ -50,6 +50,24 @@ program MultiField {
     }
 };
 
+// UserDtor: a program with an explicit ~UserDtor(). The compiler emits exactly ONE
+// destructor - the user body runs first, then the builtin field teardown (allocator,
+// stop_source, inbox) is appended at the end. The user body bumps a global counter so
+// the test can confirm the user destructor executed.
+int g_userDtorRuns = 0;
+
+program UserDtor {
+    int code = 0;
+
+    int main(move list<string> args) {
+        return code;
+    }
+
+    ~UserDtor() {
+        g_userDtorRuns = g_userDtorRuns + 1;
+    }
+};
+
 // Resource: simple heap-allocated struct used by ListOwnership
 struct Resource {
     int id    = 0;
@@ -169,6 +187,25 @@ bool testProgramBasicArgsAndField() {
     c.WaitForExit();
     result &= Test("basic counter", c.exitCode, 12);
     result &= Test("basic counter usedBytes", c._allocator.usedBytes(), 0);
+    return result;
+}
+
+bool testProgramUserDestructor() {
+    bool result = true;
+    g_userDtorRuns = 0;
+    {
+        UserDtor u;
+        u.code = 7;
+        list<string> args;
+        u.run(args);
+        u.WaitForExit();
+        result &= Test("user dtor exit code", u.exitCode, 7);
+        // Destructor has not run yet - u is still in scope.
+        result &= Test("user dtor not yet run", g_userDtorRuns, 0);
+    }
+    // u left scope: the single ~UserDtor() ran (user body bumped the global, then the
+    // builtin teardown freed _allocator / _stop_source / inbox).
+    result &= Test("user dtor ran once", g_userDtorRuns, 1);
     return result;
 }
 
@@ -587,55 +624,124 @@ bool testOnStdinNullByDefault() {
 }
 
 // ---------------------------------------------------------------------------
-// inbox (actor mailbox) tests
+// inbox messaging tests (arena_channel mailbox, wired with `producer >> consumer`)
 // ---------------------------------------------------------------------------
 
-class StopMsg : IMessage { };
 class PingMsg : IMessage { int value = 0; };
 class SumMsg  : IMessage { int a = 0; int b = 0; };
 
+// The program mailbox is the arena_channel `inbox` / `outbox` pair, wired by `p >> w`:
+// the consumer (w) owns the channel (its `inbox`), the producer (p) gets a handle in
+// its `outbox`. Each side knows how many messages to send/receive (no sentinel needed);
+// payloads are bump-allocated inside the producer's page_arena and transferred zero-copy.
+
+// Consumer: receives `count` messages, sums the value of any PingMsg (ignores others).
 program EchoWorker {
+    int count    = 0;
     int received = 0;
 
     int main(move list<string> args) {
-        while (true) {
-            IMessage msg = inbox.receive();
-            if (msg is StopMsg) break;
-            if (msg is PingMsg) {
-                PingMsg* ping = msg as PingMsg;
+        int i = 0;
+        while (i < count) {
+            page_arena<IMessage>* pa = inbox.recv();
+            IMessage root = pa._root;
+            if (root is PingMsg) {
+                PingMsg* ping = root as PingMsg;
                 received = received + ping.value;
             }
+            inbox.release_arena(pa);
+            i++;
         }
         return received;
     }
 };
 
+// Consumer: receives `count` messages, sums a+b of any SumMsg.
 program SumWorker {
+    int count = 0;
     int total = 0;
 
     int main(move list<string> args) {
-        while (true) {
-            IMessage msg = inbox.receive();
-            if (msg is StopMsg) break;
-            if (msg is SumMsg) {
-                SumMsg* s = msg as SumMsg;
+        int i = 0;
+        while (i < count) {
+            page_arena<IMessage>* pa = inbox.recv();
+            IMessage root = pa._root;
+            if (root is SumMsg) {
+                SumMsg* s = root as SumMsg;
                 total = total + s.a + s.b;
             }
+            inbox.release_arena(pa);
+            i++;
         }
         return total;
     }
 };
 
+// Producer: sends `count` PingMsgs with values base..base+count-1.
+program PingProducer {
+    int count = 0;
+    int base  = 0;
+
+    int main(move list<string> args) {
+        int i = 0;
+        while (i < count) {
+            page_arena<IMessage>* pa = outbox.acquire_arena();
+            PingMsg* msg = (PingMsg*)pa.alloc((i64)sizeof(PingMsg));
+            msg.value = base + i;
+            pa._root = msg;
+            outbox.send(pa);
+            i++;
+        }
+        return 0;
+    }
+};
+
+// Producer: sends two fixed SumMsgs.
+program SumPairProducer {
+    int main(move list<string> args) {
+        page_arena<IMessage>* pa1 = outbox.acquire_arena();
+        SumMsg* m1 = (SumMsg*)pa1.alloc((i64)sizeof(SumMsg));
+        m1.a = 3;  m1.b = 4;   pa1._root = m1;  outbox.send(pa1);
+
+        page_arena<IMessage>* pa2 = outbox.acquire_arena();
+        SumMsg* m2 = (SumMsg*)pa2.alloc((i64)sizeof(SumMsg));
+        m2.a = 10; m2.b = 20;  pa2._root = m2;  outbox.send(pa2);
+        return 0;
+    }
+};
+
+// Producer: sends a SumMsg (which EchoWorker ignores) then a PingMsg(42).
+program MixedProducer {
+    int main(move list<string> args) {
+        page_arena<IMessage>* pa1 = outbox.acquire_arena();
+        SumMsg* skip = (SumMsg*)pa1.alloc((i64)sizeof(SumMsg));
+        skip.a = 99; skip.b = 99; pa1._root = skip; outbox.send(pa1);
+
+        page_arena<IMessage>* pa2 = outbox.acquire_arena();
+        PingMsg* ping = (PingMsg*)pa2.alloc((i64)sizeof(PingMsg));
+        ping.value = 42; pa2._root = ping; outbox.send(pa2);
+        return 0;
+    }
+};
+
+// Wire producer >> consumer, run the consumer first (it blocks on recv), then the
+// producer, and join both. Returns the consumer's exit code.
 bool testInboxSingleMessage() {
     bool result = true;
+    PingProducer p;
     EchoWorker w;
-    w.inbox.init(8);
-    list<string> args;
-    w.run(args);
-    PingMsg* m = new PingMsg;
-    m.value = 7;
-    w.inbox.send(move m);
-    w.inbox.send(new StopMsg);
+    p.count = 1;
+    p.base  = 7;
+    w.count = 1;
+    p.useChannel = true;   // opt in to the arena mailbox
+    w.useChannel = true;
+    p >> w;
+
+    list<string> a1;
+    list<string> a2;
+    w.run(a2);
+    p.run(a1);
+    p.WaitForExit();
     w.WaitForExit();
     result &= Test("inbox single ping", w.exitCode, 7);
     return result;
@@ -643,20 +749,20 @@ bool testInboxSingleMessage() {
 
 bool testInboxMultipleMessages() {
     bool result = true;
+    PingProducer p;
     EchoWorker w;
-    w.inbox.init(8);
-    list<string> args;
-    w.run(args);
+    p.count = 5;
+    p.base  = 1;   // values 1..5 -> sum 15
+    w.count = 5;
+    p.useChannel = true;
+    w.useChannel = true;
+    p >> w;
 
-    int i = 0;
-    while (i < 5) {
-        PingMsg* m = new PingMsg;
-        m.value = i + 1;
-        w.inbox.send(move m);
-        i++;
-    }
-    w.inbox.send(new StopMsg);
-
+    list<string> a1;
+    list<string> a2;
+    w.run(a2);
+    p.run(a1);
+    p.WaitForExit();
     w.WaitForExit();
     result &= Test("inbox five pings sum", w.exitCode, 15);
     return result;
@@ -664,22 +770,18 @@ bool testInboxMultipleMessages() {
 
 bool testInboxSumMessages() {
     bool result = true;
+    SumPairProducer p;
     SumWorker w;
-    w.inbox.init(4);
-    list<string> args;
-    w.run(args);
+    w.count = 2;
+    p.useChannel = true;
+    w.useChannel = true;
+    p >> w;
 
-    SumMsg* m1 = new SumMsg;
-    m1.a = 3;
-    m1.b = 4;
-    w.inbox.send(move m1);
-
-    SumMsg* m2 = new SumMsg;
-    m2.a = 10;
-    m2.b = 20;
-    w.inbox.send(move m2);
-
-    w.inbox.send(new StopMsg);
+    list<string> a1;
+    list<string> a2;
+    w.run(a2);
+    p.run(a1);
+    p.WaitForExit();
     w.WaitForExit();
     result &= Test("inbox sum messages", w.exitCode, 37);
     return result;
@@ -687,24 +789,87 @@ bool testInboxSumMessages() {
 
 bool testInboxPolymorphicMessages() {
     bool result = true;
+    MixedProducer p;
     EchoWorker w;
-    w.inbox.init(8);
-    list<string> args;
-    w.run(args);
+    w.count = 2;   // receives SumMsg (ignored) + PingMsg(42)
+    p.useChannel = true;
+    w.useChannel = true;
+    p >> w;
 
-    // Mix PingMsg and SumMsg - worker only handles PingMsg
-    SumMsg* skip = new SumMsg;
-    skip.a = 99;
-    skip.b = 99;
-    w.inbox.send(move skip);
-
-    PingMsg* ping = new PingMsg;
-    ping.value = 42;
-    w.inbox.send(move ping);
-
-    w.inbox.send(new StopMsg);
+    list<string> a1;
+    list<string> a2;
+    w.run(a2);
+    p.run(a1);
+    p.WaitForExit();
     w.WaitForExit();
     result &= Test("inbox polymorphic skip", w.exitCode, 42);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Arena-channel pipe tests (`producer >> consumer` rich messaging)
+// ---------------------------------------------------------------------------
+
+// The consumer owns the arena_channel (its synthetic inbox); `p >> c` lazily
+// allocates it and binds the producer's outbox handle to it. The producer
+// acquires a page_arena per message, bump-allocates the payload inside it, and
+// transfers ownership zero-copy; the consumer reads pa._root and recycles the
+// arena. No per-thread-allocator crosses the seam - the page-pool owns the memory.
+program ArenaPipeProducer {
+    int count = 0;
+
+    int main(move list<string> args) {
+        int i = 0;
+        while (i < count) {
+            page_arena<IMessage>* pa = outbox.acquire_arena();
+            PingMsg* msg = (PingMsg*)pa.alloc((i64)sizeof(PingMsg));
+            msg.value = i + 1;
+            pa._root = msg;            // PingMsg* -> IMessage upcast (typed root)
+            outbox.send(pa);
+            i++;
+        }
+        return 0;
+    }
+};
+
+program ArenaPipeConsumer {
+    int count = 0;
+    int total = 0;
+
+    int main(move list<string> args) {
+        int i = 0;
+        while (i < count) {
+            page_arena<IMessage>* pa = inbox.recv();
+            IMessage root = pa._root;
+            PingMsg* msg = root as PingMsg;
+            total = total + msg.value;
+            inbox.release_arena(pa);
+            i++;
+        }
+        return total;
+    }
+};
+
+bool testProgramArenaPipe() {
+    bool result = true;
+    ArenaPipeProducer p;
+    ArenaPipeConsumer c;
+    p.count = 10;
+    c.count = 10;
+    p.useChannel = true;   // opt in to the arena mailbox
+    c.useChannel = true;
+
+    p >> c;   // consumer owns the channel; producer gets a handle to it
+
+    list<string> a1;
+    list<string> a2;
+    c.run(a2);   // consumer blocks on recv()
+    p.run(a1);   // producer sends 10 messages
+
+    p.WaitForExit();
+    c.WaitForExit();
+    // sum of 1+2+...+10 = 55
+    result &= Test("arena pipe sum 1..10", c.exitCode, 55);
     return result;
 }
 
@@ -1163,6 +1328,7 @@ extern int main() {
 
     total++; passed += testProgramBasicArgsAndField()    ? 1 : 0;
     total++; passed += testProgramMinimalNoFields()      ? 1 : 0;
+    total++; passed += testProgramUserDestructor()       ? 1 : 0;
     total++; passed += testProgramEmptyArgs()            ? 1 : 0;
     total++; passed += testProgramExitCodeZero()         ? 1 : 0;
     total++; passed += testProgramExitCodeNonZero()      ? 1 : 0;
@@ -1195,6 +1361,7 @@ extern int main() {
     total++; passed += testInboxMultipleMessages()       ? 1 : 0;
     total++; passed += testInboxSumMessages()            ? 1 : 0;
     total++; passed += testInboxPolymorphicMessages()    ? 1 : 0;
+    total++; passed += testProgramArenaPipe()            ? 1 : 0;
     total++; passed += testProgramCrashRecovery()        ? 1 : 0;
     total++; passed += testRequestStop()                 ? 1 : 0;
     total++; passed += testWaitForExitTimeoutFast()      ? 1 : 0;

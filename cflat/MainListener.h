@@ -872,17 +872,6 @@ public:
         LLVMBackend::TypeAndValue returnType{ .TypeName = name };
         compiler->CreateFunctionDeclaration(name, returnType, {});
 
-        // Pre-register channel<IMessage> so the synthetic inbox field resolves during the main pass
-        {
-            const std::string channelMangledName = "channel__IMessage";
-            if (!compiler->dataStructures.count(channelMangledName))
-            {
-                compiler->CreateStructType(channelMangledName, {});
-                LLVMBackend::TypeAndValue chReturnType{ .TypeName = channelMangledName };
-                compiler->CreateFunctionDeclaration(channelMangledName, chReturnType, {});
-            }
-        }
-
         // Pre-declare trampoline: int __program_run_Name(void*)
         {
             LLVMBackend::TypeAndValue intReturn{ .TypeName = "int" };
@@ -1002,17 +991,6 @@ public:
         compiler->CreateStructType(name, {});
         LLVMBackend::TypeAndValue returnType{ .TypeName = name };
         compiler->CreateFunctionDeclaration(name, returnType, {});
-
-        // Pre-register channel<IMessage> so the synthetic inbox field resolves during the main pass
-        {
-            const std::string channelMangledName = "channel__IMessage";
-            if (!compiler->dataStructures.count(channelMangledName))
-            {
-                compiler->CreateStructType(channelMangledName, {});
-                LLVMBackend::TypeAndValue chReturnType{ .TypeName = channelMangledName };
-                compiler->CreateFunctionDeclaration(channelMangledName, chReturnType, {});
-            }
-        }
 
         // Pre-declare trampoline: int __program_run_Name(void*)
         {
@@ -5470,6 +5448,141 @@ public:
         }
     }
 
+    // Wire `producer.outbox = consumer.inbox` for `producer >> consumer` (program-owned
+    // arena_channel piping). The consumer owns the channel: its inbox is lazily heap-allocated
+    // and init()ed the first time anyone wires to it (a runtime null-check makes this fan-in safe,
+    // so `a >> c` and `b >> c` share the one channel c owns). The producer's outbox is just a
+    // borrowed handle pointing at it.
+    void EmitProgramToProgramArenaWire(const std::string& producerName, llvm::Value* producerStorage,
+        const std::string& consumerName, llvm::Value* consumerStorage,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        auto& producerPd = compiler->programTable[producerName];
+        auto& consumerPd = compiler->programTable[consumerName];
+
+        if (consumerPd.InboxArenaFieldIndex == (unsigned)-1 || producerPd.OutboxFieldIndex == (unsigned)-1)
+        {
+            LogErrorContext(ctx,
+                "program-to-program '>>' requires arena_channel (import \"arena_channel.cb\").");
+            return;
+        }
+
+        auto dsIt = compiler->dataStructures.find(kArenaChannelType);
+        if (dsIt == compiler->dataStructures.end())
+        {
+            LogErrorContext(ctx, "arena_channel type not found for program '>>'.");
+            return;
+        }
+        auto* arenaTy    = dsIt->second.StructType;
+        auto* arenaPtrTy = arenaTy->getPointerTo();
+        auto* ctorFn     = compiler->GetFunction(kArenaChannelType);
+        auto* mallocFn   = compiler->GetFunction("malloc");
+
+        // Select the no-arg init() overload (init(int, i64) also exists).
+        llvm::Function* initFn = nullptr;
+        if (auto it = compiler->functionTable.find("init"); it != compiler->functionTable.end())
+            for (const auto& sym : it->second)
+                if (sym.Parameters.size() == 1 && sym.Parameters[0].TypeName == kArenaChannelType)
+                    { initFn = sym.Function; break; }
+
+        if (!ctorFn || !mallocFn || !initFn)
+        {
+            LogErrorContext(ctx, "arena_channel ctor/init/malloc not found for program '>>'.");
+            return;
+        }
+
+        // consumer.inbox GEP and current value.
+        auto* inboxGep = compiler->builder->CreateStructGEP(
+            consumerPd.StructType, consumerStorage, consumerPd.InboxArenaFieldIndex, "inbox_gep");
+        auto* existing = compiler->builder->CreateLoad(arenaPtrTy, inboxGep, "existing_inbox");
+        auto* isNull   = compiler->builder->CreateICmpEQ(
+            existing, llvm::ConstantPointerNull::get(arenaPtrTy), "inbox_is_null");
+
+        auto* curFn     = compiler->builder->GetInsertBlock()->getParent();
+        auto* allocBB   = llvm::BasicBlock::Create(*compiler->context, "inbox_alloc", curFn);
+        auto* mergeBB   = llvm::BasicBlock::Create(*compiler->context, "inbox_ready", curFn);
+        compiler->builder->CreateCondBr(isNull, allocBB, mergeBB);
+
+        // Lazy-alloc path: malloc + zero-ctor + init() the arena_channel, store into inbox.
+        compiler->builder->SetInsertPoint(allocBB);
+        auto* arenaSize = compiler->GetTypeSizeBytes(arenaTy);
+        auto* arenaRaw  = compiler->builder->CreateCall(
+            mallocFn->getFunctionType(), mallocFn, {arenaSize}, "inbox_arena_raw");
+        auto* arenaPtr  = compiler->builder->CreateBitCast(arenaRaw, arenaPtrTy, "inbox_arena_ptr");
+        auto* arenaZero = compiler->builder->CreateCall(
+            ctorFn->getFunctionType(), ctorFn, {}, "inbox_arena_zero");
+        compiler->builder->CreateStore(arenaZero, arenaPtr);
+        compiler->builder->CreateCall(initFn->getFunctionType(), initFn, {arenaPtr});
+        compiler->builder->CreateStore(arenaPtr, inboxGep);
+        compiler->builder->CreateBr(mergeBB);
+
+        // Merge: reload the (now non-null) inbox and bind it into producer.outbox.
+        compiler->builder->SetInsertPoint(mergeBB);
+        auto* inboxPtr  = compiler->builder->CreateLoad(arenaPtrTy, inboxGep, "inbox_ptr");
+        auto* outboxGep = compiler->builder->CreateStructGEP(
+            producerPd.StructType, producerStorage, producerPd.OutboxFieldIndex, "outbox_gep");
+        compiler->builder->CreateStore(inboxPtr, outboxGep);
+    }
+
+    // Wire stdout->stdin stream piping for direct `producer >> consumer` (no explicit `stream` in
+    // the middle). Synthesizes a hidden `stream` local - default-constructed, init()ed, and
+    // registered for ~stream() at scope exit so its buffers are freed - then reuses the same
+    // EmitProgramToStreamWire / EmitStreamToProgramWire helpers as the explicit `p >> s; s >> q`
+    // form. The synthesized stream is marked `_autoClose` so the producer's run() trampoline calls
+    // close() after main() returns (the analogue of the explicit form's manual `s.close()`); the
+    // user therefore writes only `p >> q`, then `p.run(); q.run(); p.WaitForExit(); q.WaitForExit();`.
+    // No-op (arena channel still wired) when stream.cb is not imported.
+    void EmitProgramToProgramStreamWire(const std::string& producerName, llvm::Value* producerStorage,
+        const std::string& consumerName, llvm::Value* consumerStorage,
+        antlr4::ParserRuleContext* ctx)
+    {
+        auto* compiler = Compiler(ctx);
+        if (!compiler->dataStructures.count("stream")) return;  // stream.cb not imported - arena-only
+
+        auto* streamTy = compiler->dataStructures["stream"].StructType;
+        auto* ctorFn   = compiler->GetFunction("stream");
+        auto* initFn   = FindStreamMethodFn(compiler, "init");
+        if (!ctorFn || !initFn)
+        {
+            LogErrorContext(ctx, "stream ctor/init not found for program>>program piping - import \"stream.cb\".");
+            return;
+        }
+
+        // Hidden stream local: alloca at entry, default-construct, init().
+        auto* streamStorage = compiler->AllocaAtEntry(streamTy, nullptr, "pipe_stream");
+        auto* zeroVal = compiler->builder->CreateCall(ctorFn->getFunctionType(), ctorFn, {}, "pipe_stream_zero");
+        compiler->builder->CreateStore(zeroVal, streamStorage);
+        compiler->builder->CreateCall(initFn->getFunctionType(), initFn, {streamStorage});
+
+        // Mark _autoClose = true so the producer trampoline closes it after main() returns.
+        unsigned autoCloseIdx = (unsigned)-1;
+        const auto& fields = compiler->dataStructures["stream"].StructFields;
+        for (unsigned i = 0; i < fields.size(); ++i)
+            if (fields[i].VariableName == "_autoClose") { autoCloseIdx = i; break; }
+        if (autoCloseIdx != (unsigned)-1)
+        {
+            auto* acGep    = compiler->builder->CreateStructGEP(streamTy, streamStorage, autoCloseIdx, "autoclose_gep");
+            auto* acElemTy = streamTy->getStructElementType(autoCloseIdx);
+            compiler->builder->CreateStore(llvm::ConstantInt::get(acElemTy, 1), acGep);
+        }
+
+        // Register the hidden stream for scope-exit destruction (frees both buffers + the CVs).
+        if (!compiler->stackNamedVariable.empty())
+        {
+            LLVMBackend::NamedVariable nv;
+            nv.TypeAndValue.TypeName = "stream";
+            nv.TypeAndValue.Pointer  = false;
+            nv.Storage               = streamStorage;
+            compiler->stackNamedVariable.back().namedVariable[
+                "__pipe_stream_" + std::to_string(compiler->pipeStreamCounter++)] = nv;
+        }
+
+        // Reuse the explicit-form wiring for both directions.
+        EmitProgramToStreamWire(producerName, producerStorage, streamStorage, ctx);
+        EmitStreamToProgramWire(streamStorage, consumerName, consumerStorage, ctx);
+    }
+
     // True if functionTable has an `opName` overload whose first parameter type matches
     // typeName. Used to decide whether a shift operator should dispatch to an overload
     // (member or free) instead of a primitive bit-shift.
@@ -5525,6 +5638,42 @@ public:
                 bool lhsIsStream  = lhsType == "stream";
                 bool rhsIsStream  = rhsType == "stream";
 
+                if (lhsIsProgram && rhsIsProgram && lhsStorage && rhsStorage)
+                {
+                    // Direct program>>program (the design's "stream always wired, channel additive"):
+                    // the stdout->stdin stream is ALWAYS wired (auto-synthesized + auto-closed); the
+                    // rich arena_channel is wired only when BOTH programs opted in via useChannel = true
+                    // (a runtime branch, since `>>` runs once). useChannel defaults to 0, so programs
+                    // that only pipe stdout pay nothing for an arena_channel they never touch.
+                    EmitProgramToProgramStreamWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
+
+                    auto& lpd = compiler->programTable[lhsType];
+                    auto& rpd = compiler->programTable[rhsType];
+                    auto* i32Ty = llvm::Type::getInt32Ty(*compiler->context);
+                    auto* lUseGEP = compiler->builder->CreateStructGEP(
+                        lpd.StructType, lhsStorage, lpd.UseChannelFieldIndex, "l_usechannel_gep");
+                    auto* rUseGEP = compiler->builder->CreateStructGEP(
+                        rpd.StructType, rhsStorage, rpd.UseChannelFieldIndex, "r_usechannel_gep");
+                    auto* lOn = compiler->builder->CreateICmpNE(
+                        compiler->builder->CreateLoad(i32Ty, lUseGEP, "l_usechannel"),
+                        llvm::ConstantInt::get(i32Ty, 0), "l_usechannel_on");
+                    auto* rOn = compiler->builder->CreateICmpNE(
+                        compiler->builder->CreateLoad(i32Ty, rUseGEP, "r_usechannel"),
+                        llvm::ConstantInt::get(i32Ty, 0), "r_usechannel_on");
+                    auto* bothOn = compiler->builder->CreateAnd(lOn, rOn, "usechannel_both");
+
+                    auto* curFn   = compiler->builder->GetInsertBlock()->getParent();
+                    auto* wireBB  = llvm::BasicBlock::Create(*compiler->context, "arena_wire",  curFn);
+                    auto* afterBB = llvm::BasicBlock::Create(*compiler->context, "arena_after", curFn);
+                    compiler->builder->CreateCondBr(bothOn, wireBB, afterBB);
+
+                    compiler->builder->SetInsertPoint(wireBB);
+                    EmitProgramToProgramArenaWire(lhsType, lhsStorage, rhsType, rhsStorage, ctx);
+                    compiler->builder->CreateBr(afterBB);
+
+                    compiler->builder->SetInsertPoint(afterBB);
+                    return rv;  // return consumer so `a >> b >> c` could chain later
+                }
                 if (lhsIsProgram && rhsIsStream && lhsStorage && rhsStorage)
                 {
                     EmitProgramToStreamWire(lhsType, lhsStorage, rhsStorage, ctx);
@@ -10501,6 +10650,101 @@ public:
         }
     }
 
+    // Pre-declare a generic instantiation's member function signatures so that
+    // cross-references resolve to a declaration before any method body is emitted.
+    // This matters because the post-fields dependency flush (ProcessPendingInstantiations)
+    // can pull in a *sibling* instantiation whose body calls back into this
+    // still-incomplete type's methods (e.g. block_pool<T> field-flushed during
+    // arena_channel<T>, calling page_arena<T>::reset). Without a forward declaration
+    // the call site reports "Unknown identifier". LLVM fills the body in later when
+    // this type's member-body loop runs. Caller gates on "is an instantiation".
+    void PreDeclareInstantiationMembers(
+        LLVMBackend* compiler,
+        const std::vector<CFlatParser::FunctionDefinitionContext*>& functionList,
+        const std::string& baseName,
+        const std::string& structName,
+        const LLVMBackend::TypeAndValue& returnType)
+    {
+        for (auto func : functionList)
+        {
+            if (IsReturnBlockFunction(func)) continue;
+            if (func->genericTypeParameters() != nullptr) continue;
+
+            std::string funcName = getFunctionName(func);
+
+            // Constructor overload - pre-declare without this* parameter
+            if (funcName == baseName && func->parameterTypeList())
+            {
+                auto* declParamList = func->parameterTypeList();
+                auto declParams = this->ParseParameterTypeList(declParamList);
+                bool declVarargs = declParamList->Ellipsis() != nullptr;
+                std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
+                compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
+                continue;
+            }
+
+            bool isOperatorFunc = (funcName == "operator new"
+                                || funcName == "operator delete"
+                                || funcName == "operator string");
+            bool isStaticFunc = isFunctionStatic(func);
+            bool isStaticLike = isOperatorFunc || isStaticFunc;
+            std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
+
+            auto declReturnType = this->getFunctionReturnType(func);
+            auto* declParamList = func->parameterTypeList();
+            auto declParams = this->ParseParameterTypeList(declParamList);
+            bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
+
+            if (!isStaticLike)
+            {
+                LLVMBackend::DeclTypeAndValue thisParam;
+                thisParam.TypeName = structName;
+                thisParam.VariableName = structName + "__";
+                thisParam.Pointer = true;
+                declParams.insert(declParams.begin(), thisParam);
+            }
+
+            std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
+            bool declReturnsOwned = false;
+            if (declReturnType.TypeName == "string")
+            {
+                if (declName == "operator+")
+                    declReturnsOwned = true;
+                else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
+                    declReturnsOwned = true;
+                else if (declReturnType.IsMove)
+                    declReturnsOwned = true;
+            }
+            else if (declReturnType.IsMove && declReturnType.Pointer)
+            {
+                declReturnsOwned = true;
+            }
+            compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
+        }
+    }
+
+    // The program-owned inbox/outbox channel is always arena_channel<IMessage>:
+    // the seam is untyped (consumers downcast pa->_root), so IMessage is the
+    // single, fixed payload interface. Mangled name of that instantiation.
+    static constexpr const char* kArenaChannelType = "arena_channel__IMessage";
+
+    // Ensure arena_channel<IMessage> (and its transitive block_pool<IMessage> /
+    // page_arena<IMessage>) is fully instantiated so the synthetic program
+    // inbox/outbox fields and the `>>` wiring have a concrete type + methods to
+    // reference. Returns true if the type is available (template was imported).
+    bool EnsureArenaChannelInstantiated(LLVMBackend* compiler)
+    {
+        if (compiler->dataStructures.count(kArenaChannelType)) return true;
+        if (!genericClassTemplates.count("arena_channel")) return false;
+        if (!instantiatedGenerics.count(kArenaChannelType))
+        {
+            pendingInstantiations.push_back({"arena_channel", {"IMessage"}, kArenaChannelType});
+            instantiatedGenerics.insert(kArenaChannelType);
+        }
+        ProcessPendingInstantiations();
+        return compiler->dataStructures.count(kArenaChannelType) > 0;
+    }
+
     void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(ctx);
@@ -10699,6 +10943,13 @@ public:
         LLVMBackend::TypeAndValue returnType{
             .TypeName = structName,
         };
+        // Member functions of this struct. Pre-declare their signatures (for
+        // instantiations) BEFORE the dependency flush below, so a sibling
+        // instantiation pulled in by the flush can resolve calls back into this
+        // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
+        auto functionList = ctx->functionDefinition();
+        if (!nameOverride.empty())
+            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
         // Flush any nested generic instantiations queued while parsing field declarations,
         // so their constructors exist before this struct's default constructor calls them.
         {
@@ -10845,71 +11096,7 @@ public:
             }
         }
 
-        // Parse member functions
-        auto functionList = ctx->functionDefinition();
-
-        // For generic instantiations, pre-declare all member function signatures
-        // so they can forward-reference each other. (Non-generic structs already
-        // get this via ForwardRefScanner::ScanStructDefinition.)
-        if (!nameOverride.empty())
-        {
-            for (auto func : functionList)
-            {
-                if (IsReturnBlockFunction(func)) continue;
-                if (func->genericTypeParameters() != nullptr) continue;
-
-                std::string funcName = getFunctionName(func);
-
-                // Constructor overload - pre-declare without this* parameter
-                if (funcName == baseName && func->parameterTypeList())
-                {
-                    auto* declParamList = func->parameterTypeList();
-                    auto declParams = this->ParseParameterTypeList(declParamList);
-                    bool declVarargs = declParamList->Ellipsis() != nullptr;
-                    std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
-                    compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
-                    continue;
-                }
-
-                bool isOperatorFunc = (funcName == "operator new"
-                                    || funcName == "operator delete"
-                                    || funcName == "operator string");
-                bool isStaticFunc = isFunctionStatic(func);
-                bool isStaticLike = isOperatorFunc || isStaticFunc;
-                std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
-
-                auto declReturnType = this->getFunctionReturnType(func);
-                auto* declParamList = func->parameterTypeList();
-                auto declParams = this->ParseParameterTypeList(declParamList);
-                bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
-
-                if (!isStaticLike)
-                {
-                    LLVMBackend::DeclTypeAndValue thisParam;
-                    thisParam.TypeName = structName;
-                    thisParam.VariableName = structName + "__";
-                    thisParam.Pointer = true;
-                    declParams.insert(declParams.begin(), thisParam);
-                }
-
-                std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
-                bool declReturnsOwned = false;
-                if (declReturnType.TypeName == "string")
-                {
-                    if (declName == "operator+")
-                        declReturnsOwned = true;
-                    else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
-                        declReturnsOwned = true;
-                    else if (declReturnType.IsMove)
-                        declReturnsOwned = true;
-                }
-                else if (declReturnType.IsMove && declReturnType.Pointer)
-                {
-                    declReturnsOwned = true;
-                }
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
-            }
-        }
+        // Member function signatures were pre-declared above (before the flush).
 
         // Pre-register destructor so 'delete' inside static methods can call it.
         if (!ctx->destructorDefinition().empty())
@@ -11092,6 +11279,107 @@ public:
         return nullptr;
     }
 
+    // Emit the program's builtin field teardown into the CURRENT insert point of the
+    // destructor being built: cleanup() + free the IAllocator stored in _allocator,
+    // dispose _stop_source, and free the consumer-owned inbox arena_channel. All steps
+    // null-check first, so it is safe even if run() was never called.
+    //
+    // This does NOT emit the function return - the caller appends the ret afterward. That
+    // is how the program gets ONE destructor with the builtin fields cleaned up at the end:
+    // a user-written ~Name() body runs first, then this teardown is appended before the ret
+    // (see ParseProgramDestructorDefinition); programs without a user destructor get a
+    // synthetic ~Name() that is just this teardown.
+    //
+    // Self-contained: every value is rederived from `name` via programTable / dataStructures,
+    // so it works from both the user-destructor path and the synthetic-destructor path.
+    void EmitProgramSyntheticTeardown(const std::string& name, llvm::Value* thisArg)
+    {
+        auto* compiler = compilerLLVM;
+        auto* dtorFn      = compiler->builder->GetInsertBlock()->getParent();
+        auto* progType    = compiler->dataStructures[name].StructType;
+        auto* fatTy       = compiler->GetFatPtrType();   // {i8*, i8*}
+        auto* voidPtrType = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* freeFn      = compiler->GetFunction("free");
+        if (!progType || !freeFn) return;
+
+        unsigned allocatorIdx  = compiler->programTable[name].AllocatorFieldIndex;
+        unsigned stopSrcIdx    = compiler->programTable[name].StopSourceFieldIndex;
+        unsigned inboxArenaIdx = compiler->programTable[name].InboxArenaFieldIndex;
+
+        auto* stopSrcDisposeFn = FindMethodOf("dispose", "stop_source");
+        auto* stopSrcType      = compiler->dataStructures.count("stop_source")
+                                 ? compiler->dataStructures["stop_source"].StructType : nullptr;
+
+        // Load self->_allocator (IAllocator fat-ptr)
+        auto* dtor_allocFieldGEP = compiler->builder->CreateStructGEP(
+            progType, thisArg, allocatorIdx, "alloc_field_gep");
+        auto* allocFatPtr = compiler->builder->CreateLoad(fatTy, dtor_allocFieldGEP, "alloc_fat_ptr");
+
+        // if (data ptr != null) { cleanup(); free(data); zero _allocator; }
+        auto* allocDataPtr = compiler->builder->CreateExtractValue(allocFatPtr, {1u}, "alloc_data");
+        auto* isNotNull    = compiler->builder->CreateICmpNE(
+            allocDataPtr,
+            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
+            "alloc_not_null");
+        auto* cleanupBlock = llvm::BasicBlock::Create(*compiler->context, "alloc_cleanup", dtorFn);
+        auto* doneBlock    = llvm::BasicBlock::Create(*compiler->context, "dtor_done",     dtorFn);
+        compiler->builder->CreateCondBr(isNotNull, cleanupBlock, doneBlock);
+
+        compiler->builder->SetInsertPoint(cleanupBlock);
+        // alloca a fat-ptr slot so CallInterfaceMethod can GEP into it
+        auto* allocFatPtrSlot = compiler->builder->CreateAlloca(fatTy, nullptr, "alloc_fat_slot");
+        compiler->builder->CreateStore(allocFatPtr, allocFatPtrSlot);
+        compiler->CallInterfaceMethod(allocFatPtrSlot, "IAllocator", "cleanup", {});
+        // free the underlying memory (data ptr is already in allocDataPtr)
+        compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocDataPtr});
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), dtor_allocFieldGEP);
+        compiler->builder->CreateBr(doneBlock);
+
+        compiler->builder->SetInsertPoint(doneBlock);
+
+        // Dispose _stop_source (no-op if _state is null, safe to call after Kill())
+        if (stopSrcDisposeFn && stopSrcType)
+        {
+            auto* stopSrcGEP = compiler->builder->CreateStructGEP(
+                progType, thisArg, stopSrcIdx, "stop_src_gep");
+            compiler->builder->CreateCall(
+                stopSrcDisposeFn->getFunctionType(), stopSrcDisposeFn, {stopSrcGEP});
+        }
+
+        // Free the consumer-owned inbox arena_channel (lazily allocated by `a >> b`).
+        // Only consumers carry a non-null inbox; a producer's outbox is a BORROWED handle
+        // to some consumer's inbox and is never freed here. Safe at scope exit because the
+        // WaitForExit contract joins producer threads before they can touch the channel.
+        if (inboxArenaIdx != (unsigned)-1)
+        {
+            auto* arenaTy = compiler->dataStructures.count(kArenaChannelType)
+                            ? compiler->dataStructures[kArenaChannelType].StructType : nullptr;
+            auto* arenaDestroyFn = FindMethodOf("destroy", kArenaChannelType);
+            if (arenaTy && arenaDestroyFn)
+            {
+                auto* arenaPtrTy = arenaTy->getPointerTo();
+                auto* inboxGEP = compiler->builder->CreateStructGEP(
+                    progType, thisArg, inboxArenaIdx, "inbox_arena_gep");
+                auto* inboxPtr = compiler->builder->CreateLoad(arenaPtrTy, inboxGEP, "inbox_arena_ptr");
+                auto* inboxNotNull = compiler->builder->CreateICmpNE(
+                    inboxPtr, llvm::ConstantPointerNull::get(arenaPtrTy), "inbox_not_null");
+                auto* inboxCleanupBB = llvm::BasicBlock::Create(*compiler->context, "inbox_cleanup", dtorFn);
+                auto* inboxDoneBB    = llvm::BasicBlock::Create(*compiler->context, "inbox_dtor_done", dtorFn);
+                compiler->builder->CreateCondBr(inboxNotNull, inboxCleanupBB, inboxDoneBB);
+
+                compiler->builder->SetInsertPoint(inboxCleanupBB);
+                compiler->builder->CreateCall(
+                    arenaDestroyFn->getFunctionType(), arenaDestroyFn, {inboxPtr});
+                auto* inboxRaw = compiler->builder->CreateBitCast(inboxPtr, voidPtrType, "inbox_raw");
+                compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {inboxRaw});
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(arenaPtrTy), inboxGEP);
+                compiler->builder->CreateBr(inboxDoneBB);
+
+                compiler->builder->SetInsertPoint(inboxDoneBB);
+            }
+        }
+    }
+
     void EmitProgramRunWrapper(const std::string& name)
     {
         auto* compiler = compilerLLVM;
@@ -11217,7 +11505,7 @@ public:
 
         auto* stopSrcInitFn        = FindMethodOf("init",           "stop_source");
         auto* stopSrcRequestStopFn = FindMethodOf("request_stop",   "stop_source");
-        auto* stopSrcDisposeFn     = FindMethodOf("dispose",        "stop_source");
+        // _stop_source dispose happens in ~Name() via EmitProgramSyntheticTeardown.
         auto* stopSrcType          = compiler->dataStructures.count("stop_source")
                                      ? compiler->dataStructures["stop_source"].StructType : nullptr;
 
@@ -11577,6 +11865,55 @@ public:
 
             // cleanupBB: shared teardown - both normal and exception paths converge here.
             compiler->builder->SetInsertPoint(cleanupBB);
+
+            // Auto-close a directly-piped output stream. `producer >> consumer` synthesizes a
+            // hidden stream, marks it _autoClose, and stores it in _out; here - after main() has
+            // returned, on the producer's own thread - we flush its last buffer + send EOF so the
+            // consumer's read loop terminates (the synthesized analogue of the explicit form's
+            // manual s.close()). Gated on _autoClose so the explicit `p >> s; s >> q` form, which
+            // also sets _out but closes manually, is left untouched. Skipped for programs with no
+            // _out (consumers, or programs that never pipe to stdout).
+            {
+                unsigned outIdx = compiler->programTable[name].OutFieldIndex;
+                auto* streamTy  = compiler->dataStructures.count("stream")
+                                  ? compiler->dataStructures["stream"].StructType : nullptr;
+                auto* closeFn   = FindMethodOf("close", "stream");
+                unsigned autoCloseIdx = (unsigned)-1;
+                if (streamTy)
+                {
+                    const auto& sfields = compiler->dataStructures["stream"].StructFields;
+                    for (unsigned i = 0; i < sfields.size(); ++i)
+                        if (sfields[i].VariableName == "_autoClose") { autoCloseIdx = i; break; }
+                }
+                if (outIdx != (unsigned)-1 && streamTy && closeFn && autoCloseIdx != (unsigned)-1)
+                {
+                    auto* streamPtrTy = streamTy->getPointerTo();
+                    auto* outGEP = compiler->builder->CreateStructGEP(progType, self, outIdx, "out_field_gep");
+                    auto* outPtr = compiler->builder->CreateLoad(streamPtrTy, outGEP, "out_stream");
+                    auto* outNotNull = compiler->builder->CreateICmpNE(
+                        outPtr, llvm::ConstantPointerNull::get(streamPtrTy), "out_not_null");
+
+                    auto* acChkBB  = llvm::BasicBlock::Create(*compiler->context, "autoclose_chk",  trampolineFn);
+                    auto* acDoBB   = llvm::BasicBlock::Create(*compiler->context, "autoclose_do",   trampolineFn);
+                    auto* acContBB = llvm::BasicBlock::Create(*compiler->context, "autoclose_cont", trampolineFn);
+                    compiler->builder->CreateCondBr(outNotNull, acChkBB, acContBB);
+
+                    compiler->builder->SetInsertPoint(acChkBB);
+                    auto* acElemTy = streamTy->getStructElementType(autoCloseIdx);
+                    auto* acGEP = compiler->builder->CreateStructGEP(streamTy, outPtr, autoCloseIdx, "autoclose_gep");
+                    auto* acVal = compiler->builder->CreateLoad(acElemTy, acGEP, "autoclose");
+                    auto* acTrue = compiler->builder->CreateICmpNE(
+                        acVal, llvm::ConstantInt::get(acElemTy, 0), "autoclose_true");
+                    compiler->builder->CreateCondBr(acTrue, acDoBB, acContBB);
+
+                    compiler->builder->SetInsertPoint(acDoBB);
+                    compiler->builder->CreateCall(closeFn->getFunctionType(), closeFn, {outPtr});
+                    compiler->builder->CreateBr(acContBB);
+
+                    compiler->builder->SetInsertPoint(acContBB);
+                }
+            }
+
             compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), activeAllocGlobal);
             {
                 auto* stdoutHookGEP = compiler->builder->CreateStructGEP(
@@ -11896,9 +12233,15 @@ public:
         }
 
         // ======================================================================
-        // EMIT ~Name(): void ~Name(Name* this)   [only if user didn't provide one]
-        // Calls cleanup() and frees the IAllocator stored in _allocator.
-        // Null-checks so it's safe to call even if run() was never called.
+        // EMIT ~Name(): void ~Name(Name* this)
+        // The program always has exactly one compiler-owned destructor that ends with
+        // the builtin field teardown (free _allocator, dispose _stop_source, free the
+        // consumer-owned inbox arena_channel - see EmitProgramSyntheticTeardown).
+        //
+        // When the user wrote their own ~Name(), ParseProgramDestructorDefinition already
+        // emitted it with the teardown appended at the end and set Destructor, so we skip
+        // this block. Otherwise we synthesize a ~Name() that is just the teardown.
+        // Null-checks make it safe to call even if run() was never called.
         // ======================================================================
         if (compiler->dataStructures[name].Destructor == nullptr)
         {
@@ -11909,43 +12252,7 @@ public:
             auto* dtorFn = compiler->CreateFunctionDefinition("~" + name, voidReturn, {thisParam});
             compiler->RegisterDestructor(name, dtorFn);
 
-            auto* thisArg = dtorFn->getArg(0);
-
-            // Load self->_allocator (IAllocator fat-ptr)
-            auto* dtor_allocFieldGEP = compiler->builder->CreateStructGEP(
-                progType, thisArg, allocatorIdx, "alloc_field_gep");
-            auto* allocFatPtr = compiler->builder->CreateLoad(fatTy, dtor_allocFieldGEP, "alloc_fat_ptr");
-
-            // if (data ptr != null) { cleanup(); free(data); zero _allocator; }
-            auto* allocDataPtr = compiler->builder->CreateExtractValue(allocFatPtr, {1u}, "alloc_data");
-            auto* isNotNull    = compiler->builder->CreateICmpNE(
-                allocDataPtr,
-                llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(voidPtrType)),
-                "alloc_not_null");
-            auto* cleanupBlock = llvm::BasicBlock::Create(*compiler->context, "alloc_cleanup", dtorFn);
-            auto* doneBlock    = llvm::BasicBlock::Create(*compiler->context, "dtor_done",     dtorFn);
-            compiler->builder->CreateCondBr(isNotNull, cleanupBlock, doneBlock);
-
-            compiler->builder->SetInsertPoint(cleanupBlock);
-            // alloca a fat-ptr slot so CallInterfaceMethod can GEP into it
-            auto* allocFatPtrSlot = compiler->builder->CreateAlloca(fatTy, nullptr, "alloc_fat_slot");
-            compiler->builder->CreateStore(allocFatPtr, allocFatPtrSlot);
-            compiler->CallInterfaceMethod(allocFatPtrSlot, "IAllocator", "cleanup", {});
-            // free the underlying memory (data ptr is already in allocDataPtr)
-            compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocDataPtr});
-            compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), dtor_allocFieldGEP);
-            compiler->builder->CreateBr(doneBlock);
-
-            compiler->builder->SetInsertPoint(doneBlock);
-
-            // Dispose _stop_source (no-op if _state is null, safe to call after Kill())
-            if (stopSrcDisposeFn && stopSrcType)
-            {
-                auto* stopSrcGEP = compiler->builder->CreateStructGEP(
-                    progType, thisArg, stopSrcIdx, "stop_src_gep");
-                compiler->builder->CreateCall(
-                    stopSrcDisposeFn->getFunctionType(), stopSrcDisposeFn, {stopSrcGEP});
-            }
+            EmitProgramSyntheticTeardown(name, dtorFn->getArg(0));
 
             compiler->CreateReturnCall(nullptr);
             compiler->CreateBlockBreak(nullptr, true);
@@ -11978,20 +12285,6 @@ public:
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse imported program: " << name << "\n";
 
-        // Ensure channel<IMessage> is fully instantiated before CreateStructType uses its layout.
-        if (!instantiatedGenerics.count("channel__IMessage"))
-        {
-            pendingInstantiations.push_back({"channel", {"IMessage"}, "channel__IMessage"});
-            instantiatedGenerics.insert("channel__IMessage");
-            ProcessPendingInstantiations();
-        }
-
-        if (!instantiatedInterfaces.count("IQueue__IMessage"))
-        {
-            pendingInstantiations.push_back({"IQueue", {"IMessage"}, "IQueue__IMessage"});
-            ProcessPendingInstantiations();
-        }
-
         // No user-declared fields - only synthetic fields
         std::vector<LLVMBackend::DeclTypeAndValue> declList;
 
@@ -12001,12 +12294,15 @@ public:
         unsigned onStdoutFieldIndex      = allocatorFieldIndex + 1;
         unsigned onStdinFieldIndex       = onStdoutFieldIndex + 1;
         unsigned onStdinReturnFieldIndex = onStdinFieldIndex + 1;
-        unsigned inboxFieldIndex         = onStdinReturnFieldIndex + 1;
-        unsigned stopSrcFieldIndex       = inboxFieldIndex + 1;
+        unsigned stopSrcFieldIndex       = onStdinReturnFieldIndex + 1;
         unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
+        unsigned useChannelFieldIndex    = trackHandlesFieldIndex + 1;
         unsigned outFieldIndex           = (unsigned)-1;
         unsigned inStreamFieldIndex      = (unsigned)-1;
+        unsigned inboxArenaFieldIndex    = (unsigned)-1;
+        unsigned outboxFieldIndex        = (unsigned)-1;
         bool     hasStreamType           = compiler->dataStructures.count("stream") > 0;
+        bool     hasArenaChannelType     = EnsureArenaChannelInstantiated(compiler);
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -12047,13 +12343,6 @@ public:
             onStdinReturnField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdinReturnField);
 
-            LLVMBackend::DeclTypeAndValue inboxField;
-            inboxField.TypeName     = "IQueue__IMessage";
-            inboxField.VariableName = "inbox";
-            inboxField.IsInterface  = true;
-            inboxField.Pointer      = true;
-            declList.push_back(inboxField);
-
             LLVMBackend::DeclTypeAndValue stopSrcField;
             stopSrcField.TypeName     = "stop_source";
             stopSrcField.VariableName = "_stop_source";
@@ -12063,6 +12352,11 @@ public:
             trackHandlesField.TypeName     = "int";
             trackHandlesField.VariableName = "trackHandles";
             declList.push_back(trackHandlesField);
+
+            LLVMBackend::DeclTypeAndValue useChannelField;
+            useChannelField.TypeName     = "int";   // int not bool - avoids i1-in-ConstantStruct assertion
+            useChannelField.VariableName = "useChannel";
+            declList.push_back(useChannelField);
 
             if (hasStreamType) {
                 LLVMBackend::DeclTypeAndValue outField;
@@ -12078,6 +12372,24 @@ public:
                 inField.Pointer      = true;
                 inStreamFieldIndex = (unsigned)declList.size();
                 declList.push_back(inField);
+            }
+
+            // inbox / outbox: program-owned arena_channel handles for `a >> b` rich piping
+            // (see ParseProgramDefinition for the full rationale). Both default null.
+            if (hasArenaChannelType) {
+                LLVMBackend::DeclTypeAndValue inboxArenaField;
+                inboxArenaField.TypeName     = kArenaChannelType;
+                inboxArenaField.VariableName = "inbox";
+                inboxArenaField.Pointer      = true;
+                inboxArenaFieldIndex = (unsigned)declList.size();
+                declList.push_back(inboxArenaField);
+
+                LLVMBackend::DeclTypeAndValue outboxField;
+                outboxField.TypeName     = kArenaChannelType;
+                outboxField.VariableName = "outbox";
+                outboxField.Pointer      = true;
+                outboxFieldIndex = (unsigned)declList.size();
+                declList.push_back(outboxField);
             }
         }
 
@@ -12173,34 +12485,6 @@ public:
                     structVal, llvm::Constant::getNullValue(fieldType), onStdinReturnFieldIndex);
             }
 
-            // inbox = heap-allocated channel<IMessage> fat-ptr
-            {
-                auto* fatTy = compiler->GetFatPtrType();
-                auto dsIt = compiler->dataStructures.find("channel__IMessage");
-                auto* inboxCtorFn = compiler->GetFunction("channel__IMessage");
-                auto* mallocInboxFn = compiler->GetFunction("malloc");
-                if (dsIt != compiler->dataStructures.end() && inboxCtorFn && mallocInboxFn)
-                {
-                    auto* channelType    = dsIt->second.StructType;
-                    auto* channelSize    = compiler->GetTypeSizeBytes(channelType);
-                    auto* channelRaw     = compiler->builder->CreateCall(
-                        mallocInboxFn->getFunctionType(), mallocInboxFn, {channelSize}, "inbox_raw");
-                    auto* channelPtr     = compiler->builder->CreateBitCast(
-                        channelRaw, channelType->getPointerTo(), "inbox_ptr");
-                    auto* channelZeroVal = compiler->builder->CreateCall(
-                        inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_zero");
-                    compiler->builder->CreateStore(channelZeroVal, channelPtr);
-                    auto* inboxVtable    = compiler->GetOrCreateVTable("channel__IMessage", "IQueue__IMessage");
-                    auto* inboxFatPtr    = compiler->BuildInterfaceFatValue(inboxVtable, channelPtr);
-                    structVal = compiler->CreateInsertValue(structVal, inboxFatPtr, inboxFieldIndex);
-                }
-                else
-                {
-                    structVal = compiler->CreateInsertValue(
-                        structVal, llvm::Constant::getNullValue(fatTy), inboxFieldIndex);
-                }
-            }
-
             // _stop_source = stop_source()
             if (auto* stopSrcCtorFn = compiler->GetFunction("stop_source"))
             {
@@ -12215,6 +12499,12 @@ public:
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                 trackHandlesFieldIndex);
 
+            // useChannel = 0 (opt-in; `p1 >> p2` only wires the arena channel when both are set)
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                useChannelFieldIndex);
+
             // _out / _in = nullptr (only when stream.cb is imported)
             if (outFieldIndex != (unsigned)-1)
             {
@@ -12222,6 +12512,15 @@ public:
                 auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
                 structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
+            }
+
+            // inbox / outbox = nullptr (only when arena_channel.cb is imported)
+            if (inboxArenaFieldIndex != (unsigned)-1)
+            {
+                auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
+                auto* nullArena = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, nullArena, inboxArenaFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, nullArena, outboxFieldIndex);
             }
 
             compiler->CreateReturnCall(structVal);
@@ -12238,11 +12537,13 @@ public:
         compiler->programTable[name].OnStdoutFieldIndex       = onStdoutFieldIndex;
         compiler->programTable[name].OnStdinFieldIndex        = onStdinFieldIndex;
         compiler->programTable[name].OnStdinReturnFieldIndex  = onStdinReturnFieldIndex;
-        compiler->programTable[name].InboxFieldIndex          = inboxFieldIndex;
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
+        compiler->programTable[name].UseChannelFieldIndex    = useChannelFieldIndex;
         compiler->programTable[name].OutFieldIndex           = outFieldIndex;
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
+        compiler->programTable[name].InboxArenaFieldIndex    = inboxArenaFieldIndex;
+        compiler->programTable[name].OutboxFieldIndex        = outboxFieldIndex;
         // IsImportedProgram and MainFunction were already set by LLVMBackend.cpp pre-scan
 
         // All imported programs implicitly implement IProcess.
@@ -12271,50 +12572,40 @@ public:
 
         auto declList = ParseDeclarationList(ctx->declaration());
 
-        // Ensure channel<IMessage> is fully instantiated before CreateStructType uses its layout.
-        if (!instantiatedGenerics.count("channel__IMessage"))
-        {
-            pendingInstantiations.push_back({"channel", {"IMessage"}, "channel__IMessage"});
-            instantiatedGenerics.insert("channel__IMessage");
-            ProcessPendingInstantiations();
-        }
-
-        // Ensure IQueue<IMessage> interface is instantiated so the inbox fat-ptr vtable can be built.
-        if (!instantiatedInterfaces.count("IQueue__IMessage"))
-        {
-            pendingInstantiations.push_back({"IQueue", {"IMessage"}, "IQueue__IMessage"});
-            ProcessPendingInstantiations();
-        }
-
         // Guard against user fields clashing with auto-injected synthetic fields
         for (auto& field : declList)
         {
             if (field.VariableName == "exitCode" || field.VariableName == "_thread"
                 || field.VariableName == "_allocator" || field.VariableName == "onStdout"
                 || field.VariableName == "onStdin" || field.VariableName == "onStdinReturn"
-                || field.VariableName == "inbox" || field.VariableName == "_stop_source" || field.VariableName == "_inbox"
+                || field.VariableName == "_stop_source" || field.VariableName == "inbox"
+                || field.VariableName == "outbox" || field.VariableName == "useChannel"
                 || field.VariableName == "trackHandles" || field.VariableName == "_out" || field.VariableName == "_in")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
         // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), onStdin (function<char*()>),
-        // inbox (IQueue<IMessage> fat-ptr), _stop_source (stop_source),
+        // onStdout (function<void(char*)>), onStdin (function<char*()>), _stop_source (stop_source),
         // trackHandles (int - stored as i32 to avoid i1-in-ConstantStruct LLVM assertion),
-        // _out / _in (stream* - only when stream.cb is imported; set by >> for direct write_bytes/read_buf access)
+        // useChannel (int - opt-in: gates the arena channel wiring in `p1 >> p2`),
+        // _out / _in (stream* - only when stream.cb is imported; set by >> for direct write_bytes/read_buf access),
+        // inbox / outbox (arena_channel* - only when arena_channel.cb is imported; the messaging mailbox)
         unsigned exitCodeFieldIndex     = (unsigned)declList.size();
         unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex    = threadFieldIndex + 1;
         unsigned onStdoutFieldIndex      = allocatorFieldIndex + 1;
         unsigned onStdinFieldIndex       = onStdoutFieldIndex + 1;
         unsigned onStdinReturnFieldIndex = onStdinFieldIndex + 1;
-        unsigned inboxFieldIndex         = onStdinReturnFieldIndex + 1;
-        unsigned stopSrcFieldIndex       = inboxFieldIndex + 1;
+        unsigned stopSrcFieldIndex       = onStdinReturnFieldIndex + 1;
         unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
+        unsigned useChannelFieldIndex    = trackHandlesFieldIndex + 1;
         unsigned outFieldIndex           = (unsigned)-1;  // set below if stream.cb is imported
         unsigned inStreamFieldIndex      = (unsigned)-1;  // set below if stream.cb is imported
+        unsigned inboxArenaFieldIndex    = (unsigned)-1;  // set below if arena_channel.cb is imported
+        unsigned outboxFieldIndex        = (unsigned)-1;  // set below if arena_channel.cb is imported
         bool     hasStreamType           = compiler->dataStructures.count("stream") > 0;
+        bool     hasArenaChannelType     = EnsureArenaChannelInstantiated(compiler);
         {
             LLVMBackend::DeclTypeAndValue exitCodeField;
             exitCodeField.TypeName     = "int";
@@ -12355,16 +12646,6 @@ public:
             onStdinReturnField.FuncPtrParams         = {{"char", true}};
             declList.push_back(onStdinReturnField);
 
-            // inbox: IQueue<IMessage> fat-ptr - swappable before run() just like _allocator.
-            // By default the constructor pre-allocates a channel<IMessage> and builds the fat-ptr.
-            // Users can replace it with any IQueue<IMessage> implementation via `p.inbox = &myQueue`.
-            LLVMBackend::DeclTypeAndValue inboxField;
-            inboxField.TypeName     = "IQueue__IMessage";
-            inboxField.VariableName = "inbox";
-            inboxField.IsInterface  = true;
-            inboxField.Pointer      = true;
-            declList.push_back(inboxField);
-
             LLVMBackend::DeclTypeAndValue stopSrcField;
             stopSrcField.TypeName     = "stop_source";
             stopSrcField.VariableName = "_stop_source";
@@ -12374,6 +12655,11 @@ public:
             trackHandlesField.TypeName     = "int";
             trackHandlesField.VariableName = "trackHandles";
             declList.push_back(trackHandlesField);
+
+            LLVMBackend::DeclTypeAndValue useChannelField;
+            useChannelField.TypeName     = "int";   // int not bool - avoids i1-in-ConstantStruct assertion
+            useChannelField.VariableName = "useChannel";
+            declList.push_back(useChannelField);
 
             if (hasStreamType) {
                 LLVMBackend::DeclTypeAndValue outField;
@@ -12389,6 +12675,26 @@ public:
                 inField.Pointer      = true;
                 inStreamFieldIndex = (unsigned)declList.size();
                 declList.push_back(inField);
+            }
+
+            // inbox / outbox: program-owned arena_channel handles - the messaging mailbox and
+            // the `a >> b` rich-piping endpoints. Consumer owns inbox (lazily allocated by >>);
+            // producer's outbox is bound to the consumer's inbox. Both default null - programs
+            // that never message pay nothing.
+            if (hasArenaChannelType) {
+                LLVMBackend::DeclTypeAndValue inboxArenaField;
+                inboxArenaField.TypeName     = kArenaChannelType;
+                inboxArenaField.VariableName = "inbox";
+                inboxArenaField.Pointer      = true;
+                inboxArenaFieldIndex = (unsigned)declList.size();
+                declList.push_back(inboxArenaField);
+
+                LLVMBackend::DeclTypeAndValue outboxField;
+                outboxField.TypeName     = kArenaChannelType;
+                outboxField.VariableName = "outbox";
+                outboxField.Pointer      = true;
+                outboxFieldIndex = (unsigned)declList.size();
+                declList.push_back(outboxField);
             }
         }
 
@@ -12486,36 +12792,6 @@ public:
                     structVal, llvm::Constant::getNullValue(fieldType), onStdinReturnFieldIndex);
             }
 
-            // Synthetic field: inbox = IQueue<IMessage> fat-ptr pointing to a heap-allocated
-            // channel<IMessage> (zero-init).  Pre-allocating ensures inbox.init(N) is safe to
-            // call before run().  Users replace it with `p.inbox = &myQueue` to swap the impl.
-            {
-                auto* fatTy = compiler->GetFatPtrType();
-                auto dsIt = compiler->dataStructures.find("channel__IMessage");
-                auto* inboxCtorFn = compiler->GetFunction("channel__IMessage");
-                auto* mallocInboxFn = compiler->GetFunction("malloc");
-                if (dsIt != compiler->dataStructures.end() && inboxCtorFn && mallocInboxFn)
-                {
-                    auto* channelType    = dsIt->second.StructType;
-                    auto* channelSize    = compiler->GetTypeSizeBytes(channelType);
-                    auto* channelRaw     = compiler->builder->CreateCall(
-                        mallocInboxFn->getFunctionType(), mallocInboxFn, {channelSize}, "inbox_raw");
-                    auto* channelPtr     = compiler->builder->CreateBitCast(
-                        channelRaw, channelType->getPointerTo(), "inbox_ptr");
-                    auto* channelZeroVal = compiler->builder->CreateCall(
-                        inboxCtorFn->getFunctionType(), inboxCtorFn, {}, "inbox_zero");
-                    compiler->builder->CreateStore(channelZeroVal, channelPtr);
-                    auto* inboxVtable    = compiler->GetOrCreateVTable("channel__IMessage", "IQueue__IMessage");
-                    auto* inboxFatPtr    = compiler->BuildInterfaceFatValue(inboxVtable, channelPtr);
-                    structVal = compiler->CreateInsertValue(structVal, inboxFatPtr, inboxFieldIndex);
-                }
-                else
-                {
-                    structVal = compiler->CreateInsertValue(
-                        structVal, llvm::Constant::getNullValue(fatTy), inboxFieldIndex);
-                }
-            }
-
             // Synthetic field: _stop_source = stop_source() (zero-init; init() called in run())
             if (auto* stopSrcCtorFn = compiler->GetFunction("stop_source"))
             {
@@ -12530,6 +12806,12 @@ public:
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                 trackHandlesFieldIndex);
 
+            // Synthetic field: useChannel = 0 (opt-in arena-channel gate for `p1 >> p2`)
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                useChannelFieldIndex);
+
             // Synthetic fields: _out = nullptr, _in = nullptr (stream*; only present when stream.cb is imported)
             if (outFieldIndex != (unsigned)-1)
             {
@@ -12537,6 +12819,16 @@ public:
                 auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
                 structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
+            }
+
+            // Synthetic fields: inbox = nullptr, outbox = nullptr (arena_channel*; only present
+            // when arena_channel.cb is imported). `a >> b` lazily allocates b.inbox and binds it.
+            if (inboxArenaFieldIndex != (unsigned)-1)
+            {
+                auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
+                auto* nullArena = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, nullArena, inboxArenaFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, nullArena, outboxFieldIndex);
             }
 
             compiler->CreateReturnCall(structVal);
@@ -12579,21 +12871,10 @@ public:
             global_scope = savedScope;
         }
 
-        // Parse destructor if present
-        {
-            bool savedScope = global_scope;
-            for (auto dtor : ctx->destructorDefinition())
-            {
-                global_scope = false;
-                ParseDestructorDefinition(dtor, name);
-            }
-            global_scope = savedScope;
-        }
-
-        // Flush instantiations (e.g. list__string from main's params) before emitting run()
-        ProcessPendingInstantiations();
-
-        // Set programTable before EmitProgramRunWrapper so it can read field indices
+        // Set programTable field indices BEFORE parsing the destructor: a user ~Name()
+        // is emitted as one destructor with the builtin field teardown appended at the
+        // end (ParseProgramDestructorDefinition -> EmitProgramSyntheticTeardown), and the
+        // teardown reads these indices.
         compiler->programTable[name].StructType          = structType;
         compiler->programTable[name].ConfigFields        = declList;
         compiler->programTable[name].ExitCodeFieldIndex  = exitCodeFieldIndex;
@@ -12602,11 +12883,28 @@ public:
         compiler->programTable[name].OnStdoutFieldIndex       = onStdoutFieldIndex;
         compiler->programTable[name].OnStdinFieldIndex        = onStdinFieldIndex;
         compiler->programTable[name].OnStdinReturnFieldIndex  = onStdinReturnFieldIndex;
-        compiler->programTable[name].InboxFieldIndex          = inboxFieldIndex;
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
+        compiler->programTable[name].UseChannelFieldIndex    = useChannelFieldIndex;
         compiler->programTable[name].OutFieldIndex           = outFieldIndex;
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
+        compiler->programTable[name].InboxArenaFieldIndex    = inboxArenaFieldIndex;
+        compiler->programTable[name].OutboxFieldIndex        = outboxFieldIndex;
+
+        // Parse the user destructor if present (at most one). Emitted as a single
+        // compiler-owned ~Name() whose user body runs first, then the builtin teardown.
+        {
+            bool savedScope = global_scope;
+            for (auto dtor : ctx->destructorDefinition())
+            {
+                global_scope = false;
+                ParseProgramDestructorDefinition(dtor, name);
+            }
+            global_scope = savedScope;
+        }
+
+        // Flush instantiations (e.g. list__string from main's params) before emitting run()
+        ProcessPendingInstantiations();
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
         EmitProgramRunWrapper(name);
@@ -12777,6 +13075,13 @@ public:
         LLVMBackend::TypeAndValue returnType{
             .TypeName = structName,
         };
+        // Member functions of this class. Pre-declare their signatures (for
+        // instantiations) BEFORE the dependency flush below, so a sibling
+        // instantiation pulled in by the flush can resolve calls back into this
+        // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
+        auto functionList = ctx->functionDefinition();
+        if (!nameOverride.empty())
+            PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
         // Flush any nested generic instantiations queued while parsing field declarations,
         // so their constructors exist before this class's default constructor calls them.
         {
@@ -12888,70 +13193,7 @@ public:
             }
         }
 
-        // Parse member functions
-        auto functionList = ctx->functionDefinition();
-
-        // For generic instantiations, pre-declare all member function signatures
-        // so they can forward-reference each other.
-        if (!nameOverride.empty())
-        {
-            for (auto func : functionList)
-            {
-                if (IsReturnBlockFunction(func)) continue;
-                if (func->genericTypeParameters() != nullptr) continue;
-
-                std::string funcName = getFunctionName(func);
-
-                // Constructor overload - pre-declare without this* parameter
-                if (funcName == baseName && func->parameterTypeList())
-                {
-                    auto* declParamList = func->parameterTypeList();
-                    auto declParams = this->ParseParameterTypeList(declParamList);
-                    bool declVarargs = declParamList->Ellipsis() != nullptr;
-                    std::vector<LLVMBackend::TypeAndValue> ctorAllParams(declParams.begin(), declParams.end());
-                    compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
-                    continue;
-                }
-
-                bool isOperatorFunc = (funcName == "operator new"
-                                    || funcName == "operator delete"
-                                    || funcName == "operator string");
-                bool isStaticFunc = isFunctionStatic(func);
-                bool isStaticLike = isOperatorFunc || isStaticFunc;
-                std::string declName = isStaticLike ? (structName + "." + funcName) : funcName;
-
-                auto declReturnType = this->getFunctionReturnType(func);
-                auto* declParamList = func->parameterTypeList();
-                auto declParams = this->ParseParameterTypeList(declParamList);
-                bool declVarargs = declParamList && declParamList->Ellipsis() != nullptr;
-
-                if (!isStaticLike)
-                {
-                    LLVMBackend::DeclTypeAndValue thisParam;
-                    thisParam.TypeName = structName;
-                    thisParam.VariableName = structName + "__";
-                    thisParam.Pointer = true;
-                    declParams.insert(declParams.begin(), thisParam);
-                }
-
-                std::vector<LLVMBackend::TypeAndValue> declAllParams(declParams.begin(), declParams.end());
-                bool declReturnsOwned = false;
-                if (declReturnType.TypeName == "string")
-                {
-                    if (declName == "operator+")
-                        declReturnsOwned = true;
-                    else if (declName == "operator string" && declAllParams.size() == 1 && declAllParams[0].TypeName == "i32")
-                        declReturnsOwned = true;
-                    else if (declReturnType.IsMove)
-                        declReturnsOwned = true;
-                }
-                else if (declReturnType.IsMove && declReturnType.Pointer)
-                {
-                    declReturnsOwned = true;
-                }
-                compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
-            }
-        }
+        // Member function signatures were pre-declared above (before the flush).
 
         // Pre-register destructor so 'delete' inside static methods can call it.
         if (!ctx->destructorDefinition().empty())
@@ -13306,6 +13548,55 @@ public:
         auto blockItemList = ctx->compoundStatement()->blockItemList();
         if (blockItemList)
             ParseBlockItemList(blockItemList);
+
+        compiler->CreateReturnCall(nullptr);
+        compiler->CreateBlockBreak(nullptr, true);
+        compiler->ClearCurrentSubprogram();
+    }
+
+    // Like ParseDestructorDefinition, but for a `program`: emit the user's ~Name() body,
+    // then append the builtin field teardown so the program has ONE destructor with the
+    // builtin fields cleaned up at the end. Requires programTable[name] field indices to
+    // be set before this is called.
+    void ParseProgramDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& name)
+    {
+        auto* compiler = Compiler(ctx);
+        LLVMBackend::DeclTypeAndValue thisParam;
+        thisParam.TypeName = name;
+        thisParam.VariableName = name + "__";
+        thisParam.Pointer = true;
+
+        std::vector<LLVMBackend::TypeAndValue> params = { thisParam };
+
+        LLVMBackend::TypeAndValue returnType;
+        returnType.TypeName = "void";
+
+        int line = static_cast<int>(ctx->getStart()->getLine());
+        auto fn = compiler->CreateFunctionDefinition("~" + name, returnType, params, false, false, line);
+        compiler->RegisterDestructor(name, fn);
+
+        compiler->InitializeBlock(&fn->front(), false);
+
+        auto blockItemList = ctx->compoundStatement()->blockItemList();
+        if (blockItemList)
+            ParseBlockItemList(blockItemList);
+
+        // The builtin field teardown is appended at the end of the user body. If the body
+        // fell through to an already-terminated block (an explicit `return;` at the tail),
+        // the teardown would be both unreachable and emitted past a terminator, so reject it
+        // with a clear message instead of producing invalid IR / silently skipping cleanup.
+        if (compiler->builder->GetInsertBlock()->getTerminator() != nullptr)
+        {
+            LogErrorContext(ctx, std::format(
+                "program '{}': ~{}() must not end with an explicit 'return;'. The builtin "
+                "field cleanup (allocator, stop_source, inbox) is appended at the end of the "
+                "destructor, so the body must fall off the end.", name, name));
+        }
+        else
+        {
+            // Builtin program field teardown runs at the end, after the user body falls through.
+            EmitProgramSyntheticTeardown(name, fn->getArg(0));
+        }
 
         compiler->CreateReturnCall(nullptr);
         compiler->CreateBlockBreak(nullptr, true);
