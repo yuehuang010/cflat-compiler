@@ -3,7 +3,8 @@
   "version-string": "0.0.1",
   "dependencies": [
     "curl",
-    "sqlite3"
+    "sqlite3",
+    "zlib"
   ],
   "builtin-baseline": "d015e31e90838a4c9dfa3eed45979bc70d9357fc"
 }

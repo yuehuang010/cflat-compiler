@@ -1,0 +1,106 @@
+// zlib over vcpkg. The `import package-vcpkg` form lets cflat run
+// `vcpkg install` itself (against the sibling vcpkg.json) and auto-resolve the
+// include dir, link lib, and runtime DLL (zlib1.dll) for the declared port.
+// No manual build.bat, no manual lib paths.
+//
+// This demo reads its own source file, compresses it with zlib's compress(),
+// decompresses the result with uncompress(), then compares the round-trip
+// bytes against the original to verify the round trip succeeded.
+//
+// Build:
+//   x64/Debug/cflat.exe example/vcpkg/zlib_demo.cb -o out/zlib_demo.exe
+// Run (pass the source path, or rely on the default relative path):
+//   out\zlib_demo.exe example/vcpkg/zlib_demo.cb
+import package-vcpkg "zlib.h" from "zlib";
+import "filesystem.cb";
+import "string.cb";
+
+// compress/uncompress return int and take only pointer + u32 args, so
+// auto-extern picks them up. compressBound returns uLong (32-bit on Windows);
+// it is also auto-externed. They are declared here for documentation only -
+// remove these and the program still compiles.
+//   int compress(u8* dest, u32* destLen, u8* source, u32 sourceLen);
+//   int uncompress(u8* dest, u32* destLen, u8* source, u32 sourceLen);
+//   u32 compressBound(u32 sourceLen);
+
+extern int main(int argc, char** argv)
+{
+    // Default to this file's path relative to the repo root; allow override.
+    char* path = "example/vcpkg/zlib_demo.cb";
+    if (argc > 1) { path = argv[1]; }
+
+    File* f = new File;
+    if (!f->openRead((string)path))
+    {
+        printf("Could not open source file: %s\n", path);
+        delete f;
+        return 1;
+    }
+    string src = f->readAll();
+    f->close();
+    delete f;
+
+    i32 srcLen = src.length();
+    if (srcLen == 0)
+    {
+        printf("Source file is empty: %s\n", path);
+        return 1;
+    }
+    u8* srcData = (u8*)src.data();
+    printf("Read %d bytes of source from %s\n", srcLen, path);
+
+    // Compress.
+    u32 bound = compressBound((u32)srcLen);
+    u8* comp = new u8[bound];
+    u32 compLen = bound;
+    int rc = compress(comp, &compLen, srcData, (u32)srcLen);
+    if (rc != 0)
+    {
+        printf("compress() failed with code %d\n", rc);
+        delete[] comp;
+        return 1;
+    }
+    printf("Compressed to %d bytes (%d%% of original)\n",
+           (i32)compLen, (i32)((compLen * 100) / (u32)srcLen));
+
+    // Decompress.
+    u8* decomp = new u8[srcLen];
+    u32 decompLen = (u32)srcLen;
+    rc = uncompress(decomp, &decompLen, comp, compLen);
+    if (rc != 0)
+    {
+        printf("uncompress() failed with code %d\n", rc);
+        delete[] comp;
+        delete[] decomp;
+        return 1;
+    }
+    printf("Decompressed to %d bytes\n", (i32)decompLen);
+
+    // Verify the round trip is byte-for-byte identical.
+    int ok = 1;
+    if ((i32)decompLen != srcLen)
+    {
+        ok = 0;
+    }
+    else
+    {
+        int i = 0;
+        while (i < srcLen)
+        {
+            if (decomp[i] != srcData[i]) { ok = 0; break; }
+            i++;
+        }
+    }
+
+    delete[] comp;
+    delete[] decomp;
+
+    if (ok == 0)
+    {
+        printf("FAILED: round-trip data does not match original.\n");
+        return 1;
+    }
+
+    printf("SUCCESS: decompressed data matches original (%d bytes).\n", srcLen);
+    return 0;
+}
