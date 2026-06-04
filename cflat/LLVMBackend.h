@@ -2481,6 +2481,7 @@ private:
         req.args           = BuildClangDriverArgs(hdrDir, extraDefines, /*errorRecovery*/ true);
         req.wantMacros     = true;
         req.requireInScope = true;
+        req.skipFunctionBodies = true;   // headers: declarations only - skip inline bodies
         req.wantIncludes   = (outIncludes != nullptr);
         req.inScopeDirs.push_back(hdrDir);
         for (const auto& inc : cIncludeDirs_) req.inScopeDirs.push_back(inc);

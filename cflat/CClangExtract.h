@@ -121,6 +121,7 @@ namespace cflat_cinterop
         std::vector<std::string> inScopeDirs;
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
         bool wantIncludes = false;          // deep header-cache: record every transitively included file
+        bool skipFunctionBodies = false;    // header bind: parse declarations only, skip function bodies
     };
 
     struct ExtractResult

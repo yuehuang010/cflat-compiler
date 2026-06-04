@@ -387,6 +387,16 @@ namespace cflat_cinterop
                 m.name = mp.name; m.file = mp.file; m.line = mp.line; m.col = mp.col;
                 m.kind = RawMacro::Skip;
 
+                // EvaluateAsRValue must not be called on an error-recovery or value-dependent
+                // initializer (it can assert on the inconsistent node). Probes for non-value
+                // macros are built unparenthesized so they fail to parse and leave a null init
+                // (handled above), but skip defensively here for any that still produce one.
+                if (init->containsErrors() || init->isValueDependent())
+                {
+                    st.out.macros.push_back(std::move(m));
+                    return true;
+                }
+
                 if (auto* sl = llvm::dyn_cast<StringLiteral>(init->IgnoreParenImpCasts()))
                 {
                     if (sl->isOrdinary())
@@ -476,6 +486,12 @@ namespace cflat_cinterop
                 civOpts.RecoverOnError = true;
                 std::unique_ptr<CompilerInvocation> invocationUP = createInvocation(cargs, civOpts);
                 if (!invocationUP) { err = "createInvocation failed"; return false; }
+                // Header binds only need declarations. Skipping function bodies avoids parsing
+                // inline definitions in system headers (e.g. an `&`-taking __inline in math.h
+                // trips a clang classifier assert in assertion-enabled builds) and is faster;
+                // the FunctionDecl + signature are still produced.
+                if (req.skipFunctionBodies)
+                    invocationUP->getFrontendOpts().SkipFunctionBodies = true;
                 invocation.reset(invocationUP.release());
             }
 
@@ -519,12 +535,20 @@ namespace cflat_cinterop
                 probes.reserve(st.probes.size() * 48);
                 for (size_t i = 0; i < st.probes.size(); ++i)
                 {
+                    // No parens around the macro: a macro that expands to a type name (e.g.
+                    // math.h `complex` -> `_complex`) would, when parenthesized, parse as a
+                    // C-style cast with a missing operand and build a classification-inconsistent
+                    // node that trips a clang assert (Expr::ClassifyImpl, "isPRValue()") during
+                    // `__auto_type` deduction. Unparenthesized, the same macro is a clean "type
+                    // name where an expression was expected" error, leaving no usable initializer
+                    // - which the probe reader skips. `=` binds looser than any operator in a
+                    // value macro body, so dropping the parens does not change folded values.
                     probes += "static const __auto_type ";
                     probes += kProbePrefix;
                     probes += std::to_string(i);
-                    probes += " = (";
+                    probes += " = ";
                     probes += st.probes[i].name;
-                    probes += ");\n";
+                    probes += ";\n";
                 }
                 fullSource = req.source + probes;
             }

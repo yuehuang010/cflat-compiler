@@ -1,0 +1,53 @@
+// C-runtime header interop regression test (Tier 1: zero external dependencies).
+// These standard CRT headers bind through clang's auto-detected UCRT include dir, exactly
+// like <windows.h>, so no --c-include flag is needed. They cover interop shapes that
+// windows.h leaves under-exercised:
+//   1. stdlib.h qsort - a CFlat named function passed as a BARE C function pointer comparator
+//      (the only Tier 1 path that round-trips a callback into a C library).
+//   2. math.h - double-by-value parameters and returns through the extern ABI.
+//   3. stdlib.h / time.h - scalar int / pointer / time_t returns.
+import "test_helper.cb";
+import "math.h";
+import "stdlib.h";
+import "time.h";
+
+// qsort comparator: ascending integer order. Receives pointers to two array elements.
+int int_cmp(const void* a, const void* b)
+{
+    int* pa = (int*)a;
+    int* pb = (int*)b;
+    return *pa - *pb;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    // --- math.h (double-by-value ABI). All comparisons are exact for these inputs. ---
+    total++; passed += Test("sqrt(4.0) == 2.0",   sqrt(4.0) == 2.0,        true);
+    total++; passed += Test("pow(2,10) == 1024",  pow(2.0, 10.0) == 1024.0, true);
+    total++; passed += Test("fabs(-5.0) == 5.0",  fabs(-5.0) == 5.0,       true);
+    total++; passed += Test("floor(3.7) == 3.0",  floor(3.7) == 3.0,       true);
+    total++; passed += Test("ceil(3.2) == 4.0",   ceil(3.2) == 4.0,        true);
+
+    // --- stdlib.h scalars ---
+    total++; passed += Test("abs(-7) == 7",       abs(-7) == 7,            true);
+    total++; passed += Test("atoi(\"123\") == 123", atoi("123") == 123,    true);
+
+    // --- time.h: time_t (i64) return ---
+    i64 now = time(nullptr);
+    total++; passed += Test("time(nullptr) > 0",  now > (i64)0,            true);
+
+    // --- stdlib.h qsort with a CFlat comparator passed as a bare C function pointer ---
+    int[5] nums = default;
+    nums[0] = 5; nums[1] = 2; nums[2] = 8; nums[3] = 1; nums[4] = 9;
+    qsort(&nums[0], (u64)5, (u64)sizeof(int), int_cmp);
+
+    bool sorted = nums[0] == 1 && nums[1] == 2 && nums[2] == 5
+               && nums[3] == 8 && nums[4] == 9;
+    total++; passed += Test("qsort ascending order", sorted, true);
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
