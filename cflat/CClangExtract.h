@@ -120,6 +120,7 @@ namespace cflat_cinterop
         bool requireInScope = false;        // keep only decls whose file is under inScopeDirs
         std::vector<std::string> inScopeDirs;
         bool definitionsOnly = false;       // .c auto-extern: only functions defined in this TU
+        bool wantIncludes = false;          // deep header-cache: record every transitively included file
     };
 
     struct ExtractResult
@@ -131,6 +132,7 @@ namespace cflat_cinterop
         std::vector<RawGlobalVar> globals;
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
+        std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
     };
 
     // Parse the TU once and fill `out`. Returns false only on a hard failure to build a TU;

@@ -709,6 +709,7 @@ private:
     // calling exit(1), so the batch loop can record the failure and move on.
     bool batchMode_ = false;
     bool noCache_ = false;
+    bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
     int platformValue = 64;  // 64 for win64, 32 for win32
     // C interop: temp .obj files produced by clang-cl from .c inputs, linked
     // into the final image by EmitExecutable and then deleted.
@@ -847,6 +848,13 @@ private:
         std::string file;
         int line = 1;
     };
+    // One transitively-included file recorded for deep (transitive) disk-cache validation.
+    struct CHeaderDep
+    {
+        std::string path;
+        int64_t  mtime = 0;  // file_time_type::time_since_epoch().count()
+        uint64_t hash  = 0;  // FNV-1a of file contents (checked only on mtime drift)
+    };
     struct CFileSigCacheEntry
     {
         std::filesystem::file_time_type mtime{};
@@ -857,6 +865,8 @@ private:
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
+        // Populated only for deep-mode disk-cache entries; empty otherwise (shallow validation).
+        std::vector<CHeaderDep> deps;
     };
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
@@ -2238,7 +2248,7 @@ private:
     }
 
     // FNV-1a 64-bit hash of a file's bytes. Returns false if the file can't be read.
-    bool HashFileContents(const std::string& path, uint64_t& outHash) const
+    static bool HashFileFnv1a(const std::string& path, uint64_t& outHash)
     {
         auto bufOrErr = llvm::MemoryBuffer::getFile(path);
         if (!bufOrErr) return false;
@@ -2250,6 +2260,10 @@ private:
         }
         outHash = h;
         return true;
+    }
+    bool HashFileContents(const std::string& path, uint64_t& outHash) const
+    {
+        return HashFileFnv1a(path, outHash);
     }
 
     // Register a set of extracted C signatures into the function table (as unmangled,
@@ -2454,7 +2468,8 @@ private:
                              std::vector<CMacroEntry>& outMacros,
                              std::vector<CFunctionMacroEntry>& outFuncMacros,
                              std::vector<CGlobalEntry>& outGlobals,
-                             const std::vector<std::string>& extraDefines = {})
+                             const std::vector<std::string>& extraDefines = {},
+                             std::vector<std::string>* outIncludes = nullptr)
     {
         const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
         std::string fwd = headerPath;
@@ -2466,6 +2481,7 @@ private:
         req.args           = BuildClangDriverArgs(hdrDir, extraDefines, /*errorRecovery*/ true);
         req.wantMacros     = true;
         req.requireInScope = true;
+        req.wantIncludes   = (outIncludes != nullptr);
         req.inScopeDirs.push_back(hdrDir);
         for (const auto& inc : cIncludeDirs_) req.inScopeDirs.push_back(inc);
 
@@ -2479,6 +2495,8 @@ private:
             if (verbose) std::cout << "[verbose]   C header extraction failed: " << err << "\n";
             return false;
         }
+
+        if (outIncludes) *outIncludes = std::move(raw.includedFiles);
 
         {
             llvm::TimeTraceScope adoptScope("AdoptTypedefs", headerPath);
@@ -3242,7 +3260,8 @@ private:
     // EmitExecutable. Results are cached per header+include-dir set, mirroring
     // ExtractCSignatures. Runs in LSP mode too (registration only), so headers contribute
     // hover / completion / go-to-definition.
-    bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {})
+    bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {},
+                        bool diskCache = false)
     {
         llvm::SmallString<256> realPath;
         std::string fileForLsp = headerPath;
@@ -3308,18 +3327,48 @@ private:
             return true;
         }
 
+        // Persistent disk cache (opt-in via the `cache` import clause). On hit we preload the
+        // in-memory cache and register the decls, skipping the clang header parse entirely.
+        // The disk key folds the same path/include/define set as the in-memory key above.
+        std::filesystem::path cHeaderCacheDir = GetCHeaderCacheDir();
+        uint64_t diskKey = 0;
+        if (diskCache && !mtEc && !cHeaderCacheDir.empty())
+        {
+            diskKey = CHeaderDiskCacheKey(fileForLsp, cIncludeDirs_, cDefines_, extraDefines);
+            CFileSigCacheEntry diskEntry;
+            if (TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry))
+            {
+                if (verbose) std::cout << "[verbose] C header disk cache hit for " << fileForLsp << "\n";
+                {
+                    std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
+                    cFileSigCache_[cacheKey] = diskEntry;
+                }
+                RegisterCRecords(diskEntry.records, fileForLsp);
+                RegisterCSignatures(diskEntry.sigs, fileForLsp);
+                RegisterCEnums(diskEntry.enums, fileForLsp);
+                RegisterCMacros(diskEntry.macros);
+                RegisterCFunctionMacros(diskEntry.funcMacros, fileForLsp);
+                RegisterCGlobals(diskEntry.globals, fileForLsp);
+                return true;
+            }
+        }
+
         std::vector<CSigEntry> sigs;
         std::vector<CEnumEntry> enums;
         std::vector<CRecordEntry> records;
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
+        // Deep mode: collect the transitive include set so the disk entry can validate it.
+        bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
+        std::vector<std::string> includes;
         {
             // Functions / enums / records / object-like macro values / function-like macros are
             // all produced by the clang C++ API extractor in one full parse (+ a cheap
             // preprocess-only prepass for macro names). No clang-cl, no libclang.
             llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
-            if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, globals, extraDefines))
+            if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, globals,
+                                     extraDefines, wantDeps ? &includes : nullptr))
                 return false;
         }
 
@@ -3334,6 +3383,27 @@ private:
             entry.macros = macros;
             entry.funcMacros = funcMacros;
             entry.globals = globals;
+            // Build the transitive dependency list (deep mode): keep only paths that resolve
+            // to a real file on disk - this drops the virtual stub and clang pseudo-files,
+            // and dedups. A non-existent dep would otherwise poison every later validation.
+            if (wantDeps)
+            {
+                std::unordered_set<std::string> seen;
+                for (const auto& inc : includes)
+                {
+                    std::error_code dec;
+                    auto dm = std::filesystem::last_write_time(inc, dec);
+                    if (dec) continue;
+                    if (!seen.insert(inc).second) continue;
+                    CHeaderDep dep;
+                    dep.path  = inc;
+                    dep.mtime = (int64_t)dm.time_since_epoch().count();
+                    HashFileFnv1a(inc, dep.hash);
+                    entry.deps.push_back(std::move(dep));
+                }
+            }
+            if (diskCache && !cHeaderCacheDir.empty())
+                WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
         }
@@ -8681,6 +8751,9 @@ public:
     bool IsVerbose() const { return verbose; }
     void SetBatchMode(bool v) { batchMode_ = v; }
     void SetNoCache(bool v) { noCache_ = v; }
+    // When true, headers opted into the disk cache (via the `cache` import clause) record and
+    // validate every transitively-included file's mtime/hash rather than just the top header.
+    void SetCHeaderCacheDeep(bool v) { cHeaderCacheDeep_ = v; }
 
     using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg)>;
     void SetDiagnosticSink(DiagnosticSink sink) { diagnosticSink_ = std::move(sink); }
@@ -8694,7 +8767,7 @@ public:
     // inputOverride, when non-empty, replaces positional(0) as the file to compile.
     // Used by batch / --check mode to compile each positional file independently.
     bool Compile(const ArgParser& args, const std::string& inputOverride = {});
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {});
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
 
     // Vcpkg integration setters - wired from CLI flags in main.cpp.
     void SetVcpkgExe(const std::string& path)        { vcpkg_.SetExeOverride(path); }
@@ -8730,6 +8803,36 @@ public:
         uint64_t h = 14695981039346656037ULL;
         for (unsigned char c : fileForLsp) { h ^= c; h *= 1099511628211ULL; }
         for (const auto& d : defines) for (unsigned char c : d) { h ^= c; h *= 1099511628211ULL; }
+        return h;
+    }
+
+    // Disk-cache directory for plain `import "x.h" cache;` header binds. Sits beside the
+    // core-bitcode and linker-path caches under %USERPROFILE%\.cflat. Empty if unavailable.
+    static std::string GetCHeaderCacheDir()
+    {
+        std::string base = GetCflatCacheDir();
+        if (base.empty()) return {};
+        return base + "\\cheaders";
+    }
+
+    // FNV-1a key for the plain-header disk cache. Folds the same inputs as the in-memory
+    // cache key in CompileCHeader (canonical path, every --c-include dir, every --c-define,
+    // and every per-import inline define) so a header exposed differently under different
+    // roots/defines never collides on a stale entry. The version-stamped SDK include dirs
+    // here are what catch an SDK upgrade in shallow mode.
+    static uint64_t CHeaderDiskCacheKey(const std::string& fileForLsp,
+                                        const std::vector<std::string>& includeDirs,
+                                        const std::vector<std::string>& defines,
+                                        const std::vector<std::string>& extraDefines)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        auto fold = [&h](const std::string& s) {
+            for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+        };
+        fold(fileForLsp);
+        for (const auto& inc : includeDirs)  { fold("|I"); fold(inc); }
+        for (const auto& def : defines)      { fold("|D"); fold(def); }
+        for (const auto& def : extraDefines) { fold("|d"); fold(def); }
         return h;
     }
 
@@ -8913,7 +9016,19 @@ public:
         return m;
     }
 
-    static bool TryLoadVcpkgHeaderDiskCache(
+    // Validate one transitively-included dependency: accept on mtime match (fast) or, on
+    // mtime drift, content-hash match. A vanished file or unreadable hash is a miss.
+    static bool CHeaderDepFresh(const CHeaderDep& dep)
+    {
+        std::error_code ec;
+        auto mt = std::filesystem::last_write_time(dep.path, ec);
+        if (ec) return false;
+        if ((int64_t)mt.time_since_epoch().count() == dep.mtime) return true;
+        uint64_t h = 0;
+        return HashFileFnv1a(dep.path, h) && h == dep.hash;
+    }
+
+    static bool TryLoadCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
@@ -8930,7 +9045,8 @@ public:
         nlohmann::json j;
         try { f >> j; } catch (...) { return false; }
 
-        if (j.value("version", 0) != 1) return false;
+        int version = j.value("version", 0);
+        if (version != 1 && version != 2) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -8948,11 +9064,26 @@ public:
         if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
         if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
         if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
+
+        // A deep (transitive) entry is only fresh if every recorded include is unchanged.
+        // Shallow entries (no "deps") skip this and rely on the top-header check above.
+        if (j.contains("deps"))
+        {
+            for (const auto& dj : j["deps"])
+            {
+                CHeaderDep dep;
+                dep.path  = dj.value("f", std::string{});
+                dep.mtime = dj.value("mt", int64_t{0});
+                dep.hash  = dj.value("h",  uint64_t{0});
+                if (!CHeaderDepFresh(dep)) return false;
+                entry.deps.push_back(std::move(dep));
+            }
+        }
         out = std::move(entry);
         return true;
     }
 
-    static void WriteVcpkgHeaderDiskCache(
+    static void WriteCHeaderDiskCache(
         const std::filesystem::path& cacheDir,
         uint64_t diskKey,
         std::filesystem::file_time_type mtime,
@@ -8965,7 +9096,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 1;
+        j["version"] = 2;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 
@@ -8987,6 +9118,15 @@ public:
         nlohmann::json globals = nlohmann::json::array();
         for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
         j["globals"] = globals;
+
+        // Deep mode only: the transitive include set for strict (transitive) validation.
+        if (!entry.deps.empty())
+        {
+            nlohmann::json deps = nlohmann::json::array();
+            for (const auto& d : entry.deps)
+                deps.push_back({{"f", d.path}, {"mt", d.mtime}, {"h", d.hash}});
+            j["deps"] = deps;
+        }
 
         // Atomic write: PID-stamped temp file renamed over the target.
         auto tmpPath  = cacheDir / std::format("{:016x}.{}.tmp", diskKey, _getpid());
@@ -9114,7 +9254,7 @@ public:
         if (haveHash && !mtEc)
         {
             CFileSigCacheEntry diskEntry;
-            if (TryLoadVcpkgHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
+            if (TryLoadCHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, diskEntry))
             {
                 std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
                 cFileSigCache_[inMemKey] = std::move(diskEntry);
@@ -9136,7 +9276,7 @@ public:
                 if (it != cFileSigCache_.end()) { entryToWrite = it->second; haveEntry = true; }
             }
             if (haveEntry)
-                WriteVcpkgHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
+                WriteCHeaderDiskCache(vcpkgCacheDir, diskKey, headerMtime, contentHash, entryToWrite);
         }
 
         if (ok) ProcessPendingMacroSources();

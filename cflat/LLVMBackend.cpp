@@ -52,6 +52,13 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
     return defines;
 }
 
+// True when this import line carries an inline `cache` clause, opting the header into the
+// persistent C-header disk cache. Applies to the bare-header and `import package` forms.
+static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
+{
+    return imp->cacheClause() != nullptr;
+}
+
 // True when this import line is `import package-vcpkg "..." from "...";`. Detected by
 // the second child token text - mirrors the existing `package` / `program` test.
 static bool IsPackageVcpkgImport(CFlatParser::ImportDeclarationContext* imp)
@@ -326,8 +333,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         bool isCProgram = isProgram && impExt == ".c";
                         std::string explicitLib = DequoteLibClause(imp);
                         std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << "\n";
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines))
+                        bool cacheHeader = HasCacheClause(imp);
+                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << (cacheHeader ? " (cache)" : "") << "\n";
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines, cacheHeader))
                             return false;
 
                         if (isProgram)
@@ -612,7 +620,7 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
     return dirs;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines, bool cacheHeader)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -729,7 +737,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                     lp = (std::filesystem::path(importingFilePath).parent_path() / lp).lexically_normal();
                 cLinkLibs_.push_back(lp.string());
             }
-            bool ok = CompileCHeader(canonicalStr, extraDefines);
+            bool ok = CompileCHeader(canonicalStr, extraDefines, cacheHeader);
             // Translate any queued function-like-macro source into generic templates so
             // they are visible to the importing file's ForwardRefScanner.
             if (ok) ProcessPendingMacroSources();

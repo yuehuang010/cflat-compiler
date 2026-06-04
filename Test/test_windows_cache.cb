@@ -1,0 +1,27 @@
+// C-header disk-cache regression test. Mirrors test_windows.cb but opts the windows.h
+// bind into the persistent disk cache via the `cache` import clause. The first compile
+// extracts windows.h and writes %USERPROFILE%\.cflat\cheaders\<key>.json; later compiles
+// load the JSON instead of re-running the clang header parse. Either way the extracted
+// decls must be identical, so the same calls resolve and run.
+import "test_helper.cb";
+import "windows.h" cache;
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    u32 pid = GetCurrentProcessId();
+    total++; passed += Test("GetCurrentProcessId nonzero (cached)", pid != 0, true);
+
+    void* out = GetStdHandle((u32)-11);  // STD_OUTPUT_HANDLE
+    total++; passed += Test("GetStdHandle non-null (cached)", out != nullptr, true);
+
+    u32 tick1 = GetTickCount();
+    Sleep(1);
+    u32 tick2 = GetTickCount();
+    total++; passed += Test("GetTickCount monotonic (cached)", tick2 >= tick1, true);
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

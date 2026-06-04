@@ -166,6 +166,25 @@ namespace cflat_cinterop
             }
         };
 
+        // Deep header-cache PPCallbacks: record every file the preprocessor enters. The raw
+        // list includes the virtual main stub and clang pseudo-files (<built-in>, ...); those
+        // are filtered out by the caller when it builds the on-disk dependency list (only
+        // paths that resolve to a real file on disk are kept).
+        struct IncludeCollector : public PPCallbacks
+        {
+            Preprocessor& pp;
+            ExtractState& st;
+            IncludeCollector(Preprocessor& p, ExtractState& s) : pp(p), st(s) {}
+
+            void FileChanged(SourceLocation loc, FileChangeReason reason,
+                             SrcMgr::CharacteristicKind, FileID) override
+            {
+                if (reason != EnterFile) return;
+                StringRef fn = pp.getSourceManager().getFilename(loc);
+                if (!fn.empty()) st.out.includedFiles.push_back(fn.str());
+            }
+        };
+
         struct DeclVisitor : public RecursiveASTVisitor<DeclVisitor>
         {
             ASTContext& ctx;
@@ -416,6 +435,13 @@ namespace cflat_cinterop
         {
             ExtractState& st;
             explicit ExtractAction(ExtractState& s) : st(s) {}
+            bool BeginSourceFileAction(CompilerInstance& ci) override
+            {
+                if (st.req.wantIncludes)
+                    ci.getPreprocessor().addPPCallbacks(
+                        std::make_unique<IncludeCollector>(ci.getPreprocessor(), st));
+                return true;
+            }
             std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance&, StringRef) override
             {
                 return std::make_unique<ExtractConsumer>(st);

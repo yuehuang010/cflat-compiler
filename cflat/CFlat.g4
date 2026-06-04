@@ -618,9 +618,9 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import StringLiteral (As Identifier)? ';'
+    : Import StringLiteral (As Identifier)? cacheClause? ';'
     | Import 'program' StringLiteral As Identifier ';'
-    | Import 'package' StringLiteral libClause? defineClause* ';'
+    | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause ';'
     ;
 
@@ -636,6 +636,16 @@ libClause
 // Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
 defineClause
     : 'define' StringLiteral
+    ;
+
+// Optional inline opt-in to the persistent C-header disk cache:
+//   import "windows.h" cache;
+//   import package "curl/curl.h" lib "libcurl.lib" cache;
+// `cache` is a soft keyword (inline literal, like lib/define/from). When present, the
+// extracted declarations for this header are cached to %USERPROFILE%\.cflat\cheaders so
+// the next cold compile loads the JSON instead of re-running the clang header parse.
+cacheClause
+    : 'cache'
     ;
 
 // Required port name (with optional [features]) on an `import package-vcpkg` line:

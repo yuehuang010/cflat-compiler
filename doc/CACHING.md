@@ -62,6 +62,45 @@ core file produces a new hash and the old directory is ignored - it can be delet
 | `--init` re-run | Overwrites the files in the current hash directory |
 | Cache absent or unreadable | Transparent fallback to full source parse |
 
+## C-header cache (opt-in)
+
+Binding a large C header (e.g. `import "windows.h";`) runs a full clang parse of the header
+and its transitive includes. For `windows.h` that dominates a cold compile (~1.3s of ~2.3s,
+visible as the `CHeaderExtract` phase under `-ftime-trace`). The in-memory cache only helps
+*within* one process (LSP, `--check` batches); a fresh `cflat.exe` starts cold.
+
+Opt a header into a persistent disk cache with the inline `cache` clause:
+
+```cflat
+import "windows.h" cache;
+import package "curl/curl.h" lib "libcurl.lib" cache;   // clause comes last
+```
+
+The extracted declarations (functions, enums, records, macros, globals) are serialized to:
+
+```
+%USERPROFILE%\.cflat\cheaders\<key>.json
+```
+
+The `<key>` is an FNV-1a hash of the canonical header path plus every `--c-include` dir,
+`--c-define`, and inline `define` - the same inputs as the in-memory cache key - so a header
+exposed differently under different roots/defines never collides on a stale entry.
+
+### Validation: shallow (default) vs deep
+
+| Mode | Trigger | What is checked |
+|------|---------|-----------------|
+| Shallow | default | Top header mtime (hash on mtime drift) + the version-stamped SDK include dirs baked into the key. An SDK upgrade changes those paths -> automatic miss. |
+| Deep | `--c-header-cache-deep` | Every transitively `#include`d file's mtime/hash, recorded as a `deps` list in the JSON and re-checked on load. Catches an in-place SDK header edit the top-header check would miss, at the cost of validating hundreds of files. |
+
+A `cache` clause with no `--c-header-cache-deep` writes a shallow entry; adding the switch
+rewrites it with a `deps` list on the next miss. Loading is forward-compatible: a shallow
+entry skips the transitive check, a deep entry enforces it regardless of the current switch.
+
+This is **distinct** from the `import package-vcpkg` cache, which is co-located in
+`vcpkg_installed/.cflat-cache/` (a vcpkg package is already version-pinned, so it caches
+unconditionally). Headers without a `cache` clause are never disk-cached.
+
 ## Troubleshooting
 
 - **Cache not taking effect**: run `cflat.exe --init` to rebuild it after an update.
