@@ -127,6 +127,16 @@ if not exist "%OUT%\results" mkdir "%OUT%\results"
 del /q "%OUT%\results\*.result" 2>nul
 del /q "%OUT%\results\*.log" 2>nul
 
+REM Warm the compiler cache (linker paths + core-library bitcode) once up front so the
+REM parallel worker compiles load bitcode instead of re-parsing the stdlib closure each time.
+REM Use the compiler under test; --init must succeed - a failure is a real regression.
+"%COMPILER%" --init --nologo >"%OUT%\results\init.log" 2>&1
+if errorlevel 1 (
+    echo FAILED: cflat.exe --init
+    type "%OUT%\results\init.log"
+    exit /b 1
+)
+
 REM Pre-build the C-interop fixture library so test_c_package.cb can bind it.
 REM (Uses the clang-cl/lld-link deployed next to cflat.exe for this config.)
 if exist "%SRC%\cinterop\build_mathlib.bat" (
