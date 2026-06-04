@@ -67,3 +67,4 @@ core file produces a new hash and the old directory is ignored - it can be delet
 - **Cache not taking effect**: run `cflat.exe --init` to rebuild it after an update.
 - **Unexpected errors after update**: delete `%USERPROFILE%\.cflat\` and re-run `--init`.
 - **Bypass for debugging**: pass `--no-cache` to force a full parse for a single invocation.
+- **Profiling a slow compile**: pass `-ftime-trace` (clang's single-dash spelling) to write a Chrome-trace JSON to `<input>.time-trace.json`. Load it in `chrome://tracing` or Perfetto to see where the time goes. With a warm cache `RuntimeImport` should be small; the usual remaining cost is `CHeaderExtract` (libclang parsing of any imported C header, e.g. `windows.h`), which is not yet disk-cached.

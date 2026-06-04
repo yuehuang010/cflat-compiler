@@ -89,7 +89,7 @@ int main(int argc, char* argv[])
     if (showLogo)
         std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
 
-    // --ftime-trace is a top-level switch: initialize the profiler up front so every
+    // -ftime-trace is a top-level switch: initialize the profiler up front so every
     // code path below (single compile or --check batch) is captured, and write the trace
     // at the matching exit. The TimeTraceScope annotations inside Compile feed it.
     bool ftimeTrace = args.hasFlag("ftime-trace");
