@@ -583,7 +583,7 @@ bool testCaptureMultiple()
             total.value = total.value + (int)(n * rate) + base;
         };
         accumulate(2);   // (int)(2*1.5) + 10 = 3+10 = 13
-        accumulate(4);   // (int)(4*1.5) + 10 = 6+10 = 16  → total=29
+        accumulate(4);   // (int)(4*1.5) + 10 = 6+10 = 16  -> total=29
         result &= Test("multi int+float+struct", total.value, 29);
     }
 

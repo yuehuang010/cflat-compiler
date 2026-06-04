@@ -1991,11 +1991,11 @@ bool testImplicitStringLiteral()
 {
     bool result = true;
 
-    // string s = "literal" - implicit char* → string coercion in variable declaration
+    // string s = "literal" - implicit char* -> string coercion in variable declaration
     string s1 = "hello";
     result &= Test("implicit_decl", s1, "hello");
 
-    // list<string>.add("literal") - implicit char* → string coercion in function argument
+    // list<string>.add("literal") - implicit char* -> string coercion in function argument
     list<string> words = default;
     words.add("foo");
     words.add("bar");

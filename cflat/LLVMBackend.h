@@ -690,7 +690,7 @@ public:
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
-    // Maps import alias name → set of unqualified symbol names the file contributed.
+    // Maps import alias name -> set of unqualified symbol names the file contributed.
     // Populated by CompileImportedFile when namespaceName is non-empty.
     std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
     std::unordered_set<std::string> importedFiles;
@@ -994,7 +994,7 @@ private:
     {
         auto fn = llvm::Function::Create(returnType, llvm::Function::ExternalLinkage, name, *module);
 
-        // CFlat treats null pointer dereferences as defined behavior (hardware fault → SEH).
+        // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
         // This attribute prevents instcombine from removing loads/stores through null pointers
         // as UB, preserving the fault so the program construct's SEH handler can catch it.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
@@ -6458,7 +6458,7 @@ public:
             fn = createFunctionProto(mangledName, functionType);
         }
 
-        // CFlat treats null pointer dereferences as defined behavior (hardware fault → SEH).
+        // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
@@ -6625,7 +6625,7 @@ public:
         }
 
         // Apply pointer wrapping to get the element type before array wrapping.
-        // This ensures char*[3] → [3 x ptr] not [3 x i8].
+        // This ensures char*[3] -> [3 x ptr] not [3 x i8].
         if (allowPointer && typeAndValue.Pointer)
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
@@ -6639,7 +6639,7 @@ public:
 
         if (typeAndValue.ConstArraySize > 0)
         {
-            // Build from innermost to outermost: T[N1][N2] → [N1 x [N2 x T]]
+            // Build from innermost to outermost: T[N1][N2] -> [N1 x [N2 x T]]
             llvm::Type* inner = type;
             for (int i = (int)typeAndValue.ConstInnerDimensions.size() - 1; i >= 0; i--)
                 inner = llvm::ArrayType::get(inner, typeAndValue.ConstInnerDimensions[i]);
@@ -6766,7 +6766,7 @@ public:
                                 result = 0;
                         }
                     }
-                    // Implicit char* → string coercion: string literal or char* passed to a string param.
+                    // Implicit char* -> string coercion: string literal or char* passed to a string param.
                     if (result < 0 && candidateParamItr->TypeName == "string" && !candidateParamItr->Pointer
                         && arg.BaseType && arg.BaseType->isPointerTy())
                         result = 1;
@@ -7326,7 +7326,7 @@ public:
                     if (candParamItr->TypeName == "string" && !candParamItr->Pointer
                         && value && value->getType() == builder->getInt8Ty()->getPointerTo())
                     {
-                        // Implicit char* → string coercion: string literal or char* passed to a string param.
+                        // Implicit char* -> string coercion: string literal or char* passed to a string param.
                         auto* c = llvm::dyn_cast<llvm::Constant>(value);
                         if (c && IsStringLiteralConstant(c))
                             value = WrapStringLiteralAsString(value);

@@ -56,7 +56,7 @@ import "thread.cb";
 class channel<T>
 {
     // ── cache line 0: shared read-only config ─────────────────────────────────
-    // buf*(8) + seq*(8) + cap(8) + mask(8) + 4×pad(32) = 64 bytes
+    // buf*(8) + seq*(8) + cap(8) + mask(8) + 4xpad(32) = 64 bytes
     T*   _buf  = nullptr;
     i64* _seq  = nullptr;
     i64  _cap  = 0;
@@ -64,19 +64,19 @@ class channel<T>
     i64  _c0 = 0; i64 _c1 = 0; i64 _c2 = 0; i64 _c3 = 0;
 
     // ── cache line 1: producer cursor ─────────────────────────────────────────
-    // head(8) + 7×pad(56) = 64 bytes
+    // head(8) + 7xpad(56) = 64 bytes
     i64 _head = 0;
     i64 _h0 = 0; i64 _h1 = 0; i64 _h2 = 0; i64 _h3 = 0;
     i64 _h4 = 0; i64 _h5 = 0; i64 _h6 = 0;
 
     // ── cache line 2: consumer cursor ─────────────────────────────────────────
-    // tail(8) + 7×pad(56) = 64 bytes
+    // tail(8) + 7xpad(56) = 64 bytes
     i64 _tail = 0;
     i64 _t0 = 0; i64 _t1 = 0; i64 _t2 = 0; i64 _t3 = 0;
     i64 _t4 = 0; i64 _t5 = 0; i64 _t6 = 0;
 
     // ── cache line 3: producer refcount + close flag ──────────────────────────
-    // producers(8) + closed(8) + 6×pad(48) = 64 bytes
+    // producers(8) + closed(8) + 6xpad(48) = 64 bytes
     //
     // Rust-mpsc-style termination: each live producer registers via
     // add_producer().  When the last one leaves (close_producer() brings the

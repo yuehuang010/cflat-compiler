@@ -845,7 +845,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
 
     // Register the file-scoped import alias.  The "$global$:<alias>" sentinel tells
-    // ResolveQualifiedName and ParsePostfixExpression to resolve Alias.X → X only
+    // ResolveQualifiedName and ParsePostfixExpression to resolve Alias.X -> X only
     // when X was contributed by this file (membership-checked via importAliasMembers).
     if (!namespaceName.empty())
     {

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ============================================================
 // MainListener.h - CFlat front-end: ForwardRefScanner + MainListener
 // ============================================================
@@ -1206,7 +1206,7 @@ private:
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>&      genericClassTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructTypeParams;
     std::unordered_set<std::string>&                                            instantiatedGenerics;
-    // Constraints: templateName -> { typeParamName -> [requiredInterface, …] }
+    // Constraints: templateName -> { typeParamName -> [requiredInterface, ...] }
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
@@ -3770,7 +3770,7 @@ public:
             arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
         }
 
-        // Evaluate inner dimensions for multi-dim arrays: T[N][M] → ConstInnerDimensions = {M}
+        // Evaluate inner dimensions for multi-dim arrays: T[N][M] -> ConstInnerDimensions = {M}
         typeAndValue.ConstInnerDimensions.clear();
         for (auto* dimExpr : typeAndValue.ExtraArrayDims)
         {
@@ -4046,7 +4046,7 @@ public:
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                             }
                             lambdaExpectedType = {};
-                            // Implicit char* → string coercion: string s = "hello" or string s = charPtr.
+                            // Implicit char* -> string coercion: string s = "hello" or string s = charPtr.
                             if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
                                 && right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
                             {
@@ -5752,7 +5752,7 @@ public:
 
                 if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
                 {
-                    // ptr - ptr → element count (C ptrdiff_t semantics)
+                    // ptr - ptr -> element count (C ptrdiff_t semantics)
                     auto* i64Ty = Compiler(ctx)->builder->getInt64Ty();
                     auto* byteDiff = Compiler(ctx)->builder->CreateSub(
                         Compiler(ctx)->builder->CreatePtrToInt(lvalue, i64Ty),
@@ -5773,7 +5773,7 @@ public:
                     && rvalue && rvalue->getType()->isIntegerTy()
                     && (op == "+" || op == "-"))
                 {
-                    // Pointer arithmetic: ptr + int / ptr - int → GEP
+                    // Pointer arithmetic: ptr + int / ptr - int -> GEP
                     if (op == "-")
                         rvalue = Compiler(ctx)->builder->CreateNeg(rvalue, "neg");
                     lvalue = Compiler(ctx)->CreateGEP(elemType, lvalue, rvalue, "ptrarith");
@@ -5843,7 +5843,7 @@ public:
                 return namedVar.Primary;
             if (namedVar.Storage != nullptr)
             {
-                // Pointer array decay: char*[3] used as char** → GEP to first element.
+                // Pointer array decay: char*[3] used as char** -> GEP to first element.
                 // Must check before the alloca load path below.
                 if (namedVar.BaseType && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
                 {
@@ -7437,7 +7437,7 @@ public:
                         if (!namespaceContext.empty())
                         {
                             // "$global$:<alias>" sentinel: file-scoped import alias.
-                            // Resolve Alias.Symbol → Symbol only if Symbol is a member of that alias.
+                            // Resolve Alias.Symbol -> Symbol only if Symbol is a member of that alias.
                             bool isFileAlias = namespaceContext.starts_with("$global$:");
                             std::string memberName = terminal->getText();
                             std::string qualifiedName;
@@ -7446,7 +7446,7 @@ public:
                                 std::string aliasName = namespaceContext.substr(9);
                                 qualifiedName = Compiler(ctx)->IsImportAliasMember(aliasName, memberName)
                                     ? memberName
-                                    : namespaceContext + "." + memberName;  // will fail → error
+                                    : namespaceContext + "." + memberName;  // will fail -> error
                             }
                             else
                             {
@@ -8555,7 +8555,7 @@ public:
                                     {
                                         std::string elemTypeName = typeName.substr(6);
 
-                                        // arr = src.getArray(name) → alloca fat ptr
+                                        // arr = src.getArray(name) -> alloca fat ptr
                                         auto* arrVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getArray", {nameNV});
                                         auto* arrAlloca = compiler->builder->CreateAlloca(fatTy, nullptr, "reflect_set_arr");
                                         compiler->builder->CreateStore(arrVal, arrAlloca);
@@ -8839,7 +8839,7 @@ public:
                                         // Compile-time use-after-move check: arg is a moved variable.
                                         if (argNV.IsMoved && argNV.IdentifierLine > 0)
                                         {
-                                            // (Same diagnostic shape as direct-call site; conservative — only fires when source variable was already moved.)
+                                            // (Same diagnostic shape as direct-call site; conservative - only fires when source variable was already moved.)
                                             Compiler(ctx)->LogError(std::format("use of moved variable '{}'", argNV.CallerName));
                                         }
                                     }
@@ -9250,7 +9250,7 @@ public:
                                     // Propagate struct TypeName for pointer args (e.g. move expressions, new)
                                     // so struct*->interface* upcast matching works in ComputeOverloadFunction.
                                     // Only propagate for known struct types - primitive TypeNames (char, bool,
-                                    // int, …) must stay empty so LLVM-type comparison handles them correctly.
+                                    // int, ...) must stay empty so LLVM-type comparison handles them correctly.
                                     if (argVar.TypeAndValue.TypeName.empty() && argNV.TypeAndValue.Pointer
                                         && !argNV.TypeAndValue.TypeName.empty()
                                         && Compiler(ctx)->IsDataStructure(argNV.TypeAndValue.TypeName))
@@ -10286,7 +10286,7 @@ public:
                 hex += *itr++;
             return static_cast<char>(std::stoi(hex, nullptr, 16));
         }
-        // Octal escape: 1–3 octal digits (\0, \033, \177, etc.).
+        // Octal escape: 1-3 octal digits (\0, \033, \177, etc.).
         if (esc >= '0' && esc <= '7')
         {
             int val = esc - '0';
@@ -10334,7 +10334,7 @@ public:
         return *itr;
     }
 
-    // foldBraces: when true, {{ → { and }} → } (source-level escape for non-interpolated strings).
+    // foldBraces: when true, {{ -> { and }} -> } (source-level escape for non-interpolated strings).
     // Pass false when decoding accumulated literal content inside ParseFormatString, because
     // that content may contain legitimate }} sequences (e.g. from JSON) that must not be folded.
     std::string ProcessRawText(const std::string& rawText, bool foldBraces = false)
@@ -10359,7 +10359,7 @@ public:
             }
             else if (foldBraces && (*itr == '{' || *itr == '}') && (itr + 1) != rawText.cend() && *(itr + 1) == *itr)
             {
-                // {{ → { and }} → } (only for source-level non-interpolated strings)
+                // {{ -> { and }} -> } (only for source-level non-interpolated strings)
                 output += *itr;
                 itr += 2;
             }
@@ -11601,7 +11601,7 @@ public:
                 progType, self, allocatorIdx, "alloc_field_gep");
             auto* existingFatPtr = compiler->builder->CreateLoad(fatTy, allocFieldGEP, "existing_alloc");
 
-            // Check data ptr (field 1): null means user left _allocator unset → use default.
+            // Check data ptr (field 1): null means user left _allocator unset -> use default.
             auto* existingDataPtr = compiler->builder->CreateExtractValue(existingFatPtr, {1u}, "existing_data");
             auto* isNull = compiler->builder->CreateICmpEQ(
                 existingDataPtr,
@@ -11729,7 +11729,7 @@ public:
             auto* exitCodeGEP = compiler->builder->CreateStructGEP(
                 progType, self, exitCodeIdx, "exit_code_gep");
 
-            // ---- ArgcArgv conversion: list<string> → argc + char** argv ----
+            // ---- ArgcArgv conversion: list<string> -> argc + char** argv ----
             // Used only when main(int argc, char** argv) style is detected.
             // argvHolderAlloca stores the malloc'd argv array so cleanupBB can free it.
             llvm::AllocaInst* argvHolderAlloca = nullptr;
@@ -13395,7 +13395,7 @@ public:
         return typeParams;
     }
 
-    // Returns { typeParamName -> [requiredInterface, …] } from a whereClause context.
+    // Returns { typeParamName -> [requiredInterface, ...] } from a whereClause context.
     std::unordered_map<std::string, std::vector<std::string>>
     ParseWhereClause(CFlatParser::WhereClauseContext* wc)
     {
@@ -13775,7 +13775,7 @@ public:
             return static_cast<int>(uval);
         // C++ rule: hex literals that exceed i32 positive range but fit in u32 are typed as
         // unsigned int. Since ConstantVariant has no uint32_t, reinterpret bits as i32.
-        // This preserves the bit pattern: 0xBA63E001 → i32(-1168474111) with correct bits.
+        // This preserves the bit pattern: 0xBA63E001 -> i32(-1168474111) with correct bits.
         if (isHex && uval <= 0xFFFFFFFFull)
             return static_cast<int>(static_cast<uint32_t>(uval));
         return static_cast<int64_t>(uval);

@@ -7,18 +7,18 @@ import "vmem.cb";
 // before the user pointer. dealloc always backs up 8 bytes to find the
 // header; the sign of _size distinguishes the two paths:
 //
-//   _size > 0  → slab allocation  (free block via coalescing free list)
-//   _size < 0  → large allocation (free via vmem_free)
+//   _size > 0  -> slab allocation  (free block via coalescing free list)
+//   _size < 0  -> large allocation (free via vmem_free)
 //
 // Large-alloc vmem_alloc layout:
 //   [base + 0]  _FA_LargePrefix._totalSize (8 bytes - vmem_alloc size)
 //   [base + 8]  _FA_LargePrefix._next      (8 bytes - linked list)
 //   [base + 16] _FA_Header._size           (8 bytes - stored as -userSize)
-//   [base + 24] user data                  ← returned pointer
+//   [base + 24] user data                  <- returned pointer
 //
 // Slab-alloc block layout (within a segment):
 //   [block + 0] _FA_Header._size           (8 bytes - stored as +userSize)
-//   [block + 8] user data                  ← returned pointer
+//   [block + 8] user data                  <- returned pointer
 //
 // The free list is a sorted doubly-linked list of free blocks ordered by
 // address. Adjacent free blocks are coalesced on dealloc (O(1)).
@@ -214,7 +214,7 @@ class FitAllocator : IAllocator
 
         // _FA_Header sits right after the prefix.
         _FA_Header* hdr = (_FA_Header*)(base + pfxSize);
-        hdr->_size = -size;  // negative → large allocation
+        hdr->_size = -size;  // negative -> large allocation
 
         _largeBytes  = _largeBytes + size;
         _largeCount  = _largeCount + 1;
@@ -303,7 +303,7 @@ class FitAllocator : IAllocator
         _maybeSplit(fb, allocSize);
 
         _FA_Header* hdr = (_FA_Header*)fb;
-        hdr->_size = allocSize;  // positive → slab
+        hdr->_size = allocSize;  // positive -> slab
 
         _usedBytes = _usedBytes + allocSize;
         return (void*)((i8*)fb + _hdrSize());

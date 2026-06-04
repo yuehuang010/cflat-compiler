@@ -1,7 +1,7 @@
 import "graphic/bitmap.cb";
 import "test_helper.cb";
 
-// ── round-trip: create → save → load → verify ────────────────────────────────
+// ── round-trip: create -> save -> load -> verify ────────────────────────────────
 
 int testRoundTrip()
 {

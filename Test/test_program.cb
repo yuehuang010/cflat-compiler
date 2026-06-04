@@ -901,7 +901,7 @@ program ListStringOwnership {
 bool testListStringNoLeaks() {
     bool result = true;
     ListStringOwnership p;
-    p.count = 4;  // 4 strings × 16 bytes = 64 bytes = one block; count>4 would overflow
+    p.count = 4;  // 4 strings x 16 bytes = 64 bytes = one block; count>4 would overflow
     list<string> args;
     p.run(args);
     p.WaitForExit();
@@ -1246,14 +1246,14 @@ program ArgcArgvMain {
 bool testArgcArgvMain() {
     bool ok = true;
 
-    // Empty args → argc = 0
+    // Empty args -> argc = 0
     ArgcArgvMain p0;
     list<string> empty;
     p0.run(empty);
     p0.WaitForExit();
     ok &= Test("ArgcArgv argc empty", p0.exitCode, 0);
 
-    // Two args → argc = 2
+    // Two args -> argc = 2
     ArgcArgvMain p2;
     list<string> twoArgs;
     string s1 = "" + "hello";
@@ -1270,14 +1270,14 @@ bool testArgcArgvMain() {
 bool testImportedProgram() {
     bool ok = true;
 
-    // Empty args → argc = 0
+    // Empty args -> argc = 0
     Hello h0;
     list<string> empty;
     h0.run(empty);
     h0.WaitForExit();
     ok &= Test("imported program empty args", h0.exitCode, 0);
 
-    // Two args → argc = 2
+    // Two args -> argc = 2
     Hello h2;
     list<string> twoArgs;
     string s1 = "" + "hello";

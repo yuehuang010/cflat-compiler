@@ -471,7 +471,7 @@ point.item_1 = 1.5f;
 int n = point.size();   // 2 - number of elements
 ```
 
-Fields are named `item_0`, `item_1`, … and can be accessed directly.
+Fields are named `item_0`, `item_1`, ... and can be accessed directly.
 
 ### Tuple Construction
 
@@ -1154,7 +1154,7 @@ p = arr;
 p += 3;                // points to arr[3]
 p -= 2;                // points to arr[1]
 
-// ptr - ptr → element count (C ptrdiff_t)
+// ptr - ptr -> element count (C ptrdiff_t)
 int* start = arr;
 int* end   = arr + 4;
 int diff = (int)(end - start);   // 4  (not 16 bytes)
@@ -1400,7 +1400,7 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 |------|---------|
 | `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort - **auto-imported** |
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
-| `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type; fields `item_0`, `item_1`, …; `size()` |
+| `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type; fields `item_0`, `item_1`, ...; `size()` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation |
 | `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |

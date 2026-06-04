@@ -15,8 +15,8 @@ import "math.cb";
 
 // ── sample image generator ────────────────────────────────────────────────────
 //
-// Builds a 256×128 test card in memory:
-//   top half    - hue wheel (R→G→B across width, brightness increasing downward)
+// Builds a 256x128 test card in memory:
+//   top half    - hue wheel (R->G->B across width, brightness increasing downward)
 //   lower quarter - 8-step grayscale ramp
 //   bottom strip  - 7 primary/secondary color bars
 
@@ -82,7 +82,7 @@ Bitmap* makeSample()
 
 // ── color quantization ────────────────────────────────────────────────────────
 //
-// Map any RGB pixel to one of 216 entries in a 6×6×6 color cube so that Sixel
+// Map any RGB pixel to one of 216 entries in a 6x6x6 color cube so that Sixel
 // color registers stay within the palette size supported by Windows Terminal.
 
 int quantizeRGB(int r, int g, int b)
@@ -155,7 +155,7 @@ void renderSixel(Bitmap* bmp)
     // Sixel DCS: enter Sixel mode with default raster attributes.
     printf("\033Pq");
 
-    // Define all 216 palette entries (6×6×6 RGB cube, values in 0..100).
+    // Define all 216 palette entries (6x6x6 RGB cube, values in 0..100).
     int ci = 0;
     while (ci < 216)
     {
@@ -265,7 +265,7 @@ void renderSixel(Bitmap* bmp)
 // ── half-block fallback ───────────────────────────────────────────────────────
 //
 // Two image rows per terminal row using the UTF-8 upper-half-block (▀):
-// top pixel → foreground, bottom pixel → background.
+// top pixel -> foreground, bottom pixel -> background.
 
 void renderHalfBlock(Bitmap* bmp)
 {

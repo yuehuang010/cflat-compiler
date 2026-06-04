@@ -6,7 +6,7 @@
 //
 // Note: pointer variables must be declared BEFORE the loop.  CFlat emits
 // alloca instructions at the declaration site.  Declaring inside the loop
-// would place allocas in the loop body, consuming N×8 bytes of stack.
+// would place allocas in the loop body, consuming Nx8 bytes of stack.
 
 import "list.cb";
 import "thread.cb";

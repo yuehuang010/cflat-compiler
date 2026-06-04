@@ -16,8 +16,8 @@ import "string.cb";
 //   stream s;
 //   s.bufferSize = 65536;   // optional - default is 65536 bytes
 //   s.init();
-//   p1 >> s;                // wires p1.onStdout → s.write()
-//   s >> p2;                // wires p2.onStdin  → s.read(), p2.onStdinReturn → s.return_buffer()
+//   p1 >> s;                // wires p1.onStdout -> s.write()
+//   s >> p2;                // wires p2.onStdin  -> s.read(), p2.onStdinReturn -> s.return_buffer()
 //   p1.run(args); p2.run(args);
 //   p1.WaitForExit();
 //   s.close();              // flush remaining data + send EOF sentinel

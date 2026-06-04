@@ -39,13 +39,13 @@ struct Star {
 
 // ── Global render buffers ────────────────────────────────────────────────────
 
-int*   g_px     = nullptr;  // palette-index per pixel, W_px × H_px
+int*   g_px     = nullptr;  // palette-index per pixel, W_px x H_px
 char*  g_sx     = nullptr;  // Sixel output buffer (3 MB)
 int    g_sx_len = 0;
 int    g_W      = 0;        // pixel width
 int    g_H      = 0;        // pixel height
 int    g_bands  = 0;        // ceil(H / 6) sixel bands
-double g_pixAR2 = 1.0;      // (cellH/cellW)² - pixel aspect ratio squared, for ellipse test
+double g_pixAR2 = 1.0;      // (cellH/cellW)2 - pixel aspect ratio squared, for ellipse test
 
 // ── Star helpers ─────────────────────────────────────────────────────────────
 
@@ -69,7 +69,7 @@ int starPalette(int type, double bright) {
 // Sixel pixels have aspect ratio cellH:cellW (tall:wide, e.g. 20:10 = 2:1).
 // We draw an ellipse where x-radius=r and y-radius=r*(cellW/cellH) so the
 // result appears round in display pixels.  Inclusion test in Sixel space:
-//   dx² + dy²*(cellH/cellW)² ≤ r²
+//   dx2 + dy2*(cellH/cellW)2 ≤ r2
 void drawCircle(int cx, int cy, int r, int c) {
     if (r < 1) {
         if (cx >= 0 && cx < g_W && cy >= 0 && cy < g_H)
@@ -152,11 +152,11 @@ void buildFrame() {
     while (band < g_bands) {
         int base_y = band * 6;
 
-        // Clear the band to black first (color 0, all-rows bitmask 63 → char '~').
+        // Clear the band to black first (color 0, all-rows bitmask 63 -> char '~').
         sxCh('#'); sxInt(0); sxRun('~', g_W); sxCh('$');
 
         // First pass: discover which non-background colors appear in this band.
-        // Pack into a 48-bit presence mask (color c → bit c-1).
+        // Pack into a 48-bit presence mask (color c -> bit c-1).
         i64 present = 0;
         int x = 0;
         while (x < g_W) {

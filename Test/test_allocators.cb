@@ -135,7 +135,7 @@ bool testEntryAllocatorBasic()
 {
     EntryAllocator ea;
 
-    if (ea.alloc(0) != nullptr) return false;  // zero-size → null
+    if (ea.alloc(0) != nullptr) return false;  // zero-size -> null
     ea.dealloc(nullptr);                        // no-op - must not crash
 
     void* p1 = ea.alloc(4);

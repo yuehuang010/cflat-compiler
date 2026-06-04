@@ -1715,7 +1715,7 @@ bool testMultiDimArrays()
 {
     bool result = true;
 
-    // --- char[3][5]: 3 rows × 5 cols ---
+    // --- char[3][5]: 3 rows x 5 cols ---
     char[3][5] cg = default;
     int r = 0;
     while (r < 3)
@@ -1732,7 +1732,7 @@ bool testMultiDimArrays()
     result &= Test("char2d[1][2]", cg[1][2], 7);
     result &= Test("char2d[2][4]", cg[2][4], 14);
 
-    // --- int[4][3]: 4 rows × 3 cols ---
+    // --- int[4][3]: 4 rows x 3 cols ---
     int[4][3] ig = default;
     r = 0;
     while (r < 4)
@@ -1981,7 +1981,7 @@ bool testPointerArithmetic()
     q -= 2;
     result &= Test("int* p-=2 elem", *q, 20);
 
-    // ptr - ptr → element count
+    // ptr - ptr -> element count
     int* start = arr;
     int* end = arr + 4;
     int diff = (int)(end - start);
@@ -2007,7 +2007,7 @@ bool testPointerArithmetic()
     cursor++;
     result &= Test("i8* cursor++ again", *cursor, 67);
 
-    // i8* ptr - ptr → byte count
+    // i8* ptr - ptr -> byte count
     i8* bstart = buf;
     i8* bend = buf + 4;
     int bdiff = (int)(bend - bstart);

@@ -1,4 +1,4 @@
-﻿import "interfaces.cb";
+import "interfaces.cb";
 import "test_helper.cb";
 import "list.cb";
 import "interfaces.cb";

@@ -1,5 +1,5 @@
 // hashset<T> - unordered set using open addressing with linear probing.
-// T must support == for equality. Primitive types (int, i64, char, …) are hashed
+// T must support == for equality. Primitive types (int, i64, char, ...) are hashed
 // via Hash(); pointer types are hashed by address; other types must implement hash().
 // The set does NOT own its elements - callers are responsible for freeing any
 // heap-allocated objects stored in the set.

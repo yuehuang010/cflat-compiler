@@ -220,7 +220,7 @@ struct Terminal {
 
     // Query the pixel dimensions of one character cell via CSI 16 t.
     // The terminal responds with ESC[6;<cellH>;<cellW>t.
-    // Falls back to common defaults (8×16) if the query is not answered.
+    // Falls back to common defaults (8x16) if the query is not answered.
     // Must be called after init().
     void getCellSize(int* cellW, int* cellH) {
         *cellW = 8;

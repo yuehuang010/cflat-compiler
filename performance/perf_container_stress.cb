@@ -3,7 +3,7 @@
 // Exercises the full add-iterate-destruct lifecycle of a list<int*> with
 // N=200,000 elements.  The list doubles its backing array ~18 times, creating
 // a realistic mixed-size allocation pattern: many small (new int, 4 bytes)
-// plus periodic medium backing-array reallocations (32 B → 64 B → … → ~3 MB).
+// plus periodic medium backing-array reallocations (32 B -> 64 B -> ... -> ~3 MB).
 // BlockAllocator is excluded because backing arrays exceed its 64-byte limit.
 
 import "list.cb";

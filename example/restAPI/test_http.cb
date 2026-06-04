@@ -70,14 +70,14 @@ extern int main()
 
     delete req2;
 
-    // ── 3. Empty input → valid=false ─────────────────────────────────────────
+    // ── 3. Empty input -> valid=false ─────────────────────────────────────────
 
     i8* raw3 = "";
     HttpRequest* req3 = parseHttpRequest(raw3, 0);
     if (req3->valid) { printf("FAIL 3: empty input should be invalid\n"); ok = false; }
     delete req3;
 
-    // ── 4. No CRLF → valid=false ─────────────────────────────────────────────
+    // ── 4. No CRLF -> valid=false ─────────────────────────────────────────────
 
     i8* raw4 = "GET / HTTP/1.1";
     HttpRequest* req4 = parseHttpRequest(raw4, strlen(raw4));
@@ -135,7 +135,7 @@ extern int main()
 
     delete req8;
 
-    // ── 9. getHeader miss → nullptr; missing Content-Length → 0 ─────────────
+    // ── 9. getHeader miss -> nullptr; missing Content-Length -> 0 ─────────────
 
     i8* raw9 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     HttpRequest* req9 = parseHttpRequest(raw9, strlen(raw9));
@@ -185,7 +185,7 @@ extern int main()
 
     delete req12;
 
-    // ── 13. Response: no body → Content-Length absent ─────────────────────────
+    // ── 13. Response: no body -> Content-Length absent ─────────────────────────
 
     HttpResponse* r13 = new HttpResponse;
     r13->setStatus(204, "No Content");
@@ -200,7 +200,7 @@ extern int main()
     delete rbuf13;
     delete r13;
 
-    // ── 14. setBody() called twice → second replaces first ────────────────────
+    // ── 14. setBody() called twice -> second replaces first ────────────────────
 
     HttpResponse* r14 = HttpResponse.ok(nullptr);
     r14->setTextBody("first");
@@ -282,7 +282,7 @@ extern int main()
     delete rbuf19;
     delete r19;
 
-    // ── 20. serverError with nullptr → default body ───────────────────────────
+    // ── 20. serverError with nullptr -> default body ───────────────────────────
 
     HttpResponse* r20 = HttpResponse.serverError(nullptr);
     int rlen20 = 0;

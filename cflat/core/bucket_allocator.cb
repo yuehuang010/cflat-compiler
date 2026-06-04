@@ -287,7 +287,7 @@ class BucketAllocator : IAllocator
         i64 dataOff    = _dataOffsetFor(blockSize);
         i64 blockCount = ((i64)65536 - dataOff) / blockSize;
 
-        // Push in reverse so the lowest block address ends up on top → returned first.
+        // Push in reverse so the lowest block address ends up on top -> returned first.
         i64 k = blockCount - (i64)1;
         while (k >= (i64)0)
         {

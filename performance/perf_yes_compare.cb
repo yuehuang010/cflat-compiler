@@ -126,7 +126,7 @@ int raw_consumer(void* ctx)
 // Producer acquires an arena, bump-allocs a small payload, try_sends it.
 // If the ring is full the arena is released back (skipped); no blocking.
 // Consumer try_recvs; exits when producer sets g_ac_done and ring drains.
-// Measures the full zero-copy pipeline: acquire → alloc → send → recv → release.
+// Measures the full zero-copy pipeline: acquire -> alloc -> send -> recv -> release.
 
 class AcPayload : IMessage { int _value = 0; };
 

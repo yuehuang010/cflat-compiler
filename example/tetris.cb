@@ -25,9 +25,9 @@ int BOARD_H = 20;
 
 // The playfield occupies:
 //   22 rows  (1 top-border + 20 board rows + 1 bottom-border)
-//   22 cols  (1 left-border + 10 cells×2 chars + 1 right-border)
+//   22 cols  (1 left-border + 10 cellsx2 chars + 1 right-border)
 // The HUD sits 3 columns to the right of the right border.
-// Minimum terminal: 40 wide × 22 tall.
+// Minimum terminal: 40 wide x 22 tall.
 
 int DISPLAY_ROWS = 22;   // height of bordered playfield
 int DISPLAY_COLS = 22;   // width  of bordered playfield
@@ -75,7 +75,7 @@ int g_level = 1;
 //
 // Pieces: 0=I 1=O 2=T 3=S 4=Z 5=L 6=J
 //
-// Each rotation is a 4×4 bitmask: bit (r*4+c) is set if cell (r,c) is filled.
+// Each rotation is a 4x4 bitmask: bit (r*4+c) is set if cell (r,c) is filled.
 
 int pieceMask(int p, int r)
 {
@@ -83,7 +83,7 @@ int pieceMask(int p, int r)
         if (r == 0 || r == 2) return 15;  //  ████
         return 4369;                       //  vertical (0x1111)
     }
-    if (p == 1) return 51;                // O (yellow): 2×2 (0x0033)
+    if (p == 1) return 51;                // O (yellow): 2x2 (0x0033)
     if (p == 2) {                         // T (magenta)
         if (r == 0) return 39;
         if (r == 1) return 562;
@@ -236,7 +236,7 @@ void tryRotate()
 //  g_originRow + 1 .. +20   : board rows 0..19
 //  g_originRow + 21         : bottom border
 //  g_originCol + 0          : left border '|'
-//  g_originCol + 1 .. +20   : board cells (10 cols × 2 chars)
+//  g_originCol + 1 .. +20   : board cells (10 cols x 2 chars)
 //  g_originCol + 21         : right border '|'
 //  g_originCol + DISPLAY_COLS + HUD_GAP : HUD
 
