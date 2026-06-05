@@ -6,10 +6,15 @@
 //      (the only Tier 1 path that round-trips a callback into a C library).
 //   2. math.h - double-by-value parameters and returns through the extern ABI.
 //   3. stdlib.h / time.h - scalar int / pointer / time_t returns.
+//
+// All three CRT headers opt into the persistent disk cache via the `cache` clause, so this
+// test also exercises the C-header disk-cache write (cold) and load (warm, on repeat runs)
+// paths. math.h in particular carries non-finite float macros (INFINITY/NAN/HUGE_VAL*), which
+// regressed the warm load before the raw-bits encoding fix - see project_cheader_disk_cache.
 import "test_helper.cb";
-import "math.h";
-import "stdlib.h";
-import "time.h";
+import "math.h" cache;
+import "stdlib.h" cache;
+import "time.h" cache;
 
 // qsort comparator: ascending integer order. Receives pointers to two array elements.
 int int_cmp(const void* a, const void* b)

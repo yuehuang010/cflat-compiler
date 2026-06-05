@@ -8977,7 +8977,15 @@ public:
         nlohmann::json j = {{"n", m.name}, {"v", m.value}, {"f", m.file},
                             {"ln", m.line}, {"co", m.col}};
         if (m.isPointer) j["isp"]  = true;
-        if (m.isFloat)  { j["isf"]  = true; j["fv"]   = m.floatValue; }
+        // Store the float as its raw IEEE-754 bit pattern, not as a JSON number:
+        // nlohmann serializes inf/NaN as JSON `null` (math.h's INFINITY/NAN/HUGE_VAL),
+        // which then throws type_error.302 on reload. Bits round-trip every value exactly.
+        if (m.isFloat)
+        {
+            uint64_t fvbits = 0;
+            std::memcpy(&fvbits, &m.floatValue, sizeof(double));
+            j["isf"] = true; j["fvb"] = fvbits;
+        }
         if (m.isString) { j["iss"]  = true; j["sv"]   = m.stringValue; }
         if (m.isFuncPtr){ j["isfp"] = true; j["fptv"] = TvToJson(m.funcPtrTV); }
         return j;
@@ -8992,7 +9000,11 @@ public:
         m.col       = j.value("co",  0);
         m.isPointer = j.value("isp", false);
         m.isFloat   = j.value("isf", false);
-        if (m.isFloat)  m.floatValue  = j.value("fv", 0.0);
+        if (m.isFloat)
+        {
+            uint64_t fvbits = j.value("fvb", uint64_t{0});
+            std::memcpy(&m.floatValue, &fvbits, sizeof(double));
+        }
         m.isString  = j.value("iss",  false);
         if (m.isString) m.stringValue = j.value("sv", std::string{});
         m.isFuncPtr = j.value("isfp", false);
@@ -9047,7 +9059,9 @@ public:
         try { f >> j; } catch (...) { return false; }
 
         int version = j.value("version", 0);
-        if (version != 1 && version != 2) return false;
+        // v1/v2 stored float macro values as JSON numbers, which encode inf/NaN as `null`
+        // and throw on reload; only v3 (raw-bits float encoding) is safe to consume.
+        if (version != 3) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -9056,30 +9070,36 @@ public:
         bool hashOk  = (storedHash  == contentHash);
         if (!mtimeOk && !hashOk) return false;
 
+        // Any malformed/incompatible field must degrade to a cache miss (reparse), never abort
+        // the compiler: the nlohmann accessors throw on a type mismatch, so guard the whole build.
         CFileSigCacheEntry entry;
         entry.mtime = mtime;
         entry.hash  = contentHash;
-        if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));
-        if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
-        if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
-        if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
-        if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
-        if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
-
-        // A deep (transitive) entry is only fresh if every recorded include is unchanged.
-        // Shallow entries (no "deps") skip this and rely on the top-header check above.
-        if (j.contains("deps"))
+        try
         {
-            for (const auto& dj : j["deps"])
+            if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));
+            if (j.contains("enums"))      for (const auto& e : j["enums"])      entry.enums.push_back(EnumFromJson(e));
+            if (j.contains("records"))    for (const auto& r : j["records"])    entry.records.push_back(RecordFromJson(r));
+            if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
+            if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
+            if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
+
+            // A deep (transitive) entry is only fresh if every recorded include is unchanged.
+            // Shallow entries (no "deps") skip this and rely on the top-header check above.
+            if (j.contains("deps"))
             {
-                CHeaderDep dep;
-                dep.path  = dj.value("f", std::string{});
-                dep.mtime = dj.value("mt", int64_t{0});
-                dep.hash  = dj.value("h",  uint64_t{0});
-                if (!CHeaderDepFresh(dep)) return false;
-                entry.deps.push_back(std::move(dep));
+                for (const auto& dj : j["deps"])
+                {
+                    CHeaderDep dep;
+                    dep.path  = dj.value("f", std::string{});
+                    dep.mtime = dj.value("mt", int64_t{0});
+                    dep.hash  = dj.value("h",  uint64_t{0});
+                    if (!CHeaderDepFresh(dep)) return false;
+                    entry.deps.push_back(std::move(dep));
+                }
             }
         }
+        catch (...) { return false; }
         out = std::move(entry);
         return true;
     }
@@ -9097,7 +9117,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 2;
+        j["version"] = 3;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 
