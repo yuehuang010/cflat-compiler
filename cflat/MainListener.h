@@ -8838,6 +8838,68 @@ public:
                             break;
                         }
 
+                        // Hardware intrinsic: __pause() - emit the x86 PAUSE spin-loop hint.
+                        // Returns nothing. x86/Intel target only; guard callers with
+                        // `if const (__X86__)`. Wrapped by pause() in mutex.cb for spinlocks.
+                        if (functionName == "__pause")
+                        {
+                            Compiler(ctx)->CreatePause();
+                            namedVar = {};
+                            break;
+                        }
+
+                        // Compiler intrinsics that take value arguments (bit ops, prefetch,
+                        // fma, branch hints). Evaluate the argument expressions, then emit the
+                        // matching LLVM intrinsic. These are wrapped by core/intrinsic.cb,
+                        // core/math.cb (fma), so user code calls the friendly name.
+                        if (functionName == "__popcount" || functionName == "__ctz" || functionName == "__clz" ||
+                            functionName == "__prefetch"  || functionName == "__fma" ||
+                            functionName == "__likely"    || functionName == "__unlikely")
+                        {
+                            std::vector<LLVMBackend::NamedVariable> argNVs;
+                            if (argumentList.size() > 0)
+                            {
+                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                for (auto* namedArgument : namedArgCtx)
+                                    argNVs.push_back(this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression()));
+                            }
+                            auto argValue = [&](size_t i) -> llvm::Value* {
+                                return argNVs[i].Primary ? argNVs[i].Primary : LoadNamedVariable(argNVs[i]);
+                            };
+
+                            if (functionName == "__prefetch")
+                            {
+                                if (!argNVs.empty())
+                                    Compiler(ctx)->CreatePrefetch(argValue(0));
+                                namedVar = {};
+                                break;
+                            }
+
+                            // The remaining intrinsics produce a value whose type mirrors an input.
+                            namedVar = {};
+                            if (functionName == "__popcount" || functionName == "__ctz" || functionName == "__clz")
+                            {
+                                llvm::Value* v = argValue(0);
+                                namedVar.Primary = functionName == "__popcount" ? Compiler(ctx)->CreatePopcount(v)
+                                                 : functionName == "__ctz"      ? Compiler(ctx)->CreateCtz(v)
+                                                 :                                 Compiler(ctx)->CreateClz(v);
+                                namedVar.TypeAndValue.TypeName = argNVs[0].TypeAndValue.TypeName;
+                            }
+                            else if (functionName == "__fma")
+                            {
+                                namedVar.Primary = Compiler(ctx)->CreateFma(argValue(0), argValue(1), argValue(2));
+                                namedVar.TypeAndValue.TypeName = argNVs[0].TypeAndValue.TypeName;
+                            }
+                            else // __likely / __unlikely
+                            {
+                                namedVar.Primary = Compiler(ctx)->CreateExpect(argValue(0), functionName == "__likely");
+                                namedVar.TypeAndValue.TypeName = "bool";
+                            }
+                            namedVar.Storage  = nullptr;
+                            namedVar.BaseType = namedVar.Primary->getType();
+                            break;
+                        }
+
                         // Handle va_start / va_end - pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
@@ -10311,7 +10373,8 @@ public:
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
-            "reflect", "reflect_set", "__rdtscp", "__lfence",
+            "reflect", "reflect_set", "__rdtscp", "__lfence", "__pause",
+            "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
         };
         if (kIntrinsics.count(name))
             return {};

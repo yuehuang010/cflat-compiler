@@ -1,7 +1,11 @@
-// Compiler hardware-intrinsic regression tests: the __X86__ guard constant and
-// the x86 RDTSCP / LFENCE intrinsics exposed through core/time.cb.
+// Compiler hardware-intrinsic regression tests: the __X86__ guard constant, the
+// x86 RDTSCP / LFENCE / PAUSE intrinsics, and the target-independent bit ops,
+// prefetch, fused multiply-add, and branch-probability hints.
 
-import "time.cb";
+import "time.cb";        // rdtscp(), lfence()
+import "mutex.cb";       // pause()
+import "intrinsic.cb";   // popcount/ctz/clz, prefetch, likely/unlikely
+import "math.cb";        // Math.fma
 import "test_helper.cb";
 
 // The compiler emits __X86__ = 1 on the (only) supported x86/Intel target.
@@ -61,6 +65,72 @@ int testLfence()
     return passed;
 }
 
+// PAUSE is a spin-loop hint with no observable result; spin a short loop with it
+// and confirm execution proceeds (no crash, loop completes).
+int testPause()
+{
+    int passed = 0;
+    int spins = 0;
+    while (spins < 1000)
+    {
+        pause();
+        spins = spins + 1;
+    }
+    passed += Test("pause loop completed", spins, 1000);
+    return passed;
+}
+
+// Bit-count intrinsics: popcount/ctz/clz.  ctz(0) and clz(0) are defined as the
+// bit width (64) since is_zero_poison is false.
+int testBitOps()
+{
+    int passed = 0;
+
+    passed += Test("popcount(0xFF)",   popcount((u64)0xFF), 8);
+    passed += Test("popcount(0)",      popcount((u64)0),    0);
+    passed += Test("popcount(all-1s)", popcount((u64)0xFFFFFFFFFFFFFFFF), 64);
+
+    passed += Test("ctz(8)",  ctz((u64)8), 3);   // 0b1000
+    passed += Test("ctz(1)",  ctz((u64)1), 0);
+    passed += Test("ctz(0)",  ctz((u64)0), 64);  // defined: bit width
+
+    passed += Test("clz(1)",                  clz((u64)1), 63);
+    passed += Test("clz(0)",                  clz((u64)0), 64);  // defined: bit width
+    passed += Test("clz(0x8000000000000000)", clz((u64)0x8000000000000000), 0);
+
+    return passed;
+}
+
+// Fused multiply-add: 2*3 + 4 == 10.  Compared via a tolerance band so the test
+// does not depend on a double Test() overload.
+int testFma()
+{
+    int passed = 0;
+    double r = Math.fma(2.0, 3.0, 4.0);
+    passed += Test("fma(2,3,4) == 10", r > 9.999 && r < 10.001, true);
+    return passed;
+}
+
+// Software prefetch has no observable result; touch a local and prefetch its
+// address to confirm the emitted intrinsic does not fault.
+int testPrefetch()
+{
+    int passed = 0;
+    int data = 42;
+    prefetch(&data);
+    passed += Test("prefetch did not fault", data, 42);
+    return passed;
+}
+
+// Branch-probability hints return their condition unchanged.
+int testBranchHints()
+{
+    int passed = 0;
+    passed += Test("likely(true)",    likely(true),    true);
+    passed += Test("unlikely(false)", unlikely(false), false);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -71,6 +141,11 @@ extern int main()
     r = testX86Constant(); passed += r; total += 1;
     r = testRdtscp();      passed += r; total += 2;
     r = testLfence();      passed += r; total += 2;
+    r = testPause();       passed += r; total += 1;
+    r = testBitOps();      passed += r; total += 9;
+    r = testFma();         passed += r; total += 1;
+    r = testPrefetch();    passed += r; total += 1;
+    r = testBranchHints(); passed += r; total += 2;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

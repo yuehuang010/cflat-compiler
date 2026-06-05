@@ -1843,6 +1843,75 @@ private:
         builder->CreateCall(fn, {});
     }
 
+    // Emit the x86 PAUSE instruction - a spin-loop hint that yields the SMT
+    // sibling and lowers the power/throughput cost of a busy-wait.  Returns
+    // nothing.  x86/Intel target only - guard callers with `if const (__X86__)`.
+    void CreatePause()
+    {
+        // llvm.x86.sse2.pause returns void and takes no arguments.
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::x86_sse2_pause);
+        builder->CreateCall(fn, {});
+    }
+
+    // Population count (llvm.ctpop) - number of set bits.  Target-independent:
+    // lowers to POPCNT on x86, CNT on ARM, etc.  Result has the same integer
+    // type as the input.
+    llvm::Value* CreatePopcount(llvm::Value* intVal)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::ctpop, { intVal->getType() });
+        return builder->CreateCall(fn, { intVal }, "popcount");
+    }
+
+    // Count trailing zeros (llvm.cttz).  Target-independent.  The second argument
+    // is_zero_poison is false, so cttz(0) is the bit width (well-defined) rather
+    // than poison.  Result has the same integer type as the input.
+    llvm::Value* CreateCtz(llvm::Value* intVal)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::cttz, { intVal->getType() });
+        return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "ctz");
+    }
+
+    // Count leading zeros (llvm.ctlz).  Target-independent.  is_zero_poison is
+    // false, so ctlz(0) is the bit width.  Result matches the input's type.
+    llvm::Value* CreateClz(llvm::Value* intVal)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::ctlz, { intVal->getType() });
+        return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "clz");
+    }
+
+    // Software prefetch (llvm.prefetch).  Target-independent.  Hints the memory
+    // subsystem to pull `addr` toward the cache.  Hardcoded to a read prefetch
+    // (rw=0) with high temporal locality (3) into the data cache (cache type=1) -
+    // the common streaming/strided-loop case.  Returns nothing.
+    void CreatePrefetch(llvm::Value* addr)
+    {
+        auto* i32ty = llvm::Type::getInt32Ty(*context);
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::prefetch, { addr->getType() });
+        builder->CreateCall(fn, {
+            addr,
+            llvm::ConstantInt::get(i32ty, 0),   // rw: 0 = read
+            llvm::ConstantInt::get(i32ty, 3),   // locality: 3 = high temporal
+            llvm::ConstantInt::get(i32ty, 1) }); // cache type: 1 = data cache
+    }
+
+    // Fused multiply-add (llvm.fma): a * b + c with a single rounding step.
+    // Target-independent; lowers to a hardware FMA when available.  All three
+    // operands and the result share the same floating-point type.
+    llvm::Value* CreateFma(llvm::Value* a, llvm::Value* b, llvm::Value* c)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::fma, { a->getType() });
+        return builder->CreateCall(fn, { a, b, c }, "fma");
+    }
+
+    // Branch-probability hint (llvm.expect): tells the optimizer the i1 condition
+    // `cond` is expected to equal `expected`.  Target-independent; affects block
+    // layout only, not the computed value.  Result is the same i1 value.
+    llvm::Value* CreateExpect(llvm::Value* cond, bool expected)
+    {
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::expect, { cond->getType() });
+        return builder->CreateCall(fn, { cond, llvm::ConstantInt::get(cond->getType(), expected ? 1 : 0) }, "expect");
+    }
+
     // Emit an integer narrowing/widening conversion (to_i8, to_u8, to_i16, to_u16,
     // to_i32, to_u32, to_i64, to_u64).  Returns nullptr for unrecognized names.
     // Narrowing always truncates; widening sign-extends for signed targets, zero-extends for unsigned.

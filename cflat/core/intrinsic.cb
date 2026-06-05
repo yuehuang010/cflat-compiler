@@ -1,0 +1,53 @@
+// intrinsic.cb - thin wrappers over target-independent compiler intrinsics.
+//
+// These lower to a single CPU instruction where the target supports it
+// (POPCNT/LZCNT/TZCNT on x86, CNT/CLZ on ARM, etc.) and to a short fallback
+// sequence otherwise - so unlike the x86-only rdtscp()/lfence()/pause(), they
+// need no __X86__ guard and are safe on any target.
+//
+// Usage:
+//   import "intrinsic.cb";
+//   int bits = popcount(mask);
+//   int tz   = ctz(mask);          // count trailing zeros; ctz(0) == 64
+//   int lz   = clz(mask);          // count leading zeros;  clz(0) == 64
+//   prefetch(&data[i + 16]);       // pull a future cache line in early
+//   if (likely(p != nullptr)) ...  // branch-probability hint
+
+// Number of set bits in x.
+int popcount(u64 x)
+{
+    return (int)__popcount(x);
+}
+
+// Count trailing zero bits (from the least-significant end).  ctz(0) == 64.
+int ctz(u64 x)
+{
+    return (int)__ctz(x);
+}
+
+// Count leading zero bits (from the most-significant end).  clz(0) == 64.
+int clz(u64 x)
+{
+    return (int)__clz(x);
+}
+
+// Software prefetch: hint the memory subsystem to pull the line containing p
+// toward the cache (read, high temporal locality, data cache).  No-op for
+// correctness; affects performance only.
+void prefetch(void* p)
+{
+    __prefetch(p);
+}
+
+// Branch-probability hint: tells the optimizer cond is usually true.  Returns
+// cond unchanged - affects block layout only.
+bool likely(bool cond)
+{
+    return __likely(cond);
+}
+
+// Branch-probability hint: tells the optimizer cond is usually false.
+bool unlikely(bool cond)
+{
+    return __unlikely(cond);
+}

@@ -50,4 +50,18 @@ namespace Math
     {
         return x < minVal ? minVal : (x > maxVal ? maxVal : x);
     }
+
+    // Fused multiply-add: a * b + c computed with a single rounding step (more
+    // accurate than a * b + c written out, and a single instruction where the
+    // target has hardware FMA).
+    double fma(double a, double b, double c)
+    {
+        return __fma(a, b, c);
+    }
+
+    // Fused multiply-add for float.
+    float fma(float a, float b, float c)
+    {
+        return __fma(a, b, c);
+    }
 }

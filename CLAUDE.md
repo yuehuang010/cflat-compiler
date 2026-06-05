@@ -379,7 +379,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
-| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |
+| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, `fma` (fused multiply-add), trig, rounding |
 | `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
 | `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |
@@ -388,13 +388,14 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `random.cb` | Splitmix64 PRNG; requires `import "random.cb"` |
 | `channel.cb` | `channel<T>` - MPMC blocking channel; requires `import "channel.cb"` |
 | `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring buffer |
-| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - thread synchronization primitives |
+| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - thread synchronization primitives; `pause()` (x86 spin-loop hint) |
 | `latch.cb` | `latch` - one-shot countdown synchronization |
 | `semaphore.cb` | `semaphore` - counting semaphore |
 | `rwlock.cb` | `rwlock` - reader-writer lock |
 | `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
 | `time.cb` | `TimePoint.now()`, `Stopwatch`, `Timer`, `sleep`, `rdtscp()` (x86 cycle counter for jitter timing), `lfence()` (x86 serializing load fence), duration utilities |
+| `intrinsic.cb` | Target-independent compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely` (no `__X86__` guard needed) |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
 | `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
 | `arena.cb` | Arena bump allocator |
