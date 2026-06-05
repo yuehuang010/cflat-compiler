@@ -5473,11 +5473,40 @@ public:
         }
     }
 
+    // Allocate a lightweight (uninitialized) arena_channel shell on the heap and return the
+    // typed pointer. The shell's _ring._cap is 0, so its send/recv are silent no-ops until
+    // init() is called. Used to default a program's inbox/outbox to a non-null self-loopback
+    // shell, so an unwired recv()/send() can never deref a null `this`. The builder must be
+    // positioned inside a function (this emits malloc + ctor calls). Returns the LLVM null
+    // arena pointer if the ctor/malloc are unavailable (degrades to the old null default).
+    llvm::Value* EmitArenaChannelShellAlloc(LLVMBackend* compiler)
+    {
+        auto dsIt = compiler->dataStructures.find(kArenaChannelType);
+        if (dsIt == compiler->dataStructures.end()) return nullptr;
+        auto* arenaTy    = dsIt->second.StructType;
+        auto* arenaPtrTy = arenaTy->getPointerTo();
+        auto* ctorFn     = compiler->GetFunction(kArenaChannelType);
+        auto* mallocFn   = compiler->GetFunction("malloc");
+        if (!ctorFn || !mallocFn) return llvm::Constant::getNullValue(arenaPtrTy);
+
+        auto* arenaSize = compiler->GetTypeSizeBytes(arenaTy);
+        auto* arenaRaw  = compiler->builder->CreateCall(
+            mallocFn->getFunctionType(), mallocFn, {arenaSize}, "arena_shell_raw");
+        auto* arenaPtr  = compiler->builder->CreateBitCast(arenaRaw, arenaPtrTy, "arena_shell_ptr");
+        auto* arenaZero = compiler->builder->CreateCall(
+            ctorFn->getFunctionType(), ctorFn, {}, "arena_shell_zero");
+        compiler->builder->CreateStore(arenaZero, arenaPtr);
+        return arenaPtr;
+    }
+
     // Wire `producer.outbox = consumer.inbox` for `producer >> consumer` (program-owned
-    // arena_channel piping). The consumer owns the channel: its inbox is lazily heap-allocated
-    // and init()ed the first time anyone wires to it (a runtime null-check makes this fan-in safe,
-    // so `a >> c` and `b >> c` share the one channel c owns). The producer's outbox is just a
-    // borrowed handle pointing at it.
+    // arena_channel piping). Both inbox and outbox are non-null lightweight shells allocated in
+    // each program's ctor (self-loopback default); this only runs when both programs opted in via
+    // useChannel (see the `>>` call site). It init()s the consumer's existing inbox shell -
+    // upgrading it to a live ring - then rebinds the producer's outbox from its own self-loopback
+    // shell to point at that inbox. init() is idempotent, so fan-in (`a >> c; b >> c`) wires the
+    // one channel c owns without re-initializing it. The producer's own inbox shell is untouched
+    // (freed by the producer's teardown); the rebound outbox is a borrowed handle, never freed.
     void EmitProgramToProgramArenaWire(const std::string& producerName, llvm::Value* producerStorage,
         const std::string& consumerName, llvm::Value* consumerStorage,
         antlr4::ParserRuleContext* ctx)
@@ -5501,50 +5530,28 @@ public:
         }
         auto* arenaTy    = dsIt->second.StructType;
         auto* arenaPtrTy = arenaTy->getPointerTo();
-        auto* ctorFn     = compiler->GetFunction(kArenaChannelType);
-        auto* mallocFn   = compiler->GetFunction("malloc");
 
-        // Select the no-arg init() overload (init(int, i64) also exists).
+        // Select the no-arg init() overload (idempotent; init(int, i64) also exists).
         llvm::Function* initFn = nullptr;
         if (auto it = compiler->functionTable.find("init"); it != compiler->functionTable.end())
             for (const auto& sym : it->second)
                 if (sym.Parameters.size() == 1 && sym.Parameters[0].TypeName == kArenaChannelType)
                     { initFn = sym.Function; break; }
 
-        if (!ctorFn || !mallocFn || !initFn)
+        if (!initFn)
         {
-            LogErrorContext(ctx, "arena_channel ctor/init/malloc not found for program '>>'.");
+            LogErrorContext(ctx, "arena_channel init not found for program '>>'.");
             return;
         }
 
-        // consumer.inbox GEP and current value.
+        // The consumer's inbox is a non-null shell allocated in its ctor. init() upgrades it to a
+        // live ring (no-op if a previous `>>` already wired it - the fan-in case).
         auto* inboxGep = compiler->builder->CreateStructGEP(
             consumerPd.StructType, consumerStorage, consumerPd.InboxArenaFieldIndex, "inbox_gep");
-        auto* existing = compiler->builder->CreateLoad(arenaPtrTy, inboxGep, "existing_inbox");
-        auto* isNull   = compiler->builder->CreateICmpEQ(
-            existing, llvm::ConstantPointerNull::get(arenaPtrTy), "inbox_is_null");
+        auto* inboxPtr = compiler->builder->CreateLoad(arenaPtrTy, inboxGep, "inbox_ptr");
+        compiler->builder->CreateCall(initFn->getFunctionType(), initFn, {inboxPtr});
 
-        auto* curFn     = compiler->builder->GetInsertBlock()->getParent();
-        auto* allocBB   = llvm::BasicBlock::Create(*compiler->context, "inbox_alloc", curFn);
-        auto* mergeBB   = llvm::BasicBlock::Create(*compiler->context, "inbox_ready", curFn);
-        compiler->builder->CreateCondBr(isNull, allocBB, mergeBB);
-
-        // Lazy-alloc path: malloc + zero-ctor + init() the arena_channel, store into inbox.
-        compiler->builder->SetInsertPoint(allocBB);
-        auto* arenaSize = compiler->GetTypeSizeBytes(arenaTy);
-        auto* arenaRaw  = compiler->builder->CreateCall(
-            mallocFn->getFunctionType(), mallocFn, {arenaSize}, "inbox_arena_raw");
-        auto* arenaPtr  = compiler->builder->CreateBitCast(arenaRaw, arenaPtrTy, "inbox_arena_ptr");
-        auto* arenaZero = compiler->builder->CreateCall(
-            ctorFn->getFunctionType(), ctorFn, {}, "inbox_arena_zero");
-        compiler->builder->CreateStore(arenaZero, arenaPtr);
-        compiler->builder->CreateCall(initFn->getFunctionType(), initFn, {arenaPtr});
-        compiler->builder->CreateStore(arenaPtr, inboxGep);
-        compiler->builder->CreateBr(mergeBB);
-
-        // Merge: reload the (now non-null) inbox and bind it into producer.outbox.
-        compiler->builder->SetInsertPoint(mergeBB);
-        auto* inboxPtr  = compiler->builder->CreateLoad(arenaPtrTy, inboxGep, "inbox_ptr");
+        // Rebind producer.outbox (its own self-loopback shell) to the consumer's live inbox.
         auto* outboxGep = compiler->builder->CreateStructGEP(
             producerPd.StructType, producerStorage, producerPd.OutboxFieldIndex, "outbox_gep");
         compiler->builder->CreateStore(inboxPtr, outboxGep);
@@ -11458,10 +11465,13 @@ public:
                 stopSrcDisposeFn->getFunctionType(), stopSrcDisposeFn, {stopSrcGEP});
         }
 
-        // Free the consumer-owned inbox arena_channel (lazily allocated by `a >> b`).
-        // Only consumers carry a non-null inbox; a producer's outbox is a BORROWED handle
-        // to some consumer's inbox and is never freed here. Safe at scope exit because the
-        // WaitForExit contract joins producer threads before they can touch the channel.
+        // Free the program-owned inbox arena_channel shell (always allocated in the ctor; a
+        // consumer's was upgraded to a live ring by `a >> b`, a producer's/non-messaging one is
+        // still an inert shell - arena_channel::destroy() no-ops on an uninitialized shell, then
+        // free() releases the struct either way). The outbox is a BORROWED handle (a self-loopback
+        // alias of this inbox before wiring, or some consumer's inbox after `>>`) and is never
+        // freed here. Safe at scope exit because the WaitForExit contract joins producer threads
+        // before they can touch the channel.
         if (inboxArenaIdx != (unsigned)-1)
         {
             auto* arenaTy = compiler->dataStructures.count(kArenaChannelType)
@@ -12626,13 +12636,18 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
 
-            // inbox / outbox = nullptr (only when arena_channel.cb is imported)
+            // inbox / outbox = a non-null lightweight arena_channel shell (self-loopback default;
+            // only when arena_channel.cb is imported). The shell is uninitialized (_ring._cap==0)
+            // so send/recv are silent no-ops until `>>` (with both useChannel set) calls init();
+            // allocating it here guarantees a non-null `this` so an unwired recv()/send() cannot
+            // crash. `>>` rebinds the producer's outbox to the consumer's inbox.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
-                auto* nullArena = llvm::Constant::getNullValue(arenaTy->getPointerTo());
-                structVal = compiler->CreateInsertValue(structVal, nullArena, inboxArenaFieldIndex);
-                structVal = compiler->CreateInsertValue(structVal, nullArena, outboxFieldIndex);
+                llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
+                if (!shell) shell = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, shell, outboxFieldIndex);
             }
 
             compiler->CreateReturnCall(structVal);
@@ -12933,14 +12948,18 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
 
-            // Synthetic fields: inbox = nullptr, outbox = nullptr (arena_channel*; only present
-            // when arena_channel.cb is imported). `a >> b` lazily allocates b.inbox and binds it.
+            // Synthetic fields: inbox / outbox = a non-null lightweight arena_channel shell
+            // (self-loopback default; only present when arena_channel.cb is imported). The shell is
+            // uninitialized (_ring._cap==0) so send/recv are silent no-ops until `>>` (with both
+            // useChannel set) calls init(); allocating it here guarantees a non-null `this` so an
+            // unwired recv()/send() cannot crash. `>>` rebinds the producer's outbox to b.inbox.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
-                auto* nullArena = llvm::Constant::getNullValue(arenaTy->getPointerTo());
-                structVal = compiler->CreateInsertValue(structVal, nullArena, inboxArenaFieldIndex);
-                structVal = compiler->CreateInsertValue(structVal, nullArena, outboxFieldIndex);
+                llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
+                if (!shell) shell = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
+                structVal = compiler->CreateInsertValue(structVal, shell, outboxFieldIndex);
             }
 
             compiler->CreateReturnCall(structVal);

@@ -175,35 +175,50 @@ class arena_channel<T> where T : IMessage
         _ring.init(ringCap);
     }
 
+    // No-arg init() used by `program >> program` wiring. Idempotent: a second call
+    // (e.g. a fan-in `a >> b; c >> b` that wires the same consumer inbox twice) is a
+    // no-op, so it never leaks the first ring. The explicit init(int, i64) overload is
+    // unguarded for direct users who manage the lifecycle themselves.
     void init()
     {
+        if (_ready()) { return; }   // already wired
         init(1024, (i64)65536);
     }
+
+    // True once init() has built the ring. Until then the channel is a lightweight shell
+    // (no _buf/_seq/slab) and send/recv are silent no-ops - this is what lets a program's
+    // inbox/outbox default to a non-null shell so an unwired recv()/send() can't crash.
+    bool _ready() { return _ring._cap != (i64)0; }
 
     // Day-to-day allocation - forward to block_pool / slab.
     void* alloc(i64 size)    { return _pool.alloc(size); }
     void  dealloc(void* ptr) { _pool.dealloc(ptr); }
 
     // Return a fresh (or recycled) page_arena ready for use.
+    // Quiet no-op (returns nullptr) on an uninitialized shell.
     page_arena<T>* acquire_arena()
     {
+        if (!_ready()) { return nullptr; }
         page_arena<T>* pa = _pool.acquire_arena();
         pa->_id = _nextId.increment();
         return pa;
     }
 
     // Transfer ownership of pa to the consumer (blocks if ring is full).
-    void send(page_arena<T>* pa)          { _ring.send((i64)pa); }
+    // Quiet no-op on an uninitialized shell (the arena is simply dropped).
+    void send(page_arena<T>* pa)          { if (!_ready()) { return; } _ring.send((i64)pa); }
 
-    // Non-blocking send; returns false if ring is full. Caller retains pa.
-    bool try_send(page_arena<T>* pa)      { return _ring.try_push((i64)pa); }
+    // Non-blocking send; returns false if ring is full (or the shell is uninitialized).
+    bool try_send(page_arena<T>* pa)      { if (!_ready()) { return false; } return _ring.try_push((i64)pa); }
 
     // Block until an arena is available; caller receives exclusive ownership.
-    page_arena<T>* recv()                 { return (page_arena<T>*)_ring.receive(); }
+    // Quiet no-op on an uninitialized shell: returns nullptr immediately (does NOT block).
+    page_arena<T>* recv()                 { if (!_ready()) { return nullptr; } return (page_arena<T>*)_ring.receive(); }
 
-    // Non-blocking receive; returns nullptr if ring is empty.
+    // Non-blocking receive; returns nullptr if ring is empty (or the shell is uninitialized).
     page_arena<T>* try_recv()
     {
+        if (!_ready()) { return nullptr; }
         i64 raw = 0;
         if (_ring.try_receive(&raw)) return (page_arena<T>*)raw;
         return nullptr;
@@ -216,6 +231,10 @@ class arena_channel<T> where T : IMessage
     // Call only after all producer threads have finished and the ring is drained.
     void destroy()
     {
+        // Uninitialized shell: nothing was allocated (no ring buffer, no slab), so there
+        // is nothing to tear down. Guard required because _ring.try_receive() would index
+        // _seq (null) through a zero _mask and dereference a null pointer otherwise.
+        if (!_ready()) { return; }
         i64 raw = 0;
         while (_ring.try_receive(&raw)) { _pool.release_arena((page_arena<T>*)raw); raw = 0; }
         _ring.destroy();

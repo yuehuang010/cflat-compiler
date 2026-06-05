@@ -874,6 +874,77 @@ bool testProgramArenaPipe() {
 }
 
 // ---------------------------------------------------------------------------
+// Unwired-mailbox tests (lightweight arena_channel shell; quiet until init())
+// ---------------------------------------------------------------------------
+// A program's inbox/outbox are non-null lightweight arena_channel shells by default
+// (allocated in the ctor, self-loopback). Until `>>` (with both useChannel set) calls
+// init(), the shell's ring is empty (_ring._cap==0), so send/recv/acquire_arena are
+// silent no-ops instead of dereferencing a null `this`. These tests pin that contract:
+// an unwired consumer's recv() returns nullptr immediately (no block, no crash) and an
+// unwired producer's acquire_arena() returns nullptr (so send() drops harmlessly).
+
+program UnwiredConsumer {
+    int got_null = 0;
+
+    int main(move list<string> args) {
+        page_arena<IMessage>* pa = inbox.recv();   // unwired shell: nullptr, no block, no crash
+        if (pa == nullptr) { got_null = 1; }
+        return got_null;
+    }
+};
+
+program UnwiredProducer {
+    int main(move list<string> args) {
+        page_arena<IMessage>* pa = outbox.acquire_arena();   // unwired shell: nullptr
+        if (pa == nullptr) { return 1; }
+        outbox.send(pa);   // would be a silent no-op too, but acquire already guards
+        return 0;
+    }
+};
+
+// Consumer never wired by `>>` and never opted into useChannel: recv() must no-op.
+bool testUnwiredConsumerRecvIsQuiet() {
+    bool result = true;
+    UnwiredConsumer w;
+    list<string> args;
+    w.run(args);
+    w.WaitForExit();
+    result &= Test("unwired recv() returns null (no crash)", w.exitCode, 1);
+    return result;
+}
+
+// Producer never wired by `>>`: acquire_arena() must no-op (returns null).
+bool testUnwiredProducerSendIsQuiet() {
+    bool result = true;
+    UnwiredProducer p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("unwired acquire_arena() returns null (no crash)", p.exitCode, 1);
+    return result;
+}
+
+// `p >> w` is issued, but neither program set useChannel, so the useChannel gate skips
+// init() - the mailbox stays an inert shell on both ends. This is the exact footgun that
+// used to AV (null inbox `this`); now both sides quietly no-op.
+bool testPipeWithoutUseChannelIsQuiet() {
+    bool result = true;
+    UnwiredProducer p;
+    UnwiredConsumer w;
+    // useChannel deliberately left false on both ends.
+    p >> w;
+    list<string> a1;
+    list<string> a2;
+    w.run(a2);
+    p.run(a1);
+    p.WaitForExit();
+    w.WaitForExit();
+    result &= Test("pipe without useChannel: consumer recv quiet", w.exitCode, 1);
+    result &= Test("pipe without useChannel: producer send quiet", p.exitCode, 1);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // stop_token tests
 // ---------------------------------------------------------------------------
 
@@ -1362,6 +1433,9 @@ extern int main() {
     total++; passed += testInboxSumMessages()            ? 1 : 0;
     total++; passed += testInboxPolymorphicMessages()    ? 1 : 0;
     total++; passed += testProgramArenaPipe()            ? 1 : 0;
+    total++; passed += testUnwiredConsumerRecvIsQuiet()  ? 1 : 0;
+    total++; passed += testUnwiredProducerSendIsQuiet()  ? 1 : 0;
+    total++; passed += testPipeWithoutUseChannelIsQuiet() ? 1 : 0;
     total++; passed += testProgramCrashRecovery()        ? 1 : 0;
     total++; passed += testRequestStop()                 ? 1 : 0;
     total++; passed += testWaitForExitTimeoutFast()      ? 1 : 0;
