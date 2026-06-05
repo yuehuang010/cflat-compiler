@@ -159,6 +159,20 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     bool debugInfo = args.hasFlag("debug-info");
     importSearchDir = args.getOption("import-dir").value_or("");
     auto platformOption = args.getOption("platform").value_or("win64");
+    // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean
+    // error before any clang-cl spawn or codegen, and both the C-interop and native-object
+    // paths can use the resolved values verbatim. The CPU table is identical for both
+    // triples (shared X86 backend); we validate against the active platform's triple.
+    {
+        std::string triple = (platformOption == "win32")
+            ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+        if (auto cpuOpt = args.getOption("cpu"))
+            if (!ResolveCpuName(*cpuOpt, triple, "--cpu", verbose, targetCpu_))
+                return false;
+        if (auto tuneOpt = args.getOption("tune"))
+            if (!ResolveCpuName(*tuneOpt, triple, "--tune", verbose, tuneCpu_))
+                return false;
+    }
     // Captured for clang C compiles (imports run during parse, before EmitExecutable).
     cOptLevel_ = args.getOptimizationLevel();
     cDebugInfo_ = debugInfo;
@@ -182,6 +196,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         std::cout << "[verbose] runtime dir:  " << runtimeDir << "\n";
         std::cout << "[verbose] import dir:   " << (importSearchDir.empty() ? "(none)" : importSearchDir) << "\n";
         std::cout << "[verbose] debug info:   " << (debugInfo ? "yes" : "no") << "\n";
+        // Effective codegen CPU: the platform default unless --cpu overrode it. Tune
+        // defaults to the target CPU unless --tune set it (mirrors -mtune semantics).
+        std::string effectiveCpu = targetCpu_.empty()
+            ? (platformOption == "win32" ? "i686" : "x86-64") : targetCpu_;
+        std::cout << "[verbose] target cpu:   " << effectiveCpu << "\n";
+        std::cout << "[verbose] tune:         "
+                  << (tuneCpu_.empty() ? effectiveCpu + " (same as target cpu)" : tuneCpu_) << "\n";
     }
 
     if (exePath)
@@ -463,6 +484,18 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 std::cerr << "  namedVar var: " << namedVariable.first << "\n";
             }
         }
+    }
+
+    // --tune is tune-only: it must not change the legal instruction set, only the
+    // scheduling model. LLVM plumbs that as a per-function "tune-cpu" attribute (the X86
+    // subtarget reads it for the sched model while features still come from the target
+    // CPU). Stamp it on every defined function, mirroring clang, before any output is
+    // emitted so it lands in --out-lli / --bitcode and the linked object alike.
+    if (!tuneCpu_.empty())
+    {
+        for (auto& F : *module)
+            if (!F.isDeclaration())
+                F.addFnAttr("tune-cpu", tuneCpu_);
     }
 
     if (lliPath)
@@ -1454,6 +1487,91 @@ LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::str
     LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
     SaveLinkerPathsToCache(arch, paths);
     return paths;
+}
+
+bool LLVMBackend::PrintSupportedCpus()
+{
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+
+    // CFlat currently targets only Windows on the X86 family (win64 / win32). Both
+    // platforms map to LLVM's X86 backend, which exposes a single CPU table regardless
+    // of pointer width, so listing it once via the win64 triple covers both.
+    const char* triple = "x86_64-pc-windows-msvc";
+    std::string err;
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+    if (!target)
+    {
+        std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+        return false;
+    }
+
+    std::unique_ptr<llvm::MCSubtargetInfo> sti(
+        target->createMCSubtargetInfo(triple, "", ""));
+    if (!sti)
+    {
+        std::cerr << "Error: could not create subtarget info for '" << triple << "'.\n";
+        return false;
+    }
+
+    // getAllProcessorDescriptions() is required to be sorted by Key, so we can print
+    // it in order directly. Skip any empty key defensively.
+    std::cout << "Supported target CPUs (Windows x86/x64):\n";
+    for (const auto& kv : sti->getAllProcessorDescriptions())
+    {
+        if (kv.Key && *kv.Key)
+            std::cout << "  " << kv.Key << "\n";
+    }
+    return true;
+}
+
+bool LLVMBackend::PrintHostCpu()
+{
+    // getHostCPUName() reads CPUID and maps it to an LLVM CPU name (the same value
+    // --cpu native resolves to). No target init is required for this query.
+    llvm::StringRef host = llvm::sys::getHostCPUName();
+    if (host.empty())
+    {
+        std::cerr << "Error: could not determine the host CPU.\n";
+        return false;
+    }
+    std::cout << host.str() << "\n";
+    return true;
+}
+
+bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string& triple,
+                                 const char* label, bool verbose, std::string& resolved)
+{
+    std::string name = requested;
+    if (name == "native")
+    {
+        name = llvm::sys::getHostCPUName().str();
+        if (verbose)
+            std::cout << "[verbose] " << label << " native resolved to: " << name << "\n";
+    }
+
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+
+    std::string err;
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+    if (!target)
+    {
+        std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+        return false;
+    }
+
+    std::unique_ptr<llvm::MCSubtargetInfo> sti(
+        target->createMCSubtargetInfo(triple, "", ""));
+    if (sti && !sti->isCPUStringValid(name))
+    {
+        std::cerr << "Error: unknown " << label << " '" << name
+                  << "'. Run --print-supported-cpus for the list.\n";
+        return false;
+    }
+
+    resolved = name;
+    return true;
 }
 
 bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)

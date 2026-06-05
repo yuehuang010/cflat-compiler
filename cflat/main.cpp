@@ -55,6 +55,10 @@ int main(int argc, char* argv[])
     args.addOption("vcpkg-triplet", 0, "vcpkg triplet (default derived from --platform: x64-windows / x86-windows)");
     args.addFlag("vcpkg-no-install", 0, "Do not run 'vcpkg install'; error out if a package-vcpkg port is not already installed");
     args.addFlag("init", 0, "Populate %USERPROFILE%\\.cflat\\ cache with linker paths for x64 and x86, then exit");
+    args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
+    args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
+    args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
+    args.addOption("tune", 0, "Tune scheduling for this CPU without changing the instruction set (name or 'native')", "");
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
 
@@ -77,6 +81,12 @@ int main(int argc, char* argv[])
         bool ok = LLVMBackend::RunInit(runtimeDir, args.hasFlag("verbose"));
         return ok ? 0 : 1;
     }
+
+    if (args.hasFlag("print-supported-cpus"))
+        return LLVMBackend::PrintSupportedCpus() ? 0 : 1;
+
+    if (args.hasFlag("print-host-cpu"))
+        return LLVMBackend::PrintHostCpu() ? 0 : 1;
 
     auto filename = args.getPositional(0);
     if (!filename)

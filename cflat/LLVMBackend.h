@@ -49,6 +49,7 @@
 #include <llvm\Support\TargetSelect.h>
 #include <llvm\Target\TargetMachine.h>
 #include <llvm\MC\TargetRegistry.h>
+#include <llvm\MC\MCSubtargetInfo.h>
 #include <llvm\TargetParser\Host.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
@@ -711,6 +712,14 @@ private:
     bool batchMode_ = false;
     bool noCache_ = false;
     bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
+    // --cpu: target CPU passed to createTargetMachine (the -mcpu-style knob: sets default
+    // ISA features + scheduling model). Empty means the platform default (x86-64 / i686).
+    // --tune: tune-only CPU (the -mtune knob: scheduling model only, no change to the
+    // legal instruction set); applied as the per-function "tune-cpu" attribute.
+    // Both are resolved ("native" -> host CPU) and validated in Compile, so EmitExecutable
+    // and the C interop path can use them verbatim.
+    std::string targetCpu_;
+    std::string tuneCpu_;
     int platformValue = 64;  // 64 for win64, 32 for win32
     // C interop: temp .obj files produced by clang-cl from .c inputs, linked
     // into the final image by EmitExecutable and then deleted.
@@ -2060,6 +2069,11 @@ private:
         if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
         else if (cOptLevel_ == 1) argStrs.push_back("/O1");
         if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
+        // Match the native object's tuning for C interop objects. --cpu sets both ISA and
+        // tune (clang -march); --tune overrides tune only (clang -mtune). clang-cl needs the
+        // /clang: prefix to forward these clang-driver options. Pre-resolved/validated in Compile.
+        if (!targetCpu_.empty()) argStrs.push_back("/clang:-march=" + targetCpu_);
+        if (!tuneCpu_.empty())   argStrs.push_back("/clang:-mtune=" + tuneCpu_);
         for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
         // For an imported program, rename the object's `main` symbol so it matches the
         // `__imported_main_<Alias>` declaration (above) and does not collide with the
@@ -3546,6 +3560,11 @@ private:
             std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
             return false;
         }
+
+        // --cpu overrides the platform default. The value was already resolved ("native"
+        // -> host CPU) and validated in Compile, so it can be used verbatim here.
+        if (!targetCpu_.empty())
+            cpu = targetCpu_;
 
         llvm::TargetOptions opt;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
@@ -9404,6 +9423,21 @@ public:
     // Populate %USERPROFILE%\.cflat\ with cached linker paths for x64 and x86.
     // Prints discovered paths to stdout. Returns false if the cache dir cannot be created.
     static bool RunInit(const std::string& runtimeDir, bool verbose);
+
+    // List the target CPUs supported on the currently supported platforms
+    // (Windows x86/x64, which both use LLVM's X86 backend and share one CPU table).
+    // Prints the sorted CPU names to stdout. Returns false on failure.
+    static bool PrintSupportedCpus();
+
+    // Print the LLVM name of the host CPU (what --cpu native resolves to), e.g.
+    // "znver4". Returns false if the host CPU cannot be determined.
+    static bool PrintHostCpu();
+
+    // Resolve a --cpu/--tune value for the given triple: map "native" to the host CPU
+    // and validate the result against the target's CPU table. 'label' names the flag in
+    // the error message. Returns false with a diagnostic if the name is unknown.
+    static bool ResolveCpuName(const std::string& requested, const std::string& triple,
+                               const char* label, bool verbose, std::string& resolved);
 
     // Core bitcode cache: returns %USERPROFILE%\.cflat\runtime\<hash> or "" on failure.
     // The hash is derived from the modification times of all .cb files in runtimeDir/core.
