@@ -1,0 +1,140 @@
+// perf_mpmc_contention.cb - the CAS-storm regime where pause() is supposed to help.
+//
+// The channel<T> blocking send()/receive() advance _head/_tail with a CAS in a
+// retry loop.  With ONE producer and ONE consumer the two cursors live on
+// separate cache lines and never contend (that is perf_spin_contention.cb).  With
+// MANY producers, every producer CASes the SAME _head cursor: all but one lose the
+// race each round, reload, and retry - a storm of failed CAS attempts that bounces
+// the _head cache line between cores.  An x86 PAUSE in the retry tail is meant to
+// damp that storm.  Consumers do the same on _tail.
+//
+// This benchmark sweeps the contention level (1/2/4/8 producers + consumers) so a
+// single binary traces the whole curve: PAUSE is expected to be neutral at low
+// thread counts and to help (if at all) only once the CAS storm is real.  Threads
+// are intentionally NOT pinned - we want them spread across physical cores so the
+// contention is genuine; at 8P/8C (16 threads) the box is oversubscribed on a
+// typical machine, which deepens the storm.
+//
+// Fixed-work: each producer sends TOTAL/P items, each consumer receives TOTAL/C.
+// The caps sum to TOTAL on both sides, so the run is deadlock-free without the
+// close protocol (no consumer is starved below its cap while items remain).
+//
+// Compare items/sec per row before and after pause() in channel.cb's send/receive.
+
+import "thread.cb";
+import "time.cb";
+import "channel.cb";
+
+int MAX_THREADS = 16;     // array sizing; largest config below must fit
+int TOTAL       = 4000000; // divisible by every P/C in the sweep
+int RING        = 4096;    // large -> contention is CAS-loss, not full/empty
+int TRIALS      = 3;
+
+void report(int p, int c, i64 best_us)
+{
+    i64 us = best_us;
+    if (us == (i64)0) us = (i64)1;
+    i64 tps   = (i64)TOTAL * (i64)1000000 / us;
+    i64 ns_op = us * (i64)1000 / (i64)TOTAL;
+    printf("  %2dP/%2dC   best %8lld us   %12lld items/s   %6lld ns/item\n", p, c, us, tps, ns_op);
+}
+
+channel<int>* g_mp_ch = nullptr;
+
+struct MpProdCtx { int count = 0; };
+struct MpConsCtx { int count = 0;  i64 sum = 0; };
+
+int mp_producer(void* raw)
+{
+    MpProdCtx* c = (MpProdCtx*)raw;
+    int i = 0;
+    while (i < c->count) { g_mp_ch.send(i); i++; }
+    return 0;
+}
+
+int mp_consumer(void* raw)
+{
+    MpConsCtx* c = (MpConsCtx*)raw;
+    i64 s = 0;
+    int i = 0;
+    while (i < c->count) { s = s + (i64)g_mp_ch.receive(); i++; }
+    c->sum = s;
+    return 0;
+}
+
+// One full TOTAL-item transfer with P producers and C consumers.
+// Returns elapsed microseconds; writes items consumed into *consumed.
+i64 run_mpmc_once(int p, int c, i64* consumed)
+{
+    channel<int> ch;
+    ch.init(RING);
+    g_mp_ch = &ch;
+
+    Thread[16]    prods;
+    Thread[16]    cons;
+    MpProdCtx[16] pctx;
+    MpConsCtx[16] cctx;
+
+    int perProd = TOTAL / p;
+    int perCons = TOTAL / c;
+
+    int i = 0;
+    while (i < p) { pctx[i].count = perProd; i++; }
+    i = 0;
+    while (i < c) { cctx[i].count = perCons; cctx[i].sum = 0; i++; }
+
+    Stopwatch sw;
+    sw.start();
+
+    // Start consumers first so they drain as soon as producers push.
+    i = 0;
+    while (i < c) { cons[i].start(mp_consumer, (void*)(&cctx[i])); i++; }
+    i = 0;
+    while (i < p) { prods[i].start(mp_producer, (void*)(&pctx[i])); i++; }
+
+    i = 0;
+    while (i < p) { prods[i].join(); i++; }
+    i = 0;
+    while (i < c) { cons[i].join(); i++; }
+
+    sw.stop();
+
+    i64 total = 0;
+    i = 0;
+    while (i < c) { if (cctx[i].sum != (i64)0) total = total + (i64)perCons; i++; }
+    *consumed = total;
+
+    ch.destroy();
+    return (i64)sw.elapsed().microseconds();
+}
+
+void sweep(int p, int c)
+{
+    i64 best     = (i64)0;
+    i64 consumed = (i64)0;
+    int t = 0;
+    while (t < TRIALS)
+    {
+        i64 cc = (i64)0;
+        i64 us = run_mpmc_once(p, c, &cc);
+        consumed = cc;
+        if (best == (i64)0 || us < best) best = us;
+        t++;
+    }
+    report(p, c, best);
+    if (consumed != (i64)TOTAL)
+        printf("       [WARN] consumed %lld of %d items - result unreliable\n", consumed, TOTAL);
+}
+
+extern int main()
+{
+    printf("\n--- MPMC contention sweep (ring=%d, %d items, best of %d, unpinned) ---\n",
+           RING, TOTAL, TRIALS);
+
+    sweep(1, 1);
+    sweep(2, 2);
+    sweep(4, 4);
+    sweep(8, 8);
+
+    return 0;
+}

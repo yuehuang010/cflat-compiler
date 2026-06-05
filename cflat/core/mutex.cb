@@ -34,17 +34,3 @@ struct mutex {
     // No-op - SRW locks require no cleanup (no kernel object, no heap allocation).
     void destroy() { }
 };
-
-// Spin-loop hint: emit an x86 PAUSE instruction inside a busy-wait so the SMT
-// sibling gets the core and the spin costs less power.  Use it in the retry
-// body of a spinlock or lock-free CAS loop:
-//
-//   while (!try_acquire()) { pause(); }
-//
-// x86/Intel only; the `if const (__X86__)` guard compiles it away on a non-x86
-// target rather than emitting an invalid instruction.
-void pause()
-{
-    if const (__X86__)
-        __pause();
-}

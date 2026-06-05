@@ -27,6 +27,7 @@
 // and (head + 1) % cap == tail means full.
 
 import "interfaces.cb";
+import "intrinsic.cb";   // pause() - spin-loop hint for the full/empty busy-waits
 
 // Atomic stubs - intercepted by compiler; emit LLVM atomic IR.
 extern int  __atomic_i32_load(int* ptr);
@@ -80,6 +81,7 @@ class spsc_queue<T>
         int head = __atomic_i32_load(&_head);
         int next = (head + 1) % _cap;
         while (next == __atomic_i32_load(&_tail)) {   // spin while full
+            pause();
             head = __atomic_i32_load(&_head);
             next = (head + 1) % _cap;
         }
@@ -91,6 +93,7 @@ class spsc_queue<T>
     T pop() {
         int tail = __atomic_i32_load(&_tail);
         while (tail == __atomic_i32_load(&_head)) {   // spin while empty
+            pause();
             tail = __atomic_i32_load(&_tail);
         }
         T out = _buf[tail];

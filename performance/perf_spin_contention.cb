@@ -1,0 +1,162 @@
+// perf_spin_contention.cb - isolates the busy-wait paths that pause() targets.
+//
+// The spsc_queue blocking push()/pop() and the channel blocking send()/receive()
+// spin (busy-wait) while the ring is full/empty.  To make the spin cost
+// observable this benchmark:
+//   - uses a SMALL ring, so full/empty (and therefore spinning) happens often, and
+//   - pins the producer and consumer to two SMT siblings of one physical core, so
+//     the spinning thread competes for that core's shared execution units with the
+//     thread doing real work.  That is exactly the case an x86 PAUSE in the spin
+//     body relieves: it yields the pipeline to the busy sibling.
+//
+// Fixed-work design: transfer ITEMS items, measure wall time, and report the best
+// of TRIALS runs as items/sec and ns/item.  Compare the number before and after
+// adding pause() to the spin loops in spsc_queue.cb / channel.cb.
+//
+// NOTE on affinity: masks 1 and 2 select logical CPUs 0 and 1, which are the two
+// SMT siblings of physical core 0 on a typical Windows topology.  If a machine
+// enumerates siblings differently the absolute numbers shift, but the
+// before/after comparison on the same machine stays valid.
+
+import "thread.cb";
+import "time.cb";
+import "spsc_queue.cb";
+import "channel.cb";
+
+int ITEMS  = 4000000;   // items transferred per trial
+int TRIALS = 3;
+int RING   = 8;         // small ring -> frequent full/empty -> heavy spinning
+
+u64 PROD_CPU = (u64)1;  // logical CPU 0
+u64 CONS_CPU = (u64)2;  // logical CPU 1 (SMT sibling of 0 on a typical machine)
+
+void report(char* name, i64 best_us)
+{
+    i64 us = best_us;
+    if (us == (i64)0) us = (i64)1;
+    i64 tps   = (i64)ITEMS * (i64)1000000 / us;
+    i64 ns_op = us * (i64)1000 / (i64)ITEMS;
+    printf("  %-22s  best %8lld us   %12lld items/s   %6lld ns/item\n", name, us, tps, ns_op);
+}
+
+// -- spsc_queue blocking push/pop (pure spin, no yield) -----------------------
+
+spsc_queue<int>* g_spsc     = nullptr;
+i64              g_spsc_sum = 0;
+
+int spsc_producer(void* ctx)
+{
+    int i = 0;
+    while (i < ITEMS) { g_spsc.push(i); i++; }
+    return 0;
+}
+
+int spsc_consumer(void* ctx)
+{
+    i64 sum = 0;
+    int i = 0;
+    while (i < ITEMS) { sum = sum + (i64)g_spsc.pop(); i++; }
+    g_spsc_sum = sum;
+    return 0;
+}
+
+i64 run_spsc_once()
+{
+    spsc_queue<int> q;
+    q.init(RING);
+    g_spsc     = &q;
+    g_spsc_sum = 0;
+
+    Thread tp;
+    Thread tc;
+
+    Stopwatch sw;
+    sw.start();
+    tp.start(spsc_producer, nullptr);
+    tc.start(spsc_consumer, nullptr);
+    tp.setAffinity(PROD_CPU);
+    tc.setAffinity(CONS_CPU);
+    tp.join();
+    tc.join();
+    sw.stop();
+
+    q.destroy();
+    return (i64)sw.elapsed().microseconds();
+}
+
+// -- channel blocking send/receive (CAS spin, yields every 1024) --------------
+
+channel<int>* g_ch     = nullptr;
+i64           g_ch_sum = 0;
+
+int ch_producer(void* ctx)
+{
+    int i = 0;
+    while (i < ITEMS) { g_ch.send(i); i++; }
+    return 0;
+}
+
+int ch_consumer(void* ctx)
+{
+    i64 sum = 0;
+    int i = 0;
+    while (i < ITEMS) { sum = sum + (i64)g_ch.receive(); i++; }
+    g_ch_sum = sum;
+    return 0;
+}
+
+i64 run_ch_once()
+{
+    channel<int> ch;
+    ch.init(RING);
+    g_ch     = &ch;
+    g_ch_sum = 0;
+
+    Thread tp;
+    Thread tc;
+
+    Stopwatch sw;
+    sw.start();
+    tp.start(ch_producer, nullptr);
+    tc.start(ch_consumer, nullptr);
+    tp.setAffinity(PROD_CPU);
+    tc.setAffinity(CONS_CPU);
+    tp.join();
+    tc.join();
+    sw.stop();
+
+    ch.destroy();
+    return (i64)sw.elapsed().microseconds();
+}
+
+extern int main()
+{
+    printf("\n--- spin contention (SMT-colocated, ring=%d, %d items, best of %d) ---\n",
+           RING, ITEMS, TRIALS);
+
+    i64 spsc_best = (i64)0;
+    int t = 0;
+    while (t < TRIALS)
+    {
+        i64 us = run_spsc_once();
+        if (spsc_best == (i64)0 || us < spsc_best) spsc_best = us;
+        t++;
+    }
+    report("spsc push/pop", spsc_best);
+
+    i64 ch_best = (i64)0;
+    t = 0;
+    while (t < TRIALS)
+    {
+        i64 us = run_ch_once();
+        if (ch_best == (i64)0 || us < ch_best) ch_best = us;
+        t++;
+    }
+    report("channel send/receive", ch_best);
+
+    // Sanity: a zero sum would mean the transfer loop was elided.
+    if (g_spsc_sum == (i64)0 || g_ch_sum == (i64)0)
+        printf("  [WARN] a consumer sum was zero - loop may have been optimized away\n");
+
+    return 0;
+}

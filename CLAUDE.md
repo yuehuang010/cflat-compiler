@@ -388,14 +388,14 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `random.cb` | Splitmix64 PRNG; requires `import "random.cb"` |
 | `channel.cb` | `channel<T>` - MPMC blocking channel; requires `import "channel.cb"` |
 | `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring buffer |
-| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - thread synchronization primitives; `pause()` (x86 spin-loop hint) |
+| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - thread synchronization primitives |
 | `latch.cb` | `latch` - one-shot countdown synchronization |
 | `semaphore.cb` | `semaphore` - counting semaphore |
 | `rwlock.cb` | `rwlock` - reader-writer lock |
 | `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
 | `time.cb` | `TimePoint.now()`, `Stopwatch`, `Timer`, `sleep`, `rdtscp()` (x86 cycle counter for jitter timing), `lfence()` (x86 serializing load fence), duration utilities |
-| `intrinsic.cb` | Target-independent compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely` (no `__X86__` guard needed) |
+| `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely` (target-independent), `pause()` (x86 spin-loop hint, used by `spsc_queue`/`channel` spin loops) |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
 | `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
 | `arena.cb` | Arena bump allocator |

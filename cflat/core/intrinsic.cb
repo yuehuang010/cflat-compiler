@@ -51,3 +51,18 @@ bool unlikely(bool cond)
 {
     return __unlikely(cond);
 }
+
+// Spin-loop hint: emit an x86 PAUSE instruction inside a busy-wait so the SMT
+// sibling gets the shared core and the spin costs less power.  Use it in the
+// retry body of a spinlock or lock-free spin loop:
+//
+//   while (queue_full()) { pause(); }
+//
+// Unlike the other wrappers here, PAUSE is x86/Intel only, so it is guarded with
+// `if const (__X86__)` - on a non-x86 target it compiles away rather than
+// emitting an invalid instruction.
+void pause()
+{
+    if const (__X86__)
+        __pause();
+}
