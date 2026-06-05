@@ -1,0 +1,23 @@
+// Grouped import: `import { ... };` is shorthand for several plain `import "x";` lines.
+// Pulls in two core libraries (a .cb header group) plus the math.h C-header binding to
+// confirm the group form routes both CFlat sources and C headers exactly like singles.
+import { "test_helper.cb", "list.cb" };
+import { "math.h" };
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    // From list.cb (second entry of the .cb group).
+    list<int> xs = default;
+    xs.add(10);
+    xs.add(20);
+    total++; passed += Test("group import: list.cb usable", xs.get(0) + xs.get(1), 30);
+
+    // From math.h (single-entry group routes to the C-header bind).
+    total++; passed += Test("group import: math.h sqrt", sqrt(9.0) == 3.0, true);
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

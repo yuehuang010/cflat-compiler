@@ -823,6 +823,30 @@ import "math/vector.cb";
 
 Imported functions, structs, and namespaces are available immediately after the import.
 
+#### Grouped imports (`{ ... }`)
+
+A brace-wrapped comma list imports several files on one line - a shorthand for writing the
+same plain `import "x";` statements separately:
+
+```c
+import { "utils.cb", "math/vector.cb" };
+import { "sqlite3.h", "sqlite3.c" };   // binds the header, compiles the .c (see C Interop)
+```
+
+Each entry routes exactly like a bare `import "x";` (the `.cb` / `.h` / `.c` dispatch is per
+entry), so a group can mix CFlat sources and C inputs. A trailing comma is allowed. Group
+entries take no per-entry `lib` / `define`. A trailing `cache` applies to **every** entry of
+the group:
+
+```c
+import { "windows.h", "shlwapi.h" } cache;   // both headers opt into the disk cache
+```
+
+(`cache` is a no-op for `.cb` / `.c` entries - only the `.h` header-bind path consults it.)
+An `as` alias is meaningful only when the group holds a single filename, since one alias cannot
+name several files; use separate `import` lines when you need an alias, `lib`, or `define` on a
+specific file.
+
 #### Import alias (`as`)
 
 Give an imported file a local alias so its symbols are accessible under a qualified name:

@@ -300,7 +300,7 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 - **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
 - **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`
 - **Type aliases**: `using M = Math` - expands at reference time
-- **Module system**: `import "file.cb"` for multi-file compilation
+- **Module system**: `import "file.cb"` for multi-file compilation; `import { "a.cb", "b.cb" };` is a grouped shorthand for several plain imports on one line (each entry routes exactly like a bare `import "x";` - same `.cb`/`.h`/`.c` dispatch, no per-entry `lib`/`define`). A trailing `cache` on a group applies to **every** entry (`import { "a.h", "b.h" } cache;` caches both - a no-op for `.cb`/`.c` entries). `as` is meaningful only on a single-entry group (one alias cannot name many files).
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths
 - **Implicit upcast, no implicit downcast**: widening conversions (e.g. `i32` -> `i64`, derived -> base/interface) happen implicitly; narrowing conversions (downcasts) require an explicit cast
 - **Null-safe access**: `ptr?.field` - works on any struct pointer (local variables, function arguments, struct member fields)

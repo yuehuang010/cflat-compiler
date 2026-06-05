@@ -618,10 +618,22 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import StringLiteral (As Identifier)? cacheClause? ';'
+    : Import importGroup (As Identifier)? cacheClause? ';'
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause ';'
+    ;
+
+// A plain file import target: either a single bare filename or a brace-wrapped comma
+// list of them. The list form is a shorthand for writing several `import "file";` lines
+// (so `import { "sqlite3.h", "sqlite3.c" };` binds the header and compiles the .c). Each
+// entry routes exactly like a plain `import "x";`; the optional `as` / `cache` on the
+// importDeclaration apply only when the group holds a single filename. The other
+// importDeclaration alternatives (program/package/package-vcpkg) keep a single direct
+// StringLiteral, so that accessor stays singular for them.
+importGroup
+    : StringLiteral
+    | '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
 // Optional inline import library for a header binding: import package "x.h" lib "y.lib";

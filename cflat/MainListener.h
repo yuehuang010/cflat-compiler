@@ -2115,8 +2115,33 @@ public:
         {
             if (auto* imp = extDecl->importDeclaration())
             {
-                std::string raw = imp->StringLiteral()->getText();
-                std::string importFilename = raw.substr(1, raw.size() - 2);
+                // Grouped import `import { "a", "b" };` inside an if-const branch - expand
+                // to plain imports (no alias/lib/define/cache, like a bare `import "x";`).
+                if (auto* grp = imp->importGroup())
+                {
+                    auto lits = grp->StringLiteral();
+                    if (lits.size() > 1)
+                    {
+                        for (auto* lit : lits)
+                        {
+                            std::string gr = lit->getText();
+                            if (gr.size() < 2) continue;
+                            Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, gr.substr(1, gr.size() - 2));
+                        }
+                        continue;
+                    }
+                }
+                std::string importFilename;
+                if (auto* grp = imp->importGroup())
+                {
+                    std::string gr = grp->StringLiteral(0)->getText();
+                    importFilename = gr.substr(1, gr.size() - 2);
+                }
+                else
+                {
+                    std::string raw = imp->StringLiteral()->getText();
+                    importFilename = raw.substr(1, raw.size() - 2);
+                }
                 // `import package-vcpkg "header" from "port";` inside an if-const branch.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg")
                 {

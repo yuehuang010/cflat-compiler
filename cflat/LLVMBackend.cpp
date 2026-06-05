@@ -59,6 +59,22 @@ static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
     return imp->cacheClause() != nullptr;
 }
 
+// Dequoted filenames from a grouped import `import { "a", "b" };`, in source order.
+// Empty when this import is not the grouped form (so callers can fall through to the
+// single-StringLiteral handling). Each entry is a plain import: no alias/lib/define/cache.
+static std::vector<std::string> DequoteImportGroup(CFlatParser::ImportDeclarationContext* imp)
+{
+    std::vector<std::string> out;
+    auto* grp = imp->importGroup();
+    if (!grp) return out;
+    for (auto* lit : grp->StringLiteral())
+    {
+        std::string raw = lit->getText();
+        if (raw.size() >= 2) out.push_back(raw.substr(1, raw.size() - 2));
+    }
+    return out;
+}
+
 // True when this import line is `import package-vcpkg "..." from "...";`. Detected by
 // the second child token text - mirrors the existing `package` / `program` test.
 static bool IsPackageVcpkgImport(CFlatParser::ImportDeclarationContext* imp)
@@ -313,8 +329,32 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (auto* tu = computeUnit->translationUnit()) {
                 for (auto* decl : tu->externalDeclaration()) {
                     if (auto* imp = decl->importDeclaration()) {
-                        std::string raw = imp->StringLiteral()->getText();
-                        std::string importFilename = raw.substr(1, raw.size() - 2);
+                        // `import { "a", "b" };` - a group of >1 plain imports. Each entry
+                        // routes like a plain `import "x";` (no per-entry alias/lib/define). A
+                        // trailing `cache` on the group applies to every entry (a no-op for
+                        // .cb/.c entries; only the .h header-bind branch consults it).
+                        auto groupedImports = DequoteImportGroup(imp);
+                        if (groupedImports.size() > 1)
+                        {
+                            bool cacheGroup = HasCacheClause(imp);
+                            for (const auto& gf : groupedImports)
+                            {
+                                if (verbose) std::cout << "[verbose] import requested (group): " << gf << (cacheGroup ? " (cache)" : "") << "\n";
+                                if (!CompileImportedFile(filename, gf, "", "", "", {}, cacheGroup))
+                                    return false;
+                            }
+                            continue;
+                        }
+                        // Single filename: from the importGroup (plain/`as`/`cache` form) or,
+                        // for the program/package/vcpkg alternatives, the direct StringLiteral.
+                        std::string importFilename;
+                        if (!groupedImports.empty())
+                            importFilename = groupedImports[0];
+                        else
+                        {
+                            std::string raw = imp->StringLiteral()->getText();
+                            importFilename = raw.substr(1, raw.size() - 2);
+                        }
                         // `import package-vcpkg "header" from "port";` - dispatch to the
                         // vcpkg resolver and skip the regular import dedup/parse machinery.
                         if (IsPackageVcpkgImport(imp))
@@ -787,8 +827,26 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             if (auto* imp = decl->importDeclaration())
             {
-                std::string raw = imp->StringLiteral()->getText();
-                std::string nested = raw.substr(1, raw.size() - 2);
+                // Grouped import `import { "a", "b" };` - expand to plain nested imports.
+                auto groupedImports = DequoteImportGroup(imp);
+                if (groupedImports.size() > 1)
+                {
+                    for (const auto& gf : groupedImports)
+                    {
+                        if (verbose) std::cout << "[verbose]   nested import (group): " << gf << "\n";
+                        if (!CompileImportedFile(canonicalStr, gf))
+                            return false;
+                    }
+                    continue;
+                }
+                std::string nested;
+                if (!groupedImports.empty())
+                    nested = groupedImports[0];
+                else
+                {
+                    std::string raw = imp->StringLiteral()->getText();
+                    nested = raw.substr(1, raw.size() - 2);
+                }
                 if (IsPackageVcpkgImport(imp))
                 {
                     std::string portSpec = DequoteFromClause(imp);
@@ -1077,8 +1135,23 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         if (auto* tu = computeUnit->translationUnit()) {
             for (auto* decl : tu->externalDeclaration()) {
                 if (auto* imp = decl->importDeclaration()) {
-                    std::string raw = imp->StringLiteral()->getText();
-                    std::string importFilename = raw.substr(1, raw.size() - 2);
+                    // Grouped import `import { "a", "b" };` - expand to plain imports.
+                    auto groupedImports = DequoteImportGroup(imp);
+                    if (groupedImports.size() > 1)
+                    {
+                        for (const auto& gf : groupedImports)
+                            if (!CompileImportedFile(filePath, gf))
+                                return false;
+                        continue;
+                    }
+                    std::string importFilename;
+                    if (!groupedImports.empty())
+                        importFilename = groupedImports[0];
+                    else
+                    {
+                        std::string raw = imp->StringLiteral()->getText();
+                        importFilename = raw.substr(1, raw.size() - 2);
+                    }
                     if (IsPackageVcpkgImport(imp))
                     {
                         std::string portSpec = DequoteFromClause(imp);
