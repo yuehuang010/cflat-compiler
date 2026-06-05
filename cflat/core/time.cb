@@ -245,3 +245,45 @@ void sleep(i64 ms)
     if (ms > 0)
         Sleep((i32)ms);
 }
+
+// Emit an LFENCE: a load fence that also serializes the instruction stream.
+// LFENCE does not retire until every prior instruction has completed, and no
+// later instruction begins before it.  Use it to bracket a timed region so
+// out-of-order execution cannot pull work across an rdtscp() read:
+//
+//   lfence();                 // fence the region's start
+//   i64 t0 = rdtscp();
+//   do_work(i);
+//   i64 cycles = rdtscp() - t0;
+//   lfence();                 // fence the region's end
+//
+// x86/Intel only; guarded with `if const (__X86__)` so a non-x86 target compiles
+// it away rather than emitting an invalid instruction.
+void lfence()
+{
+    if const (__X86__)
+        __lfence();
+}
+
+// Read the CPU timestamp counter via the serializing RDTSCP instruction and
+// return the raw 64-bit cycle count.  RDTSCP waits for all prior instructions to
+// retire before reading the counter, so back-to-back deltas measure a code region
+// without out-of-order execution smearing the result - ideal for per-iteration
+// loop-jitter measurement at sub-100ns resolution.
+//
+// Notes:
+//   - Returns CYCLES, not nanoseconds.  Convert with the invariant-TSC frequency
+//     (cycles / tsc_hz); use it only for deltas, never as a wall-clock value.
+//   - x86/Intel only.  Guarded with `if const (__X86__)` so a future non-x86
+//     target fails to compile here rather than emitting an invalid instruction.
+//
+// Example - per-iteration jitter:
+//   i64 t0 = rdtscp();
+//   do_work(i);
+//   i64 cycles = rdtscp() - t0;   // store into a preallocated array, analyze later
+i64 rdtscp()
+{
+    if const (__X86__)
+        return __rdtscp();
+    return 0;   // non-x86 target: __rdtscp() is eliminated; RDTSCP is unavailable
+}

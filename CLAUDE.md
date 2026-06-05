@@ -343,7 +343,7 @@ Implementation: `EmitOwningPtrCleanup()` in `LLVMBackend.h`; `EmitDestructorsFor
 ### Compile-Time Features
 
 - **`if const`**: Condition evaluated at compile-time; dead branches eliminated from IR. Works at both function and file scope.
-- **Compile-time macros**: `__FILE__`, `__FUNCTION__`, `__LINE__`, `__PLATFORM__` (64 or 32). Available globally.
+- **Compile-time macros**: `__FILE__`, `__FUNCTION__`, `__LINE__`, `__PLATFORM__` (64 or 32), `__WIN64__` / `__WIN32__` / `__WINDOWS__`, `__X86__` (1 on the x86/Intel target; guards architecture-specific intrinsics). Available globally.
 - **`is_pointer(T)`**: Compile-time intrinsic that returns 1 if the type parameter T resolves to a pointer type in the current generic instantiation, 0 otherwise. Use with `if const` to branch on element ownership in generic code.
 - **Platform support**: `-p win64` (default) or `-p win32`; guard with `if const (__PLATFORM__ == 64) { ... }`
 
@@ -394,7 +394,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `rwlock.cb` | `rwlock` - reader-writer lock |
 | `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
-| `time.cb` | `Time.now()`, sleep, duration utilities |
+| `time.cb` | `TimePoint.now()`, `Stopwatch`, `Timer`, `sleep`, `rdtscp()` (x86 cycle counter for jitter timing), `lfence()` (x86 serializing load fence), duration utilities |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
 | `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
 | `arena.cb` | Arena bump allocator |

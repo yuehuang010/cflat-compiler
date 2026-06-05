@@ -33,6 +33,7 @@
 #pragma warning(disable: 4244 4267)
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\Intrinsics.h>
+#include <llvm\IR\IntrinsicsX86.h>   // llvm::Intrinsic::x86_rdtscp (CreateRdtscp)
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
@@ -1816,6 +1817,30 @@ private:
 
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), id, {floatVal->getType()});
         return builder->CreateCall(fn, {floatVal});
+    }
+
+    // Emit the x86 RDTSCP instruction - a serializing read of the CPU timestamp
+    // counter.  Returns the 64-bit cycle count; the TSC_AUX processor id (the
+    // intrinsic's second result) is discarded.  x86/Intel target only - CFlat
+    // callers should guard with `if const (__X86__)`.
+    llvm::Value* CreateRdtscp()
+    {
+        // llvm.x86.rdtscp returns { i64 cycles, i32 aux } and takes no arguments.
+        auto* fn   = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::x86_rdtscp);
+        auto* call = builder->CreateCall(fn, {});
+        return builder->CreateExtractValue(call, { 0u }, "rdtscp");
+    }
+
+    // Emit the x86 LFENCE instruction - a load fence that also serializes the
+    // instruction stream: it does not retire until all prior instructions have
+    // completed, and no later instruction starts before it.  Pairs with RDTSC so
+    // out-of-order execution cannot smear a measured region's start/end.  Returns
+    // nothing.  x86/Intel target only - guard callers with `if const (__X86__)`.
+    void CreateLfence()
+    {
+        // llvm.x86.sse2.lfence returns void and takes no arguments.
+        auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::x86_sse2_lfence);
+        builder->CreateCall(fn, {});
     }
 
     // Emit an integer narrowing/widening conversion (to_i8, to_u8, to_i16, to_u16,

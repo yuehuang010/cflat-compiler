@@ -1,0 +1,77 @@
+// Compiler hardware-intrinsic regression tests: the __X86__ guard constant and
+// the x86 RDTSCP / LFENCE intrinsics exposed through core/time.cb.
+
+import "time.cb";
+import "test_helper.cb";
+
+// The compiler emits __X86__ = 1 on the (only) supported x86/Intel target.
+int testX86Constant()
+{
+    int passed = 0;
+    passed += Test("__X86__ == 1", (int)__X86__, 1);
+    return passed;
+}
+
+// RDTSCP advances: reading the counter after some work yields a strictly larger
+// cycle count than before.  This is the core measurement primitive for
+// per-iteration loop-jitter timing.
+int testRdtscp()
+{
+    int passed = 0;
+
+    i64 t0 = rdtscp();
+
+    i64 sum = 0;
+    int i = 0;
+    while (i < 100000)
+    {
+        sum = sum + (i64)i;
+        i = i + 1;
+    }
+
+    i64 t1 = rdtscp();
+
+    passed += Test("rdtscp advances", t1 > t0, true);
+    passed += Test("loop executed",   sum > (i64)0, true);   // keep the loop live
+    return passed;
+}
+
+// LFENCE brackets a timed region so out-of-order execution cannot pull the loop
+// across either rdtscp() read.  The fenced measurement still advances.
+int testLfence()
+{
+    int passed = 0;
+
+    lfence();
+    i64 t0 = rdtscp();
+
+    i64 sum = 0;
+    int i = 0;
+    while (i < 100000)
+    {
+        sum = sum + (i64)i;
+        i = i + 1;
+    }
+
+    i64 t1 = rdtscp();
+    lfence();
+
+    passed += Test("fenced rdtscp advances", t1 > t0, true);
+    passed += Test("fenced loop executed",   sum > (i64)0, true);
+    return passed;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    int r;
+
+    r = testX86Constant(); passed += r; total += 1;
+    r = testRdtscp();      passed += r; total += 2;
+    r = testLfence();      passed += r; total += 2;
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

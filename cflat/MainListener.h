@@ -8814,6 +8814,30 @@ public:
                             break;
                         }
 
+                        // Hardware intrinsic: __rdtscp() - serializing read of the x86 CPU
+                        // timestamp counter (RDTSCP). Returns an i64 raw cycle count. x86/Intel
+                        // target only; callers should guard with `if const (__X86__)`. Wrapped
+                        // by rdtscp() in time.cb for measuring loop jitter at sub-100ns resolution.
+                        if (functionName == "__rdtscp")
+                        {
+                            namedVar.Primary = Compiler(ctx)->CreateRdtscp();
+                            namedVar.Storage = nullptr;
+                            namedVar.BaseType = namedVar.Primary->getType();
+                            namedVar.TypeAndValue.TypeName = "i64";
+                            break;
+                        }
+
+                        // Hardware intrinsic: __lfence() - emit the x86 LFENCE load/serializing
+                        // fence. Returns nothing. x86/Intel target only; guard callers with
+                        // `if const (__X86__)`. Wrapped by lfence() in time.cb; pair with rdtscp()
+                        // to keep out-of-order execution from smearing a measured region.
+                        if (functionName == "__lfence")
+                        {
+                            Compiler(ctx)->CreateLfence();
+                            namedVar = {};
+                            break;
+                        }
+
                         // Handle va_start / va_end - pass the va_list alloca address to the LLVM intrinsic.
                         if (functionName == "va_start" || functionName == "va_end")
                         {
@@ -10287,7 +10311,7 @@ public:
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_primitive", "is_string", "annotationof",
-            "reflect", "reflect_set",
+            "reflect", "reflect_set", "__rdtscp", "__lfence",
         };
         if (kIntrinsics.count(name))
             return {};

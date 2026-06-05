@@ -274,6 +274,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         SetCompileTimeMacro("__WIN32__", win32Const, "int");
         auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
         SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
+        // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
+        // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
+        auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+        SetCompileTimeMacro("__X86__", x86Const, "int");
 
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
@@ -1088,6 +1092,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         SetCompileTimeMacro("__WIN32__", win32Const, "int");
         auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
         SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
+        // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
+        // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
+        auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+        SetCompileTimeMacro("__X86__", x86Const, "int");
     }
 
     if (!runtimeDir.empty())
@@ -1845,6 +1853,10 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     SetCompileTimeMacro("__WIN32__", win32Const, "int");
     auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
     SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
+    // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
+    // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
+    auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
+    SetCompileTimeMacro("__X86__", x86Const, "int");
 
     if (runtimeDir.empty()) return false;
     auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
