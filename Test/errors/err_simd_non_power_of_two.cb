@@ -1,0 +1,5 @@
+// simd lane count must be a power of 2.
+
+expect_error("simd lane count must be a power of 2 in [2,64] (got 7)") {
+    simd<float, 7> v;
+}

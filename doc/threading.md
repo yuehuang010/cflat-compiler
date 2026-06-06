@@ -19,6 +19,8 @@
   - [Reader-Writer Locks](#reader-writer-locks)
   - [Atomic Memory-Ordering Guards](#atomic-memory-ordering-guards)
 
+**Related:** [HPC & SIMD](HPC.md) (`vectorize`, `simd<T,N>`) | [Language & Core Library Features](LANGUAGE.md)
+
 ---
 
 ## Memory Management

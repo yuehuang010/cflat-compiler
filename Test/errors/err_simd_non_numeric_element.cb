@@ -1,0 +1,5 @@
+// simd element type must be a numeric scalar (bool / i1 is rejected).
+
+expect_error("simd element type must be a numeric scalar") {
+    simd<bool, 4> v;
+}

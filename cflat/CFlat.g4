@@ -280,7 +280,15 @@ typeSpecifier
     | Identifier ('.' Identifier)+   // namespace-qualified type (e.g. MathAdv.MyNumber)
     | genericIdentifier
     | functionPointerSpecifier
+    | simdTypeSpecifier
     | tupleTypeSpecifier
+    ;
+
+// Builtin special-form vector type: simd<T,N>. 'simd' is an inline-literal soft keyword
+// (same mechanism as 'function'). N is parsed as an expression and constant-folded in the
+// listener (mirrors arrayDimSpec); it must be a power-of-2 integer literal.
+simdTypeSpecifier
+    : 'simd' '<' typeSpecifier ',' assignmentExpression '>'
     ;
 
 tupleTypeSpecifier

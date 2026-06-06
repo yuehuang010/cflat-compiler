@@ -203,7 +203,10 @@ int descendToLeaf(i64 key)
         int cnt = nd->count;
         int j = 0;
         int k = 0;
-        while (k < cnt)
+        // The separator tally is a pure count reduction over a contiguous key run
+        // with no early exit - the one shape a vectorizer handles cleanly. Assert
+        // it: `vectorize` hard-errors at -O2 if this loop ever stops vectorizing.
+        vectorize while (k < cnt)
         {
             j = j + (int)(key >= nd->keys[k]);
             k = k + 1;

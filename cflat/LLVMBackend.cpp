@@ -1968,6 +1968,11 @@ static llvm::json::Object SerializeTav(const TAV& t)
             o["aid"] = std::move(dims);
         }
     }
+    if (t.IsSimd)
+    {
+        o["sd"] = true;
+        o["sdl"] = static_cast<int64_t>(t.SimdLanes);
+    }
     return o;
 }
 
@@ -2007,6 +2012,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto* dims = o.getArray("aid"))
         for (auto& d : *dims)
             if (auto v = d.getAsInteger()) t.ConstInnerDimensions.push_back(static_cast<uint64_t>(*v));
+    if (auto v = o.getBoolean("sd")) t.IsSimd = *v;
+    if (auto v = o.getInteger("sdl")) t.SimdLanes = static_cast<uint64_t>(*v);
     return t;
 }
 

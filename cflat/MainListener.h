@@ -103,6 +103,39 @@ static std::string MangleTypeArg(const std::string& typeName)
     return result;
 }
 
+// simd<T,N>: validate the lane count N. It must be a plain power-of-2 integer literal in [2,64]
+// (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
+// silently waste a lane is rejected rather than padded). Returns true and sets lanesOut on
+// success; otherwise sets errorOut and returns false.
+static bool TryParseSimdLaneCount(const std::string& text, uint64_t& lanesOut, std::string& errorOut)
+{
+    uint64_t v = 0;
+    try
+    {
+        size_t pos = 0;
+        v = std::stoull(text, &pos, 0);   // base 0 also accepts 0x.. forms
+        if (pos != text.size())
+            throw std::invalid_argument("trailing characters");
+    }
+    catch (...)
+    {
+        errorOut = std::format("simd lane count must be an integer literal (got '{}')", text);
+        return false;
+    }
+    if (v < 2 || v > 64 || (v & (v - 1)) != 0)
+    {
+        uint64_t up = 2; while (up < v && up < 64) up <<= 1;
+        uint64_t down = (up > 2) ? (up >> 1) : 2;
+        if (down == up)
+            errorOut = std::format("simd lane count must be a power of 2 in [2,64] (got {}); did you mean simd<...,{}>?", v, up);
+        else
+            errorOut = std::format("simd lane count must be a power of 2 in [2,64] (got {}); did you mean simd<...,{}> or simd<...,{}>?", v, down, up);
+        return false;
+    }
+    lanesOut = v;
+    return true;
+}
+
 // Extract function name from FunctionDefinitionContext (handles operator overloads).
 static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
 {
@@ -345,6 +378,20 @@ private:
                             }
                         }
                         // For bare 'function', signature inferred from initializer at declaration site
+                        break;
+                    }
+                    // simd<T,N> builtin vector type. Record fields best-effort; the main pass reports
+                    // any malformed lane count (avoid double-logging from the pre-scan).
+                    if (typeSpec->simdTypeSpecifier() != nullptr)
+                    {
+                        auto* sd = typeSpec->simdTypeSpecifier();
+                        uint64_t lanes = 0;
+                        std::string err;
+                        TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err);
+                        declType.TypeName = sd->typeSpecifier()->getText();
+                        declType.IsSimd = true;
+                        declType.SimdLanes = lanes;
+                        declType.Pointer = declSpec->pointer() != nullptr;
                         break;
                     }
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
@@ -1433,6 +1480,25 @@ private:
                         }
                     }
                     // For bare 'function', signature inferred from initializer at declaration site
+                    break;
+                }
+                // simd<T,N> builtin vector type (not a generic): record element type + lane count.
+                if (typeSpec->simdTypeSpecifier() != nullptr)
+                {
+                    auto* sd = typeSpec->simdTypeSpecifier();
+                    std::string elemType = sd->typeSpecifier()->getText();
+                    // Resolve a generic type parameter (e.g. T -> float inside simd<T,8> in a template body).
+                    auto substIt = activeTypeSubstitutions.find(elemType);
+                    if (substIt != activeTypeSubstitutions.end())
+                        elemType = substIt->second;
+                    uint64_t lanes = 0;
+                    std::string err;
+                    if (!TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err))
+                        LogErrorContext(sd, err);
+                    declType.TypeName = elemType;
+                    declType.IsSimd = true;
+                    declType.SimdLanes = lanes;
+                    declType.Pointer = declSpec->pointer() != nullptr;
                     break;
                 }
                 if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
@@ -4364,6 +4430,10 @@ public:
 
                     if (right != nullptr)
                     {
+                        // simd<T,N> initialized from a scalar: splat across all lanes.
+                        if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
+                            right = compiler->SplatToSimd(right, typeAndValue);
+
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
 
                         // Apply field initializer overrides after the default value is stored.
@@ -8093,7 +8163,20 @@ public:
                             LogErrorContext(expressCtx, "Expecting be an integer type.");
                         }
 
-                        if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
+                        if (namedVar.BaseType && namedVar.BaseType->isVectorTy())
+                        {
+                            // simd<T,N> lane read: load the whole vector, extractelement. This yields
+                            // a value (not an addressable lvalue), so it flows through Primary.
+                            auto* vecTy = llvm::cast<llvm::FixedVectorType>(namedVar.BaseType);
+                            llvm::Value* vecVal = LoadNamedVariable(namedVar);
+                            namedVar.Primary = Compiler(ctx)->builder->CreateExtractElement(vecVal, rvalue, "simdlane");
+                            namedVar.Storage = nullptr;
+                            namedVar.BaseType = vecTy->getElementType();
+                            // TypeName already holds the element scalar (e.g. "float"); drop the simd-ness.
+                            namedVar.TypeAndValue.IsSimd = false;
+                            namedVar.TypeAndValue.SimdLanes = 0;
+                        }
+                        else if (auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(namedVar.BaseType))
                         {
                             // Fixed-size array (char buf[N] or char* words[N]): two-index GEP {0, i}.
                             // Check BaseType first so pointer-element arrays (char*[N]) don't fall
@@ -8133,7 +8216,11 @@ public:
                             namedVar.Storage = Compiler(ctx)->CreateGEP(namedVar.BaseType, namedVar.Storage, rvalue);
                             namedVar.BaseType = namedVar.Storage->getType();
                         }
-                        namedVar.Primary = nullptr;
+                        // The lvalue branches above produce a Storage pointer; clear the stale Primary
+                        // so the result is read from Storage. The simd-lane branch instead produces a
+                        // value via Primary (Storage == nullptr) - keep it.
+                        if (namedVar.Storage)
+                            namedVar.Primary = nullptr;
 
                         if (namedVar.BaseType && namedVar.BaseType->isStructTy())
                         {

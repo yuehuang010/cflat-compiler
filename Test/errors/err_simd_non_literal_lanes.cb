@@ -1,0 +1,5 @@
+// simd lane count must be an integer literal, not a name.
+
+expect_error("simd lane count must be an integer literal") {
+    simd<float, LANES> v;
+}

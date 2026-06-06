@@ -217,6 +217,12 @@ public:
         uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
         std::vector<uint64_t> ConstInnerDimensions;   // inner dimensions for multi-dim arrays (e.g. [M] in T[N][M])
 
+        // simd<T,N>: builtin special-form vector type. IsSimd => TypeName is the element scalar (e.g. "float"),
+        // SimdLanes is N (power of 2). Lowers to LLVM <N x T>. A primitive value (register-resident), NOT a
+        // struct/array aggregate and NOT a pointer - never combined with Pointer/ConstArraySize.
+        bool IsSimd = false;
+        uint64_t SimdLanes = 0;
+
         // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
         // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
@@ -5856,6 +5862,66 @@ public:
         return gv;
     }
 
+    // Element-wise arithmetic on simd<T,N> values. Either operand may be a scalar, which is
+    // splatted across all lanes (with element-type conversion). Both vector operands must share
+    // the same lane count and element type. v1 supports + - * / only; comparisons are deferred.
+    llvm::Value* CreateVectorOperation(Operation op, llvm::Value* left, llvm::Value* right, bool isUnsigned = false)
+    {
+        auto* lvt = llvm::dyn_cast<llvm::FixedVectorType>(left->getType());
+        auto* rvt = llvm::dyn_cast<llvm::FixedVectorType>(right->getType());
+        llvm::FixedVectorType* vt = lvt ? lvt : rvt;
+
+        auto splat = [&](llvm::Value* scalar) -> llvm::Value*
+        {
+            scalar = ConvertScalarToType(scalar, vt->getElementType());
+            return builder->CreateVectorSplat(vt->getElementCount(), scalar);
+        };
+        if (!lvt) left = splat(left);
+        if (!rvt) right = splat(right);
+
+        if (left->getType() != right->getType())
+        {
+            LogError("simd operands must have the same lane count and element type");
+            return left;
+        }
+
+        bool isFloat = vt->getElementType()->isFloatingPointTy();
+        switch (op)
+        {
+        case Operation::Add:      case Operation::AddAssignment:
+            return isFloat ? builder->CreateFAdd(left, right) : builder->CreateAdd(left, right);
+        case Operation::Subtract: case Operation::MinusAssignment:
+            return isFloat ? builder->CreateFSub(left, right) : builder->CreateSub(left, right);
+        case Operation::Multiply: case Operation::MultiplyAssignment:
+            return isFloat ? builder->CreateFMul(left, right) : builder->CreateMul(left, right);
+        case Operation::Divide:   case Operation::DivideAssignment:
+            return isFloat ? builder->CreateFDiv(left, right)
+                 : isUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+        default:
+            LogError("simd supports only + - * / operators (comparisons and other operators are not yet supported)");
+            return left;
+        }
+    }
+
+    // Splat a scalar across all lanes of a simd<T,N> value (converting element type as needed).
+    // Used to initialize/assign a simd variable from a scalar (e.g. simd<float,8> v = 1.0;).
+    llvm::Value* SplatToSimd(llvm::Value* scalar, const TypeAndValue& tv)
+    {
+        auto* vecTy = llvm::cast<llvm::FixedVectorType>(GetType(tv));
+        scalar = ConvertScalarToType(scalar, vecTy->getElementType());
+        return builder->CreateVectorSplat(vecTy->getElementCount(), scalar);
+    }
+
+    // Convert a scalar to an exact target scalar type, handling both widening (Upconvert)
+    // and narrowing (e.g. a double literal into a float lane), which Upconvert alone won't do.
+    llvm::Value* ConvertScalarToType(llvm::Value* scalar, llvm::Type* target)
+    {
+        scalar = Upconvert(scalar, target);
+        if (scalar->getType() != target)
+            scalar = CreateCast(scalar, target);
+        return scalar;
+    }
+
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
     {
         if (left == nullptr)
@@ -5941,6 +6007,11 @@ public:
                 break;  // ==, !=, logical ops, etc. fall through to the integer path below
             }
         }
+
+        // simd<T,N> operands: element-wise vector ops. A <N x float> answers false to the scalar
+        // isFloatingPointTy() check below, so vectors must be handled before the scalar paths.
+        if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
+            return CreateVectorOperation(op, left, right);
 
         // Upconvert both
         left = Upconvert(left, right);
@@ -6124,6 +6195,11 @@ public:
         // Delegate pointer operations before Upconvert can corrupt pointer/int pairs.
         if (left->getType()->isPointerTy() || right->getType()->isPointerTy())
             return CreateOperation(op, left, right);
+
+        // simd<T,N> operands: element-wise ops. A <N x iX>/<N x float> answers false to the scalar
+        // isFloatingPointTy() check below, so vectors must be handled before the integer switch.
+        if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
+            return CreateVectorOperation(op, left, right, leftIsUnsigned || rightIsUnsigned);
 
         left  = Upconvert(left,  right, leftIsUnsigned);
         right = Upconvert(right, left,  rightIsUnsigned);
@@ -6862,6 +6938,23 @@ public:
                     type = builder->getVoidTy();
                 }
             }
+        }
+
+        // simd<T,N> -> LLVM <N x T> vector primitive. Wrap before pointer wrapping so
+        // simd<float,8>* lowers to <8 x float>*. Element must be a numeric scalar.
+        if (typeAndValue.IsSimd)
+        {
+            if (typeAndValue.SimdLanes == 0)
+                return type;  // malformed lane count already reported; avoid a 0-width vector
+            bool numeric = type->isFloatTy() || type->isDoubleTy()
+                || (type->isIntegerTy() && !type->isIntegerTy(1));  // reject bool (i1), void, struct
+            if (!numeric)
+            {
+                LogError(std::format("simd element type must be a numeric scalar "
+                    "(i8..i64, u8..u64, float, double), got '{}'", resolvedTypeName));
+                return type;
+            }
+            type = llvm::FixedVectorType::get(type, static_cast<unsigned>(typeAndValue.SimdLanes));
         }
 
         // Apply pointer wrapping to get the element type before array wrapping.
@@ -9075,6 +9168,7 @@ public:
         if (tv.IsCdecl)        j["cd"]  = true;
         if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
         if (!tv.ConstInnerDimensions.empty()) j["idims"] = tv.ConstInnerDimensions;
+        if (tv.IsSimd) { j["sd"] = true; j["sdl"] = tv.SimdLanes; }
         if (tv.IsFunctionPointer)
         {
             j["fp"]  = true;
@@ -9104,6 +9198,8 @@ public:
         tv.IsCdecl        = j.value("cd",  false);
         tv.ConstArraySize = j.value("arr", uint64_t{0});
         if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].get<std::vector<uint64_t>>();
+        tv.IsSimd   = j.value("sd",  false);
+        tv.SimdLanes = j.value("sdl", uint64_t{0});
         tv.IsFunctionPointer = j.value("fp", false);
         if (tv.IsFunctionPointer)
         {
