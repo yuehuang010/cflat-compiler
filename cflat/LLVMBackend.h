@@ -9088,6 +9088,14 @@ public:
     // inputOverride, when non-empty, replaces positional(0) as the file to compile.
     // Used by batch / --check mode to compile each positional file independently.
     bool Compile(const ArgParser& args, const std::string& inputOverride = {});
+
+    // --grammar: parse a single source file in isolation to validate its syntax
+    // (no imports, no forward-ref scan, no codegen). Syntax errors are reported
+    // with the same humanized hints as a normal compile. When verbose is set, the
+    // full parse-tree rule stack is also printed. Returns true if the file parsed
+    // without syntax errors.
+    bool CheckGrammar(const std::string& filename);
+
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
 
     // Vcpkg integration setters - wired from CLI flags in main.cpp.

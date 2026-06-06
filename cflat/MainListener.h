@@ -1284,8 +1284,6 @@ private:
     // Queue for pending generic instantiations (delayed until safe to emit code)
     std::vector<PendingInstantiation>& pendingInstantiations;
 
-    constexpr static bool debugPrint = false;
-
     struct SwitchCaseEntry
     {
         llvm::ConstantInt* value = nullptr;       // non-null for integer cases
@@ -2286,9 +2284,6 @@ public:
 
     void enterExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx) override
     {
-        if constexpr (debugPrint)
-            return;
-
         // Skip nodes nested inside a namespace - they are handled by ParseNamespaceDefinition.
         if (dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(ctx->parent))
             return;
@@ -14165,11 +14160,5 @@ public:
         size_t line = ctx->getStart()->getLine();
         size_t column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{},{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
-    }
-
-    void enterEveryRule(antlr4::ParserRuleContext* ctx) override
-    {
-        if constexpr (debugPrint)
-            PrintContext(ctx);
     }
 };

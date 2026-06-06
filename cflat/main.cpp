@@ -43,6 +43,7 @@ int main(int argc, char* argv[])
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
     args.addFlag("check", 0, "Check one or more source files for errors without emitting any output (batch)");
+    args.addFlag("grammar", 0, "Validate the grammar (parse only) of one or more source files; add -v to print the full parse-tree rule stack");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
     args.addFlag("no-opt", 0, "Disable baseline passes (sroa, mem2reg, instcombine, simplifycfg)");
     args.addFlag("nologo", 0, "Hide compiler version and completion messages");
@@ -115,6 +116,28 @@ int main(int argc, char* argv[])
             std::cout << "Time trace written to " << tracePath << "\n";
         llvm::timeTraceProfilerCleanup();
     };
+
+    // --grammar: parse each positional source file in isolation to validate its syntax,
+    // emitting no output and pulling in no imports/core libraries. With -v, the full
+    // parse-tree rule stack is printed for each file. A failing file does not abort the
+    // batch; the exit code is non-zero if any file failed to parse.
+    if (args.hasFlag("grammar"))
+    {
+        LLVMBackend compiler;
+        compiler.SetRuntimeDir(runtimeDir);
+        compiler.SetVerbose(args.hasFlag("verbose"));
+
+        int failures = 0;
+        for (size_t i = 0; i < args.positionalCount(); ++i)
+        {
+            if (!compiler.CheckGrammar(*args.getPositional(i)))
+                ++failures;
+        }
+        if (showLogo)
+            std::cout << std::format("Checked grammar of {} file(s), {} failed.\n",
+                                     args.positionalCount(), failures);
+        return failures == 0 ? 0 : 1;
+    }
 
     // --check: compile every positional source file for diagnostics only, emitting no
     // output (used by test.bat to batch the err_*.cb negative tests). A single backend is

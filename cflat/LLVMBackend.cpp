@@ -24,6 +24,7 @@
 #include "CFlatBaseListener.h"
 #include "LLVMBackend.h"
 #include "MainListener.h"
+#include "GrammarTreeListener.h"
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
@@ -137,6 +138,60 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
                 std::cerr << "hint: " << d.hint << "\n";
         }
     }
+}
+
+bool LLVMBackend::CheckGrammar(const std::string& filename)
+{
+    if (!std::filesystem::exists(filename))
+    {
+        std::cerr << "Error: input file '" << filename << "' does not exist.\n";
+        return false;
+    }
+
+    std::ifstream stream;
+    stream.open(filename);
+    if (!stream)
+    {
+        std::cerr << "Error: cannot open input file '" << filename << "'.\n";
+        return false;
+    }
+    auto sourceLines = ReadFileToLines(stream);
+
+    antlr4::ANTLRInputStream input(stream);
+    CFlatLexer lexer(&input);
+    antlr4::CommonTokenStream tokens(&lexer);
+    CFlatParser parser(&tokens);
+
+    CFlatErrorListener errorListener(filename, sourceLines);
+    lexer.removeErrorListeners();
+    lexer.addErrorListener(&errorListener);
+    parser.removeErrorListeners();
+    parser.addErrorListener(&errorListener);
+
+    tokens.fill();
+    auto* compilationUnit = parser.compilationUnit();
+
+    // With -v, print the full parse-tree rule stack so the grammar match can be
+    // inspected rule by rule. Printed even when there are syntax errors - the
+    // partial tree shows how far the parse got before the error.
+    if (verbose)
+    {
+        std::cout << std::format("[grammar] {}: {} tokens, parse-tree rule stack:\n",
+                                 filename, tokens.getTokens().size());
+        GrammarTreeListener treeListener(&parser);
+        antlr4::tree::ParseTreeWalker().walk(&treeListener, compilationUnit);
+    }
+
+    if (errorListener.hasErrors())
+    {
+        ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
+        std::cerr << std::format("GRAMMAR FAIL: {} ({} error(s))\n",
+                                 filename, errorListener.getDiagnostics().size());
+        return false;
+    }
+
+    std::cout << std::format("GRAMMAR OK: {}\n", filename);
+    return true;
 }
 
 bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverride)

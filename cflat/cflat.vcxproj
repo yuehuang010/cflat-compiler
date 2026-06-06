@@ -508,6 +508,7 @@
   <ItemGroup>
     <ClInclude Include="ArgParser.h" />
     <ClInclude Include="CFlatErrorListener.h" />
+    <ClInclude Include="GrammarTreeListener.h" />
     <ClInclude Include="CompilerManager.h" />
     <ClInclude Include="VcpkgResolver.h" />
     <ClInclude Include="Version.h" />
