@@ -157,6 +157,20 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     auto lliPath = checkOnly ? std::optional<std::string>{} : args.getOption("out-lli");
     auto bitcodePath = checkOnly ? std::string{} : args.getOption("bitcode").value_or("");
     bool debugInfo = args.hasFlag("debug-info");
+
+    // Delete any pre-existing outputs up front so a failed compile can never
+    // leave a stale binary behind for the user to unknowingly run. Without this,
+    // an edit-compile-run loop that hits a compile error silently re-runs the
+    // previous build's exe/IR. Use the non-throwing remove (a running/locked exe
+    // simply fails to delete, which is fine - that path is unwritable anyway and
+    // emission will report it).
+    {
+        std::error_code rmEc;
+        if (exePath)             std::filesystem::remove(*exePath, rmEc);
+        if (lliPath)             std::filesystem::remove(*lliPath, rmEc);
+        if (!bitcodePath.empty()) std::filesystem::remove(bitcodePath, rmEc);
+    }
+
     importSearchDir = args.getOption("import-dir").value_or("");
     auto platformOption = args.getOption("platform").value_or("win64");
     // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean

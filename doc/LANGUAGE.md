@@ -879,6 +879,29 @@ i64 big64 = 0x200000005;
 i32 trunc = (i32)big64;   // 5  (low 32 bits)
 ```
 
+### `bool` in arithmetic
+
+`bool` is an `i1`. The comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`)
+and the logical operators (`&&`, `||`, `!`) yield a normalized `bool` - exactly
+`0` (false) or `1` (true), never a wider unspecified value. A `bool` widens to an
+integer as that same `0`/`1` (a `zext i1`), both implicitly in arithmetic and via
+an explicit `(int)` cast - the two forms emit identical IR, so the cast is
+optional:
+
+```c
+int j = 0;
+j = j + (a >= b);        // +1 when a >= b, +0 otherwise (no cast needed)
+j = j + (int)(a >= b);   // identical: redundant cast
+
+bool flag = (a >= b);
+int  x = flag;           // x is 0 or 1
+```
+
+Because the result is guaranteed `0`/`1`, summing comparisons is well-defined -
+the basis for branchless code such as counting how many sorted keys are `<= key`:
+`j += (key >= keys[k])` over the run gives the exact rank with no data-dependent
+branch.
+
 UFCS integer narrowing methods - each wraps to the target width:
 
 ```c

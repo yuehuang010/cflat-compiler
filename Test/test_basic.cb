@@ -1848,6 +1848,57 @@ bool testReturnBoolFromInt()
     return result;
 }
 
+// bool is i1 and converts to an integer as exactly 0/1 (zext i1), both
+// implicitly in arithmetic and via an explicit cast - and the comparison
+// operators yield a normalized 0/1. Branchless code (e.g. counting how many
+// sorted keys are <= a probe) relies on this, so lock it down. See the
+// "bool in arithmetic" section of doc/LANGUAGE.md.
+bool testBoolArithmetic()
+{
+    bool result = true;
+
+    int a = 5;
+    int b = 3;
+
+    // Comparison result used directly in arithmetic - no cast.
+    int j = 0;
+    j = j + (a >= b);          // true  -> +1
+    j = j + (a <  b);          // false -> +0
+    result &= Test("bool implicit add 0/1", j, 1);
+
+    // Explicit (int) cast must produce the same 0/1.
+    result &= Test("bool cast true ==1",  (int)(a >= b), 1);
+    result &= Test("bool cast false==0",  (int)(a <  b), 0);
+
+    // Assigning a bool to an int widens to 0/1.
+    bool flag = (a >= b);
+    int x = flag;
+    result &= Test("int = bool true",  x, 1);
+    flag = (a < b);
+    x = flag;
+    result &= Test("int = bool false", x, 0);
+
+    // Logical operators also yield a normalized 0/1.
+    result &= Test("logical && ->1", (int)(true && true),   1);
+    result &= Test("logical || ->0", (int)(false || false), 0);
+    result &= Test("logical !  ->1", (int)(!false),         1);
+
+    // The branchless-rank idiom: count keys <= probe over a sorted run.
+    i64[5] keys = default;
+    keys[0] = 10; keys[1] = 20; keys[2] = 30; keys[3] = 40; keys[4] = 50;
+    i64 probe = 35;
+    int rank = 0;
+    int k = 0;
+    while (k < 5)
+    {
+        rank = rank + (probe >= keys[k]);   // +1 for 10,20,30; +0 for 40,50
+        k = k + 1;
+    }
+    result &= Test("branchless rank of 35", rank, 3);
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1919,6 +1970,7 @@ extern int main()
     total++; passed += testMultiDimArrays()              ? 1 : 0;
     total++; passed += testCastMemberAccess()            ? 1 : 0;
     total++; passed += testReturnBoolFromInt()           ? 1 : 0;
+    total++; passed += testBoolArithmetic()              ? 1 : 0;
     total++; passed += testUnion()                       ? 1 : 0;
     total++; passed += testBreakContinue()               ? 1 : 0;
     total++; passed += testDoWhile()                     ? 1 : 0;

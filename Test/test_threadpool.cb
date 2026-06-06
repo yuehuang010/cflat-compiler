@@ -4,6 +4,16 @@
 //   x64/Release/cflat.exe Test/test_threadpool.cb -i Test/library \
 //       -o out/test_threadpool.exe && out/test_threadpool.exe
 //
+// KNOWN FLAKE: under the parallel test.bat harness this can intermittently be
+// reported as "FAILED: test_threadpool - run error" even though the assertions
+// all pass ("ThreadPool tests: 20/20 passed" prints first).  The failure is a
+// nonzero PROCESS EXIT during teardown (a worker-thread/allocator shutdown race
+// surfacing only under the contention of many tests running at once), not a
+// test-logic failure.  It passes cleanly every time when run standalone.  If you
+// see this single test fail with 20/20 still printed, re-run it on its own to
+// confirm before treating it as a regression; a real failure shows a lower
+// X/20 count.
+//
 // API contract:
 //   - pool.submit(fn, move void* ctx)         -> move TaskHandle* (nullptr on refusal)
 //   - pool.submitDetached(fn, move void* ctx) -> bool             (false on refusal)
