@@ -2651,7 +2651,20 @@ public:
 
                 compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
                 auto condition = ParseExpression(expression);
-                compiler->CreateConditionJump(condition, blockInner, blockResume);
+
+                // A constant-true guard (`while (true)` / `while (1)`) can only be
+                // left via `break`. Branch unconditionally into the body so the
+                // resume block keeps a predecessor only when a break targets it.
+                // CreateConditionJump would instead emit a cond-br that always
+                // lists blockResume as a successor, making the dead exit look like
+                // a live fall-through path and wrongly demanding a trailing return.
+                // When no break targets it, blockResume is left predecessor-less;
+                // IsCurrentBlockUnreachable() then recognizes it as dead at the end
+                // of the enclosing function/lambda (see the missing-return checks).
+                if (compiler->IsConstantTruthy(condition))
+                    compiler->CreateBlockBreak(blockInner, false);  // unconditional br to body
+                else
+                    compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 compiler->InitializeBlock(blockInner, false);
                 ParseStatement(innerStatement);
@@ -3554,7 +3567,13 @@ public:
 
         if (!expectErrorHandled)
         {
-            if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
+            // An unreachable trailing block (e.g. the dead exit of a `while (true)`
+            // loop with no break) does not fall through, so it must not be flagged
+            // as a missing return. It is also left without a terminator, so close it
+            // with 'unreachable' below for module validity.
+            bool blockUnreachable = compiler->IsCurrentBlockUnreachable();
+
+            if (returnType.TypeName != "void" && !compiler->IsBlockTerminated() && !blockUnreachable)
                 LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
 
             // if return is void, then this might need a implicit return;
@@ -3565,6 +3584,10 @@ public:
 
             // Pop the stack
             compiler->CreateBlockBreak(nullptr, true);
+
+            if (!compiler->IsBlockTerminated() && blockUnreachable)
+                compiler->builder->CreateUnreachable();
+
             compiler->ClearCurrentSubprogram();
         }
 
@@ -10013,12 +10036,21 @@ public:
         if (!consumedLockThisReceiver.empty())
             currentLockSet = savedLockSet;
 
+        // A dead trailing block (e.g. fall-off of a `while (true)` with no break)
+        // does not fall through - do not flag it as a missing return; close it
+        // with 'unreachable' for module validity.
+        bool lambdaBlockUnreachable = compiler->IsCurrentBlockUnreachable();
+
         if (returnType.TypeName == "void" && !compiler->IsBlockTerminated())
             compiler->CreateReturnCall(nullptr);
-        else if (returnType.TypeName != "void" && !compiler->IsBlockTerminated())
+        else if (returnType.TypeName != "void" && !compiler->IsBlockTerminated() && !lambdaBlockUnreachable)
             LogErrorContext(ctx, std::format("Lambda '{}' missing return statement.", lambdaName));
 
         compiler->CreateBlockBreak(nullptr, true);
+
+        if (!compiler->IsBlockTerminated() && lambdaBlockUnreachable)
+            compiler->builder->CreateUnreachable();
+
         compiler->RestoreBuilderState(savedState);
 
         // Build user-visible function-pointer TypeAndValue (no __env param).

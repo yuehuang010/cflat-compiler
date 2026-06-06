@@ -31,6 +31,7 @@
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <llvm\IR\CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
 #include <llvm\IR\IRBuilder.h>
 #include <llvm\IR\Intrinsics.h>
 #include <llvm\IR\IntrinsicsX86.h>   // llvm::Intrinsic::x86_rdtscp (CreateRdtscp)
@@ -8698,6 +8699,30 @@ public:
     bool IsBlockTerminated()
     {
         return builder->GetInsertBlock()->getTerminator() != nullptr;
+    }
+
+    // True when v is a compile-time-constant non-zero integer - the guard of an
+    // infinite loop such as `while (true)` / `while (1)`. Control can only leave
+    // such a loop via `break`; it never falls through the condition.
+    bool IsConstantTruthy(llvm::Value* v)
+    {
+        if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v))
+            return !ci->isZero();
+        return false;
+    }
+
+    // True when the current insert block is unreachable: a non-entry block with
+    // no predecessors (nothing branches to it). Used by fall-through analysis so
+    // that the dead exit of an infinite loop (e.g. `while (true)` with no break)
+    // is not mistaken for a live path that must end in a return.
+    bool IsCurrentBlockUnreachable()
+    {
+        auto* bb = builder->GetInsertBlock();
+        if (bb == nullptr || bb->getParent() == nullptr)
+            return false;
+        if (bb == &bb->getParent()->getEntryBlock())
+            return false;
+        return llvm::pred_empty(bb);
     }
 
     void CreateBreakCall()

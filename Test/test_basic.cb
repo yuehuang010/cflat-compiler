@@ -1922,6 +1922,7 @@ extern int main()
     total++; passed += testUnion()                       ? 1 : 0;
     total++; passed += testBreakContinue()               ? 1 : 0;
     total++; passed += testDoWhile()                     ? 1 : 0;
+    total++; passed += testWhileTrueReturn()             ? 1 : 0;
     total++; passed += testAndShortCircuit()             ? 1 : 0;
     total++; passed += testInterfaceNullCheck()          ? 1 : 0;
     total++; passed += testSizeof()                      ? 1 : 0;
@@ -2229,6 +2230,65 @@ bool testDoWhile()
     } while (idx <= 5);
     result &= Test("dowhile_sum_1_to_5", sum, 15);
 
+    return result;
+}
+
+// =============================================================
+// while(true) fall-through tests
+// Regression: a `while (true)` loop with no `break` can only be left
+// via a `return` inside the body, so the function never falls through.
+// Control-flow analysis used to only check whether the final insert
+// block was terminated; the loop's (dead) resume block was the insert
+// point with no terminator, so the compiler wrongly reported a missing
+// return and the code only compiled with a dead trailing `return`.
+// These functions intentionally have NO return after the loop - if they
+// compile and run, the fix holds.
+// =============================================================
+
+// No trailing return - the body always returns once i reaches n.
+int wtrPick(int n)
+{
+    int i = 0;
+    while (true)
+    {
+        if (i >= n)
+            return i;
+        i = i + 1;
+    }
+}
+
+// while(1) (constant non-zero, not just the literal `true`) behaves the same.
+int wtrFirstHit(int start)
+{
+    int x = start;
+    while (1)
+    {
+        if (x % 7 == 0)
+            return x;
+        x = x + 1;
+    }
+}
+
+// A `break` keeps the exit reachable, so a real return after the loop is
+// still required (and used) - this must compile and run normally.
+int wtrCountUpTo(int n)
+{
+    int i = 0;
+    while (true)
+    {
+        if (i >= n)
+            break;
+        i = i + 1;
+    }
+    return i;
+}
+
+bool testWhileTrueReturn()
+{
+    bool result = true;
+    result &= Test("wtr_pick_returns_from_body", wtrPick(3), 3);
+    result &= Test("wtr_while1_first_multiple_of_7", wtrFirstHit(10), 14);  // 10..14 -> 14
+    result &= Test("wtr_break_then_return", wtrCountUpTo(5), 5);
     return result;
 }
 

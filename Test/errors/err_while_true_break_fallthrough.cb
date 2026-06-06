@@ -1,0 +1,16 @@
+// A `while (true)` that can be left via `break` DOES fall through, so a non-void
+// function with no return after the loop must still be rejected. This guards the
+// while(true) missing-return fix from over-firing (silently accepting a genuine
+// fall-through just because the guard is constant-true).
+expect_error("missing a return statement") {
+    int countUpTo(int n)
+    {
+        int i = 0;
+        while (true)
+        {
+            if (i >= n)
+                break;
+            i = i + 1;
+        }
+    }
+}
