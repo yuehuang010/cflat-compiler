@@ -1,0 +1,12 @@
+// Carried dependence: a[k] depends on a[k-1] written last iteration. Genuinely
+// sequential - the vectorizer must refuse, and `vectorize` must turn that refusal
+// into a hard compile error at -O2. The array is a pointer parameter so its data
+// is opaque (cannot be constant-folded / the loop cannot be eliminated).
+void prefixSum(int* a, int n)
+{
+    vectorize for (int k = 1; k < n; k = k + 1)
+    {
+        a[k] = a[k-1] + 1;
+    }
+}
+extern int main() { return 0; }

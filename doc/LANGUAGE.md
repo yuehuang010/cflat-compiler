@@ -1173,6 +1173,45 @@ for (int k = 0; k < 10; k++)
 
 Both also work inside `foreach` and `do...while` loops.
 
+### `vectorize` loops
+
+`vectorize` is a prefix modifier on a counted `for` or `while` loop that turns
+auto-vectorization from a silent best-effort into a **checked contract**: the loop
+must be vectorized by the optimizer, or the compile fails with an error.
+
+```c
+vectorize for (int k = 0; k < n; k = k + 1)
+{
+    c[k] = a[k] + b[k];      // elementwise add - vectorizes
+}
+
+vectorize while (k < n)      // while form: condition must be countable
+{
+    sum = sum + a[k];        // integer reduction - vectorizes
+    k = k + 1;
+}
+```
+
+Semantics:
+
+- **Enforced only at `-O2`.** The loop vectorizer runs only at `-O2`, so that is the
+  only level where `vectorize` is enforced. At `-O0`/`-O1` it is a no-op and the loop
+  compiles as an ordinary loop. (Build with `-O2` to get the guarantee.)
+- **Hard error on failure.** If the optimizer cannot vectorize a marked loop, the
+  compile fails, e.g. `vectorize loop could not be vectorized: ...`. This catches
+  the silent regression where a loop quietly stops vectorizing after an edit.
+- **Runtime alias checks are accepted.** When the compiler cannot prove the loop's
+  pointers are disjoint, the optimizer emits a runtime overlap check guarding the
+  vector path (with a scalar fallback). That still satisfies the contract.
+- A loop fails the contract when it is not vectorizable: no countable trip count
+  (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
+  dependence (`a[k] = a[k-1] + 1`), or a non-inlinable call in the body.
+- Integer reductions (`sum += a[k]`) vectorize. Floating-point reductions are not
+  supported yet (they would require reassociating the additions, which changes the
+  numeric result) and are reported as a failure.
+- Only counted `for` and `while` are allowed; `do`/`while` and `foreach` are rejected
+  up front (`foreach` lowers to `count()`/`get()` calls that cannot vectorize).
+
 ### Pointer Arithmetic
 
 CFlat follows C semantics: arithmetic on a typed pointer steps by **element size**, not by bytes.

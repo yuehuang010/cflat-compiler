@@ -1,0 +1,14 @@
+// A non-inlinable call (printf) in the body both blocks vectorization and keeps
+// the loop alive (side effect prevents DCE). Must hard-error at -O2.
+extern int main()
+{
+    int[64] a = default;
+    int k = 0;
+    while (k < 64) { a[k] = k; k = k + 1; }
+
+    vectorize for (int i = 0; i < 64; i = i + 1)
+    {
+        printf("%d\n", a[i]);
+    }
+    return 0;
+}

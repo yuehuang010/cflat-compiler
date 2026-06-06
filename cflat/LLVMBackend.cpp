@@ -14,6 +14,8 @@
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
 #include <llvm\Support\TimeProfiler.h>
 #include <llvm\Support\JSON.h>
+#include <llvm\IR\DiagnosticInfo.h>
+#include <llvm\IR\DiagnosticHandler.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -25,6 +27,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <map>
 
 // Return the dequoted path from an inline `lib "..."` clause on an import declaration,
 // or "" if there is none. Used to wire `import package "x.h" lib "y.lib";` into the link.
@@ -512,17 +515,6 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 F.addFnAttr("tune-cpu", tuneCpu_);
     }
 
-    if (lliPath)
-    {
-        llvm::TimeTraceScope irScope("WriteIR", *lliPath);
-        if (verbose) std::cout << "[verbose] writing IR to " << *lliPath << "\n";
-        if (!SaveToFile(*lliPath))
-        {
-            std::cerr << "Error: failed to save IR to '" << *lliPath << "'.\n";
-            return false;
-        }
-    }
-
     {
         llvm::TimeTraceScope verifyScope("VerifyModule");
         if (verbose) std::cout << "[verbose] verifying module\n";
@@ -546,6 +538,19 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
         if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel << ")\n";
         OptimizeModule(optLevel);
+    }
+
+    // Written after optimization so --out-lli reflects the final IR (vectorized
+    // loops, inlining, etc.) that actually lands in the object.
+    if (lliPath)
+    {
+        llvm::TimeTraceScope irScope("WriteIR", *lliPath);
+        if (verbose) std::cout << "[verbose] writing IR to " << *lliPath << "\n";
+        if (!SaveToFile(*lliPath))
+        {
+            std::cerr << "Error: failed to save IR to '" << *lliPath << "'.\n";
+            return false;
+        }
     }
 
     if (!bitcodePath.empty())
@@ -1072,12 +1077,160 @@ void LLVMBackend::RunBaselinePasses()
     MPM.run(*module, MAM);
 }
 
+namespace {
+
+// One captured loop-vectorize analysis remark: LLVM's stable remark name (the
+// reliable key) plus its human message (fallback / passthrough).
+struct VectorizeRemark { std::string name; std::string msg; };
+
+// Captures loop-vectorize analysis remarks so the `vectorize` keyword's failure
+// diagnostics can name a specific reason. The pass/fail decision itself is made by
+// scanning the optimized IR (see OptimizeModule); this only enriches the message.
+struct VectorizeDiagnosticHandler : public llvm::DiagnosticHandler
+{
+    std::map<std::string, VectorizeRemark>& remarkByFn;
+
+    explicit VectorizeDiagnosticHandler(std::map<std::string, VectorizeRemark>& remarks)
+        : remarkByFn(remarks) {}
+
+    // Enable loop-vectorize remark categories so they reach handleDiagnostics.
+    static bool isLoopVectorize(llvm::StringRef passName) { return passName == "loop-vectorize"; }
+    bool isAnalysisRemarkEnabled(llvm::StringRef passName) const override { return isLoopVectorize(passName); }
+    bool isMissedOptRemarkEnabled(llvm::StringRef passName) const override { return isLoopVectorize(passName); }
+    bool isPassedOptRemarkEnabled(llvm::StringRef passName) const override { return isLoopVectorize(passName); }
+
+    bool handleDiagnostics(const llvm::DiagnosticInfo& di) override
+    {
+        if (const auto* opt = llvm::dyn_cast<llvm::DiagnosticInfoOptimizationBase>(&di))
+        {
+            // The loop vectorizer's analysis remarks reliably carry a
+            // "loop not vectorized: <reason>" message, but the pass name is
+            // sometimes empty (vs "loop-vectorize"), so key on the message
+            // signature rather than the pass name. Correlated by function; only
+            // consulted when the IR scan has already flagged a failed loop there.
+            if (di.getKind() == llvm::DK_OptimizationRemarkAnalysis &&
+                opt->getMsg().rfind("loop not vectorized:", 0) == 0)
+            {
+                remarkByFn[opt->getFunction().getName().str()] =
+                    { opt->getRemarkName().str(), opt->getMsg() };  // latest for this fn
+            }
+            return true;  // consumed; do not let the default handler print it
+        }
+        return false;  // let the default handler deal with anything else
+    }
+};
+
+// Compose the most precise, well-located reason for a failed `vectorize` loop from
+// (a) LLVM's analysis remark - keyed on its stable remark NAME, with the message as
+// fallback - and (b) the CFlat-side AST facts gathered at codegen. Updates outLine/
+// outCol to point at the specific offending construct (the call, the condition)
+// when known, otherwise at the loop itself.
+std::string ComposeVectorizeFailure(const LLVMBackend::VectorizeLoopInfo* info,
+                                    const VectorizeRemark* remark,
+                                    int& outLine, int& outCol)
+{
+    std::string rn = remark ? remark->name : std::string();
+    std::string rm = remark ? remark->msg  : std::string();
+    auto nameIs = [&](std::initializer_list<const char*> names) {
+        for (auto* n : names) if (rn == n) return true; return false;
+    };
+    auto msgHas = [&](const char* s) { return !rm.empty() && rm.find(s) != std::string::npos; };
+
+    // 1) Non-inlinable call in the body.
+    if (nameIs({ "CantVectorizeLibcall", "CantVectorizeCall" }) || msgHas("call instruction"))
+    {
+        if (info && info->hasCall)
+        {
+            outLine = info->callLine; outCol = info->callCol;
+            return "the loop body calls '" + info->callName + "', which was not inlined; "
+                   "only inlinable or intrinsic calls can be vectorized";
+        }
+        return "the loop body contains a call that was not inlined; "
+               "only inlinable or intrinsic calls can be vectorized";
+    }
+
+    // 2) No countable trip count - either LLVM said so, or it is a `while` whose
+    //    condition is a sentinel comparison (==/!=) rather than a counted bound.
+    if (nameIs({ "CantComputeNumberOfIterations" }) || msgHas("could not determine number of loop iterations")
+        || (info && info->isWhile && !info->conditionCounted))
+    {
+        if (info && info->isWhile && info->condLine)
+        {
+            outLine = info->condLine; outCol = info->condCol;
+            return "the loop has no countable trip count; the condition '" + info->condText +
+                   "' is not a counted comparison (use a counted bound like 'i < n')";
+        }
+        return "the loop has no countable trip count; use a counted 'for' or 'while'";
+    }
+
+    // 3) Loop-carried dependence.
+    if (nameIs({ "CantReorderMemOps" }) || msgHas("unsafe dependent memory") || msgHas("safe to reorder memory"))
+        return "a loop-carried dependence prevents vectorization "
+               "(an iteration depends on a value an earlier iteration wrote, e.g. a[k] = a[k-1] + 1)";
+
+    // 4) Cross-iteration value that is not a recognized reduction.
+    if (nameIs({ "NonReductionValueUsedOutsideLoop" }) || msgHas("could not be identified as reduction"))
+        return "a cross-iteration value here is not a recognized reduction "
+               "(only integer reductions vectorize; floating-point reductions are not supported)";
+
+    // 5) Control flow the vectorizer cannot handle.
+    if (nameIs({ "LoopContainsSwitch" }) || msgHas("switch statement"))
+        return "the loop body contains a switch statement, which cannot be vectorized";
+    if (msgHas("control flow is not understood"))
+        return "the loop has control flow the vectorizer cannot handle (e.g. a data-dependent break)";
+
+    // 6) Fallbacks. Prefer LLVM's own wording (minus its prefix) when present.
+    if (!rm.empty())
+    {
+        const std::string prefix = "loop not vectorized: ";
+        return rm.rfind(prefix, 0) == 0 ? rm.substr(prefix.size()) : rm;
+    }
+    // No LLVM remark at all (some loop shapes emit only the generic transform
+    // warning) - fall back to the best structural guess from the AST facts.
+    if (info && info->hasCall)
+    {
+        outLine = info->callLine; outCol = info->callCol;
+        return "the loop body calls '" + info->callName + "', which may not be vectorizable; "
+               "only inlinable or intrinsic calls can be vectorized";
+    }
+    if (info && !info->isWhile)
+        return "the loop could not be vectorized "
+               "(most often a loop-carried dependence, e.g. a[k] = a[k-1] + ...)";
+    return "the loop could not be vectorized "
+           "(needs a countable trip count, no carried dependence, and only inlinable calls)";
+}
+
+} // namespace
+
 void LLVMBackend::OptimizeModule(int optimizationLevel)
 {
     if (optimizationLevel == 0)
         return;
 
-    llvm::PassBuilder PB;
+    // The loop vectorizer only runs at -O2, so `vectorize` is enforced only there.
+    // Below -O2 it is a no-op (the metadata is harmless and simply ignored).
+    bool enforceVectorize = (optimizationLevel >= 2) && !vectorizeLoops_.empty();
+    std::map<std::string, VectorizeRemark> remarkByFn;
+    if (enforceVectorize)
+    {
+        context->setDiagnosticHandler(
+            std::make_unique<VectorizeDiagnosticHandler>(remarkByFn),
+            /*RespectFilters=*/false);
+    }
+
+    // Build the pipeline WITH a TargetMachine so TargetTransformInfo is available;
+    // the loop vectorizer needs it to cost vector instructions (without it, it runs
+    // target-agnostic and declines to vectorize). Also pin the module's data layout
+    // to the TM so vector type sizing is correct.
+    auto TM = CreateOptTargetMachine();
+    if (TM)
+        module->setDataLayout(TM->createDataLayout());
+
+    llvm::PipelineTuningOptions pto;
+    pto.LoopVectorization = true;
+    pto.SLPVectorization = true;
+
+    llvm::PassBuilder PB(TM.get(), pto);
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
     llvm::CGSCCAnalysisManager CGAM;
@@ -1096,6 +1249,71 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
 
     MPM.run(*module, MAM);
+
+    if (enforceVectorize)
+    {
+        // Restore a plain handler so later diagnostics on this context are not
+        // swallowed (the context persists across compiles in batch/LSP).
+        context->setDiagnosticHandler(std::make_unique<llvm::DiagnosticHandler>());
+
+        // Decide pass/fail by scanning the optimized IR, the same signal LLVM's
+        // own WarnMissedTransformations uses: a loop still carrying our
+        // `cflat.vectorize.line` metadata WITHOUT `llvm.loop.isvectorized` was
+        // seen by the vectorizer and left scalar -> the contract failed. A loop
+        // that vectorized carries `isvectorized`; one that was eliminated carries
+        // no metadata at all (vacuously fine). The reason text, when the analysis
+        // remark reached our handler, is best-effort.
+        auto loopEntry = [](llvm::MDNode* loopID, llvm::StringRef key) -> llvm::MDNode* {
+            for (unsigned i = 1; i < loopID->getNumOperands(); ++i)
+            {
+                auto* entry = llvm::dyn_cast_or_null<llvm::MDNode>(loopID->getOperand(i));
+                if (!entry || entry->getNumOperands() == 0) continue;
+                auto* s = llvm::dyn_cast<llvm::MDString>(entry->getOperand(0));
+                if (s && s->getString() == key) return entry;
+            }
+            return nullptr;
+        };
+
+        for (auto& F : *module)
+        {
+            if (F.isDeclaration()) continue;
+            for (auto& BB : F)
+            {
+                auto* term = BB.getTerminator();
+                if (!term) continue;
+                auto* loopID = term->getMetadata(llvm::LLVMContext::MD_loop);
+                if (!loopID) continue;
+
+                auto* lineEntry = loopEntry(loopID, "cflat.vectorize.line");
+                if (!lineEntry) continue;                              // not a vectorize loop
+                if (loopEntry(loopID, "llvm.loop.isvectorized")) continue;  // vectorized: ok
+
+                int line = 0;
+                if (lineEntry->getNumOperands() >= 2)
+                    if (auto* c = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(lineEntry->getOperand(1)))
+                        line = static_cast<int>(c->getSExtValue());
+
+                // Match the failed loop to the AST facts gathered at codegen (by
+                // line) and to LLVM's analysis remark (by function), then compose
+                // the most precise, located message.
+                const VectorizeLoopInfo* info = nullptr;
+                for (const auto& vi : vectorizeLoops_)
+                    if (vi.line == line) { info = &vi; break; }
+
+                const VectorizeRemark* remark = nullptr;
+                auto r = remarkByFn.find(F.getName().str());
+                if (r != remarkByFn.end()) remark = &r->second;
+
+                int outLine = line, outCol = info ? info->col : 0;
+                std::string reason = ComposeVectorizeFailure(info, remark, outLine, outCol);
+
+                currentLine = outLine;
+                currentColumn = outCol;
+                LogError("vectorize loop could not be vectorized: " + reason);
+                // LogError does not return for a normal compile (it exits / throws).
+            }
+        }
+    }
 }
 
 bool LLVMBackend::Analyze(const std::string& filePath,
@@ -1322,6 +1540,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallBondedSources.clear();
     lastCallRequiredLocks.clear();
     lastCallParameterNames.clear();
+    vectorizeLoops_.clear();
 
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
     // on the next Analyze() call.

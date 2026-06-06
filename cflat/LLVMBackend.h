@@ -178,6 +178,21 @@ public:
 
     };
 
+    // Structured facts about one `vectorize` loop, gathered at codegen time and
+    // used to compose a precise failure diagnostic (see ComposeVectorizeFailure).
+    struct VectorizeLoopInfo
+    {
+        int line = 0, col = 0;          // the `vectorize` keyword
+        bool isWhile = false;           // while form (vs counted for)
+        bool conditionCounted = true;   // false when a while condition is equality/sentinel (==,!=) - not a counted bound
+        int condLine = 0, condCol = 0;  // the loop condition
+        std::string condText;
+        bool hasCall = false;           // a call appears in the loop body
+        std::string callName;           // its callee text
+        int callLine = 0, callCol = 0;  // the call site
+    };
+    void AddVectorizeLoopInfo(const VectorizeLoopInfo& info) { vectorizeLoops_.push_back(info); }
+
     struct TypeAndValue
     {
         std::string TypeName;
@@ -727,6 +742,13 @@ private:
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
+
+    // Structured facts about each `vectorize` loop, gathered at codegen time (when
+    // the AST is available) and consulted by the post-optimization enforcement scan
+    // to produce a precise, well-located failure message. Matched to a failed loop
+    // by source line (which also travels in the loop's `!llvm.loop` metadata).
+    // Non-empty gates enforcement at -O2. Cleared by ResetForReanalysis.
+    std::vector<VectorizeLoopInfo> vectorizeLoops_;
     // C interop (prebuilt libraries): header search dirs (--c-include) used when
     // AST-dumping a bound header, and import libraries (--c-lib) added to the
     // lld-link line by EmitExecutable. A sibling runtime DLL of each lib is copied
@@ -3527,6 +3549,32 @@ private:
         return true;
     }
 
+    // Build a TargetMachine for the current target so the optimizer's PassBuilder
+    // has TargetTransformInfo. Without a TM the loop vectorizer cannot cost vector
+    // instructions and silently declines to vectorize (only memcpy/memset idioms
+    // and SLP still fire). Mirrors the triple/CPU resolution in EmitExecutable.
+    // Returns null on failure (the optimizer then runs target-agnostic, as before).
+    std::unique_ptr<llvm::TargetMachine> CreateOptTargetMachine()
+    {
+        llvm::InitializeAllTargets();
+        llvm::InitializeAllTargetMCs();
+        llvm::InitializeAllAsmPrinters();
+
+        std::string triple = (platformValue == 32)
+            ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+        std::string cpu = !targetCpu_.empty()
+            ? targetCpu_ : (platformValue == 32 ? std::string("i686") : std::string("x86-64"));
+
+        std::string err;
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        if (!target)
+            return nullptr;
+
+        llvm::TargetOptions opt;
+        return std::unique_ptr<llvm::TargetMachine>(
+            target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
+    }
+
     bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false)
     {
         std::string triple;
@@ -5006,6 +5054,13 @@ public:
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
         auto type = GetType(typeValue, autoType);
+        // A fixed-size array's dimension is already encoded in `type` (GetType
+        // returns [N x T], or [N x [M x T]] for multi-dim). Passing that same N
+        // again as the alloca element-count would allocate N copies of [N x T] -
+        // an N x N over-allocation (e.g. int[1024] -> 4MB instead of 4KB, which
+        // both wastes stack and defeats the loop vectorizer's bounds analysis).
+        if (typeValue.ConstArraySize > 0)
+            arraySize = nullptr;
         // Effective alignment: max(decl-level alignas, struct-level alignas, ABI).
         uint64_t effAlign = GetEffectiveAlignmentForType(typeValue.TypeName, type);
         if (userAlign > effAlign) effAlign = userAlign;
@@ -8755,6 +8810,40 @@ public:
             }
             EmitDestructorsForScope(stackFrame);
         }
+    }
+
+    // Stamp `!llvm.loop !{!"llvm.loop.vectorize.enable", i1 true}` on the latch
+    // branch of the loop just emitted, and record it for post-optimization
+    // enforcement. Called for `vectorize` loops; the back-edge must be the
+    // terminator of the current insert block (true for while/for latches here).
+    // Forcing vectorize.enable makes LLVM emit an explicit failure diagnostic
+    // when the loop cannot be vectorized, which OptimizeModule turns into an error.
+    void AttachVectorizeHintToCurrentLatch(int sourceLine)
+    {
+        auto* term = builder->GetInsertBlock()->getTerminator();
+        auto* br = llvm::dyn_cast_or_null<llvm::BranchInst>(term);
+        if (!br)
+            return;  // body did not fall through to a back-edge (e.g. ended in return)
+
+        auto* i1True = llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context), 1);
+        auto* enableMD = llvm::MDNode::get(*context, {
+            llvm::MDString::get(*context, "llvm.loop.vectorize.enable"),
+            llvm::ConstantAsMetadata::get(i1True),
+        });
+        // Stamp the source line into the loop ID so post-optimization enforcement
+        // can report the exact `vectorize` loop without relying on debug info or
+        // diagnostic-handler correlation.
+        auto* lineMD = llvm::MDNode::get(*context, {
+            llvm::MDString::get(*context, "cflat.vectorize.line"),
+            llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), sourceLine)),
+        });
+
+        // Loop metadata is a self-referential node: operand 0 points at itself.
+        llvm::SmallVector<llvm::Metadata*, 3> ops{ nullptr, enableMD, lineMD };
+        auto* loopID = llvm::MDNode::getDistinct(*context, ops);
+        loopID->replaceOperandWith(0, loopID);
+        br->setMetadata(llvm::LLVMContext::MD_loop, loopID);
     }
 
     std::string GetSourceFileName() const { return sourceFileName; }

@@ -1,0 +1,15 @@
+// A `vectorize while` whose condition is a pointer chase has no countable trip
+// count, so it cannot be vectorized. Must hard-error at -O2.
+struct Node { Node* next = default; int v = default; };
+int sum(Node* head)
+{
+    int s = 0;
+    Node* p = head;
+    vectorize while (p != nullptr)
+    {
+        s = s + p->v;
+        p = p->next;
+    }
+    return s;
+}
+extern int main() { return 0; }

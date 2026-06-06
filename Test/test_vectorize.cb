@@ -1,0 +1,90 @@
+// vectorize keyword: the loop must be vectorized at -O2 or the compile fails.
+// Under test.bat (compiled at -O0) this is a no-op and simply runs as a plain
+// loop; test_vectorize.bat compiles it at -O2 to exercise the enforced contract.
+// Either way the results below must be correct.
+
+int sumArrays()
+{
+    int[1024] a = default;
+    int[1024] b = default;
+    int[1024] c = default;
+
+    int i = 0;
+    while (i < 1024)
+    {
+        a[i] = i;
+        b[i] = 2 * i;
+        i = i + 1;
+    }
+
+    // Elementwise add over distinct, non-aliasing local arrays: canonical
+    // vectorizable kernel (counted trip, no carried dependence).
+    vectorize for (int k = 0; k < 1024; k = k + 1)
+    {
+        c[k] = a[k] + b[k];
+    }
+
+    int total = 0;
+    int j = 0;
+    while (j < 1024)
+    {
+        total = total + c[j];
+        j = j + 1;
+    }
+    return total; // sum of 3*i for i in [0,1024) = 3 * (1023*1024/2) = 1571328
+}
+
+int reduceArray()
+{
+    int[1000] a = default;
+    int i = 0;
+    while (i < 1000)
+    {
+        a[i] = i + 1;
+        i = i + 1;
+    }
+
+    // Integer reduction: recognized cross-iteration pattern, vectorizes.
+    int sum = 0;
+    vectorize for (int k = 0; k < 1000; k = k + 1)
+    {
+        sum = sum + a[k];
+    }
+    return sum; // 1+2+...+1000 = 500500
+}
+
+int vectorizeWhile()
+{
+    int[512] a = default;
+    int n = 512;
+    int i = 0;
+    while (i < n)
+    {
+        a[i] = 1;
+        i = i + 1;
+    }
+
+    int count = 0;
+    int k = 0;
+    // while form with a countable condition vectorizes the same as the for form.
+    vectorize while (k < n)
+    {
+        count = count + a[k];
+        k = k + 1;
+    }
+    return count; // 512
+}
+
+extern int main()
+{
+    int fails = 0;
+    if (sumArrays() != 1571328) fails = fails + 1;
+    if (reduceArray() != 500500) fails = fails + 1;
+    if (vectorizeWhile() != 512) fails = fails + 1;
+
+    if (fails == 0)
+        printf("test_vectorize: all passed\n");
+    else
+        printf("test_vectorize: %d FAILED\n", fails);
+    return fails;
+}

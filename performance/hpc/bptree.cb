@@ -1,0 +1,594 @@
+// bptree.cb - A cache-line-blocked B+ tree (L3-cache-aware ordered map).
+//
+// Goal: an ordered i64 -> i64 map whose hot working set stays resident in the
+// CPU caches, so lookups and range scans avoid DRAM round-trips. It is the
+// structure to reach for when you need *ordered* / *range* queries and a plain
+// binary search tree's pointer-chasing would thrash the cache.
+//
+// Why this layout is cache-friendly (the three levers that matter):
+//
+//   1. Wide, cache-line-sized nodes. Each node is a flat sorted run of keys we
+//      scan within one or two 64-byte cache lines. With i64 keys, 64B holds 8
+//      keys; FANOUT below is 16 (two lines), giving a high branching factor so
+//      a tree over millions of keys is only 3-4 levels deep -> ~3-4 cache
+//      misses per lookup instead of ~20 for a binary tree.
+//
+//   2. Keys-only internal nodes (SoA). Internal nodes store ONLY separator keys
+//      and child indices - never values. The upper levels, hit on every query,
+//      stay tiny and L2/L3-resident. Values live only in the leaves.
+//
+//   3. Index-based children + one contiguous arena. Children are referenced by
+//      i32 index into a single `array<BNode>` / `array<BLeaf>`, not by pointer.
+//      Denser than 8-byte pointers and keeps the whole tree in one contiguous
+//      block the hardware prefetcher loves. Leaves are singly linked so a range
+//      query is a linear leaf walk, and we prefetch() the next leaf one hop
+//      ahead to hide the latency.
+//
+// Tuning: set FANOUT so a node spans a small multiple of your cache line, and
+// size N so the structure fits L3. Read your real cache sizes with:
+//   x64/Debug/cflat.exe --print-host-cpu
+//
+// Build (always -O2 for meaningful numbers; the node/leaf scans vectorize):
+//   x64/Debug/cflat.exe performance/hpc/bptree.cb -o out/bptree.exe -O2
+// Run:
+//   out\bptree.exe
+//
+// This is a read-optimized design: it bulk-loads from sorted input (the common
+// case for an index built once and queried many times). Insert/split is left
+// out on purpose - add it only once the read layout is proven for your data.
+
+import "array.cb";
+import "time.cb";
+import "intrinsic.cb";
+
+extern int printf(const char* fmt, ...);
+
+// FANOUT children per internal node; MAXKEY = FANOUT - 1 separators/leaf slots.
+// Keep the struct's literal array sizes (below) in sync with these.
+int FANOUT = 16;
+int MAXKEY = 15;
+
+// Internal node: keys-only, children by index. Dense -> stays hot in L2/L3.
+// 15 i64 keys (120B) + 16 i32 children (64B) + small scalars ~= 3 cache lines.
+struct BNode
+{
+    i64  keys[15];           // separator keys: keys[i] = min key of child[i+1]
+    i32  child[16];          // index into node arena (or leaf arena if childLeaf)
+    i32  count = 0;          // number of live separator keys (= childCount - 1)
+    bool childLeaf = false;  // true if child[] indexes the leaf arena
+};
+
+// Leaf: holds the actual values plus a next-leaf index so an in-order range
+// scan is a pure linear walk across contiguous memory.
+struct BLeaf
+{
+    i64  keys[15];
+    i64  vals[15];
+    i32  count = 0;
+    i32  next = -1;          // next leaf index in sorted order, -1 = end
+};
+
+// --- Tree state (single-threaded, so plain globals keep the code readable) ---
+
+array<BNode> g_nodes = default;
+array<BLeaf> g_leaves = default;
+int  g_nodeCount = 0;
+int  g_leafCount = 0;
+int  g_rootIdx = 0;
+bool g_rootIsLeaf = true;
+
+// Bulk-load the tree bottom-up from sorted (keys[i], vals[i]) input.
+// keys must be sorted ascending. Builds a perfectly packed tree in O(n).
+void build(array<i64>* keys, array<i64>* vals)
+{
+    int n = keys->count();
+    int nLeaves = (n + MAXKEY - 1) / MAXKEY;
+    if (nLeaves < 1)
+        nLeaves = 1;
+
+    g_leaves.init(nLeaves);
+    // Internal nodes across all levels sum to well under nLeaves; +16 is slack.
+    g_nodes.init(nLeaves + 16);
+    g_nodeCount = 0;
+    g_leafCount = 0;
+
+    // The "current level" being consumed, and the parent level being produced.
+    // Both are sized to nLeaves (the widest level) and reused each iteration.
+    array<i32> curIdx = default;
+    array<i64> curMin = default;
+    array<i32> nextIdx = default;
+    array<i64> nextMin = default;
+    curIdx.init(nLeaves);
+    curMin.init(nLeaves);
+    nextIdx.init(nLeaves);
+    nextMin.init(nLeaves);
+    int curCount = 0;
+
+    // Pass 1: pack the sorted input into leaves and link them in order.
+    int pos = 0;
+    while (pos < n)
+    {
+        int idx = g_leafCount;
+        g_leafCount = g_leafCount + 1;
+        BLeaf* lf = g_leaves.getPtr(idx);
+        lf->next = -1;
+        i64 mn = keys->get(pos);
+
+        int c = 0;
+        while (c < MAXKEY && pos < n)
+        {
+            lf->keys[c] = keys->get(pos);
+            lf->vals[c] = vals->get(pos);
+            c = c + 1;
+            pos = pos + 1;
+        }
+        lf->count = c;
+
+        if (idx > 0)
+            g_leaves.getPtr(idx - 1)->next = idx;
+
+        curIdx.set(curCount, idx);
+        curMin.set(curCount, mn);
+        curCount = curCount + 1;
+    }
+
+    // Pass 2: build internal levels until a single root remains.
+    bool childLeaf = true;
+    while (curCount > 1)
+    {
+        int nextCount = 0;
+        int p = 0;
+        while (p < curCount)
+        {
+            int idx = g_nodeCount;
+            g_nodeCount = g_nodeCount + 1;
+            BNode* nd = g_nodes.getPtr(idx);
+            nd->childLeaf = childLeaf;
+
+            i64 mn = curMin.get(p);           // node's min key = first child's min
+
+            // First child has no separator; subsequent children contribute one.
+            nd->child[0] = curIdx.get(p);
+            p = p + 1;
+            int c = 1;
+            while (c < FANOUT && p < curCount)
+            {
+                nd->keys[c - 1] = curMin.get(p);  // separator = min key of child[c]
+                nd->child[c] = curIdx.get(p);
+                c = c + 1;
+                p = p + 1;
+            }
+            nd->count = c - 1;
+
+            nextIdx.set(nextCount, idx);
+            nextMin.set(nextCount, mn);
+            nextCount = nextCount + 1;
+        }
+
+        // Promote the parent level to be the next current level.
+        int i = 0;
+        while (i < nextCount)
+        {
+            curIdx.set(i, nextIdx.get(i));
+            curMin.set(i, nextMin.get(i));
+            i = i + 1;
+        }
+        curCount = nextCount;
+        childLeaf = false;
+    }
+
+    g_rootIdx = curIdx.get(0);
+    g_rootIsLeaf = (g_nodeCount == 0);   // no internal node built -> root is a leaf
+}
+
+// Descend from the root to the leaf that would contain `key`.
+int descendToLeaf(i64 key)
+{
+    if (g_rootIsLeaf)
+        return g_rootIdx;
+
+    int idx = g_rootIdx;
+    while (true)
+    {
+        BNode* nd = g_nodes.getPtr(idx);
+        // Branchless linear scan. The naive form `while (key >= keys[j]) j++`
+        // has a data-dependent exit branch that random keys mispredict ~50% of
+        // the time - and we pay it at every one of the ~5 levels per lookup.
+        // Since the keys are sorted ascending, the first j with key < keys[j] is
+        // exactly the *count* of separators <= key, so we can drop the early exit
+        // and unconditionally tally `key >= keys[k]` over all live separators.
+        // Each iteration is now a setcc + add (no unpredictable branch); the only
+        // branch left is the loop counter, which is ~always the full 15 and so
+        // predicts perfectly. child[j] is the subtree whose keys are < keys[j].
+        int cnt = nd->count;
+        int j = 0;
+        int k = 0;
+        while (k < cnt)
+        {
+            j = j + (int)(key >= nd->keys[k]);
+            k = k + 1;
+        }
+        int child = nd->child[j];
+        if (nd->childLeaf)
+            return child;
+        idx = child;
+    }
+    return -1;   // unreachable: the loop always returns at a childLeaf node
+}
+
+// Point lookup. Returns true and writes *out if key is present.
+bool lookup(i64 key, i64* out)
+{
+    int lf = descendToLeaf(key);
+    BLeaf* leaf = g_leaves.getPtr(lf);
+    int i = 0;
+    while (i < leaf->count)
+    {
+        if (leaf->keys[i] == key)
+        {
+            *out = leaf->vals[i];
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Scan one leaf for `key`; add its value into *acc if present. Factored out so
+// both the scalar lookup and the pipelined batch path share identical leaf code.
+void scanLeafInto(int lf, i64 key, i64* acc)
+{
+    BLeaf* leaf = g_leaves.getPtr(lf);
+    int c = leaf->count;
+    int i = 0;
+    while (i < c)
+    {
+        if (leaf->keys[i] == key)
+        {
+            *acc = *acc + leaf->vals[i];
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// Software-pipeline depth: how many independent probes are kept in flight so a
+// leaf's cache miss is hidden behind later probes' descents. Power of two so the
+// ring index is a mask, not a divide. 8 is enough to cover an L3/DRAM leaf miss
+// behind ~8 (mostly L2-resident) descents; beyond that gains flatten.
+int BATCH_DEPTH = 8;
+
+// Pipelined batch lookups - the real lever for a latency-bound index.
+//
+// A single lookup is a serial dependency chain: descend (a few L2-resident
+// internal nodes) then one leaf load that usually misses to L3/DRAM, and the
+// next lookup cannot begin until this one's leaf arrives. Independent probes
+// have no such dependency, so we software-pipeline BATCH_DEPTH of them at once:
+// for probe i we resolve its leaf and issue a prefetch, but defer the scan until
+// BATCH_DEPTH probes later - by which point the prefetch has long since pulled
+// that leaf into cache. Each leaf miss is thus overlapped with the descents of
+// the probes behind it instead of stalling the pipeline. Returns the sum of all
+// found values. A `ring` of (leaf, key) pairs holds the in-flight probes.
+i64 lookupBatch(i64* probes, int n)
+{
+    int D = BATCH_DEPTH;
+    i64 sum = 0;
+    int[8] leafRing = default;       // sized to BATCH_DEPTH (keep in sync)
+    i64[8] keyRing = default;
+
+    // Prologue: launch the first D descents+prefetches with nothing to scan yet.
+    int primed = D;
+    if (primed > n)
+        primed = n;
+    int i = 0;
+    while (i < primed)
+    {
+        i64 key = probes[i];
+        int lf = descendToLeaf(key);
+        prefetch((void*)g_leaves.getPtr(lf));
+        leafRing[i] = lf;
+        keyRing[i] = key;
+        i = i + 1;
+    }
+
+    // Steady state: scan the probe that entered the ring D iterations ago (now
+    // resident), then launch probe i into the slot it vacated.
+    while (i < n)
+    {
+        int slot = i % D;            // %D folds to & (D-1) since D is a power of 2
+        scanLeafInto(leafRing[slot], keyRing[slot], &sum);
+        i64 key = probes[i];
+        int lf = descendToLeaf(key);
+        prefetch((void*)g_leaves.getPtr(lf));
+        leafRing[slot] = lf;
+        keyRing[slot] = key;
+        i = i + 1;
+    }
+
+    // Epilogue: drain the last D in-flight probes, oldest first.
+    int d = 0;
+    while (d < primed)
+    {
+        int slot = (n - primed + d) % D;
+        scanLeafInto(leafRing[slot], keyRing[slot], &sum);
+        d = d + 1;
+    }
+    return sum;
+}
+
+// Range query over [lo, hi]: sum the values and count the matches. Walks the
+// linked leaves linearly, prefetching the next leaf one hop ahead.
+i64 rangeSum(i64 lo, i64 hi, i64* outCount)
+{
+    int lf = descendToLeaf(lo);
+    i64 sum = 0;
+    i64 cnt = 0;
+
+    while (lf >= 0)
+    {
+        BLeaf* leaf = g_leaves.getPtr(lf);
+
+        // Pull the next leaf's cache lines in while we scan this one.
+        if (leaf->next >= 0)
+            prefetch((void*)g_leaves.getPtr(leaf->next));
+
+        bool done = false;
+        int i = 0;
+        while (i < leaf->count)
+        {
+            i64 k = leaf->keys[i];
+            if (k > hi)
+            {
+                done = true;
+                break;          // keys are sorted; nothing further can match
+            }
+            if (k >= lo)
+            {
+                sum = sum + leaf->vals[i];
+                cnt = cnt + 1;
+            }
+            i = i + 1;
+        }
+        if (done)
+            break;
+        lf = leaf->next;
+    }
+
+    *outCount = cnt;
+    return sum;
+}
+
+// --- Sorted-array baseline (binary search) for an apples-to-apples compare ---
+
+array<i64> g_baseKeys = default;
+array<i64> g_baseVals = default;
+
+bool baselineLookup(i64 key, i64* out)
+{
+    int lo = 0;
+    int hi = g_baseKeys.count() - 1;
+    while (lo <= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        i64 k = g_baseKeys.get(mid);
+        if (k == key)
+        {
+            *out = g_baseVals.get(mid);
+            return true;
+        }
+        if (k < key)
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
+    return false;
+}
+
+// Tiny self-contained LCG so the demo has no external RNG dependency.
+u64 g_rng = 0x9e3779b97f4a7c15;
+u64 nextRand()
+{
+    g_rng = g_rng * 6364136223846793005 + 1442695040888963407;
+    return g_rng;
+}
+
+extern int main()
+{
+    int N = 1000000;          // keys (8 MB of i64 -> exercises L3 and beyond)
+    int M = 2000000;          // lookups to time
+    printf("Building B+ tree over %d sorted keys (FANOUT=%d)...\n", N, FANOUT);
+
+    // Sorted input: even keys 0,2,4,... so odd probes test the absent path too.
+    array<i64> keys = default;
+    array<i64> vals = default;
+    keys.init(N);
+    vals.init(N);
+    int i = 0;
+    while (i < N)
+    {
+        keys.set(i, (i64)i * 2);
+        vals.set(i, (i64)i * 10);
+        i = i + 1;
+    }
+
+    build(&keys, &vals);
+    printf("  leaves=%d internal_nodes=%d root_is_leaf=%d\n",
+           g_leafCount, g_nodeCount, (int)g_rootIsLeaf);
+
+    // Mirror the same data into the sorted-array baseline.
+    g_baseKeys.init(N);
+    g_baseVals.init(N);
+    i = 0;
+    while (i < N)
+    {
+        g_baseKeys.set(i, keys.get(i));
+        g_baseVals.set(i, vals.get(i));
+        i = i + 1;
+    }
+
+    i64 maxKey = (i64)N * 2;
+
+    // --- Correctness check against the baseline ---
+    int mismatches = 0;
+    i = 0;
+    while (i < 10000)
+    {
+        i64 probe = (i64)(nextRand() % (u64)maxKey);
+        i64 a = 0;
+        i64 b = 0;
+        bool fa = lookup(probe, &a);
+        bool fb = baselineLookup(probe, &b);
+        if (fa != fb || (fa && a != b))
+            mismatches = mismatches + 1;
+        i = i + 1;
+    }
+    printf("Correctness vs baseline: %d mismatches (expect 0)\n", mismatches);
+
+    // --- Lookup throughput: B+ tree vs sorted-array binary search ---
+    // Each phase is timed REPS times; we report the average and the best run.
+    // Best filters out OS-scheduler noise; average shows the typical case.
+    int REPS = 7;
+    Stopwatch sw;
+    i64 sink = 0;
+    int r = 0;
+
+    // Materialize the probe sequence ONCE, outside every timed region. The probe
+    // RNG uses a 64-bit modulo (~20-cycle integer divide); generating it inside
+    // the timed loop would tax each variant equally but bury the actual lookup
+    // cost. With probes precomputed, the timings reflect tree/search work only -
+    // and the batch path can stream the same buffer.
+    array<i64> probes = default;
+    probes.init(M);
+    g_rng = 0x1234567;
+    i = 0;
+    while (i < M)
+    {
+        probes.set(i, (i64)(nextRand() % (u64)maxKey));
+        i = i + 1;
+    }
+    i64* probePtr = probes.getPtr(0);
+
+    // The pipelined path reorders nothing observable, so its summed result must
+    // match the scalar path exactly. Verify once before timing either.
+    i64 scalarCheck = 0;
+    i = 0;
+    while (i < M)
+    {
+        i64 v = 0;
+        if (lookup(probePtr[i], &v))
+            scalarCheck = scalarCheck + v;
+        i = i + 1;
+    }
+    i64 batchCheck = lookupBatch(probePtr, M);
+    printf("Batch vs scalar lookup sum: match=%d\n", (int)(scalarCheck == batchCheck));
+
+    // --- B+ tree lookups (scalar, one independent call per probe) ---
+    double treeSum = 0.0;
+    double treeBest = 1.0e30;
+    r = 0;
+    while (r < REPS)
+    {
+        sw.restart();
+        i = 0;
+        while (i < M)
+        {
+            i64 v = 0;
+            if (lookup(probePtr[i], &v))
+                sink = sink + v;
+            i = i + 1;
+        }
+        sw.stop();
+        double m = sw.elapsed().milliseconds();
+        treeSum = treeSum + m;
+        if (m < treeBest)
+            treeBest = m;
+        r = r + 1;
+    }
+    double treeMs = treeSum / (double)REPS;
+
+    // --- B+ tree lookups (pipelined batch with one-ahead leaf prefetch) ---
+    double batchSum = 0.0;
+    double batchBest = 1.0e30;
+    r = 0;
+    while (r < REPS)
+    {
+        sw.restart();
+        sink = sink + lookupBatch(probePtr, M);
+        sw.stop();
+        double m = sw.elapsed().milliseconds();
+        batchSum = batchSum + m;
+        if (m < batchBest)
+            batchBest = m;
+        r = r + 1;
+    }
+    double batchMs = batchSum / (double)REPS;
+
+    // --- Sorted-array binary search baseline ---
+    double baseSum = 0.0;
+    double baseBest = 1.0e30;
+    r = 0;
+    while (r < REPS)
+    {
+        sw.restart();
+        i = 0;
+        while (i < M)
+        {
+            i64 v = 0;
+            if (baselineLookup(probePtr[i], &v))
+                sink = sink + v;
+            i = i + 1;
+        }
+        sw.stop();
+        double m = sw.elapsed().milliseconds();
+        baseSum = baseSum + m;
+        if (m < baseBest)
+            baseBest = m;
+        r = r + 1;
+    }
+    double baseMs = baseSum / (double)REPS;
+
+    printf("\nLookups (%d random, %d runs, avg / best):\n", M, REPS);
+    printf("  B+ tree scalar: %8.2f / %8.2f ms  (%6.1f M ops/s best)\n",
+           treeMs, treeBest, (double)M / 1000.0 / treeBest);
+    printf("  B+ tree batch : %8.2f / %8.2f ms  (%6.1f M ops/s best)\n",
+           batchMs, batchBest, (double)M / 1000.0 / batchBest);
+    printf("  sorted+bsearch: %8.2f / %8.2f ms  (%6.1f M ops/s best)\n",
+           baseMs, baseBest, (double)M / 1000.0 / baseBest);
+
+    // --- Range query throughput (the structure's reason to exist) ---
+    int R = 100000;
+    i64 width = 1000;         // each query spans ~500 present keys
+    i64 totalMatches = 0;
+    double rangeSumMs = 0.0;
+    double rangeBest = 1.0e30;
+    r = 0;
+    while (r < REPS)
+    {
+        g_rng = 0xabcdef;
+        totalMatches = 0;
+        sw.restart();
+        i = 0;
+        while (i < R)
+        {
+            i64 lo = (i64)(nextRand() % (u64)maxKey);
+            i64 cnt = 0;
+            i64 s = rangeSum(lo, lo + width, &cnt);
+            sink = sink + s;
+            totalMatches = totalMatches + cnt;
+            i = i + 1;
+        }
+        sw.stop();
+        double m = sw.elapsed().milliseconds();
+        rangeSumMs = rangeSumMs + m;
+        if (m < rangeBest)
+            rangeBest = m;
+        r = r + 1;
+    }
+    double rangeMs = rangeSumMs / (double)REPS;
+    printf("\nRange queries (%d, width=%lld, %d runs): %8.2f / %8.2f ms  (%6.1f M ops/s best), avg %lld matches/query\n",
+           R, width, REPS, rangeMs, rangeBest,
+           (double)R / 1000.0 / rangeBest, totalMatches / (i64)R);
+
+    printf("\nsink=%lld (printed so the optimizer can't delete the work)\n", sink);
+    return 0;
+}

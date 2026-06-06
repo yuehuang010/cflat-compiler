@@ -1263,6 +1263,13 @@ private:
 
     std::vector<SwitchContext> switchStack;
 
+    // Set while emitting the loop wrapped by a `vectorize` statement. Consumed
+    // (and cleared) at the start of the iteration-statement emit so a nested
+    // non-vectorize loop in the body does not inherit the request, and a nested
+    // `vectorize` loop re-arms it for itself.
+    bool vectorizeActive_ = false;
+    int  vectorizeLine_ = 0;
+
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
     std::string ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry)
@@ -2431,6 +2438,42 @@ public:
         }
     }
 
+    // Returns the first call-like postfix expression (one carrying an argument
+    // list) in the subtree, or nullptr. Used to point a `vectorize` diagnostic at
+    // a non-inlinable call in the loop body.
+    CFlatParser::PostfixExpressionContext* FindFirstCall(antlr4::tree::ParseTree* node)
+    {
+        if (node == nullptr) return nullptr;
+        if (auto* pf = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+            if (!pf->argumentExpressionList().empty())
+                return pf;
+        for (auto* child : node->children)
+            if (auto* found = FindFirstCall(child))
+                return found;
+        return nullptr;
+    }
+
+    void ScanComparisons(antlr4::tree::ParseTree* node, bool& hasRelational, bool& hasEquality)
+    {
+        if (node == nullptr) return;
+        if (auto* rel = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+            if (rel->shiftExpression().size() > 1) hasRelational = true;   // < <= > >=
+        if (auto* eq = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+            if (eq->typeCheckExpression().size() > 1) hasEquality = true;  // == !=
+        for (auto* child : node->children)
+            ScanComparisons(child, hasRelational, hasEquality);
+    }
+
+    // True when a loop condition compares with == / != but carries no relational
+    // bound (< <= > >=): the classic non-countable sentinel / pointer-chase form
+    // (e.g. `while (p != nullptr)`).
+    bool ConditionIsSentinel(antlr4::tree::ParseTree* node)
+    {
+        bool hasRelational = false, hasEquality = false;
+        ScanComparisons(node, hasRelational, hasEquality);
+        return hasEquality && !hasRelational;
+    }
+
     void ParseStatement(CFlatParser::StatementContext* statement)
     {
         auto* compiler = Compiler(statement);
@@ -2439,7 +2482,55 @@ public:
         auto jump = statement->jumpStatement();
         auto expressStatement = statement->expressionStatement();
         auto iterationStatement = statement->iterationStatement();
+        auto vectorizeStatement = statement->vectorizeStatement();
         auto selectionStatement = statement->selectionStatement();
+
+        // `vectorize <loop>` is handled by the iteration path below with the
+        // request flag armed. Only counted `for` and `while` can be vectorized;
+        // do-while and foreach (which lowers to count()/get() calls) are rejected
+        // up front with a clear message rather than a cryptic LLVM remark.
+        if (vectorizeStatement != nullptr)
+        {
+            iterationStatement = vectorizeStatement->iterationStatement();
+            if (iterationStatement->Do() ||
+                (iterationStatement->declarationSpecifiers() && iterationStatement->In()))
+            {
+                LogErrorContext(vectorizeStatement,
+                    "vectorize supports counted 'for' and 'while' loops only");
+                return;
+            }
+            vectorizeActive_ = true;
+            vectorizeLine_ = static_cast<int>(vectorizeStatement->getStart()->getLine());
+
+            // Gather AST facts about this loop so a failed vectorization (detected
+            // post-optimization) can report a precise, well-located reason.
+            LLVMBackend::VectorizeLoopInfo vinfo;
+            vinfo.line = vectorizeLine_;
+            vinfo.col  = static_cast<int>(vectorizeStatement->getStart()->getCharPositionInLine());
+            vinfo.isWhile = iterationStatement->While() != nullptr && iterationStatement->Do() == nullptr;
+            if (vinfo.isWhile)
+            {
+                auto* cond = iterationStatement->expression();
+                if (cond != nullptr)
+                {
+                    vinfo.condText = cond->getText();
+                    vinfo.condLine = static_cast<int>(cond->getStart()->getLine());
+                    vinfo.condCol  = static_cast<int>(cond->getStart()->getCharPositionInLine());
+                    // A counted loop compares against a bound (< <= > >=); an
+                    // equality/sentinel condition (== / !=, e.g. `p != nullptr`)
+                    // is the classic non-countable pointer-chase.
+                    vinfo.conditionCounted = !ConditionIsSentinel(cond);
+                }
+            }
+            if (auto* call = FindFirstCall(iterationStatement->statement()))
+            {
+                vinfo.hasCall = true;
+                vinfo.callName = call->primaryExpression() ? call->primaryExpression()->getText() : std::string("a function");
+                vinfo.callLine = static_cast<int>(call->getStart()->getLine());
+                vinfo.callCol  = static_cast<int>(call->getStart()->getCharPositionInLine());
+            }
+            compiler->AddVectorizeLoopInfo(vinfo);
+        }
         auto compoundStatement = statement->compoundStatement();
         auto labeledStatement = statement->labeledStatement();
         auto expectErrorStmt = statement->expectErrorStatement();
@@ -2599,6 +2690,12 @@ public:
         }
         else if (iterationStatement != nullptr)
         {
+            // Consume the vectorize request immediately so it binds only to this
+            // loop level (a nested loop in the body re-reads a cleared flag).
+            bool doVectorize = vectorizeActive_;
+            int  vectorizeLine = vectorizeLine_;
+            vectorizeActive_ = false;
+
             /*
             iterationStatement
                 : While '(' expression ')' statement
@@ -2670,6 +2767,11 @@ public:
                 ParseStatement(innerStatement);
                 compiler->CreateContinueCall();
 
+                // The back-edge to blockCondition is now the terminator of the
+                // current block (the loop latch); stamp the vectorize hint on it.
+                if (doVectorize)
+                    compiler->AttachVectorizeHintToCurrentLatch(vectorizeLine);
+
                 // resume
                 compiler->InitializeBlock(blockResume, false);
 
@@ -2730,6 +2832,11 @@ public:
                     }
 
                     compiler->CreateBlockBreak(blockCondition, false);
+
+                    // The increment block's back-edge to blockCondition is the
+                    // loop latch terminator; stamp the vectorize hint on it.
+                    if (doVectorize)
+                        compiler->AttachVectorizeHintToCurrentLatch(vectorizeLine);
 
                     // resume
                     compiler->InitializeBlock(blockResume, false);

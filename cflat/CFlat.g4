@@ -476,11 +476,20 @@ statement
     | expressionStatement
     | selectionStatement
     | iterationStatement
+    | vectorizeStatement
     | jumpStatement
     | lockStatement
     | ('volatile') '(' (
         logicalOrExpression (',' logicalOrExpression)*
     )? (':' (logicalOrExpression (',' logicalOrExpression)*)?)* ')' ';'
+    ;
+
+// 'vectorize' is a prefix modifier on a counted loop. It reuses iterationStatement
+// so 'vectorize for (...)' and 'vectorize while (...)' both parse; codegen rejects
+// the loop forms that cannot be vectorized (do-while, foreach). 'vectorize' is a
+// soft keyword (inline literal, same mechanism as 'lock'/'program').
+vectorizeStatement
+    : 'vectorize' iterationStatement
     ;
 
 lockStatement
