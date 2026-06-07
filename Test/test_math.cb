@@ -31,6 +31,94 @@ extern int main()
     total++; passed += Test("Math.sin(0.0f)",  Math.sin(0.0f),         0.0f);
     total++; passed += Test("Math.cos(0.0f)",  Math.cos(0.0f),         1.0f);
 
+    // Math.PI / constants (zero-arg functions)
+    total++; passed += Test("Math.PI()",    (float)Math.PI(),    3.14159265f);
+    total++; passed += Test("Math.E()",     (float)Math.E(),     2.71828183f);
+    total++; passed += Test("Math.SQRT2()", (float)Math.SQRT2(), 1.41421356f);
+    total++; passed += Test("Math.LN2()",   (float)Math.LN2(),   0.69314718f);
+
+    // Math.abs / fabs overloads for float and double
+    total++; passed += Test("Math.fabs(-3.5)", (float)Math.fabs(-3.5),   3.5f);
+    total++; passed += Test("Math.fabs(-2f)",  Math.fabs(-2.0f),         2.0f);
+    total++; passed += Test("Math.abs(-4.0)",  (float)Math.abs(-4.0),    4.0f);
+
+    // Math.sign
+    total++; passed += Test("Math.sign(-5.0)", (float)Math.sign(-5.0), -1.0f);
+    total++; passed += Test("Math.sign(0.0)",  (float)Math.sign(0.0),   0.0f);
+    total++; passed += Test("Math.sign(3.0)",  (float)Math.sign(3.0),   1.0f);
+
+    // float min / max / clamp overloads
+    total++; passed += Test("Math.min(2.0,5.0)",         (float)Math.min(2.0, 5.0),              2.0f);
+    total++; passed += Test("Math.max(2.0,5.0)",         (float)Math.max(2.0, 5.0),              5.0f);
+    total++; passed += Test("Math.clamp(7.0,0.0,5.0)",   (float)Math.clamp(7.0, 0.0, 5.0),       5.0f);
+    total++; passed += Test("Math.min(2f,5f)",           Math.min(2.0f, 5.0f),                   2.0f);
+    total++; passed += Test("Math.max(2f,5f)",           Math.max(2.0f, 5.0f),                   5.0f);
+
+    // exp / exp2 via llvm intrinsics (method form)
+    total++; passed += Test("Math.exp(0.0)",   (float)Math.exp(0.0),   1.0f);
+    total++; passed += Test("Math.exp2(10.0)", (float)Math.exp2(10.0), 1024.0f);
+    total++; passed += Test("Math.exp(0f)",    Math.exp(0.0f),         1.0f);
+
+    // pow (CRT)
+    total++; passed += Test("Math.pow(2,10)", (float)Math.pow(2.0, 10.0), 1024.0f);
+    total++; passed += Test("Math.pow(9,0.5)",(float)Math.pow(9.0, 0.5),  3.0f);
+
+    // cbrt (CRT)
+    total++; passed += Test("Math.cbrt(27)", (float)Math.cbrt(27.0),  3.0f);
+    total++; passed += Test("Math.cbrt(-8)", (float)Math.cbrt(-8.0), -2.0f);
+
+    // log / log2 / log10 via llvm intrinsics
+    total++; passed += Test("Math.log(E)",      (float)Math.log(Math.E()),   1.0f);
+    total++; passed += Test("Math.log2(8.0)",   (float)Math.log2(8.0),       3.0f);
+    total++; passed += Test("Math.log10(100.0)",(float)Math.log10(100.0),    2.0f);
+    total++; passed += Test("Math.log(1f)",      Math.log(1.0f),              0.0f);
+
+    // tan (CRT - tests the _libm_ thunk / no-recursion path)
+    total++; passed += Test("Math.tan(0.0)",  (float)Math.tan(0.0),  0.0f);
+    total++; passed += Test("Math.tan(0f)",   Math.tan(0.0f),        0.0f);
+
+    // asin / acos / atan / atan2 (CRT)
+    total++; passed += Test("Math.asin(0.0)",      (float)Math.asin(0.0),       0.0f);
+    total++; passed += Test("Math.acos(1.0)",      (float)Math.acos(1.0),       0.0f);
+    total++; passed += Test("Math.atan(0.0)",      (float)Math.atan(0.0),       0.0f);
+    // atan2(1,1) = pi/4; compare both sides via the same float conversion to avoid literal mismatch
+    total++; passed += Test("Math.atan2(1,1)",     (float)Math.atan2(1.0, 1.0), (float)(Math.PI() / 4.0));
+
+    // sinh / cosh / tanh (CRT)
+    total++; passed += Test("Math.sinh(0.0)", (float)Math.sinh(0.0), 0.0f);
+    total++; passed += Test("Math.cosh(0.0)", (float)Math.cosh(0.0), 1.0f);
+    total++; passed += Test("Math.tanh(0.0)", (float)Math.tanh(0.0), 0.0f);
+
+    // floor / ceil / round / trunc (llvm intrinsics via method form)
+    total++; passed += Test("Math.floor(-2.5)", (float)Math.floor(-2.5), -3.0f);
+    total++; passed += Test("Math.ceil(-2.5)",  (float)Math.ceil(-2.5),  -2.0f);
+    total++; passed += Test("Math.round(2.5)",  (float)Math.round(2.5),   3.0f);
+    total++; passed += Test("Math.trunc(-2.9)", (float)Math.trunc(-2.9), -2.0f);
+    total++; passed += Test("Math.floor(-2.5f)",Math.floor(-2.5f),       -3.0f);
+
+    // fmod (CRT)
+    total++; passed += Test("Math.fmod(7,3)",   (float)Math.fmod(7.0, 3.0),   1.0f);
+    total++; passed += Test("Math.fmod(7f,3f)", Math.fmod(7.0f, 3.0f),        1.0f);
+
+    // copysign (CRT)
+    total++; passed += Test("Math.copysign(3,-1)", (float)Math.copysign(3.0, -1.0), -3.0f);
+    total++; passed += Test("Math.copysign(-3,1)", (float)Math.copysign(-3.0, 1.0),  3.0f);
+
+    // hypot (CRT)
+    total++; passed += Test("Math.hypot(3,4)", (float)Math.hypot(3.0, 4.0), 5.0f);
+
+    // fmin / fmax (CRT)
+    total++; passed += Test("Math.fmin(2,5)", (float)Math.fmin(2.0, 5.0), 2.0f);
+    total++; passed += Test("Math.fmax(2,5)", (float)Math.fmax(2.0, 5.0), 5.0f);
+
+    // lerp
+    total++; passed += Test("Math.lerp(0,10,0.5)", (float)Math.lerp(0.0, 10.0, 0.5), 5.0f);
+    total++; passed += Test("Math.lerp(0f,10f,0.5f)", Math.lerp(0.0f, 10.0f, 0.5f), 5.0f);
+
+    // radians / degrees
+    total++; passed += Test("Math.radians(180)", (float)Math.radians(180.0), 3.14159265f);
+    total++; passed += Test("Math.degrees(pi)",  (float)Math.degrees(Math.PI()), 180.0f);
+
     // integer conversion methods
     i64 big = 0x100000000;  // 2^32
     big = big + 0x42;       // 0x1_0000_0042 - high bits above i32 range

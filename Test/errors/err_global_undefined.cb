@@ -1,0 +1,12 @@
+// `global::` must resolve to a symbol at the root (file/global) scope. A name that
+// exists in no root scope is a clean compile error, not a silent miss or a crash.
+
+namespace N {
+    int useUndefined()
+    {
+        expect_error("Undefined global symbol 'doesNotExist'.");
+        return global::doesNotExist(1, 2);
+    }
+}
+
+extern int main() { return N.useUndefined(); }

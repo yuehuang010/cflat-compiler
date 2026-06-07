@@ -290,6 +290,13 @@ namespace MathUtils
     // `add` that returns a+b+100), so addThenDouble(3,4) == (3+4)*2 == 14.
     int addThenDouble(int a, int b) { return multiply(add(a, b), 2); }
 
+    // `global::add` escapes the namespace and reaches the GLOBAL add (a+b+100),
+    // even though the sibling MathUtils.add (a+b) would shadow a bare `add`.
+    int addViaGlobal(int a, int b) { return global::add(a, b); }
+
+    // Bare `add` still resolves to the sibling MathUtils.add (a+b).
+    int addViaSibling(int a, int b) { return add(a, b); }
+
     namespace Advanced
     {
         int square(int x) { return x * x; }
@@ -298,6 +305,10 @@ namespace MathUtils
         // Unqualified sibling call inside a nested namespace resolves to
         // Advanced.square; sumOfSquares(3,4) == 9 + 16 == 25.
         int sumOfSquares(int a, int b) { return square(a) + square(b); }
+
+        // `global::` with a dotted path resolves at the root: global::MathUtils.add
+        // is the sibling-free root MathUtils.add (a+b), reached from this nested scope.
+        int addViaGlobalDotted(int a, int b) { return global::MathUtils.add(a, b); }
     }
 }
 
@@ -317,6 +328,12 @@ bool testNamespace()
     // member (more-local wins over the global `add`): (3+4)*2 = 14, not (3+4+100)*2.
     result &= Test("sibling_call", MathUtils.addThenDouble(3, 4), 14);
     result &= Test("nested_sibling_call", MathUtils.Advanced.sumOfSquares(3, 4), 25); // 9+16=25
+    // global:: escapes the sibling shadow: addViaGlobal reaches the global add (a+b+100),
+    // while addViaSibling still resolves to the namespace member (a+b).
+    result &= Test("global_scope_escape", MathUtils.addViaGlobal(3, 4), 107);          // 3+4+100
+    result &= Test("global_scope_sibling_still_local", MathUtils.addViaSibling(3, 4), 7); // 3+4
+    // global:: with a dotted path resolves at the root namespace.
+    result &= Test("global_scope_dotted", MathUtils.Advanced.addViaGlobalDotted(3, 4), 7); // 3+4
     return result;
 }
 

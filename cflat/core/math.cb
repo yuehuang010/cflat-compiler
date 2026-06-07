@@ -1,8 +1,59 @@
 // math.cb - common mathematical utilities.
-// Provides abs, min, max, clamp for integers and floats.
+// Provides integer abs/min/max/clamp and a complete floating-point math library
+// under the Math namespace, covering exponents, logarithms, trigonometry,
+// hyperbolic functions, rounding, and utility helpers.
+//
+// Implementation notes:
+//   - Functions with stable single-argument LLVM intrinsics use the method form
+//     (e.g. x.exp()) so they constant-fold and vectorize at -O2.
+//   - Functions backed by the C runtime (tan, asin, atan2, pow, cbrt, hypot,
+//     etc.) use file-scope extern declarations. The Math.* wrappers reach the
+//     CRT symbol directly with the 'global::' scope-escape qualifier (e.g.
+//     'return global::tan(x);'), which resolves at the root scope and so cannot
+//     recurse into the Math sibling of the same name.
+//   - Constants are exposed as zero-arg functions (e.g. Math.PI()) because
+//     namespace-scope const declarations are not currently supported.
+
+// -----------------------------------------------------------------
+// File-scope CRT declarations.  The Math.* wrappers below reach these
+// via 'global::', so no _libm_* thunks are needed.
+// -----------------------------------------------------------------
+
+// trig
+extern double tan(double a);
+extern double asin(double a);
+extern double acos(double a);
+extern double atan(double a);
+extern double atan2(double y, double x);
+
+// hyperbolic
+extern double sinh(double a);
+extern double cosh(double a);
+extern double tanh(double a);
+
+// exponent / log (no stable LLVM intrinsic for these)
+extern double expm1(double a);
+extern double log1p(double a);
+
+// misc
+extern double cbrt(double a);
+extern double hypot(double a, double b);
+extern double fmod(double a, double b);
+
+// binary (simpler to route through CRT than to wire new call-site intrinsics)
+extern double pow(double a, double b);
+extern double copysign(double a, double b);
+extern double fmin(double a, double b);
+extern double fmax(double a, double b);
+
+// =================================================================
+// Math namespace
+// =================================================================
 
 namespace Math
 {
+    // --- integer utilities (existing) ---
+
     // Absolute value for i32.
     i32 abs(i32 x)
     {
@@ -39,21 +90,87 @@ namespace Math
         return a > b ? a : b;
     }
 
-    // Clamp x to [min, max] for i32.
+    // Clamp x to [minVal, maxVal] for i32.
     i32 clamp(i32 x, i32 minVal, i32 maxVal)
     {
         return x < minVal ? minVal : (x > maxVal ? maxVal : x);
     }
 
-    // Clamp x to [min, max] for i64.
+    // Clamp x to [minVal, maxVal] for i64.
     i64 clamp(i64 x, i64 minVal, i64 maxVal)
     {
         return x < minVal ? minVal : (x > maxVal ? maxVal : x);
     }
 
-    // Fused multiply-add: a * b + c computed with a single rounding step (more
-    // accurate than a * b + c written out, and a single instruction where the
-    // target has hardware FMA).
+    // --- floating-point min/max/clamp ---
+
+    // Minimum of two doubles.
+    double min(double a, double b)
+    {
+        return a < b ? a : b;
+    }
+
+    // Minimum of two floats.
+    float min(float a, float b)
+    {
+        return a < b ? a : b;
+    }
+
+    // Maximum of two doubles.
+    double max(double a, double b)
+    {
+        return a > b ? a : b;
+    }
+
+    // Maximum of two floats.
+    float max(float a, float b)
+    {
+        return a > b ? a : b;
+    }
+
+    // Clamp x to [minVal, maxVal] for double.
+    double clamp(double x, double minVal, double maxVal)
+    {
+        return x < minVal ? minVal : (x > maxVal ? maxVal : x);
+    }
+
+    // Clamp x to [minVal, maxVal] for float.
+    float clamp(float x, float minVal, float maxVal)
+    {
+        return x < minVal ? minVal : (x > maxVal ? maxVal : x);
+    }
+
+    // --- constants (returned as zero-arg functions; LLVM constant-folds them) ---
+
+    double PI()    { return 3.14159265358979323846; }
+    double TAU()   { return 6.28318530717958647692; }
+    double E()     { return 2.71828182845904523536; }
+    double SQRT2() { return 1.41421356237309504880; }
+    double LN2()   { return 0.69314718055994530941; }
+    double LN10()  { return 2.30258509299404568401; }
+
+    // --- absolute value for floating-point ---
+
+    // Absolute value for double (llvm.fabs).
+    double fabs(double x) { return x.abs(); }
+
+    // Absolute value for float (llvm.fabs over f32).
+    float fabs(float x) { return x.abs(); }
+
+    // abs overloads for float/double (aliases for fabs; integer overloads kept above).
+    double abs(double x) { return x.abs(); }
+    float abs(float x)   { return x.abs(); }
+
+    // --- sign function (-1 / 0 / +1) ---
+
+    i32 sign(i32 x)    { return x < 0 ? -1 : (x > 0 ? 1 : 0); }
+    i64 sign(i64 x)    { return x < 0 ? -1 : (x > 0 ? 1 : 0); }
+    double sign(double x) { return x < 0.0 ? -1.0 : (x > 0.0 ? 1.0 : 0.0); }
+    float sign(float x)   { return x < 0.0f ? -1.0f : (x > 0.0f ? 1.0f : 0.0f); }
+
+    // --- fused multiply-add (existing) ---
+
+    // Fused multiply-add: a * b + c computed with a single rounding step.
     double fma(double a, double b, double c)
     {
         return __fma(a, b, c);
@@ -65,40 +182,150 @@ namespace Math
         return __fma(a, b, c);
     }
 
+    // --- square root (existing + method form) ---
+
     // Square root. Lowers to the llvm.sqrt intrinsic (hardware SQRTSD where
-    // available), so it constant-folds and vectorizes - unlike an opaque CRT call.
-    double sqrt(double x)
-    {
-        return x.sqrt();
-    }
+    // available), so it constant-folds and vectorizes.
+    double sqrt(double x) { return x.sqrt(); }
 
     // Square root for float (llvm.sqrt over f32).
-    float sqrt(float x)
-    {
-        return x.sqrt();
-    }
+    float sqrt(float x) { return x.sqrt(); }
+
+    // Cube root (CRT cbrt).
+    double cbrt(double x) { return global::cbrt(x); }
+    float cbrt(float x)   { return (float)global::cbrt((double)x); }
+
+    // --- exponents ---
+
+    // e^x. Lowers to the llvm.exp intrinsic.
+    double exp(double x) { return x.exp(); }
+    float exp(float x)   { return x.exp(); }
+
+    // 2^x. Lowers to the llvm.exp2 intrinsic.
+    double exp2(double x) { return x.exp2(); }
+    float exp2(float x)   { return x.exp2(); }
+
+    // e^x - 1, accurate for small x (CRT expm1).
+    double expm1(double x) { return global::expm1(x); }
+    float expm1(float x)   { return (float)global::expm1((double)x); }
+
+    // a raised to the power b (CRT pow).
+    double pow(double a, double b) { return global::pow(a, b); }
+    float pow(float a, float b)    { return (float)global::pow((double)a, (double)b); }
+
+    // --- logarithms ---
+
+    // Natural logarithm. Lowers to the llvm.log intrinsic.
+    double log(double x) { return x.log(); }
+    float log(float x)   { return x.log(); }
+
+    // Base-2 logarithm. Lowers to the llvm.log2 intrinsic.
+    double log2(double x) { return x.log2(); }
+    float log2(float x)   { return x.log2(); }
+
+    // Base-10 logarithm. Lowers to the llvm.log10 intrinsic.
+    double log10(double x) { return x.log10(); }
+    float log10(float x)   { return x.log10(); }
+
+    // log(1 + x), accurate for small x (CRT log1p).
+    double log1p(double x) { return global::log1p(x); }
+    float log1p(float x)   { return (float)global::log1p((double)x); }
+
+    // --- trigonometry (existing + new) ---
 
     // Sine. Lowers to the llvm.sin intrinsic.
-    double sin(double x)
-    {
-        return x.sin();
-    }
-
-    // Sine for float (llvm.sin over f32).
-    float sin(float x)
-    {
-        return x.sin();
-    }
+    double sin(double x) { return x.sin(); }
+    float sin(float x)   { return x.sin(); }
 
     // Cosine. Lowers to the llvm.cos intrinsic.
-    double cos(double x)
-    {
-        return x.cos();
-    }
+    double cos(double x) { return x.cos(); }
+    float cos(float x)   { return x.cos(); }
 
-    // Cosine for float (llvm.cos over f32).
-    float cos(float x)
-    {
-        return x.cos();
-    }
+    // Tangent (CRT tan - reached via global:: so it cannot recurse into Math.tan).
+    double tan(double x) { return global::tan(x); }
+    float tan(float x)   { return (float)global::tan((double)x); }
+
+    // Arcsine in radians, domain [-1, 1] (CRT asin).
+    double asin(double x) { return global::asin(x); }
+    float asin(float x)   { return (float)global::asin((double)x); }
+
+    // Arccosine in radians, domain [-1, 1] (CRT acos).
+    double acos(double x) { return global::acos(x); }
+    float acos(float x)   { return (float)global::acos((double)x); }
+
+    // Arctangent in radians (CRT atan).
+    double atan(double x) { return global::atan(x); }
+    float atan(float x)   { return (float)global::atan((double)x); }
+
+    // Four-quadrant arctangent: angle of (x, y) from positive x-axis (CRT atan2).
+    double atan2(double y, double x) { return global::atan2(y, x); }
+    float atan2(float y, float x)    { return (float)global::atan2((double)y, (double)x); }
+
+    // --- hyperbolic ---
+
+    // Hyperbolic sine (CRT sinh).
+    double sinh(double x) { return global::sinh(x); }
+    float sinh(float x)   { return (float)global::sinh((double)x); }
+
+    // Hyperbolic cosine (CRT cosh).
+    double cosh(double x) { return global::cosh(x); }
+    float cosh(float x)   { return (float)global::cosh((double)x); }
+
+    // Hyperbolic tangent (CRT tanh).
+    double tanh(double x) { return global::tanh(x); }
+    float tanh(float x)   { return (float)global::tanh((double)x); }
+
+    // --- rounding ---
+
+    // Round to nearest, ties away from zero. Lowers to llvm.round.
+    double round(double x) { return x.round(); }
+    float round(float x)   { return x.round(); }
+
+    // Largest integer not greater than x. Lowers to llvm.floor.
+    double floor(double x) { return x.floor(); }
+    float floor(float x)   { return x.floor(); }
+
+    // Smallest integer not less than x. Lowers to llvm.ceil.
+    double ceil(double x) { return x.ceil(); }
+    float ceil(float x)   { return x.ceil(); }
+
+    // Truncate toward zero. Lowers to llvm.trunc.
+    double trunc(double x) { return x.trunc(); }
+    float trunc(float x)   { return x.trunc(); }
+
+    // Floating-point remainder of a / b, same sign as a (CRT fmod).
+    double fmod(double a, double b) { return global::fmod(a, b); }
+    float fmod(float a, float b)    { return (float)global::fmod((double)a, (double)b); }
+
+    // --- comparison / sign helpers ---
+
+    // Compose magnitude of a with sign of b (CRT copysign).
+    double copysign(double a, double b) { return global::copysign(a, b); }
+    float copysign(float a, float b)    { return (float)global::copysign((double)a, (double)b); }
+
+    // Hypotenuse: sqrt(a^2 + b^2), avoids overflow (CRT hypot).
+    double hypot(double a, double b) { return global::hypot(a, b); }
+    float hypot(float a, float b)    { return (float)global::hypot((double)a, (double)b); }
+
+    // Floating-point minimum (CRT fmin; returns the non-NaN operand if one is NaN).
+    double fmin(double a, double b) { return global::fmin(a, b); }
+    float fmin(float a, float b)    { return (float)global::fmin((double)a, (double)b); }
+
+    // Floating-point maximum (CRT fmax; returns the non-NaN operand if one is NaN).
+    double fmax(double a, double b) { return global::fmax(a, b); }
+    float fmax(float a, float b)    { return (float)global::fmax((double)a, (double)b); }
+
+    // --- utility helpers ---
+
+    // Linear interpolation: a + t * (b - a).
+    double lerp(double a, double b, double t) { return a + t * (b - a); }
+    float lerp(float a, float b, float t)     { return a + t * (b - a); }
+
+    // Convert degrees to radians.
+    double radians(double deg) { return deg * PI() / 180.0; }
+    float radians(float deg)   { return (float)(deg * PI() / 180.0); }
+
+    // Convert radians to degrees.
+    double degrees(double rad) { return rad * 180.0 / PI(); }
+    float degrees(float rad)   { return (float)(rad * 180.0 / PI()); }
 }

@@ -35,6 +35,7 @@ grammar CFlat;
 
 primaryExpression
     : Constant
+    | Identifier DoubleColon genericIdentifier   // global:: scope-escape qualifier ('global' is a contextual soft keyword, checked in the listener)
     | genericIdentifier
     | StringLiteral+
     | lambdaExpression
@@ -1128,6 +1129,10 @@ QuestionQuestion
 
 Question
     : '?'
+    ;
+
+DoubleColon
+    : '::'
     ;
 
 Colon

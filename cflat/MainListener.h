@@ -7651,6 +7651,10 @@ public:
 
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
+            // Set when the primary was a `global::name` form whose base resolved to a dot-less
+            // root function: the following call must resolve at root (skip the enclosing-namespace
+            // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
+            bool globalScopeCall = false;
 
             for (auto parseTree : ctx->children)
             {
@@ -8118,6 +8122,60 @@ public:
                     case CFlatParser::RulePrimaryExpression:
                     {
                         auto prevPrimary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parseTree);
+
+                        // `global::name` scope-escape qualifier: resolve the following name at the
+                        // ROOT (file/global) scope, bypassing the enclosing-namespace lookup. The
+                        // leading token must literally be `global` (a contextual soft keyword).
+                        if (prevPrimary->DoubleColon() != nullptr)
+                        {
+                            auto* compiler = Compiler(ctx);
+                            auto* leadTok = prevPrimary->Identifier();
+                            if (leadTok == nullptr || leadTok->getText() != "global")
+                            {
+                                LogErrorContext(prevPrimary, "expected 'global' before '::' scope qualifier");
+                                namedVar = {};
+                                structVar = {};
+                                break;
+                            }
+
+                            auto* gid = prevPrimary->genericIdentifier();
+                            std::string rootName = gid->Identifier()->getText();
+
+                            if (compiler->IsNamespace(rootName))
+                            {
+                                // global::Outer.Inner.x - seed the namespace context at root; the
+                                // following `.member` postfix builds a dotted (root-anchored) name,
+                                // which ResolveQualifiedName never prepends the current namespace to.
+                                namespaceContext = compiler->ResolveNamespace(rootName);
+                                primaryIdentifier = namespaceContext;
+                                namedVar = {};
+                                structVar = {};
+                                interfaceVar = {};
+                                break;
+                            }
+
+                            // Dot-less root symbol: a global variable, or a function (value or call).
+                            primaryIdentifier = rootName;
+                            namedVar = {};
+                            auto globalNV = compiler->GetGlobalVariableNV(rootName);
+                            if (globalNV.Storage != nullptr)
+                            {
+                                namedVar = globalNV;
+                            }
+                            else if (compiler->GetFunction(rootName))
+                            {
+                                namedVar.Primary = compiler->GetFunctionForFuncPtr(rootName);
+                                namedVar.CallerName = rootName;
+                                globalScopeCall = true;
+                            }
+                            else
+                            {
+                                LogErrorContext(prevPrimary, std::format("Undefined global symbol '{}'.", rootName));
+                            }
+                            structVar = {};
+                            interfaceVar = {};
+                            break;
+                        }
 
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
                         // map it to its mangled constructor name (e.g. Box__MyInt).
@@ -9566,10 +9624,11 @@ public:
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 arguments.push_back(argumentNamedVar);
                             }
-                            else
+                            else if (!globalScopeCall)
                             {
                                 // Bare call inside a member function - inject 'this' automatically
-                                // if the callee is a method of the same struct.
+                                // if the callee is a method of the same struct. A `global::` call
+                                // explicitly targets the root, so never inject an implicit 'this'.
                                 auto thisVar = Compiler(ctx)->GetCurrentMemberThis(functionName);
                                 if (thisVar.Storage != nullptr)
                                     arguments.push_back(thisVar);
@@ -9771,7 +9830,8 @@ public:
                                 Compiler(ctx)->CreateConditionJump(structVar.Storage, accessBlock, nullBlock);
                                 // insert point is now accessBlock
 
-                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
+                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
+                                globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
@@ -9835,7 +9895,8 @@ public:
                                         if (!inst.empty()) resolvedFuncName = inst;
                                     }
                                 }
-                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments);
+                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
+                                globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())

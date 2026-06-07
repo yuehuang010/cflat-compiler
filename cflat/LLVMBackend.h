@@ -1861,19 +1861,37 @@ private:
         builder->CreateCall(fn, {apAlloca});
     }
 
-    // Emit a single-argument LLVM float intrinsic (round, floor, ceil, fabs, sqrt,
-    // sin, cos). Returns nullptr if methodName is not a recognized float method.
-    // Works for both float (f32) and double (f64) - type is inferred from floatVal.
+    // Emit a single-argument LLVM float intrinsic.  Works for both float (f32)
+    // and double (f64) - type is inferred from floatVal.  Returns nullptr if
+    // methodName is not a recognized float method.
+    //
+    // Supported methods and their LLVM counterparts:
+    //   round      -> llvm.round       ceil       -> llvm.ceil
+    //   floor      -> llvm.floor       trunc      -> llvm.trunc
+    //   abs        -> llvm.fabs        rint       -> llvm.rint
+    //   sqrt       -> llvm.sqrt        nearbyint  -> llvm.nearbyint
+    //   sin        -> llvm.sin         exp        -> llvm.exp
+    //   cos        -> llvm.cos         exp2       -> llvm.exp2
+    //   log        -> llvm.log         log2       -> llvm.log2
+    //   log10      -> llvm.log10
     llvm::Value* CreateFloatIntrinsic(const std::string& methodName, llvm::Value* floatVal)
     {
         llvm::Intrinsic::ID id;
-        if      (methodName == "round") id = llvm::Intrinsic::round;
-        else if (methodName == "floor") id = llvm::Intrinsic::floor;
-        else if (methodName == "ceil")  id = llvm::Intrinsic::ceil;
-        else if (methodName == "abs")   id = llvm::Intrinsic::fabs;
-        else if (methodName == "sqrt")  id = llvm::Intrinsic::sqrt;
-        else if (methodName == "sin")   id = llvm::Intrinsic::sin;
-        else if (methodName == "cos")   id = llvm::Intrinsic::cos;
+        if      (methodName == "round")     id = llvm::Intrinsic::round;
+        else if (methodName == "floor")     id = llvm::Intrinsic::floor;
+        else if (methodName == "ceil")      id = llvm::Intrinsic::ceil;
+        else if (methodName == "trunc")     id = llvm::Intrinsic::trunc;
+        else if (methodName == "abs")       id = llvm::Intrinsic::fabs;
+        else if (methodName == "rint")      id = llvm::Intrinsic::rint;
+        else if (methodName == "nearbyint") id = llvm::Intrinsic::nearbyint;
+        else if (methodName == "sqrt")      id = llvm::Intrinsic::sqrt;
+        else if (methodName == "sin")       id = llvm::Intrinsic::sin;
+        else if (methodName == "cos")       id = llvm::Intrinsic::cos;
+        else if (methodName == "exp")       id = llvm::Intrinsic::exp;
+        else if (methodName == "exp2")      id = llvm::Intrinsic::exp2;
+        else if (methodName == "log")       id = llvm::Intrinsic::log;
+        else if (methodName == "log2")      id = llvm::Intrinsic::log2;
+        else if (methodName == "log10")     id = llvm::Intrinsic::log10;
         else return nullptr;
 
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), id, {floatVal->getType()});
@@ -7478,9 +7496,9 @@ public:
         return nullptr; // not an atomic builtin
     }
 
-    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<LLVMBackend::NamedVariable> arguments)
+    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<LLVMBackend::NamedVariable> arguments, bool forceRoot = false)
     {
-        functionName = ResolveQualifiedName(functionName);
+        functionName = ResolveQualifiedName(functionName, forceRoot);
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
@@ -9103,12 +9121,21 @@ public:
     // by expanding namespace aliases on the leading component and then walking up parent namespaces.
     std::string ResolveQualifiedName(const std::string& name) const
     {
+        return ResolveQualifiedName(name, false);
+    }
+
+    // forceRoot: skip the enclosing-namespace outward walk and resolve the name starting at
+    // the root (file/global) scope. Used by the `global::` scope-escape qualifier so a
+    // namespace member that shadows a global (e.g. Math.tan over the CRT tan) can still
+    // reach the root symbol.
+    std::string ResolveQualifiedName(const std::string& name, bool forceRoot) const
+    {
         // Bare name referenced inside a namespace body: prefer an enclosing-namespace
         // sibling (e.g. inside "N", a bare "helper" resolves to "N.helper") before
         // falling back to a top-level/global symbol. Walk outward through parent
         // namespaces so a nested "Outer.Inner" also sees "Outer" members. A more-local
         // match wins; if no qualified sibling exists the bare name resolves below.
-        if (!currentNamespace_.empty() && name.find('.') == std::string::npos)
+        if (!forceRoot && !currentNamespace_.empty() && name.find('.') == std::string::npos)
         {
             std::string prefix = currentNamespace_;
             while (true)
