@@ -3747,6 +3747,12 @@ public:
 
         compiler->InitializeBlock(&fn->front(), false);
 
+        // Make the enclosing namespace visible to body resolution so an unqualified
+        // sibling reference (bare "helper" inside "namespace N") resolves to "N.helper".
+        // Restored at function exit so it does not leak into the next definition.
+        std::string savedNamespace = compiler->GetCurrentNamespace();
+        compiler->SetCurrentNamespace(namespaceName);
+
         currentFunctionIsVariadic = varargs;
 
         if (isAutoReturn)
@@ -3839,8 +3845,11 @@ public:
         {
             auto sites = compiler->EndAutoReturnCapture();
             compiler->FinalizeAutoReturnFunction(name, fn, sites, allParams, varargs, returnsOwned, !structName.empty());
+            compiler->SetCurrentNamespace(savedNamespace);
             return;  // auto functions do not participate in default-param overload generation in v1
         }
+
+        compiler->SetCurrentNamespace(savedNamespace);
 
         GenerateDefaultParamOverloads(name, returnType, params, varargs, line);
     }
@@ -10739,6 +10748,26 @@ public:
         };
         if (kIntrinsics.count(name))
             return {};
+
+        // Enclosing-namespace sibling: a bare name inside "namespace N" may refer to a
+        // sibling member "N.<name>" (walking outward through parent namespaces).
+        // ResolveQualifiedName performs that lookup using the current namespace context.
+        std::string nsQualified = compiler->ResolveQualifiedName(name);
+        if (nsQualified != name)
+        {
+            if (compiler->GetFunction(nsQualified))
+            {
+                namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
+                namedVar.CallerName = nsQualified;
+                return namedVar;
+            }
+            // Return-block and generic-template siblings have no IR entry yet; defer to
+            // the call-site dispatch (which re-qualifies through ResolveQualifiedName).
+            if (compiler->GetReturnBlock(nsQualified) != nullptr)
+                return {};
+            if (genericFunctionTemplates.count(nsQualified))
+                return {};
+        }
 
         LogErrorContext(node, std::format("Undefined variable {}.", name));
         return {};

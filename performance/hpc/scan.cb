@@ -1,0 +1,88 @@
+// scan.cb - reductions, prefix sums, and streaming statistics over double[].
+//
+//   prefix_sum_inclusive / prefix_sum_exclusive : parallel-prefix building blocks
+//   sum / minval / maxval                        : whole-array reductions
+//   Welford (mean + variance in one pass)        : numerically stable streaming stats
+//
+// Prefix sums and Welford carry a loop-carried dependence, so they are scalar by design
+// (they cannot vectorize). They are still allocation-free and single-pass.
+
+namespace Scan
+{
+    // out[i] = sum(src[0..i])   (inclusive scan). out and src may be the same length;
+    // distinct views recommended.
+    void prefix_sum_inclusive(double[] src, double[] out, int n)
+    {
+        double acc = 0.0;
+        int i = 0;
+        while (i < n) { acc = acc + src[i]; out[i] = acc; i = i + 1; }
+    }
+
+    // out[i] = sum(src[0..i-1])   (exclusive scan; out[0] = 0).
+    void prefix_sum_exclusive(double[] src, double[] out, int n)
+    {
+        double acc = 0.0;
+        int i = 0;
+        while (i < n) { out[i] = acc; acc = acc + src[i]; i = i + 1; }
+    }
+
+    double sum(double[] x, int n)
+    {
+        double s = 0.0;
+        int i = 0;
+        while (i < n) { s = s + x[i]; i = i + 1; }
+        return s;
+    }
+
+    double minval(double[] x, int n)
+    {
+        double m = x[0];
+        int i = 1;
+        while (i < n) { if (x[i] < m) m = x[i]; i = i + 1; }
+        return m;
+    }
+
+    double maxval(double[] x, int n)
+    {
+        double m = x[0];
+        int i = 1;
+        while (i < n) { if (x[i] > m) m = x[i]; i = i + 1; }
+        return m;
+    }
+}
+
+// Streaming mean/variance via Welford's algorithm - O(1) state, one pass, and far more
+// stable than the textbook sum-of-squares formula. Usable as an online accumulator.
+struct Welford
+{
+    i64 count = default;
+    double mean = default;
+    double m2 = default;     // sum of squares of differences from the running mean
+
+    void reset() { count = (i64)0; mean = 0.0; m2 = 0.0; }
+
+    void add(double value)
+    {
+        count = count + (i64)1;
+        double delta = value - mean;
+        mean = mean + delta / (double)count;
+        double delta2 = value - mean;
+        m2 = m2 + delta * delta2;
+    }
+
+    double get_mean() { return mean; }
+
+    // Population variance (divide by N). Returns 0 for an empty accumulator.
+    double variance()
+    {
+        if (count == (i64)0) return 0.0;
+        return m2 / (double)count;
+    }
+
+    // Sample variance (divide by N-1).
+    double sample_variance()
+    {
+        if (count < (i64)2) return 0.0;
+        return m2 / (double)(count - (i64)1);
+    }
+};

@@ -22,6 +22,15 @@ extern int main()
     total++; passed += Test("float.abs(-2.5)",   (-2.5f).abs(),   2.5f);
     total++; passed += Test("float.sqrt(4.0)",   (4.0f).sqrt(),   2.0f);
 
+    // Math namespace transcendentals (llvm.sqrt / llvm.sin / llvm.cos).
+    // Test() has no double overload, so cast the double results to float.
+    total++; passed += Test("Math.sqrt(4.0)",  (float)Math.sqrt(4.0),  2.0f);
+    total++; passed += Test("Math.sin(0.0)",   (float)Math.sin(0.0),   0.0f);
+    total++; passed += Test("Math.cos(0.0)",   (float)Math.cos(0.0),   1.0f);
+    total++; passed += Test("Math.sqrt(9.0f)", Math.sqrt(9.0f),        3.0f);
+    total++; passed += Test("Math.sin(0.0f)",  Math.sin(0.0f),         0.0f);
+    total++; passed += Test("Math.cos(0.0f)",  Math.cos(0.0f),         1.0f);
+
     // integer conversion methods
     i64 big = 0x100000000;  // 2^32
     big = big + 0x42;       // 0x1_0000_0042 - high bits above i32 range

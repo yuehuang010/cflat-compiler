@@ -1,0 +1,51 @@
+// sparse.cb - compressed sparse row (CSR) matrix and sparse matrix-vector product.
+//
+// CSR is the workhorse layout for iterative solvers (CG, GMRES) where the matrix is
+// large and mostly zero. A matrix with `rows` rows and `nnz` nonzeros is three arrays:
+//
+//   values[nnz]      : the nonzero coefficients, row by row
+//   col_index[nnz]   : the column of each nonzero
+//   row_ptr[rows+1]  : row i occupies values[row_ptr[i] .. row_ptr[i+1])
+//
+// SpMV (y = A*x) is the inner kernel of every Krylov solver. The inner loop is an
+// indirect-gather reduction (x[col_index[k]]), which does not vectorize - that is
+// inherent to sparse formats, not a CFlat limitation.
+
+struct CsrMatrix
+{
+    double[] values = default;
+    int[] col_index = default;     // noalias view, indexed only (no arithmetic)
+    int[] row_ptr = default;
+    int rows = default;
+    int cols = default;
+    int nnz = default;
+
+    void alloc(int r, int c, int nz)
+    {
+        rows = r; cols = c; nnz = nz;
+        values = new double[nz];
+        col_index = new int[nz];
+        row_ptr = new int[r + 1];
+    }
+
+    void dispose()
+    {
+        delete[_] values;
+        delete[_] col_index;
+        delete[_] row_ptr;
+    }
+
+    // y = A*x.  x has `cols` entries, y has `rows`.
+    void spmv(double[] x, double[] y)
+    {
+        for (int i = 0; i < rows; i = i + 1)
+        {
+            double s = 0.0;
+            int start = row_ptr[i];
+            int end = row_ptr[i + 1];
+            int k = start;
+            while (k < end) { s = s + values[k] * x[col_index[k]]; k = k + 1; }
+            y[i] = s;
+        }
+    }
+};

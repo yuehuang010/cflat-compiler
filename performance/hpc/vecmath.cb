@@ -1,0 +1,87 @@
+// vecmath.cb - BLAS level-1 style dense vector kernels over double[].
+//
+// Design notes (customer perspective):
+//   - Buffers are `double[]` array-views, so distinct vectors are noalias and the
+//     pure map kernels (axpy/scal/copy) vectorize at -O2 with NO runtime alias check.
+//   - Reduction kernels (dot/asum/nrm2) are plain scalar loops: a floating-point
+//     reduction reorders the additions, which changes the result, so the `vectorize`
+//     contract intentionally refuses them. We leave them unmarked rather than lie.
+//   - Length is carried alongside the view (the BLAS convention); a view is thin.
+//
+// All routines are single-threaded and allocation-free on the hot path.
+
+import "math.cb";   // Math.sqrt (llvm.sqrt intrinsic)
+
+namespace Vec
+{
+    // y[i] += alpha * x[i]   (the canonical SAXPY/DAXPY map; vectorizes).
+    void axpy(double alpha, double[] x, double[] y, int n)
+    {
+        vectorize for (int i = 0; i < n; i = i + 1)
+            y[i] = y[i] + alpha * x[i];
+    }
+
+    // x[i] *= alpha   (scale in place; vectorizes).
+    void scal(double alpha, double[] x, int n)
+    {
+        vectorize for (int i = 0; i < n; i = i + 1)
+            x[i] = x[i] * alpha;
+    }
+
+    // y[i] = x[i]   (copy; vectorizes).
+    void copy(double[] x, double[] y, int n)
+    {
+        vectorize for (int i = 0; i < n; i = i + 1)
+            y[i] = x[i];
+    }
+
+    // y[i] = value   (fill; vectorizes).
+    void fill(double[] x, double value, int n)
+    {
+        vectorize for (int i = 0; i < n; i = i + 1)
+            x[i] = value;
+    }
+
+    // sum(x[i] * y[i])   (dot product; FP reduction, left scalar).
+    double dot(double[] x, double[] y, int n)
+    {
+        double s = 0.0;
+        int i = 0;
+        while (i < n) { s = s + x[i] * y[i]; i = i + 1; }
+        return s;
+    }
+
+    // sum(|x[i]|)   (L1 norm).
+    double asum(double[] x, int n)
+    {
+        double s = 0.0;
+        int i = 0;
+        while (i < n) { double v = x[i]; s = s + (v < 0.0 ? -v : v); i = i + 1; }
+        return s;
+    }
+
+    // sqrt(sum(x[i]^2))   (L2 / Euclidean norm).
+    double nrm2(double[] x, int n)
+    {
+        double s = 0.0;
+        int i = 0;
+        while (i < n) { double v = x[i]; s = s + v * v; i = i + 1; }
+        return Math.sqrt(s);
+    }
+
+    // index of the element with the largest magnitude (BLAS IDAMAX).
+    int iamax(double[] x, int n)
+    {
+        if (n <= 0) return -1;
+        int best = 0;
+        double bestv = x[0] < 0.0 ? -x[0] : x[0];
+        int i = 1;
+        while (i < n)
+        {
+            double v = x[i] < 0.0 ? -x[i] : x[i];
+            if (v > bestv) { bestv = v; best = i; }
+            i = i + 1;
+        }
+        return best;
+    }
+}

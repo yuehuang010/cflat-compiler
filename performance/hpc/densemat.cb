@@ -1,0 +1,62 @@
+// densemat.cb - dense row-major matrix kernels (BLAS level-2 and level-3 style).
+//
+// A matrix is a flat `double[]` in row-major order plus its (rows, cols); the caller
+// owns the storage. Kernels take noalias views so the optimizer needs no alias guards.
+//
+//   gemv : y = alpha * A*x + beta * y          (matrix-vector)
+//   gemm : C = alpha * A*B + beta * C          (matrix-matrix, ikj order)
+//   transpose                                    (B = A^T)
+//
+// gemm uses the cache-friendly i-k-j loop order: the innermost loop is a stride-1 map
+// over a row of B accumulated into a row of C (an axpy), which vectorizes at -O2.
+
+namespace Mat
+{
+    // y = alpha * A*x + beta * y.  A is (m x n) row-major, x has n, y has m.
+    void gemv(double alpha, double[] a, double[] x, double beta, double[] y, int m, int n)
+    {
+        for (int i = 0; i < m; i = i + 1)
+        {
+            double s = 0.0;
+            int row = i * n;
+            int j = 0;
+            while (j < n) { s = s + a[row + j] * x[j]; j = j + 1; }   // FP reduction
+            y[i] = alpha * s + beta * y[i];
+        }
+    }
+
+    // C = alpha * A*B + beta * C.  A is (m x k), B is (k x n), C is (m x n), all row-major.
+    // i-k-j order: stride-1 inner map over B's row k into C's row i -> vectorizes.
+    void gemm(double alpha, double[] a, double[] b, double beta, double[] c,
+              int m, int k, int n)
+    {
+        // Apply beta to C first (pure scale; vectorizes over the whole buffer).
+        int total = m * n;
+        vectorize for (int t = 0; t < total; t = t + 1)
+            c[t] = beta * c[t];
+
+        for (int i = 0; i < m; i = i + 1)
+        {
+            int crow = i * n;
+            int arow = i * k;
+            for (int p = 0; p < k; p = p + 1)
+            {
+                double aval = alpha * a[arow + p];
+                int brow = p * n;
+                vectorize for (int j = 0; j < n; j = j + 1)
+                    c[crow + j] = c[crow + j] + aval * b[brow + j];
+            }
+        }
+    }
+
+    // B = A^T.  A is (m x n) row-major, B is (n x m) row-major.
+    void transpose(double[] a, double[] b, int m, int n)
+    {
+        for (int i = 0; i < m; i = i + 1)
+        {
+            int arow = i * n;
+            int j = 0;
+            while (j < n) { b[j * m + i] = a[arow + j]; j = j + 1; }
+        }
+    }
+}

@@ -729,6 +729,11 @@ public:
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
+    // Namespace whose body is currently being code-generated (e.g. "N" or "Outer.Inner").
+    // Empty at file scope. Set/restored around a namespace member's body so that an
+    // unqualified sibling reference (e.g. bare "helper" inside "N") resolves to the
+    // enclosing-namespace symbol "N.helper". See ResolveQualifiedName.
+    std::string currentNamespace_;
     // Maps import alias name -> set of unqualified symbol names the file contributed.
     // Populated by CompileImportedFile when namespaceName is non-empty.
     std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
@@ -1856,8 +1861,8 @@ private:
         builder->CreateCall(fn, {apAlloca});
     }
 
-    // Emit a single-argument LLVM float intrinsic (round, floor, ceil, fabs, sqrt).
-    // Returns nullptr if methodName is not a recognized float method.
+    // Emit a single-argument LLVM float intrinsic (round, floor, ceil, fabs, sqrt,
+    // sin, cos). Returns nullptr if methodName is not a recognized float method.
     // Works for both float (f32) and double (f64) - type is inferred from floatVal.
     llvm::Value* CreateFloatIntrinsic(const std::string& methodName, llvm::Value* floatVal)
     {
@@ -1867,6 +1872,8 @@ private:
         else if (methodName == "ceil")  id = llvm::Intrinsic::ceil;
         else if (methodName == "abs")   id = llvm::Intrinsic::fabs;
         else if (methodName == "sqrt")  id = llvm::Intrinsic::sqrt;
+        else if (methodName == "sin")   id = llvm::Intrinsic::sin;
+        else if (methodName == "cos")   id = llvm::Intrinsic::cos;
         else return nullptr;
 
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), id, {floatVal->getType()});
@@ -5310,6 +5317,31 @@ public:
         return value;
     }
 
+    // C integer promotion for the compile-time constant-fold path: a sub-int
+    // operand is promoted to int (i32) before the two constants are folded.
+    // Without this, binary folding of small literals overflows in the literal's
+    // minimal storage width - the literal 1 is stored as i8, so (i8)1 << 20 folds
+    // to 0 and (i8)100 << 1 to -56. Callers gate this on both operands being
+    // constants, so runtime narrow arithmetic keeps its width (and still matches
+    // narrow return/storage types). The folded constant is truncated back by the
+    // receiving storage (CreateCast) when assigned to a narrower type.
+    //
+    // i32 is the smallest width that actually resolves the overflow: i16 still
+    // loses 1 << 20 and 4 * 1024 * 1024, and going wider than int (to i64) is
+    // unnecessary - so we cap at exactly i32 (C's int) and never promote i32/i64.
+    // i1 (bool) is left alone; promotion targets only the i8/i16 char/short widths.
+    llvm::Value* PromoteToInt(llvm::Value* value, bool isUnsigned = false) const
+    {
+        auto* type = value->getType();
+        if (type->isIntegerTy())
+        {
+            unsigned width = type->getIntegerBitWidth();
+            if (width == 8 || width == 16)
+                return Upconvert(value, builder->getInt32Ty(), isUnsigned);
+        }
+        return value;
+    }
+
 
     /// <summary>
     /// Compare bit width.
@@ -6029,6 +6061,17 @@ public:
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
             return CreateVectorOperation(op, left, right);
 
+        // C integer promotion, scoped to the compile-time fold case (both operands
+        // are constants). Widening sub-int constants to i32 stops expressions over
+        // small literals (e.g. 1 << 20, 4 * 1024 * 1024) from overflowing in the
+        // literals' minimal storage width. Runtime narrow arithmetic is left alone
+        // so its result keeps the narrow type and still matches narrow return/storage.
+        if (llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right))
+        {
+            left = PromoteToInt(left);
+            right = PromoteToInt(right);
+        }
+
         // Upconvert both
         left = Upconvert(left, right);
         right = Upconvert(right, left);
@@ -6216,6 +6259,15 @@ public:
         // isFloatingPointTy() check below, so vectors must be handled before the integer switch.
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
             return CreateVectorOperation(op, left, right, leftIsUnsigned || rightIsUnsigned);
+
+        // C integer promotion (see PromoteToInt), scoped to the compile-time fold
+        // case (both operands constant) so runtime narrow arithmetic is unaffected.
+        // Signedness is preserved so unsigned narrow constants zero-extend.
+        if (llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right))
+        {
+            left  = PromoteToInt(left,  leftIsUnsigned);
+            right = PromoteToInt(right, rightIsUnsigned);
+        }
 
         left  = Upconvert(left,  right, leftIsUnsigned);
         right = Upconvert(right, left,  rightIsUnsigned);
@@ -9004,6 +9056,8 @@ public:
     }
 
     void RegisterNamespace(const std::string& name) { namespaceTable.insert(name); }
+    const std::string& GetCurrentNamespace() const { return currentNamespace_; }
+    void SetCurrentNamespace(const std::string& name) { currentNamespace_ = name; }
     void RegisterNamespaceAlias(const std::string& alias, const std::string& target) { namespaceAliasTable[alias] = target; }
     void RegisterLocalNamespaceAlias(const std::string& alias, const std::string& target)
     {
@@ -9049,6 +9103,26 @@ public:
     // by expanding namespace aliases on the leading component and then walking up parent namespaces.
     std::string ResolveQualifiedName(const std::string& name) const
     {
+        // Bare name referenced inside a namespace body: prefer an enclosing-namespace
+        // sibling (e.g. inside "N", a bare "helper" resolves to "N.helper") before
+        // falling back to a top-level/global symbol. Walk outward through parent
+        // namespaces so a nested "Outer.Inner" also sees "Outer" members. A more-local
+        // match wins; if no qualified sibling exists the bare name resolves below.
+        if (!currentNamespace_.empty() && name.find('.') == std::string::npos)
+        {
+            std::string prefix = currentNamespace_;
+            while (true)
+            {
+                std::string candidate = prefix + "." + name;
+                if (dataStructures.count(candidate) || interfaceTable.count(candidate) || functionTable.count(candidate))
+                    return candidate;
+                auto parentDot = prefix.rfind('.');
+                if (parentDot == std::string::npos)
+                    break;
+                prefix = prefix.substr(0, parentDot);
+            }
+        }
+
         if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name))
             return name;
 

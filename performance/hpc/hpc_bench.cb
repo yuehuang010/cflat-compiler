@@ -1,0 +1,129 @@
+// hpc_bench.cb - throughput benchmark for the single-threaded HPC library suite.
+// Reports GFLOP/s (or GB/s for memory-bound kernels) so the effect of -O2 and --cpu
+// targeting is visible.
+//
+// Build for best results with an explicit ISA level (AVX2 / AVX-512), e.g.:
+//   x64/Release/cflat.exe performance/hpc/hpc_bench.cb -i performance/hpc -i cflat/core \
+//       -o out/hpc_bench.exe -O2 --cpu x86-64-v3
+//   out/hpc_bench.exe
+
+import "cruntime.cb";
+import "time.cb";
+import "vecmath.cb";
+import "densemat.cb";
+import "stencil.cb";
+import "fft.cb";
+import "sparse.cb";
+
+// Report a kernel: total floating-point work (in GFLOP) over elapsed seconds.
+void report(char* name, double gflop, double secs)
+{
+    double rate = gflop / secs;
+    printf("  %-22s %8.2f ms   %8.2f GFLOP/s\n", name, secs * 1000.0, rate);
+}
+
+void report_bw(char* name, double gbytes, double secs)
+{
+    double rate = gbytes / secs;
+    printf("  %-22s %8.2f ms   %8.2f GB/s\n", name, secs * 1000.0, rate);
+}
+
+extern int main()
+{
+    Stopwatch sw;
+
+    // ---- BLAS-1: axpy (memory-bound) and dot ----
+    int n = 1 << 22;                 // ~4M doubles = 32 MB/array
+    double[] x = new double[n];
+    double[] y = new double[n];
+    Vec.fill(x, 1.0, n);
+    Vec.fill(y, 2.0, n);
+
+    int reps = 50;
+    sw.restart();
+    for (int r = 0; r < reps; r = r + 1) Vec.axpy(1.0000001, x, y, n);
+    double t = sw.elapsed().seconds();
+    // axpy: 2 flops/elem; touches 3 doubles/elem (read x, read+write y) = 24 bytes.
+    report("axpy", (double)reps * (double)n * 2.0 / 1.0e9, t);
+    report_bw("axpy (bandwidth)", (double)reps * (double)n * 24.0 / 1.0e9, t);
+
+    double acc = 0.0;
+    sw.restart();
+    for (int r = 0; r < reps; r = r + 1) acc = acc + Vec.dot(x, y, n);
+    t = sw.elapsed().seconds();
+    report("dot", (double)reps * (double)n * 2.0 / 1.0e9, t);
+    printf("    (dot checksum %.1f)\n", acc);
+    delete[_] x; delete[_] y;
+
+    // ---- BLAS-3: gemm (compute-bound, the FLOP/s showcase) ----
+    int m = 256;
+    double[] a = new double[m * m];
+    double[] b = new double[m * m];
+    double[] c = new double[m * m];
+    Vec.fill(a, 1.0, m * m);
+    Vec.fill(b, 1.0, m * m);
+    Vec.fill(c, 0.0, m * m);
+    int greps = 20;
+    sw.restart();
+    for (int r = 0; r < greps; r = r + 1) Mat.gemm(1.0, a, b, 0.0, c, m, m, m);
+    t = sw.elapsed().seconds();
+    // gemm: 2*M*K*N flops.
+    report("gemm 256x256", (double)greps * 2.0 * (double)m * (double)m * (double)m / 1.0e9, t);
+    delete[_] a; delete[_] b; delete[_] c;
+
+    // ---- stencil: 2D 5-point Jacobi ----
+    int h = 2048; int w = 2048;
+    double[] g = new double[h * w];
+    double[] g2 = new double[h * w];
+    Vec.fill(g, 1.0, h * w);
+    int sreps = 20;
+    sw.restart();
+    for (int r = 0; r < sreps; r = r + 1) Stencil.jacobi2d(g, g2, h, w);
+    t = sw.elapsed().seconds();
+    // ~4 adds + 1 mul per interior cell.
+    report("jacobi2d 2048^2", (double)sreps * 5.0 * (double)h * (double)w / 1.0e9, t);
+    delete[_] g; delete[_] g2;
+
+    // ---- FFT: radix-2 over 1M points ----
+    int fn = 1 << 20;
+    double[] fb = new double[2 * fn];
+    int i = 0;
+    while (i < fn) { fb[2 * i] = (double)(i & 255); fb[2 * i + 1] = 0.0; i = i + 1; }
+    int freps = 20;
+    sw.restart();
+    for (int r = 0; r < freps; r = r + 1) FFT.fft(fb, fn);
+    t = sw.elapsed().seconds();
+    // ~5*N*log2(N) flops for radix-2.
+    report("fft 2^20", (double)freps * 5.0 * (double)fn * 20.0 / 1.0e9, t);
+    delete[_] fb;
+
+    // ---- sparse SpMV: tridiagonal matrix, ~3M nonzeros ----
+    int sn = 1 << 20;
+    int nnz = 3 * sn - 2;
+    CsrMatrix sm;
+    sm.alloc(sn, sn, nnz);
+    int k = 0;
+    int row = 0;
+    while (row < sn)
+    {
+        sm.row_ptr[row] = k;
+        if (row > 0)      { sm.values[k] = -1.0; sm.col_index[k] = row - 1; k = k + 1; }
+        sm.values[k] = 2.0; sm.col_index[k] = row; k = k + 1;
+        if (row < sn - 1) { sm.values[k] = -1.0; sm.col_index[k] = row + 1; k = k + 1; }
+        row = row + 1;
+    }
+    sm.row_ptr[sn] = k;
+    double[] sx = new double[sn];
+    double[] sy = new double[sn];
+    Vec.fill(sx, 1.0, sn);
+    int spreps = 50;
+    sw.restart();
+    for (int r = 0; r < spreps; r = r + 1) sm.spmv(sx, sy);
+    t = sw.elapsed().seconds();
+    report("spmv tridiag 2^20", (double)spreps * 2.0 * (double)nnz / 1.0e9, t);
+    delete[_] sx; delete[_] sy;
+    sm.dispose();
+
+    printf("\nDone.\n");
+    return 0;
+}

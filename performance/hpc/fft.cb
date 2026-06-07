@@ -1,0 +1,99 @@
+// fft.cb - iterative in-place radix-2 Cooley-Tukey FFT over interleaved complex data.
+//
+// A complex array of N points is stored as a `double[]` of length 2*N: element k is
+// (re=buf[2k], im=buf[2k+1]). N must be a power of two. The transform is in place.
+//
+//   fft(buf, n)   : forward DFT  (sign -1 in the exponent)
+//   ifft(buf, n)  : inverse DFT, scaled by 1/N
+//   dft_naive     : O(N^2) reference transform, for correctness checking
+//
+// Single-threaded; the only heap use is the trig calls. Twiddles are computed on the fly
+// via sin/cos (a real library would cache them, but this keeps the kernel self-contained).
+
+import "math.cb";   // Math.sin / Math.cos (llvm.sin / llvm.cos intrinsics)
+
+namespace FFT
+{
+    double PI = 3.14159265358979323846;
+
+    // In-place bit-reversal permutation of the N complex points.
+    void bit_reverse(double[] buf, int n)
+    {
+        int j = 0;
+        for (int i = 1; i < n; i = i + 1)
+        {
+            int bit = n >> 1;
+            while ((j & bit) != 0) { j = j ^ bit; bit = bit >> 1; }
+            j = j ^ bit;
+            if (i < j)
+            {
+                int ir = 2 * i; int jr = 2 * j;
+                double tr = buf[ir]; double ti = buf[ir + 1];
+                buf[ir] = buf[jr]; buf[ir + 1] = buf[jr + 1];
+                buf[jr] = tr; buf[jr + 1] = ti;
+            }
+        }
+    }
+
+    // Shared butterfly engine. sign = -1 forward, +1 inverse.
+    void transform(double[] buf, int n, double sign)
+    {
+        bit_reverse(buf, n);
+        int len = 2;
+        while (len <= n)
+        {
+            double ang = sign * 2.0 * PI / (double)len;
+            double wr = Math.cos(ang);
+            double wi = Math.sin(ang);
+            int half = len >> 1;
+            for (int start = 0; start < n; start = start + len)
+            {
+                double cr = 1.0; double ci = 0.0;   // running twiddle w^k
+                for (int k = 0; k < half; k = k + 1)
+                {
+                    int even = 2 * (start + k);
+                    int odd = 2 * (start + k + half);
+                    double er = buf[even]; double ei = buf[even + 1];
+                    double or_ = buf[odd]; double oi = buf[odd + 1];
+                    double tr = cr * or_ - ci * oi;   // twiddle * odd
+                    double ti = cr * oi + ci * or_;
+                    buf[even] = er + tr; buf[even + 1] = ei + ti;
+                    buf[odd] = er - tr; buf[odd + 1] = ei - ti;
+                    double ncr = cr * wr - ci * wi;   // advance twiddle
+                    ci = cr * wi + ci * wr;
+                    cr = ncr;
+                }
+            }
+            len = len << 1;
+        }
+    }
+
+    void fft(double[] buf, int n) { transform(buf, n, -1.0); }
+
+    void ifft(double[] buf, int n)
+    {
+        transform(buf, n, 1.0);
+        double inv = 1.0 / (double)n;
+        int total = 2 * n;
+        vectorize for (int i = 0; i < total; i = i + 1)
+            buf[i] = buf[i] * inv;
+    }
+
+    // O(N^2) reference DFT into a separate output buffer (length 2*N). Forward transform.
+    void dft_naive(double[] src, double[] out, int n)
+    {
+        for (int kk = 0; kk < n; kk = kk + 1)
+        {
+            double sr = 0.0; double si = 0.0;
+            for (int t = 0; t < n; t = t + 1)
+            {
+                double ang = -2.0 * PI * (double)kk * (double)t / (double)n;
+                double wr = Math.cos(ang); double wi = Math.sin(ang);
+                double xr = src[2 * t]; double xi = src[2 * t + 1];
+                sr = sr + xr * wr - xi * wi;
+                si = si + xr * wi + xi * wr;
+            }
+            out[2 * kk] = sr; out[2 * kk + 1] = si;
+        }
+    }
+}

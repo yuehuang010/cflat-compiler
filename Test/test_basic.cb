@@ -286,10 +286,18 @@ namespace MathUtils
     int add(int a, int b) { return a + b; }
     int multiply(int a, int b) { return a * b; }
 
+    // Unqualified sibling call: `add` must resolve to MathUtils.add (NOT the global
+    // `add` that returns a+b+100), so addThenDouble(3,4) == (3+4)*2 == 14.
+    int addThenDouble(int a, int b) { return multiply(add(a, b), 2); }
+
     namespace Advanced
     {
         int square(int x) { return x * x; }
         int cube(int x) { return x * x * x; }
+
+        // Unqualified sibling call inside a nested namespace resolves to
+        // Advanced.square; sumOfSquares(3,4) == 9 + 16 == 25.
+        int sumOfSquares(int a, int b) { return square(a) + square(b); }
     }
 }
 
@@ -305,6 +313,10 @@ bool testNamespace()
     result &= Test("no_collision", MathUtils.add(3, 4) != add(3, 4), 1);
     result &= Test("global_using_add", Math.add(3, 4), 7);              // global alias resolves to MathUtils.add
     result &= Test("global_using_multiply", Math.multiply(3, 4), 12);   // global alias resolves to MathUtils.multiply
+    // Unqualified sibling call inside the namespace must resolve to the namespace
+    // member (more-local wins over the global `add`): (3+4)*2 = 14, not (3+4+100)*2.
+    result &= Test("sibling_call", MathUtils.addThenDouble(3, 4), 14);
+    result &= Test("nested_sibling_call", MathUtils.Advanced.sumOfSquares(3, 4), 25); // 9+16=25
     return result;
 }
 
@@ -1984,6 +1996,7 @@ extern int main()
     total++; passed += testArrayDefaultInit()            ? 1 : 0;
     total++; passed += testArrayFieldInit()              ? 1 : 0;
     total++; passed += testAlignas()                     ? 1 : 0;
+    total++; passed += testConstFold()                   ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -2720,6 +2733,43 @@ bool testAlignas()
     AlignCL* p = new AlignCL;
     result &= Test("new AlignCL%64", (int)(((i64)p) & 63), 0);
     delete p;
+
+    return result;
+}
+
+// =============================================================
+// Compile-time constant folding (C integer promotion)
+// =============================================================
+// Regression: small integer literals are stored at their minimal width (1 is i8),
+// so binary folding used to overflow in that width - (i8)1 << 20 folded to 0 and
+// (i8)100 << 1 to -56. C integer promotion now widens sub-int operands to i32
+// before the fold. Runtime forms were always correct; only compile-time literal
+// folding was affected.
+bool testConstFold()
+{
+    bool result = true;
+
+    // Shifts that overflow the i8 source width.
+    result &= Test("1 << 8",    1 << 8,    256);
+    result &= Test("1 << 20",   1 << 20,   1048576);
+    result &= Test("100 << 1",  100 << 1,  200);
+
+    // Chained multiply that overflows i16 (4*1024 fits i16, *1024 overflows it).
+    result &= Test("4*1024*1024", 4 * 1024 * 1024, 4194304);
+    result &= Test("2*1000*1000", 2 * 1000 * 1000, 2000000);
+
+    // Add/subtract that exceed the narrow width.
+    result &= Test("100 + 100",  100 + 100,  200);
+    result &= Test("200 + 100",  200 + 100,  300);
+
+    // Folded literal must match the runtime form computed from int variables.
+    int one = 1;
+    int sh  = 20;
+    result &= Test("fold==runtime shift", 1 << 20, one << sh);
+
+    int a = 4;
+    int k = 1024;
+    result &= Test("fold==runtime mul", 4 * 1024 * 1024, a * k * k);
 
     return result;
 }

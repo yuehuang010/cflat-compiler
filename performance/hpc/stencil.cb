@@ -1,0 +1,70 @@
+// stencil.cb - structured-grid stencil kernels (the heart of finite-difference PDE
+// solvers and image filters). All out-of-place: src and dst are distinct noalias views,
+// so the interior sweep vectorizes at -O2.
+//
+//   jacobi1d  : dst[i] = (src[i-1] + src[i+1]) * 0.5            (3-point average)
+//   laplace1d : dst[i] = src[i-1] - 2*src[i] + src[i+1]         (1D Laplacian)
+//   jacobi2d  : 5-point average smoother on an (h x w) grid
+//   boxblur2d : 3x3 box blur on an (h x w) grid
+//
+// Boundary cells are copied through unchanged (Dirichlet-style halo); only the interior
+// is updated. The caller owns both buffers and tracks dimensions.
+
+namespace Stencil
+{
+    // 3-point Jacobi average over a 1D line of n cells. Endpoints copied through.
+    void jacobi1d(double[] src, double[] dst, int n)
+    {
+        if (n == 0) return;
+        dst[0] = src[0];
+        if (n > 1) dst[n - 1] = src[n - 1];
+        vectorize for (int i = 1; i < n - 1; i = i + 1)
+            dst[i] = (src[i - 1] + src[i + 1]) * 0.5;
+    }
+
+    // 1D Laplacian: dst[i] = src[i-1] - 2*src[i] + src[i+1]. Endpoints set to 0.
+    void laplace1d(double[] src, double[] dst, int n)
+    {
+        if (n == 0) return;
+        dst[0] = 0.0;
+        if (n > 1) dst[n - 1] = 0.0;
+        vectorize for (int i = 1; i < n - 1; i = i + 1)
+            dst[i] = src[i - 1] - 2.0 * src[i] + src[i + 1];
+    }
+
+    // 5-point Jacobi smoother on a row-major (h x w) grid. Border copied through.
+    void jacobi2d(double[] src, double[] dst, int h, int w)
+    {
+        // Copy the full border first, then overwrite the interior.
+        for (int x = 0; x < w; x = x + 1) { dst[x] = src[x]; dst[(h - 1) * w + x] = src[(h - 1) * w + x]; }
+        for (int y = 0; y < h; y = y + 1) { dst[y * w] = src[y * w]; dst[y * w + w - 1] = src[y * w + w - 1]; }
+
+        for (int y = 1; y < h - 1; y = y + 1)
+        {
+            int row = y * w;
+            int up = row - w;
+            int down = row + w;
+            vectorize for (int x = 1; x < w - 1; x = x + 1)
+                dst[row + x] = (src[up + x] + src[down + x] + src[row + x - 1] + src[row + x + 1]) * 0.25;
+        }
+    }
+
+    // 3x3 box blur on a row-major (h x w) grid. Border copied through.
+    void boxblur2d(double[] src, double[] dst, int h, int w)
+    {
+        for (int x = 0; x < w; x = x + 1) { dst[x] = src[x]; dst[(h - 1) * w + x] = src[(h - 1) * w + x]; }
+        for (int y = 0; y < h; y = y + 1) { dst[y * w] = src[y * w]; dst[y * w + w - 1] = src[y * w + w - 1]; }
+
+        double inv9 = 1.0 / 9.0;
+        for (int y = 1; y < h - 1; y = y + 1)
+        {
+            int row = y * w;
+            int up = row - w;
+            int down = row + w;
+            vectorize for (int x = 1; x < w - 1; x = x + 1)
+                dst[row + x] = (src[up + x - 1] + src[up + x] + src[up + x + 1] +
+                                src[row + x - 1] + src[row + x] + src[row + x + 1] +
+                                src[down + x - 1] + src[down + x] + src[down + x + 1]) * inv9;
+        }
+    }
+}
