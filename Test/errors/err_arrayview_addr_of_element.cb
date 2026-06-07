@@ -1,0 +1,6 @@
+// Taking the address of a view element (&a[i]) yields a raw `int*` - a borrow of one slot,
+// never a whole-allocation view. Binding it back into a `T[]` would forge an offset view that
+// overlaps the original (breaking "distinct base => disjoint"), so it must be rejected.
+expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+    int firstAddr(int[] a) { int[] v = &a[0]; return v[0]; }
+}

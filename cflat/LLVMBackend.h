@@ -223,6 +223,13 @@ public:
         bool IsSimd = false;
         uint64_t SimdLanes = 0;
 
+        // Thin `int[]` array-view: an `int*` representation (Pointer is also set) carrying a
+        // noalias contract. Distinct `int[]` values point at distinct WHOLE allocations
+        // (pointer arithmetic and the `int* -> int[]` cast are both forbidden, so an offset
+        // sub-view is unconstructible). Drives: LLVM noalias on params, the arithmetic ban,
+        // distinct mangling, and `int[] -> int*` implicit decay. See doc/LANGUAGE.md.
+        bool IsArrayView = false;
+
         // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
         // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
@@ -340,6 +347,12 @@ public:
 
             std::string type = TypeName;
 
+            if (IsArrayView)
+            {
+                // Distinct from a bare pointer so `f(int[])` and `f(int*)` are separate overloads.
+                return (TypeName == "void" ? std::string("U8") : type) + "Arr";
+            }
+
             if (Pointer)
             {
                 // Note: LLVM doesn't have void ptr, instead use i8 ptr.
@@ -448,6 +461,7 @@ public:
         llvm::Value* value      = nullptr;
         bool         isUnsigned = false;
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
+        bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -632,6 +646,7 @@ public:
     bool lastCallReturnsOwned = false;       // set when the last call returned an owned heap string or pointer
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
+    bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
@@ -1212,7 +1227,7 @@ private:
         }
     }
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false)
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false)
     {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -1231,6 +1246,7 @@ private:
         stackState.isFunction = true;
         stackState.functionName = friendlyName;
         currentFunctionReturnsOwned = returnsOwned;
+        currentFunctionReturnIsArrayView = returnIsArrayView;
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
@@ -6783,7 +6799,22 @@ public:
         else if (isCdecl)
             fn->setCallingConv(llvm::CallingConv::C);
 
-        createFunctionBlock(fn, functionName, arguments, returnsOwned);
+        // Thin `int[]` array-view params carry a noalias contract (distinct views point at
+        // distinct whole allocations). Stamp LLVM noalias so the loop vectorizer can drop its
+        // runtime alias check. Native params map 1:1 to fn args (no sret/byval reordering);
+        // skipped for extern C, where pointers alias freely.
+        if (!external)
+        {
+            unsigned ai = 0;
+            for (const auto& a : arguments)
+            {
+                if (a.IsArrayView && ai < fn->arg_size())
+                    fn->addParamAttr(ai, llvm::Attribute::NoAlias);
+                ++ai;
+            }
+        }
+
+        createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView);
 
         if (diBuilder && diFile && line > 0)
         {
@@ -7522,6 +7553,18 @@ public:
             // param, which for printf is 'ptr %fmt' - causing all variadic args to be
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
+
+            // Array-view parameter gate: a raw `T*` must not bind to a `T[]` parameter - that
+            // would forge the noalias contract the view promises (a whole, distinct allocation).
+            // Placed before the binding branches because an array-view param has Pointer=true and
+            // is handled by the pointer-parameter branch below. The reverse (`T[] -> T*` decay)
+            // is always safe; a view argument carries IsArrayView and passes.
+            if (!inVariadicRange && candParamItr->IsArrayView
+                && arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView)
+                LogError(std::format(
+                    "cannot pass a raw pointer 'T*' as array-view parameter '{}' ('T[]') - a view "
+                    "must span a whole allocation (it comes only from 'new T[n]' or another 'T[]'); "
+                    "the 'T[] -> T*' decay is one-way", candParamItr->VariableName));
 
             if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
             {
@@ -9177,6 +9220,7 @@ public:
         if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
         if (!tv.ConstInnerDimensions.empty()) j["idims"] = tv.ConstInnerDimensions;
         if (tv.IsSimd) { j["sd"] = true; j["sdl"] = tv.SimdLanes; }
+        if (tv.IsArrayView) j["av"] = true;
         if (tv.IsFunctionPointer)
         {
             j["fp"]  = true;
@@ -9208,6 +9252,7 @@ public:
         if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].get<std::vector<uint64_t>>();
         tv.IsSimd   = j.value("sd",  false);
         tv.SimdLanes = j.value("sdl", uint64_t{0});
+        tv.IsArrayView = j.value("av", false);
         tv.IsFunctionPointer = j.value("fp", false);
         if (tv.IsFunctionPointer)
         {

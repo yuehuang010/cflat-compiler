@@ -12,10 +12,15 @@ The two features are complementary halves of the within-core (SIMD) parallelism 
 - **`simd<T,N>`** - write the vector values yourself for a *guaranteed* result. The
   escape hatch for when auto-vectorization can't or won't fire.
 
+A third feature, the **`T[]` array-view**, removes the *reason* a `vectorize` loop most
+often needs a runtime guard: pointer aliasing. It is the canonical fix a vectorization
+failure points you toward.
+
 ## Table of Contents
 
 - [`vectorize` loops](#vectorize-loops)
 - [`simd<T,N>` explicit vector type](#simdtn-explicit-vector-type)
+- [`T[]` array-view (noalias)](#t-array-view-noalias)
 
 **Related:** [Threading & Memory Management](threading.md) (affinity, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
 
@@ -92,3 +97,62 @@ simd<i32, 4> q = p * p;        // 25 per lane
 - It is a **primitive value**, not a struct or array - no ownership, destructor, or `move`
   interaction. (Comparisons, lane writes, shuffles, and load/store against `T[]` are not yet
   supported.)
+
+## `T[]` array-view (noalias)
+
+`T[]` (empty brackets) is a distinct type from `T*`: a **thin array-view**. It has the
+exact same representation as a pointer - just `T*` under the hood, no length is carried -
+but it adds a **noalias contract**: distinct `T[]` values point at distinct, *whole*
+allocations.
+
+```c
+// Two views are provably disjoint -> each is noalias -> the loop vectorizes at -O2
+// with NO runtime alias check (no loop versioning, no scalar fallback).
+void axpy(int[] y, int[] x, int n, int k)
+{
+    int i = 0;
+    while (i < n) { y[i] = y[i] + k * x[i]; i = i + 1; }
+}
+
+int[] a = new int[n];   // `new T[n]` yields a view: a fresh, whole, distinct allocation
+int[] b = new int[n];
+axpy(a, b, n, 2);
+```
+
+Contrast with C, where `int[]` as a parameter silently decays to `int*` (same type, no
+guarantee). CFlat makes the distinction real: `int[]` is the *stronger* type you opt into
+by spelling, and `int*` stays the raw, may-alias, arithmetic-capable C pointer. Migrate a
+hot kernel to `int[]` deliberately; existing `int*` code is never reinterpreted.
+
+Rules:
+
+- **noalias by spelling.** Writing `int[]` emits LLVM `noalias` on that parameter, so the
+  loop vectorizer drops the runtime overlap check it would otherwise insert for `int*`
+  (see the *runtime alias checks* note under `vectorize`). This is the headline win.
+- **No pointer arithmetic.** `a + i`, `a++`, `a--` are compile errors on a view - index it
+  with `a[i]` instead. This is what makes the noalias contract *provable* rather than
+  trusted: with no arithmetic (and no `int* -> int[]` conversion), a view can only ever
+  span a whole allocation, so two views alias if and only if they share a base pointer.
+- **One-way conversion, enforced.** Decay `T[] -> T*` is implicit and always safe (it drops
+  the guarantee). The reverse - binding a raw `T*` into a `T[]` - is a **compile error** at
+  every binding site: declaration-init (`int[] a = p;`), re-assignment (`a = p;`), struct
+  field store (`s.view = p;`), passing to a `T[]` parameter (`f(p)`), and `return p;` from a
+  `T[]`-returning function. A view therefore comes *only* from `new T[n]`, another `T[]`, or a
+  copy of one - which is what makes "two views alias iff they share a base pointer" provable.
+- **Usable as a struct field.** A container can hold a noalias buffer as an `int[]` field:
+  store it from `new T[n]` at construction, read it back as a view, and pass it to kernels.
+  The store gate guarantees the field can only ever hold a whole-allocation view, so reads
+  are sound by construction.
+- **You track the length yourself.** A view is thin - it carries no length. Pass the count
+  alongside (the C/BLAS convention), keeping the dependency visible in the signature.
+
+> Not yet supported / deliberately excluded:
+> - **Sub-slicing (`a[i:j]`)** is omitted - it would manufacture offset views that overlap,
+>   reopening the aliasing problem that the whole-allocation invariant closes.
+> - **`T[]` as a generic type argument** (`list<int[]>`) does not parse - `int[]` is a
+>   parameter/local/field type, not a container element type (use `int*`).
+> - `&a[i]` yields a raw `int*` (a borrow of one element), and the one-way rule applies to
+>   it too: it is usable as an `int*` but cannot be bound back into a `T[]`, so it cannot
+>   forge an offset view.
+> - One escape hatch remains by design, the same category as Fortran `EQUIVALENCE`: a
+>   `union { int* p; int[] v; }` can type-pun a raw pointer into a view.

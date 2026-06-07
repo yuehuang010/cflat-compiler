@@ -1,0 +1,319 @@
+// HPC feature tests: the thin `int[]` array-view (noalias) type and the explicit
+// `simd<T,N>` vector type. Both are within-core (SIMD) primitives - see doc/HPC.md.
+//
+// Array-view section: `int[]` parameters, obtaining a view from `new T[n]`, element
+// read/write via indexing `a[i]`, two-view BLAS-style kernels (the noalias case),
+// `int[] -> int*` decay, and an `int[]` struct field. Compiled by test.bat at -O0 where
+// the view is a plain pointer; the noalias attribute it emits is verified at -O2.
+//
+// simd section: splat construction, element-wise + - * /, mixed scalar/vector operands,
+// all power-of-two lane counts, the full numeric element-type set, and lane reads.
+// Seeded from argc (= 1 with no args) so the vector ops execute at runtime rather than
+// constant-folding away.
+
+import "cruntime.cb";
+import "test_helper.cb";
+
+// ---------------------------------------------------------------------------
+// int[] array-view kernels
+// ---------------------------------------------------------------------------
+
+// Single-view kernel: fill each element. Indexing is the only allowed access.
+void fill(int[] a, int n, int base)
+{
+    int i = 0;
+    while (i < n) { a[i] = base + i; i = i + 1; }
+}
+
+// Single-view reduction.
+int sumv(int[] a, int n)
+{
+    int s = 0;
+    int i = 0;
+    while (i < n) { s = s + a[i]; i = i + 1; }
+    return s;
+}
+
+// Two-view kernel (the BLAS pattern): y and x are provably distinct allocations, so each
+// carries noalias and the loop vectorizes without a runtime alias check at -O2.
+void axpy(int[] y, int[] x, int n, int k)
+{
+    int i = 0;
+    while (i < n) { y[i] = y[i] + k * x[i]; i = i + 1; }
+}
+
+// `int[]` decays implicitly to `int*` when passed to a pointer parameter.
+int sumPtr(int* a, int n)
+{
+    int s = 0;
+    int i = 0;
+    while (i < n) { s = s + a[i]; i = i + 1; }
+    return s;
+}
+
+// A container holding a noalias buffer as an `int[]` field. The field is sourced from
+// `new T[n]` (a view), read back as a view, indexed, and passed to view kernels - the
+// store gate guarantees the field can only ever hold a whole-allocation view.
+struct Matrix { int[] data; int n; };
+
+// A class (not just struct) with an `int[]` field AND methods. This is the case the
+// grammar fix targets: a field whose type carries empty brackets (`int[]`) must be
+// disambiguated from a method definition (both begin with declaration-specifiers). The
+// methods read the field back as a view - by index and by passing it to a free kernel.
+class Vec
+{
+    int[] data;
+    int n;
+    int at(int i) { return data[i]; }       // field read, indexed
+    int total() { return sumv(data, n); }   // field read passed to a view kernel
+};
+
+// A nested struct that itself carries an `int[]` field, to confirm the grammar fix holds
+// for aggregates declared inside another aggregate's body.
+struct Outer
+{
+    struct Buf { int[] cells; int len; };
+    Buf buf;
+    int tag;
+};
+
+// Returns a fresh view: `new T[n]` is a blessed view source, so a `T[]` return is legal.
+int[] makeRange(int n, int base)
+{
+    int[] r = new int[n];
+    fill(r, n, base);
+    return r;
+}
+
+// Returns its view parameter unchanged - view flows out through a `T[]` return.
+int[] passthru(int[] a) { return a; }
+
+// ---------------------------------------------------------------------------
+// simd<T,N> vector ops
+// ---------------------------------------------------------------------------
+
+int testFloatArithmetic(int seed)
+{
+    int passed = 0;
+    float s = (float)seed;            // 1.0
+
+    simd<float, 8> a = s + 1.0;       // 2.0 per lane (splat)
+    simd<float, 8> b = 3.0;           // 3.0 per lane
+    simd<float, 8> mul = a * b;       // 6.0
+    simd<float, 8> add = mul + a;     // 8.0
+    simd<float, 8> sub = add - b;     // 5.0
+    simd<float, 8> div = sub / a;     // 2.5
+
+    passed += Test("simd float mul", mul[0], 6.0f);
+    passed += Test("simd float add lane7", add[7], 8.0f);
+    passed += Test("simd float sub lane3", sub[3], 5.0f);
+    passed += Test("simd float div", div[0], 2.5f);
+    return passed;
+}
+
+int testMixedScalarVector(int seed)
+{
+    int passed = 0;
+    simd<float, 4> a = (float)seed;   // 1.0
+    simd<float, 4> b = a * 2.0;        // vector * scalar -> 2.0
+    simd<float, 4> c = 10.0 - a;       // scalar - vector -> 9.0
+    simd<float, 4> d = 12.0 / a;       // scalar / vector -> 12.0
+    simd<float, 4> e = a + 4.0;        // vector + scalar -> 5.0
+
+    passed += Test("simd vector*scalar", b[0], 2.0f);
+    passed += Test("simd scalar-vector", c[3], 9.0f);
+    passed += Test("simd scalar/vector", d[1], 12.0f);
+    passed += Test("simd vector+scalar", e[2], 5.0f);
+    return passed;
+}
+
+int testIntegerSimd(int seed)
+{
+    int passed = 0;
+    simd<i32, 4> p = seed + 4;        // 5
+    simd<i32, 4> sq = p * p;          // 25
+    simd<i32, 4> df = sq - p;         // 20
+    simd<i32, 4> sm = sq + p;         // 30
+    simd<i32, 4> dv = sq / p;         // 5 (signed divide)
+
+    passed += Test("simd i32 mul", sq[1], 25);
+    passed += Test("simd i32 sub", df[2], 20);
+    passed += Test("simd i32 add", sm[0], 30);
+    passed += Test("simd i32 sdiv", dv[3], 5);
+    return passed;
+}
+
+int testUnsignedSimd(int seed)
+{
+    int passed = 0;
+    simd<u32, 4> u = (u32)(seed * 100); // 100
+    simd<u32, 4> w = u / 8;             // 12 (unsigned divide)
+
+    passed += Test("simd u32 udiv", (int)w[2], 12);
+    return passed;
+}
+
+// All four power-of-two lane counts compile, lower, and execute. Read the first,
+// a middle, and the last lane of each to confirm the lane indexing spans the width.
+int testLaneCounts(int seed)
+{
+    int passed = 0;
+    int v = seed + 6;                  // 7
+
+    simd<i32, 2>  c2  = v;
+    simd<i32, 16> c16 = v;
+    simd<i32, 32> c32 = v;
+    simd<i32, 64> c64 = v;
+
+    simd<i32, 2>  d2  = c2  * c2;       // 49
+    simd<i32, 16> d16 = c16 + c16;      // 14
+    simd<i32, 32> d32 = c32 - c32;      // 0
+    simd<i32, 64> d64 = c64 * c64;      // 49
+
+    passed += Test("simd N=2 lane0",   d2[0],   49);
+    passed += Test("simd N=2 lane1",   d2[1],   49);
+    passed += Test("simd N=16 lane15", d16[15], 14);
+    passed += Test("simd N=32 lane16", d32[16], 0);
+    passed += Test("simd N=64 lane63", d64[63], 49);
+    return passed;
+}
+
+// Every numeric element type: signed/unsigned 8/16/32/64-bit ints plus float/double.
+// Small operands keep the narrow integer lanes inside range.
+int testElementTypes(int seed)
+{
+    int passed = 0;
+
+    simd<i8,  8> i8v  = (i8)(seed + 2);   // 3   -> *3 = 9
+    simd<i16, 8> i16v = (i16)(seed + 9);  // 10  -> *10 = 100
+    simd<i64, 4> i64v = (i64)(seed + 99); // 100 -> *100 = 10000
+    simd<u8,  8> u8v  = (u8)(seed + 4);   // 5   -> *5 = 25
+    simd<u16, 8> u16v = (u16)(seed + 20); // 21  -> *21 = 441
+    simd<u64, 4> u64v = (u64)(seed + 999);// 1000 -> /4 = 250
+    simd<double, 4> dv = (double)seed;    // 1.0 -> +0.5 then *3 = 4.5
+
+    simd<i8,  8> i8r  = i8v  * i8v;        // 9
+    simd<i16, 8> i16r = i16v * i16v;       // 100
+    simd<i64, 4> i64r = i64v * i64v;       // 10000
+    simd<u8,  8> u8r  = u8v  * u8v;         // 25
+    simd<u16, 8> u16r = u16v * u16v;       // 441
+    simd<u64, 4> u64r = u64v / 4;          // 250
+    simd<double, 4> dr = (dv + 0.5) * 3.0; // 4.5
+
+    passed += Test("simd i8 mul",    (int)i8r[0],   9);
+    passed += Test("simd i16 mul",   (int)i16r[7],  100);
+    passed += Test("simd i64 mul",   i64r[2],       (i64)10000);
+    passed += Test("simd u8 mul",    (int)u8r[3],   25);
+    passed += Test("simd u16 mul",   (int)u16r[4],  441);
+    passed += Test("simd u64 udiv",  u64r[1],       (i64)250);
+    passed += Test("simd double op", (float)dr[3],  4.5f);
+    return passed;
+}
+
+// Several vectors of the same shape interacting in one expression, and a chain of
+// dependent vector temporaries, to confirm values flow correctly across operations.
+int testMultiVar(int seed)
+{
+    int passed = 0;
+    simd<float, 4> a = (float)seed;        // 1.0
+    simd<float, 4> b = a + 1.0;            // 2.0
+    simd<float, 4> c = b + 1.0;            // 3.0
+    simd<float, 4> r = (a + b) * c - a;    // (1+2)*3 - 1 = 8.0
+
+    passed += Test("simd multivar lane0", r[0], 8.0f);
+    passed += Test("simd multivar lane3", r[3], 8.0f);
+    return passed;
+}
+
+extern int main(int argc, char** argv)
+{
+    int passed = 0;
+    int total  = 0;
+
+    // ---- simd<T,N> ----
+    int seed = argc;   // 1 with no args
+
+    passed += testFloatArithmetic(seed);   total += 4;
+    passed += testMixedScalarVector(seed); total += 4;
+    passed += testIntegerSimd(seed);       total += 4;
+    passed += testUnsignedSimd(seed);      total += 1;
+    passed += testLaneCounts(seed);        total += 5;
+    passed += testElementTypes(seed);      total += 7;
+    passed += testMultiVar(seed);          total += 2;
+
+    // ---- int[] array-view ----
+    int n = argc + 7;   // 8 with no args
+
+    int[] a = new int[n];        // blessed: a fresh, whole, distinct allocation
+    fill(a, n, 10);              // a = {10, 11, ..., 17}
+
+    passed += Test("arrayview read first", a[0], 10);   total += 1;
+    passed += Test("arrayview read last",  a[n - 1], 17); total += 1;
+    passed += Test("arrayview sum", sumv(a, n), 108);   total += 1;  // 10+11+...+17
+
+    int[] b = new int[n];
+    fill(b, n, 1);               // b = {1, 2, ..., 8}
+    axpy(a, b, n, 2);            // a[i] += 2 * b[i]  ->  {12, 15, 18, 21, 24, 27, 30, 33}
+
+    passed += Test("arrayview axpy first", a[0], 12);   total += 1;
+    passed += Test("arrayview axpy last",  a[n - 1], 33); total += 1;
+    passed += Test("arrayview axpy sum", sumv(a, n), 180); total += 1; // 108 + 2*36
+
+    passed += Test("arrayview decays to int*", sumPtr(b, n), 36); total += 1; // 1+2+...+8
+
+    // Struct `int[]` field: store a view from new[], read it back, index it, and pass the
+    // field read to a view kernel (the field-read carries the array-view contract).
+    Matrix m;
+    m.n = n;
+    m.data = new int[n];                       // view -> view field store (allowed)
+    fill(m.data, n, 100);                      // field-read view passed to a kernel
+    passed += Test("arrayview field index", m.data[2], 102); total += 1;
+    passed += Test("arrayview field sum", sumv(m.data, n), 828); total += 1; // 8*100 + (0+..+7)
+
+    int* mp = move m.data; delete[_] mp;       // extract the field's buffer to delete it
+
+    // view -> view binds must NOT be rejected: a copy and a reassignment between views.
+    int[] c = a;                 // decl-init copy: aliases a's buffer (never owns)
+    passed += Test("arrayview view copy", c[0], 12); total += 1;
+    int[] e = a;
+    e = b;                       // reassign view <- view: now aliases b (never owned)
+    passed += Test("arrayview view reassign", e[0], 1); total += 1;
+
+    // functions may return a view (from new[] or a passed-through view parameter).
+    int[] f = makeRange(n, 50);  // owns a fresh buffer {50, 51, ..., 57}
+    passed += Test("arrayview returned view", f[0], 50); total += 1;
+    int[] g = passthru(f);       // g aliases f
+    passed += Test("arrayview passthru view", g[3], 53); total += 1;
+    int* fp = move f; delete[_] fp;
+
+    // class with an int[] field AND methods - the grammar disambiguation case.
+    Vec vv;
+    vv.n = n;
+    vv.data = new int[n];
+    fill(vv.data, n, 200);       // {200, ..., 207}
+    passed += Test("arrayview class field at", vv.at(1), 201); total += 1;
+    passed += Test("arrayview class field total", vv.total(), 1628); total += 1; // 200*8 + 28
+    int* vp = move vv.data; delete[_] vp;
+
+    // &a[i] yields a raw int* (a borrow of one element) - it is usable as an int*, but it
+    // cannot be bound back into a T[] (that would forge an offset view; see err_arrayview_*).
+    int[] h = new int[4];
+    h[2] = 9;
+    int* hp = &h[2];
+    passed += Test("arrayview addr-of element as int*", hp[0], 9); total += 1;
+    int* hq = move h; delete[_] hq;
+
+    // nested aggregate carrying an int[] field.
+    Outer o;
+    o.buf.len = n;
+    o.buf.cells = new int[n];
+    fill(o.buf.cells, n, 300);   // {300, ..., 307}
+    passed += Test("arrayview nested field", o.buf.cells[5], 305); total += 1;
+    int* op = move o.buf.cells; delete[_] op;
+
+    delete[_] a;
+    delete[_] b;
+
+    printf("\n%d / %d HPC tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

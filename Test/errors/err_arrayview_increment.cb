@@ -1,0 +1,5 @@
+// `++` / `--` are banned on a thin `int[]` array-view - it has no pointer arithmetic.
+
+expect_error("'++' is not allowed on an array-view") {
+    void advance(int[] a) { a++; }
+}

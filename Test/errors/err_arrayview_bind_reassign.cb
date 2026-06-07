@@ -1,0 +1,4 @@
+// Re-assigning a raw `int*` into an existing `int[]` is the same laundering door.
+expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+    void f(int* p) { int[] a = new int[4]; a = p; }
+}

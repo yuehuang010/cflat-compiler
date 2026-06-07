@@ -1,0 +1,4 @@
+// Binding a raw `int*` into an `int[]` at declaration-init forges the noalias contract.
+expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+    void f(int* p) { int[] a = p; a[0] = 1; }
+}

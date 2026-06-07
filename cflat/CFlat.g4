@@ -232,7 +232,7 @@ declarationSpecifier
     ;
 
 arrayDimSpec
-    : ('[' assignmentExpression ']')+
+    : ('[' assignmentExpression? ']')+   // empty brackets `T[]` = thin noalias array-view; sized `T[N]` = fixed array
     ;
 
 initDeclaratorList
@@ -694,12 +694,27 @@ functionDefinition
     ;
 
 structDefinition
-    : 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
-    | 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    : 'struct' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
+    | 'union' alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? '{' aggregateMember* '}' ';'
     ;
 
 classDefinition
-    : Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' (declaration | functionDefinition | destructorDefinition | structDefinition | classDefinition | lockFieldGroup)* '}' ';'
+    : Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' aggregateMember* '}' ';'
+    ;
+
+// A struct/class body member. Extracted into a named rule (rather than an inline
+// `(declaration | functionDefinition | ...)*` closure) so ANTLR's adaptive prediction
+// gets the same full-context decision it uses for `externalDeclaration+` at file scope.
+// The inline closure could not disambiguate a field whose type carries an empty-bracket
+// arrayDimSpec (the `int[]` array-view) from a `functionDefinition`, since both begin
+// with `declarationSpecifiers`; the named rule resolves it.
+aggregateMember
+    : declaration
+    | functionDefinition
+    | destructorDefinition
+    | structDefinition
+    | classDefinition
+    | lockFieldGroup
     ;
 
 lockFieldGroup

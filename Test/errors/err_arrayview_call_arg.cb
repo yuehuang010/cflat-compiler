@@ -1,0 +1,5 @@
+// Passing a raw `int*` to an `int[]` parameter forges the noalias contract at the call site.
+expect_error("cannot pass a raw pointer 'T*' as array-view parameter") {
+    void kernel(int[] a, int n) { a[0] = 1; }
+    void f(int* p) { kernel(p, 4); }
+}

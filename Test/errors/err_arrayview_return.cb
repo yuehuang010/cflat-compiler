@@ -1,0 +1,4 @@
+// Returning a raw `int*` as an `int[]` return type forges a view from an aliasing pointer.
+expect_error("cannot return a raw pointer 'T*' as an array-view 'T[]'") {
+    int[] forge(int* p) { return p; }
+}

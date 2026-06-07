@@ -103,6 +103,61 @@ static std::string MangleTypeArg(const std::string& typeName)
     return result;
 }
 
+// Struct/class bodies parse through the named `aggregateMember` rule (see CFlat.g4), so the
+// per-kind children (declarations, methods, ...) are nested one level under aggregateMember
+// rather than being direct children of the struct/class context. These helpers flatten an
+// aggregate's members back into the per-kind vectors the listener expects, preserving source
+// order. Templated on the context type so they serve both StructDefinitionContext and
+// ClassDefinitionContext (both expose aggregateMember()).
+template <typename TCtx>
+static std::vector<CFlatParser::DeclarationContext*> MemberDeclarations(TCtx* ctx)
+{
+    std::vector<CFlatParser::DeclarationContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* d = m->declaration()) out.push_back(d);
+    return out;
+}
+template <typename TCtx>
+static std::vector<CFlatParser::FunctionDefinitionContext*> MemberFunctionDefinitions(TCtx* ctx)
+{
+    std::vector<CFlatParser::FunctionDefinitionContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* f = m->functionDefinition()) out.push_back(f);
+    return out;
+}
+template <typename TCtx>
+static std::vector<CFlatParser::DestructorDefinitionContext*> MemberDestructorDefinitions(TCtx* ctx)
+{
+    std::vector<CFlatParser::DestructorDefinitionContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* d = m->destructorDefinition()) out.push_back(d);
+    return out;
+}
+template <typename TCtx>
+static std::vector<CFlatParser::StructDefinitionContext*> MemberStructDefinitions(TCtx* ctx)
+{
+    std::vector<CFlatParser::StructDefinitionContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* s = m->structDefinition()) out.push_back(s);
+    return out;
+}
+template <typename TCtx>
+static std::vector<CFlatParser::ClassDefinitionContext*> MemberClassDefinitions(TCtx* ctx)
+{
+    std::vector<CFlatParser::ClassDefinitionContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* c = m->classDefinition()) out.push_back(c);
+    return out;
+}
+template <typename TCtx>
+static std::vector<CFlatParser::LockFieldGroupContext*> MemberLockFieldGroups(TCtx* ctx)
+{
+    std::vector<CFlatParser::LockFieldGroupContext*> out;
+    for (auto* m : ctx->aggregateMember())
+        if (auto* l = m->lockFieldGroup()) out.push_back(l);
+    return out;
+}
+
 // simd<T,N>: validate the lane count N. It must be a plain power-of-2 integer literal in [2,64]
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
 // silently waste a lane is rejected rather than padded). Returns true and sets lanesOut on
@@ -429,6 +484,13 @@ private:
                     declType.ArraySize = dims.empty() ? nullptr : dims[0];
                     for (size_t di = 1; di < dims.size(); di++)
                         declType.ExtraArrayDims.push_back(dims[di]);
+                    if (dims.empty())
+                    {
+                        // `T[]` (empty brackets) = thin noalias array-view: an `int*` repr
+                        // (Pointer) carrying a noalias contract, distinct from a fixed array.
+                        declType.IsArrayView = true;
+                        declType.Pointer = true;
+                    }
                 }
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
@@ -702,7 +764,7 @@ private:
                 s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                             keyword + " " + typeName, {}, doc);
-                for (auto* func : ctx->functionDefinition())
+                for (auto* func : MemberFunctionDefinitions(ctx))
                 {
                     std::string funcName = getFunctionName(func);
                     if (funcName == typeName || funcName.empty()) continue;
@@ -744,7 +806,7 @@ private:
         compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
         // Pre-declare member functions (and detect constructor overloads)
-        for (auto func : ctx->functionDefinition())
+        for (auto func : MemberFunctionDefinitions(ctx))
         {
             if (getFunctionName(func) == typeName)
             {
@@ -761,7 +823,7 @@ private:
         }
 
         // Pre-declare destructor
-        for (auto dtor : ctx->destructorDefinition())
+        for (auto dtor : MemberDestructorDefinitions(ctx))
         {
             LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = typeName;
@@ -772,13 +834,13 @@ private:
         }
 
         // Recursively pre-declare nested struct/class definitions
-        for (auto* nestedStruct : ctx->structDefinition())
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
             ScanStructDefinition(nestedStruct, typeName);
-        for (auto* nestedClass : ctx->classDefinition())
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
             ScanClassDefinition(nestedClass, typeName);
 
         // Pre-declare functions inside positional lock groups and mark their RequiredLocks.
-        for (auto* lfg : ctx->lockFieldGroup())
+        for (auto* lfg : MemberLockFieldGroups(ctx))
         {
             auto groupArgs = lfg->lockClause()->lockArgList()->expression();
             if (groupArgs.empty()) continue;
@@ -1573,6 +1635,13 @@ private:
                     declType.ArraySize = dims.empty() ? nullptr : dims[0];
                     for (size_t di = 1; di < dims.size(); di++)
                         declType.ExtraArrayDims.push_back(dims[di]);
+                    if (dims.empty())
+                    {
+                        // `T[]` (empty brackets) = thin noalias array-view: an `int*` repr
+                        // (Pointer) carrying a noalias contract, distinct from a fixed array.
+                        declType.IsArrayView = true;
+                        declType.Pointer = true;
+                    }
                 }
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
@@ -2686,6 +2755,13 @@ public:
                         LLVMBackend::NamedVariable returnNV;
                         if (assignExpr != nullptr)
                             returnNV = ParseAssignmentExpressionNamed(assignExpr);
+                        // Returning a raw `T*` as a `T[]` return type would forge the noalias
+                        // contract (a view must span a whole allocation). Decay T[]->T* is fine.
+                        if (compiler->currentFunctionReturnIsArrayView
+                            && returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsArrayView)
+                            LogErrorContext(jump, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
+                                "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
+                                "the 'T[] -> T*' decay is one-way");
                         auto right = LoadNamedVariable(returnNV);
                         ProcessPlusPlus();
 
@@ -4260,6 +4336,8 @@ public:
                                 srcOwningName = rightNV.CallerName;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
+                                // int[] v = rawIntPtr; is the laundering door - reject it.
+                                RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV.TypeAndValue);
                             }
                             lambdaExpectedType = {};
                             // Implicit char* -> string coercion: string s = "hello" or string s = charPtr.
@@ -4644,6 +4722,28 @@ public:
         }
     }
 
+    // Soundness gate for the thin int[] array-view: reject binding a raw `T*` into a `T[]`.
+    // A view carries a noalias contract - it always spans a whole, distinct allocation - which
+    // lets the -O2 vectorizer drop its runtime alias check. A raw `T*` may alias or point
+    // partway into a buffer (it has pointer arithmetic), so laundering one into a view would
+    // forge that contract and silently miscompile. The safe direction (T[] -> T* decay) is
+    // always allowed; view -> view and `new T[n]` -> view are allowed (RHS is itself a view).
+    // Returns true (and logs) when the bind is rejected. `target` is the declared type of the
+    // assignment/parameter/return slot; `rhs` is the value being bound into it.
+    bool RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& target,
+                                     const LLVMBackend::TypeAndValue& rhs)
+    {
+        if (target.IsArrayView && rhs.Pointer && !rhs.IsArrayView)
+        {
+            LogErrorContext(ctx, "cannot bind a raw pointer 'T*' to an array-view 'T[]' - a view "
+                "must span a whole allocation (it comes only from 'new T[n]' or another 'T[]'); "
+                "the 'T[] -> T*' decay is one-way");
+            return true;
+        }
+        return false;
+    }
+
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -4768,6 +4868,10 @@ public:
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
             lambdaExpectedType = {};
+            // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
+            // would launder a raw pointer into the noalias contract - reject (decay is one-way).
+            if (operatorText == "=")
+                RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV.TypeAndValue);
             // An assignment to an existing variable (not a declaration) does not transfer
             // ownership - consuming lastOwningResult here would be wrong (the new-allocated
             // value is either moved via items.add(move p) or managed by the caller).
@@ -6000,6 +6104,9 @@ public:
                     && rvalue && rvalue->getType()->isIntegerTy()
                     && (op == "+" || op == "-"))
                 {
+                    if (lv.isArrayView || rv.isArrayView)
+                        LogErrorContext(ctx, "pointer arithmetic is not allowed on an array-view 'T[]' - index it with 'a[i]' instead "
+                            "(the view spans a whole allocation; arithmetic would create an aliasing pointer the noalias contract forbids)");
                     // Pointer arithmetic: ptr + int / ptr - int -> GEP
                     if (op == "-")
                         rvalue = Compiler(ctx)->builder->CreateNeg(rvalue, "neg");
@@ -6306,6 +6413,7 @@ public:
             }
             LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
             result.elemType = elemType;
+            result.isArrayView = namedVar.TypeAndValue.IsArrayView;
             return result;
         }
         else if (nextCtxs.size() > 1)
@@ -6621,6 +6729,17 @@ public:
 
                 namedVar.Primary = namedVar.Storage;
                 namedVar.Storage = nullptr;
+                // The address of an element (e.g. &a[i]) is a raw pointer to one slot, never a
+                // whole-allocation array-view. Clear the flag so it cannot bind back into a `T[]`
+                // (which would forge an offset view that overlaps the original - the escape hatch
+                // the noalias contract must keep one-way). Mark a scalar operand's address as a
+                // pointer so the array-view bind gate sees `&a[i]` as the raw `int*` it is.
+                namedVar.TypeAndValue.IsArrayView = false;
+                if (!namedVar.TypeAndValue.Pointer)
+                    namedVar.TypeAndValue.Pointer = true;
+                // The address of an element borrows, it does not own - clear IsOwning so taking
+                // `&a[i]` does not move/consume the owning buffer `a` it points into.
+                namedVar.IsOwning = false;
             }
             else if (opText == "*")
             {
@@ -7166,6 +7285,9 @@ public:
         LLVMBackend::NamedVariable result;
         result.TypeAndValue.TypeName = typeName;
         result.TypeAndValue.Pointer = true;
+        // `new T[n]` yields a thin array-view: a fresh, whole, distinct allocation - the blessed
+        // way to obtain an `int[]`. Decays implicitly to `T*` when stored into a pointer lvalue.
+        result.TypeAndValue.IsArrayView = isArray;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
         compiler->lastOwningResult = true;
@@ -7629,6 +7751,8 @@ public:
                     }
                     case CFlatParser::PlusPlus:
                     {
+                        if (namedVar.TypeAndValue.IsArrayView)
+                            LogErrorContext(ctx, "'++' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         if (namedVar.Storage)
                         {
                             llvm::Type* et = nullptr;
@@ -7645,6 +7769,8 @@ public:
                     }
                     case CFlatParser::MinusMinus:
                     {
+                        if (namedVar.TypeAndValue.IsArrayView)
+                            LogErrorContext(ctx, "'--' is not allowed on an array-view 'T[]' - it has no pointer arithmetic; index it with 'a[i]' instead");
                         if (namedVar.Storage)
                         {
                             llvm::Type* et = nullptr;
@@ -8186,6 +8312,9 @@ public:
                         {
                             // Indexing through a pointer (e.g. char* p; p[i]).
                             auto elementTypeAndValue = namedVar.TypeAndValue;
+                            // An indexed element is a single slot, never a whole-allocation view -
+                            // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
+                            elementTypeAndValue.IsArrayView = false;
                             if (elementTypeAndValue.ElemPointer)
                             {
                                 // Double-pointer (e.g. T* where T=Employee*): element type is T* (Employee*).
@@ -9551,6 +9680,10 @@ public:
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    // Propagate the array-view flag so a `T[]` argument is still seen
+                                    // as a view at the call site (otherwise the noalias gate would
+                                    // false-reject a legitimate view passed to a `T[]` parameter).
+                                    argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondedSources = argNV.BondedSources;
@@ -11147,15 +11280,15 @@ public:
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
         // Process nested struct/class definitions before fields so their types are available
-        for (auto* nestedStruct : ctx->structDefinition())
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
             ParseStructDefinition(nestedStruct, {}, structName);
-        for (auto* nestedClass : ctx->classDefinition())
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
             ParseClassDefinition(nestedClass, {}, structName);
 
         // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
         structScopeStack.push_back(structName);
 
-        auto declarationList = ctx->declaration();
+        auto declarationList = MemberDeclarations(ctx);
         std::vector<llvm::Type*> types;
 
         // Queue and instantiate generic types used in field declarations before
@@ -11218,7 +11351,7 @@ public:
 
         // Process lock field groups: each group annotates its fields with GuardedBy,
         // and registers member functions with the group's lock as a RequiredLock.
-        for (auto* lfg : ctx->lockFieldGroup())
+        for (auto* lfg : MemberLockFieldGroups(ctx))
         {
             // Also queue generic types used inside the group.
             if (activeTypeSubstitutions.empty() && activePackSubstitutions.empty())
@@ -11287,7 +11420,7 @@ public:
         // instantiations) BEFORE the dependency flush below, so a sibling
         // instantiation pulled in by the flush can resolve calls back into this
         // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
-        auto functionList = ctx->functionDefinition();
+        auto functionList = MemberFunctionDefinitions(ctx);
         if (!nameOverride.empty())
             PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
         // Flush any nested generic instantiations queued while parsing field declarations,
@@ -11300,7 +11433,7 @@ public:
         // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
         // ParseConstructorDefinition will handle it later in the member function loop.
         bool hasExplicitNoArgCtor = !isUnion && [&]() {
-            for (auto* f : ctx->functionDefinition())
+            for (auto* f : MemberFunctionDefinitions(ctx))
                 if (getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
@@ -11439,7 +11572,7 @@ public:
         // Member function signatures were pre-declared above (before the flush).
 
         // Pre-register destructor so 'delete' inside static methods can call it.
-        if (!ctx->destructorDefinition().empty())
+        if (!MemberDestructorDefinitions(ctx).empty())
         {
             if (auto* dtorFn = compiler->GetFunction("~" + structName))
                 compiler->RegisterDestructor(structName, dtorFn);
@@ -11483,7 +11616,7 @@ public:
         // Parse functions declared inside positional lock groups.
         {
             bool savedScope = global_scope;
-            for (auto* lfg : ctx->lockFieldGroup())
+            for (auto* lfg : MemberLockFieldGroups(ctx))
             {
                 for (auto* func : lfg->functionDefinition())
                 {
@@ -11497,7 +11630,7 @@ public:
         // Parse destructor
         {
             bool savedScope = global_scope;
-            for (auto dtor : ctx->destructorDefinition())
+            for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
                 ParseDestructorDefinition(dtor, structName);
@@ -13318,15 +13451,15 @@ public:
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
 
         // Process nested struct/class definitions before fields so their types are available
-        for (auto* nestedStruct : ctx->structDefinition())
+        for (auto* nestedStruct : MemberStructDefinitions(ctx))
             ParseStructDefinition(nestedStruct, {}, structName);
-        for (auto* nestedClass : ctx->classDefinition())
+        for (auto* nestedClass : MemberClassDefinitions(ctx))
             ParseClassDefinition(nestedClass, {}, structName);
 
         // Push scope so unqualified nested type names resolve (e.g. Inner -> Outer.Inner)
         structScopeStack.push_back(structName);
 
-        auto declarationList = ctx->declaration();
+        auto declarationList = MemberDeclarations(ctx);
         std::vector<llvm::Type*> types;
 
         // Queue and instantiate generic types used in field declarations before
@@ -13388,7 +13521,7 @@ public:
         }
 
         // Process lock field groups: each group annotates its fields with GuardedBy.
-        for (auto* lfg : ctx->lockFieldGroup())
+        for (auto* lfg : MemberLockFieldGroups(ctx))
         {
             if (activeTypeSubstitutions.empty() && activePackSubstitutions.empty())
                 ScanAndQueueGenericTypeUses(lfg);
@@ -13431,7 +13564,7 @@ public:
         // instantiations) BEFORE the dependency flush below, so a sibling
         // instantiation pulled in by the flush can resolve calls back into this
         // type's methods to a forward declaration. See PreDeclareInstantiationMembers.
-        auto functionList = ctx->functionDefinition();
+        auto functionList = MemberFunctionDefinitions(ctx);
         if (!nameOverride.empty())
             PreDeclareInstantiationMembers(compiler, functionList, baseName, structName, returnType);
         // Flush any nested generic instantiations queued while parsing field declarations,
@@ -13443,7 +13576,7 @@ public:
         }
         // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
         bool hasExplicitNoArgCtor = [&]() {
-            for (auto* f : ctx->functionDefinition())
+            for (auto* f : MemberFunctionDefinitions(ctx))
                 if (getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
@@ -13548,7 +13681,7 @@ public:
         // Member function signatures were pre-declared above (before the flush).
 
         // Pre-register destructor so 'delete' inside static methods can call it.
-        if (!ctx->destructorDefinition().empty())
+        if (!MemberDestructorDefinitions(ctx).empty())
         {
             if (auto* dtorFn = compiler->GetFunction("~" + structName))
                 compiler->RegisterDestructor(structName, dtorFn);
@@ -13644,7 +13777,7 @@ public:
         // Parse functions declared inside positional lock groups.
         {
             bool savedScope = global_scope;
-            for (auto* lfg : ctx->lockFieldGroup())
+            for (auto* lfg : MemberLockFieldGroups(ctx))
             {
                 for (auto* func : lfg->functionDefinition())
                 {
@@ -13658,7 +13791,7 @@ public:
         // Parse destructor
         {
             bool savedScope = global_scope;
-            for (auto dtor : ctx->destructorDefinition())
+            for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
                 ParseDestructorDefinition(dtor, structName);

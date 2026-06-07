@@ -1,0 +1,6 @@
+// Pointer arithmetic is banned on a thin `int[]` array-view (it would create an aliasing
+// pointer into the noalias buffer). Indexing `a[i]` is the only allowed access.
+
+expect_error("pointer arithmetic is not allowed on an array-view") {
+    int firstOf(int[] a) { int* p = a + 1; return p[0]; }
+}

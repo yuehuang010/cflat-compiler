@@ -1,0 +1,6 @@
+// Storing a raw `int*` into an `int[]` struct field would let later reads hand out a
+// "view" that never spanned a whole allocation - reject at the field store.
+struct V { int[] view; int n; };
+expect_error("cannot bind a raw pointer 'T*' to an array-view 'T[]'") {
+    void f(int* p) { V v; v.view = p; }
+}
