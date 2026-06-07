@@ -22,3 +22,24 @@ echo === Benchmark (hpc_bench, --cpu %CPU%) ===
 "%CFLAT%" performance\hpc\hpc_bench.cb -i performance\hpc -i cflat\core -o out\hpc\hpc_bench.exe -O2 --cpu %CPU%
 if errorlevel 1 exit /b 1
 out\hpc\hpc_bench.exe
+if errorlevel 1 exit /b 1
+
+echo.
+echo === Solvers (CG + Jacobi over CSR) ===
+"%CFLAT%" performance\hpc\solvers.cb -i performance\hpc -i cflat\core -o out\hpc\solvers.exe -O2 --cpu %CPU%
+if errorlevel 1 exit /b 1
+out\hpc\solvers.exe
+if errorlevel 1 exit /b 1
+
+echo.
+echo === Dense factorization (Cholesky + LU) ===
+"%CFLAT%" performance\hpc\factor.cb -i performance\hpc -i cflat\core -o out\hpc\factor.exe -O2 --cpu %CPU%
+if errorlevel 1 exit /b 1
+out\hpc\factor.exe
+if errorlevel 1 exit /b 1
+
+echo.
+echo === Black-Scholes (closed-form + Monte-Carlo) ===
+"%CFLAT%" performance\hpc\montecarlo.cb -i performance\hpc -i cflat\core -o out\hpc\montecarlo.exe -O2 --cpu %CPU%
+if errorlevel 1 exit /b 1
+out\hpc\montecarlo.exe

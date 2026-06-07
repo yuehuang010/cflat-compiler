@@ -1,0 +1,212 @@
+// solvers.cb - iterative sparse linear solvers built by composing the existing
+// HPC libraries: CSR SpMV from sparse.cb plus the BLAS-1 kernels from vecmath.cb.
+//
+// Design notes (customer perspective):
+//   - The solvers do NOT reimplement any kernel: every matrix-vector product is
+//     CsrMatrix.spmv, and every vector op (axpy/scal/dot/nrm2/copy/fill) is a
+//     Vec.* call. The solver is pure orchestration - exactly how a real Krylov
+//     library is layered on top of BLAS + a sparse format.
+//   - All scratch vectors are allocated once up front (new double[n]) and reused
+//     across iterations, so the iteration loop itself is allocation-free.
+//   - Test system: the 1D Poisson / Laplacian operator (tridiagonal, 2 on the
+//     diagonal, -1 on the off-diagonals). It is symmetric positive definite, the
+//     canonical CG test problem. We pick a known x, form b = A*x, solve, and
+//     check the recovered x against the known answer plus the residual ||Ax-b||.
+
+import "cruntime.cb";   // printf
+import "math.cb";       // Math.sqrt
+import "vecmath.cb";    // Vec.axpy / scal / dot / nrm2 / copy / fill
+import "sparse.cb";     // CsrMatrix + spmv
+
+// Build the n x n 1D Laplacian in CSR: tridiagonal [-1, 2, -1].
+// Row 0 and row n-1 have 2 nonzeros, interior rows have 3. nnz = 3n - 2.
+void build_laplacian1d(CsrMatrix* a, int n)
+{
+    int nnz = 3 * n - 2;
+    a->alloc(n, n, nnz);
+
+    int k = 0;            // running index into values/col_index
+    a->row_ptr[0] = 0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        if (i > 0)
+        {
+            a->values[k] = -1.0; a->col_index[k] = i - 1; k = k + 1;
+        }
+        a->values[k] = 2.0; a->col_index[k] = i; k = k + 1;
+        if (i < n - 1)
+        {
+            a->values[k] = -1.0; a->col_index[k] = i + 1; k = k + 1;
+        }
+        a->row_ptr[i + 1] = k;
+    }
+}
+
+// Conjugate Gradient for a symmetric-positive-definite A.
+// Solves A*x = b in place on x (x must be preset to an initial guess, e.g. 0).
+// Returns the iteration count; writes the final residual norm to *out_res.
+int cg_solve(CsrMatrix* a, double[] b, double[] x, int n,
+             double tol, int maxiter, double* out_res)
+{
+    double[] r  = new double[n];   // residual  r = b - A x
+    double[] p  = new double[n];   // search direction
+    double[] ap = new double[n];   // A * p
+
+    // r = b - A x ; with x0 = 0 this is just b, but compute generally.
+    a->spmv(x, ap);                       // ap = A x0
+    Vec.copy(b, r, n);                    // r = b
+    Vec.axpy(-1.0, ap, r, n);            // r = b - A x0
+
+    Vec.copy(r, p, n);                    // p = r
+    double rsold = Vec.dot(r, r, n);
+
+    int iter = 0;
+    double resnorm = Math.sqrt(rsold);
+    while (iter < maxiter && resnorm > tol)
+    {
+        a->spmv(p, ap);                          // ap = A p
+        double pAp = Vec.dot(p, ap, n);
+        double alpha = rsold / pAp;
+
+        Vec.axpy(alpha, p, x, n);               // x += alpha p
+        Vec.axpy(-alpha, ap, r, n);             // r -= alpha A p
+
+        double rsnew = Vec.dot(r, r, n);
+        resnorm = Math.sqrt(rsnew);
+
+        double beta = rsnew / rsold;
+        Vec.scal(beta, p, n);                    // p *= beta
+        Vec.axpy(1.0, r, p, n);                 // p += r   -> p = r + beta p
+        rsold = rsnew;
+        iter = iter + 1;
+    }
+
+    out_res[0] = resnorm;
+    delete[_] r; delete[_] p; delete[_] ap;
+    return iter;
+}
+
+// Jacobi iteration: x_new[i] = (b[i] - sum_{j!=i} A[i][j] x[j]) / A[i][i].
+// Converges for diagonally dominant / SPD-with-care systems; the 1D Laplacian is
+// weakly diagonally dominant so Jacobi converges slowly but monotonically.
+int jacobi_solve(CsrMatrix* a, double[] b, double[] x, int n,
+                 double tol, int maxiter, double* out_res)
+{
+    double[] xnew = new double[n];
+    double[] ax   = new double[n];   // for residual check
+
+    int iter = 0;
+    double resnorm = tol + 1.0;
+    while (iter < maxiter && resnorm > tol)
+    {
+        for (int i = 0; i < n; i = i + 1)
+        {
+            double diag = 0.0;
+            double sigma = 0.0;
+            int start = a->row_ptr[i];
+            int end = a->row_ptr[i + 1];
+            for (int k = start; k < end; k = k + 1)
+            {
+                int j = a->col_index[k];
+                if (j == i) diag = a->values[k];
+                else        sigma = sigma + a->values[k] * x[j];
+            }
+            xnew[i] = (b[i] - sigma) / diag;
+        }
+        Vec.copy(xnew, x, n);
+
+        // residual ||A x - b||
+        a->spmv(x, ax);
+        Vec.axpy(-1.0, b, ax, n);     // ax = A x - b
+        resnorm = Vec.nrm2(ax, n);
+        iter = iter + 1;
+    }
+
+    out_res[0] = resnorm;
+    delete[_] xnew; delete[_] ax;
+    return iter;
+}
+
+int g_pass = 0;
+int g_total = 0;
+
+void check(char* name, double got, double want, double tol)
+{
+    g_total = g_total + 1;
+    double d = got - want;
+    if (d < 0.0) d = -d;
+    if (d < tol) { g_pass = g_pass + 1; printf("  ok   %-26s = %.8f\n", name, got); }
+    else         { printf("  FAIL %-26s got %.8f want %.8f\n", name, got, want); }
+}
+
+extern int main()
+{
+    printf("=== CFlat iterative sparse solvers (CG + Jacobi) ===\n\n");
+
+    int n = 64;
+    CsrMatrix a;
+    build_laplacian1d(&a, n);
+
+    // Known solution. NOTE: a single sine mode sin(pi*k*(i+1)/(n+1)) is an exact
+    // eigenvector of the 1D Laplacian, which makes CG converge in a single step
+    // (b becomes lambda*x). To actually exercise multi-iteration CG we use a
+    // ramp-plus-bump, which is a broad mix of eigenmodes.
+    double[] xexact = new double[n];
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double t = (double)(i + 1) / (double)(n + 1);
+        xexact[i] = t * (1.0 - t) + 0.3 * t;   // not a single eigenmode
+    }
+
+    // b = A * x_exact
+    double[] b = new double[n];
+    a.spmv(xexact, b);
+
+    // ---- Conjugate Gradient ----
+    printf("[CG]\n");
+    double[] x = new double[n];
+    Vec.fill(x, 0.0, n);
+    double res = 0.0;
+    int iters = cg_solve(&a, b, x, n, 0.000000001, 1000, &res);
+    printf("  CG converged in %d iterations, residual = %.3e\n", iters, res);
+
+    // verify recovered x matches the known analytic answer
+    double maxerr = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double e = x[i] - xexact[i];
+        if (e < 0.0) e = -e;
+        if (e > maxerr) maxerr = e;
+    }
+    check("CG max |x - x_exact|", maxerr, 0.0, 0.000001);
+    check("CG final residual",    res,    0.0, 0.00001);
+    // CG on an SPD n x n system converges exactly within n steps in theory.
+    if (iters <= n) { g_pass = g_pass + 1; printf("  ok   %-26s = %d (<= %d)\n", "CG iters bounded by n", iters, n); }
+    else            { printf("  FAIL CG iters %d > n %d\n", iters, n); }
+    g_total = g_total + 1;
+
+    // ---- Jacobi ----
+    printf("[Jacobi]\n");
+    double[] xj = new double[n];
+    Vec.fill(xj, 0.0, n);
+    double resj = 0.0;
+    int itersj = jacobi_solve(&a, b, xj, n, 0.0001, 20000, &resj);
+    printf("  Jacobi stopped after %d iterations, residual = %.3e\n", itersj, resj);
+
+    double maxerrj = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double e = xj[i] - xexact[i];
+        if (e < 0.0) e = -e;
+        if (e > maxerrj) maxerrj = e;
+    }
+    check("Jacobi residual < tol", resj, 0.0, 0.0001);
+    // Jacobi converges much more slowly; just require it got reasonably close.
+    check("Jacobi max |x - x_exact|", maxerrj, 0.0, 0.01);
+
+    delete[_] xexact; delete[_] b; delete[_] x; delete[_] xj;
+    a.dispose();
+
+    printf("\n%d / %d checks passed.\n", g_pass, g_total);
+    return g_pass == g_total ? 0 : 1;
+}

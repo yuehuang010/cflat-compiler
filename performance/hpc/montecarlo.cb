@@ -1,0 +1,186 @@
+// montecarlo.cb - Black-Scholes option pricing: closed-form vs Monte-Carlo.
+//
+// Two ways to price a European call:
+//   1. The closed-form Black-Scholes formula, applied as a VECTORIZED element-wise
+//      map over an array of spot prices (one option per lane). It needs exp/log/
+//      sqrt (from Math.*) and the normal CDF, which we build from an erf
+//      approximation - itself made branchless so the whole map vectorizes at -O2.
+//   2. A Monte-Carlo estimate: simulate many terminal prices under the risk-neutral
+//      GBM, average the discounted payoff, and watch it converge to the closed form.
+//
+// Design notes (customer perspective):
+//   - The closed-form batch is a pure element-wise map over double[] spots, so it is
+//     a `vectorize for` (the noalias array-views let it vectorize with no alias
+//     check). erf is written branchlessly (sign via select, not a control branch)
+//     specifically so the contract is satisfiable.
+//   - The Monte-Carlo path uses the splitmix64-style Random from random.cb and
+//     Box-Muller for normal draws; its hot loop is an FP reduction (averaging the
+//     payoff) so it stays scalar, same convention as the reduction kernels.
+
+import "cruntime.cb";   // printf
+import "math.cb";       // Math.exp / log / sqrt / PI
+import "random.cb";     // Random (splitmix64)
+
+// Abramowitz & Stegun 7.1.26 erf approximation (~1e-7 abs error), branchless:
+// erf is odd, so erf(x) = sign(x) * erf(|x|); the sign and |x| are selects, not
+// branches, which keeps the enclosing map vectorizable.
+double erf_approx(double x)
+{
+    double s = x < 0.0 ? -1.0 : 1.0;
+    double ax = x < 0.0 ? -x : x;
+    double t = 1.0 / (1.0 + 0.3275911 * ax);
+    double poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
+                    - 0.284496736) * t + 0.254829592) * t;
+    double y = 1.0 - poly * Math.exp(-ax * ax);
+    return s * y;
+}
+
+// Standard normal CDF: N(x) = 0.5 * (1 + erf(x / sqrt(2))).
+double norm_cdf(double x)
+{
+    return 0.5 * (1.0 + erf_approx(x * 0.70710678118654752440));   // 1/sqrt(2)
+}
+
+// Scalar closed-form Black-Scholes European call price.
+double bs_call(double spot, double strike, double r, double sigma, double tau)
+{
+    double srt = sigma * Math.sqrt(tau);
+    double d1 = (Math.log(spot / strike) + (r + 0.5 * sigma * sigma) * tau) / srt;
+    double d2 = d1 - srt;
+    return spot * norm_cdf(d1) - strike * Math.exp(-r * tau) * norm_cdf(d2);
+}
+
+// Closed-form Black-Scholes European put price (for completeness / put-call parity).
+double bs_put(double spot, double strike, double r, double sigma, double tau)
+{
+    double srt = sigma * Math.sqrt(tau);
+    double d1 = (Math.log(spot / strike) + (r + 0.5 * sigma * sigma) * tau) / srt;
+    double d2 = d1 - srt;
+    return strike * Math.exp(-r * tau) * norm_cdf(-d2) - spot * norm_cdf(-d1);
+}
+
+// VECTORIZED batch: price one call per spot in S[], all sharing K/r/sigma/tau.
+// Pure element-wise map over disjoint double[] views -> vectorizes at -O2.
+void bs_call_batch(double[] spot, double[] out, int n,
+                   double strike, double r, double sigma, double tau)
+{
+    double srt = sigma * Math.sqrt(tau);
+    double half_var = 0.5 * sigma * sigma;
+    double disc = strike * Math.exp(-r * tau);
+    double inv_srt = 1.0 / srt;
+    vectorize for (int i = 0; i < n; i = i + 1)
+    {
+        double d1 = (Math.log(spot[i] / strike) + (r + half_var) * tau) * inv_srt;
+        double d2 = d1 - srt;
+        out[i] = spot[i] * norm_cdf(d1) - disc * norm_cdf(d2);
+    }
+}
+
+// Monte-Carlo price of a single European call under risk-neutral GBM:
+//   S_T = S0 * exp((r - 0.5 sigma^2) tau + sigma sqrt(tau) Z),  Z ~ N(0,1)
+//   price = exp(-r tau) * mean(max(S_T - K, 0))
+// Z drawn via Box-Muller from two uniforms. FP reduction -> scalar loop.
+double mc_call(double spot, double strike, double r, double sigma, double tau,
+               int paths, Random* rng)
+{
+    double drift = (r - 0.5 * sigma * sigma) * tau;
+    double vol = sigma * Math.sqrt(tau);
+    double sum = 0.0;
+    int i = 0;
+    while (i < paths)
+    {
+        double u1 = rng->nextDouble();
+        double u2 = rng->nextDouble();
+        if (u1 < 0.0000000001) u1 = 0.0000000001;   // guard log(0)
+        double z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI() * u2);
+        double st = spot * Math.exp(drift + vol * z);
+        double payoff = st - strike;
+        if (payoff < 0.0) payoff = 0.0;
+        sum = sum + payoff;
+        i = i + 1;
+    }
+    return Math.exp(-r * tau) * (sum / (double)paths);
+}
+
+int g_pass = 0;
+int g_total = 0;
+
+void expect(char* name, bool cond)
+{
+    g_total = g_total + 1;
+    if (cond) { g_pass = g_pass + 1; printf("  ok   %s\n", name); }
+    else      { printf("  FAIL %s\n", name); }
+}
+
+extern int main()
+{
+    printf("=== CFlat Black-Scholes: closed-form vs Monte-Carlo ===\n\n");
+
+    double r = 0.05;
+    double sigma = 0.2;
+    double tau = 1.0;
+    double strike = 100.0;
+
+    // ---- Vectorized closed-form batch over a range of spot prices ----
+    printf("[closed-form batch]\n");
+    int n = 9;
+    double[] spot = new double[n];
+    double[] price = new double[n];
+    for (int i = 0; i < n; i = i + 1) spot[i] = 60.0 + (double)i * 10.0;   // 60..140
+    bs_call_batch(spot, price, n, strike, r, sigma, tau);
+    for (int i = 0; i < n; i = i + 1)
+        printf("  S=%6.1f  call=%8.4f\n", spot[i], price[i]);
+
+    // Sanity: the batch must match the scalar formula exactly (same code path).
+    double maxdiff = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double d = price[i] - bs_call(spot[i], strike, r, sigma, tau);
+        if (d < 0.0) d = -d;
+        if (d > maxdiff) maxdiff = d;
+    }
+    expect("batch matches scalar closed-form", maxdiff < 0.0000001);
+
+    // Monotonic in spot (a call is worth more as the underlying rises).
+    bool mono = true;
+    for (int i = 1; i < n; i = i + 1) if (price[i] <= price[i - 1]) mono = false;
+    expect("call price increases with spot", mono);
+
+    // Deep ITM (S=140) call ~ S - K*exp(-r tau) (intrinsic + tiny time value).
+    double intrinsic = 140.0 - strike * Math.exp(-r * tau);
+    expect("deep-ITM call near forward intrinsic", price[8] > intrinsic);
+
+    // ---- Monte-Carlo convergence toward the closed form (at the money) ----
+    printf("\n[Monte-Carlo, S=K=100]\n");
+    double exact = bs_call(100.0, strike, r, sigma, tau);
+    printf("  closed-form call = %.6f\n", exact);
+
+    Random rng;
+    rng.seed(123456789);
+
+    // Error should shrink roughly as 1/sqrt(paths); just require the largest run
+    // lands within a small tolerance and is closer than the smallest run.
+    double err_small = 0.0;
+    double err_large = 0.0;
+    int paths = 10000;
+    int run = 0;
+    while (run < 3)
+    {
+        double mc = mc_call(100.0, strike, r, sigma, tau, paths, &rng);
+        double err = mc - exact;
+        if (err < 0.0) err = -err;
+        printf("  paths=%8d  MC=%.6f  abs err=%.6f\n", paths, mc, err);
+        if (run == 0) err_small = err;
+        err_large = err;
+        paths = paths * 10;
+        run = run + 1;
+    }
+
+    expect("MC (1e6 paths) within 0.05 of closed form", err_large < 0.05);
+    expect("MC error shrinks with more paths", err_large < err_small);
+
+    delete[_] spot; delete[_] price;
+
+    printf("\n%d / %d checks passed.\n", g_pass, g_total);
+    return g_pass == g_total ? 0 : 1;
+}

@@ -196,6 +196,25 @@ s.num1 = 10;
 int t = s.Total();   // 12
 ```
 
+#### Member access: `.` and `->`
+
+Use `.` on a value and `->` on a pointer. Both reach **fields and methods** - `->`
+dispatches a method through a pointer exactly as `.` does on a value:
+
+```c
+MyStruct  s = MyStruct();
+MyStruct* p = &s;
+
+int a = s.Total();    // value: dot
+int b = p->Total();   // pointer: arrow - same method, dispatched through p
+p->num1 = 10;         // field through a pointer
+```
+
+`->` is kept as a deliberate convenience for porting C code; it is not required (CFlat could
+infer member access from the operand type), but it lets C/C++ source move over unchanged. It
+is the natural spelling once a kernel passes large aggregates by pointer - e.g. a
+`CsrMatrix* a` argument calling `a->spmv(x, y, n)`.
+
 
 ### Enums
 

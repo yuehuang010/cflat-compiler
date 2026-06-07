@@ -145,6 +145,16 @@ Rules:
   are sound by construction.
 - **You track the length yourself.** A view is thin - it carries no length. Pass the count
   alongside (the C/BLAS convention), keeping the dependency visible in the signature.
+- **Allocate with `new T[n]`, free with `delete[_]`.** A view allocated by `new T[n]` is
+  released with the array-delete form `delete[_] a;` - note the underscore (`delete[_]`, not
+  `delete[]`). The plain `delete a;` form is for a single `new T`, not for an `new T[n]`
+  buffer. Free each view exactly once when the kernel is done with it:
+
+  ```c
+  double[] a = new double[n];
+  // ... use a in kernels ...
+  delete[_] a;   // array-delete; underscore is part of the token
+  ```
 
 > Not yet supported / deliberately excluded:
 > - **Sub-slicing (`a[i:j]`)** is omitted - it would manufacture offset views that overlap,
