@@ -248,6 +248,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Captured for clang C compiles (imports run during parse, before EmitExecutable).
     cOptLevel_ = args.getOptimizationLevel();
     cDebugInfo_ = debugInfo;
+    // Cross-thread sharing scan level (--xthread-scan N, N in 1..3); 0 = silent default.
+    // Threads through --check too since that path also calls Compile(args, file).
+    xthreadScanLevel_ = args.getXthreadScanLevel();
     // C library bindings: header search dirs, prebuilt import libraries, and defines.
     cIncludeDirs_ = args.getMultiOption("c-include");
     for (const auto& lib : args.getMultiOption("c-lib"))
@@ -523,6 +526,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
         }
+
+        // Cross-thread sharing scan (--xthread-scan N): a read-only pre-pass that records
+        // the struct types escaping across a thread-spawn boundary, so the codegen walk can
+        // report non-atomic, non-guarded field accesses of those types. Silent at level 0.
+        ScanCrossThreadEscapes(computeUnit);
 
         if (verbose) std::cout << "[verbose] code-gen walk (" << sourceFileName << ")\n";
         {
@@ -1602,6 +1610,10 @@ void LLVMBackend::ResetForReanalysis()
     lastCallRequiredLocks.clear();
     lastCallParameterNames.clear();
     vectorizeLoops_.clear();
+    // Cross-thread sharing scan: per-file escaped-type set and report dedupe set.
+    // The configured scan LEVEL is intentionally preserved across files in a batch.
+    threadSharedTypes_.clear();  // re-derived per top-level file by ScanCrossThreadEscapes
+    xthreadReported_.clear();
 
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
     // on the next Analyze() call.
@@ -1617,6 +1629,229 @@ void LLVMBackend::ResetForReanalysis()
     // string.cb references 'string' as a return type before the struct is parsed,
     // so it must exist before any core file is compiled.
     RegisterBuiltinString();
+}
+
+// ---- Cross-thread sharing diagnostic (--xthread-scan N) pre-pass ----
+//
+// Collects the set of struct TYPES whose instances escape to a spawned thread, so the
+// two field-access reporting sites in MainListener can flag non-atomic/non-guarded
+// shared fields. This is a deliberately lightweight, syntactic pre-pass: it resolves
+// a context argument back to a local/parameter declaration to learn its struct type.
+namespace {
+
+// Recursively gather every parse-tree node of context type T under `node`.
+template <class T>
+void CollectContexts(antlr4::tree::ParseTree* node, std::vector<T*>& out)
+{
+    if (auto* t = dynamic_cast<T*>(node))
+        out.push_back(t);
+    for (auto* child : node->children)
+        CollectContexts<T>(child, out);
+}
+
+// Pull the (typeName, isPointer) out of a declarationSpecifiers, skipping the
+// soft-keyword/qualifier specifiers that are not the actual type.
+void XtDeclTypeInfo(CFlatParser::DeclarationSpecifiersContext* ds, std::string& typeName, bool& isPointer)
+{
+    typeName.clear();
+    isPointer = false;
+    if (!ds) return;
+    for (auto* d : ds->declarationSpecifier())
+    {
+        if (auto* ts = d->typeSpecifier())
+        {
+            std::string t = ts->getText();
+            if (t == "move" || t == "bond" || t == "const")
+                continue;  // not the type
+            if (typeName.empty())
+                typeName = t;
+        }
+        if (d->pointer())
+            isPointer = true;
+    }
+}
+
+// Name bound by a directDeclarator (handles the parenthesized form).
+std::string XtDirectDeclName(CFlatParser::DirectDeclaratorContext* dd)
+{
+    if (!dd) return "";
+    if (dd->Identifier()) return dd->Identifier()->getText();
+    if (dd->Move()) return "move";
+    if (dd->declarator() && dd->declarator()->directDeclarator())
+        return XtDirectDeclName(dd->declarator()->directDeclarator());
+    return "";
+}
+
+// From the raw text of a context argument, recover the referenced identifier and
+// whether it was an address-of (&x) and/or a move handoff. Strips leading casts.
+void XtParseCtxArg(const std::string& raw, std::string& ident, bool& addressOf, bool& isMove)
+{
+    ident.clear();
+    addressOf = false;
+    isMove = false;
+    std::string s = raw;
+    auto isIdentChar = [](char c) { return std::isalnum((unsigned char)c) != 0 || c == '_'; };
+
+    // Leading `move` keyword (call-site move handoff): ownership transfers, not shared.
+    if (s.rfind("move", 0) == 0 && (s.size() == 4 || !isIdentChar(s[4])))
+    {
+        isMove = true;
+        s = s.substr(4);
+    }
+    // Strip leading cast groups like `(void*)` / `(ComputeCtx*)`.
+    while (!s.empty() && s[0] == '(')
+    {
+        size_t close = s.find(')');
+        if (close == std::string::npos) break;
+        std::string after = s.substr(close + 1);
+        if (after.empty()) break;            // a parenthesized expression, not a cast prefix
+        s = after;
+    }
+    if (!s.empty() && s[0] == '&')
+    {
+        addressOf = true;
+        s = s.substr(1);
+    }
+    size_t i = 0;
+    while (i < s.size() && isIdentChar(s[i]))
+        ++i;
+    ident = s.substr(0, i);
+}
+
+} // namespace
+
+void LLVMBackend::ScanCrossThreadEscapes(CFlatParser::CompilationUnitContext* cu)
+{
+    if (xthreadScanLevel_ <= 0 || cu == nullptr)
+        return;
+
+    const int level = xthreadScanLevel_;
+
+    std::vector<CFlatParser::FunctionDefinitionContext*> functions;
+    CollectContexts<CFlatParser::FunctionDefinitionContext>(cu, functions);
+
+    for (auto* fn : functions)
+    {
+        // Build the local symbol table: parameters + declared locals -> (type, isPointer).
+        std::unordered_map<std::string, std::pair<std::string, bool>> locals;
+
+        if (auto* ptl = fn->parameterTypeList())
+        {
+            if (auto* pl = ptl->parameterList())
+            {
+                for (auto* pd : pl->parameterDeclaration())
+                {
+                    std::string type; bool ptr = false;
+                    XtDeclTypeInfo(pd->declarationSpecifiers(), type, ptr);
+                    if (type.empty() || !pd->declarator())
+                        continue;
+                    std::string name = XtDirectDeclName(pd->declarator()->directDeclarator());
+                    if (!name.empty())
+                        locals[name] = { type, ptr };
+                }
+            }
+        }
+
+        std::vector<CFlatParser::DeclarationContext*> decls;
+        CollectContexts<CFlatParser::DeclarationContext>(fn, decls);
+        for (auto* decl : decls)
+        {
+            std::string type; bool ptr = false;
+            XtDeclTypeInfo(decl->declarationSpecifiers(), type, ptr);
+            if (type.empty() || !decl->initDeclaratorList())
+                continue;
+            for (auto* id : decl->initDeclaratorList()->initDeclarator())
+            {
+                if (!id->declarator())
+                    continue;
+                std::string name = XtDirectDeclName(id->declarator()->directDeclarator());
+                if (!name.empty())
+                    locals[name] = { type, ptr };
+            }
+        }
+
+        // Resolve one candidate context argument to a struct type and, per level, escape it.
+        auto consider = [&](const std::string& argText)
+        {
+            std::string ident; bool addressOf = false, isMove = false;
+            XtParseCtxArg(argText, ident, addressOf, isMove);
+            if (ident.empty() || isMove)
+                return;                      // unresolved, or ownership handed off (safe)
+            auto it = locals.find(ident);
+            if (it == locals.end())
+                return;
+            const std::string& typeName = it->second.first;
+            bool isPtr = it->second.second;
+            if (dataStructures.find(typeName) == dataStructures.end())
+                return;                      // not a known struct type
+            if (addressOf && !isPtr)
+            {
+                // &localStruct -> escape at level >= 1
+                if (level >= 1)
+                    AddXthreadEscapedType(typeName);
+            }
+            else if (isPtr)
+            {
+                // heap struct-pointer handoff -> escape at level >= 2
+                if (level >= 2)
+                    AddXthreadEscapedType(typeName);
+            }
+        };
+
+        std::vector<CFlatParser::PostfixExpressionContext*> postfixes;
+        CollectContexts<CFlatParser::PostfixExpressionContext>(fn, postfixes);
+
+        for (auto* pe : postfixes)
+        {
+            const auto& kids = pe->children;
+            for (size_t k = 0; k < kids.size(); ++k)
+            {
+                // Member call `.start(...)` / `->start(...)`: a thread spawn. The
+                // context is the 2nd argument (1st is the thread function).
+                auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(kids[k]);
+                if (!term || term->getText() != "start" || k == 0)
+                    continue;
+                std::string prev = kids[k - 1]->getText();
+                if (prev != "." && prev != "->" && prev != "?.")
+                    continue;
+                // Find the argument list of this call (first one after the member name).
+                CFlatParser::ArgumentExpressionListContext* args = nullptr;
+                for (size_t j = k + 1; j < kids.size(); ++j)
+                {
+                    if (auto* a = dynamic_cast<CFlatParser::ArgumentExpressionListContext*>(kids[j]))
+                    {
+                        args = a;
+                        break;
+                    }
+                }
+                if (!args)
+                    continue;
+                auto named = args->argumentNamedExpression();
+                if (named.size() >= 2 && named[1]->assignmentExpression())
+                    consider(named[1]->assignmentExpression()->getText());
+            }
+        }
+
+        // Level 3: treat ANY struct pointer / address-of-struct passed to ANY call as a
+        // potential cross-thread escape (most aggressive, most false positives).
+        if (level >= 3)
+        {
+            std::vector<CFlatParser::ArgumentExpressionListContext*> allArgs;
+            CollectContexts<CFlatParser::ArgumentExpressionListContext>(fn, allArgs);
+            for (auto* args : allArgs)
+                for (auto* nm : args->argumentNamedExpression())
+                    if (nm->assignmentExpression())
+                        consider(nm->assignmentExpression()->getText());
+        }
+    }
+
+    if (verbose && !threadSharedTypes_.empty())
+    {
+        std::cout << "[verbose] xthread escaped types:";
+        for (const auto& t : threadSharedTypes_)
+            std::cout << " " << t;
+        std::cout << "\n";
+    }
 }
 
 // ---- Linker path cache helpers ----

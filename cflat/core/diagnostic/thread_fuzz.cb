@@ -1,0 +1,102 @@
+// thread_fuzz.cb - seeded randomized thread-scheduling fuzzer (v1).
+//
+// Opt-in debugging tool. Importing this module and calling ThreadFuzz.enable()
+// installs the global __fuzz_hook (declared in memory.cb, alongside the analogous
+// __try_owner_dealloc hook, so it is cross-file visible to the core primitives).
+// Every synchronization
+// sched-point in the core primitives (mutex, channel, semaphore, latch, thread)
+// then consults a per-thread seeded RNG and sometimes yields, perturbing thread
+// interleavings so timing-dependent bugs are hit far more often than the OS
+// scheduler hits them by luck. A captured seed makes a crash replayable.
+//
+// Usage:
+//   import "diagnostic/thread_fuzz.cb";
+//   ThreadFuzz.enable();        // call once at startup, before spawning threads
+//
+// Environment:
+//   CFLAT_FUZZ_SEED    - i64 seed. If unset, one is drawn from entropy and
+//                        printed so the run can be replayed.
+//   CFLAT_FUZZ_PERIOD  - positive int; ~1 in PERIOD sched-points perturbs.
+//                        Defaults to 8. Smaller == more aggressive.
+//
+// Honest limits: this controls thread yielding only, not core placement or other
+// entropy (TimePoint.now, ASLR, user random.cb draws), so replay is "very likely"
+// not bit-for-bit. See core/diagnostic/THREAD_FUZZ_PLAN.md.
+
+// MSVC CRT bindings used only by this diagnostic module.
+extern char* getenv(const char* name);
+extern int   atoi(const char* str);
+extern i64   _atoi64(const char* str);
+
+// Global scheduler config, set once in enable(). Read-only on the hot path.
+i64 __fuzz_global_seed   = 0;
+i64 __fuzz_global_period = 8;
+
+// Per-thread fuzzer state. Lazily seeded on the first sched-point each thread
+// hits, so brand-new threads (including ones spawned after enable()) are handled
+// with no shared state and no locking on the hot path.
+struct __FuzzTLS {
+    bool inited  = false;
+    i64  rng     = 0;
+    i64  counter = 0;
+};
+thread_local __FuzzTLS __fuzz_tls = default;
+
+// splitmix64 (mirrors core/random.cb). Advances the per-thread state and returns
+// a scrambled draw. Constants are the signed i64 equivalents of the unsigned
+// golden-ratio increment and the two avalanche multipliers.
+i64 __fuzz_splitmix64(__FuzzTLS* s) {
+    s->rng += -7046029254386353131;   // +0x9e3779b97f4a7c15
+    i64 z = s->rng;
+    z = (z ^ (z >> 30)) * -4658895347498068487;   // *0xbf58476d1ce4e5b9
+    z = (z ^ (z >> 27)) * -7769279635992552469;   // *0x94d049bb133111eb
+    return z ^ (z >> 31);
+}
+
+// The hook. Called from arbitrary threads at every sched-point. 'site' is a small
+// per-call-site id (unused by v1's randomized yielding; kept for v2/PCT and for
+// diagnostics). Each thread's decisions are a pure function of (seed, tid, local
+// counter), which keeps the hot path lock-free and makes replay far more stable
+// than a shared, racy RNG.
+void __fuzz_on_syncpoint(int site) {
+    if (!__fuzz_tls.inited) {
+        __fuzz_tls.rng    = __fuzz_global_seed ^ (i64)GetCurrentThreadId();
+        __fuzz_tls.inited = true;
+    }
+    __fuzz_tls.counter = __fuzz_tls.counter + 1;
+    i64 r  = __fuzz_splitmix64(&__fuzz_tls);
+    i64 rr = r ^ (r >> 63);                 // clear sign bit so modulo is non-negative
+    if ((rr % __fuzz_global_period) == 0) {
+        // Pick one of two cheap perturbations from another bit of the draw.
+        if (((r >> 8) & 1) != 0) { SwitchToThread(); }
+        else                     { Sleep(0); }
+    }
+}
+
+namespace ThreadFuzz {
+
+    // Install the fuzzer. Reads CFLAT_FUZZ_SEED / CFLAT_FUZZ_PERIOD, then points
+    // __fuzz_hook at the per-syncpoint function. Idempotent enough to call once.
+    void enable() {
+        char* periodEnv = getenv("CFLAT_FUZZ_PERIOD");
+        if (periodEnv != nullptr) {
+            int p = atoi(periodEnv);
+            if (p > 0) { __fuzz_global_period = (i64)p; }
+        }
+
+        char* seedEnv = getenv("CFLAT_FUZZ_SEED");
+        if (seedEnv != nullptr) {
+            __fuzz_global_seed = _atoi64(seedEnv);
+        } else {
+            // No seed supplied - draw one from entropy and print it so any crash
+            // this run uncovers can be replayed via CFLAT_FUZZ_SEED.
+            i64 entropy = 0;
+            QueryPerformanceCounter(&entropy);
+            __fuzz_global_seed = entropy;
+        }
+        printf("[thread_fuzz] enabled: seed=%lld period=%lld\n",
+               __fuzz_global_seed, __fuzz_global_period);
+
+        __fuzz_hook = __fuzz_on_syncpoint;
+    }
+};

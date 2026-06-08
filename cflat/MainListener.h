@@ -1266,6 +1266,8 @@ public:
 };
 
 
+
+
 class MainListener : public CFlatBaseListener
 {
 private:
@@ -7998,6 +8000,14 @@ public:
                                     }
                                 }
 
+                                // Cross-thread sharing scan (--xthread-scan N): report when a
+                                // field of a type seen escaping a thread spawn is accessed and is
+                                // neither atomic nor lock-guarded. Information gathering only; never
+                                // errors. Prints an [xthread] line to stdout (not the diag sink).
+                                Compiler(ctx)->ReportXthreadFieldAccess(
+                                    structVar.TypeAndValue.VariableName, primaryIdentifier,
+                                    structVar.TypeAndValue.TypeName, fieldType);
+
                                 if (nullConditionalPending && structVar.Storage != nullptr)
                                 {
                                     // Null-conditional field access: emit a null check branch
@@ -10827,6 +10837,16 @@ public:
                         "Field '{}' is guarded by '{}': must hold '{}' before accessing it.",
                         name, memberVar.TypeAndValue.GuardedBy, memberVar.TypeAndValue.GuardedBy));
                 }
+            }
+            // Cross-thread sharing scan (--xthread-scan N): self-field access inside a method
+            // of a type seen escaping a thread spawn (e.g. a program's run-thread). The owning
+            // struct is derived from the enclosing function name (GetMemberVariable does not
+            // tag OwningStructName, by design - that would trip the delete-encapsulation check).
+            // Prints an [xthread] line to stdout; information gathering only, never an error.
+            if (compiler->GetXthreadScanLevel() > 0)
+            {
+                std::string owner = SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler);
+                compiler->ReportXthreadFieldAccess("this", name, owner, memberVar.TypeAndValue);
             }
             return memberVar;
         }

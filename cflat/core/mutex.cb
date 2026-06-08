@@ -18,10 +18,12 @@ struct mutex {
     void* _srw = nullptr;  // Win32 SRWLOCK - lock state stored in the pointer value; 0 == unlocked
 
     void acquire() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(1); }  // thread-fuzz sched-point
         AcquireSRWLockExclusive(&_srw);
     }
 
     void release() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(2); }  // thread-fuzz sched-point
         ReleaseSRWLockExclusive(&_srw);
     }
 

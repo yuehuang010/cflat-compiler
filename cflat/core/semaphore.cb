@@ -22,16 +22,19 @@ struct semaphore {
 
     // Decrement count; block until count > 0.  (alias: acquire)
     void acquire() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(20); }  // thread-fuzz sched-point
         WaitForSingleObject(_handle, -1);  // -1 == INFINITE
     }
 
     // Increment count by 1; wake one blocked acquire() caller.  (alias: release)
     void release() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(21); }  // thread-fuzz sched-point
         ReleaseSemaphore(_handle, 1, nullptr);
     }
 
     // Increment count by n; wake up to n blocked acquire() callers.
     void release_n(int n) {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(22); }  // thread-fuzz sched-point
         ReleaseSemaphore(_handle, n, nullptr);
     }
 

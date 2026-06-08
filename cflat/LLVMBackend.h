@@ -24,6 +24,7 @@
 #include <variant>
 #include <format>
 #include <unordered_set>
+#include <iostream>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -730,7 +731,24 @@ public:
 
     friend class MainListener;
     friend class ForwardRefScanner;
+    friend class CrossThreadEscapeScanner;
 
+public:
+    // True if a field is thread-safe by construction so it should NOT be reported by the
+    // cross-thread scan: explicitly guarded by a lock (GuardedBy) or an atomic wrapper
+    // type (lowered struct name atomic__i32 / atomic_counter / atomic_flag / ...). At the
+    // most aggressive level (--xthread-scan 3) atomics no longer suppress, since
+    // default-ordering atomics are surveyed too.
+    bool FieldSatisfiesThreadDiscipline(const TypeAndValue& field) const
+    {
+        if (!field.GuardedBy.empty())
+            return true;
+        if (xthreadScanLevel_ < 3 && field.TypeName.rfind("atomic", 0) == 0)
+            return true;
+        return false;
+    }
+
+private:
     std::unique_ptr<llvm::IRBuilder<>> builder;
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::LLVMContext> context;
@@ -805,12 +823,24 @@ private:
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
 
+    // Cross-thread sharing scan state. xthreadScanLevel_ is 0 unless --xthread-scan N
+    // (N in 1..3) was passed; threadSharedTypes_ holds the struct type names found
+    // escaping across a thread-spawn boundary (populated by ScanCrossThreadEscapes before
+    // the codegen walk; consumed at the two field-access check sites). Findings are printed
+    // to stdout with an [xthread] prefix (not the diagnostic sink). Cleared by ResetForReanalysis.
+    int xthreadScanLevel_ = 0;
+    std::unordered_set<std::string> threadSharedTypes_;
+
     // Structured facts about each `vectorize` loop, gathered at codegen time (when
     // the AST is available) and consulted by the post-optimization enforcement scan
     // to produce a precise, well-located failure message. Matched to a failed loop
     // by source line (which also travels in the loop's `!llvm.loop` metadata).
     // Non-empty gates enforcement at -O2. Cleared by ResetForReanalysis.
     std::vector<VectorizeLoopInfo> vectorizeLoops_;
+    // Dedupe set for the [xthread] cross-thread sharing report (see xthreadScanLevel_
+    // / threadSharedTypes_ above): each distinct finding line prints at most once.
+    // Cleared by ResetForReanalysis.
+    std::unordered_set<std::string> xthreadReported_;
     // C interop (prebuilt libraries): header search dirs (--c-include) used when
     // AST-dumping a bound header, and import libraries (--c-lib) added to the
     // lld-link line by EmitExecutable. A sibling runtime DLL of each lib is copied
@@ -2270,6 +2300,81 @@ private:
             llvm::sys::fs::remove(objPath);
             LogError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            return false;
+        }
+
+        cObjectFiles_.push_back(objPath);
+        return true;
+    }
+
+    // Compile the in-process crash-handler (core/crashdump.c) into a temporary object
+    // recorded in cObjectFiles_ for EmitExecutable to link. Used only under -g, where a
+    // PDB is produced and DbgHelp can symbolize CFlat frames at runtime.
+    //
+    // Deliberately NOT routed through CompileCFile: that path runs ExtractCSignatures
+    // (libclang) and registers the C functions as CFlat externs, which we do not want for
+    // an internal handler. This is a minimal clang-cl spawn. arch is "x64" or "x86".
+    // Failures are reported via LogError and return false without aborting the compile.
+    bool CompileCrashHandlerObject(const std::string& arch)
+    {
+        if (runtimeDir.empty())
+        {
+            LogError("cannot locate crash handler source: runtime directory is unset.");
+            return false;
+        }
+
+        llvm::SmallString<256> srcPath(runtimeDir);
+        llvm::sys::path::append(srcPath, "core", "crashdump.c");
+        if (!llvm::sys::fs::exists(srcPath))
+        {
+            LogError(std::format("crash handler source not found: '{}'.", srcPath.str().str()));
+            return false;
+        }
+
+        const std::string clangPath = FindClangCl();
+        if (clangPath.empty())
+        {
+            LogError("clang-cl.exe not found - cannot compile crash handler.");
+            return false;
+        }
+
+        llvm::SmallString<256> objFile;
+        if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_crashdump", "obj", objFile))
+        {
+            LogError(std::format("could not create temp object for crash handler: {}", ec.message()));
+            return false;
+        }
+        std::string objPath = objFile.str().str();
+
+        const std::string target = (arch == "x86")
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+        const std::string foArg = "/Fo" + objPath;
+
+        // /Z7 puts CodeView in the object so the handler's own frames are symbolizable too.
+        std::vector<std::string> argStrs = {
+            clangPath, "/c", "/Z7", "/nologo", target, srcPath.str().str(), foArg
+        };
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        if (verbose)
+        {
+            std::cout << "[verbose] compiling crash handler: " << srcPath.str().str()
+                      << " -> " << objPath << "\n";
+            std::cout << "[verbose]   clang-cl";
+            for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
+            std::cout << "\n";
+        }
+
+        std::string clangCompileErr;
+        int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
+        if (rc != 0)
+        {
+            llvm::sys::fs::remove(objPath);
+            LogError(std::format("clang-cl failed to compile crash handler (exit {}){}{}",
+                rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
         }
 
@@ -3788,6 +3893,15 @@ private:
 
         // ---- Find lld-link and MSVC / Windows SDK lib paths (cache-first) ----
         const std::string arch = (platform == "win32") ? "x86" : "x64";
+
+        // Under -g a PDB is produced beside the exe, so DbgHelp can symbolize CFlat
+        // frames at runtime. Compile the in-process crash handler and link it in (with
+        // dbghelp.lib below). Best-effort: if the handler compile fails (e.g. core/crashdump.c
+        // not deployed or clang-cl missing), CompileCrashHandlerObject logs via LogError and
+        // returns false; we then skip the handler-specific link args so the link still
+        // succeeds and still produces the PDB - just without the in-process backtrace.
+        bool crashHandlerLinked = debugInfo && CompileCrashHandlerObject(arch);
+
         LinkerPaths linkerPaths_;
         {
             llvm::TimeTraceScope pathScope("FindLinkerPaths", exePath);
@@ -3825,6 +3939,20 @@ private:
             else
                 pdbPath += ".pdb";
             linkArgStrs.push_back("/PDB:" + pdbPath);
+        }
+        if (crashHandlerLinked)
+        {
+            // DbgHelp (StackWalk64/SymFromAddr/SymGetLineFromAddr64) for the in-process
+            // crash handler. dbghelp.lib lives in the Windows SDK um lib dir (umLibPath,
+            // already on the libpath below). Gated on crashHandlerLinked so a failed
+            // handler compile does not /INCLUDE a symbol that was never emitted.
+            linkArgStrs.push_back("dbghelp.lib");
+            // Force-retain the crash handler's .CRT$XCU initializer: it has no external
+            // references, so lld-link's /OPT:REF (on by default, even with /DEBUG) would
+            // garbage-collect it. x86 decorates the data symbol with a leading underscore.
+            linkArgStrs.push_back(arch == "x86"
+                ? "/INCLUDE:_cflat_crash_init_"
+                : "/INCLUDE:cflat_crash_init_");
         }
         if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
         if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
@@ -9319,6 +9447,53 @@ public:
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v) { cHeaderCacheDeep_ = v; }
+
+    // ---- Cross-thread sharing diagnostic (--xthread-scan N) ----------------
+    // Opt-in, default OFF (level 0). A pre-pass (ScanCrossThreadEscapes, run before the
+    // codegen walk) collects the set of struct TYPES whose instances escape to a spawned
+    // thread into threadSharedTypes_; the two field-access reporting sites in MainListener
+    // then print a one-line [xthread] report to stdout for any access to a field of such a
+    // type that is neither atomic nor guarded by a lock. Higher levels widen which
+    // spawn/escape patterns the pre-pass recognizes:
+    //   1 - address-of a local struct passed to a thread spawn (&ctx; low noise)
+    //   2 - level 1 + a heap struct-pointer local handed to a spawn (ptr handoff)
+    //   3 - level 2 + any struct pointer passed to ANY call, and default-ordering
+    //       atomics no longer suppress (most aggressive / most false positives)
+    // This is a plain compiler stdout report, NOT a diagnostic-sink warning, so it
+    // is never routed to the LSP and never affects the exit code.
+    void SetXthreadScanLevel(int n) { xthreadScanLevel_ = n; }
+    int  GetXthreadScanLevel() const { return xthreadScanLevel_; }
+    bool IsXthreadEscapedType(const std::string& typeName) const
+    {
+        return threadSharedTypes_.find(typeName) != threadSharedTypes_.end();
+    }
+    void AddXthreadEscapedType(const std::string& typeName)
+    {
+        if (!typeName.empty())
+            threadSharedTypes_.insert(typeName);
+    }
+    // Pre-pass: walk the main translation unit's parse tree (before the codegen walk) and
+    // populate threadSharedTypes_ with struct types that escape to a spawned thread.
+    // No-op when xthreadScanLevel_ == 0. Defined in LLVMBackend.cpp.
+    void ScanCrossThreadEscapes(CFlatParser::CompilationUnitContext* cu);
+    // Emit one [xthread] line for a field access on an escaped struct type, unless the
+    // field is thread-safe by construction (atomic wrapper or lock-guarded). Deduped so
+    // each distinct finding prints once. Plain stdout - NOT a diagnostic-sink warning.
+    void ReportXthreadFieldAccess(const std::string& varName, const std::string& fieldName,
+                                  const std::string& structType, const TypeAndValue& field)
+    {
+        if (xthreadScanLevel_ <= 0)
+            return;
+        if (!IsXthreadEscapedType(structType))
+            return;
+        if (FieldSatisfiesThreadDiscipline(field))
+            return;                         // atomic wrapper or GuardedBy lock -> safe
+        std::string line = std::format(
+            "[xthread] field '{}.{}' ({}) shared across spawn, not atomic/guarded",
+            varName.empty() ? "?" : varName, fieldName, structType);
+        if (xthreadReported_.insert(line).second)
+            std::cout << line << "\n";
+    }
 
     // severity: 1 = Error, 2 = Warning (matches the LSP DiagnosticSeverity codes).
     using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg, int severity)>;

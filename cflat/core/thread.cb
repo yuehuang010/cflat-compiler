@@ -29,12 +29,14 @@ struct __ThreadArgsMove {
 stdcall int __thread_trampoline(void* param) {
     __ThreadArgs* args = (__ThreadArgs*)param;
     __active_allocator = args->_allocator;
+    if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
     return args->fn(args->ctx);
 }
 
 stdcall int __thread_trampoline_move(void* param) {
     __ThreadArgsMove* args = (__ThreadArgsMove*)param;
     __active_allocator = args->_allocator;
+    if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
     return args->fn(args->ctx);
 }
 
@@ -101,6 +103,7 @@ struct Thread {
 
     // Blocks until the thread exits. Returns the thread's exit code.
     i32 join() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(42); }  // thread-fuzz sched-point
         WaitForSingleObject(_handle, -1);  // -1 == INFINITE
         i32 code = 0;
         GetExitCodeThread(_handle, &code);

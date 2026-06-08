@@ -1,0 +1,42 @@
+// heap_audit.cb - opt-in double-free / heap-audit detector (front end).
+//
+// Importing this module and calling HeapAudit.enable() installs the global
+// __alloc_audit_hook / __free_audit_hook (declared in memory.cb, alongside the
+// analogous __fuzz_hook / __try_owner_dealloc hooks, so they are cross-file visible
+// to operator new/delete). From then on operator new records every allocation live
+// (with its size) and operator delete checks every free against that table: a free of
+// an already-freed pointer is reported as a DOUBLE FREE - with the pointer and its
+// size - and stops the process at the bad free itself, deterministically, regardless
+// of timing or which thread does it. Size discriminates the large channel ring buffer
+// (~2MB) from small ctx/handle allocations.
+//
+// The table, the lock, and the failure report live in the sibling C file
+// (diagnostic/heap_audit.c), imported below so it is compiled by clang-cl and merged
+// into the image by lld-link (requires building with -o). No CRT stdio is used; output
+// goes through Win32 WriteFile - see crashdump.c for the same pattern.
+//
+// Usage:
+//   import "diagnostic/heap_audit.cb";
+//   HeapAudit.enable();      // call once at startup, before spawning threads
+//
+// Honest limits: only allocations made AFTER enable() that flow through operator
+// new/delete are tracked; pointers allocated before enable() (or freed via a raw
+// allocator path that bypasses operator delete) are ignored, not flagged.
+
+import "heap_audit.c";
+
+// C entry points (diagnostic/heap_audit.c). Hand-written so the signatures are exact;
+// these take precedence over the .c auto-extern (first-writer-wins).
+extern void cflat_heap_audit_alloc(void* p, u64 size);
+extern void cflat_heap_audit_free(void* p);
+
+namespace HeapAudit {
+
+    // Install the audit. Points the two memory.cb hooks at the C entry points. After
+    // this returns, every operator new/delete is tracked. Idempotent; call once.
+    void enable() {
+        __alloc_audit_hook = cflat_heap_audit_alloc;
+        __free_audit_hook  = cflat_heap_audit_free;
+        printf("[heap_audit] enabled\n");
+    }
+};

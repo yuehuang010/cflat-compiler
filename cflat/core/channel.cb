@@ -132,6 +132,7 @@ class channel<T>
 
     // Non-blocking send.  Returns false if the channel is full.
     bool try_push(T item) {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(10); }  // thread-fuzz sched-point (before CAS region)
         i64 pos = __atomic_i64_load(&_head);
         while (true) {
             int  slot   = (int)(pos & _mask);
@@ -180,6 +181,7 @@ class channel<T>
 
     // IQueue-compatible aliases - separate bodies to avoid generic forwarding issues.
     bool try_pop(T* out) {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(11); }  // thread-fuzz sched-point (before CAS region)
         i64 pos = __atomic_i64_load(&_tail);
         while (true) {
             int  slot   = (int)(pos & _mask);

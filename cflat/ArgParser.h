@@ -183,6 +183,26 @@ public:
 		return 0;
 	}
 
+	// Cross-thread sharing scan level (information-gathering survey). Consumes the value
+	// of the `--xthread-scan N` option (N in 1..3). 0 = silent (default, fully
+	// backward-compatible); higher levels widen the set of memory reported as escaping
+	// across a thread-spawn boundary. An out-of-range value is reported and treated as 0.
+	int getXthreadScanLevel() const
+	{
+		auto val = getOption("xthread-scan");
+		if (!val || val->empty())
+			return 0;
+		int level = 0;
+		try { level = std::stoi(*val); }
+		catch (...) { level = -1; }
+		if (level < 1 || level > 3)
+		{
+			std::cerr << "Error: --xthread-scan requires a level of 1, 2, or 3 (got '" << *val << "').\n";
+			return 0;
+		}
+		return level;
+	}
+
 	void printUsage() const
 	{
 		std::cout << "Usage: " << m_program;

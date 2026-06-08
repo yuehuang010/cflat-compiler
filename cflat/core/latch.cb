@@ -28,6 +28,7 @@ struct latch {
 
     // Decrement the countdown.  When it reaches 0 all wait() callers unblock.
     void count_down() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(30); }  // thread-fuzz sched-point
         i64 remaining = __atomic_counter_decrement(&_count);
         if (remaining == 0) {
             SetEvent(_event);
@@ -37,6 +38,7 @@ struct latch {
     // Block until the countdown reaches 0.
     // Returns immediately if already at 0.
     void wait() {
+        if (__fuzz_hook != nullptr) { __fuzz_hook(31); }  // thread-fuzz sched-point
         if (__atomic_counter_read(&_count) > 0) {
             WaitForSingleObject(_event, -1);
         }

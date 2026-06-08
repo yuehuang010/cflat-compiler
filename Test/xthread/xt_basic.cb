@@ -1,0 +1,23 @@
+// xthread fixture: a borrowed struct ctx escapes a thread spawn and the parent
+// then reads/writes its non-atomic, non-guarded fields. --xthread-scan 1 must report.
+import "thread.cb";
+
+struct SquareCtx {
+    int input = 0;
+    int count = 0;
+};
+
+int squareKernel(void* ctx) {
+    SquareCtx* c = (SquareCtx*)ctx;
+    c->count = c->input * c->input;
+    return 0;
+}
+
+extern int main() {
+    SquareCtx ctx;
+    ctx.input = 7;
+    Thread t;
+    t.start(squareKernel, &ctx);
+    t.join();
+    return ctx.count;
+}

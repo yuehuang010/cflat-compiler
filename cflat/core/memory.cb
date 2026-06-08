@@ -19,6 +19,27 @@ thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null 
 // page-aligned header magic before touching anything else.
 function<bool(void*)> __try_owner_dealloc = nullptr;
 
+// Thread-fuzzing hook (diagnostic). Null in everyday builds; installed by
+// diagnostic/thread_fuzz.cb's ThreadFuzz.enable(). When non-null, each
+// synchronization sched-point (mutex/channel/semaphore/latch/thread) calls it so
+// a seeded scheduler can perturb thread interleavings and reproduce timing-
+// dependent bugs. The only everyday cost is one predictable null-pointer compare
+// per sync operation. Declared here (rather than runtime.cb) because memory.cb's
+// file-scope globals are visible to every core file via the auto-import pre-scan,
+// matching the sibling __try_owner_dealloc hook above.
+function<void(int)> __fuzz_hook = nullptr;
+
+// Heap-audit hooks (diagnostic). Null in everyday builds; installed by
+// diagnostic/heap_audit.cb's HeapAudit.enable(). When non-null, operator new records
+// each allocation (pointer + size) live and operator delete checks each free, flagging
+// a double free at the bad free itself. Declared here (rather than runtime.cb) so the
+// file-scope globals are visible to every core file via the auto-import pre-scan,
+// matching the sibling __fuzz_hook / __try_owner_dealloc hooks above. Only assign these
+// to a real function in enable(); never re-assign to nullptr at runtime (a runtime
+// nullptr store to a function-typed global aborts LLVM with "Invalid constantexpr cast").
+function<void(void*, u64)> __alloc_audit_hook = nullptr;
+function<void(void*)>      __free_audit_hook  = nullptr;
+
 void __register_handle(void* handle, void* closeFn)
 {
     // stub - handle tracking is future work
@@ -26,14 +47,19 @@ void __register_handle(void* handle, void* closeFn)
 
 void* operator new(i64 size)
 {
+    void* ptr = nullptr;
     if (__active_allocator != nullptr)
-        return __active_allocator.alloc(size);
-    return malloc(size);
+        ptr = __active_allocator.alloc(size);
+    else
+        ptr = malloc(size);
+    if (__alloc_audit_hook != nullptr) { __alloc_audit_hook(ptr, (u64)size); }
+    return ptr;
 }
 
 void operator delete(void* ptr)
 {
     if (ptr == nullptr) return;
+    if (__free_audit_hook != nullptr) { __free_audit_hook(ptr); }
     if (__try_owner_dealloc != nullptr && __try_owner_dealloc(ptr)) return;
     if (__active_allocator != nullptr)
     {

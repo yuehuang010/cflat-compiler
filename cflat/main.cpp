@@ -42,6 +42,7 @@ int main(int argc, char* argv[])
     args.addFlag("O0", '0', "No optimization (default)");
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
+    args.addOption("xthread-scan", 0, "Cross-thread sharing scan level 1..3 (default off). Prints [xthread] reports to stdout for non-atomic/unguarded struct fields shared across a thread spawn. 1=borrowed ctx, 2=+ptr handoff, 3=+any struct-ptr call arg");
     args.addFlag("check", 0, "Check one or more source files for errors without emitting any output (batch)");
     args.addFlag("grammar", 0, "Validate the grammar (parse only) of one or more source files; add -v to print the full parse-tree rule stack");
     args.addFlag("no-runtime", 0, "Do not auto-import core/runtime.cb");
