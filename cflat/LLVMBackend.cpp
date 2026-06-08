@@ -12,6 +12,8 @@
 #include <llvm\Transforms\Scalar\SROA.h>
 #include <llvm\Transforms\InstCombine\InstCombine.h>
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
+#include <llvm\Transforms\Instrumentation\AddressSanitizer.h>
+#include <llvm\Support\CommandLine.h>
 #include <llvm\Support\TimeProfiler.h>
 #include <llvm\Support\JSON.h>
 #include <llvm\IR\DiagnosticInfo.h>
@@ -596,10 +598,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     }
 
     int optLevel = args.getOptimizationLevel();
-    if (optLevel > 0)
+    // OptimizeModule also hosts the AddressSanitizer pass, which must run even at -O0,
+    // so enter it when --asan is set regardless of the optimization level.
+    if (optLevel > 0 || asan_)
     {
         llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
-        if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel << ")\n";
+        if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel
+                               << (asan_ ? ", asan" : "") << ")\n";
         OptimizeModule(optLevel);
     }
 
@@ -1267,6 +1272,97 @@ std::string ComposeVectorizeFailure(const LLVMBackend::VectorizeLoopInfo* info,
 
 void LLVMBackend::OptimizeModule(int optimizationLevel)
 {
+    // AddressSanitizer must instrument even at -O0 (its whole point is to catch bugs in
+    // unoptimized debug builds). Run the module-level AddressSanitizerPass in its own pass
+    // manager before the optimization pipeline so the __asan_* instrumentation and the
+    // asan.module_ctor are in place regardless of the -O level. Gated on asan_ so non-asan
+    // builds never touch this and stay byte-for-byte unchanged.
+    if (asan_)
+    {
+        // Force the dynamic shadow. We link the dynamic asan runtime
+        // (clang_rt.asan_dynamic), which maps its shadow region at a base chosen
+        // at runtime and published in __asan_shadow_memory_dynamic_address. By
+        // default the pass bakes in a STATIC Windows shadow offset
+        // (kWindowsShadowOffset64 = 0x100000000000); the instrumented shadow load
+        // then targets (addr>>3)+0x100000000000, which is not where the dynamic
+        // runtime actually placed shadow -> the shadow byte read faults and every
+        // check surfaces as a raw access-violation instead of a clean asan report.
+        // Forcing the dynamic shadow makes the pass emit a load of
+        // __asan_shadow_memory_dynamic_address, matching the linked runtime. (This
+        // is what clang-cl does for -fsanitize=address on Windows.)
+        {
+            auto& regOpts = llvm::cl::getRegisteredOptions();
+            auto it = regOpts.find("asan-force-dynamic-shadow");
+            if (it != regOpts.end())
+            {
+                if (auto* flag = static_cast<llvm::cl::opt<bool>*>(it->second))
+                    flag->setValue(true);
+            }
+        }
+
+        auto asanTM = CreateOptTargetMachine();
+        if (asanTM)
+            module->setDataLayout(asanTM->createDataLayout());
+
+        llvm::PassBuilder PB(asanTM.get());
+        llvm::LoopAnalysisManager LAM;
+        llvm::FunctionAnalysisManager FAM;
+        llvm::CGSCCAnalysisManager CGAM;
+        llvm::ModuleAnalysisManager MAM;
+        PB.registerModuleAnalyses(MAM);
+        PB.registerCGSCCAnalyses(CGAM);
+        PB.registerFunctionAnalyses(FAM);
+        PB.registerLoopAnalyses(LAM);
+        PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+        // Defaults match clang's plain `-fsanitize=address`: stack use-after-scope on,
+        // runtime detection of use-after-return, version check left enabled (it pins the
+        // instrumentation to the compiler-rt runtime ABI - __asan_version_mismatch_check_v8
+        // for this LLVM 18 toolchain, which the linked runtime must export).
+        llvm::AddressSanitizerOptions asanOpts;
+        asanOpts.UseAfterScope = true;
+
+        // The AddressSanitizer pass only instruments memory accesses in functions that carry
+        // the SanitizeAddress attribute - clang stamps it on every function it compiles under
+        // -fsanitize=address. cflat does not emit it during codegen, so add it here to every
+        // defined function (the module pass still handles globals + the ctor without it). The
+        // asan runtime's own helpers are declarations (skipped). Without this, only globals
+        // get redzones and no __asan_load*/__asan_store* checks are emitted.
+        for (llvm::Function& F : *module)
+        {
+            if (F.isDeclaration())
+                continue;
+            F.addFnAttr(llvm::Attribute::SanitizeAddress);
+        }
+
+        // Exclude cflat's globals from ASan global instrumentation. On COFF the
+        // global-GC path (InstrumentGlobalsCOFF, used by default and required for
+        // the dynamic-runtime shadow to work) wraps each instrumented global in a
+        // redzone struct and emits its metadata in a COMDAT associative to the
+        // instrumented global's symbol. cflat's private internal globals (e.g.
+        // __string_empty) don't survive that path - the COFF object writer aborts
+        // with "Associative COMDAT symbol '__string_empty.<hash>' does not exist".
+        // Marking every global NoAddress makes ASan skip global instrumentation
+        // (no redzones, no associative COMDATs) while leaving heap/stack/function
+        // instrumentation - what we need for use-after-free - fully intact. We
+        // keep UseGlobalGC at its default (true): flipping it to false breaks the
+        // Windows dynamic-runtime shadow, turning every instrumented access into a
+        // raw shadow-load access-violation instead of a clean asan report. The
+        // only cost here is no global-buffer-overflow detection.
+        for (llvm::GlobalVariable& G : module->globals())
+        {
+            llvm::GlobalValue::SanitizerMetadata md =
+                G.hasSanitizerMetadata() ? G.getSanitizerMetadata()
+                                         : llvm::GlobalValue::SanitizerMetadata();
+            md.NoAddress = true;
+            G.setSanitizerMetadata(md);
+        }
+
+        llvm::ModulePassManager MPM;
+        MPM.addPass(llvm::AddressSanitizerPass(asanOpts));
+        MPM.run(*module, MAM);
+    }
+
     if (optimizationLevel == 0)
         return;
 

@@ -42,6 +42,14 @@ public:
 		{
 			std::string arg = argv[i];
 
+			// clang-compatible spelling for --asan. Accepted as a no-op-cost alias so
+			// existing -fsanitize=address habits/build scripts work; sets the "asan" flag.
+			if (arg == "-fsanitize=address" || arg == "--fsanitize=address")
+			{
+				m_flagValues["asan"] = true;
+				continue;
+			}
+
 			if (arg == "--help" || arg == "-h")
 			{
 				printUsage();

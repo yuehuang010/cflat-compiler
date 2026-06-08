@@ -36,6 +36,7 @@ int main(int argc, char* argv[])
     args.addOption("out-lli", 'l', "Output LLVM IR file path (.ll)");
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
+    args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
     args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
@@ -192,6 +193,7 @@ int main(int argc, char* argv[])
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
     compiler.SetNoCache(args.hasFlag("no-cache"));
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
+    compiler.SetAsan(args.hasFlag("asan"));
     bool ok = compiler.Compile(args);
 
     writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");

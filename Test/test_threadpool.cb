@@ -339,7 +339,14 @@ bool testCancellation() {
     c->sawCancel  = &sawCancel;
     move TaskHandle* h = pool.submit(taskCancellable, c);
 
-    sleep(20);
+    // Wait until the task has actually started before cancelling, so we exercise
+    // mid-flight cancellation.  A fixed sleep is not enough: under a heavily
+    // oversubscribed machine (the parallel test harness runs many copies at
+    // once) the worker may not schedule the task within the window, so cancel()
+    // would set stop before the loop ran even one iteration, leaving
+    // iterations==0 and failing spuriously.  Spinning on the first increment
+    // makes "ran some iterations" deterministic.
+    while (iterations.read() == 0) { SwitchToThread(); }
     h->cancel();
     h->wait();
 
@@ -732,6 +739,16 @@ program ThreadPoolProgram {
         }
 
         return failed;
+    }
+
+    // A program does not auto-destruct its user-declared fields (CFlat has no
+    // automatic member destruction), so we must shut the pool down ourselves.
+    // Without this the worker threads spawned by pool.init() are never joined;
+    // at process exit they are terminated mid-wait and, under contention,
+    // occasionally fault while the runtime tears their stacks down - an
+    // intermittent nonzero exit even though all assertions passed.
+    ~ThreadPoolProgram() {
+        pool.shutdown();
     }
 };
 

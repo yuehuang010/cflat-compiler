@@ -822,6 +822,10 @@ private:
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
+    // --asan: instrument with AddressSanitizer and link the compiler-rt asan runtime.
+    // Intended to be paired with -g so the runtime report can name CFlat source lines.
+    // Off by default; when off, codegen/linking is byte-for-byte unchanged.
+    bool asan_ = false;
 
     // Cross-thread sharing scan state. xthreadScanLevel_ is 0 unless --xthread-scan N
     // (N in 1..3) was passed; threadSharedTypes_ holds the struct type names found
@@ -3957,6 +3961,24 @@ private:
         if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
         if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
         if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+
+        // AddressSanitizer runtime. The compiler-rt asan import libs ship in the same MSVC
+        // lib/<arch> dir as the CRT (already on the libpath above) and the runtime DLL lives
+        // in the sibling bin/Host*/<arch> dir. We link the dynamic asan runtime (matches the
+        // dynamic CRT, /MD-style msvcrt.lib used below) and force-include the thunk via
+        // /wholearchive so its CRT$XI* interceptor-init records are retained. The asan DLL is
+        // copied next to the exe after a successful link (see below). Gated on asan_.
+        std::string asanDllToCopy;
+        if (asan_)
+        {
+            if (!ResolveAsanRuntime(arch, msvcLibPath, linkArgStrs, asanDllToCopy))
+            {
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                return false;
+            }
+        }
+
         linkArgStrs.push_back("msvcrt.lib");
         linkArgStrs.push_back("ucrt.lib");
         linkArgStrs.push_back("vcruntime.lib");
@@ -4002,7 +4024,88 @@ private:
             llvm::TimeTraceScope dllScope("CopyCRuntimeDlls", exePath);
             CopyCRuntimeDlls(exePath);
         }
+
+        // The asan runtime is a DLL, so it must sit next to the exe to launch (the
+        // instrumented program imports __asan_* from it). Copy it after a successful link.
+        if (asan_ && !asanDllToCopy.empty())
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            fs::path dest = fs::path(exePath).parent_path() / fs::path(asanDllToCopy).filename();
+            fs::copy_file(asanDllToCopy, dest, fs::copy_options::overwrite_existing, ec);
+            if (ec)
+                LogError(std::format("--asan: failed to copy asan runtime DLL '{}' next to '{}': {}",
+                                     asanDllToCopy, exePath, ec.message()));
+            else if (verbose)
+                std::cout << "[verbose]   copied asan runtime DLL: " << asanDllToCopy
+                          << " -> " << dest.string() << "\n";
+        }
         return true;
+    }
+
+    // Resolve the compiler-rt AddressSanitizer runtime for --asan and add it to the link.
+    // The dynamic asan import libs (clang_rt.asan_dynamic-<suffix>.lib and the matching
+    // runtime-thunk) ship in the MSVC lib/<arch> dir (msvcLibDir, already on the libpath),
+    // and the runtime DLL lives in the sibling bin/Host{x64,x86}/<arch> dir. Appends the two
+    // libs plus a /wholearchive for the thunk to linkArgStrs and returns the absolute DLL
+    // path to deploy in dllSrcOut. On any missing piece, reports via LogError and returns
+    // false (the runtime ABI is version-pinned, so a missing/mismatched runtime is fatal -
+    // we never silently fall back). suffix: x86_64 for x64, i386 for x86.
+    bool ResolveAsanRuntime(const std::string& arch, const std::string& msvcLibDir,
+                            std::vector<std::string>& linkArgStrs, std::string& dllSrcOut)
+    {
+        namespace fs = std::filesystem;
+        if (msvcLibDir.empty())
+        {
+            LogError("--asan: MSVC lib directory not found, cannot locate the asan runtime "
+                     "(clang_rt.asan_dynamic). Ensure Visual Studio with the C++ "
+                     "AddressSanitizer component is installed.");
+            return false;
+        }
+
+        const std::string suffix = (arch == "x86") ? "i386" : "x86_64";
+        const std::string dynLib   = "clang_rt.asan_dynamic-" + suffix + ".lib";
+        const std::string thunkLib = "clang_rt.asan_dynamic_runtime_thunk-" + suffix + ".lib";
+
+        fs::path libDir(msvcLibDir);
+        for (const std::string& lib : { dynLib, thunkLib })
+        {
+            std::error_code ec;
+            if (!fs::exists(libDir / lib, ec))
+            {
+                LogError(std::format("--asan: asan runtime import library '{}' not found in "
+                                     "'{}'. Install the 'C++ AddressSanitizer' component for "
+                                     "this MSVC toolset.", lib, msvcLibDir));
+                return false;
+            }
+        }
+
+        // libDir is already on the /libpath, so reference the libs by name. The thunk must be
+        // pulled in whole so its interceptor init records are not GC'd by /OPT:REF.
+        linkArgStrs.push_back(dynLib);
+        linkArgStrs.push_back(thunkLib);
+        linkArgStrs.push_back("/wholearchive:" + thunkLib);
+
+        // The DLL lives under the MSVC version root: msvcLibDir is <ver>/lib/<arch>, so the
+        // version root is two levels up; the DLL is at <ver>/bin/Host{x64,x86}/<arch>/.
+        const std::string dllName = "clang_rt.asan_dynamic-" + suffix + ".dll";
+        fs::path verRoot = libDir.parent_path().parent_path(); // <ver>/lib/<arch> -> <ver>
+        for (const char* host : { "Hostx64", "Hostx86" })
+        {
+            fs::path candidate = verRoot / "bin" / host / arch / dllName;
+            std::error_code ec;
+            if (fs::exists(candidate, ec))
+            {
+                dllSrcOut = candidate.string();
+                return true;
+            }
+        }
+
+        LogError(std::format("--asan: asan runtime DLL '{}' not found under '{}\\bin'. The "
+                             "import library was present but the matching runtime DLL is "
+                             "missing; reinstall the 'C++ AddressSanitizer' component.",
+                             dllName, verRoot.string()));
+        return false;
     }
 
     // For each --c-lib, find a matching runtime DLL (lib dir, or a ../bin sibling) and copy
@@ -9442,6 +9545,8 @@ public:
     void SetSourceDisplayName(const std::string& name) { sourceDisplayName_ = name; }
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
+    // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
+    void SetAsan(bool v) { asan_ = v; }
     void SetBatchMode(bool v) { batchMode_ = v; }
     void SetNoCache(bool v) { noCache_ = v; }
     // When true, headers opted into the disk cache (via the `cache` import clause) record and

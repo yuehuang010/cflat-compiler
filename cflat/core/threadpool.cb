@@ -700,22 +700,27 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
     // access has to go through a local copy taken upfront.
     TaskHandle* h_ref = task.handle;
     int code = task.fn(task.ctx, task._token);
-    if (h_ref != nullptr) {
-        __threadpool_publish_done(h_ref, code);
-    }
-    // Read the continuation under _lock to stay coherent with then(), but
-    // perform the channel push outside the lock.  Inflight is incremented for
-    // the cont BEFORE we decrement for self so drain() never sees a spurious
-    // zero between the two.
+
+    // Completion handshake.  CRITICAL ORDERING: __threadpool_publish_done() sets
+    // h_ref->done, which releases any wait()er - and that wait()er is then free
+    // to delete the handle the instant done becomes visible.  So publish_done()
+    // must be the LAST access to h_ref.  We therefore read/clear the
+    // continuation FIRST and publish LAST, both under wctx->mtx.  (Publishing
+    // before this read was a use-after-free: a worker dereferenced
+    // h_ref->_hasCont after a wait()er had already deleted the handle.)
+    //
+    // Coherence with then(): wctx->mtx IS the pool's _lock (init() sets
+    // _ctx.mtx = &_lock), and then() checks dep->done.load() under that same
+    // _lock.  Because we now set done under the lock too, then() and the worker
+    // serialize: either then() sees done and self-submits the continuation, or
+    // we see _hasCont and fire it here - never both, never neither.  then()
+    // pre-incremented _inflight when it registered the continuation, so we do
+    // NOT increment again here.  The channel push happens outside the lock; if
+    // it fails we roll back the pre-reserved inflight slot.
     bool fired    = false;
     Task cont     = default;
     int  contPrio = THREADPOOL_PRIORITY_NORMAL;
 
-    // Invariant: then() pre-incremented _inflight when it registered the
-    // continuation, so we do NOT increment again here.  We hold the lock only
-    // to read/clear _hasCont and copy the cont fields under the same lock
-    // ordering used by then().  The actual channel push happens outside the
-    // lock, and if it fails we roll back the pre-reserved inflight slot.
     wctx->mtx->acquire();
     if (h_ref != nullptr && h_ref->_hasCont) {
         cont.fn     = h_ref->_contFn;
@@ -729,6 +734,11 @@ void __threadpool_execute_task(WorkerCtx* wctx, Task task) {
         contPrio = h_ref->_contPriority;
         h_ref->_hasCont = false;   // consume so we don't fire twice
         fired = true;
+    }
+    if (h_ref != nullptr) {
+        // LAST touch of h_ref: a wait()er may delete the handle as soon as this
+        // makes done visible, so nothing below may read h_ref.
+        __threadpool_publish_done(h_ref, code);
     }
     wctx->mtx->release();
 
