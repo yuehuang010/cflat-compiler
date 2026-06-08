@@ -389,6 +389,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely` (target-independent), `pause()` (x86 spin-loop hint, used by `spsc_queue`/`channel` spin loops) |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
 | `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
+| `regex.cb` | `Regex.compile` / `isMatch` / `find` / `findAll` / `replace` / `split`, capture groups, case-insensitive - NFA (Thompson, linear-time) regex; requires `import "regex.cb"`. See [`doc/REGEX.md`](doc/REGEX.md) |
 | `arena.cb` | Arena bump allocator |
 | `block_allocator.cb` | Block-based pooled allocator (used by `program` thread startup) |
 | `malloc_allocator.cb` | Thin wrapper around system malloc/free |

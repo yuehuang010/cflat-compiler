@@ -1,0 +1,1010 @@
+// regex.cb - NFA / Thompson regular-expression engine with submatch capture.
+//
+// A pattern is parsed once into an AST, compiled to a Thompson NFA, and matched
+// by a Pike VM that simulates the active threads one input byte at a time, each
+// thread carrying its own capture-slot vector. Matching is linear-time O(n*m) in
+// the input length n and pattern size m, with no catastrophic backtracking.
+//
+// Semantics are leftmost-first greedy (Perl/PCRE/Python/JS style): at a given
+// start position the highest-priority thread wins, '*'/'+'/'?'/'{}' are greedy,
+// and alternation prefers the earlier branch. (This differs from POSIX
+// leftmost-longest: for "a|ab|abc" the match is "a", not "abc".)
+//
+// Usage:
+//     import "regex.cb";
+//     Regex r;
+//     r.compile("(\\d+)-(\\d+)");
+//     Match m = r.find("call 123-4567 now");
+//     m.value(input)      -> "123-4567"   (group 0 = whole match)
+//     m.group(1, input)   -> "123"
+//     m.group(2, input)   -> "4567"
+//     r.findAll(input)    -> list<Match>  (non-overlapping)
+//     r.replace(input, "$2-$1")           -> capture-referencing substitution
+//     r.split("a,b,c")    -> list<string>
+//     r.compileIgnoreCase("abc"); r.isMatch("ABC") -> true
+//     // one-off helpers:
+//     Regex.isMatch("\\d+", input);
+//
+// Capture groups are numbered 1..9 by '(' order (group 0 is the whole match);
+// groups beyond 9 still affect precedence but are not captured.
+//
+// Supported syntax: literals, '.', '*', '+', '?', '|', grouping '( )', anchors
+// '^' '$', classes '[a-z]' '[^...]', escapes '\d \w \s \b' (+ '\D \W \S'), and
+// bounded repeats '{n}' '{n,}' '{n,m}'.
+//
+// IMPORTANT - escaping in pattern STRING LITERALS:
+//   CFlat runs every string literal through format-string interpolation, so when
+//   you write a pattern as a literal:
+//     - backslash classes: write "\\d \\w \\s \\b" (double backslash).
+//     - bounded repeats:    write "a{{2,3}}" (the '{{'/'}}' fold yields "a{2,3}").
+//   Patterns built from a variable or read from a file use the raw spelling.
+
+import "list.cb";
+import "string.cb";
+
+// Capture-slot vector width: slots 2g / 2g+1 hold group g's [start, end).
+// Group 0 is the whole match; groups 1..9 are user captures -> 20 slots.
+// (A bare global constant would need an initializer order we avoid; the value 20
+//  appears inline with this comment as the single source of truth.)
+
+// ----------------------------------------------------------------------------
+// ByteSet - a 256-bit membership set (one bit per byte value), held as four
+// 64-bit words so it is a flat value type with no heap and trivial copying.
+// ----------------------------------------------------------------------------
+struct ByteSet
+{
+    u64 w0 = 0;
+    u64 w1 = 0;
+    u64 w2 = 0;
+    u64 w3 = 0;
+
+    void _zero()
+    {
+        w0 = 0; w1 = 0; w2 = 0; w3 = 0;
+    }
+
+    void setBit(int c)
+    {
+        int w  = c >> 6;
+        u64 m  = (u64)1 << (c & 63);
+        if      (w == 0) w0 = w0 | m;
+        else if (w == 1) w1 = w1 | m;
+        else if (w == 2) w2 = w2 | m;
+        else             w3 = w3 | m;
+    }
+
+    void clearBit(int c)
+    {
+        int w   = c >> 6;
+        u64 m   = (u64)1 << (c & 63);
+        u64 inv = ((u64)0 - (u64)1) ^ m;   // all-ones with bit c cleared
+        if      (w == 0) w0 = w0 & inv;
+        else if (w == 1) w1 = w1 & inv;
+        else if (w == 2) w2 = w2 & inv;
+        else             w3 = w3 & inv;
+    }
+
+    bool test(int c)
+    {
+        int w  = c >> 6;
+        u64 m  = (u64)1 << (c & 63);
+        if      (w == 0) return (w0 & m) != (u64)0;
+        else if (w == 1) return (w1 & m) != (u64)0;
+        else if (w == 2) return (w2 & m) != (u64)0;
+        return (w3 & m) != (u64)0;
+    }
+
+    void setRange(int lo, int hi)
+    {
+        int i = lo;
+        while (i <= hi) { setBit(i); i++; }
+    }
+
+    void setAll()
+    {
+        u64 all = (u64)0 - (u64)1;
+        w0 = all; w1 = all; w2 = all; w3 = all;
+    }
+
+    void negate()
+    {
+        u64 all = (u64)0 - (u64)1;
+        w0 = all ^ w0; w1 = all ^ w1; w2 = all ^ w2; w3 = all ^ w3;
+    }
+};
+
+// ----------------------------------------------------------------------------
+// ReNode - one node of the parsed pattern AST. Children are integer indices into
+// the Regex._nodes pool.
+//
+// kind: 0 set, 1 concat(a,b), 2 alt(a,b), 3 star(a), 4 plus(a), 5 quest(a),
+//       6 repeat(a,n,m) [m == -1 unbounded], 7 assert, 8 empty, 9 group(a, n=index)
+// ----------------------------------------------------------------------------
+struct ReNode
+{
+    int kind       = 0;
+    int setIdx     = 0;    // kind 0: index into _sets
+    int a          = -1;   // child
+    int b          = -1;   // child (concat / alt)
+    int n          = 0;    // repeat lower bound, or group index (kind 9)
+    int m          = 0;    // repeat upper bound (-1 = unbounded)
+    int assertKind = 0;    // kind 7: 0 begin '^', 1 end '$', 2 word-boundary '\b'
+};
+
+// ----------------------------------------------------------------------------
+// NfaState - one Thompson NFA state. Stored by index in Regex._states.
+//
+// kind: 0 consume (match _sets[setIdx], then go to out)
+//       1 split   (epsilon to out and out2, out first = higher priority)
+//       2 accept
+//       3 assert  (zero-width; epsilon to out only when the assertion holds)
+//       4 save    (record capture slot = current position, then epsilon to out)
+// ----------------------------------------------------------------------------
+struct NfaState
+{
+    int kind       = 0;
+    int setIdx     = 0;
+    int assertKind = 0;
+    int slot       = 0;    // kind 4: capture slot to record
+    int out        = -1;
+    int out2       = -1;
+};
+
+// ----------------------------------------------------------------------------
+// Match - the result of find()/findAll(). caps[2g]/caps[2g+1] are group g's
+// [start, end) byte offsets into the input (-1 if the group did not participate).
+// ----------------------------------------------------------------------------
+struct Match
+{
+    bool success = false;
+    int  start   = 0;     // == caps[0]
+    int  end     = 0;     // == caps[1]
+    int  caps[20];        // filled only when success; group g -> caps[2g], caps[2g+1]
+
+    int groupStart(int g)
+    {
+        if (g < 0 || g > 9) return -1;
+        return caps[2 * g];
+    }
+
+    int groupEnd(int g)
+    {
+        if (g < 0 || g > 9) return -1;
+        return caps[2 * g + 1];
+    }
+
+    bool groupMatched(int g)
+    {
+        if (!success) return false;
+        return groupStart(g) >= 0 && groupEnd(g) >= 0;
+    }
+
+    // Substring of group g (0 = whole match), or empty if g did not participate.
+    move string group(int g, string input)
+    {
+        string r = default;
+        if (!groupMatched(g)) return r;
+        int gs  = groupStart(g);
+        int ge  = groupEnd(g);
+        int len = ge - gs;
+        if (len < 0) len = 0;
+        i8* src = input.data();
+        i8* buf = new i8[len + 1];
+        int i = 0;
+        while (i < len) { buf[i] = src[gs + i]; i++; }
+        buf[len] = 0;
+        r._ptr = buf;
+        r._len = len;
+        return r;
+    }
+
+    // The whole matched substring (group 0).
+    move string value(string input)
+    {
+        return group(0, input);
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Regex - a compiled pattern.
+// ----------------------------------------------------------------------------
+class Regex
+{
+    list<ReNode>   _nodes  = default;
+    list<ByteSet>  _sets   = default;
+    list<NfaState> _states = default;
+    int  _start    = 0;
+    int  _nstates  = 0;
+    int  _ngroups  = 0;
+    bool _ok       = false;
+    bool _ic       = false;   // case-insensitive
+    int  _gen      = 0;       // generation counter for per-step thread dedup
+
+    // transient parse cursor (valid only during compile())
+    i8*  _src = nullptr;
+    int  _pos = 0;
+    int  _len = 0;
+
+    // -- pool helpers --------------------------------------------------------
+
+    int _addSet(ByteSet bs)
+    {
+        _sets.add(bs);
+        return _sets.count() - 1;
+    }
+
+    int _newNodeSet(int setIdx)
+    {
+        ReNode r; r.kind = 0; r.setIdx = setIdx;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeBinary(int kind, int a, int b)
+    {
+        ReNode r; r.kind = kind; r.a = a; r.b = b;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeUnary(int kind, int a)
+    {
+        ReNode r; r.kind = kind; r.a = a;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeRepeat(int a, int n, int m)
+    {
+        ReNode r; r.kind = 6; r.a = a; r.n = n; r.m = m;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeAssert(int ak)
+    {
+        ReNode r; r.kind = 7; r.assertKind = ak;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeEmpty()
+    {
+        ReNode r; r.kind = 8;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    int _newNodeGroup(int a, int g)
+    {
+        ReNode r; r.kind = 9; r.a = a; r.n = g;
+        _nodes.add(r);
+        return _nodes.count() - 1;
+    }
+
+    // -- cursor --------------------------------------------------------------
+
+    i8 _peek()
+    {
+        if (_pos >= _len) return 0;
+        return _src[_pos];
+    }
+
+    i8 _peekAt(int off)
+    {
+        int p = _pos + off;
+        if (p >= _len) return 0;
+        return _src[p];
+    }
+
+    i8 _consume()
+    {
+        if (_pos >= _len) return 0;
+        i8 c = _src[_pos];
+        _pos++;
+        return c;
+    }
+
+    // -- character-class fillers + case folding ------------------------------
+
+    void _fillDigit(ByteSet* b)
+    {
+        b->setRange((int)'0', (int)'9');
+    }
+
+    void _fillWord(ByteSet* b)
+    {
+        b->setRange((int)'0', (int)'9');
+        b->setRange((int)'a', (int)'z');
+        b->setRange((int)'A', (int)'Z');
+        b->setBit((int)'_');
+    }
+
+    void _fillSpace(ByteSet* b)
+    {
+        b->setBit((int)' ');
+        b->setBit(9);    // \t
+        b->setBit(10);   // \n
+        b->setBit(13);   // \r
+        b->setBit(11);   // \v
+        b->setBit(12);   // \f
+    }
+
+    // In case-insensitive mode, add the opposite-case counterpart of every ASCII
+    // letter already in the set. Call on the POSITIVE set before negation.
+    void _maybeFold(ByteSet* b)
+    {
+        if (!_ic) return;
+        int c = (int)'a';
+        while (c <= (int)'z') { if (b->test(c)) b->setBit(c - 32); c++; }
+        c = (int)'A';
+        while (c <= (int)'Z') { if (b->test(c)) b->setBit(c + 32); c++; }
+    }
+
+    // -- parser (recursive descent) ------------------------------------------
+
+    int _parseAlt()
+    {
+        int left = _parseConcat();
+        while (_ok && _peek() == '|')
+        {
+            _consume();
+            int right = _parseConcat();
+            left = _newNodeBinary(2, left, right);
+        }
+        return left;
+    }
+
+    int _parseConcat()
+    {
+        int result = -1;
+        while (_ok)
+        {
+            i8 c = _peek();
+            if (c == 0 || c == '|' || c == ')') break;
+            int atom = _parseRepeated();
+            if (!_ok) break;
+            if (result == -1) result = atom;
+            else              result = _newNodeBinary(1, result, atom);
+        }
+        if (result == -1) result = _newNodeEmpty();
+        return result;
+    }
+
+    int _parseRepeated()
+    {
+        int atom = _parseAtom();
+        if (!_ok) return atom;
+        i8 c = _peek();
+        if (c == '*') { _consume(); return _newNodeUnary(3, atom); }
+        if (c == '+') { _consume(); return _newNodeUnary(4, atom); }
+        if (c == '?') { _consume(); return _newNodeUnary(5, atom); }
+        if (c == '{') { return _parseBrace(atom); }
+        return atom;
+    }
+
+    int _readInt()
+    {
+        i8 c = _peek();
+        if (c < '0' || c > '9') { _ok = false; return 0; }
+        int v = 0;
+        while (true)
+        {
+            i8 d = _peek();
+            if (d < '0' || d > '9') break;
+            v = v * 10 + ((int)d - (int)'0');
+            _consume();
+        }
+        return v;
+    }
+
+    int _parseBrace(int atom)
+    {
+        _consume(); // '{'
+        int nVal = _readInt();
+        if (!_ok) return atom;
+        int mVal = nVal;
+        if (_peek() == ',')
+        {
+            _consume();
+            if (_peek() == '}') mVal = -1;       // {n,}
+            else { mVal = _readInt(); if (!_ok) return atom; }
+        }
+        if (_peek() != '}') { _ok = false; return atom; }
+        _consume();
+        if (mVal != -1 && mVal < nVal) { _ok = false; return atom; }
+        return _newNodeRepeat(atom, nVal, mVal);
+    }
+
+    int _parseAtom()
+    {
+        i8 c = _peek();
+        if (c == '(')
+        {
+            _consume();
+            int g = _ngroups + 1;
+            _ngroups = g;
+            int inner = _parseAlt();
+            if (_peek() != ')') { _ok = false; return -1; }
+            _consume();
+            return _newNodeGroup(inner, g);
+        }
+        if (c == '[') return _parseClass();
+        if (c == '.')
+        {
+            _consume();
+            ByteSet bs; bs.setAll(); bs.clearBit(10);   // any byte except '\n'
+            return _newNodeSet(_addSet(bs));
+        }
+        if (c == '^') { _consume(); return _newNodeAssert(0); }
+        if (c == '$') { _consume(); return _newNodeAssert(1); }
+        if (c == '\\') { _consume(); return _parseEscape(); }
+        if (c == 0) { _ok = false; return -1; }
+        _consume();
+        ByteSet bs; bs._zero(); bs.setBit((int)c & 0xFF);
+        _maybeFold(&bs);
+        return _newNodeSet(_addSet(bs));
+    }
+
+    int _parseEscape()
+    {
+        i8 c = _consume();
+        if (c == 0) { _ok = false; return -1; }
+        if (c == 'b') return _newNodeAssert(2);
+
+        ByteSet bs; bs._zero();
+        if (c == 'd') { _fillDigit(&bs); return _newNodeSet(_addSet(bs)); }
+        if (c == 'D') { _fillDigit(&bs); bs.negate(); return _newNodeSet(_addSet(bs)); }
+        if (c == 'w') { _fillWord(&bs);  return _newNodeSet(_addSet(bs)); }
+        if (c == 'W') { _fillWord(&bs);  bs.negate(); return _newNodeSet(_addSet(bs)); }
+        if (c == 's') { _fillSpace(&bs); return _newNodeSet(_addSet(bs)); }
+        if (c == 'S') { _fillSpace(&bs); bs.negate(); return _newNodeSet(_addSet(bs)); }
+
+        int lit = (int)c & 0xFF;
+        if      (c == 'n') lit = 10;
+        else if (c == 't') lit = 9;
+        else if (c == 'r') lit = 13;
+        else if (c == 'f') lit = 12;
+        bs.setBit(lit);
+        _maybeFold(&bs);
+        return _newNodeSet(_addSet(bs));
+    }
+
+    void _addClassEscape(ByteSet* bs, i8 e)
+    {
+        if      (e == 'd') _fillDigit(bs);
+        else if (e == 'w') _fillWord(bs);
+        else if (e == 's') _fillSpace(bs);
+        else if (e == 'n') bs->setBit(10);
+        else if (e == 't') bs->setBit(9);
+        else if (e == 'r') bs->setBit(13);
+        else               bs->setBit((int)e & 0xFF);
+    }
+
+    int _parseClass()
+    {
+        _consume(); // '['
+        bool neg = false;
+        if (_peek() == '^') { _consume(); neg = true; }
+        ByteSet bs; bs._zero();
+        bool first = true;
+        while (true)
+        {
+            i8 c = _peek();
+            if (c == 0) { _ok = false; return -1; }
+            if (c == ']' && !first) { _consume(); break; }
+            first = false;
+
+            if (c == '\\')
+            {
+                _consume();
+                i8 e = _consume();
+                _addClassEscape(&bs, e);
+                continue;
+            }
+
+            _consume();
+            if (_peek() == '-')
+            {
+                i8 after = _peekAt(1);
+                if (after != ']' && after != 0)
+                {
+                    _consume();              // '-'
+                    i8 hi = _consume();
+                    bs.setRange((int)c & 0xFF, (int)hi & 0xFF);
+                    continue;
+                }
+            }
+            bs.setBit((int)c & 0xFF);
+        }
+        _maybeFold(&bs);      // fold positive set before negating
+        if (neg) bs.negate();
+        return _newNodeSet(_addSet(bs));
+    }
+
+    // -- NFA construction (Thompson, continuation-passing) -------------------
+
+    int _newConsume(int setIdx, int out)
+    {
+        NfaState s; s.kind = 0; s.setIdx = setIdx; s.out = out;
+        _states.add(s);
+        return _states.count() - 1;
+    }
+
+    int _newSplit(int out, int out2)
+    {
+        NfaState s; s.kind = 1; s.out = out; s.out2 = out2;
+        _states.add(s);
+        return _states.count() - 1;
+    }
+
+    int _newAssertState(int ak, int out)
+    {
+        NfaState s; s.kind = 3; s.assertKind = ak; s.out = out;
+        _states.add(s);
+        return _states.count() - 1;
+    }
+
+    int _newSave(int slot, int out)
+    {
+        NfaState s; s.kind = 4; s.slot = slot; s.out = out;
+        _states.add(s);
+        return _states.count() - 1;
+    }
+
+    int _newAccept()
+    {
+        NfaState s; s.kind = 2;
+        _states.add(s);
+        return _states.count() - 1;
+    }
+
+    void _setOut(int idx, int v)
+    {
+        NfaState s = _states.get(idx);
+        s.out = v;
+        _states.set(idx, s);
+    }
+
+    int _emit(int node, int cont)
+    {
+        ReNode r = _nodes.get(node);
+        if (r.kind == 0)            // set leaf
+            return _newConsume(r.setIdx, cont);
+        if (r.kind == 1)            // concat a then b
+        {
+            int sb = _emit(r.b, cont);
+            return _emit(r.a, sb);
+        }
+        if (r.kind == 2)            // alt (a higher priority than b)
+        {
+            int sa = _emit(r.a, cont);
+            int sb = _emit(r.b, cont);
+            return _newSplit(sa, sb);
+        }
+        if (r.kind == 3)            // star (greedy: enter before exit)
+        {
+            int split = _newSplit(-1, cont);
+            int sa    = _emit(r.a, split);
+            _setOut(split, sa);
+            return split;
+        }
+        if (r.kind == 4)            // plus
+        {
+            int split = _newSplit(-1, cont);
+            int sa    = _emit(r.a, split);
+            _setOut(split, sa);
+            return sa;
+        }
+        if (r.kind == 5)            // quest
+        {
+            int sa = _emit(r.a, cont);
+            return _newSplit(sa, cont);
+        }
+        if (r.kind == 6)            // repeat {n,m}
+        {
+            int cur = cont;
+            if (r.m == -1)
+            {
+                int split = _newSplit(-1, cont);
+                int sa    = _emit(r.a, split);
+                _setOut(split, sa);
+                cur = split;
+                int i = 0;
+                while (i < r.n) { cur = _emit(r.a, cur); i++; }
+                return cur;
+            }
+            int opt = r.m - r.n;
+            int i = 0;
+            while (i < opt)
+            {
+                int sa = _emit(r.a, cur);
+                cur = _newSplit(sa, cur);
+                i++;
+            }
+            i = 0;
+            while (i < r.n) { cur = _emit(r.a, cur); i++; }
+            return cur;
+        }
+        if (r.kind == 7)            // assert (anchor / boundary)
+            return _newAssertState(r.assertKind, cont);
+        if (r.kind == 9)            // capturing group
+        {
+            int g = r.n;
+            if (g <= 9)
+            {
+                int after = _newSave(2 * g + 1, cont);
+                int body  = _emit(r.a, after);
+                return _newSave(2 * g, body);
+            }
+            return _emit(r.a, cont);   // beyond capture limit: precedence only
+        }
+        // kind 8 empty - epsilon straight through
+        return cont;
+    }
+
+    // -- public: compile -----------------------------------------------------
+
+    bool _compile(string pattern, bool ignoreCase)
+    {
+        _nodes.clear();
+        _sets.clear();
+        _states.clear();
+        _src     = pattern.data();
+        _len     = pattern.length();
+        _pos     = 0;
+        _ok      = true;
+        _ic      = ignoreCase;
+        _ngroups = 0;
+
+        int root = _parseAlt();
+        if (!_ok) return false;
+        if (_pos != _len) { _ok = false; return false; }   // trailing ')' etc.
+
+        // Wrap the whole pattern in capture group 0.
+        int accept = _newAccept();
+        int s1     = _newSave(1, accept);
+        int body   = _emit(root, s1);
+        _start     = _newSave(0, body);
+        _nstates   = _states.count();
+        return true;
+    }
+
+    bool compile(string pattern)           { return _compile(pattern, false); }
+    bool compileIgnoreCase(string pattern) { return _compile(pattern, true); }
+    bool ok()        { return _ok; }
+    int  groupCount() { return _ngroups; }
+
+    // -- matching (Pike VM, leftmost-first) ----------------------------------
+
+    bool _isWordByte(i8 c)
+    {
+        int u = (int)c & 0xFF;
+        return (u >= (int)'0' && u <= (int)'9')
+            || (u >= (int)'a' && u <= (int)'z')
+            || (u >= (int)'A' && u <= (int)'Z')
+            || u == (int)'_';
+    }
+
+    bool _wordAt(i8* s, int n, int i)
+    {
+        if (i < 0 || i >= n) return false;
+        return _isWordByte(s[i]);
+    }
+
+    bool _assertHolds(int ak, int pos, i8* s, int n)
+    {
+        if (ak == 0) return pos == 0;
+        if (ak == 1) return pos == n;
+        return _wordAt(s, n, pos - 1) != _wordAt(s, n, pos);   // word boundary
+    }
+
+    // Follow epsilon transitions from `st`, recording captures into `caps` (a
+    // width-20 working buffer that is mutated and restored), and appending
+    // consume/accept threads to (outStates, outCaps) in priority order.
+    void _addThread(int st, int* caps, int pos, i8* s, int n,
+                    list<int>* outStates, int* outCaps, int* stamp)
+    {
+        if (st < 0) return;
+        if (stamp[st] == _gen) return;
+        stamp[st] = _gen;
+        NfaState x = _states.get(st);
+        if (x.kind == 1)
+        {
+            _addThread(x.out,  caps, pos, s, n, outStates, outCaps, stamp);
+            _addThread(x.out2, caps, pos, s, n, outStates, outCaps, stamp);
+        }
+        else if (x.kind == 3)
+        {
+            if (_assertHolds(x.assertKind, pos, s, n))
+                _addThread(x.out, caps, pos, s, n, outStates, outCaps, stamp);
+        }
+        else if (x.kind == 4)
+        {
+            int slot = x.slot;
+            int old  = caps[slot];
+            caps[slot] = pos;
+            _addThread(x.out, caps, pos, s, n, outStates, outCaps, stamp);
+            caps[slot] = old;                 // restore for sibling branches
+        }
+        else
+        {
+            int idx = outStates->count();     // consume (0) or accept (2) leaf
+            outStates->add(st);
+            int b = idx * 20;
+            int k = 0;
+            while (k < 20) { outCaps[b + k] = caps[k]; k++; }
+        }
+    }
+
+    // Run the VM from start position `sp`. On a match, fill matchCaps and return
+    // true. Scratch lists/pools are supplied by the caller and reused.
+    bool _runFrom(int sp, i8* s, int n, int* stamp, int* matchCaps,
+                  list<int>* cstates, int* ccaps, list<int>* nstates, int* ncaps)
+    {
+        int[20] init;
+        int[20] w;
+        int j = 0;
+        while (j < 20) { init[j] = -1; j++; }
+
+        _gen = _gen + 1;
+        cstates->clear();
+        _addThread(_start, &init[0], sp, s, n, cstates, ccaps, stamp);
+
+        bool matched = false;
+        int pos = sp;
+        while (true)
+        {
+            int cc = cstates->count();
+            if (cc == 0) break;
+
+            _gen = _gen + 1;
+            nstates->clear();
+            int i = 0;
+            while (i < cc)
+            {
+                int st = cstates->get(i);
+                NfaState x = _states.get(st);
+                if (x.kind == 2)              // accept
+                {
+                    int b = i * 20;
+                    int k = 0;
+                    while (k < 20) { matchCaps[k] = ccaps[b + k]; k++; }
+                    matched = true;
+                    break;                    // cut lower-priority threads
+                }
+                else if (x.kind == 0)         // consume
+                {
+                    if (pos < n)
+                    {
+                        ByteSet bs = _sets.get(x.setIdx);
+                        if (bs.test((int)s[pos] & 0xFF))
+                        {
+                            int b = i * 20;
+                            int k = 0;
+                            while (k < 20) { w[k] = ccaps[b + k]; k++; }
+                            _addThread(x.out, &w[0], pos + 1, s, n, nstates, ncaps, stamp);
+                        }
+                    }
+                }
+                i++;
+            }
+
+            // nlist -> clist
+            cstates->clear();
+            int m2 = nstates->count();
+            int t = 0;
+            while (t < m2)
+            {
+                cstates->add(nstates->get(t));
+                int b = t * 20;
+                int k = 0;
+                while (k < 20) { ccaps[b + k] = ncaps[b + k]; k++; }
+                t++;
+            }
+
+            if (pos >= n) break;
+            pos++;
+        }
+        return matched;
+    }
+
+    int* _newStamp()
+    {
+        int* stamp = new int[_nstates];
+        int i = 0;
+        while (i < _nstates) { stamp[i] = -1; i++; }
+        return stamp;
+    }
+
+    // Leftmost match. Returns a Match; .success is false if no match.
+    Match find(string input)
+    {
+        Match r = default;
+        if (!_ok) return r;
+        i8* s = input.data();
+        int n = input.length();
+
+        int*  stamp = _newStamp();
+        int*  ccaps = new int[_nstates * 20];
+        int*  ncaps = new int[_nstates * 20];
+        list<int> cstates;
+        list<int> nstates;
+        int[20] mc;
+        _gen = 0;
+
+        int sp = 0;
+        while (sp <= n)
+        {
+            if (_runFrom(sp, s, n, stamp, &mc[0], &cstates, ccaps, &nstates, ncaps))
+            {
+                r.success = true;
+                r.start   = mc[0];
+                r.end     = mc[1];
+                int k = 0;
+                while (k < 20) { r.caps[k] = mc[k]; k++; }
+                break;
+            }
+            sp++;
+        }
+
+        delete[] stamp;
+        delete[] ccaps;
+        delete[] ncaps;
+        return r;
+    }
+
+    bool isMatch(string input)
+    {
+        Match m = find(input);
+        return m.success;
+    }
+
+    // All non-overlapping matches, left to right.
+    move list<Match> findAll(string input)
+    {
+        list<Match> out = default;
+        if (!_ok) return move out;
+        i8* s = input.data();
+        int n = input.length();
+
+        int*  stamp = _newStamp();
+        int*  ccaps = new int[_nstates * 20];
+        int*  ncaps = new int[_nstates * 20];
+        list<int> cstates;
+        list<int> nstates;
+        int[20] mc;
+        _gen = 0;
+
+        int sp = 0;
+        while (sp <= n)
+        {
+            if (_runFrom(sp, s, n, stamp, &mc[0], &cstates, ccaps, &nstates, ncaps))
+            {
+                Match m = default;
+                m.success = true;
+                m.start   = mc[0];
+                m.end     = mc[1];
+                int k = 0;
+                while (k < 20) { m.caps[k] = mc[k]; k++; }
+                out.add(m);
+                if (mc[1] > sp) sp = mc[1];   // advance past the match
+                else            sp = sp + 1;  // empty match: step one byte
+            }
+            else sp++;
+        }
+
+        delete[] stamp;
+        delete[] ccaps;
+        delete[] ncaps;
+        return move out;
+    }
+
+    // -- replace / split -----------------------------------------------------
+
+    void _appendRange(stringbuilder* sb, i8* s, int a, int b)
+    {
+        int i = a;
+        while (i < b) { sb->appendChar(s[i]); i++; }
+    }
+
+    // Append `repl` with $0..$9 replaced by captured groups and $$ -> '$'.
+    void _appendReplacement(stringbuilder* sb, string repl, Match m, string input)
+    {
+        i8* r  = repl.data();
+        int rn = repl.length();
+        i8* s  = input.data();
+        int i  = 0;
+        while (i < rn)
+        {
+            i8 c = r[i];
+            if (c == '$' && i + 1 < rn)
+            {
+                i8 d = r[i + 1];
+                if (d == '$') { sb->appendChar('$'); i = i + 2; continue; }
+                if (d >= '0' && d <= '9')
+                {
+                    int g = (int)d - (int)'0';
+                    if (m.groupMatched(g))
+                        _appendRange(sb, s, m.groupStart(g), m.groupEnd(g));
+                    i = i + 2;
+                    continue;
+                }
+            }
+            sb->appendChar(c);
+            i++;
+        }
+    }
+
+    // Replace every non-overlapping match in `input` with `repl` (which may use
+    // $0..$9 group references). Returns a fresh owning string.
+    move string replace(string input, string repl)
+    {
+        stringbuilder sb;
+        i8* s = input.data();
+        int n = input.length();
+        list<Match> ms = findAll(input);
+        int last = 0;
+        int i = 0;
+        while (i < ms.count())
+        {
+            Match m = ms.get(i);
+            _appendRange(&sb, s, last, m.start);
+            _appendReplacement(&sb, repl, m, input);
+            last = m.end;
+            i++;
+        }
+        _appendRange(&sb, s, last, n);
+        return sb.toString();
+    }
+
+    move string _substr(i8* s, int a, int b)
+    {
+        int len = b - a;
+        if (len < 0) len = 0;
+        i8* buf = new i8[len + 1];
+        int i = 0;
+        while (i < len) { buf[i] = s[a + i]; i++; }
+        buf[len] = 0;
+        string r = default;
+        r._ptr = buf;
+        r._len = len;
+        return r;
+    }
+
+    // Split `input` around non-overlapping matches of the pattern.
+    move list<string> split(string input)
+    {
+        list<string> out = default;
+        i8* s = input.data();
+        int n = input.length();
+        list<Match> ms = findAll(input);
+        int last = 0;
+        int i = 0;
+        while (i < ms.count())
+        {
+            Match m = ms.get(i);
+            out.add(_substr(s, last, m.start));
+            last = m.end;
+            i++;
+        }
+        out.add(_substr(s, last, n));
+        return move out;
+    }
+
+    // -- static one-off helpers ---------------------------------------------
+
+    static bool isMatch(string pattern, string input)
+    {
+        Regex re;
+        re.compile(pattern);
+        return re.isMatch(input);
+    }
+
+    static Match find(string pattern, string input)
+    {
+        Regex re;
+        re.compile(pattern);
+        return re.find(input);
+    }
+};

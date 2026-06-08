@@ -1,0 +1,315 @@
+// Tests for core/regex.cb (NFA / Thompson engine).
+//
+// NOTE on pattern literals: CFlat folds string-literal escapes and '{...}'
+// interpolation before the regex engine sees the bytes, so in source we write
+// backslash classes doubled ("\\d") and bounded repeats with doubled braces
+// ("a{{2,3}}" -> the engine receives "a{2,3}").
+
+import "test_helper.cb";
+import "regex.cb";
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    // -- literals ------------------------------------------------------------
+    total++; passed += Test("lit_match",      Regex.isMatch("abc", "abc"),   true);
+    total++; passed += Test("lit_substr",     Regex.isMatch("abc", "xabcx"), true);
+    total++; passed += Test("lit_nomatch",    Regex.isMatch("abc", "abd"),   false);
+
+    // -- '.' any char --------------------------------------------------------
+    total++; passed += Test("dot_match",      Regex.isMatch("a.c", "axc"),   true);
+    total++; passed += Test("dot_needs_one",  Regex.isMatch("a.c", "ac"),    false);
+
+    // -- quantifiers ---------------------------------------------------------
+    total++; passed += Test("star_zero",      Regex.isMatch("ab*c", "ac"),    true);
+    total++; passed += Test("star_many",      Regex.isMatch("ab*c", "abbbc"), true);
+    total++; passed += Test("plus_one",       Regex.isMatch("ab+c", "abc"),   true);
+    total++; passed += Test("plus_needs_one", Regex.isMatch("ab+c", "ac"),    false);
+    total++; passed += Test("quest_zero",     Regex.isMatch("ab?c", "ac"),    true);
+    total++; passed += Test("quest_one",      Regex.isMatch("ab?c", "abc"),   true);
+    total++; passed += Test("quest_max_one",  Regex.isMatch("^ab?c$", "abbc"), false);
+
+    // -- alternation & grouping ---------------------------------------------
+    total++; passed += Test("alt_a",          Regex.isMatch("^(a|b)$", "a"),  true);
+    total++; passed += Test("alt_b",          Regex.isMatch("^(a|b)$", "b"),  true);
+    total++; passed += Test("alt_none",       Regex.isMatch("^(a|b)$", "c"),  false);
+    total++; passed += Test("group_plus",     Regex.isMatch("^(ab)+$", "abab"), true);
+    total++; passed += Test("group_plus_bad", Regex.isMatch("^(ab)+$", "aba"),  false);
+
+    // -- anchors -------------------------------------------------------------
+    total++; passed += Test("anchor_full",    Regex.isMatch("^abc$", "abc"),  true);
+    total++; passed += Test("anchor_tail",    Regex.isMatch("^abc$", "abcd"), false);
+    total++; passed += Test("anchor_start",   Regex.isMatch("^a", "ba"),      false);
+
+    // -- character classes ---------------------------------------------------
+    total++; passed += Test("class_in",       Regex.isMatch("^[a-c]$", "b"),  true);
+    total++; passed += Test("class_out",      Regex.isMatch("^[a-c]$", "d"),  false);
+    total++; passed += Test("class_neg_in",   Regex.isMatch("^[^a-c]$", "d"), true);
+    total++; passed += Test("class_neg_out",  Regex.isMatch("^[^a-c]$", "a"), false);
+
+    // -- escapes (doubled backslash in source) ------------------------------
+    total++; passed += Test("digit_match",    Regex.isMatch("^\\d+$", "123"),  true);
+    total++; passed += Test("digit_nomatch",  Regex.isMatch("^\\d+$", "12a"),  false);
+    total++; passed += Test("word_match",     Regex.isMatch("^\\w+$", "a_1"),  true);
+    total++; passed += Test("space_match",    Regex.isMatch("^a\\sb$", "a b"), true);
+
+    // -- word boundary -------------------------------------------------------
+    total++; passed += Test("bound_hit",      Regex.isMatch("\\bcat\\b", "a cat!"),   true);
+    total++; passed += Test("bound_miss",     Regex.isMatch("\\bcat\\b", "category"), false);
+
+    // -- bounded repeats (doubled braces in source) -------------------------
+    total++; passed += Test("rep_nm_min",     Regex.isMatch("^a{{2,3}}$", "aa"),  true);
+    total++; passed += Test("rep_nm_max",     Regex.isMatch("^a{{2,3}}$", "aaa"), true);
+    total++; passed += Test("rep_nm_under",   Regex.isMatch("^a{{2,3}}$", "a"),   false);
+    total++; passed += Test("rep_nm_over",    Regex.isMatch("^a{{2,3}}$", "aaaa"), false);
+    total++; passed += Test("rep_exact",      Regex.isMatch("^a{{3}}$", "aaa"),   true);
+    total++; passed += Test("rep_exact_bad",  Regex.isMatch("^a{{3}}$", "aa"),    false);
+    total++; passed += Test("rep_open",       Regex.isMatch("^a{{2,}}$", "aaaaa"), true);
+    total++; passed += Test("rep_open_under", Regex.isMatch("^a{{2,}}$", "a"),     false);
+
+    // -- find (leftmost-longest span) ---------------------------------------
+    Regex rd;
+    rd.compile("\\d+");
+    Match m = rd.find("abc123xyz");
+    total++; passed += Test("find_ok",     m.success, true);
+    total++; passed += Test("find_start",  m.start,   3);
+    total++; passed += Test("find_end",    m.end,     6);
+    total++; passed += Test("find_value",  m.value("abc123xyz"), "123");
+
+    Regex rg;
+    rg.compile("a{{2,3}}");
+    Match m2 = rg.find("aaaa");
+    total++; passed += Test("find_greedy_end", m2.end, 3);
+
+    // -- findAll -------------------------------------------------------------
+    Regex ra;
+    ra.compile("\\d+");
+    list<Match> ms = ra.findAll("a12b345c");
+    total++; passed += Test("findall_count", ms.count(), 2);
+    total++; passed += Test("findall_0",     ms.get(0).value("a12b345c"), "12");
+    total++; passed += Test("findall_1",     ms.get(1).value("a12b345c"), "345");
+
+    Regex rov;
+    rov.compile("aa");
+    list<Match> ms2 = rov.findAll("aaaa");
+    total++; passed += Test("findall_nonoverlap", ms2.count(), 2);
+
+    // -- malformed patterns leave ok()==false -------------------------------
+    Regex bad1; bad1.compile("(");
+    total++; passed += Test("bad_open_paren", bad1.ok(), false);
+    Regex bad2; bad2.compile("[a");
+    total++; passed += Test("bad_open_class", bad2.ok(), false);
+    Regex bad3; bad3.compile("a{{2,1}}");
+    total++; passed += Test("bad_range",      bad3.ok(), false);
+    total++; passed += Test("bad_query",      bad1.isMatch("x"), false);
+
+    // -- nested groups -------------------------------------------------------
+    total++; passed += Test("nest_opt_zero",  Regex.isMatch("^(a(bc)*d)$", "ad"),     true);
+    total++; passed += Test("nest_opt_one",   Regex.isMatch("^(a(bc)*d)$", "abcd"),   true);
+    total++; passed += Test("nest_opt_many",  Regex.isMatch("^(a(bc)*d)$", "abcbcd"), true);
+    total++; passed += Test("nest_opt_bad",   Regex.isMatch("^(a(bc)*d)$", "abcbd"),  false);
+    total++; passed += Test("nest_alt_grp",   Regex.isMatch("^((ab)|(cd))+$", "abcdab"), true);
+    total++; passed += Test("nest_alt_bad",   Regex.isMatch("^((ab)|(cd))+$", "abc"),    false);
+
+    // -- quantified groups ---------------------------------------------------
+    total++; passed += Test("grp_star_empty", Regex.isMatch("^(ab)*$", ""),       true);
+    total++; passed += Test("grp_alt_plus",   Regex.isMatch("^(a|b)+$", "abba"),  true);
+    total++; passed += Test("grp_alt_bad",    Regex.isMatch("^(a|b)+$", "abc"),   false);
+    total++; passed += Test("grp_quest_zero", Regex.isMatch("^(ab)?$", ""),       true);
+    total++; passed += Test("grp_quest_two",  Regex.isMatch("^(ab)?$", "abab"),   false);
+
+    // -- nested quantifiers must terminate (epsilon-loop safety) ------------
+    total++; passed += Test("star_star",      Regex.isMatch("^(a*)*$", "aaaa"),   true);
+    total++; passed += Test("star_star_empty",Regex.isMatch("^(a*)*$", ""),       true);
+    total++; passed += Test("plus_star",      Regex.isMatch("^(a+)*$", "aaa"),    true);
+    total++; passed += Test("star_star_pos",  Regex.isMatch("(a*)*c", "aaaac"),   true);
+    total++; passed += Test("star_star_neg",
+        Regex.isMatch("(a*)*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), false);  // 30 a's, no c
+
+    // -- empty pattern and empty branches ------------------------------------
+    total++; passed += Test("empty_pat",      Regex.isMatch("", "abc"),  true);
+    total++; passed += Test("empty_anchored",  Regex.isMatch("^$", ""),   true);
+    total++; passed += Test("empty_anchor_no", Regex.isMatch("^$", "a"),  false);
+    total++; passed += Test("alt_empty_a",    Regex.isMatch("^(a|)$", "a"), true);
+    total++; passed += Test("alt_empty_none", Regex.isMatch("^(a|)$", ""),  true);
+    total++; passed += Test("alt_empty_bad",  Regex.isMatch("^(a|)$", "b"), false);
+
+    // -- '.' and '.*' --------------------------------------------------------
+    total++; passed += Test("dotstar_zero",   Regex.isMatch("^a.*b$", "ab"),     true);
+    total++; passed += Test("dotstar_many",   Regex.isMatch("^a.*b$", "axxxb"),  true);
+    total++; passed += Test("dot_no_newline", Regex.isMatch("a.b", "a\nb"),      false);
+    total++; passed += Test("dot_count",      Regex.isMatch("^.{{3}}$", "abc"),  true);
+    total++; passed += Test("dot_count_bad",  Regex.isMatch("^.{{3}}$", "ab"),   false);
+
+    // -- zero / exact / combined repeats ------------------------------------
+    total++; passed += Test("rep_zero_empty", Regex.isMatch("^a{{0}}$", ""),  true);
+    total++; passed += Test("rep_zero_one",   Regex.isMatch("^a{{0}}$", "a"), false);
+    total++; passed += Test("rep_0_2_empty",  Regex.isMatch("^a{{0,2}}$", ""),   true);
+    total++; passed += Test("rep_0_2_over",   Regex.isMatch("^a{{0,2}}$", "aaa"),false);
+    total++; passed += Test("rep_five",       Regex.isMatch("^a{{5}}$", "aaaaa"), true);
+    total++; passed += Test("rep_five_bad",   Regex.isMatch("^a{{5}}$", "aaaa"),  false);
+    total++; passed += Test("rep_combo",      Regex.isMatch("^\\d{{3}}-\\d{{4}}$", "123-4567"), true);
+    total++; passed += Test("rep_combo_bad",  Regex.isMatch("^\\d{{3}}-\\d{{4}}$", "12-4567"),  false);
+
+    // -- character-class corner cases ---------------------------------------
+    total++; passed += Test("cls_lead_dash",  Regex.isMatch("^[-a]+$", "-a-"),     true);
+    total++; passed += Test("cls_trail_dash", Regex.isMatch("^[a-]+$", "a-a"),     true);
+    total++; passed += Test("cls_esc_bracket",Regex.isMatch("^[\\]]$", "]"),       true);
+    total++; passed += Test("cls_dot_literal",Regex.isMatch("^[.]$", "."),         true);
+    total++; passed += Test("cls_dot_lit_no",  Regex.isMatch("^[.]$", "a"),         false);
+    total++; passed += Test("cls_hex",        Regex.isMatch("^[0-9a-fA-F]+$", "1aF"), true);
+    total++; passed += Test("cls_hex_bad",    Regex.isMatch("^[0-9a-fA-F]+$", "1g"),  false);
+    total++; passed += Test("cls_esc_d",      Regex.isMatch("^[\\d]+$", "42"),     true);
+    total++; passed += Test("cls_neg_digit",  Regex.isMatch("^[^0-9]+$", "abc"),   true);
+    total++; passed += Test("cls_neg_digit_no",Regex.isMatch("^[^0-9]+$", "ab1"),  false);
+
+    // -- escaped metacharacters ---------------------------------------------
+    total++; passed += Test("esc_dot",        Regex.isMatch("^a\\.b$", "a.b"),  true);
+    total++; passed += Test("esc_dot_no",     Regex.isMatch("^a\\.b$", "axb"),  false);
+    total++; passed += Test("esc_star",       Regex.isMatch("^a\\*b$", "a*b"),  true);
+    total++; passed += Test("esc_parens",     Regex.isMatch("^\\(\\)$", "()"),  true);
+    // pattern "\\" (one backslash) matches a single backslash byte:
+    total++; passed += Test("esc_backslash",  Regex.isMatch("^\\\\$", "\\"),    true);
+
+    // -- more word-boundary cases -------------------------------------------
+    total++; passed += Test("bound_mid",      Regex.isMatch("\\bbar\\b", "foo bar baz"), true);
+    total++; passed += Test("bound_suffix_no",Regex.isMatch("cat\\b", "cats"),  false);
+    total++; passed += Test("bound_start",    Regex.isMatch("\\ba", "a"),       true);
+
+    // -- case sensitivity (no flag) -----------------------------------------
+    total++; passed += Test("case_sensitive", Regex.isMatch("^abc$", "ABC"),    false);
+    total++; passed += Test("case_class",     Regex.isMatch("^[a-z]$", "A"),    false);
+
+    // -- leftmost-longest tie-breaking --------------------------------------
+    Regex rl;
+    rl.compile("(ab|a)");
+    Match ml = rl.find("ab");
+    total++; passed += Test("longest_alt_end", ml.end, 2);
+
+    // leftmost-first (Perl) semantics: the earliest alternative wins, so
+    // "a|ab|abc" matches just "a" even though longer matches exist.
+    Regex rl2;
+    rl2.compile("a|ab|abc");
+    Match ml2 = rl2.find("xabc");
+    total++; passed += Test("lfirst_start", ml2.start, 1);
+    total++; passed += Test("lfirst_end",   ml2.end,   2);
+
+    // -- static find overload + value ---------------------------------------
+    Match ms3 = Regex.find("\\d+", "x42y");
+    total++; passed += Test("static_find_start", ms3.start, 1);
+    total++; passed += Test("static_find_value", ms3.value("x42y"), "42");
+
+    // -- findAll over words, and a non-empty repeat --------------------------
+    Regex rw;
+    rw.compile("\\w+");
+    list<Match> ws = rw.findAll("foo bar");
+    total++; passed += Test("findall_words_count", ws.count(), 2);
+    total++; passed += Test("findall_words_0",     ws.get(0).value("foo bar"), "foo");
+    total++; passed += Test("findall_words_1",     ws.get(1).value("foo bar"), "bar");
+
+    Regex rp;
+    rp.compile("a+");
+    list<Match> aps = rp.findAll("aba");
+    total++; passed += Test("findall_aplus_count", aps.count(), 2);
+
+    // -- anchored alternation list ------------------------------------------
+    total++; passed += Test("alt_list_hit",  Regex.isMatch("^(cat|dog|bird)$", "dog"),  true);
+    total++; passed += Test("alt_list_miss", Regex.isMatch("^(cat|dog|bird)$", "cats"), false);
+
+    // -- capture groups ------------------------------------------------------
+    Regex rc;
+    rc.compile("(\\d+)-(\\d+)");
+    Match mc = rc.find("call 123-4567 now");
+    total++; passed += Test("cap_whole",   mc.value("call 123-4567 now"), "123-4567");
+    total++; passed += Test("cap_g1",      mc.group(1, "call 123-4567 now"), "123");
+    total++; passed += Test("cap_g2",      mc.group(2, "call 123-4567 now"), "4567");
+    total++; passed += Test("cap_g1_start",mc.groupStart(1), 5);
+    total++; passed += Test("cap_count",   rc.groupCount(), 2);
+
+    // nested + optional groups: group that does not participate -> unmatched
+    Regex rn;
+    rn.compile("(a)(b)?c");
+    Match mn = rn.find("ac");
+    total++; passed += Test("cap_opt_whole",   mn.value("ac"), "ac");
+    total++; passed += Test("cap_opt_g1",      mn.group(1, "ac"), "a");
+    total++; passed += Test("cap_opt_absent",  mn.groupMatched(2), false);
+
+    Match mn2 = rn.find("abc");
+    total++; passed += Test("cap_opt_present", mn2.group(2, "abc"), "b");
+
+    // group with quantifier captures the LAST iteration
+    Regex rq;
+    rq.compile("(ab)+");
+    Match mq = rq.find("ababab");
+    total++; passed += Test("cap_rep_whole", mq.value("ababab"), "ababab");
+    total++; passed += Test("cap_rep_last",  mq.group(1, "ababab"), "ab");
+
+    // captures in findAll
+    Regex rk;
+    rk.compile("(\\w)(\\w)");
+    list<Match> ks = rk.findAll("abcd");
+    total++; passed += Test("cap_all_count", ks.count(), 2);
+    total++; passed += Test("cap_all_0g1",   ks.get(0).group(1, "abcd"), "a");
+    total++; passed += Test("cap_all_1g2",   ks.get(1).group(2, "abcd"), "d");
+
+    // -- case-insensitive ----------------------------------------------------
+    Regex ci;
+    ci.compileIgnoreCase("hello");
+    total++; passed += Test("ic_upper",   ci.isMatch("HELLO"), true);
+    total++; passed += Test("ic_mixed",   ci.isMatch("HeLLo"), true);
+    total++; passed += Test("ic_substr",  ci.isMatch("say HELLO!"), true);
+
+    Regex ci2;
+    ci2.compileIgnoreCase("^[a-z]+$");
+    total++; passed += Test("ic_class",   ci2.isMatch("AbCdE"), true);
+    total++; passed += Test("ic_class_no",ci2.isMatch("Ab3"),   false);
+
+    Regex cs;
+    cs.compile("hello");      // case-sensitive control
+    total++; passed += Test("cs_control", cs.isMatch("HELLO"), false);
+
+    // -- replace -------------------------------------------------------------
+    Regex rr;
+    rr.compile("\\d+");
+    total++; passed += Test("replace_simple", rr.replace("a1b22c333", "#"), "a#b#c#");
+
+    Regex rr2;
+    rr2.compile("(\\w+)@(\\w+)");
+    total++; passed += Test("replace_groups",
+        rr2.replace("user@host", "$2.$1"), "host.user");
+
+    Regex rr3;
+    rr3.compile("a");
+    total++; passed += Test("replace_dollar",
+        rr3.replace("a", "$$"), "$");      // $$ -> literal $
+
+    total++; passed += Test("replace_none",
+        rr.replace("abc", "#"), "abc");    // no matches -> unchanged
+
+    // -- split ---------------------------------------------------------------
+    Regex sp;
+    sp.compile(",");
+    list<string> parts = sp.split("a,b,c");
+    total++; passed += Test("split_count", parts.count(), 3);
+    total++; passed += Test("split_0",     parts.get(0), "a");
+    total++; passed += Test("split_2",     parts.get(2), "c");
+
+    Regex sp2;
+    sp2.compile("\\s+");
+    list<string> words = sp2.split("the  quick   fox");
+    total++; passed += Test("split_ws_count", words.count(), 3);
+    total++; passed += Test("split_ws_1",     words.get(1), "quick");
+
+    // -- linear-time safety: a pattern that catastrophically backtracks in a
+    //    naive engine must still return promptly here. 32 a's then a 'c' can
+    //    never match "(a+)+b"; the NFA decides it in O(n*m).
+    total++; passed += Test("nfa_no_blowup",
+        Regex.isMatch("(a+)+b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac"), false);
+    total++; passed += Test("nfa_pos",
+        Regex.isMatch("(a+)+b", "aaaab"), true);
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}
