@@ -878,13 +878,22 @@ private:
         backendAnalyzed_[slot] = true;
 
         if (!filePath.empty())
+        {
             backend->SetSourceFileDir(std::filesystem::path(filePath).parent_path().string());
+            // Make diagnostics point at the real document instead of the temp copy.
+            backend->SetSourceDisplayName(std::filesystem::path(filePath).filename().string());
+        }
+        else
+        {
+            backend->SetSourceDisplayName("");
+        }
 
-        backend->SetDiagnosticSink([&](const std::string& /*file*/, size_t line, size_t col, const std::string& msg)
+        backend->SetDiagnosticSink([&](const std::string& /*file*/, size_t line, size_t col, const std::string& msg, int severity)
         {
             lsp::Diagnostic diag;
-            diag.range   = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
-            diag.message = msg;
+            diag.range    = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
+            diag.message  = msg;
+            diag.severity = severity;
             diagnostics.push_back(diag);
         });
         backend->SetSymbolSink(newIndex.get());

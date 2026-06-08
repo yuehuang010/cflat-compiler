@@ -683,12 +683,15 @@ public:
 
     void LogError(std::string message) const
     {
-        std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
         if (diagnosticSink_)
         {
-            diagnosticSink_(sourceFileName, currentLine, currentColumn, message);
+            // LSP mode: the error is delivered to the editor over the sink (JSON-RPC).
+            // Don't also echo to cout - in LSP mode cout is redirected to stderr, so the
+            // echo is pure noise that duplicates the diagnostic already sent to the client.
+            diagnosticSink_(sourceFileName, currentLine, currentColumn, message, 1);
             throw CompilerAbortException{ message, sourceFileName, currentLine, currentColumn };
         }
+        std::cout << std::format("{}({},{}): {}\n", sourceFileName, currentLine, currentColumn, message);
         if (!expectedError.empty())
         {
             if (message.find(expectedError) != std::string::npos)
@@ -714,6 +717,14 @@ public:
 
     void LogWarning(std::string message) const
     {
+        if (diagnosticSink_)
+        {
+            // LSP mode: forward warnings to the editor as warning-severity diagnostics.
+            // Previously these went only to cout (-> stderr), so they were both noise on
+            // stderr and invisible in the editor. Routing through the sink fixes both.
+            diagnosticSink_(sourceFileName, currentLine, currentColumn, message, 2);
+            return;
+        }
         std::cout << std::format("{}({},{}): warning: {}\n", sourceFileName, currentLine, currentColumn, message);
     }
 
@@ -763,6 +774,10 @@ public:
     std::string importSearchDir;
     std::string runtimeDir;
     std::string sourceFileDir_;  // original source dir for LSP temp-file analysis
+    // Display name to use in diagnostics in place of the analyzed file's own name.
+    // The LSP analyzes a temp copy (cflat_lsp_*.cb); without this, every diagnostic and
+    // the __FILE__ macro would carry the temp name instead of the real source file.
+    std::string sourceDisplayName_;
 
     // Per-backend generic-template state, shared with MainListener via references.
     GenericTemplateState gts;
@@ -1024,7 +1039,7 @@ private:
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
-    std::function<void(const std::string&, size_t, size_t, const std::string&)> diagnosticSink_;
+    std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
 
     llvm::Function* currentFunction;
@@ -9294,6 +9309,9 @@ public:
     void SetSkipRuntimeImport(bool v) { skipRuntimeImport = v; }
     void SetRuntimeDir(const std::string& dir) { runtimeDir = dir; }
     void SetSourceFileDir(const std::string& dir) { sourceFileDir_ = dir; }
+    // Overrides the file name shown in diagnostics (and baked into __FILE__) for the next
+    // Analyze(). Used by the LSP so errors point at the real document, not the temp copy.
+    void SetSourceDisplayName(const std::string& name) { sourceDisplayName_ = name; }
     void SetVerbose(bool v) { verbose = v; }
     bool IsVerbose() const { return verbose; }
     void SetBatchMode(bool v) { batchMode_ = v; }
@@ -9302,7 +9320,8 @@ public:
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v) { cHeaderCacheDeep_ = v; }
 
-    using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg)>;
+    // severity: 1 = Error, 2 = Warning (matches the LSP DiagnosticSeverity codes).
+    using DiagnosticSink = std::function<void(const std::string& file, size_t line, size_t col, const std::string& msg, int severity)>;
     void SetDiagnosticSink(DiagnosticSink sink) { diagnosticSink_ = std::move(sink); }
 
     void SetSymbolSink(LspSymbolIndex* sink) { symbolSink_ = sink; }

@@ -117,7 +117,7 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
             std::string msg = d.message;
             if (!d.hint.empty())
                 msg += "\nhint: " + d.hint;
-            diagnosticSink_(d.file, static_cast<size_t>(d.line), static_cast<size_t>(d.col), msg);
+            diagnosticSink_(d.file, static_cast<size_t>(d.line), static_cast<size_t>(d.col), msg, 1);
             // No throw - parse errors are pre-codegen; caller returns false.
         }
         else
@@ -1377,7 +1377,12 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 {
     gts.Clear();
 
-    sourceFileName = std::filesystem::path(filePath).filename().string();
+    // Diagnostics should name the real document, not the temp copy the LSP hands us.
+    // When the caller supplied a display name, use it; otherwise fall back to the
+    // analyzed file's own name (e.g. direct CLI --check on a real path).
+    sourceFileName = sourceDisplayName_.empty()
+        ? std::filesystem::path(filePath).filename().string()
+        : sourceDisplayName_;
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
     importedFiles.insert(rootCanonical);
@@ -1443,7 +1448,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
 
-        CFlatErrorListener analyzeErrorListener(filePath, analyzeSourceLines);
+        // Use the display name (real document) for parse diagnostics, not the temp copy.
+        CFlatErrorListener analyzeErrorListener(sourceFileName, analyzeSourceLines);
         lexer.removeErrorListeners();
         lexer.addErrorListener(&analyzeErrorListener);
         parser.removeErrorListeners();
