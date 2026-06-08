@@ -77,24 +77,19 @@ if errorlevel 1 (
     set /a FAIL+=1
     exit /b 0
 )
-REM Extract just the span_axpy function body and assert: it vectorizes, carries the array-view
-REM alias.scope metadata, and contains NO vector.memcheck. (A whole-file grep would be confused by
-REM memchecks in unrelated core functions, so the check is scoped to the function.)
-pwsh -NoProfile -Command ^
-  "$ll = Get-Content -Raw '%SPAN_LL%';" ^
-  "$m = [regex]::Match($ll, '(?s)define[^\r\n]*@_span_axpy.*?\r?\n\}');" ^
-  "if (-not $m.Success) { Write-Host '  FAILED: span_axpy not found in IR'; exit 1 }" ^
-  "$b = $m.Value;" ^
-  "if (-not ($b -match '<\d+ x double>'))  { Write-Host '  FAILED: span_axpy did not vectorize'; exit 1 }" ^
-  "if (-not ($b -match 'alias\.scope'))    { Write-Host '  FAILED: span_axpy missing array-view alias.scope metadata'; exit 1 }" ^
-  "if ($b -match 'memcheck')               { Write-Host '  FAILED: span_axpy emitted a runtime alias check (vector.memcheck) - noalias not effective'; exit 1 }" ^
-  "$mc = [regex]::Match($ll, '(?s)define[^\r\n]*@_chunk_axpy.*?\r?\n\}');" ^
-  "if (-not $mc.Success) { Write-Host '  FAILED: chunk_axpy not found in IR'; exit 1 }" ^
-  "$bc = $mc.Value;" ^
-  "if (-not ($bc -match '<\d+ x double>')) { Write-Host '  FAILED: chunk_axpy did not vectorize'; exit 1 }" ^
-  "if (-not ($bc -match 'alias\.scope'))   { Write-Host '  FAILED: chunk_axpy missing array-view alias.scope metadata'; exit 1 }" ^
-  "if ($bc -match 'memcheck')              { Write-Host '  FAILED: chunk_axpy emitted a runtime alias check - sliced span lost noalias'; exit 1 }" ^
-  "Write-Host '  OK: span_axpy and chunk_axpy vectorized, alias-scoped, no memcheck'; exit 0"
+REM Assert per function that span_axpy/chunk_axpy each vectorized, carry the array-view
+REM alias.scope metadata, and contain NO vector.memcheck. The checks are scoped to each
+REM function body (a whole-file grep would be confused by memchecks in unrelated core
+REM functions). Validation is done by a small CFlat program rather than a shell script.
+set CHECK_SRC=Test\span_noalias_check.cb
+set CHECK_EXE=out\span_noalias_check.exe
+"%COMPILER%" "%CHECK_SRC%" -i Test\library -o "%CHECK_EXE%"
+if errorlevel 1 (
+    echo   FAILED: span noalias validator did not compile
+    set /a FAIL+=1
+    exit /b 0
+)
+"%CHECK_EXE%" "%SPAN_LL%"
 if errorlevel 1 set /a FAIL+=1
 exit /b 0
 

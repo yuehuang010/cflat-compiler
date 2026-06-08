@@ -1,0 +1,92 @@
+// Validator for test_hpc.bat's span<T> noalias guarantee. Replaces the inline
+// PowerShell IR grep: reads the -O2 LLVM IR emitted for span_noalias_fixture.cb
+// and asserts, per function, that it (1) vectorized, (2) carries the array-view
+// alias.scope metadata, and (3) emitted NO runtime alias check (vector.memcheck).
+//
+// The checks are scoped to each function body so a memcheck in an unrelated core
+// function cannot mask a real regression. Named without a `test_` prefix so
+// test.bat's `test_*.cb` wildcard skips it (it is driven by test_hpc.bat).
+//
+// Usage: span_noalias_check <path-to-span_noalias_fixture.ll>
+//   exit 0 = all checks passed, 1 = at least one check failed.
+import "cruntime.cb";
+import "string.cb";
+import "filesystem.cb";
+
+// Length of a null-terminated C string.
+int cstrLen(i8* s)
+{
+    int n = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+// Index of `needle` in `hay[start..endExcl)`, or -1 if not found.
+int indexIn(i8* hay, int start, int endExcl, i8* needle)
+{
+    int nl = cstrLen(needle);
+    if (nl == 0) { return start; }
+    int i = start;
+    while (i + nl <= endExcl) {
+        int j = 0;
+        while (j < nl && hay[i + j] == needle[j]) { j = j + 1; }
+        if (j == nl) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Verify the body of `@<fnTag>` vectorizes, is alias-scoped, and has no memcheck.
+// Returns 1 on success, 0 on failure (and prints the specific reason).
+int checkFunction(i8* ir, int len, i8* fnTag)
+{
+    int start = indexIn(ir, 0, len, fnTag);
+    if (start < 0) {
+        printf("  FAILED: %s not found in IR\n", fnTag);
+        return 0;
+    }
+    // Function body ends at the first line-start closing brace after the header.
+    int end = indexIn(ir, start, len, "\n}");
+    if (end < 0) { end = len; }
+
+    if (indexIn(ir, start, end, "x double>") < 0) {
+        printf("  FAILED: %s did not vectorize (no <N x double>)\n", fnTag);
+        return 0;
+    }
+    if (indexIn(ir, start, end, "alias.scope") < 0) {
+        printf("  FAILED: %s missing array-view alias.scope metadata\n", fnTag);
+        return 0;
+    }
+    if (indexIn(ir, start, end, "memcheck") >= 0) {
+        printf("  FAILED: %s emitted a runtime alias check (vector.memcheck) - noalias not effective\n", fnTag);
+        return 0;
+    }
+    return 1;
+}
+
+extern int main(int argc, char** argv)
+{
+    stringbuilder sb;
+    if (argc > 1) { sb.appendCStr(argv[1]); }
+    else { sb.appendCStr("out\\span_noalias_fixture.ll"); }
+    string path = sb.toString();
+
+    if (!File.exists(path)) {
+        printf("  FAILED: IR file not found: %s\n", path.data());
+        return 1;
+    }
+
+    string ir = File.readAllText(path);
+    i8* p = ir.data();
+    int len = ir.length();
+
+    int ok = 1;
+    if (checkFunction(p, len, "@_span_axpy") == 0)  { ok = 0; }
+    if (checkFunction(p, len, "@_chunk_axpy") == 0) { ok = 0; }
+
+    if (ok == 1) {
+        printf("  OK: span_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");
+        return 0;
+    }
+    return 1;
+}
