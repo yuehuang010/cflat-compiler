@@ -1,0 +1,286 @@
+import "thread.cb";
+import "threadpool.cb";
+
+// parallel.cb - data-parallel helpers that close the "across-core" gap left by the
+// single-threaded HPC primitives (`vectorize`, `simd<T,N>`, span<T> noalias). They
+// partition an index range [0,n) into balanced sub-ranges, fan the work out over
+// worker threads, and (for reductions) combine the per-worker partials.
+//
+// Two backends per helper:
+//   - RAW THREAD (parallel_for_n / parallel_reduce) - spawns `workers` threads and
+//                            joins them. Zero setup; best for an occasional region.
+//   - THREAD POOL (parallel_for_n_pool / parallel_reduce_pool) - takes a ThreadPool*,
+//                            submits one task per chunk, and waits on the returned
+//                            handles. Reuses resident workers; best when the region
+//                            runs repeatedly (e.g. once per solver timestep).
+//
+// `workers <= 0` selects a default (hardware_concurrency(), or the pool's worker
+// count for the pool overloads). `workers` is clamped to `n` so every spawned
+// worker gets at least one element.
+//
+// The body is a non-capturing `function<...>` plus a shared, BORROWED `void* ctx`
+// it reads its buffers/scalars through (CFlat lambdas do not capture, so the kernel
+// inputs travel in a caller-defined context struct). The body never owns ctx.
+//
+//   struct AxpyCtx { double[] y; double[] x; double alpha; }
+//
+//   AxpyCtx c;  c.y = y;  c.x = x;  c.alpha = 2.5;
+//   parallel_for_n(n, 0, (i64 lo, i64 hi, void* raw) => {
+//       AxpyCtx* k = (AxpyCtx*)raw;
+//       double[] y = k->y;  double[] x = k->x;  double a = k->alpha;
+//       for (i64 i = lo; i < hi; i = i + 1) { y[i] = y[i] + a * x[i]; }
+//   }, &c);
+
+// ----------------------------------------------------------------------------
+// parallel_for_n - run body([lo,hi), ctx) once per worker over a partition of [0,n).
+// ----------------------------------------------------------------------------
+
+// Boxed per-chunk work item. For the raw-thread overload these live in one array
+// owned by the helper (borrowed to each thread, freed after join). For the pool
+// overload each is heap-allocated and moved into the task, which frees it.
+struct __PForBox {
+    function<void(i64, i64, void*)> body = default;
+    void* ctx   = nullptr;
+    i64   start = 0;
+    i64   end   = 0;
+};
+
+// Wrapper so a heap array of TaskHandle* can be allocated: `new TaskHandle*[n]`
+// (a bare-pointer element type) does not parse, but a one-field struct does.
+struct __HandleSlot {
+    TaskHandle* h = nullptr;
+};
+
+// Thread.start trampoline (borrow ctx; helper owns the box).
+int __pfor_thread_tramp(void* raw) {
+    __PForBox* b = (__PForBox*)raw;
+    b->body(b->start, b->end, b->ctx);
+    return 0;
+}
+
+// ThreadPool.submit trampoline (owns the box; frees it after running).
+int __pfor_pool_tramp(move void* raw, stop_token tok) {
+    __PForBox* b = (__PForBox*)raw;
+    b->body(b->start, b->end, b->ctx);
+    delete b;
+    return 0;
+}
+
+// RAW THREAD overload.
+void parallel_for_n(i64 n, int workers, function<void(i64, i64, void*)> body, void* ctx) {
+    if (n <= 0) { return; }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+
+    Thread*    threads = new Thread[workers];
+    __PForBox* boxes   = new __PForBox[workers];
+
+    i64 base  = n / (i64)workers;
+    i64 rem   = n % (i64)workers;
+    i64 start = 0;
+    int w = 0;
+    while (w < workers) {
+        i64 count = base + ((i64)w < rem ? 1 : 0);
+        boxes[w].body  = body;
+        boxes[w].ctx   = ctx;
+        boxes[w].start = start;
+        boxes[w].end   = start + count;
+        threads[w].start(__pfor_thread_tramp, &boxes[w]);
+        start = start + count;
+        w = w + 1;
+    }
+    w = 0;
+    while (w < workers) { threads[w].join(); w = w + 1; }
+
+    delete[_] threads;
+    delete[_] boxes;
+}
+
+// THREAD POOL variant. Named with a `_pool` suffix rather than overloading
+// parallel_for_n: the reduction's pool variant cannot overload (two generic
+// functions of the same name monomorphize to the same mangled symbol and
+// collide), so both pool entry points use the suffix for a consistent API.
+void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, function<void(i64, i64, void*)> body, void* ctx) {
+    if (n <= 0) { return; }
+    if (workers <= 0) { workers = pool->workerCount(); }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+
+    __HandleSlot* handles = new __HandleSlot[workers];
+
+    i64 base  = n / (i64)workers;
+    i64 rem   = n % (i64)workers;
+    i64 start = 0;
+    int w = 0;
+    while (w < workers) {
+        i64 count = base + ((i64)w < rem ? 1 : 0);
+        __PForBox* box = new __PForBox;
+        box->body  = body;
+        box->ctx   = ctx;
+        box->start = start;
+        box->end   = start + count;
+        handles[w].h = pool->submit(__pfor_pool_tramp, box);
+        if (handles[w].h == nullptr) {
+            // Pool refused (queue saturated / shutting down): submit already
+            // freed the box, so run this range inline on the calling thread.
+            body(start, start + count, ctx);
+        }
+        start = start + count;
+        w = w + 1;
+    }
+
+    w = 0;
+    while (w < workers) {
+        TaskHandle* h = move handles[w].h;
+        if (h != nullptr) { h->wait(); delete h; }
+        w = w + 1;
+    }
+    delete[_] handles;
+}
+
+// ----------------------------------------------------------------------------
+// parallel_reduce<T> - fold [0,n) into a single T. Each worker reduces its chunk to
+// a partial via partial([lo,hi), ctx); the helper merges the partials with combine
+// (seeded by identity) after all workers finish. combine must be associative; the
+// result depends on `workers` (reassociation), so it is not bit-identical to a
+// serial fold - standard for parallel/SIMD reductions.
+// ----------------------------------------------------------------------------
+
+struct __PRedBox<T> {
+    // `run` MUST stay first: __PRedHeader aliases it so the non-generic pool
+    // trampoline can invoke the T-specialized work without being generic itself.
+    function<int(void*)>        run     = default;
+    function<T(i64, i64, void*)> partial = default;
+    void* ctx   = nullptr;
+    i64   start = 0;
+    i64   end   = 0;
+    T*    slot  = nullptr;   // this chunk's partial lands here (distinct per worker)
+};
+
+// Non-generic view of __PRedBox<T>'s leading `run` field. A generic function
+// cannot be referenced as a function-pointer value to hand to submit(), and a
+// lambda cannot declare the `move void*` parameter the pool's task ABI requires
+// - so the box carries a non-capturing `function<int(void*)>` (which lambdas CAN
+// express, and which is T-independent in type) and this non-generic trampoline
+// dispatches through it.
+struct __PRedHeader {
+    function<int(void*)> run = default;
+};
+
+// ThreadPool.submit trampoline for the reduction (owns the box; frees it).
+int __pred_pool_tramp(move void* raw, stop_token tok) {
+    __PRedHeader* hdr = (__PRedHeader*)raw;
+    hdr->run((void*)hdr);   // run casts back to __PRedBox<T>* and stores its partial
+    delete raw;             // box has no destructor; free as a raw allocation
+    return 0;
+}
+
+// RAW THREAD overload.
+T parallel_reduce<T>(i64 n, int workers, T identity,
+                     function<T(i64, i64, void*)> partial,
+                     function<T(T, T)> combine, void* ctx) {
+    if (n <= 0) { return identity; }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+
+    Thread*       threads  = new Thread[workers];
+    __PRedBox<T>* boxes    = new __PRedBox<T>[workers];
+    T*            partials = new T[workers];
+
+    // Non-capturing trampoline (references only the type parameter T); writes the
+    // chunk's partial through the box's distinct slot, so no synchronization.
+    function<int(void*)> tramp = (void* raw) => {
+        __PRedBox<T>* b = (__PRedBox<T>*)raw;
+        *b->slot = b->partial(b->start, b->end, b->ctx);
+        return 0;
+    };
+
+    i64 base  = n / (i64)workers;
+    i64 rem   = n % (i64)workers;
+    i64 start = 0;
+    int w = 0;
+    while (w < workers) {
+        i64 count = base + ((i64)w < rem ? 1 : 0);
+        partials[w]      = identity;
+        boxes[w].partial = partial;
+        boxes[w].ctx     = ctx;
+        boxes[w].start   = start;
+        boxes[w].end     = start + count;
+        boxes[w].slot    = &partials[w];
+        threads[w].start(tramp, &boxes[w]);
+        start = start + count;
+        w = w + 1;
+    }
+
+    T total = identity;
+    w = 0;
+    while (w < workers) {
+        threads[w].join();
+        total = combine(total, partials[w]);
+        w = w + 1;
+    }
+
+    delete[_] threads;
+    delete[_] boxes;
+    delete[_] partials;
+    return total;
+}
+
+// THREAD POOL variant (see parallel_for_n_pool for why this is a distinct name).
+T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
+                          function<T(i64, i64, void*)> partial,
+                          function<T(T, T)> combine, void* ctx) {
+    if (n <= 0) { return identity; }
+    if (workers <= 0) { workers = pool->workerCount(); }
+    if (workers <= 0) { workers = hardware_concurrency(); }
+    if ((i64)workers > n) { workers = (int)n; }
+
+    __HandleSlot* handles  = new __HandleSlot[workers];
+    T*            partials = new T[workers];
+
+    // Non-capturing trampoline (reads everything from the box). Stored in each
+    // box so the non-generic __pred_pool_tramp can dispatch through it.
+    function<int(void*)> run = (void* raw) => {
+        __PRedBox<T>* b = (__PRedBox<T>*)raw;
+        *b->slot = b->partial(b->start, b->end, b->ctx);
+        return 0;
+    };
+
+    i64 base  = n / (i64)workers;
+    i64 rem   = n % (i64)workers;
+    i64 start = 0;
+    int w = 0;
+    while (w < workers) {
+        i64 count = base + ((i64)w < rem ? 1 : 0);
+        partials[w]    = identity;
+        __PRedBox<T>* box = new __PRedBox<T>;
+        box->run     = run;
+        box->partial = partial;
+        box->ctx     = ctx;
+        box->start   = start;
+        box->end     = start + count;
+        box->slot    = &partials[w];
+        handles[w].h = pool->submit(__pred_pool_tramp, box);
+        if (handles[w].h == nullptr) {
+            // Pool refused: box already freed; reduce this range inline.
+            partials[w] = partial(start, start + count, ctx);
+        }
+        start = start + count;
+        w = w + 1;
+    }
+
+    w = 0;
+    while (w < workers) {
+        TaskHandle* h = move handles[w].h;
+        if (h != nullptr) { h->wait(); delete h; }
+        w = w + 1;
+    }
+
+    T total = identity;
+    w = 0;
+    while (w < workers) { total = combine(total, partials[w]); w = w + 1; }
+
+    delete[_] handles;
+    delete[_] partials;
+    return total;
+}

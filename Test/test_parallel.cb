@@ -1,0 +1,210 @@
+import "test_helper.cb";
+import "parallel.cb";
+
+// Exercises core/parallel.cb: parallel_for_n (map) and parallel_reduce<T>
+// (reduction), each on both the raw-thread and the ThreadPool backend.
+
+int g_pass = 0;
+int g_total = 0;
+
+void check(const char* name, bool cond) {
+    g_total = g_total + 1;
+    g_pass = g_pass + Test(name, cond, true);
+}
+
+bool approx(double a, double b) {
+    double d = a - b;
+    if (d < 0.0) { d = -d; }
+    return d < 0.000001;
+}
+
+// ---- contexts -------------------------------------------------------------
+
+struct AxpyCtx {
+    double[] y     = default;
+    double[] x     = default;
+    double   alpha = 0.0;
+};
+
+struct DotCtx {
+    double[] x = default;
+    double[] y = default;
+};
+
+struct SumCtx {
+    i64[] v = default;
+};
+
+// ---- parallel_for_n: axpy y[i] = y[i] + alpha*x[i] ------------------------
+
+void fillAxpy(double[] x, double[] y, i64 n) {
+    i64 i = 0;
+    while (i < n) { x[i] = (double)i; y[i] = 2.0 * (double)i; i = i + 1; }
+}
+
+bool checkAxpy(double[] y, i64 n) {
+    // y started at 2i, alpha=3, x=i -> expect 5i.
+    i64 i = 0;
+    while (i < n) {
+        if (!approx(y[i], 5.0 * (double)i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+void testForN_thread() {
+    i64 n = 100000;
+    double[] x = new double[n];
+    double[] y = new double[n];
+    fillAxpy(x, y, n);
+
+    AxpyCtx c;
+    c.y = y; c.x = x; c.alpha = 3.0;
+    parallel_for_n(n, 4, (i64 lo, i64 hi, void* raw) => {
+        AxpyCtx* k = (AxpyCtx*)raw;
+        double[] yy = k->y;
+        double[] xx = k->x;
+        double a = k->alpha;
+        i64 i = lo;
+        while (i < hi) { yy[i] = yy[i] + a * xx[i]; i = i + 1; }
+    }, &c);
+
+    check("parallel_for_n thread axpy", checkAxpy(y, n));
+    delete[_] x;
+    delete[_] y;
+}
+
+void testForN_pool() {
+    i64 n = 100000;
+    double[] x = new double[n];
+    double[] y = new double[n];
+    fillAxpy(x, y, n);
+
+    ThreadPool pool;
+    pool.init(4);
+
+    AxpyCtx c;
+    c.y = y; c.x = x; c.alpha = 3.0;
+    parallel_for_n_pool(&pool, n, 0, (i64 lo, i64 hi, void* raw) => {
+        AxpyCtx* k = (AxpyCtx*)raw;
+        double[] yy = k->y;
+        double[] xx = k->x;
+        double a = k->alpha;
+        i64 i = lo;
+        while (i < hi) { yy[i] = yy[i] + a * xx[i]; i = i + 1; }
+    }, &c);
+
+    pool.shutdown();
+    check("parallel_for_n pool axpy", checkAxpy(y, n));
+    delete[_] x;
+    delete[_] y;
+}
+
+// ---- reduction kernels (named functions: a value-returning lambda passed
+//      inline as an argument does not pick up its return type, so reductions
+//      use named partial/combine functions - the realistic pattern). ---------
+
+double dotPartial(i64 lo, i64 hi, void* raw) {
+    DotCtx* k = (DotCtx*)raw;
+    double[] xx = k->x;
+    double[] yy = k->y;
+    double s = 0.0;
+    i64 j = lo;
+    while (j < hi) { s = s + xx[j] * yy[j]; j = j + 1; }
+    return s;
+}
+
+double addDouble(double a, double b) { return a + b; }
+
+i64 sumPartial(i64 lo, i64 hi, void* raw) {
+    SumCtx* k = (SumCtx*)raw;
+    i64[] vv = k->v;
+    i64 s = 0;
+    i64 j = lo;
+    while (j < hi) { s = s + vv[j]; j = j + 1; }
+    return s;
+}
+
+i64 addI64(i64 a, i64 b) { return a + b; }
+
+// ---- parallel_reduce: dot product (double) --------------------------------
+
+void testReduce_thread_dot() {
+    i64 n = 100000;
+    double[] x = new double[n];
+    double[] y = new double[n];
+    i64 i = 0;
+    while (i < n) { x[i] = 1.0; y[i] = 2.0; i = i + 1; }   // dot = 2*n
+
+    DotCtx c;
+    c.x = x; c.y = y;
+    double dot = parallel_reduce<double>(n, 4, 0.0, dotPartial, addDouble, &c);
+
+    check("parallel_reduce thread dot", approx(dot, 2.0 * (double)n));
+    delete[_] x;
+    delete[_] y;
+}
+
+void testReduce_pool_dot() {
+    i64 n = 100000;
+    double[] x = new double[n];
+    double[] y = new double[n];
+    i64 i = 0;
+    while (i < n) { x[i] = 1.0; y[i] = 2.0; i = i + 1; }
+
+    ThreadPool pool;
+    pool.init(4);
+
+    DotCtx c;
+    c.x = x; c.y = y;
+    double dot = parallel_reduce_pool<double>(&pool, n, 0, 0.0, dotPartial, addDouble, &c);
+
+    pool.shutdown();
+    check("parallel_reduce pool dot", approx(dot, 2.0 * (double)n));
+    delete[_] x;
+    delete[_] y;
+}
+
+// ---- parallel_reduce: integer sum (generic over i64) ----------------------
+
+void testReduce_thread_sum() {
+    i64 n = 100000;
+    i64[] v = new i64[n];
+    i64 i = 0;
+    while (i < n) { v[i] = i; i = i + 1; }   // sum 0..n-1 = n*(n-1)/2
+
+    SumCtx c;
+    c.v = v;
+    i64 sum = parallel_reduce<i64>(n, 8, (i64)0, sumPartial, addI64, &c);
+
+    i64 expect = n * (n - 1) / 2;
+    check("parallel_reduce thread i64 sum", sum == expect);
+    delete[_] v;
+}
+
+// ---- edge: more workers than elements -------------------------------------
+
+void testReduce_moreWorkersThanN() {
+    i64 n = 3;
+    i64[] v = new i64[n];
+    v[0] = 10; v[1] = 20; v[2] = 30;
+
+    SumCtx c;
+    c.v = v;
+    i64 sum = parallel_reduce<i64>(n, 16, (i64)0, sumPartial, addI64, &c);
+
+    check("parallel_reduce workers>n", sum == 60);
+    delete[_] v;
+}
+
+extern int main() {
+    testForN_thread();
+    testForN_pool();
+    testReduce_thread_dot();
+    testReduce_pool_dot();
+    testReduce_thread_sum();
+    testReduce_moreWorkersThanN();
+
+    printf("%d/%d passed\n", g_pass, g_total);
+    return g_pass == g_total ? 0 : 1;
+}

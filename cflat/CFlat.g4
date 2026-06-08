@@ -458,6 +458,7 @@ typeName
 
 abstractDeclarator
     : pointer
+    | pointer? arrayDimSpec   // `(T[])` cast target = the noalias array-view escape (explicit T* -> T[])
     ;
 
 typedefName

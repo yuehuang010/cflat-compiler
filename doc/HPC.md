@@ -22,8 +22,9 @@ failure points you toward.
 - [`simd<T,N>` explicit vector type](#simdtn-explicit-vector-type)
 - [`T[]` array-view (noalias)](#t-array-view-noalias)
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
+- [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
 
-**Related:** [Threading & Memory Management](threading.md) (affinity, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
+**Related:** [Threading & Memory Management](threading.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
 
 ---
 
@@ -134,12 +135,24 @@ Rules:
   with `a[i]` instead. This is what makes the noalias contract *provable* rather than
   trusted: with no arithmetic (and no `int* -> int[]` conversion), a view can only ever
   span a whole allocation, so two views alias if and only if they share a base pointer.
-- **One-way conversion, enforced.** Decay `T[] -> T*` is implicit and always safe (it drops
-  the guarantee). The reverse - binding a raw `T*` into a `T[]` - is a **compile error** at
-  every binding site: declaration-init (`int[] a = p;`), re-assignment (`a = p;`), struct
-  field store (`s.view = p;`), passing to a `T[]` parameter (`f(p)`), and `return p;` from a
-  `T[]`-returning function. A view therefore comes *only* from `new T[n]`, another `T[]`, or a
-  copy of one - which is what makes "two views alias iff they share a base pointer" provable.
+- **One-way conversion, enforced - with an explicit escape.** Decay `T[] -> T*` is implicit
+  and always safe (it drops the guarantee). The reverse - *implicitly* binding a raw `T*` into
+  a `T[]` - is a **compile error** at every binding site: declaration-init (`int[] a = p;`),
+  re-assignment (`a = p;`), struct field store (`s.view = p;`), passing to a `T[]` parameter
+  (`f(p)`), and `return p;` from a `T[]`-returning function. This is the same shape as the
+  language's implicit-upcast / explicit-downcast rule: the unsafe direction (adding an
+  *unprovable* guarantee) needs an **explicit cast** `(T[])p`, by which you assert the pointer
+  spans a whole, distinct allocation:
+
+  ```c
+  int* p = some_c_api();        // a raw, whole buffer you own
+  int[] a = (int[])p;           // explicit escape: "trust me, this is a whole allocation"
+  ```
+
+  The cast is a pure reinterpret (`T*` and `T[]` share a representation) and is greppable in
+  review, so the unsafe assertion is always visible. Without it, a view comes *only* from
+  `new T[n]`, another `T[]`, or a copy of one - which is what makes "two views alias iff they
+  share a base pointer" provable for code that doesn't reach for the escape.
 - **Usable as a struct field.** A container can hold a noalias buffer as an `int[]` field:
   store it from `new T[n]` at construction, read it back as a view, and pass it to kernels.
   The store gate guarantees the field can only ever hold a whole-allocation view, so reads
@@ -163,10 +176,10 @@ Rules:
 > - **`T[]` as a generic type argument** (`list<int[]>`) does not parse - `int[]` is a
 >   parameter/local/field type, not a container element type (use `int*`).
 > - `&a[i]` yields a raw `int*` (a borrow of one element), and the one-way rule applies to
->   it too: it is usable as an `int*` but cannot be bound back into a `T[]`, so it cannot
->   forge an offset view.
-> - One escape hatch remains by design, the same category as Fortran `EQUIVALENCE`: a
->   `union { int* p; int[] v; }` can type-pun a raw pointer into a view.
+>   it too: it cannot be *implicitly* bound back into a `T[]`. The explicit `(T[])&a[i]` cast
+>   is the sanctioned way to re-bless it (this is exactly how `span<T>.chunk` builds an offset
+>   tile). The older `union { int* p; int[] v; }` type-pun still works (Fortran `EQUIVALENCE`
+>   style) but the explicit cast is preferred - it is shorter and needs no union type.
 
 ## `span<T>` (noalias) and `view<T>` (may-alias)
 
@@ -215,12 +228,119 @@ noalias promise. The reverse, `view<T> -> span<T>`, is a **compile error**: `spa
 `T[]`, so binding a `view`'s raw `T*` into it would forge the noalias contract. A span therefore
 only ever originates from a `new T[n]` view or another `T[]`.
 
-### Slicing
+### Slicing and partitioning
 
 `view<T>` has `slice(start, end)` returning a sub-range view - sound precisely because views are
-may-alias (two sub-views are allowed to overlap). `span<T>` deliberately has **no** slice: an offset
-span would break its whole-allocation invariant, reopening the aliasing the noalias contract closes.
+may-alias (two sub-views are allowed to overlap). `span<T>` deliberately has **no** general
+`slice`/`subspan`: an arbitrary offset span (e.g. `s.subspan(0,10)` and `s.subspan(5,10)`) could
+overlap while looking distinct, reopening the aliasing the noalias contract closes.
+
+What `span<T>` *does* provide is a **disjoint partition** - `chunk(idx, nchunks)` - the data-parallel
+primitive (the analog of Rust's `chunks_mut`). It returns the `idx`-th of `nchunks` contiguous,
+balanced tiles (the first `length % nchunks` tiles get one extra element, so the tiles cover the span
+exactly and differ in length by at most one). Crucially you *cannot spell an overlap*: distinct `idx`
+with the same `nchunks` are always disjoint, so each tile keeps the full noalias guarantee. Hand tile
+`i` to worker `i` and an -O2 `vectorize` loop over two workers' tiles drops the runtime alias check,
+exactly as for a whole span.
+
+```c
+// Partition two buffers N ways; each worker gets its own noalias window.
+span<double> ys = ...;  // whole buffer
+span<double> xs = ...;
+span<double> y = ys.chunk(workerId, numWorkers);   // this worker's disjoint tile
+span<double> x = xs.chunk(workerId, numWorkers);
+axpy(2.0, y, x);                                    // vectorizes, no memcheck
+```
+
+Internally `chunk` offsets the noalias `T[]` with the explicit `(T[])&_ptr[start]` escape (since
+`T[]` bans pointer arithmetic, `&_ptr[start]` gives a raw `T*` that the cast re-blesses as a view);
+it is gated behind the disjoint-tiling API so user code can never forge an overlapping view.
 
 > Self-aliasing a noalias parameter is on the caller (the same caveat as a bare `T[]` parameter):
 > passing the same span as two arguments to a *writing* kernel - `axpy(a, y, y)` - is UB the
-> optimizer may miscompile. Read-only self-aliasing (e.g. a `dot(r, r)` reduction) is harmless.
+> optimizer may miscompile. The same applies to tiles: `chunk` is disjoint only for a *fixed*
+> `nchunks` - mixing `nchunks` values (`chunk(0,2)` vs `chunk(0,3)`) can overlap. Read-only
+> self-aliasing (e.g. a `dot(r, r)` reduction) is harmless.
+
+---
+
+## Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)
+
+`vectorize`, `simd<T,N>`, and `span<T>` parallelize *within* one core (SIMD lanes). `core/parallel.cb`
+adds the *across-core* axis: partition an index range `[0, n)` into balanced sub-ranges and fan the
+work out over worker threads. `import "parallel.cb";`
+
+Each helper comes in two backends:
+
+| Backend | Function | When |
+|---------|----------|------|
+| Raw threads | `parallel_for_n`, `parallel_reduce<T>` | Occasional region; zero setup (spawns + joins `workers` threads). |
+| Thread pool | `parallel_for_n_pool`, `parallel_reduce_pool<T>` | Region runs repeatedly (e.g. per solver timestep); reuses a `ThreadPool`'s resident workers. |
+
+`workers <= 0` selects a default (`hardware_concurrency()`, or the pool's worker count for the pool
+variants); `workers` is clamped to `n`. CFlat lambdas do not capture, so the worker reads its buffers
+and scalars through a borrowed `void* ctx` (a caller-defined context struct) plus its `[lo, hi)` range.
+
+### `parallel_for_n` - parallel map
+
+```c
+struct AxpyCtx { double[] y; double[] x; double alpha; }
+
+AxpyCtx c;  c.y = y;  c.x = x;  c.alpha = 2.5;
+parallel_for_n(n, 0, (i64 lo, i64 hi, void* raw) => {     // 0 -> hardware_concurrency()
+    AxpyCtx* k = (AxpyCtx*)raw;
+    double[] y = k->y;  double[] x = k->x;  double a = k->alpha;
+    for (i64 i = lo; i < hi; i = i + 1) { y[i] = y[i] + a * x[i]; }
+}, &c);
+```
+
+The body is called once per worker (not once per element), so there is no per-element call overhead.
+A `void`-returning body lambda can be written inline as shown.
+
+### `parallel_reduce<T>` - parallel reduction
+
+Each worker folds its chunk into a partial `T`; the helper merges the partials with `combine` (seeded
+by `identity`) after all workers finish. Reductions are exactly the kernels that *cannot* use
+`vectorize` for the cross-element accumulation (FP reassociation changes the result), so threads are
+their only coarse parallelism - while the per-chunk `partial` loop can still be a `vectorize`/`simd`
+reduction, stacking SIMD under threads.
+
+```c
+struct DotCtx { double[] a; double[] b; }
+
+// A value-returning lambda passed inline as an argument does not pick up its
+// return type, so partial/combine are named functions (also the clearer pattern).
+double dotPartial(i64 lo, i64 hi, void* raw) {
+    DotCtx* k = (DotCtx*)raw;
+    double[] a = k->a;  double[] b = k->b;
+    double s = 0.0;
+    for (i64 i = lo; i < hi; i = i + 1) { s = s + a[i] * b[i]; }
+    return s;
+}
+double addD(double x, double y) { return x + y; }
+
+DotCtx c;  c.a = a;  c.b = b;
+double dot = parallel_reduce<double>(n, 4, 0.0, dotPartial, addD, &c);
+```
+
+`combine` must be associative. Because both SIMD lane-reduction *and* the per-worker split reassociate
+floating-point adds, the result depends on `workers` and is **not** bit-identical to a serial fold -
+standard and expected for parallel/SIMD reductions.
+
+### Pool variants
+
+The pool variants take a `ThreadPool*` first argument and otherwise match. Amortize the worker threads
+across a hot loop:
+
+```c
+ThreadPool pool;  pool.init(4);
+for (int step = 0; step < 1000; step++) {
+    double r = parallel_reduce_pool<double>(&pool, n, 0, 0.0, dotPartial, addD, &c);
+    // ... use r ...
+}
+pool.shutdown();
+```
+
+> The pool variants are named `*_pool` rather than overloading the raw names: two generic functions of
+> the same name monomorphize to the same mangled symbol and would collide, so both pool entry points
+> carry the suffix for a uniform API.

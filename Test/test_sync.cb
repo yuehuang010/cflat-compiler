@@ -7,6 +7,7 @@ import "latch.cb";
 import "rwlock.cb";
 import "channel.cb";
 import "spsc_queue.cb";
+import "barrier.cb";
 
 // ---------------------------------------------------------------------------
 // Thread tests
@@ -1173,6 +1174,138 @@ bool testLockAnnotations()
 }
 
 // ---------------------------------------------------------------------------
+// barrier / spin_barrier tests
+// ---------------------------------------------------------------------------
+
+struct BarrierCtx {
+    void*           bar         = nullptr;  // barrier* or spin_barrier*
+    int*            phaseData   = nullptr;  // one slot per worker
+    atomic_counter* leaderCount = nullptr;  // bumped by the elected leader each phase
+    atomic_counter* errorCount  = nullptr;  // bumped if a worker hadn't arrived
+    int             id          = 0;
+    int             phases      = 0;
+    int             workers     = 0;
+};
+
+// Each phase: write my slot, sync. The elected leader then verifies every slot
+// holds this phase's value - which can only be true if all workers arrived
+// before the leader was released (the barrier's contract). A second sync keeps
+// the leader's read from racing the next phase's overwrite.
+int barrierWorker(void* ctx) {
+    BarrierCtx* c = (BarrierCtx*)ctx;
+    barrier* b = (barrier*)c->bar;
+    int p = 0;
+    while (p < c->phases) {
+        c->phaseData[c->id] = p;
+        bool leader = b->arrive_and_wait();
+        if (leader) {
+            int i = 0;
+            while (i < c->workers) {
+                if (c->phaseData[i] != p) { c->errorCount->increment(); }
+                i = i + 1;
+            }
+            c->leaderCount->increment();
+        }
+        b->arrive_and_wait();
+        p = p + 1;
+    }
+    return 0;
+}
+
+int spinBarrierWorker(void* ctx) {
+    BarrierCtx* c = (BarrierCtx*)ctx;
+    spin_barrier* b = (spin_barrier*)c->bar;
+    int p = 0;
+    while (p < c->phases) {
+        c->phaseData[c->id] = p;
+        bool leader = b->arrive_and_wait();
+        if (leader) {
+            int i = 0;
+            while (i < c->workers) {
+                if (c->phaseData[i] != p) { c->errorCount->increment(); }
+                i = i + 1;
+            }
+            c->leaderCount->increment();
+        }
+        b->arrive_and_wait();
+        p = p + 1;
+    }
+    return 0;
+}
+
+// Shared harness: spawn `workers` threads running `worker`, run `phases`, and
+// check (1) exactly one leader per phase and (2) no worker was late.
+bool runBarrierThreaded(void* barPtr, function<int(void*)> worker, int workers, int phases,
+                        const char* leaderLabel, const char* errLabel) {
+    bool result = true;
+    int* phaseData = new int[workers];
+    int i = 0;
+    while (i < workers) { phaseData[i] = -1; i = i + 1; }
+
+    atomic_counter leaderCount;
+    atomic_counter errorCount;
+
+    Thread*     threads = new Thread[workers];
+    BarrierCtx* ctxs    = new BarrierCtx[workers];
+    i = 0;
+    while (i < workers) {
+        ctxs[i].bar         = barPtr;
+        ctxs[i].phaseData   = phaseData;
+        ctxs[i].leaderCount = &leaderCount;
+        ctxs[i].errorCount  = &errorCount;
+        ctxs[i].id          = i;
+        ctxs[i].phases      = phases;
+        ctxs[i].workers     = workers;
+        threads[i].start(worker, &ctxs[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < workers) { threads[i].join(); i = i + 1; }
+
+    result &= Test(leaderLabel, (int)leaderCount.read(), phases);
+    result &= Test(errLabel,    (int)errorCount.read(),  0);
+
+    delete[_] threads;
+    delete[_] ctxs;
+    delete[_] phaseData;
+    return result;
+}
+
+// Single thread, N=1: arrive_and_wait must return immediately AND be reusable -
+// if the generation reset were broken the second call would misbehave/hang.
+bool testBarrierSingleThreadReuse() {
+    bool result = true;
+    barrier b;
+    b.init(1);
+    int i = 0;
+    while (i < 5) {
+        bool leader = b.arrive_and_wait();   // N=1 -> always the leader
+        result &= Test("barrier n=1 reusable leader", (int)leader, 1);
+        i = i + 1;
+    }
+    b.destroy();
+    return result;
+}
+
+bool testBarrierThreaded() {
+    barrier b;
+    b.init(4);
+    bool r = runBarrierThreaded((void*)&b, barrierWorker, 4, 50,
+                                "barrier leader once per phase", "barrier no late arrivals");
+    b.destroy();
+    return r;
+}
+
+bool testSpinBarrierThreaded() {
+    spin_barrier b;
+    b.init(4);
+    bool r = runBarrierThreaded((void*)&b, spinBarrierWorker, 4, 50,
+                                "spin_barrier leader once per phase", "spin_barrier no late arrivals");
+    b.destroy();
+    return r;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1242,6 +1375,11 @@ extern int main() {
     total++; passed += testAtomicFlagReleaseAcquire()     ? 1 : 0;
     total++; passed += testAtomicI32ReleaseAcquire()      ? 1 : 0;
     total++; passed += testLockAnnotations()              ? 1 : 0;
+
+    // barrier / spin_barrier tests
+    total++; passed += testBarrierSingleThreadReuse()     ? 1 : 0;
+    total++; passed += testBarrierThreaded()              ? 1 : 0;
+    total++; passed += testSpinBarrierThreaded()          ? 1 : 0;
 
     printf("Thread/Sync tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

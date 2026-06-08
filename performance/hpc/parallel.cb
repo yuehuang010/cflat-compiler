@@ -1,0 +1,201 @@
+// parallel.cb - a customer attempt to extend the single-threaded HPC suite to
+// MULTITHREADED (across-core) data parallelism, using ONLY documented primitives:
+//   - core/thread.cb     Thread.start(fn, void* ctx) / join   (doc/threading.md)
+//   - core/atomic.cb     atomic__i64                           (doc/threading.md)
+//   - core/latch.cb      Latch countDown/wait                  (doc/threading.md)
+//
+// The single-threaded suite (vecmath/densemat/stencil) is "within-core" parallel
+// only (SIMD via `vectorize` + `double[]` noalias). This file is the missing
+// "across-core" axis: the same three canonical kernel shapes, fanned out over
+// worker threads.
+//
+//   1. parallel MAP        (axpy)      - embarrassingly parallel
+//   2. parallel REDUCTION  (dot)       - partials + combine
+//   3. parallel STENCIL    (jacobi2d)  - needs a per-sweep BARRIER
+//
+// Comments marked  >>> GAP  flag where the language/stdlib forced boilerplate or
+// could not express the natural thing at all. See README findings.
+
+import "thread.cb";
+import "atomic.cb";
+import "math.cb";
+
+// ----------------------------------------------------------------------------
+// 1. PARALLEL MAP: y[i] += alpha*x[i] over [0,n), split into WORKERS row-ranges.
+// ----------------------------------------------------------------------------
+//
+// >>> GAP 1 (typed thread context): Thread.start only takes `void* ctx`, so every
+// parallel kernel needs a hand-rolled context struct + a cast in the worker. There
+// is no typed thread spawn and no capturing lambda (lambdas are non-capturing), so
+// the partition bounds, the buffers, and alpha all have to be packed by hand.
+struct AxpyCtx {
+    double[] x     = default;
+    double[] y     = default;
+    double   alpha = 0.0;
+    int      lo    = 0;
+    int      hi    = 0;
+};
+
+int axpyWorker(void* raw)
+{
+    AxpyCtx* c = (AxpyCtx*)raw;
+    // >>> GAP 2 (no sub-view / slicing): the natural thing is to hand this worker
+    // ITS OWN noalias span of [lo,hi). But span<T> has no slice, T[] has no a[i:j],
+    // and &x[lo] yields a raw T* that the one-way rule forbids binding back into a
+    // double[]. So every worker must take the WHOLE view + (lo,hi) and self-offset.
+    double[] x = c->x;
+    double[] y = c->y;
+    double   a = c->alpha;
+    int i = c->lo;
+    // Can't `vectorize for` from lo..hi here and keep the noalias win cleanly,
+    // because x and y are the same base views shared by all workers; the vectorizer
+    // still vectorizes the body but this is the whole-array view, not this slice.
+    while (i < c->hi) { y[i] = y[i] + a * x[i]; i = i + 1; }
+    return 0;
+}
+
+void par_axpy(double alpha, double[] x, double[] y, int n, int workers)
+{
+    Thread* threads = new Thread[workers];
+    AxpyCtx* ctxs   = new AxpyCtx[workers];
+    int chunk = (n + workers - 1) / workers;
+    int w = 0;
+    while (w < workers) {
+        int lo = w * chunk;
+        int hi = lo + chunk;
+        if (hi > n) hi = n;
+        ctxs[w].x = x; ctxs[w].y = y; ctxs[w].alpha = alpha;
+        ctxs[w].lo = lo; ctxs[w].hi = hi;
+        threads[w].start(axpyWorker, &ctxs[w]);
+        w = w + 1;
+    }
+    w = 0;
+    while (w < workers) { threads[w].join(); w = w + 1; }
+    delete[_] threads;
+    delete[_] ctxs;
+}
+
+// ----------------------------------------------------------------------------
+// 2. PARALLEL REDUCTION: sum(x[i]*y[i]). Each worker accumulates a partial, then
+// the main thread combines. (FP reduction, so no `vectorize` - same as scalar dot.)
+// ----------------------------------------------------------------------------
+//
+// >>> GAP 3 (no parallel_reduce): there is no reduction primitive, so the partials
+// array, the per-worker accumulation, and the final combine are all hand-written.
+// The reductions (dot/nrm2/asum) are PRECISELY the kernels that can't use
+// `vectorize` (FP reassociation), so threads are their only parallelism - and the
+// stdlib gives no help.
+struct DotCtx {
+    double[] x      = default;
+    double[] y      = default;
+    int      lo     = 0;
+    int      hi     = 0;
+    double   result = 0.0;   // written by the worker, read after join
+};
+
+int dotWorker(void* raw)
+{
+    DotCtx* c = (DotCtx*)raw;
+    double[] x = c->x;
+    double[] y = c->y;
+    double s = 0.0;
+    int i = c->lo;
+    while (i < c->hi) { s = s + x[i] * y[i]; i = i + 1; }
+    c->result = s;
+    return 0;
+}
+
+double par_dot(double[] x, double[] y, int n, int workers)
+{
+    Thread* threads = new Thread[workers];
+    DotCtx* ctxs    = new DotCtx[workers];
+    int chunk = (n + workers - 1) / workers;
+    int w = 0;
+    while (w < workers) {
+        int lo = w * chunk;
+        int hi = lo + chunk;
+        if (hi > n) hi = n;
+        ctxs[w].x = x; ctxs[w].y = y; ctxs[w].lo = lo; ctxs[w].hi = hi;
+        threads[w].start(dotWorker, &ctxs[w]);
+        w = w + 1;
+    }
+    double total = 0.0;
+    w = 0;
+    while (w < workers) { threads[w].join(); total = total + ctxs[w].result; w = w + 1; }
+    delete[_] threads;
+    delete[_] ctxs;
+    return total;
+}
+
+// ----------------------------------------------------------------------------
+// 3. PARALLEL STENCIL (jacobi2d 5-point), ITERS sweeps. Each sweep all workers
+// write g2 from g, then g/g2 swap. Between sweeps every worker must wait for all
+// others (a BARRIER) before reading the freshly-swapped buffer.
+// ----------------------------------------------------------------------------
+//
+// >>> GAP 4 (NO REUSABLE BARRIER): doc/threading.md lists Latch (one-shot),
+// Semaphore, Mutex, RwLock, Atomic, channel, spsc - but NO reusable barrier. A
+// Latch fires once and cannot be reset, so it cannot gate a multi-sweep solver.
+// The only documented way to get a per-sweep barrier is to JOIN all threads each
+// sweep and re-spawn - paying full thread create/teardown ITERS times. That is the
+// single biggest missing piece for iterative PDE solvers.
+struct JacobiCtx {
+    double[] g   = default;   // source this sweep
+    double[] g2  = default;   // dest this sweep
+    int      h   = 0;
+    int      w   = 0;
+    int      lo  = 0;         // first interior row for this worker
+    int      hi  = 0;         // one past last interior row
+};
+
+int jacobiWorker(void* raw)
+{
+    JacobiCtx* c = (JacobiCtx*)raw;
+    double[] g  = c->g;
+    double[] g2 = c->g2;
+    int w = c->w;
+    int r = c->lo;
+    while (r < c->hi) {
+        int col = 1;
+        while (col < w - 1) {
+            int idx = r * w + col;
+            g2[idx] = 0.25 * (g[idx - 1] + g[idx + 1] + g[idx - w] + g[idx + w]);
+            col = col + 1;
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+// Re-spawn-per-sweep, because there is no barrier to keep workers alive across sweeps.
+void par_jacobi2d(double[] g, double[] g2, int h, int w, int iters, int workers)
+{
+    Thread* threads   = new Thread[workers];
+    JacobiCtx* ctxs   = new JacobiCtx[workers];
+    int interior = h - 2;                       // rows 1..h-2
+    int chunk = (interior + workers - 1) / workers;
+
+    double[] src = g;
+    double[] dst = g2;
+    int it = 0;
+    while (it < iters) {
+        int x = 0;
+        while (x < workers) {
+            int lo = 1 + x * chunk;
+            int hi = lo + chunk;
+            if (hi > h - 1) hi = h - 1;
+            ctxs[x].g = src; ctxs[x].g2 = dst;
+            ctxs[x].h = h;   ctxs[x].w = w;
+            ctxs[x].lo = lo; ctxs[x].hi = hi;
+            threads[x].start(jacobiWorker, &ctxs[x]);
+            x = x + 1;
+        }
+        x = 0;
+        while (x < workers) { threads[x].join(); x = x + 1; }
+        // swap src/dst for next sweep
+        double[] tmp = src; src = dst; dst = tmp;
+        it = it + 1;
+    }
+    delete[_] threads;
+    delete[_] ctxs;
+}

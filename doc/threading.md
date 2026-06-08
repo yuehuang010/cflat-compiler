@@ -11,6 +11,8 @@
   - [Mutex & `lock` Statement](#mutex--lock-statement-coremutexcb)
   - [Atomic](#atomic-coreatomic.cb)
   - [Other Synchronization Primitives](#other-synchronization-primitives)
+  - [Barrier](#barrier-corebarriercb)
+  - [Thread Pool](#thread-pool-corethreadpoolcb)
 - [Compile-Time Lock-Set Analysis](#compile-time-lock-set-analysis)
   - [Guarded Field Groups](#guarded-field-groups)
   - [Lock Statement](#lock-statement)
@@ -106,6 +108,35 @@ t.start((void* ctx) => { return 42; }, nullptr);
 i32 code = t.join();   // 42
 ```
 
+**Thread methods:**
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `start(fn, ctx)` | `bool` | borrow overload - the caller keeps ownership of `ctx` and must keep it alive until `join()`; the thread's `fn` must not free it. Returns `false` if the OS thread could not be created. |
+| `start(fn, move ctx)` | `bool` | move overload - ownership of `ctx` transfers to the thread (the caller's pointer is auto-nulled), and `fn` (typed `int(move void*)`) frees it. |
+| `join()` | `i32` | block until the thread exits; returns its exit code and releases the handle. |
+| `try_join(i32 ms)` | `bool` | block up to `ms`; returns `true` and cleans up if the thread exited, `false` on timeout (handle left intact). |
+| `setAffinity(u64 mask)` | - | pin the thread to a CPU set; `mask` is a bitmask of allowed cores (`1` = core 0, `2` = core 1, `3` = cores 0+1, ...). Call after `start()`, before `join()`. |
+| `terminate()` | - | forcibly kill the thread; leaks anything it held. Use only when cooperative cancellation (`stop_token`) is impossible. |
+
+**Affinity** matters for performance work: pinning a producer and consumer (or per-core HPC workers) to separate physical cores avoids OS scheduling jitter and cross-core cache bouncing.
+
+```c
+Thread t;
+t.start(worker, &ctx);
+t.setAffinity((u64)1 << 2);   // pin to core 2
+// ...
+t.join();
+```
+
+**Logical processor count** - `hardware_concurrency()` (a free function in `thread.cb`) returns the number of logical processors, for sizing a worker count or a `ThreadPool`:
+
+```c
+int cores = hardware_concurrency();   // e.g. 20; 0 if it cannot be determined
+```
+
+**Per-thread allocator inheritance.** `start()` propagates the parent's active allocator to the child: it calls `spawn_child()` on the installed allocator, which lets each allocator choose its policy - `MallocAllocator` shares itself (the child uses the same global heap), while a per-thread allocator like `BucketAllocator` hands the child a fresh instance registered for cleanup. This is what makes `new`/`delete` safe on worker threads spawned inside a `program` scope; without it a child would start with no allocator and fall through to raw CRT `malloc`/`free`, corrupting a vmem-backed allocator's pages. You don't call anything to opt in - it happens on every `start()`. (See [Memory Management](#memory-management) for the allocator interface itself.)
+
 ### Cancellation (`core/stop_token.cb`)
 
 ```c
@@ -176,7 +207,8 @@ seq.fetchAdd(1);
 ### Other Synchronization Primitives
 
 - `core/semaphore.cb` - `Semaphore` with `acquire`/`release`
-- `core/latch.cb` - `Latch` countdown; `countDown`, `wait`
+- `core/latch.cb` - `Latch` countdown; `countDown`, `wait` (one-shot - see [Barrier](#barrier-corebarriercb) for the reusable equivalent)
+- `core/barrier.cb` - `barrier` / `spin_barrier` reusable rendezvous; `arrive_and_wait`
 - `core/rwlock.cb` - `RwLock`; `acquireRead`/`releaseRead`, `acquireWrite`/`releaseWrite`
 - `core/channel.cb` - `channel<T>` blocking MPMC queue; `send`, `recv`, `tryRecv`
 - `core/spsc_queue.cb` - `spsc_queue<T>` wait-free single-producer/single-consumer ring
@@ -211,6 +243,117 @@ while (dst.receive(&v)) { /* receives all 50 in order */ }
 ```
 
 Both channels must have the same element type `T`; piping `channel<int>` into `channel<float>` is a compile error (no matching `operator>>` overload).
+
+### Barrier (`core/barrier.cb`)
+
+A **barrier** makes a fixed group of N threads rendezvous: each calls `arrive_and_wait()`, which blocks until all N have arrived, then releases them together *and resets itself* for the next round. Unlike `latch` (one-shot), a barrier is **reusable** (cyclic), so it can gate every iteration of a loop - the bulk-synchronous pattern behind iterative solvers (Jacobi, conjugate gradient, time-stepping), where every thread must finish sweep *k* before any thread starts sweep *k+1*.
+
+```c
+import "barrier.cb";
+
+barrier b;
+b.init(workers);
+
+// in each worker, every sweep:
+compute_my_slice(src, dst);
+bool leader = b.arrive_and_wait();   // wait for all workers to finish the sweep
+if (leader) { swap(src, dst); }      // serial fixup runs on exactly one thread
+b.arrive_and_wait();                 // re-sync so no worker reads a half-swapped state
+// ...
+b.destroy();
+```
+
+- `init(int n)` - set the number of participating threads. Call before any arrive.
+- `arrive_and_wait()` - arrive and block until all `n` have arrived; the barrier then resets for the next phase. **Returns `true` for exactly one thread per phase** (the last arriver, the "leader"), so a single-threaded fixup - a buffer swap, a reduction combine - can run once between phases. (This is the equivalent of C++ `std::barrier`'s completion function or Rust `Barrier`'s `is_leader()`.)
+- `arrive_and_drop()` - arrive *and* permanently leave the group, so later phases expect one fewer thread. Use when a worker is done for good.
+- `destroy()` - release resources (no threads may be waiting).
+
+**Two variants** (the same arrive/leader contract, mirroring `channel` vs `spsc_queue`):
+
+| Type | Waiting | Use when |
+|------|---------|----------|
+| `barrier` | blocking - waiters sleep on a condition variable | the general default; does not burn CPU when work is imbalanced |
+| `spin_barrier` | busy-wait - waiters spin on an atomic generation counter with `pause()` | fine-grained HPC sweeps where all workers arrive nearly simultaneously and are pinned to cores; keeps a core hot while waiting. Fixed-size (no `arrive_and_drop`). |
+
+Both are correct across reuse via an internal **generation counter**: the last arriver advances the phase before releasing, so a fast thread that laps back into the next phase cannot let a straggler from the previous phase slip through.
+
+### Thread Pool (`core/threadpool.cb`)
+
+`ThreadPool` runs a fixed set of worker threads that pull tasks from an internal priority queue. Use it instead of raw `Thread` when you have many short tasks: the workers are created once and reused, so you avoid per-task thread create/teardown.
+
+A task is a function `int(move void*, stop_token)`: it receives an owning context pointer and a cancellation token, and returns an exit code.
+
+```c
+import "threadpool.cb";
+
+struct Work { int n = 0; };
+
+int task(move void* raw, stop_token tok) {
+    Work* w = (Work*)raw;
+    int result = w->n * w->n;
+    delete w;                 // the task owns ctx; free it when done
+    return result;
+}
+
+ThreadPool pool;
+pool.init(4);                 // 4 worker threads
+
+Work* w = new Work; w->n = 7;
+move TaskHandle* h = pool.submit(task, w);   // ownership of w moves into the pool
+if (h != nullptr) {
+    h->wait();                // block until the task finishes
+    int code = h->exitCode;   // 49
+}
+
+pool.shutdown();              // drain, stop workers, release resources
+```
+
+**Ownership of `ctx`.** Once you pass `ctx` to `submit`/`submitDetached`/`then`, the pool owns it. On success the pointer is moved (still owning) into the task function, which must free it. If the pool *refuses* the task (returns `nullptr`/`false` - queue full or shutting down), the pool frees `ctx` itself. Either way the caller never frees `ctx` after handing it over.
+
+**Submission methods:**
+
+| Method | Returns | Use |
+|--------|---------|-----|
+| `submit(fn, ctx, priority?)` | `move TaskHandle*` (or `nullptr`) | wait on / cancel the task |
+| `submitDetached(fn, ctx, priority?)` | `bool` | fire-and-forget; no handle |
+| `then(dep, fn, ctx, priority?)` | `move TaskHandle*` (or `nullptr`) | run `fn` after `dep` finishes (call once per `dep`) |
+
+`priority` is optional (defaults to `THREADPOOL_PRIORITY_NORMAL`); the other values are `THREADPOOL_PRIORITY_HIGH` and `THREADPOOL_PRIORITY_LOW`.
+
+**`TaskHandle`** (returned owning by `submit`/`then`):
+
+- `wait()` - block until the task completes (busy-spin yielding the core).
+- `wait_for(int ms)` - block until done or timeout; returns `true` if it finished in time.
+- `cancel()` - request cancellation; the task must check `tok.stop_requested()`.
+- `exitCode` / `failed` - the task's return code and whether it was non-zero (valid after `wait`).
+- Forgetting to `wait()` is safe: `~TaskHandle` blocks until the worker has finished before freeing.
+
+**`TaskResult<T>`** - a typed result holder (the equivalent of a future) for returning a value rather than just an exit code. Bundle a `TaskResult<T>*` into your context; the task calls `set(v)` (or `fail()`), and the submitter calls `get()` to block and retrieve the value:
+
+```c
+struct SqCtx { int in = 0; TaskResult<int>* out = nullptr; };
+
+int sq(move void* raw, stop_token tok) {
+    SqCtx* c = (SqCtx*)raw;
+    c->out->set(c->in * c->in);
+    delete c;
+    return 0;
+}
+
+TaskResult<int> r;
+SqCtx* c = new SqCtx; c->in = 9; c->out = &r;
+pool.submitDetached(sq, c);
+int v = r.get();              // blocks; returns 81  (use r.hasFailed() if the task may fail)
+```
+
+**Lifecycle:**
+
+- `drain()` - block until every submitted task has finished (workers stay alive).
+- `shutdown()` - `drain()`, stop and join all workers, release resources; the pool can be `init()`ed again afterwards. The destructor calls `shutdown()` automatically.
+- `resize(int newCount)` - grow or shrink the worker count at runtime. Not thread-safe against concurrent `submit`/`drain`/`shutdown` - quiesce the pool first.
+- `workerCount()` / `approxPendingCount()` - introspection (the pending count is approximate, for diagnostics only).
+
+> **Inside a `program`:** the pool runs fully multi-threaded inside `program` scope; worker threads cross-allocate safely against the program allocator. Size the internal queue via `THREADPOOL_QUEUE_CAPACITY` if bursts of `submit` outpace the workers (a saturated queue makes `submit` return `nullptr`/`false`).
 
 ---
 

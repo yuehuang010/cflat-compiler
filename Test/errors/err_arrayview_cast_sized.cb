@@ -1,0 +1,5 @@
+// Only the empty-bracket `(T[])` (the noalias array-view) is a valid cast target;
+// a sized `(T[N])` is not meaningful as a cast and is rejected.
+expect_error("a sized array '(T[N])' is not a valid cast target") {
+    void f(int* p) { int[] a = (int[3])p; a[0] = 1; }
+}

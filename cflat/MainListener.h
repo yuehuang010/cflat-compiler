@@ -6513,6 +6513,21 @@ public:
                 namedVar.Storage = nullptr;
             }
 
+            // Explicit `(T[])p` escape: re-establish the noalias array-view from a raw
+            // pointer. `T*` and `T[]` share an identical representation, so this is a pure
+            // reinterpret (no bit manipulation) - the sanctioned inverse of the implicit
+            // `T[] -> T*` decay, by which the programmer asserts the pointer spans a whole,
+            // distinct allocation. The result carries IsArrayView, so it passes the one-way
+            // bind gate (RejectRawPointerToArrayView) at every binding site.
+            if (destTypeName.IsArrayView)
+            {
+                if (!namedVar.TypeAndValue.Pointer)
+                    LogErrorContext(ctx, "'(T[])' cast requires a pointer source 'T*'; "
+                        "cannot cast a non-pointer to an array-view");
+                namedVar.TypeAndValue = destTypeName;
+                return namedVar;
+            }
+
             bool srcIsSigned = namedVar.TypeAndValue.IsUnsignedInteger() == -1;
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned);
             namedVar.TypeAndValue = destTypeName;
@@ -6574,6 +6589,18 @@ public:
 
         if (abstractDecl && abstractDecl->pointer())
         {
+            typeValue.Pointer = true;
+        }
+
+        // `(T[])` cast target: the noalias array-view. Empty brackets only - a sized
+        // `(T[N])` is not a meaningful cast. Mirrors the declaration path: an array-view
+        // is a pointer repr carrying the noalias contract.
+        if (abstractDecl && abstractDecl->arrayDimSpec())
+        {
+            if (!abstractDecl->arrayDimSpec()->assignmentExpression().empty())
+                LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
+                    "use '(T[])' for the noalias array-view");
+            typeValue.IsArrayView = true;
             typeValue.Pointer = true;
         }
 

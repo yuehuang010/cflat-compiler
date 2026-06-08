@@ -1,0 +1,5 @@
+// The explicit `(T[])` escape re-blesses a raw pointer as a noalias array-view.
+// Casting a non-pointer (here an int) to an array-view is meaningless and rejected.
+expect_error("'(T[])' cast requires a pointer source") {
+    void f() { int x = 5; int[] a = (int[])x; a[0] = 1; }
+}

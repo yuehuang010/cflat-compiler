@@ -88,7 +88,13 @@ pwsh -NoProfile -Command ^
   "if (-not ($b -match '<\d+ x double>'))  { Write-Host '  FAILED: span_axpy did not vectorize'; exit 1 }" ^
   "if (-not ($b -match 'alias\.scope'))    { Write-Host '  FAILED: span_axpy missing array-view alias.scope metadata'; exit 1 }" ^
   "if ($b -match 'memcheck')               { Write-Host '  FAILED: span_axpy emitted a runtime alias check (vector.memcheck) - noalias not effective'; exit 1 }" ^
-  "Write-Host '  OK: span_axpy vectorized, alias-scoped, no memcheck'; exit 0"
+  "$mc = [regex]::Match($ll, '(?s)define[^\r\n]*@_chunk_axpy.*?\r?\n\}');" ^
+  "if (-not $mc.Success) { Write-Host '  FAILED: chunk_axpy not found in IR'; exit 1 }" ^
+  "$bc = $mc.Value;" ^
+  "if (-not ($bc -match '<\d+ x double>')) { Write-Host '  FAILED: chunk_axpy did not vectorize'; exit 1 }" ^
+  "if (-not ($bc -match 'alias\.scope'))   { Write-Host '  FAILED: chunk_axpy missing array-view alias.scope metadata'; exit 1 }" ^
+  "if ($bc -match 'memcheck')              { Write-Host '  FAILED: chunk_axpy emitted a runtime alias check - sliced span lost noalias'; exit 1 }" ^
+  "Write-Host '  OK: span_axpy and chunk_axpy vectorized, alias-scoped, no memcheck'; exit 0"
 if errorlevel 1 set /a FAIL+=1
 exit /b 0
 

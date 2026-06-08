@@ -1,0 +1,161 @@
+// barrier.cb - reusable (cyclic) thread barriers.
+//
+// A barrier makes a fixed group of N threads rendezvous: each calls
+// arrive_and_wait(), which blocks until all N have arrived, then releases them
+// all together AND resets itself for the next round. Unlike `latch` (one-shot),
+// a barrier can gate every iteration of a loop - the bulk-synchronous pattern
+// behind iterative solvers (Jacobi, CG, time-stepping):
+//
+//   barrier b;
+//   b.init(workers);
+//   // in each worker, every sweep:
+//   compute_my_slice(src, dst);
+//   bool leader = b.arrive_and_wait();   // wait for all workers to finish the sweep
+//   if (leader) { swap(src, dst); }      // serial fixup runs on exactly one thread
+//   b.arrive_and_wait();                 // re-sync so no worker reads mid-swap
+//   ...
+//   b.destroy();
+//
+// Two variants, mirroring channel (blocking) vs spsc_queue (spinning):
+//   barrier       - blocking: waiters sleep on a condition variable. The general
+//                   default; does not burn CPU when work is imbalanced.
+//   spin_barrier  - busy-wait: waiters spin on an atomic generation counter with
+//                   pause(). Lowest per-phase latency for HPC sweeps where all
+//                   workers arrive nearly simultaneously and are pinned to cores;
+//                   keeps a core hot while waiting.
+//
+// Both are CORRECT for reuse via a generation counter: the last arriver advances
+// the phase, so a fast thread that laps back into the next phase cannot let a
+// straggler from the previous phase slip through.
+
+import "mutex.cb";
+import "atomic.cb";
+import "intrinsic.cb";   // pause() - spin-loop hint (x86; compiles away elsewhere)
+
+// ---------------------------------------------------------------------------
+// barrier - blocking (mutex + condition variable).
+//
+// All shared state is touched only under _mtx, so no atomics are needed: the
+// condition-variable wait already requires the lock, and sleep_cv releases and
+// reacquires it atomically.
+// ---------------------------------------------------------------------------
+struct barrier {
+    mutex _mtx        = default;
+    void* _cv         = nullptr;   // Win32 CONDITION_VARIABLE (pointer-sized)
+    int   _total      = 0;         // participants expected each phase (N)
+    int   _count      = 0;         // arrivals still pending in the current phase
+    u64   _generation = 0;         // phase id; bumped when a phase completes
+
+    // Set up the barrier for n participating threads. Call before any arrive.
+    void init(int n) {
+        _total      = n;
+        _count      = n;
+        _generation = 0;
+        InitializeConditionVariable(&_cv);
+    }
+
+    // Arrive and block until all n threads have arrived; the barrier then resets
+    // for the next phase. Returns true for exactly ONE thread per phase (the last
+    // arriver, the "leader") so a single-threaded fixup - a buffer swap, a
+    // reduction combine - can run once between phases.
+    bool arrive_and_wait() {
+        _mtx.acquire();
+        u64 gen = _generation;          // capture my phase before releasing the lock
+        _count  = _count - 1;
+        if (_count == 0) {
+            _generation = _generation + 1;   // advance phase -> releases the waiters
+            _count      = _total;            // re-arm for the next round
+            WakeAllConditionVariable(&_cv);
+            _mtx.release();
+            return true;                     // leader
+        }
+        // Re-check _generation (not _count) on wake: it guards both spurious
+        // wakeups and the lap race - a thread that re-enters for the next phase
+        // captures the new generation, so this straggler still compares against
+        // its own captured old gen and exits only when the phase truly advanced.
+        while (gen == _generation) {
+            _mtx.sleep_cv(&_cv);
+        }
+        _mtx.release();
+        return false;
+    }
+
+    // Permanently leave the group: subsequent phases expect one fewer arrival.
+    // The equivalent of std::barrier::arrive_and_drop - use when a worker is
+    // done for good. Counts as an arrival for the current phase.
+    void arrive_and_drop() {
+        _mtx.acquire();
+        _total = _total - 1;
+        _count = _count - 1;
+        if (_count == 0) {
+            _generation = _generation + 1;
+            _count      = _total;
+            WakeAllConditionVariable(&_cv);
+        }
+        _mtx.release();
+    }
+
+    // Release OS resources. No threads may be waiting.
+    void destroy() {
+        _mtx.destroy();   // SRW lock: no-op, present for symmetry
+        _cv = nullptr;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// spin_barrier - busy-wait (atomic generation counter, no kernel wait object).
+//
+// Fixed-size: every phase expects the same N set at init() (no arrive_and_drop).
+// For the HPC use case the worker count is fixed for the whole solve, so this is
+// not a limitation in practice - and it keeps the lock-free path simple.
+//
+// Ordering: the per-arrival decrement is a CAS (acquire-release), so the last
+// arriver's successful CAS acquires every other arriver's prior writes; it then
+// publishes via a seq_cst store to _generation that the spinners acquire-load.
+// That chain gives the same happens-before guarantee as the blocking barrier.
+// ---------------------------------------------------------------------------
+struct spin_barrier {
+    atomic__i32 _count      = default;   // arrivals still pending in the current phase
+    atomic__i32 _generation = default;   // phase id
+    int         _total      = 0;         // participants expected each phase (N)
+
+    // Set up the barrier for n participating threads. Call before any arrive.
+    void init(int n) {
+        _total = n;
+        _count.store(n);
+        _generation.store(0);
+    }
+
+    // Arrive and busy-wait until all n threads have arrived; the barrier then
+    // resets for the next phase. Returns true for exactly one thread per phase
+    // (the last arriver) - see barrier.arrive_and_wait.
+    bool arrive_and_wait() {
+        i32 gen = _generation.load();
+
+        // Atomic fetch-and-decrement via a CAS loop (atomic__i32 exposes cas,
+        // which is acquire-release - exactly the ordering the last arriver needs).
+        bool last = false;
+        while (true) {
+            i32 cur = _count.load();
+            if (_count.cas(cur, cur - 1)) {
+                last = cur == 1;     // cur is the OLD value; ==1 means we drove it to 0
+                break;
+            }
+            pause();
+        }
+
+        if (last) {
+            _count.store(_total);            // re-arm for the next round
+            _generation.store(gen + 1);      // publish -> releases the spinners
+            return true;
+        }
+
+        while (_generation.load() == gen) {
+            pause();
+        }
+        return false;
+    }
+
+    // No OS resources to release; present for API symmetry with barrier.
+    void destroy() { }
+};

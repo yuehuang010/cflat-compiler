@@ -19,6 +19,20 @@ void span_axpy(double k, span<double> y, span<double> x)
     vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + k * xv[i]; }
 }
 
+// chunk() must preserve the noalias contract: take tile `c` of `nc` from each
+// whole span and axpy over the tiles. At -O2 this must vectorize with NO
+// vector.memcheck, exactly like the whole-span case - the headline guarantee for
+// the partition primitive (the offset T[] is re-blessed through the union pun).
+void chunk_axpy(double k, span<double> y, span<double> x, i64 c, i64 nc)
+{
+    span<double> yc = y.chunk(c, nc);
+    span<double> xc = x.chunk(c, nc);
+    double[] yv = yc.data();
+    double[] xv = xc.data();
+    i64 n = yc.length();
+    vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + k * xv[i]; }
+}
+
 extern int main()
 {
     i64 n = 1024;
@@ -31,10 +45,16 @@ extern int main()
     span<double> x; x.wrap(b, n);
     span_axpy(3.0, y, x);     // a[i] += 3 * 2  ->  a[i] + 6
 
+    // Partition both buffers into 4 tiles and axpy over each tile; the tiles
+    // cover [0,n) disjointly, so the whole array gets a[i] += 10 * 2 = +20.
+    i64 nc = 4;
+    i64 c = 0;
+    while (c < nc) { chunk_axpy(10.0, y, x, c, nc); c = c + 1; }   // a[i] -> a[i] + 26
+
     int ok = 1;
-    if (a[0]    != 6.0)    ok = 0;
-    if (a[100]  != 106.0)  ok = 0;
-    if (a[1023] != 1029.0) ok = 0;
+    if (a[0]    != 26.0)   ok = 0;
+    if (a[100]  != 126.0)  ok = 0;
+    if (a[1023] != 1049.0) ok = 0;
 
     int* ap = move a; delete[_] ap;
     int* bp = move b; delete[_] bp;

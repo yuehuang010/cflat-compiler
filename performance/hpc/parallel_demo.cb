@@ -1,0 +1,97 @@
+// parallel_demo.cb - correctness + scaling check for the multithreaded HPC kernels.
+// Compares parallel results against the single-threaded vecmath/stencil references,
+// then reports speedup at a few worker counts.
+
+import "cruntime.cb";
+import "time.cb";
+import "math.cb";
+import "vecmath.cb";
+import "stencil.cb";
+import "parallel.cb";
+
+bool close(double a, double b)
+{
+    double d = a - b;
+    if (d < 0.0) d = -d;
+    double scale = a < 0.0 ? -a : a;
+    return d <= 1.0e-6 * (scale + 1.0);
+}
+
+extern int main()
+{
+    int n = 1 << 22;            // ~4M
+    int passed = 0;
+    int total = 0;
+
+    // ---- correctness: parallel axpy vs serial axpy ----
+    double[] x  = new double[n];
+    double[] y1 = new double[n];
+    double[] y2 = new double[n];
+    Vec.fill(x, 1.0, n);
+    Vec.fill(y1, 2.0, n);
+    Vec.fill(y2, 2.0, n);
+    Vec.axpy(1.5, x, y1, n);              // serial reference
+    par_axpy(1.5, x, y2, n, 4);           // 4 workers
+    bool axpyOk = true;
+    int i = 0;
+    while (i < n) { if (!close(y1[i], y2[i])) { axpyOk = false; break; } i = i + 1; }
+    total = total + 1; if (axpyOk) { passed = passed + 1; printf("PASS par_axpy\n"); }
+    else printf("FAIL par_axpy at %d\n", i);
+
+    // ---- correctness: parallel dot vs serial dot ----
+    double ds = Vec.dot(x, y1, n);
+    double dp = par_dot(x, y1, n, 4);
+    total = total + 1;
+    if (close(ds, dp)) { passed = passed + 1; printf("PASS par_dot (%.3f)\n", dp); }
+    else printf("FAIL par_dot serial=%.6f parallel=%.6f\n", ds, dp);
+
+    delete[_] x; delete[_] y1; delete[_] y2;
+
+    // ---- correctness: parallel jacobi2d vs serial, a few sweeps ----
+    int h = 512; int w = 512;
+    double[] g  = new double[h * w];
+    double[] g2 = new double[h * w];
+    double[] s  = new double[h * w];
+    double[] s2 = new double[h * w];
+    int k = 0;
+    while (k < h * w) { double v = (double)(k & 255); g[k] = v; g2[k] = v; s[k] = v; s2[k] = v; k = k + 1; }
+
+    int iters = 8;
+    // serial reference: ping-pong by hand
+    double[] ss = s; double[] sd = s2;
+    int it = 0;
+    while (it < iters) { Stencil.jacobi2d(ss, sd, h, w); double[] t = ss; ss = sd; sd = t; it = it + 1; }
+    par_jacobi2d(g, g2, h, w, iters, 4);
+    // after `iters` (even) swaps, both results live in their original `g`/`s`.
+    bool jOk = true; int jbad = 0;
+    k = 0;
+    while (k < h * w) { if (!close(g[k], ss[k])) { jOk = false; jbad = k; break; } k = k + 1; }
+    total = total + 1;
+    if (jOk) { passed = passed + 1; printf("PASS par_jacobi2d\n"); }
+    else printf("FAIL par_jacobi2d at %d (par=%.6f ser=%.6f)\n", jbad, g[jbad], ss[jbad]);
+
+    delete[_] g; delete[_] g2; delete[_] s; delete[_] s2;
+
+    // ---- scaling: axpy throughput at 1/2/4/8 workers ----
+    printf("\n-- par_axpy scaling (n=%d) --\n", n);
+    double[] bx = new double[n];
+    double[] by = new double[n];
+    Vec.fill(bx, 1.0, n);
+    Vec.fill(by, 2.0, n);
+    Stopwatch sw;
+    int reps = 50;
+    int wc = 1;
+    while (wc <= 8) {
+        sw.restart();
+        int r = 0;
+        while (r < reps) { par_axpy(1.0000001, bx, by, n, wc); r = r + 1; }
+        double t = sw.elapsed().seconds();
+        double gbps = (double)reps * (double)n * 24.0 / 1.0e9 / t;
+        printf("  workers=%d  %8.2f ms  %8.2f GB/s\n", wc, t * 1000.0, gbps);
+        wc = wc * 2;
+    }
+    delete[_] bx; delete[_] by;
+
+    printf("\n%d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}

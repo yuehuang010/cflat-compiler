@@ -44,6 +44,40 @@ struct span<T>
     void set(i64 index, T value) { _ptr[index] = value; }
     T    operator[](i64 index) { return _ptr[index]; }
 
+    // Internal: build the sub-span [start, start+count) over the same buffer.
+    // `T[]` bans arithmetic, so `&_ptr[start]` gives a raw T* at the offset, which the
+    // explicit `(T[])` escape re-blesses as a noalias view. Private: an unrestricted
+    // offset could manufacture overlapping noalias spans, so only the disjoint chunk()
+    // partition below is exposed.
+    span<T> _offset(i64 start, i64 count)
+    {
+        span<T> r;
+        r._ptr = (T[])(&_ptr[start]);   // explicit T* -> T[]: re-establish the noalias view
+        r._len = count;
+        return r;
+    }
+
+    // The idx-th of nchunks contiguous, NON-OVERLAPPING tiles of this span - the
+    // data-parallel partition primitive (the analog of Rust's chunks_mut). Tiles
+    // are balanced: the first (length % nchunks) get one extra element, so they
+    // cover the whole span exactly and differ in length by at most one.
+    //
+    // Distinct idx with the SAME nchunks yield provably-disjoint spans, so handing
+    // tile `i` to worker `i` gives each its own noalias window - an -O2 vectorize
+    // loop over two workers' tiles drops the runtime alias check, exactly as for a
+    // whole span. (Mixing nchunks values, or writing through two tiles of the same
+    // buffer, can overlap - the same caller-responsibility caveat that already
+    // applies to passing one span as two arguments of a writing kernel.)
+    span<T> chunk(i64 idx, i64 nchunks)
+    {
+        i64 base  = _len / nchunks;
+        i64 rem   = _len % nchunks;
+        i64 extra = idx < rem ? idx : rem;        // preceding over-sized tiles
+        i64 start = idx * base + extra;
+        i64 count = base + (idx < rem ? 1 : 0);
+        return _offset(start, count);
+    }
+
     // Decay to the may-alias view<T>. This is the safe one-way direction (`T[] -> T*`); the
     // reverse (view<T> -> span<T>) has no method and is rejected at the bind site.
     view<T> as_view()
