@@ -1470,6 +1470,8 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 | `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type; fields `item_0`, `item_1`, ...; `size()` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation |
 | `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
+| `span.cb` | `span<T>` - non-owning **noalias** window (`T[]` + len); pass by value for vectorization. See [HPC.md](HPC.md) |
+| `view.cb` | `view<T>` - non-owning **may-alias** window (`T*` + len); `slice(start,end)`; sibling of `span<T>` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
 | `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |

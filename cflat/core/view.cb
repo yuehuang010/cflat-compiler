@@ -1,0 +1,34 @@
+// view<T> - non-owning, MAY-ALIAS window over a caller-owned buffer: a raw `T*` plus a length.
+// The permissive sibling of span<T>: it carries no noalias contract, so two views may overlap.
+// Use view<T> for the general case (overlapping windows, sub-ranges, may-alias data); reach for
+// span<T> only when the buffers are known disjoint and you want the -O2 vectorizer to drop its
+// runtime alias check.
+//
+// Non-owning: a view never frees _ptr. The buffer's owner (an array<T>, a `new T[n]`, a stack
+// array, ...) must outlive every view over it.
+struct view<T>
+{
+    T*  _ptr = nullptr;
+    i64 _len = 0;
+
+    // Point this view at an existing buffer of `len` elements.
+    void wrap(T* ptr, i64 len) { _ptr = ptr; _len = len; }
+
+    i64 length() { return _len; }
+    T*  data()   { return _ptr; }
+
+    T    get(i64 index) { return _ptr[index]; }
+    void set(i64 index, T value) { _ptr[index] = value; }
+    T    operator[](i64 index) { return _ptr[index]; }
+
+    // Sub-range view over [start, end). Offset sub-views are sound here precisely because view<T>
+    // is may-alias: two sub-views of the same buffer are *allowed* to overlap. (span<T> has no
+    // slice for exactly this reason - an offset span would break its whole-allocation noalias
+    // invariant.) The caller is responsible for keeping start/end within bounds.
+    view<T> slice(i64 start, i64 end)
+    {
+        view<T> v;
+        v.wrap(_ptr + start, end - start);
+        return v;
+    }
+};

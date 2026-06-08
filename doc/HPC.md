@@ -21,6 +21,7 @@ failure points you toward.
 - [`vectorize` loops](#vectorize-loops)
 - [`simd<T,N>` explicit vector type](#simdtn-explicit-vector-type)
 - [`T[]` array-view (noalias)](#t-array-view-noalias)
+- [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 
 **Related:** [Threading & Memory Management](threading.md) (affinity, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
 
@@ -166,3 +167,60 @@ Rules:
 >   forge an offset view.
 > - One escape hatch remains by design, the same category as Fortran `EQUIVALENCE`: a
 >   `union { int* p; int[] v; }` can type-pun a raw pointer into a view.
+
+## `span<T>` (noalias) and `view<T>` (may-alias)
+
+`span<T>` and `view<T>` are two-word library wrappers that bundle a buffer pointer with a length, so
+a kernel signature carries one argument per buffer instead of a `(ptr, len)` pair. They are the
+ergonomic front-ends to the raw `T[]` array-view and the raw `T*` pointer:
+
+| Type | Field | Aliasing | Comes from | Use when |
+|------|-------|----------|-----------|----------|
+| `span<T>` | `T[] _ptr` | **noalias** - distinct spans address distinct buffers | `new T[n]` or another `T[]` | the buffers are known-disjoint and you want the vectorizer to drop its overlap check |
+| `view<T>` | `T*  _ptr` | may-alias - views may overlap | any `T*` | overlapping windows, sub-ranges, general data |
+
+Both are **non-owning**: each wraps a buffer someone else owns (an `array<T>`, a `new T[n]`, a stack
+array) and never frees it - the owner must outlive every span/view over it. Import with
+`import "span.cb"` / `import "view.cb"`; create one with `wrap(buffer, len)`.
+
+### Getting the noalias guarantee from `span<T>`
+
+Pass a span **by value** (it is two machine words), and inside the kernel bind each span's buffer
+into a **local `T[]`** and loop over that:
+
+```c
+void axpy(double a, span<double> y, span<double> x)
+{
+    double[] yv = y.data();    // the noalias view
+    double[] xv = x.data();
+    i64 n = y.length();
+    vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + a * xv[i]; }
+}
+```
+
+At -O2 this vectorizes with **no runtime alias check**: the span's `T[] _ptr` field carries scoped
+alias metadata that proves two distinct spans address distinct buffers. Two rules make this work:
+
+- **By value, not by pointer.** A `span<T>*` reloads the buffer pointer and length on every
+  iteration (the optimizer cannot prove the struct header is invariant across the loop), so it does
+  not vectorize. Pass by value.
+- **Index a local `T[]`, not the span.** `span.get`/`set`/`operator[]` are convenient but do *not*
+  carry the contract across two spans - those bodies all reach the buffer through the same `this`,
+  so the optimizer cannot tell two spans apart. Bind `y.data()` to a local `T[]` and index that.
+
+### Conversions (the one-way lattice)
+
+`span<T> -> view<T>` is allowed via `s.as_view()` - the safe `T[] -> T*` decay that drops the
+noalias promise. The reverse, `view<T> -> span<T>`, is a **compile error**: `span.wrap` takes a
+`T[]`, so binding a `view`'s raw `T*` into it would forge the noalias contract. A span therefore
+only ever originates from a `new T[n]` view or another `T[]`.
+
+### Slicing
+
+`view<T>` has `slice(start, end)` returning a sub-range view - sound precisely because views are
+may-alias (two sub-views are allowed to overlap). `span<T>` deliberately has **no** slice: an offset
+span would break its whole-allocation invariant, reopening the aliasing the noalias contract closes.
+
+> Self-aliasing a noalias parameter is on the caller (the same caveat as a bare `T[]` parameter):
+> passing the same span as two arguments to a *writing* kernel - `axpy(a, y, y)` - is UB the
+> optimizer may miscompile. Read-only self-aliasing (e.g. a `dot(r, r)` reduction) is harmless.

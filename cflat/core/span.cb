@@ -1,0 +1,55 @@
+import "view.cb";
+
+// span<T> - non-owning, NOALIAS window over a whole, distinct buffer: a thin `T[]` array-view plus
+// a length. The noalias sibling of view<T>: distinct spans are guaranteed to address distinct
+// allocations, so an -O2 `vectorize` loop over them drops the runtime overlap check it would emit
+// for raw pointers. Pass a span BY VALUE (it is two machine words) so the contract reaches the
+// callee - the `T[]` field rides the compiler's array-view alias-scope metadata through the call.
+//
+// To get the guaranteed-noalias loop, bind each span's buffer into a LOCAL `T[]` and index that:
+//
+//     void axpy(double a, span<double> y, span<double> x)
+//     {
+//         double[] yv = y.data();
+//         double[] xv = x.data();
+//         i64 n = y.length();
+//         vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + a * xv[i]; }
+//     }
+//
+// Indexing through get/set/operator[] is convenient but does NOT carry the contract across two
+// spans: those bodies all reach the buffer through the same `this`, so the optimizer cannot prove
+// two spans disjoint. The local-`T[]` form above is the one that vectorizes without a check.
+//
+// Non-owning: a span never frees _ptr. The buffer's owner (an array<T>, a `new T[n]`, ...) must
+// outlive every span over it. Obtaining a span from a raw `T*` is a compile error at `wrap` (the
+// `T* -> T[]` bind is forbidden) - a span comes only from a `new T[n]` view or another `T[]`.
+struct span<T>
+{
+    // No initializer on the array-view field: `T[] _ptr = default;` currently breaks generic method
+    // instantiation, so it is left bare like the documented `Matrix { int[] data; }` pattern. A span
+    // is non-owning and must be wrap()'d before use; the array-view one-way rule guards the store.
+    T[] _ptr;
+    i64 _len = 0;
+
+    // Point this span at an existing whole-allocation view of `len` elements. The parameter is a
+    // `T[]`, so binding a raw `T*` here is rejected by the array-view one-way rule.
+    void wrap(T[] ptr, i64 len) { _ptr = ptr; _len = len; }
+
+    i64 length() { return _len; }
+
+    // The noalias view. Bind the result into a local `T[]` and loop over it for vectorization.
+    T[] data() { return _ptr; }
+
+    T    get(i64 index) { return _ptr[index]; }
+    void set(i64 index, T value) { _ptr[index] = value; }
+    T    operator[](i64 index) { return _ptr[index]; }
+
+    // Decay to the may-alias view<T>. This is the safe one-way direction (`T[] -> T*`); the
+    // reverse (view<T> -> span<T>) has no method and is rejected at the bind site.
+    view<T> as_view()
+    {
+        view<T> v;
+        v.wrap(_ptr, _len);
+        return v;
+    }
+};

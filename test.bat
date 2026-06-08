@@ -99,6 +99,30 @@ if "%~1"=="--worker-err" (
 )
 
 REM ===========================================================================
+REM Worker mode: run the HPC -O2 IR checks via test_hpc.bat
+REM ===========================================================================
+if "%~1"=="--worker-hpc" (
+    if not defined CFLAT_OUT set CFLAT_OUT=out
+    set OUT=%CFLAT_OUT%
+    set T0=!TIME!
+    call "%~dp0test_hpc.bat" %CFLAT_CONFIG% > "!OUT!\results\hpc_o2_checks.log" 2>&1
+    if !ERRORLEVEL! neq 0 (
+        echo FAILED: hpc_o2_checks>"!OUT!\results\hpc_o2_checks.result"
+        exit /b
+    )
+    set T1=!TIME!
+    for /f "tokens=1-4 delims=:." %%a in ("!T0: =0!") do set /a CS0=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    for /f "tokens=1-4 delims=:." %%a in ("!T1: =0!") do set /a CS1=1%%a*360000+1%%b*6000+1%%c*100+1%%d-36610100
+    set /a ECS=CS1-CS0
+    if !ECS! lss 0 set /a ECS+=8640000
+    set /a ES=ECS/100
+    set /a EF=ECS-ES*100
+    if !EF! lss 10 set EF=0!EF!
+    echo PASS !ES!.!EF!s>"!OUT!\results\hpc_o2_checks.result"
+    exit /b
+)
+
+REM ===========================================================================
 REM Main: launch all tests in parallel, wait, collect results
 REM ===========================================================================
 set SRC=Test
@@ -152,6 +176,10 @@ start "" /b cmd /c "%SCRIPT% --worker-err 1"
 start "" /b cmd /c "%SCRIPT% --worker-err 2"
 start "" /b cmd /c "%SCRIPT% --worker-err 3"
 start "" /b cmd /c "%SCRIPT% --worker-err 4"
+
+REM Launch the HPC -O2 IR checks (vectorize keyword + span noalias) as one worker.
+set /a LAUNCHED+=1
+start "" /b cmd /c "%SCRIPT% --worker-hpc"
 
 for %%F in (%SRC%\test_*.c) do (
     call :IsExcluded %%~nF

@@ -1,0 +1,15 @@
+// view<T> -> span<T> is the forbidden direction. A view<T> holds a raw `T*` (may-alias), and
+// span<T>.wrap takes a `T[]` (noalias). Binding view.data() (a `T*`) into a span would launder a
+// may-alias pointer into the noalias contract, so it is rejected at the call site by the array-view
+// `T* -> T[]` one-way rule. (The allowed direction, span -> view via as_view(), is exercised in
+// Test/test_hpc.cb.)
+import "span.cb";
+import "view.cb";
+
+expect_error("cannot pass a raw pointer 'T*' as array-view parameter") {
+    void f(view<double> v)
+    {
+        span<double> s;
+        s.wrap(v.data(), v.length());
+    }
+}

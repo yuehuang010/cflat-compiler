@@ -163,17 +163,6 @@ test_lsp.bat Debug    # runs against Debug
 
 LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h` (symbol registration), run `test_lsp.bat` to verify LSP behaviour. These are kept separate from `test.bat`.
 
-### Debug-Info Tests
-
-Run the debug-info regression test with:
-
-```bash
-test_debug_info.bat          # runs against Release (default)
-test_debug_info.bat Debug    # runs against Debug
-```
-
-Compiles `Test/debug_info_fixture.cb` with `-g`, runs the executable, then verifies the emitted `.ll` contains the expected DI metadata (CodeView module flag, DISubprogram with real DISubroutineType, parameter DI via `arg:`, struct DI for `Point`, generic struct DI for `Box__int`, and `DIGlobalVariableExpression`) and that a non-empty `.pdb` is produced next to the EXE. Run this after any change to the debug-info paths in `LLVMBackend.h` (`GetDIType`, `CreateFunctionDefinition`'s DI block, `CreateGlobalVariable`, `EmitDestructorsForScope`, `EmitExecutable`'s linker flags) or to `InitDebugInfo` in `LLVMBackend.cpp`. The fixture is intentionally named without a `test_` prefix so `test.bat`'s `Test\test_*.cb` wildcard skips it.
-
 ### Example Programs
 
 Build all example programs in `example/` and subdirectories:
@@ -376,6 +365,8 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>` - requires `import "interfaces.cb"` |
 | `string.cb` | `string` value type, manipulation, `IString` implementation - requires `import "string.cb"` |
 | `array.cb` | `array<T>` - fixed-size heap array; `init(n)`, `get(i)`, `set(i, v)`, `operator[]`; iterable with `for` |
+| `span.cb` | `span<T>` - non-owning NOALIAS window (`T[] _ptr` + len); pass by value, `data()` to a local `T[]` for vectorization; `as_view()` decays to `view<T>`. See [`doc/HPC.md`](doc/HPC.md) |
+| `view.cb` | `view<T>` - non-owning MAY-ALIAS window (`T* _ptr` + len); `slice(start,end)` for sub-ranges; the permissive sibling of `span<T>` |
 | `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |

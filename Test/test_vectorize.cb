@@ -1,6 +1,6 @@
 // vectorize keyword: the loop must be vectorized at -O2 or the compile fails.
 // Under test.bat (compiled at -O0) this is a no-op and simply runs as a plain
-// loop; test_vectorize.bat compiles it at -O2 to exercise the enforced contract.
+// loop; test_hpc.bat compiles it at -O2 to exercise the enforced contract.
 // Either way the results below must be correct.
 
 int sumArrays()

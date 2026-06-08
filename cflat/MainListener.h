@@ -5033,6 +5033,11 @@ public:
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
+            // Array-view element store: tag the store with the view's alias scope (matches the load
+            // side in TagViewElementAccess) so the vectorizer proves distinct views disjoint.
+            if (namedVar.TypeAndValue.NoaliasScopeId >= 0)
+                if (auto* st = llvm::dyn_cast_or_null<llvm::StoreInst>(assignResult))
+                    compiler->AttachViewNoalias(st, namedVar.TypeAndValue.NoaliasScopeId);
             // Lazy refcount: if a new-allocated local is assigned to a non-local destination
             // (struct field, heap object), create a refcount on first escape and increment it.
             if (operatorText == "=" && rightNV.IsNewAllocated && rightNV.TypeAndValue.Pointer
@@ -6171,6 +6176,16 @@ public:
         }
     }
 
+    // If `loaded` is a load instruction reading an array-view element (NoaliasScopeId >= 0), tag it
+    // with the view's alias scope so the vectorizer can prove disjointness. No-op otherwise.
+    llvm::Value* TagViewElementAccess(llvm::Value* loaded, const LLVMBackend::NamedVariable& namedVar)
+    {
+        if (namedVar.TypeAndValue.NoaliasScopeId >= 0)
+            if (auto* inst = llvm::dyn_cast_or_null<llvm::Instruction>(loaded))
+                Compiler()->AttachViewNoalias(inst, namedVar.TypeAndValue.NoaliasScopeId);
+        return loaded;
+    }
+
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
@@ -6197,11 +6212,11 @@ public:
                 if (llvm::isa<llvm::AllocaInst>(namedVar.Storage) ||
                     llvm::isa<llvm::GlobalVariable>(namedVar.Storage) ||
                     llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
-                    return compiler->CreateLoad(namedVar.Storage);
+                    return TagViewElementAccess(compiler->CreateLoad(namedVar.Storage), namedVar);
                 // Through-pointer dereference of a pointer type (e.g. *pp where pp is char**):
                 // Storage is a raw loaded address - load again to get the pointer value.
                 if (namedVar.BaseType && namedVar.BaseType->isPointerTy())
-                    return compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
+                    return TagViewElementAccess(compiler->CreateLoad(namedVar.BaseType, namedVar.Storage), namedVar);
                 return namedVar.Storage;
             }
             return nullptr;
@@ -6226,8 +6241,8 @@ public:
                     && !llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                     && !llvm::isa<llvm::GlobalVariable>(namedVar.Storage)
                     && !llvm::isa<llvm::GetElementPtrInst>(namedVar.Storage))
-                    return compiler->CreateLoad(namedVar.BaseType, namedVar.Storage);
-                return compiler->CreateLoad(namedVar.Storage);
+                    return TagViewElementAccess(compiler->CreateLoad(namedVar.BaseType, namedVar.Storage), namedVar);
+                return TagViewElementAccess(compiler->CreateLoad(namedVar.Storage), namedVar);
             }
         }
 
@@ -8379,6 +8394,20 @@ public:
                         {
                             // Indexing through a pointer (e.g. char* p; p[i]).
                             auto elementTypeAndValue = namedVar.TypeAndValue;
+                            // Array-view element access: tag the element's load/store with this view's
+                            // alias scope so the optimizer can prove distinct views are disjoint
+                            // (dropping the runtime overlap check) even when the view rides inside a
+                            // by-value struct field, where the `noalias` parameter attribute cannot
+                            // reach. Key the scope by the view's stable origin (the struct instance
+                            // for a field view `s.v[i]`, else the variable/param name) so every access
+                            // to the same buffer shares a scope and copies are not falsely disjoint.
+                            if (namedVar.TypeAndValue.IsArrayView)
+                            {
+                                std::string originKey = namedVar.TypeAndValue.ParentVariableName;
+                                if (originKey.empty()) originKey = namedVar.TypeAndValue.VariableName;
+                                if (originKey.empty()) originKey = namedVar.CallerName;
+                                elementTypeAndValue.NoaliasScopeId = Compiler(ctx)->GetOrMintViewScope(originKey);
+                            }
                             // An indexed element is a single slot, never a whole-allocation view -
                             // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
                             elementTypeAndValue.IsArrayView = false;

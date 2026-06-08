@@ -33,6 +33,7 @@
 #pragma warning(disable: 4244 4267)
 #include <llvm\IR\CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
 #include <llvm\IR\IRBuilder.h>
+#include <llvm\IR\MDBuilder.h>    // llvm::MDBuilder (alias-scope/domain metadata for T[] noalias)
 #include <llvm\IR\Intrinsics.h>
 #include <llvm\IR\IntrinsicsX86.h>   // llvm::Intrinsic::x86_rdtscp (CreateRdtscp)
 #include <llvm\IR\LLVMContext.h>
@@ -229,6 +230,14 @@ public:
         // sub-view is unconstructible). Drives: LLVM noalias on params, the arithmetic ban,
         // distinct mangling, and `int[] -> int*` implicit decay. See doc/LANGUAGE.md.
         bool IsArrayView = false;
+
+        // Transient per-function noalias provenance: when >= 0, indexes into LLVMBackend::aliasScopes_
+        // the alias-scope this view's element loads/stores should be tagged with. Keyed by ORIGIN
+        // (parameter or struct field), not SSA value, so copies of the same view share a scope and are
+        // therefore NOT treated as disjoint. NEVER serialized (it is meaningless across functions); it
+        // is recomputed each function from the live aliasScopes_ registry. See MintAliasScope /
+        // AttachViewNoalias.
+        int NoaliasScopeId = -1;
 
         // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
@@ -647,6 +656,18 @@ public:
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
+
+    // T[] array-view noalias metadata (per-function, reset in createFunctionBlock). aliasDomain_ is
+    // the single anonymous alias domain for the current function; aliasScopes_ holds one anonymous
+    // scope per distinct view ORIGIN (parameter / field) seen in the function body. A view's element
+    // accesses are tagged !alias.scope {own scope} + !noalias {every other scope}, which proves
+    // pairwise disjointness to the loop vectorizer without a runtime overlap check - the same effect
+    // the `noalias` parameter attribute gives for a bare T[] arg, but reaching through a by-value
+    // struct field (span<T>) where the attribute cannot. See MintAliasScope / AttachViewNoalias.
+    llvm::MDNode* aliasDomain_ = nullptr;
+    std::vector<llvm::MDNode*> aliasScopes_;
+    std::map<std::string, int> viewScopeByOrigin_; // origin name -> index into aliasScopes_
+
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
@@ -1232,6 +1253,63 @@ private:
         }
     }
 
+    // Mint a fresh alias scope for one view origin in the current function and return its index into
+    // aliasScopes_. The anonymous alias domain is created lazily on first use. The returned index is
+    // stored on the view's TypeAndValue::NoaliasScopeId so every access derived from the same origin
+    // (and any copy that shares the id) tags the same scope.
+    int MintAliasScope()
+    {
+        llvm::MDBuilder mdb(*context);
+        if (aliasDomain_ == nullptr)
+            aliasDomain_ = mdb.createAnonymousAliasScopeDomain("cflat.view");
+        auto* scope = mdb.createAnonymousAliasScope(aliasDomain_, "cflat.view.scope");
+        aliasScopes_.push_back(scope);
+        return (int)aliasScopes_.size() - 1;
+    }
+
+    // Tag a load/store with the noalias provenance of a view: !alias.scope = { its own scope } and
+    // !noalias = { every OTHER live scope in this function }. With each origin in its own scope, the
+    // optimizer can prove any two distinct-origin views do not alias - dropping the runtime overlap
+    // check the loop vectorizer would otherwise insert.
+    //
+    // The alias.scope is set unconditionally (even when no sibling exists yet): scopes are minted
+    // lazily as origins are first indexed, so an access emitted before its sibling's scope exists
+    // would otherwise be invisible to that later sibling's !noalias list. Always stamping the
+    // alias.scope makes the disambiguation order-independent - a later access whose !noalias names
+    // this scope proves disjointness against this access regardless of which was emitted first. The
+    // !noalias list is only attached when at least one other scope currently exists.
+    void AttachViewNoalias(llvm::Instruction* memInst, int scopeId)
+    {
+        if (memInst == nullptr || scopeId < 0 || scopeId >= (int)aliasScopes_.size())
+            return;
+        std::vector<llvm::Metadata*> others;
+        for (int i = 0; i < (int)aliasScopes_.size(); ++i)
+            if (i != scopeId)
+                others.push_back(aliasScopes_[i]);
+        memInst->setMetadata(llvm::LLVMContext::MD_alias_scope,
+            llvm::MDNode::get(*context, { aliasScopes_[scopeId] }));
+        if (!others.empty())
+            memInst->setMetadata(llvm::LLVMContext::MD_noalias, llvm::MDNode::get(*context, others));
+    }
+
+    // Return the alias-scope index for a view ORIGIN (a parameter name, local name, or
+    // struct-instance name for a field view), minting one on first sight. Keyed by the origin
+    // STRING - so every access derived from the same origin (and any copy that names the same
+    // origin) shares a scope and is therefore correctly treated as possibly-aliasing itself, while
+    // two distinct origins land in distinct scopes and are proven disjoint. An empty key returns -1
+    // (no stable provenance -> no metadata; a bare T[] parameter still relies on its noalias attr).
+    int GetOrMintViewScope(const std::string& originKey)
+    {
+        if (originKey.empty())
+            return -1;
+        auto it = viewScopeByOrigin_.find(originKey);
+        if (it != viewScopeByOrigin_.end())
+            return it->second;
+        int id = MintAliasScope();
+        viewScopeByOrigin_.emplace(originKey, id);
+        return id;
+    }
+
     void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false)
     {
         // all function starts at "entry" block
@@ -1252,6 +1330,10 @@ private:
         stackState.functionName = friendlyName;
         currentFunctionReturnsOwned = returnsOwned;
         currentFunctionReturnIsArrayView = returnIsArrayView;
+        // Reset the per-function alias-scope registry; scopes from a prior function must never leak.
+        aliasDomain_ = nullptr;
+        aliasScopes_.clear();
+        viewScopeByOrigin_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();

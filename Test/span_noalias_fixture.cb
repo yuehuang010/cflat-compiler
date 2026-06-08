@@ -1,0 +1,44 @@
+// Fixture for test_hpc.bat: the span<T> noalias guarantee, verified at -O2.
+//
+// span_axpy passes two span<double> BY VALUE and indexes each span's buffer through a local
+// `double[]`. The span's `T[] _ptr` field rides the compiler's scoped alias-scope metadata, so at
+// -O2 the loop must vectorize with NO runtime overlap check (no `vector.memcheck`) - the headline
+// span guarantee. The `vectorize` keyword additionally hard-errors if the loop fails to vectorize
+// at all, and test_hpc.bat greps the emitted IR to assert the memcheck is absent.
+//
+// Named without a `test_` prefix so test.bat's `test_*.cb` wildcard skips it (it needs -O2, which
+// test.bat does not use).
+import "span.cb";
+import "cruntime.cb";
+
+void span_axpy(double k, span<double> y, span<double> x)
+{
+    double[] yv = y.data();
+    double[] xv = x.data();
+    i64 n = y.length();
+    vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + k * xv[i]; }
+}
+
+extern int main()
+{
+    i64 n = 1024;
+    double[] a = new double[n];
+    double[] b = new double[n];
+    i64 i = 0;
+    while (i < n) { a[i] = (double)i; b[i] = 2.0; i = i + 1; }
+
+    span<double> y; y.wrap(a, n);
+    span<double> x; x.wrap(b, n);
+    span_axpy(3.0, y, x);     // a[i] += 3 * 2  ->  a[i] + 6
+
+    int ok = 1;
+    if (a[0]    != 6.0)    ok = 0;
+    if (a[100]  != 106.0)  ok = 0;
+    if (a[1023] != 1029.0) ok = 0;
+
+    int* ap = move a; delete[_] ap;
+    int* bp = move b; delete[_] bp;
+
+    printf("span_axpy ok=%d\n", ok);
+    return ok == 1 ? 0 : 1;
+}

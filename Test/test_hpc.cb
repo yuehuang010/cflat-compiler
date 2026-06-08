@@ -13,6 +13,8 @@
 
 import "cruntime.cb";
 import "test_helper.cb";
+import "span.cb";
+import "view.cb";
 
 // ---------------------------------------------------------------------------
 // int[] array-view kernels
@@ -225,6 +227,67 @@ int testMultiVar(int seed)
     return passed;
 }
 
+// ---------------------------------------------------------------------------
+// span<T> (noalias) and view<T> (may-alias) library types - see doc/HPC.md.
+// span rides the T[] array-view noalias metadata; view is the may-alias sibling.
+// (Correctness is checked here at -O0; the noalias/no-memcheck IR guarantee for
+//  span is verified at -O2 by test_hpc.bat.)
+// ---------------------------------------------------------------------------
+
+// span axpy in the documented noalias shape: bind each span's buffer to a local
+// T[] and loop over that (the form the optimizer vectorizes without a check).
+void span_axpy(double k, span<double> y, span<double> x)
+{
+    double[] yv = y.data();
+    double[] xv = x.data();
+    i64 n = y.length();
+    i64 i = 0;
+    while (i < n) { yv[i] = yv[i] + k * xv[i]; i = i + 1; }
+}
+
+int testSpanView()
+{
+    int passed = 0;
+
+    i64 n = 4;
+    double[] da = new double[n];
+    double[] db = new double[n];
+    i64 i = 0;
+    while (i < n) { da[i] = (double)i; db[i] = 1.0; i = i + 1; }   // da={0,1,2,3} db={1,1,1,1}
+
+    span<double> sy; sy.wrap(da, n);
+    span<double> sx; sx.wrap(db, n);
+
+    passed += Test("span length", (int)sy.length(), 4);
+    passed += Test("span get",    (float)sy.get(2), 2.0f);
+    sy.set(0, 7.0);
+    passed += Test("span set",    (float)sy.get(0), 7.0f);
+    passed += Test("span operator[]", (float)sx[1], 1.0f);
+    sy.set(0, 0.0);   // restore da[0]
+
+    span_axpy(2.0, sy, sx);     // da[i] += 2 * db[i]  ->  {2, 3, 4, 5}
+    passed += Test("span axpy first", (float)da[0], 2.0f);
+    passed += Test("span axpy last",  (float)da[3], 5.0f);
+
+    // span -> view decay (the safe one-way direction; view -> span is rejected, see err_*).
+    view<double> vv = sy.as_view();
+    passed += Test("span as_view length", (int)vv.length(), 4);
+    passed += Test("span as_view elem",   (float)vv[3], 5.0f);
+
+    // view over a buffer, plus a sub-range slice (offset views are sound: view is may-alias).
+    view<double> vw; vw.wrap(da, n);     // da = {2, 3, 4, 5}
+    view<double> mid = vw.slice(1, 3);   // {3, 4}
+    passed += Test("view slice length", (int)mid.length(), 2);
+    passed += Test("view slice first",  (float)mid[0], 3.0f);
+    passed += Test("view slice last",   (float)mid[1], 4.0f);
+    mid.set(0, 99.0);                    // writes through to da[1]
+    passed += Test("view slice writes through", (float)da[1], 99.0f);
+
+    int* dap = move da; delete[_] dap;
+    int* dbp = move db; delete[_] dbp;
+    return passed;
+}
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
@@ -240,6 +303,9 @@ extern int main(int argc, char** argv)
     passed += testLaneCounts(seed);        total += 5;
     passed += testElementTypes(seed);      total += 7;
     passed += testMultiVar(seed);          total += 2;
+
+    // ---- span<T> / view<T> ----
+    passed += testSpanView(); total += 12;
 
     // ---- int[] array-view ----
     int n = argc + 7;   // 8 with no args
