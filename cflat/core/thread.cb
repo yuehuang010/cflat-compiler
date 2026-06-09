@@ -9,10 +9,71 @@
 // cleanup). Without this propagation, the child starts with a null allocator
 // and any new/delete falls through to CRT malloc/free, which corrupts the
 // heap for vmem-backed BucketAllocator pages.
+// ---------------------------------------------------------------------------
+// Per-thread floating-point environment (traps + flush-to-zero / denormals).
+//
+// The SSE control word (MXCSR) is per-thread hardware state. By default CFlat
+// leaves it at the C runtime default: FP exceptions are masked (a NaN/Inf
+// producing op yields a quiet NaN/Inf instead of faulting) and denormals are
+// computed at full IEEE precision (which can be 10-100x slower on hot loops).
+//
+// A thread can opt into a different environment at creation time via a single
+// int knob (_fpConfig): trap bits OR'd with an optional flush-to-zero flag.
+// A value of 0 means "do not touch the control word" - zero behavior change.
+//
+// _controlfp_s is the UCRT control-word accessor (cdecl, already linked). It
+// drives MXCSR on x64. Enabling a trap means CLEARING that exception's mask
+// (_EM_*) bit; flush-to-zero means setting _DN_FLUSH in the _MCW_DN field.
+// ---------------------------------------------------------------------------
+extern int _controlfp_s(u32* cur, u32 newval, u32 mask);
+
+// Raw UCRT control-word bits.
+int _EM_INVALID    = 0x10;
+int _EM_ZERODIVIDE = 0x08;
+int _EM_OVERFLOW   = 0x04;
+int _MCW_EM        = 0x0008001F;  // full exception-mask field
+int _MCW_DN        = 0x03000000;  // denormal-control field
+int _DN_FLUSH      = 0x01000000;  // flush denormals to zero
+
+// Public FP-config constants. Trap bits intentionally equal the _EM_* bits so
+// the trap portion of a config can be masked directly. FP_FLUSH_DENORMALS uses
+// a distinct high bit so it never collides with a trap bit.
+int FP_TRAP_INVALID  = 0x10;
+int FP_TRAP_DIVZERO  = 0x08;
+int FP_TRAP_OVERFLOW = 0x04;
+int FP_TRAP_DEFAULT  = 0x1C;      // INVALID | DIVZERO | OVERFLOW
+int FP_FLUSH_DENORMALS = 0x10000;
+
+// Apply an FP config to the CURRENT thread. No-op when cfg == 0.
+void __fp_apply(int cfg) {
+    if (cfg == 0) return;
+    u32 cur = 0;
+    int trapBits = cfg & (_EM_INVALID | _EM_ZERODIVIDE | _EM_OVERFLOW);
+    if (trapBits != 0) {
+        // Clearing an _EM_* bit unmasks (enables a trap for) that exception.
+        _controlfp_s(&cur, 0, (u32)trapBits);
+    }
+    if ((cfg & FP_FLUSH_DENORMALS) != 0) {
+        _controlfp_s(&cur, (u32)_DN_FLUSH, (u32)_MCW_DN);
+    }
+}
+
+// Enable the given trap mask on the current thread (e.g. FP_TRAP_DEFAULT).
+void fp_enable_traps(int mask) {
+    __fp_apply(mask);
+}
+
+// Restore masked (non-trapping) FP exceptions on the current thread.
+void fp_disable_traps() {
+    u32 cur = 0;
+    _controlfp_s(&cur, (u32)_MCW_EM, (u32)_MCW_EM);
+}
+
 struct __ThreadArgs {
     function<int(void*)> fn = nullptr;
     void* ctx = nullptr;
     IAllocator _allocator;
+    int _fpConfig = 0;
 };
 
 // Move-typed args packet: the fn signature carries 'move void*', so the call
@@ -22,6 +83,7 @@ struct __ThreadArgsMove {
     function<int(move void*)> fn = nullptr;
     void* ctx = nullptr;
     IAllocator _allocator;
+    int _fpConfig = 0;
 };
 
 // Win32 LPTHREAD_START_ROUTINE. Must be __stdcall on Win32 (WINAPI convention).
@@ -29,6 +91,7 @@ struct __ThreadArgsMove {
 stdcall int __thread_trampoline(void* param) {
     __ThreadArgs* args = (__ThreadArgs*)param;
     __active_allocator = args->_allocator;
+    __fp_apply(args->_fpConfig);
     if (__fuzz_hook != nullptr) { __fuzz_hook(40); }  // thread-fuzz sched-point (child-thread entry)
     return args->fn(args->ctx);
 }
@@ -36,6 +99,7 @@ stdcall int __thread_trampoline(void* param) {
 stdcall int __thread_trampoline_move(void* param) {
     __ThreadArgsMove* args = (__ThreadArgsMove*)param;
     __active_allocator = args->_allocator;
+    __fp_apply(args->_fpConfig);
     if (__fuzz_hook != nullptr) { __fuzz_hook(41); }  // thread-fuzz sched-point (child-thread entry)
     return args->fn(args->ctx);
 }
@@ -56,13 +120,14 @@ struct Thread {
 
     // Borrow overload: caller retains ownership of ctx. The thread's fn must not
     // free ctx, and the caller must keep it alive until join() returns.
-    bool start(function<int(void*)> fn, void* ctx) {
+    bool start(function<int(void*)> fn, void* ctx, int fpConfig = 0) {
         __ThreadArgs* args = (__ThreadArgs*)malloc(sizeof(__ThreadArgs));
         args->fn  = fn;
         args->ctx = ctx;
         IAllocator child = default;
         if (__active_allocator != nullptr) child = __active_allocator.spawn_child();
         args->_allocator = child;
+        args->_fpConfig = fpConfig;
         _args = args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
@@ -83,13 +148,14 @@ struct Thread {
     // 'void*' and the caller's pointer was already nulled by the move call.
     // Callers needing recovery should validate inputs (e.g. handle limits)
     // before invoking start().
-    bool start(function<int(move void*)> fn, move void* ctx) {
+    bool start(function<int(move void*)> fn, move void* ctx, int fpConfig = 0) {
         __ThreadArgsMove* args = (__ThreadArgsMove*)malloc(sizeof(__ThreadArgsMove));
         args->fn  = fn;
         args->ctx = ctx;          // assignment transfers ctx into args->ctx; ctx local is auto-nulled
         IAllocator child = default;
         if (__active_allocator != nullptr) child = __active_allocator.spawn_child();
         args->_allocator = child;
+        args->_fpConfig = fpConfig;
         _args = (void*)args;
         i32 id = 0;
         _handle = CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);

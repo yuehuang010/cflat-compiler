@@ -1,0 +1,71 @@
+// Per-thread floating-point environment test.
+//
+// Verifies that a thread armed with FP_FLUSH_DENORMALS (flush-to-zero /
+// denormals-are-zero) flushes a denormal product to 0.0, while the default
+// main thread - left at the C runtime FP default - computes the same denormal
+// product as a non-zero value. This proves the setting both takes effect AND
+// is isolated to the configured thread.
+//
+// Operands are routed through a heap pointer so the multiply is a runtime
+// computation on loaded values - neither the frontend nor LLVM can constant
+// fold it (which would ignore the per-thread MXCSR state).
+
+import "test_helper.cb";
+import "thread.cb";
+
+extern void* malloc(win_size size);
+extern void free(void* p);
+
+struct FpCtx {
+    double a      = 0.0;
+    double b      = 0.0;
+    double result = 0.0;
+};
+
+// Runs on the spawned worker (armed with FP_FLUSH_DENORMALS). With flush-to-zero
+// the denormal product is forced to 0.0.
+int fpWorker(void* ctx) {
+    FpCtx* c = (FpCtx*)ctx;
+    double x = c->a;     // runtime load - defeats constant folding
+    double y = c->b;
+    c->result = x * y;
+    return 0;
+}
+
+// A denormal large enough that its halved value is still a representable
+// denormal (non-zero) under the default FP environment, but is flushed to 0.0
+// when flush-to-zero / denormals-are-zero is enabled.
+bool testFtzIsolation() {
+    FpCtx* c = (FpCtx*)malloc(sizeof(FpCtx));
+    c->a      = 1e-320;   // denormal double
+    c->b      = 0.5;
+    c->result = 1.0;      // sentinel - worker overwrites it
+
+    Thread t = default;
+    t.start(fpWorker, c, FP_FLUSH_DENORMALS);
+    t.join();
+    double workerResult = c->result;
+
+    // Same product on the default (non-flushing) main thread, also via runtime
+    // loads. The denormal survives as a non-zero value.
+    double mx = c->a;
+    double my = c->b;
+    double mainResult = mx * my;
+
+    free((void*)c);
+
+    int r = 1;
+    r = r & Test("ftz_worker_flushed_to_zero", workerResult == 0.0, true);
+    r = r & Test("ftz_main_thread_survives",   mainResult != 0.0,   true);
+    return r != 0;
+}
+
+extern int main() {
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testFtzIsolation() ? 1 : 0;
+
+    printf("%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

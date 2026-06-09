@@ -572,6 +572,7 @@ public:
         unsigned StopSourceFieldIndex = 0;             // struct field index of _stop_source (stop_source)
         unsigned TrackHandlesFieldIndex = 0;           // struct field index of trackHandles (bool)
         unsigned UseChannelFieldIndex = 0;             // struct field index of useChannel (int, 0/1). User opt-in: `p1 >> p2` only wires the arena channel when BOTH programs have useChannel set. Stream piping is always wired.
+        unsigned FpConfigFieldIndex = 0;               // struct field index of _fpConfig (int). User-settable per-thread FP environment (traps + flush-to-zero) applied on the program thread before main(). 0 = no-op.
         unsigned OutFieldIndex      = (unsigned)-1;     // struct field index of _out (stream*); -1 when stream.cb not imported
         unsigned InStreamFieldIndex = (unsigned)-1;     // struct field index of _in  (stream*); -1 when stream.cb not imported
         unsigned InboxArenaFieldIndex = (unsigned)-1;   // struct field index of inbox (arena_channel*); -1 when arena_channel.cb not imported. Consumer owns it; lazily allocated by `>>`.

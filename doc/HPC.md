@@ -534,6 +534,31 @@ pass any bitmask for a custom set (e.g. `cpu_mask_lowest` on a P-core range to k
 E-cores). The plain `init(workers)` overload leaves the workers unpinned. This closes the old
 pin-vs-pool gap: a bulk-synchronous solver now gets thread reuse **and** affinity at the same time.
 
+### Per-worker floating-point environment (trap NaN/Inf, flush denormals)
+
+A numerical blow-up to `NaN`/`Inf` is otherwise silent: a quiet `NaN` propagates from the step that
+produced it to wherever it first becomes visible (a garbage value many steps later), with no signal at
+the source. Each parallel worker can opt into a different per-thread FP environment so the fault lands
+where it is born, or so denormals stop dragging the hot loop into the slow path.
+
+The raw `parallel_for_n` and `parallel_reduce<T>` take a trailing `int fpConfig = 0` after `pin`; the
+`*_pool` variants inherit the config their `ThreadPool` was `init`'d with (the third `init` argument):
+
+```c
+// Trap on the first NaN/Inf in any worker - faults at the producing instruction.
+parallel_for_n(n, workers, body, /*pin=*/true, FP_TRAP_DEFAULT);
+
+// Flush denormals to zero across a pinned pool (throughput knob).
+ThreadPool pool;
+pool.init(8, cpu_mask_lowest(8), FP_FLUSH_DENORMALS);
+```
+
+`FP_TRAP_DEFAULT` is the "catch NaN/Inf at the source" diagnostic; `FP_FLUSH_DENORMALS` is the
+throughput knob (denormals can cost 10-100x). The setting is per-thread, applied at worker creation,
+and never touches the main thread. See [Per-thread floating-point environment](threading.md#per-thread-floating-point-environment-corethreadcb)
+in threading.md for the full constant list, the `fp_enable_traps`/`fp_disable_traps` in-thread helpers,
+and the `program._fpConfig` field.
+
 ### Per-thread RNG for parallel Monte Carlo
 
 A parallel Monte Carlo reduction needs each worker to draw from a **statistically independent** stream;

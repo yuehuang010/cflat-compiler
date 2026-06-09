@@ -12570,6 +12570,7 @@ public:
         unsigned onStdinReturnIdx    = compiler->programTable[name].OnStdinReturnFieldIndex;
         unsigned stopSrcIdx          = compiler->programTable[name].StopSourceFieldIndex;
         unsigned trackHandlesIdx     = compiler->programTable[name].TrackHandlesFieldIndex;
+        unsigned fpConfigIdx         = compiler->programTable[name].FpConfigFieldIndex;
 
         auto* stopSrcInitFn        = FindMethodOf("init",           "stop_source");
         auto* stopSrcRequestStopFn = FindMethodOf("request_stop",   "stop_source");
@@ -12701,6 +12702,17 @@ public:
             // Set thread-local __active_allocator to the IAllocator fat-ptr.
             auto* activeAllocGlobal = compiler->globalNamedVariable["__active_allocator"];
             compiler->builder->CreateStore(activeFatPtr, activeAllocGlobal);
+
+            // Arm the per-thread FP environment from self->_fpConfig (0 = no-op).
+            // Runs on the program thread, mirroring the Thread trampoline's __fp_apply call.
+            if (auto* fpApplyFn = compiler->GetFunction("__fp_apply"))
+            {
+                auto* fpCfgGEP = compiler->builder->CreateStructGEP(
+                    progType, self, fpConfigIdx, "fp_config_gep");
+                auto* fpCfgVal = compiler->builder->CreateLoad(
+                    llvm::Type::getInt32Ty(*compiler->context), fpCfgGEP, "fp_config");
+                compiler->builder->CreateCall(fpApplyFn->getFunctionType(), fpApplyFn, {fpCfgVal});
+            }
 
             // Install stdout hook: load self->onStdout and store into __prog_tls.stdout_hook
             {
@@ -13127,9 +13139,13 @@ public:
             // Thread.start() takes function<int(void*)> as a fat struct {i8*, i8*}.
             auto* trampolineFn  = compiler->programTable[name].TrampolineFunction;
             auto* trampolineFat = compiler->WrapBareValueAsFatStruct(trampolineFn);
+            // fpConfig arg is 0 here: the program thread arms its FP environment
+            // from self->_fpConfig inside the trampoline (EmitProgramRunWrapper),
+            // not via Thread.start. Pass an explicit 0 to match the 3-param
+            // start(fn, ctx, fpConfig) signature.
             auto* startResult = compiler->builder->CreateCall(
                 threadStartFn->getFunctionType(), threadStartFn,
-                {threadFieldGEP, trampolineFat, pkgRaw}, "start_result");
+                {threadFieldGEP, trampolineFat, pkgRaw, compiler->builder->getInt32(0)}, "start_result");
 
             // On start failure: free pkg, return false
             auto* successBlock = llvm::BasicBlock::Create(*compiler->context, "start_ok",   runFn);
@@ -13365,6 +13381,7 @@ public:
         unsigned stopSrcFieldIndex       = onStdinReturnFieldIndex + 1;
         unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
         unsigned useChannelFieldIndex    = trackHandlesFieldIndex + 1;
+        unsigned fpConfigFieldIndex      = useChannelFieldIndex + 1;
         unsigned outFieldIndex           = (unsigned)-1;
         unsigned inStreamFieldIndex      = (unsigned)-1;
         unsigned inboxArenaFieldIndex    = (unsigned)-1;
@@ -13425,6 +13442,11 @@ public:
             useChannelField.TypeName     = "int";   // int not bool - avoids i1-in-ConstantStruct assertion
             useChannelField.VariableName = "useChannel";
             declList.push_back(useChannelField);
+
+            LLVMBackend::DeclTypeAndValue fpConfigField;
+            fpConfigField.TypeName     = "int";   // per-thread FP environment knob applied on the program thread
+            fpConfigField.VariableName = "_fpConfig";
+            declList.push_back(fpConfigField);
 
             if (hasStreamType) {
                 LLVMBackend::DeclTypeAndValue outField;
@@ -13573,6 +13595,12 @@ public:
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                 useChannelFieldIndex);
 
+            // _fpConfig = 0 (no-op; user sets `prog._fpConfig = FP_*` to arm the program thread)
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                fpConfigFieldIndex);
+
             // _out / _in = nullptr (only when stream.cb is imported)
             if (outFieldIndex != (unsigned)-1)
             {
@@ -13613,6 +13641,7 @@ public:
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
         compiler->programTable[name].UseChannelFieldIndex    = useChannelFieldIndex;
+        compiler->programTable[name].FpConfigFieldIndex      = fpConfigFieldIndex;
         compiler->programTable[name].OutFieldIndex           = outFieldIndex;
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
         compiler->programTable[name].InboxArenaFieldIndex    = inboxArenaFieldIndex;
@@ -13653,7 +13682,8 @@ public:
                 || field.VariableName == "onStdin" || field.VariableName == "onStdinReturn"
                 || field.VariableName == "_stop_source" || field.VariableName == "inbox"
                 || field.VariableName == "outbox" || field.VariableName == "useChannel"
-                || field.VariableName == "trackHandles" || field.VariableName == "_out" || field.VariableName == "_in")
+                || field.VariableName == "trackHandles" || field.VariableName == "_out" || field.VariableName == "_in"
+                || field.VariableName == "_fpConfig")
                 compiler->LogError(std::format(
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
@@ -13673,6 +13703,7 @@ public:
         unsigned stopSrcFieldIndex       = onStdinReturnFieldIndex + 1;
         unsigned trackHandlesFieldIndex  = stopSrcFieldIndex + 1;
         unsigned useChannelFieldIndex    = trackHandlesFieldIndex + 1;
+        unsigned fpConfigFieldIndex      = useChannelFieldIndex + 1;
         unsigned outFieldIndex           = (unsigned)-1;  // set below if stream.cb is imported
         unsigned inStreamFieldIndex      = (unsigned)-1;  // set below if stream.cb is imported
         unsigned inboxArenaFieldIndex    = (unsigned)-1;  // set below if arena_channel.cb is imported
@@ -13733,6 +13764,11 @@ public:
             useChannelField.TypeName     = "int";   // int not bool - avoids i1-in-ConstantStruct assertion
             useChannelField.VariableName = "useChannel";
             declList.push_back(useChannelField);
+
+            LLVMBackend::DeclTypeAndValue fpConfigField;
+            fpConfigField.TypeName     = "int";   // per-thread FP environment knob applied on the program thread
+            fpConfigField.VariableName = "_fpConfig";
+            declList.push_back(fpConfigField);
 
             if (hasStreamType) {
                 LLVMBackend::DeclTypeAndValue outField;
@@ -13885,6 +13921,12 @@ public:
                 llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
                 useChannelFieldIndex);
 
+            // Synthetic field: _fpConfig = 0 (no-op; user arms the program thread via `prog._fpConfig = FP_*`)
+            structVal = compiler->CreateInsertValue(
+                structVal,
+                llvm::ConstantInt::get(llvm::Type::getInt32Ty(*compiler->context), 0),
+                fpConfigFieldIndex);
+
             // Synthetic fields: _out = nullptr, _in = nullptr (stream*; only present when stream.cb is imported)
             if (outFieldIndex != (unsigned)-1)
             {
@@ -13963,6 +14005,7 @@ public:
         compiler->programTable[name].StopSourceFieldIndex    = stopSrcFieldIndex;
         compiler->programTable[name].TrackHandlesFieldIndex  = trackHandlesFieldIndex;
         compiler->programTable[name].UseChannelFieldIndex    = useChannelFieldIndex;
+        compiler->programTable[name].FpConfigFieldIndex      = fpConfigFieldIndex;
         compiler->programTable[name].OutFieldIndex           = outFieldIndex;
         compiler->programTable[name].InStreamFieldIndex      = inStreamFieldIndex;
         compiler->programTable[name].InboxArenaFieldIndex    = inboxArenaFieldIndex;

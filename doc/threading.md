@@ -112,8 +112,8 @@ i32 code = t.join();   // 42
 
 | Method | Returns | Notes |
 |--------|---------|-------|
-| `start(fn, ctx)` | `bool` | borrow overload - the caller keeps ownership of `ctx` and must keep it alive until `join()`; the thread's `fn` must not free it. Returns `false` if the OS thread could not be created. |
-| `start(fn, move ctx)` | `bool` | move overload - ownership of `ctx` transfers to the thread (the caller's pointer is auto-nulled), and `fn` (typed `int(move void*)`) frees it. |
+| `start(fn, ctx, fpConfig = 0)` | `bool` | borrow overload - the caller keeps ownership of `ctx` and must keep it alive until `join()`; the thread's `fn` must not free it. Returns `false` if the OS thread could not be created. Optional `fpConfig` arms the new thread's FP environment (see [Per-thread floating-point environment](#per-thread-floating-point-environment-corethreadcb)); `0` = leave it at the default. |
+| `start(fn, move ctx, fpConfig = 0)` | `bool` | move overload - ownership of `ctx` transfers to the thread (the caller's pointer is auto-nulled), and `fn` (typed `int(move void*)`) frees it. Same optional `fpConfig` as the borrow overload. |
 | `join()` | `i32` | block until the thread exits; returns its exit code and releases the handle. |
 | `try_join(i32 ms)` | `bool` | block up to `ms`; returns `true` and cleans up if the thread exited, `false` on timeout (handle left intact). |
 | `setAffinity(u64 mask)` | - | pin the thread to a CPU set; `mask` is a bitmask of allowed cores (`1` = core 0, `2` = core 1, `3` = cores 0+1, ...). Call after `start()`, before `join()`. |
@@ -136,6 +136,88 @@ int cores = hardware_concurrency();   // e.g. 20; 0 if it cannot be determined
 ```
 
 **Per-thread allocator inheritance.** `start()` propagates the parent's active allocator to the child: it calls `spawn_child()` on the installed allocator, which lets each allocator choose its policy - `MallocAllocator` shares itself (the child uses the same global heap), while a per-thread allocator like `BucketAllocator` hands the child a fresh instance registered for cleanup. This is what makes `new`/`delete` safe on worker threads spawned inside a `program` scope; without it a child would start with no allocator and fall through to raw CRT `malloc`/`free`, corrupting a vmem-backed allocator's pages. You don't call anything to opt in - it happens on every `start()`. (See [Memory Management](#memory-management) for the allocator interface itself.)
+
+### Per-thread floating-point environment (`core/thread.cb`)
+
+The SSE control word (MXCSR) is **per-thread** hardware state controlling how
+floating-point exceptions and denormals are handled. CFlat leaves every thread
+at the C runtime default: FP exceptions are masked (a `0.0/0.0` or overflow
+yields a quiet `NaN`/`Inf` that propagates silently) and denormals are computed
+at full IEEE precision (which can be 10-100x slower in a hot loop).
+
+A thread can opt into a different environment **at creation time** through a
+single `int` knob, `fpConfig`: trap bits OR'd with an optional flush-to-zero
+flag. The default `0` means "leave the control word untouched" - zero behavior
+change. The setting is **per-thread and not inherited**: it is applied on the
+spawned thread before its body runs and never touches the main thread or any
+linked C library. The main thread stays at the C default, which is why HPC work
+that wants trapping or flush-to-zero runs on spawned threads.
+
+**Constants** (file-scope, in `thread.cb`):
+
+| Constant | Meaning |
+|----------|---------|
+| `FP_TRAP_INVALID` | Trap on an invalid operation (e.g. `0.0/0.0`, `sqrt` of a negative) - faults at the producing instruction instead of yielding a quiet `NaN`. |
+| `FP_TRAP_DIVZERO` | Trap on division by zero. |
+| `FP_TRAP_OVERFLOW` | Trap on overflow to `Inf`. |
+| `FP_TRAP_DEFAULT` | `FP_TRAP_INVALID | FP_TRAP_DIVZERO | FP_TRAP_OVERFLOW` - the usual "catch NaN/Inf at the source" set. |
+| `FP_FLUSH_DENORMALS` | Flush-to-zero / denormals-are-zero: denormal inputs and results become `0.0`. An HPC throughput knob - trades a small amount of precision near zero for avoiding the denormal slow path. |
+
+OR the flags together: `FP_TRAP_DEFAULT | FP_FLUSH_DENORMALS` both traps and flushes.
+
+**Arming a thread at creation** - pass the config as the optional third argument
+to `start`:
+
+```c
+import "thread.cb";
+
+// Trap NaN/Inf at the source on this worker; the main thread is unaffected.
+Thread t;
+t.start(solverStep, &ctx, FP_TRAP_DEFAULT);
+t.join();
+```
+
+**Arming from inside a running thread** - the thin wrappers `fp_enable_traps(mask)`
+and `fp_disable_traps()` change the current thread's environment directly:
+
+```c
+fp_enable_traps(FP_TRAP_DEFAULT);   // from here on, NaN/Inf faults on this thread
+// ... numerically sensitive region ...
+fp_disable_traps();                 // back to masked (quiet-NaN) behavior
+```
+
+> Trapping is a **diagnostic** tool: an armed thread that produces a `NaN`/`Inf`
+> raises a hardware FP exception (SIGFPE) at the instruction that produced it,
+> so the fault points at the source rather than at the distant place the garbage
+> first becomes visible. Use it while hunting a blow-up; ship with it off (or use
+> `FP_FLUSH_DENORMALS` alone, which never faults) once the kernel is trusted.
+
+**Thread pools and parallel helpers** carry the same knob:
+
+- `ThreadPool.init(workerCount, pinMask, fpConfig)` - every worker the pool spawns
+  (including workers added by a later `resize`) is armed with `fpConfig`. The third
+  argument is optional and defaults to `0`.
+- Raw `parallel_for_n(n, workers, body, pin, fpConfig)` and
+  `parallel_reduce<T>(n, workers, identity, partial, combine, pin, fpConfig)` arm
+  each worker thread they spawn. The `_pool` variants take no `fpConfig` - they run
+  on a `ThreadPool`'s workers and inherit whatever that pool was `init`'d with.
+
+```c
+import "threadpool.cb";
+ThreadPool pool;
+pool.init(hardware_concurrency(), cpu_mask_lowest(8), FP_FLUSH_DENORMALS);
+// every pooled worker flushes denormals
+```
+
+**`program` construct** - a program runs its `main` on a dedicated thread and
+exposes a user-settable `_fpConfig` field (mirroring `_allocator`). Set it before
+`run()` to arm the program thread:
+
+```c
+MyProg p;
+p._fpConfig = FP_TRAP_DEFAULT;   // arm the program thread (default 0 = no-op)
+p.run(args);
+```
 
 ### Cancellation (`core/stop_token.cb`)
 

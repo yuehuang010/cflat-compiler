@@ -330,6 +330,10 @@ class ThreadPool {
     // (the i-th set bit, see __threadpool_nth_core) right after it is started,
     // and resize()'s newly-grown workers are pinned the same way.
     u64            _pinMask          = 0;
+    // Per-thread FP environment applied to every worker at creation (traps +
+    // flush-to-zero), set by init(workers, pinMask, fpConfig). 0 = leave the
+    // control word at its default (no-op). See FP_* constants in thread.cb.
+    int            _fpConfig         = 0;
     // Inline mode: when init() is called on a thread that already has an
     // installed __active_allocator (i.e. inside a `program`), spawning worker
     // threads is unsafe.  Worker threads start with a null __active_allocator,
@@ -352,9 +356,10 @@ class ThreadPool {
     // If called inside a `program` scope (i.e. with a non-null __active_allocator),
     // the pool switches to inline mode: no worker threads are spawned and submit()
     // executes tasks synchronously on the caller's thread.  See _inlineMode.
-    void init(int workerCount, u64 pinMask = 0) {
+    void init(int workerCount, u64 pinMask = 0, int fpConfig = 0) {
         if (_count > 0 || _inlineMode) { return; }
         _pinMask = pinMask;
+        _fpConfig = fpConfig;
         // Inline-mode trigger for program-scope use was a workaround for the
         // cross-thread free hazard. With page-header-driven operator delete
         // (memory.cb) plus per-thread BucketAllocator via spawn_child
@@ -393,7 +398,7 @@ class ThreadPool {
             WorkerStartCtx* sc = new WorkerStartCtx();
             sc->wctx = &_ctx;
             sc->slot = i;
-            _workers[i].start(__threadpool_worker, sc);   // ownership transfers to worker
+            _workers[i].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
             if (_pinMask != (u64)0) {
                 _workers[i].setAffinity(__threadpool_nth_core(_pinMask, i));
             }
@@ -627,7 +632,7 @@ class ThreadPool {
                 WorkerStartCtx* sc = new WorkerStartCtx();
                 sc->wctx = &_ctx;
                 sc->slot = j;
-                _workers[j].start(__threadpool_worker, sc);   // ownership transfers to worker
+                _workers[j].start(__threadpool_worker, sc, _fpConfig);   // ownership transfers to worker
                 if (_pinMask != (u64)0) {
                     _workers[j].setAffinity(__threadpool_nth_core(_pinMask, j));
                 }
@@ -737,6 +742,7 @@ class ThreadPool {
         _count        = 0;
         _capacity     = 0;
         _pinMask      = 0;
+        _fpConfig     = 0;
         _ready.destroy();
         _stop.dispose();
         // Release the channel buffers so a subsequent init() starts clean.

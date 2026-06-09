@@ -1,0 +1,52 @@
+// Per-thread FP-trap demo (MANUAL - this program faults by design).
+//
+// A worker thread is armed with FP_TRAP_INVALID. When it computes 0.0 / 0.0
+// (an invalid operation) the hardware raises a floating-point exception
+// (SIGFPE) AT THE INSTRUCTION that produced the NaN, instead of silently
+// yielding a quiet NaN that would only surface much later. This is the
+// diagnostic the per-thread FP environment exists for - see doc/threading.md.
+//
+// Build (compiles cleanly):
+//     x64/Release/cflat.exe example/fp_trap_demo.cb -o out/fp_trap_demo.exe
+// Run (CRASHES on purpose when armed):
+//     out/fp_trap_demo.exe
+//
+// Kept out of test.bat precisely because it is supposed to fault. example.bat
+// only compiles examples, so this file passes there without being executed.
+
+import "thread.cb";
+
+extern void* malloc(win_size size);
+extern void free(void* p);
+
+struct DivCtx {
+    double num = 0.0;
+    double den = 0.0;
+};
+
+// Operands are loaded from a heap pointer so the divide is a runtime op the
+// compiler cannot constant-fold (folding would never raise the exception).
+int divideWorker(void* ctx) {
+    DivCtx* c = (DivCtx*)ctx;
+    double n = c->num;
+    double d = c->den;
+    double r = n / d;        // 0.0 / 0.0 -> SIGFPE on a thread armed with FP_TRAP_INVALID
+    printf("worker computed %g (no trap fired)\n", r);
+    return 0;
+}
+
+extern int main() {
+    DivCtx* c = (DivCtx*)malloc(sizeof(DivCtx));
+    c->num = 0.0;
+    c->den = 0.0;
+
+    printf("spawning worker armed with FP_TRAP_INVALID; 0.0/0.0 should fault...\n");
+
+    Thread t;
+    t.start(divideWorker, c, FP_TRAP_INVALID);
+    t.join();
+
+    free((void*)c);
+    printf("done\n");
+    return 0;
+}
