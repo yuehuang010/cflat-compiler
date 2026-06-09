@@ -11788,15 +11788,26 @@ public:
     // reference. Returns true if the type is available (template was imported).
     bool EnsureArenaChannelInstantiated(LLVMBackend* compiler)
     {
-        if (compiler->dataStructures.count(kArenaChannelType)) return true;
+        // The type must be fully laid out (sized), not merely registered: a program ctor
+        // heap-allocates a shell of arena_channel<IMessage>, which needs sizeof(). The
+        // ForwardRefScanner pre-pass may have already registered an *opaque* shell (and
+        // flagged it in instantiatedGenerics) for the template's first use later in the
+        // file - if that use is in main(), it is codegen'd after this program, so the body
+        // is still unsized here. Treat an opaque shell as "not yet instantiated" and force
+        // the field layout now by re-queuing the instantiation (bypassing the
+        // instantiatedGenerics dedup); ParseClassDefinition fills the existing shell's body,
+        // and its non-opaque re-emission guard then makes the later main-use a no-op.
+        auto isSized = [&]() {
+            auto it = compiler->dataStructures.find(kArenaChannelType);
+            return it != compiler->dataStructures.end() && it->second.StructType
+                && it->second.StructType->isSized();
+        };
+        if (isSized()) return true;
         if (!genericClassTemplates.count("arena_channel")) return false;
-        if (!instantiatedGenerics.count(kArenaChannelType))
-        {
-            pendingInstantiations.push_back({"arena_channel", {"IMessage"}, kArenaChannelType});
-            instantiatedGenerics.insert(kArenaChannelType);
-        }
+        pendingInstantiations.push_back({"arena_channel", {"IMessage"}, kArenaChannelType});
+        instantiatedGenerics.insert(kArenaChannelType);
         ProcessPendingInstantiations();
-        return compiler->dataStructures.count(kArenaChannelType) > 0;
+        return isSized();
     }
 
     void ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {})

@@ -1,14 +1,17 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Debug
+REM Default to Release (faster compiler); override with `performance.bat Debug` or the
+REM CFLAT_CONFIG env var (the first-arg override below takes precedence). Workers re-invoked
+REM via `start` inherit CFLAT_CONFIG from the environment, so the dispatcher exports it.
+if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set PERF_SRC=performance
 set OUT=out\perf
 set SCRIPT=%~f0
 
-REM Max seconds to wait for the parallel compile workers. Debug-compiler + -O2
-REM builds of all benchmarks at once can take well over a minute on a cold run.
+REM Max seconds to wait for the parallel compile workers. Release-compiler + -O2
+REM builds of all benchmarks at once can still take a while on a cold run.
 set TIMEOUT_SECS=180
 
 REM ===========================================================================
@@ -28,8 +31,18 @@ if "%~1"=="--worker-compile" (
 REM ===========================================================================
 REM Main
 REM ===========================================================================
+
+REM First-arg config override (Debug|Release), mirroring test.bat. Export CFLAT_CONFIG
+REM so the parallel `--worker-compile` children inherit the chosen configuration.
+if /I "%~1"=="Debug" (
+    set CFLAT_CONFIG=Debug
+) else if /I "%~1"=="Release" (
+    set CFLAT_CONFIG=Release
+)
+set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
+
 echo ===================================================
-echo  cflat Performance Suite
+echo  cflat Performance Suite ^(%CFLAT_CONFIG%^)
 echo ===================================================
 echo.
 
