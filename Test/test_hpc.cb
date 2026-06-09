@@ -530,6 +530,14 @@ int testSpanView()
     c0.set(2, 77.0);                     // dc[2]; must not disturb c1's region
     passed += Test("chunk neighbor intact", (float)dc[3], 88.0f);
 
+    // span.slice: general sub-range decays to a may-alias view<T> (NOT a span).
+    // dc is now {0,1,77,88,4,5,6}.
+    view<double> ss = sc.slice(2, 5);    // {77, 88, 4}
+    passed += Test("span slice length", (int)ss.length(), 3);
+    passed += Test("span slice first",  (float)ss[0], 77.0f);
+    ss.set(2, 44.0);                     // writes through to dc[4]
+    passed += Test("span slice writes through", (float)dc[4], 44.0f);
+
     int* dcp = move dc; delete[_] dcp;
     int* dap = move da; delete[_] dap;
     int* dbp = move db; delete[_] dbp;
@@ -579,7 +587,7 @@ extern int main(int argc, char** argv)
     passed += testSimdMath();              total += 25;
 
     // ---- span<T> / view<T> ----
-    passed += testSpanView(); total += 21;
+    passed += testSpanView(); total += 24;
 
     // ---- explicit (T[]) array-view cast escape ----
     passed += testArrayViewCast(); total += 3;

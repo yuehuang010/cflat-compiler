@@ -25,10 +25,10 @@ import "view.cb";
 // `T* -> T[]` bind is forbidden) - a span comes only from a `new T[n]` view or another `T[]`.
 struct span<T>
 {
-    // No initializer on the array-view field: `T[] _ptr = default;` currently breaks generic method
-    // instantiation, so it is left bare like the documented `Matrix { int[] data; }` pattern. A span
-    // is non-owning and must be wrap()'d before use; the array-view one-way rule guards the store.
-    T[] _ptr;
+    // `= default` zeroes the array-view field (a null window), matching the project convention that
+    // every field gets an initializer. A span is non-owning and must be wrap()'d before use; the
+    // array-view one-way rule guards the store.
+    T[] _ptr = default;
     i64 _len = 0;
 
     // Point this span at an existing whole-allocation view of `len` elements. The parameter is a
@@ -76,6 +76,18 @@ struct span<T>
         i64 start = idx * base + extra;
         i64 count = base + (idx < rem ? 1 : 0);
         return _offset(start, count);
+    }
+
+    // General sub-range [start, end) - returns a may-alias view<T>, NOT a span<T>. A span carries a
+    // whole-allocation noalias contract; an arbitrary sub-range cannot keep it (two sub-ranges of the
+    // same span are allowed to overlap), so slice decays to the permissive sibling. The return type
+    // itself records that the disjointness guarantee was dropped. For PROVABLY-DISJOINT tiles that stay
+    // span<T> (and keep noalias), use chunk(idx, nchunks) instead. Caller keeps start/end in bounds.
+    view<T> slice(i64 start, i64 end)
+    {
+        view<T> v;
+        v.wrap(&_ptr[start], end - start);
+        return v;
     }
 
     // Decay to the may-alias view<T>. This is the safe one-way direction (`T[] -> T*`); the

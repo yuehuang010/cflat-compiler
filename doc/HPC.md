@@ -327,9 +327,12 @@ only ever originates from a `new T[n]` view or another `T[]`.
 ### Slicing and partitioning
 
 `view<T>` has `slice(start, end)` returning a sub-range view - sound precisely because views are
-may-alias (two sub-views are allowed to overlap). `span<T>` deliberately has **no** general
-`slice`/`subspan`: an arbitrary offset span (e.g. `s.subspan(0,10)` and `s.subspan(5,10)`) could
-overlap while looking distinct, reopening the aliasing the noalias contract closes.
+may-alias (two sub-views are allowed to overlap). `span<T>.slice(start, end)` exists too, but it
+returns a `view<T>`, **not** a `span<T>`: an arbitrary offset cannot keep the whole-allocation noalias
+contract (`s.slice(0,10)` and `s.slice(5,10)` overlap while looking distinct), so the sub-range decays
+to the may-alias sibling and the **return type itself records that the guarantee was dropped**. There
+is deliberately no offset that yields another `span<T>` - that would reopen the aliasing the contract
+closes.
 
 What `span<T>` *does* provide is a **disjoint partition** - `chunk(idx, nchunks)` - the data-parallel
 primitive (the analog of Rust's `chunks_mut`). It returns the `idx`-th of `nchunks` contiguous,
