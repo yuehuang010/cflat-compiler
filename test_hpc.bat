@@ -43,8 +43,6 @@ echo === NEGATIVES: each must FAIL at -O2 with a specific, located reason ===
 call :expect_fail "Test\vectorize\neg_call.cb"             "calls 'printf'"
 call :expect_fail "Test\vectorize\neg_while_noncountable.cb" "no countable trip count"
 call :expect_fail "Test\vectorize\neg_carried_dep.cb"      "loop-carried dependence"
-REM Detection B: a span get/set keeps a runtime alias check -> "did not vectorize cleanly".
-call :expect_fail_msg "Test\vectorize\neg_span_getset.cb" "did not vectorize cleanly" "set() routes through the method"
 
 echo.
 echo === SPAN NOALIAS: by-value span axpy must vectorize with NO runtime alias check ===
@@ -83,8 +81,8 @@ REM Assert per function that span_axpy/chunk_axpy each vectorized, carry the arr
 REM alias.scope metadata, and contain NO vector.memcheck. The checks are scoped to each
 REM function body (a whole-file grep would be confused by memchecks in unrelated core
 REM functions). Validation is done by a small CFlat program rather than a shell script.
-set CHECK_SRC=Test\span_noalias_check.cb
-set CHECK_EXE=out\span_noalias_check.exe
+set CHECK_SRC=Test\verify_span_noalias.cb
+set CHECK_EXE=out\verify_span_noalias.exe
 "%COMPILER%" "%CHECK_SRC%" -i Test\library -o "%CHECK_EXE%"
 if errorlevel 1 (
     echo   FAILED: span noalias validator did not compile

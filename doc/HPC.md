@@ -62,9 +62,10 @@ Semantics:
   test (loop versioning) plus a scalar fallback - that is rejected with
   `vectorize loop did not vectorize cleanly: a runtime alias check remained ...`. The
   fix is to give the optimizer the disjointness it needs: pass the buffers as
-  `span<T>` / `T[]` (noalias). For a span, index it directly (`y[i]`) or bind a local
-  `T[] v = y.data();` - using `y.get(i)` / `y.set(i, v)` inside a `vectorize` loop is a
-  compile error, because those route through the method's `this` and keep the check.
+  `span<T>` / `T[]` (noalias). For a span, index it directly (`y[i]`), use `y.get(i)` /
+  `y.set(i, v)`, or bind a local `T[] v = y.data();` - all three carry the receiver's
+  noalias scope. (The accessor forms only carry it for an addressable span; an rvalue
+  span like `makeSpan().get(i)` falls back to the method call and keeps the check.)
 - A loop also fails the contract when it is not vectorizable at all: no countable trip
   count (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
   dependence (`a[k] = a[k-1] + 1`), or a non-inlinable call in the body.

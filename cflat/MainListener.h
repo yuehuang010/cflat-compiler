@@ -6227,6 +6227,61 @@ public:
         return loaded;
     }
 
+    // Lower a span<T> get(i)/set(i,v) to a direct `_ptr[i]` element access carrying the receiver's
+    // alias scope - the same noalias contract `y[i]` and the local-`T[]` form already get, which a
+    // method call through `this` cannot (it collapses every span to one origin, so two spans never
+    // prove disjoint). Returns the element as an lvalue NamedVariable (Storage = element address,
+    // NoaliasScopeId stamped); the caller loads it (get) or stores through it (set). Returns an empty
+    // NV (Storage == null) when `structVar` is not an addressable by-value span - the caller then
+    // falls back to the real method call (correct, just without the noalias contract). Matched
+    // structurally via ArrayViewBufferFieldIndex, so the may-alias sibling view<T> (raw-T* `_ptr`)
+    // is excluded and keeps method dispatch.
+    LLVMBackend::NamedVariable LowerSpanElementAccess(
+        antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& structVar,
+        llvm::Value* indexValue)
+    {
+        LLVMBackend::NamedVariable elem;
+        if (indexValue == nullptr || structVar.Storage == nullptr
+            || structVar.TypeAndValue.Pointer
+            || !structVar.BaseType || !structVar.BaseType->isStructTy())
+            return elem;
+
+        auto* compiler = Compiler(ctx);
+        int bufIndex = compiler->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName);
+        if (bufIndex < 0)
+            return elem;
+
+        // Load the `_ptr` array-view field (the T* buffer).
+        const auto& spanDS = compiler->GetDataStructure(structVar.TypeAndValue.TypeName);
+        auto* bufGEP = compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, (uint32_t)bufIndex);
+        llvm::Value* bufPtr = compiler->CreateLoad(bufGEP);
+
+        // Element TypeAndValue = the array-view field with the view-ness dropped (an indexed element
+        // is a single slot, never a whole-allocation view), mirroring the IsArrayView subscript
+        // branch in ParsePostfix. Key the alias scope to the receiver origin so distinct spans land
+        // in distinct scopes; an unnamed (temporary) receiver yields scope -1 = no metadata.
+        LLVMBackend::TypeAndValue elementTV = spanDS.StructFields[bufIndex];
+        std::string originKey = structVar.TypeAndValue.VariableName;
+        if (originKey.empty()) originKey = structVar.CallerName;
+        int scopeId = compiler->GetOrMintViewScope(originKey);
+        elementTV.IsArrayView = false;
+        if (elementTV.ElemPointer)
+            elementTV.ElemPointer = false;
+        else
+        {
+            elementTV.Pointer = false;
+            elementTV.IsInterfacePointer = false;
+        }
+        auto* elementType = compiler->GetType(elementTV);
+        elementTV.NoaliasScopeId = scopeId;
+
+        elem.Storage = compiler->CreateGEP(elementType, bufPtr, indexValue);
+        elem.BaseType = elementType;
+        elem.TypeAndValue = elementTV;
+        return elem;
+    }
+
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
@@ -8787,19 +8842,68 @@ public:
 
                         auto argumentList = ctx->argumentExpressionList();
 
-                        // Detection A: a span<T> get()/set() inside a vectorize loop body routes through
-                        // the method's `this`, collapsing provenance, so it cannot carry the noalias
-                        // contract. Record it (type-aware - the receiver is a noalias array-view wrapper)
-                        // so a surviving runtime alias check (Detection B) can point at it and suggest
-                        // binding a local `T[] = <recv>.data();`. operator[] is lowered to the noalias
-                        // field access for an lvalue span and handled separately for an rvalue.
-                        if (currentVectorizeBodyLine_ != 0 && (functionName == "get" || functionName == "set")
+                        // span<T> noalias fast path: lower `y.get(i)` / `y.set(i, v)` to the field
+                        // subscript `y._ptr[i]` so the element access carries the receiver's alias scope.
+                        // get()/set() reach the buffer through the method's `this`, collapsing every
+                        // span's provenance to one origin, so two distinct spans never prove disjoint at
+                        // -O2 (the documented footgun). Indexing the `_ptr` array-view field directly keys
+                        // the scope to the RECEIVER (y vs x), exactly as the lowered `y[i]` and the
+                        // local-`T[]` form do - restoring the contract for the natural method calls.
+                        // Matched structurally (a struct with an IsArrayView `_ptr` field), so the
+                        // may-alias sibling view<T> is excluded and keeps method dispatch.
+                        if ((functionName == "get" || functionName == "set")
                             && structVar.BaseType && structVar.BaseType->isStructTy()
+                            && !structVar.TypeAndValue.Pointer
                             && Compiler(ctx)->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName) >= 0)
                         {
-                            Compiler(ctx)->NoteVectorizeSpanAccessor(currentVectorizeBodyLine_, functionName,
-                                structVar.TypeAndValue.VariableName,
-                                (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
+                            auto namedArgCtx = argumentList.size() > 0
+                                ? argumentList[functionArgCounter]->argumentNamedExpression()
+                                : std::vector<CFlatParser::ArgumentNamedExpressionContext*>{};
+                            size_t expectedArgs = functionName == "set" ? 2 : 1;
+
+                            // Requires an addressable receiver (an lvalue span); an rvalue span has no
+                            // stable origin to key, so it falls through to the real method call. Record
+                            // that fall-through for Detection A when inside a vectorize body so a
+                            // surviving runtime alias check can name the accessor.
+                            if (structVar.Storage != nullptr && namedArgCtx.size() == expectedArgs)
+                            {
+                                auto idxNV = this->ParseAssignmentExpressionNamed(namedArgCtx[0]->assignmentExpression());
+                                llvm::Value* indexValue = idxNV.Primary ? idxNV.Primary : LoadNamedVariable(idxNV);
+                                auto elem = LowerSpanElementAccess(ctx, structVar, indexValue);
+                                if (elem.Storage != nullptr)
+                                {
+                                    if (functionName == "get")
+                                    {
+                                        // Read: load the element (TagViewElementAccess tags the load).
+                                        namedVar = {};
+                                        namedVar.Primary  = LoadNamedVariable(elem);
+                                        namedVar.Storage  = nullptr;
+                                        namedVar.BaseType = elem.BaseType;
+                                        namedVar.TypeAndValue = elem.TypeAndValue;
+                                        namedVar.TypeAndValue.NoaliasScopeId = -1; // a loaded value, no longer a view lvalue
+                                    }
+                                    else
+                                    {
+                                        // Write: store the value through the element, tagging the store.
+                                        auto valNV = this->ParseAssignmentExpressionNamed(namedArgCtx[1]->assignmentExpression());
+                                        llvm::Value* valValue = valNV.Primary ? valNV.Primary : LoadNamedVariable(valNV);
+                                        bool valUnsigned = valNV.TypeAndValue.IsUnsignedInteger() != -1;
+                                        auto* st = Compiler(ctx)->CreateAssignment(valValue, elem.Storage, valUnsigned, elem.BaseType);
+                                        Compiler(ctx)->AttachViewNoalias(st, elem.TypeAndValue.NoaliasScopeId);
+                                        namedVar = {};
+                                    }
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    functionArgCounter++;
+                                    break;
+                                }
+                            }
+                            else if (currentVectorizeBodyLine_ != 0)
+                            {
+                                Compiler(ctx)->NoteVectorizeSpanAccessor(currentVectorizeBodyLine_, functionName,
+                                    structVar.TypeAndValue.VariableName,
+                                    (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
+                            }
                         }
 
                         // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")

@@ -29,6 +29,16 @@ void span_idx_axpy(double k, span<double> y, span<double> x)
     vectorize for (i64 i = 0; i < n; i = i + 1) { y[i] = y[i] + k * x[i]; }
 }
 
+// get()/set() must ALSO carry the noalias contract. The compiler lowers `y.get(i)` / `y.set(i, v)`
+// on a span to the `_ptr` field subscript, keying each access's alias scope to the receiver (y vs x)
+// instead of collapsing provenance to the accessor method's `this` - so at -O2 this must vectorize
+// with NO vector.memcheck, exactly like the operator[] form above.
+void span_getset_axpy(double k, span<double> y, span<double> x)
+{
+    i64 n = y.length();
+    vectorize for (i64 i = 0; i < n; i = i + 1) { y.set(i, y.get(i) + k * x.get(i)); }
+}
+
 // chunk() must preserve the noalias contract: take tile `c` of `nc` from each
 // whole span and axpy over the tiles. At -O2 this must vectorize with NO
 // vector.memcheck, exactly like the whole-span case - the headline guarantee for
@@ -77,6 +87,21 @@ extern int main()
     if (c[0]    != 10.0)   ok = 0;
     if (c[100]  != 110.0)  ok = 0;
     if (c[1023] != 1033.0) ok = 0;
+
+    // get()/set() form on its own buffers: e[i] += 7 * 2 = +14.
+    double[] e = new double[n];
+    double[] f = new double[n];
+    i64 g = 0;
+    while (g < n) { e[g] = (double)g; f[g] = 2.0; g = g + 1; }
+    span<double> ye; ye.wrap(e, n);
+    span<double> xf; xf.wrap(f, n);
+    span_getset_axpy(7.0, ye, xf);
+    if (e[0]    != 14.0)   ok = 0;
+    if (e[100]  != 114.0)  ok = 0;
+    if (e[1023] != 1037.0) ok = 0;
+
+    int* ep = move e; delete[_] ep;
+    int* fp = move f; delete[_] fp;
 
     int* cp = move c; delete[_] cp;
     int* dp = move d; delete[_] dp;

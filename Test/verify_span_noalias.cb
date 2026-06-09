@@ -7,7 +7,7 @@
 // function cannot mask a real regression. Named without a `test_` prefix so
 // test.bat's `test_*.cb` wildcard skips it (it is driven by test_hpc.bat).
 //
-// Usage: span_noalias_check <path-to-span_noalias_fixture.ll>
+// Usage: verify_span_noalias <path-to-span_noalias_fixture.ll>
 //   exit 0 = all checks passed, 1 = at least one check failed.
 import "cruntime.cb";
 import "string.cb";
@@ -83,10 +83,11 @@ extern int main(int argc, char** argv)
     int ok = 1;
     if (checkFunction(p, len, "@_span_axpy") == 0)     { ok = 0; }
     if (checkFunction(p, len, "@_span_idx_axpy") == 0) { ok = 0; }
+    if (checkFunction(p, len, "@_span_getset_axpy") == 0) { ok = 0; }
     if (checkFunction(p, len, "@_chunk_axpy") == 0)    { ok = 0; }
 
     if (ok == 1) {
-        printf("  OK: span_axpy, span_idx_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");
+        printf("  OK: span_axpy, span_idx_axpy, span_getset_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");
         return 0;
     }
     return 1;
