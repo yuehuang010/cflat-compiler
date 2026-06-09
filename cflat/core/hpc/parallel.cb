@@ -66,14 +66,20 @@ int __pfor_pool_tramp(move void* raw, stop_token tok) {
     return 0;
 }
 
-// RAW THREAD overload.
-void parallel_for_n(i64 n, int workers, function<void(i64, i64, void*)> body, void* ctx) {
+// RAW THREAD overload. `pin` (default false) pins worker w to core
+// w % hardware_concurrency() via SetThreadAffinityMask, removing OS
+// scheduling jitter for compute-bound HPC kernels (see threading.md). Leave
+// it false when the region shares the box with other work or oversubscribes.
+void parallel_for_n(i64 n, int workers, function<void(i64, i64, void*)> body, void* ctx, bool pin = false) {
     if (n <= 0) { return; }
     if (workers <= 0) { workers = hardware_concurrency(); }
     if ((i64)workers > n) { workers = (int)n; }
 
     Thread*    threads = new Thread[workers];
     __PForBox* boxes   = new __PForBox[workers];
+
+    int hwc = hardware_concurrency();
+    if (hwc <= 0) { hwc = workers; }
 
     i64 base  = n / (i64)workers;
     i64 rem   = n % (i64)workers;
@@ -86,6 +92,7 @@ void parallel_for_n(i64 n, int workers, function<void(i64, i64, void*)> body, vo
         boxes[w].start = start;
         boxes[w].end   = start + count;
         threads[w].start(__pfor_thread_tramp, &boxes[w]);
+        if (pin) { threads[w].setAffinity((u64)1 << (w % hwc)); }
         start = start + count;
         w = w + 1;
     }
@@ -175,10 +182,12 @@ int __pred_pool_tramp(move void* raw, stop_token tok) {
     return 0;
 }
 
-// RAW THREAD overload.
+// RAW THREAD overload. `pin` (default false) pins worker w to core
+// w % hardware_concurrency() (SetThreadAffinityMask), removing scheduling
+// jitter for compute-bound reductions (e.g. Monte Carlo). See threading.md.
 T parallel_reduce<T>(i64 n, int workers, T identity,
                      function<T(i64, i64, void*)> partial,
-                     function<T(T, T)> combine, void* ctx) {
+                     function<T(T, T)> combine, void* ctx, bool pin = false) {
     if (n <= 0) { return identity; }
     if (workers <= 0) { workers = hardware_concurrency(); }
     if ((i64)workers > n) { workers = (int)n; }
@@ -186,6 +195,9 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
     Thread*       threads  = new Thread[workers];
     __PRedBox<T>* boxes    = new __PRedBox<T>[workers];
     T*            partials = new T[workers];
+
+    int hwc = hardware_concurrency();
+    if (hwc <= 0) { hwc = workers; }
 
     // Non-capturing trampoline (references only the type parameter T); writes the
     // chunk's partial through the box's distinct slot, so no synchronization.
@@ -208,6 +220,7 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
         boxes[w].end     = start + count;
         boxes[w].slot    = &partials[w];
         threads[w].start(tramp, &boxes[w]);
+        if (pin) { threads[w].setAffinity((u64)1 << (w % hwc)); }
         start = start + count;
         w = w + 1;
     }

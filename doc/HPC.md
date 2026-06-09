@@ -328,6 +328,65 @@ double dot = parallel_reduce<double>(n, 4, 0.0, dotPartial, addD, &c);
 floating-point adds, the result depends on `workers` and is **not** bit-identical to a serial fold -
 standard and expected for parallel/SIMD reductions.
 
+For an **integer** reduction (a count, a histogram bin, a checksum) `T` is `i64` and `identity` is the
+zero literal cast to the element type - `(i64)0`, not `0` (an unannotated `0` is `int`, which will not
+match the `i64` reduction):
+
+```c
+i64 addI(i64 x, i64 y) { return x + y; }                 // combine
+i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI, &c);
+```
+
+### Pinning workers to cores (`pin`)
+
+The raw-thread `parallel_for_n` and `parallel_reduce<T>` take a trailing `bool pin = false`. Set it to
+`true` to pin worker `w` to core `w % hardware_concurrency()` (via `SetThreadAffinityMask`), which
+removes the OS scheduling jitter that otherwise caps speedup on compute-bound kernels - the single most
+important knob for steady throughput (see [threading.md](threading.md)):
+
+```c
+i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI, &c, /*pin=*/true);
+```
+
+Leave it `false` when the region oversubscribes the machine or shares cores with other work. The
+`*_pool` variants do not expose `pin`: the `ThreadPool` owns its worker threads, so pin them once at
+pool construction instead.
+
+### Per-thread RNG for parallel Monte Carlo
+
+A parallel Monte Carlo reduction needs each worker to draw from a **statistically independent** stream;
+sharing one `Random` across threads is both a data race and statistically wrong. `core/random.cb`'s
+splitmix64 gives two exact ways to carve independent substreams (see the comments in `random.cb`):
+
+- `jump(i64 n)` - fast-forward a stream by `n` draws in O(1). When you know the per-worker draw count,
+  seed one generator, then jump worker `i` to its window so the windows cannot overlap.
+- `split()` - return a fresh generator seeded from this one's next output (SplittableRandom). Use it
+  when the worker/task count is not known up front.
+
+Because the kernel body is called once per worker with its `[lo, hi)` range, derive the worker's stream
+from `lo` inside `partial` - no shared state, no synchronization:
+
+```c
+import "random.cb";
+
+struct PiCtx { i64 drawsPerSample; }   // 2 draws (x, y) per sample
+
+i64 piPartial(i64 lo, i64 hi, void* raw) {
+    PiCtx* k = (PiCtx*)raw;
+    Random rng = default;
+    rng.seed(0x1234567);               // same base seed on every worker...
+    rng.jump(lo * k->drawsPerSample);  // ...then jump to this chunk's window (no overlap)
+    i64 inside = 0;
+    for (i64 i = lo; i < hi; i = i + 1) {
+        double x = rng.nextDouble();
+        double y = rng.nextDouble();
+        if (x * x + y * y <= 1.0) { inside = inside + 1; }
+    }
+    return inside;
+}
+// pi ~= 4 * parallel_reduce<i64>(n, 0, (i64)0, piPartial, addI, &ctx, true) / n
+```
+
 ### Pool variants
 
 The pool variants take a `ThreadPool*` first argument and otherwise match. Amortize the worker threads

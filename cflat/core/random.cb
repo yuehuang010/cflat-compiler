@@ -68,4 +68,44 @@ struct Random
         v = v ^ (v >> 63);
         return (double)v * (1.0 / 9223372036854775808.0);
     }
+
+    // ------------------------------------------------------------------
+    // Independent substreams (for parallel Monte Carlo / per-thread RNG).
+    //
+    // splitmix64's state is a plain counter advanced by a fixed increment
+    // GAMMA each draw (state_after_k_draws == seed + k*GAMMA), and each
+    // draw scrambles that counter through three avalanche passes. That
+    // gives two exact, cheap ways to hand every worker its own stream:
+    //
+    //   - jump(n): fast-forward THIS stream by n draws in O(1). Use it to
+    //     carve N non-overlapping windows when you know the per-worker draw
+    //     count up front - clone a seeded generator, then jump worker i to
+    //     i*drawsPerWorker so its window can never overlap another worker's.
+    //
+    //   - split(): derive a NEW generator whose seed is this generator's
+    //     next scrambled output (the SplittableRandom construction, Steele
+    //     et al. 2014). Use it when the stream count is not known ahead of
+    //     time - e.g. fork a child generator per task as work is created.
+    // ------------------------------------------------------------------
+
+    // GAMMA, the per-draw state increment (golden-ratio derived), written
+    // as its signed i64 equivalent. Must match _advance().
+    i64 _gamma() { return -7046029254386353131; }
+
+    // Fast-forward this stream by n draws in O(1). Exact: the next draw
+    // after jump(n) is the one the stream would have produced n draws later.
+    void jump(i64 n)
+    {
+        _state += _gamma() * n;
+    }
+
+    // Return a fresh generator that is statistically independent of this
+    // one. Advances this generator's state by one draw and seeds the child
+    // with the scrambled output.
+    Random split()
+    {
+        Random child = default;
+        child.seed(_advance());
+        return child;
+    }
 };

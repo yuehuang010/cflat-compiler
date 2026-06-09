@@ -1480,7 +1480,7 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 | `pair.cb` | `pair<A,B>` - two-field generic struct |
 | `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
 | `thread.cb` | `Thread` - Win32 thread wrapper; `start(fn, ctx)`, `join()` |
-| `random.cb` | `Random` - splitmix64 PRNG; `next()`, `nextRange(min, max)` |
+| `random.cb` | `Random` - splitmix64 PRNG; `seed(i64)`, `seedFromTime()`, `next()`, `nextInt(min, max)`, `nextDouble()`; independent substreams via `jump(i64)` / `split()` |
 | `time.cb` | `Duration`, `TimePoint`, `Stopwatch` - high-resolution timing |
 | `mutex.cb` | `Mutex` - Win32 CRITICAL_SECTION wrapper |
 | `atomic.cb` | `Atomic<T>` - load/store/fetchAdd with LLVM atomic IR |

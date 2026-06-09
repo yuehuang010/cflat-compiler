@@ -84,6 +84,55 @@ int testRandom()
     return passed;
 }
 
+// ── Substreams: jump() / split() ──────────────────────────────────────────────
+
+int testSubstreams()
+{
+    int passed = 0;
+
+    // jump(k) is exact: a stream seeded then advanced k draws sits at the same
+    // state as a freshly-seeded stream jumped by k, so their following draws match.
+    Random a;
+    Random b;
+    a.seed(777);
+    b.seed(777);
+    int k = 0;
+    while (k < 50) { a.next(); k++; }   // advance A by 50 draws
+    b.jump(50);                          // jump B straight to the same window
+    bool match = true;
+    int i = 0;
+    while (i < 20)
+    {
+        if (a.next() != b.next()) match = false;
+        i++;
+    }
+    passed += Test("random jump(k) matches k draws", match, true);
+
+    // Adjacent jump windows do not overlap: worker 0 covers draws [0,50), worker 1
+    // covers [50,100). The two windows must be disjoint sequences.
+    Random w0;
+    Random w1;
+    w0.seed(2024); w0.jump(0);
+    w1.seed(2024); w1.jump(50);
+    bool disjoint = true;
+    i = 0;
+    while (i < 20)
+    {
+        if (w0.next() == w1.next()) disjoint = false;
+        i++;
+    }
+    passed += Test("random jump windows disjoint", disjoint, true);
+
+    // split() yields a generator independent of the parent's continued stream.
+    Random parent;
+    parent.seed(555);
+    Random child = parent.split();
+    bool independent = parent.next() != child.next();
+    passed += Test("random split() independent", independent, true);
+
+    return passed;
+}
+
 // ── list.sort (quicksort) ─────────────────────────────────────────────────────
 
 int testSort()
@@ -149,8 +198,9 @@ extern int main()
 
     int r;
 
-    r = testRandom();  passed += r; total += 7;
-    r = testSort();    passed += r; total += 16;
+    r = testRandom();      passed += r; total += 7;
+    r = testSubstreams();  passed += r; total += 3;
+    r = testSort();        passed += r; total += 16;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

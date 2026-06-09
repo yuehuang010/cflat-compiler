@@ -1,0 +1,133 @@
+// Parallel Monte Carlo demo.
+//
+//   1. pi estimator  - throw N random darts in the unit square, count how many
+//      land in the quarter circle; pi ~= 4 * inside / N.
+//   2. MC integration - integral of exp(x) on [0,1] = e - 1 ~= 1.71828, by
+//      averaging f at N uniform random samples.
+//
+// Both run across cores via parallel_reduce<T> from hpc/parallel.cb. Each worker
+// owns an independent splitmix64 stream: all workers share one base seed, then
+// jump() to a non-overlapping window keyed off their chunk start (O(1), exact),
+// so no two workers ever draw the same numbers. Workers are pinned to cores.
+//
+// Build:  x64\Release\cflat.exe example\hpc\mc_pi.cb -o out\mc_pi.exe -O2
+// Run:    out\mc_pi.exe
+
+import "hpc/parallel.cb";
+import "random.cb";
+import "time.cb";
+import "math.cb";
+import "thread.cb";
+
+// True value of integral of exp(x) on [0,1] = e - 1.
+double TRUE_INTEGRAL() { return 1.7182818284590452; }
+double TRUE_PI()       { return 3.1415926535897932; }
+
+double absd(double a) { if (a < 0.0) { return -a; } return a; }
+
+// ---- contexts -------------------------------------------------------------
+
+struct PiCtx  { i64 baseSeed = 0; };
+struct IntCtx { i64 baseSeed = 0; };
+
+// ---- per-worker partials --------------------------------------------------
+// A value-returning lambda passed inline does not pick up its return type
+// (per the docs), so partial/combine are named functions.
+
+i64 piPartial(i64 lo, i64 hi, void* raw) {
+    PiCtx* k = (PiCtx*)raw;
+    Random rng;
+    rng.seed(k->baseSeed);
+    rng.jump(lo * 2);          // 2 draws (x, y) per sample; window is non-overlapping
+    i64 inside = 0;
+    i64 i = lo;
+    while (i < hi) {
+        double x = rng.nextDouble();
+        double y = rng.nextDouble();
+        if (x * x + y * y <= 1.0) { inside = inside + 1; }
+        i = i + 1;
+    }
+    return inside;
+}
+i64 addI64(i64 a, i64 b) { return a + b; }
+
+double intPartial(i64 lo, i64 hi, void* raw) {
+    IntCtx* k = (IntCtx*)raw;
+    Random rng;
+    rng.seed(k->baseSeed);
+    rng.jump(lo);              // 1 draw per sample; window is non-overlapping
+    double s = 0.0;
+    i64 i = lo;
+    while (i < hi) {
+        double x = rng.nextDouble();
+        s = s + Math.exp(x);
+        i = i + 1;
+    }
+    return s;
+}
+double addDouble(double a, double b) { return a + b; }
+
+// ---- drivers --------------------------------------------------------------
+
+double estimatePi(i64 n, int workers, i64 seed) {
+    PiCtx c;
+    c.baseSeed = seed;
+    i64 inside = parallel_reduce<i64>(n, workers, (i64)0, piPartial, addI64, &c, true);
+    return 4.0 * (double)inside / (double)n;
+}
+
+double estimateIntegral(i64 n, int workers, i64 seed) {
+    IntCtx c;
+    c.baseSeed = seed;
+    double sum = parallel_reduce<double>(n, workers, 0.0, intPartial, addDouble, &c, true);
+    return sum / (double)n;
+}
+
+// Returns samples/sec; writes the estimate through `out`.
+double timedPi(i64 n, int workers, i64 seed, double* out) {
+    Stopwatch sw;
+    sw.start();
+    double est = estimatePi(n, workers, seed);
+    sw.stop();
+    *out = est;
+    double secs = sw.elapsed().seconds();
+    if (secs <= 0.0) { return 0.0; }
+    return (double)n / secs;
+}
+
+extern int main() {
+    int cores = hardware_concurrency();
+    if (cores <= 0) { cores = 4; }
+
+    i64 n = 200000000;   // 200M darts
+
+    printf("Monte Carlo demo  (N = %lld samples, %d logical cores)\n", n, cores);
+    printf("------------------------------------------------------------\n");
+
+    // ---- pi: single thread vs all cores -----------------------------------
+    double pi1 = 0.0;
+    double piM = 0.0;
+    double tput1 = timedPi(n, 1,     12345, &pi1);
+    double tputM = timedPi(n, cores, 12345, &piM);
+
+    printf("pi estimate (1 thread)   : %.8f   abs err %.2e\n",
+           pi1, absd(pi1 - TRUE_PI()));
+    printf("pi estimate (%2d threads) : %.8f   abs err %.2e\n",
+           cores, piM, absd(piM - TRUE_PI()));
+    printf("true pi                  : %.8f\n", TRUE_PI());
+    printf("\n");
+    printf("throughput  1 thread     : %.1f Msamples/s\n", tput1 / 1.0e6);
+    printf("throughput  %2d threads   : %.1f Msamples/s\n", cores, tputM / 1.0e6);
+    if (tput1 > 0.0) {
+        printf("speedup                  : %.2fx\n", tputM / tput1);
+    }
+    printf("\n");
+
+    // ---- Monte Carlo integration ------------------------------------------
+    double integ = estimateIntegral(n, cores, 999);
+    printf("integral exp(x) on [0,1] : %.8f   abs err %.2e\n",
+           integ, absd(integ - TRUE_INTEGRAL()));
+    printf("true value (e - 1)       : %.8f\n", TRUE_INTEGRAL());
+
+    return 0;
+}
