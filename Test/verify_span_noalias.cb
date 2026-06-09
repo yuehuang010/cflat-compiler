@@ -80,11 +80,16 @@ extern int main(int argc, char** argv)
     i8* p = ir.data();
     int len = ir.length();
 
+    // The fixture's axpy functions are declared `extern` so they keep external linkage
+    // and survive as standalone symbols at -O2 (a non-extern function is internal and
+    // would be inlined into main, erasing the per-function symbol this validator scopes
+    // its checks to). `extern` also drops the name-mangling underscore, so the IR symbol
+    // is `@span_axpy`, not `@_span_axpy`.
     int ok = 1;
-    if (checkFunction(p, len, "@_span_axpy") == 0)     { ok = 0; }
-    if (checkFunction(p, len, "@_span_idx_axpy") == 0) { ok = 0; }
-    if (checkFunction(p, len, "@_span_getset_axpy") == 0) { ok = 0; }
-    if (checkFunction(p, len, "@_chunk_axpy") == 0)    { ok = 0; }
+    if (checkFunction(p, len, "@span_axpy") == 0)     { ok = 0; }
+    if (checkFunction(p, len, "@span_idx_axpy") == 0) { ok = 0; }
+    if (checkFunction(p, len, "@span_getset_axpy") == 0) { ok = 0; }
+    if (checkFunction(p, len, "@chunk_axpy") == 0)    { ok = 0; }
 
     if (ok == 1) {
         printf("  OK: span_axpy, span_idx_axpy, span_getset_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");

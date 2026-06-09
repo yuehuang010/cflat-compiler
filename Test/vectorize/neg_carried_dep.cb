@@ -1,7 +1,11 @@
 // Carried dependence: a[k] depends on a[k-1] written last iteration. Genuinely
 // sequential - the vectorizer must refuse, and `vectorize` must turn that refusal
-// into a hard compile error at -O2. The array is a pointer parameter so its data
-// is opaque (cannot be constant-folded / the loop cannot be eliminated).
+// into a hard compile error at -O2.
+//
+// The buffer and trip count are derived from argc (runtime-opaque) and the result is
+// observed (returned), so neither constant-folding nor dead-code elimination can erase
+// the loop before the vectorizer sees it - the loop must reach the vectorizer carrying
+// its `vectorize` contract for the negative test to fire.
 void prefixSum(int* a, int n)
 {
     vectorize for (int k = 1; k < n; k = k + 1)
@@ -9,4 +13,14 @@ void prefixSum(int* a, int n)
         a[k] = a[k-1] + 1;
     }
 }
-extern int main() { return 0; }
+extern int main(int argc, char** argv)
+{
+    int n = argc + 64;
+    int* a = new int[n];
+    int i = 0;
+    while (i < n) { a[i] = argc; i = i + 1; }
+    prefixSum(a, n);
+    int r = a[n - 1];          // sink: observe a value the loop produced
+    delete[_] a;
+    return r & 1;
+}

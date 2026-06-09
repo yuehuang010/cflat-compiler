@@ -7252,6 +7252,22 @@ public:
         // Ensure the attribute is set even on pre-declared functions that skipped createFunctionProto.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
+        // The whole program (user files + core libraries) is compiled into a single module
+        // and optimized with the per-module pipeline before lld-link merges any separately
+        // compiled C objects. A non-extern CFlat function therefore never needs to be visible
+        // by name to anything outside this module, so give it internal linkage. That unlocks
+        // interprocedural optimization the optimizer must otherwise withhold from symbols it
+        // assumes are externally referenced (dead-function elimination, inline-then-delete,
+        // argument promotion / specialization). Exceptions stay external:
+        //   - `external` (extern C) functions are the ABI surface for the linked C objects.
+        //   - `main` is the linker entry symbol.
+        //   - A function whose raw address is handed to a bare C callback is promoted back to
+        //     external at the call site (see CreateOverloadedFunctionCall) so the linker keeps
+        //     its identity. We only internalize here, where a body is being attached - never on
+        //     declaration-only protos (an internal declaration with no body is invalid IR).
+        if (!external && functionName != "main")
+            fn->setLinkage(llvm::Function::InternalLinkage);
+
         if (isStdcall && platformValue == 32)
             fn->setCallingConv(llvm::CallingConv::X86_StdCall);
         else if (isCdecl)
@@ -8130,6 +8146,13 @@ public:
                 else
                 {
                     // Extern C-compatible parameter: provide a bare C function pointer.
+                    // The CFlat function's raw address escapes into separately-linked C code
+                    // that may store and later call it by pointer, so restore external linkage
+                    // (CreateFunctionDefinition defaults non-extern functions to internal) to
+                    // keep the symbol's identity across the lld-link boundary.
+                    if (auto* escFn = llvm::dyn_cast<llvm::Function>(val))
+                        if (escFn->getLinkage() == llvm::Function::InternalLinkage)
+                            escFn->setLinkage(llvm::Function::ExternalLinkage);
                     if (val && val->getType()->isStructTy())
                     {
                         // Fat struct - extract the fn ptr (field 0) and cast to expected type.

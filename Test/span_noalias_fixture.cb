@@ -8,10 +8,17 @@
 //
 // Named without a `test_` prefix so test.bat's `test_*.cb` wildcard skips it (it needs -O2, which
 // test.bat does not use).
+//
+// The axpy functions are `extern` ONLY so they survive as standalone symbols for the IR validator
+// (verify_span_noalias.cb). A non-extern function gets internal linkage and is inlined into main at
+// -O2, erasing the per-function symbol the validator scopes its checks to. `extern` keeps them
+// out-of-line; it does not affect the span noalias contract under test (the alias.scope metadata
+// rides the span's `_ptr` field accesses in the body, independent of linkage), as the run-result
+// check (ok=1) and the no-memcheck assertion both confirm.
 import "span.cb";
 import "cruntime.cb";
 
-void span_axpy(double k, span<double> y, span<double> x)
+extern void span_axpy(double k, span<double> y, span<double> x)
 {
     double[] yv = y.data();
     double[] xv = x.data();
@@ -23,7 +30,7 @@ void span_axpy(double k, span<double> y, span<double> x)
 // vectorize with NO vector.memcheck. The compiler lowers `y[i]` on a span to the `_ptr` field
 // subscript, keying each access's alias scope to the receiver (y vs x) instead of collapsing
 // provenance to the operator[] method's `this` - so two distinct spans still prove disjoint at -O2.
-void span_idx_axpy(double k, span<double> y, span<double> x)
+extern void span_idx_axpy(double k, span<double> y, span<double> x)
 {
     i64 n = y.length();
     vectorize for (i64 i = 0; i < n; i = i + 1) { y[i] = y[i] + k * x[i]; }
@@ -33,7 +40,7 @@ void span_idx_axpy(double k, span<double> y, span<double> x)
 // on a span to the `_ptr` field subscript, keying each access's alias scope to the receiver (y vs x)
 // instead of collapsing provenance to the accessor method's `this` - so at -O2 this must vectorize
 // with NO vector.memcheck, exactly like the operator[] form above.
-void span_getset_axpy(double k, span<double> y, span<double> x)
+extern void span_getset_axpy(double k, span<double> y, span<double> x)
 {
     i64 n = y.length();
     vectorize for (i64 i = 0; i < n; i = i + 1) { y.set(i, y.get(i) + k * x.get(i)); }
@@ -43,7 +50,7 @@ void span_getset_axpy(double k, span<double> y, span<double> x)
 // whole span and axpy over the tiles. At -O2 this must vectorize with NO
 // vector.memcheck, exactly like the whole-span case - the headline guarantee for
 // the partition primitive (the offset T[] is re-blessed through the union pun).
-void chunk_axpy(double k, span<double> y, span<double> x, i64 c, i64 nc)
+extern void chunk_axpy(double k, span<double> y, span<double> x, i64 c, i64 nc)
 {
     span<double> yc = y.chunk(c, nc);
     span<double> xc = x.chunk(c, nc);

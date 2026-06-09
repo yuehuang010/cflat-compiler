@@ -1,5 +1,10 @@
 // A `vectorize while` whose condition is a pointer chase has no countable trip
 // count, so it cannot be vectorized. Must hard-error at -O2.
+//
+// The list is built at runtime (length derived from argc) and the result is observed
+// (returned), so the pointer-chase loop cannot be simplified away or eliminated before
+// the vectorizer sees it - it must reach the vectorizer carrying its `vectorize`
+// contract for the negative test to fire.
 struct Node { Node* next = default; int v = default; };
 int sum(Node* head)
 {
@@ -12,4 +17,24 @@ int sum(Node* head)
     }
     return s;
 }
-extern int main() { return 0; }
+extern int main(int argc, char** argv)
+{
+    Node* head = nullptr;
+    int i = 0;
+    while (i < argc + 3)
+    {
+        Node* nd = new Node;
+        nd->v = argc;
+        nd->next = head;
+        head = nd;
+        i = i + 1;
+    }
+    int r = sum(head);          // sink: observe the accumulated result
+    while (head != nullptr)
+    {
+        Node* nx = head->next;
+        delete head;
+        head = nx;
+    }
+    return r & 1;
+}
