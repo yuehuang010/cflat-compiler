@@ -1,0 +1,137 @@
+// factor.cb - dense matrix factorization + triangular solve over row-major double[].
+//
+// Two classic direct solvers, both over a flat row-major double[] (A[i*n + j]):
+//   - Cholesky (A = L L^T) for a symmetric positive-definite A.
+//   - LU (A = L U, Doolittle, no pivoting) for a general (diagonally dominant) A.
+// Each is paired with forward/back substitution (triangular solve) to solve Ax=b.
+//
+// Design notes:
+//   - Storage is a single contiguous double[] per matrix, indexed A[i*n + j]. The
+//     factor routines write the triangular factor into a separate double[] so the
+//     caller's original A survives.
+//   - The kernels are FP reductions (dot of two rows), so they are plain scalar
+//     loops, not `vectorize` - same rationale as dot/nrm2 in vecmath.cb.
+
+import "math.cb";       // Math.sqrt
+
+namespace Factor
+{
+    // Cholesky: factor SPD A (n x n, row-major) into lower-triangular L with A = L L^T.
+    // L is written into l[] (also row-major, upper triangle left as zero). Returns
+    // true on success, false if a non-positive pivot is hit (A not SPD).
+    bool cholesky(double[] a, double[] l, int n)
+    {
+        for (int i = 0; i < n * n; i = i + 1) l[i] = 0.0;
+
+        for (int j = 0; j < n; j = j + 1)
+        {
+            // diagonal: L[j][j] = sqrt(A[j][j] - sum_{k<j} L[j][k]^2)
+            double diag = a[j * n + j];
+            for (int k = 0; k < j; k = k + 1)
+            {
+                double ljk = l[j * n + k];
+                diag = diag - ljk * ljk;
+            }
+            if (diag <= 0.0) return false;
+            double ljj = Math.sqrt(diag);
+            l[j * n + j] = ljj;
+
+            // below diagonal: L[i][j] = (A[i][j] - sum_{k<j} L[i][k] L[j][k]) / L[j][j]
+            for (int i = j + 1; i < n; i = i + 1)
+            {
+                double s = a[i * n + j];
+                for (int k = 0; k < j; k = k + 1)
+                    s = s - l[i * n + k] * l[j * n + k];
+                l[i * n + j] = s / ljj;
+            }
+        }
+        return true;
+    }
+
+    // Forward substitution: solve L y = b for lower-triangular L (unit_diag=false:
+    // use L[i][i]; unit_diag=true: treat the diagonal as 1, used for LU's unit-L).
+    void forward_solve(double[] l, double[] b, double[] y, int n, bool unit_diag)
+    {
+        for (int i = 0; i < n; i = i + 1)
+        {
+            double s = b[i];
+            for (int k = 0; k < i; k = k + 1)
+                s = s - l[i * n + k] * y[k];
+            y[i] = unit_diag ? s : s / l[i * n + i];
+        }
+    }
+
+    // Back substitution: solve U x = y for upper-triangular U.
+    void back_solve(double[] u, double[] y, double[] x, int n)
+    {
+        for (int i = n - 1; i >= 0; i = i - 1)
+        {
+            double s = y[i];
+            for (int k = i + 1; k < n; k = k + 1)
+                s = s - u[i * n + k] * x[k];
+            x[i] = s / u[i * n + i];
+        }
+    }
+
+    // Solve A x = b for SPD A via Cholesky: A = L L^T, so L y = b then L^T x = y.
+    // Back substitution needs U = L^T; we transpose L into lt[] first.
+    bool cholesky_solve(double[] a, double[] b, double[] x, int n)
+    {
+        double[] l  = new double[n * n];
+        double[] lt = new double[n * n];
+        double[] y  = new double[n];
+
+        bool ok = cholesky(a, l, n);
+        if (ok)
+        {
+            // lt = L^T (upper triangular)
+            for (int i = 0; i < n * n; i = i + 1) lt[i] = 0.0;
+            for (int i = 0; i < n; i = i + 1)
+                for (int k = 0; k <= i; k = k + 1)
+                    lt[k * n + i] = l[i * n + k];
+
+            forward_solve(l, b, y, n, false);   // L y = b
+            back_solve(lt, y, x, n);            // L^T x = y
+        }
+
+        delete[_] l; delete[_] lt; delete[_] y;
+        return ok;
+    }
+
+    // LU factorization (Doolittle, no pivoting). On return lu[] holds L (unit
+    // diagonal, stored below) and U (stored on/above the diagonal) packed together.
+    // Suitable for diagonally dominant A where pivoting is unnecessary.
+    bool lu_factor(double[] a, double[] lu, int n)
+    {
+        for (int i = 0; i < n * n; i = i + 1) lu[i] = a[i];
+
+        for (int k = 0; k < n; k = k + 1)
+        {
+            double pivot = lu[k * n + k];
+            if (pivot < 0.0000000001 && pivot > -0.0000000001) return false;
+            for (int i = k + 1; i < n; i = i + 1)
+            {
+                double factor = lu[i * n + k] / pivot;
+                lu[i * n + k] = factor;                 // store multiplier (L)
+                for (int j = k + 1; j < n; j = j + 1)
+                    lu[i * n + j] = lu[i * n + j] - factor * lu[k * n + j];
+            }
+        }
+        return true;
+    }
+
+    // Solve A x = b via LU: L y = b (unit L) then U x = y.
+    bool lu_solve(double[] a, double[] b, double[] x, int n)
+    {
+        double[] lu = new double[n * n];
+        double[] y  = new double[n];
+        bool ok = lu_factor(a, lu, n);
+        if (ok)
+        {
+            forward_solve(lu, b, y, n, true);   // unit-diagonal L
+            back_solve(lu, y, x, n);           // U is on/above the diagonal of lu
+        }
+        delete[_] lu; delete[_] y;
+        return ok;
+    }
+}

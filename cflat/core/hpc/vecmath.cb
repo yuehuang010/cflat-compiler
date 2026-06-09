@@ -1,11 +1,11 @@
 // vecmath.cb - BLAS level-1 style dense vector kernels over double[].
 //
-// Design notes (customer perspective):
+// Design notes:
 //   - Buffers are `double[]` array-views, so distinct vectors are noalias and the
 //     pure map kernels (axpy/scal/copy) vectorize at -O2 with NO runtime alias check.
 //   - Reduction kernels (dot/asum/nrm2) are plain scalar loops: a floating-point
 //     reduction reorders the additions, which changes the result, so the `vectorize`
-//     contract intentionally refuses them. We leave them unmarked rather than lie.
+//     contract intentionally refuses them; they are left unmarked.
 //   - Length is carried alongside the view (the BLAS convention); a view is thin.
 //
 // All routines are single-threaded and allocation-free on the hot path.

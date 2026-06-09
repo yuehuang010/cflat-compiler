@@ -9,11 +9,11 @@
 
 import "cruntime.cb";
 import "time.cb";
-import "vecmath.cb";
-import "densemat.cb";
-import "stencil.cb";
-import "fft.cb";
-import "sparse.cb";
+import "hpc/vecmath.cb";
+import "hpc/densemat.cb";
+import "hpc/stencil.cb";
+import "hpc/fft.cb";
+import "hpc/sparse.cb";
 
 // Report a kernel: total floating-point work (in GFLOP) over elapsed seconds.
 void report(char* name, double gflop, double secs)

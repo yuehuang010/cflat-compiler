@@ -13,17 +13,24 @@ codegen-parity check.
 
 ## What's here
 
+The numeric kernel libraries now ship in the standard library under
+[`cflat/core/hpc/`](../../cflat/core/hpc) and are imported with the `hpc/` prefix
+(`import "hpc/vecmath.cb";`). The drivers and benchmarks below stay here in `performance/hpc/`.
+
 ### Throughput / FLOP-bound numeric kernels
 
 | File | Kind | Contents |
 |------|------|----------|
-| `vecmath.cb`  | library | BLAS-1: `axpy`, `scal`, `copy`, `fill`, `dot`, `asum`, `nrm2`, `iamax` |
-| `densemat.cb` | library | BLAS-2/3: `gemv`, `gemm` (i-k-j), `transpose` over row-major `double[]` |
-| `stencil.cb`  | library | `jacobi1d`, `laplace1d`, `jacobi2d` (5-point), `boxblur2d` (3x3) |
-| `scan.cb`     | library | `prefix_sum_inclusive/exclusive`, `sum/min/max`, `Welford` streaming mean+variance |
-| `fft.cb`      | library | iterative radix-2 Cooley-Tukey `fft`/`ifft` + `dft_naive` reference |
-| `sparse.cb`   | library | `CsrMatrix` + `spmv` (compressed sparse row matrix-vector) |
-| `hpc_demo.cb` | driver  | 31 correctness checks across every kernel |
+| `core/hpc/vecmath.cb`  | library | BLAS-1: `axpy`, `scal`, `copy`, `fill`, `dot`, `asum`, `nrm2`, `iamax` |
+| `core/hpc/densemat.cb` | library | BLAS-2/3: `gemv`, `gemm` (i-k-j), `transpose` over row-major `double[]` |
+| `core/hpc/stencil.cb`  | library | `jacobi1d`, `laplace1d`, `jacobi2d` (5-point), `boxblur2d` (3x3) |
+| `core/hpc/scan.cb`     | library | `prefix_sum_inclusive/exclusive`, `sum/min/max`, `Welford` streaming mean+variance |
+| `core/hpc/fft.cb`      | library | iterative radix-2 Cooley-Tukey `fft`/`ifft` + `dft_naive` reference |
+| `core/hpc/sparse.cb`   | library | `CsrMatrix` + `spmv` (compressed sparse row matrix-vector) |
+| `core/hpc/factor.cb`   | library | `Factor.*` dense direct solvers: Cholesky / LU (Doolittle) + forward/back substitution |
+| `core/hpc/solvers.cb`  | library | `Solver.*` iterative sparse solvers: Conjugate Gradient + Jacobi over `CsrMatrix` |
+| `core/hpc/parallel.cb` | library | `parallel_for_n` / `parallel_reduce<T>` (+ `_pool` variants) - across-core data parallelism |
+| `Test/test_hpc_kernels.cb` | test    | 38 correctness checks across every kernel (run by `test.bat` and as build_hpc's correctness step) |
 | `hpc_bench.cb`| driver  | throughput benchmark (GFLOP/s, GB/s) |
 
 ### Latency / cache-hierarchy bound
@@ -43,7 +50,7 @@ performance\hpc\build_hpc.bat Release znver4 REM AVX-512
 Or manually:
 
 ```bat
-x64\Release\cflat.exe performance\hpc\hpc_demo.cb  -i performance\hpc -i cflat\core -o out\hpc\hpc_demo.exe  -O2 --cpu x86-64-v3
+x64\Release\cflat.exe Test\test_hpc_kernels.cb     -i cflat\core -o out\hpc\test_hpc_kernels.exe -O2 --cpu x86-64-v3
 x64\Release\cflat.exe performance\hpc\hpc_bench.cb -i performance\hpc -i cflat\core -o out\hpc\hpc_bench.exe -O2 --cpu x86-64-v3
 ```
 

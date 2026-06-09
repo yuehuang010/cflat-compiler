@@ -11,10 +11,10 @@ if "%CPU%"=="" set CPU=x86-64-v3
 set CFLAT=x64\%CONFIG%\cflat.exe
 if not exist "out\hpc" mkdir "out\hpc"
 
-echo === Correctness (hpc_demo) ===
-"%CFLAT%" performance\hpc\hpc_demo.cb -i performance\hpc -i cflat\core -o out\hpc\hpc_demo.exe -O2 --cpu %CPU%
+echo === Correctness (test_hpc_kernels) ===
+"%CFLAT%" Test\test_hpc_kernels.cb -i cflat\core -o out\hpc\test_hpc_kernels.exe -O2 --cpu %CPU%
 if errorlevel 1 exit /b 1
-out\hpc\hpc_demo.exe
+out\hpc\test_hpc_kernels.exe
 if errorlevel 1 exit /b 1
 
 echo.
@@ -24,19 +24,8 @@ if errorlevel 1 exit /b 1
 out\hpc\hpc_bench.exe
 if errorlevel 1 exit /b 1
 
-echo.
-echo === Solvers (CG + Jacobi over CSR) ===
-"%CFLAT%" performance\hpc\solvers.cb -i performance\hpc -i cflat\core -o out\hpc\solvers.exe -O2 --cpu %CPU%
-if errorlevel 1 exit /b 1
-out\hpc\solvers.exe
-if errorlevel 1 exit /b 1
-
-echo.
-echo === Dense factorization (Cholesky + LU) ===
-"%CFLAT%" performance\hpc\factor.cb -i performance\hpc -i cflat\core -o out\hpc\factor.exe -O2 --cpu %CPU%
-if errorlevel 1 exit /b 1
-out\hpc\factor.exe
-if errorlevel 1 exit /b 1
+REM Dense factorization (Factor.*) and iterative sparse solvers (Solver.*) now ship in
+REM cflat/core/hpc; their correctness is checked by the test_hpc_kernels step above.
 
 echo.
 echo === Black-Scholes (closed-form + Monte-Carlo) ===

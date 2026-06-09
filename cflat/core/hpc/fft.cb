@@ -8,7 +8,7 @@
 //   dft_naive     : O(N^2) reference transform, for correctness checking
 //
 // Single-threaded; the only heap use is the trig calls. Twiddles are computed on the fly
-// via sin/cos (a real library would cache them, but this keeps the kernel self-contained).
+// via sin/cos rather than precomputed into a twiddle table, to keep the kernel self-contained.
 
 import "math.cb";   // Math.sin / Math.cos (llvm.sin / llvm.cos intrinsics)
 

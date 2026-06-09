@@ -1,7 +1,7 @@
 import "test_helper.cb";
-import "parallel.cb";
+import "hpc/parallel.cb";
 
-// Exercises core/parallel.cb: parallel_for_n (map) and parallel_reduce<T>
+// Exercises core/hpc/parallel.cb: parallel_for_n (map) and parallel_reduce<T>
 // (reduction), each on both the raw-thread and the ThreadPool backend.
 
 int g_pass = 0;

@@ -23,6 +23,7 @@ failure points you toward.
 - [`T[]` array-view (noalias)](#t-array-view-noalias)
 - [`span<T>` (noalias) and `view<T>` (may-alias)](#spant-noalias-and-viewt-may-alias)
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
+- [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
 **Related:** [Threading & Memory Management](threading.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
 
@@ -266,9 +267,9 @@ it is gated behind the disjoint-tiling API so user code can never forge an overl
 
 ## Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)
 
-`vectorize`, `simd<T,N>`, and `span<T>` parallelize *within* one core (SIMD lanes). `core/parallel.cb`
+`vectorize`, `simd<T,N>`, and `span<T>` parallelize *within* one core (SIMD lanes). `core/hpc/parallel.cb`
 adds the *across-core* axis: partition an index range `[0, n)` into balanced sub-ranges and fan the
-work out over worker threads. `import "parallel.cb";`
+work out over worker threads. `import "hpc/parallel.cb";`
 
 Each helper comes in two backends:
 
@@ -344,3 +345,50 @@ pool.shutdown();
 > The pool variants are named `*_pool` rather than overloading the raw names: two generic functions of
 > the same name monomorphize to the same mangled symbol and would collide, so both pool entry points
 > carry the suffix for a uniform API.
+
+---
+
+## Numeric kernel libraries (`core/hpc`)
+
+The features above are the *language surface*; `core/hpc/` ships a small set of ready-made
+numeric kernels built on top of them. They are normal core libraries - import with the `hpc/`
+prefix - and they exist to be both useful and a worked example of the conventions on this page:
+distinct `double[]` array-views are `noalias`, the pure element-wise maps carry `vectorize`, and
+the floating-point reductions are deliberately left scalar (a reduction reorders adds, so the
+`vectorize` contract correctly refuses it).
+
+| Import | Exposes | Contents |
+|--------|---------|----------|
+| `import "hpc/vecmath.cb";`  | `namespace Vec`     | BLAS-1: `axpy`, `scal`, `copy`, `fill`, `dot`, `asum`, `nrm2`, `iamax` |
+| `import "hpc/densemat.cb";` | `namespace Mat`     | BLAS-2/3: `gemv`, `gemm` (i-k-j), `transpose` over row-major `double[]` |
+| `import "hpc/stencil.cb";`  | `namespace Stencil` | `jacobi1d`, `laplace1d`, `jacobi2d` (5-point), `boxblur2d` (3x3) |
+| `import "hpc/scan.cb";`     | `namespace Scan` + `Welford` | `prefix_sum_inclusive/exclusive`, `sum`/`minval`/`maxval`, streaming mean+variance |
+| `import "hpc/fft.cb";`      | `namespace FFT`     | iterative radix-2 Cooley-Tukey `fft`/`ifft` + `dft_naive` reference |
+| `import "hpc/sparse.cb";`   | `struct CsrMatrix`  | compressed sparse row matrix + `spmv` |
+| `import "hpc/factor.cb";`   | `namespace Factor`  | dense direct solvers: Cholesky / LU (Doolittle) + forward/back substitution |
+| `import "hpc/solvers.cb";`  | `namespace Solver`  | iterative sparse solvers: Conjugate Gradient + Jacobi over `CsrMatrix` |
+
+`factor` and `solvers` show the intended layering: `Solver.cg_solve` reimplements no kernel - every
+matrix-vector product is `CsrMatrix.spmv` and every vector op is a `Vec.*` call, exactly how a real
+Krylov library sits on top of BLAS plus a sparse format.
+
+```c
+import "hpc/vecmath.cb";
+import "hpc/sparse.cb";
+import "hpc/solvers.cb";
+
+CsrMatrix a;  /* ...fill CSR... */
+double[] b = new double[n];
+double[] x = new double[n];
+Vec.fill(x, 0.0, n);                                 // initial guess
+double res = 0.0;
+int iters = Solver.cg_solve(&a, b, x, n, 1e-9, 1000, &res);   // x now solves A x = b
+```
+
+The convention everywhere is the BLAS one: lengths travel alongside the view (a `double[]` array-view
+is thin and carries no length), buffers are allocated up front with `new T[n]` and freed with
+`delete[_]`, and the hot paths do not allocate.
+
+Correctness for all eight is checked by [`Test/test_hpc_kernels.cb`](../Test/test_hpc_kernels.cb)
+(run by `test.bat`); throughput numbers and a write-up live in
+[`performance/hpc/README.md`](../performance/hpc/README.md).

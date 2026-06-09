@@ -1,0 +1,380 @@
+// test_hpc_kernels.cb - correctness harness for the core/hpc numeric kernel libraries
+// (vecmath, densemat, stencil, scan, fft, sparse, factor, solvers). Imports every
+// library together and checks each kernel against a known answer; returns 0 only if
+// all checks pass.
+//
+// Run automatically by test.bat at -O0 (the `vectorize` contract in the kernels is a
+// no-op there; its -O2 enforcement is covered separately by test_hpc.bat). Also run at
+// -O2 by performance/hpc/build_hpc.bat as the suite's correctness step.
+
+import "cruntime.cb";
+import "hpc/vecmath.cb";
+import "hpc/densemat.cb";
+import "hpc/stencil.cb";
+import "hpc/scan.cb";
+import "hpc/fft.cb";
+import "hpc/sparse.cb";
+import "hpc/factor.cb";
+import "hpc/solvers.cb";
+
+int g_pass = 0;
+int g_total = 0;
+
+void check(char* name, double got, double want)
+{
+    g_total = g_total + 1;
+    double d = got - want;
+    if (d < 0.0) d = -d;
+    if (d < 0.000001) { g_pass = g_pass + 1; printf("  ok   %-28s = %.6f\n", name, got); }
+    else              { printf("  FAIL %-28s got %.6f want %.6f\n", name, got, want); }
+}
+
+// Like check() but with a caller-supplied tolerance, for the factorization and
+// iterative-solver checks whose convergence floors are coarser than 1e-6 (Jacobi).
+void check_tol(char* name, double got, double want, double tol)
+{
+    g_total = g_total + 1;
+    double d = got - want;
+    if (d < 0.0) d = -d;
+    if (d < tol) { g_pass = g_pass + 1; printf("  ok   %-28s = %.3e\n", name, got); }
+    else         { printf("  FAIL %-28s got %.6f want %.6f\n", name, got, want); }
+}
+
+void check_int(char* name, int got, int want)
+{
+    g_total = g_total + 1;
+    if (got == want) { g_pass = g_pass + 1; printf("  ok   %-28s = %d\n", name, got); }
+    else             { printf("  FAIL %-28s got %d want %d\n", name, got, want); }
+}
+
+// ---- BLAS-1 ----
+void test_vecmath()
+{
+    printf("[vecmath]\n");
+    int n = 16;
+    double[] x = new double[n];
+    double[] y = new double[n];
+    Vec.fill(x, 2.0, n);
+    Vec.fill(y, 1.0, n);
+    Vec.axpy(3.0, x, y, n);            // y = 1 + 3*2 = 7
+    check("axpy y[0]", y[0], 7.0);
+    check("dot(x,y)", Vec.dot(x, y, n), 2.0 * 7.0 * 16.0);   // 224
+    Vec.scal(0.5, x, n);               // x = 1
+    check("scal x[5]", x[5], 1.0);
+    check("nrm2(x)", Vec.nrm2(x, n), 4.0);                   // sqrt(16*1)
+    check("asum(y)", Vec.asum(y, n), 7.0 * 16.0);            // 112
+    y[9] = -100.0;
+    check_int("iamax(y)", Vec.iamax(y, n), 9);
+    delete[_] x; delete[_] y;
+}
+
+// ---- BLAS-2/3 ----
+void test_densemat()
+{
+    printf("[densemat]\n");
+    // A = [[1,2,3],[4,5,6]] (2x3), x = [1,1,1] -> A*x = [6,15]
+    double[] a = new double[6];
+    a[0]=1.0; a[1]=2.0; a[2]=3.0; a[3]=4.0; a[4]=5.0; a[5]=6.0;
+    double[] xv = new double[3];
+    Vec.fill(xv, 1.0, 3);
+    double[] yv = new double[2];
+    Vec.fill(yv, 0.0, 2);
+    Mat.gemv(1.0, a, xv, 0.0, yv, 2, 3);
+    check("gemv y[0]", yv[0], 6.0);
+    check("gemv y[1]", yv[1], 15.0);
+
+    // C = A(2x3) * B(3x2). B = identity-ish [[1,0],[0,1],[1,1]] -> C = [[4,5],[10,11]]
+    double[] b = new double[6];
+    b[0]=1.0; b[1]=0.0; b[2]=0.0; b[3]=1.0; b[4]=1.0; b[5]=1.0;
+    double[] c = new double[4];
+    Vec.fill(c, 0.0, 4);
+    Mat.gemm(1.0, a, b, 0.0, c, 2, 3, 2);
+    check("gemm c[0,0]", c[0], 4.0);
+    check("gemm c[0,1]", c[1], 5.0);
+    check("gemm c[1,0]", c[2], 10.0);
+    check("gemm c[1,1]", c[3], 11.0);
+
+    // transpose A(2x3) -> At(3x2): At[0,1] = A[1,0] = 4
+    double[] at = new double[6];
+    Mat.transpose(a, at, 2, 3);
+    check("transpose at[1,0]", at[2], 2.0);   // At(3x2)[1][0] = A[0][1] = 2 (flat idx 2)
+    delete[_] a; delete[_] xv; delete[_] yv; delete[_] b; delete[_] c; delete[_] at;
+}
+
+// ---- stencils ----
+void test_stencil()
+{
+    printf("[stencil]\n");
+    int n = 8;
+    double[] s = new double[n];
+    double[] d = new double[n];
+    int i = 0;
+    while (i < n) { s[i] = (double)i; i = i + 1; }   // ramp 0..7
+    Stencil.jacobi1d(s, d, n);
+    check("jacobi1d d[3]", d[3], 3.0);               // (2+4)/2
+    Stencil.laplace1d(s, d, n);
+    check("laplace1d d[3]", d[3], 0.0);              // linear ramp -> 0 curvature
+    delete[_] s; delete[_] d;
+
+    // 2D: a 4x4 grid all 1.0 -> 5-point average stays 1.0 in the interior.
+    int h = 4; int w = 4;
+    double[] g = new double[h * w];
+    double[] g2 = new double[h * w];
+    Vec.fill(g, 1.0, h * w);
+    Stencil.jacobi2d(g, g2, h, w);
+    check("jacobi2d interior", g2[1 * w + 1], 1.0);
+    Stencil.boxblur2d(g, g2, h, w);
+    check("boxblur2d interior", g2[1 * w + 1], 1.0);
+    delete[_] g; delete[_] g2;
+}
+
+// ---- scan + stats ----
+void test_scan()
+{
+    printf("[scan]\n");
+    int n = 5;
+    double[] src = new double[n];
+    double[] out = new double[n];
+    int i = 0;
+    while (i < n) { src[i] = (double)(i + 1); i = i + 1; }   // 1,2,3,4,5
+    Scan.prefix_sum_inclusive(src, out, n);
+    check("scan incl out[4]", out[4], 15.0);
+    Scan.prefix_sum_exclusive(src, out, n);
+    check("scan excl out[4]", out[4], 10.0);
+    check("sum", Scan.sum(src, n), 15.0);
+    check("minval", Scan.minval(src, n), 1.0);
+    check("maxval", Scan.maxval(src, n), 5.0);
+
+    Welford w;
+    w.reset();
+    i = 0;
+    while (i < n) { w.add(src[i]); i = i + 1; }
+    check("welford mean", w.get_mean(), 3.0);
+    check("welford variance", w.variance(), 2.0);   // pop var of 1..5
+    delete[_] src; delete[_] out;
+}
+
+// ---- FFT ----
+void test_fft()
+{
+    printf("[fft]\n");
+    int n = 8;
+    double[] buf = new double[2 * n];
+    double[] ref = new double[2 * n];
+    int i = 0;
+    // signal: a single cosine-ish impulse at index 0 then back via inverse round-trip.
+    while (i < n) { buf[2 * i] = (double)(i + 1); buf[2 * i + 1] = 0.0; i = i + 1; }
+    // keep a copy for round-trip comparison
+    Vec.copy(buf, ref, 2 * n);
+
+    // DC bin of forward FFT == sum of inputs == 1+2+...+8 = 36
+    FFT.fft(buf, n);
+    check("fft DC real", buf[0], 36.0);
+
+    // inverse should restore the original signal
+    FFT.ifft(buf, n);
+    check("fft roundtrip re[3]", buf[6], 4.0);     // original buf[2*3] = 4
+    check("fft roundtrip im[3]", buf[7], 0.0);
+
+    // cross-check forward FFT against the naive DFT (bin 1 real part)
+    double[] nv = new double[2 * n];
+    FFT.dft_naive(ref, nv, n);
+    FFT.fft(ref, n);
+    check("fft vs dft bin1 re", ref[2], nv[2]);
+    delete[_] buf; delete[_] ref; delete[_] nv;
+}
+
+// ---- sparse SpMV ----
+void test_sparse()
+{
+    printf("[sparse]\n");
+    // 3x3 matrix:  [[10,0,0],[0,20,3],[0,0,30]]   nnz = 4
+    CsrMatrix m;
+    m.alloc(3, 3, 4);
+    m.values[0]=10.0; m.col_index[0]=0;
+    m.values[1]=20.0; m.col_index[1]=1;
+    m.values[2]=3.0;  m.col_index[2]=2;
+    m.values[3]=30.0; m.col_index[3]=2;
+    m.row_ptr[0]=0; m.row_ptr[1]=1; m.row_ptr[2]=3; m.row_ptr[3]=4;
+
+    double[] x = new double[3];
+    x[0]=1.0; x[1]=2.0; x[2]=3.0;
+    double[] y = new double[3];
+    m.spmv(x, y);
+    check("spmv y[0]", y[0], 10.0);    // 10*1
+    check("spmv y[1]", y[1], 49.0);    // 20*2 + 3*3
+    check("spmv y[2]", y[2], 90.0);    // 30*3
+    delete[_] x; delete[_] y;
+    m.dispose();
+}
+
+// shared helpers for the factor + solvers checks
+void mv_dense(double[] a, double[] x, double[] y, int n)
+{
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double s = 0.0;
+        for (int j = 0; j < n; j = j + 1)
+            s = s + a[i * n + j] * x[j];
+        y[i] = s;
+    }
+}
+
+double max_abs_diff(double[] u, double[] v, int n)
+{
+    double m = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double e = u[i] - v[i];
+        if (e < 0.0) e = -e;
+        if (e > m) m = e;
+    }
+    return m;
+}
+
+// ---- dense factorization (Cholesky + LU) ----
+void test_factor()
+{
+    printf("[factor]\n");
+    int n = 6;
+
+    // SPD matrix A = M^T M + n*I (symmetric positive-definite by construction).
+    double[] m = new double[n * n];
+    int seed = 1;
+    for (int i = 0; i < n * n; i = i + 1)
+    {
+        seed = seed * 1103515245 + 12345;
+        int v = (seed >> 16) & 0x7fff;
+        m[i] = (double)(v % 10) - 4.5;
+    }
+    double[] spd = new double[n * n];
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int k = 0; k < n; k = k + 1)
+                s = s + m[k * n + i] * m[k * n + j];   // (M^T M)[i][j]
+            if (i == j) s = s + (double)n;
+            spd[i * n + j] = s;
+        }
+
+    double[] xexact = new double[n];
+    for (int i = 0; i < n; i = i + 1) xexact[i] = (double)(i + 1) * 0.5 - 1.0;
+    double[] b = new double[n];
+    mv_dense(spd, xexact, b, n);
+
+    // Cholesky reconstruction: max |L L^T - A|.
+    double[] l = new double[n * n];
+    bool okc = Factor.cholesky(spd, l, n);
+    double maxrecon = 0.0;
+    if (okc)
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = 0; j < n; j = j + 1)
+            {
+                double s = 0.0;
+                for (int k = 0; k < n; k = k + 1)
+                    s = s + l[i * n + k] * l[j * n + k];   // (L L^T)[i][j]
+                double e = s - spd[i * n + j];
+                if (e < 0.0) e = -e;
+                if (e > maxrecon) maxrecon = e;
+            }
+    check_tol("cholesky L L^T err", maxrecon, 0.0, 0.00000001);
+
+    double[] xc = new double[n];
+    Factor.cholesky_solve(spd, b, xc, n);
+    check_tol("cholesky |x - x_exact|", max_abs_diff(xc, xexact, n), 0.0, 0.0000001);
+
+    // LU on a general diagonally dominant matrix.
+    double[] g = new double[n * n];
+    seed = 7;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double rowsum = 0.0;
+        for (int j = 0; j < n; j = j + 1)
+        {
+            seed = seed * 1103515245 + 12345;
+            int vv = (seed >> 16) & 0x7fff;
+            double a = (double)(vv % 7) - 3.0;
+            g[i * n + j] = a;
+            if (i != j) rowsum = rowsum + (a < 0.0 ? -a : a);
+        }
+        g[i * n + i] = rowsum + 1.0;   // force diagonal dominance
+    }
+    double[] bg = new double[n];
+    mv_dense(g, xexact, bg, n);
+    double[] xl = new double[n];
+    Factor.lu_solve(g, bg, xl, n);
+    check_tol("lu |x - x_exact|", max_abs_diff(xl, xexact, n), 0.0, 0.0000001);
+
+    delete[_] m; delete[_] spd; delete[_] xexact; delete[_] b;
+    delete[_] l; delete[_] xc; delete[_] g; delete[_] bg; delete[_] xl;
+}
+
+// ---- iterative sparse solvers (CG + Jacobi over a 1D Laplacian) ----
+void build_laplacian1d(CsrMatrix* a, int n)
+{
+    int nnz = 3 * n - 2;
+    a->alloc(n, n, nnz);
+    int k = 0;
+    a->row_ptr[0] = 0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        if (i > 0)     { a->values[k] = -1.0; a->col_index[k] = i - 1; k = k + 1; }
+                         a->values[k] =  2.0; a->col_index[k] = i;     k = k + 1;
+        if (i < n - 1) { a->values[k] = -1.0; a->col_index[k] = i + 1; k = k + 1; }
+        a->row_ptr[i + 1] = k;
+    }
+}
+
+void test_solvers()
+{
+    printf("[solvers]\n");
+    int n = 64;
+    CsrMatrix a;
+    build_laplacian1d(&a, n);
+
+    // ramp-plus-bump: a broad eigenmode mix so CG actually iterates (a single sine
+    // mode is an exact eigenvector and would converge in one step).
+    double[] xexact = new double[n];
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double t = (double)(i + 1) / (double)(n + 1);
+        xexact[i] = t * (1.0 - t) + 0.3 * t;
+    }
+    double[] b = new double[n];
+    a.spmv(xexact, b);
+
+    // Conjugate Gradient: recovers x within tolerance, in <= n iterations.
+    double[] x = new double[n];
+    Vec.fill(x, 0.0, n);
+    double res = 0.0;
+    int iters = Solver.cg_solve(&a, b, x, n, 0.000000001, 1000, &res);
+    check_tol("cg |x - x_exact|", max_abs_diff(x, xexact, n), 0.0, 0.000001);
+    check_int("cg iters <= n", iters <= n ? 1 : 0, 1);
+
+    // Jacobi: slow but monotone; require it got reasonably close.
+    double[] xj = new double[n];
+    Vec.fill(xj, 0.0, n);
+    double resj = 0.0;
+    Solver.jacobi_solve(&a, b, xj, n, 0.0001, 20000, &resj);
+    check_tol("jacobi residual < tol", resj, 0.0, 0.0001);
+    check_tol("jacobi |x - x_exact|", max_abs_diff(xj, xexact, n), 0.0, 0.01);
+
+    delete[_] xexact; delete[_] b; delete[_] x; delete[_] xj;
+    a.dispose();
+}
+
+extern int main()
+{
+    printf("=== CFlat single-threaded HPC library suite ===\n\n");
+    test_vecmath();
+    test_densemat();
+    test_stencil();
+    test_scan();
+    test_fft();
+    test_sparse();
+    test_factor();
+    test_solvers();
+    printf("\n%d / %d checks passed.\n", g_pass, g_total);
+    return g_pass == g_total ? 0 : 1;
+}

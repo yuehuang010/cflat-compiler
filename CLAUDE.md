@@ -385,7 +385,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `rwlock.cb` | `rwlock` - reader-writer lock |
 | `stop_token.cb` | `stop_token` / `stop_source` - cooperative cancellation |
 | `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain`; `TaskHandle`, `TaskResult<T>` |
-| `parallel.cb` | `parallel_for_n` / `parallel_reduce<T>` (raw-thread) and `parallel_for_n_pool` / `parallel_reduce_pool<T>` (ThreadPool) - across-core data parallelism over `[0,n)`. See [`doc/HPC.md`](doc/HPC.md) |
+| `hpc/parallel.cb` | `parallel_for_n` / `parallel_reduce<T>` (raw-thread) and `parallel_for_n_pool` / `parallel_reduce_pool<T>` (ThreadPool) - across-core data parallelism over `[0,n)`; `import "hpc/parallel.cb"`. See [`doc/HPC.md`](doc/HPC.md) |
 | `time.cb` | `TimePoint.now()`, `Stopwatch`, `Timer`, `sleep`, `rdtscp()` (x86 cycle counter for jitter timing), `lfence()` (x86 serializing load fence), duration utilities |
 | `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely` (target-independent), `pause()` (x86 spin-loop hint, used by `spsc_queue`/`channel` spin loops) |
 | `tuple.cb` | `tuple<A,B,C>` - fixed-arity generic struct |
