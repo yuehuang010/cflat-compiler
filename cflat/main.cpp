@@ -37,6 +37,7 @@ int main(int argc, char* argv[])
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
+    args.addFlag("run", 0, "JIT-compile and run the program in-process without writing an exe to disk. Entry must be 'int main()' or 'int main(int argc, char** argv)'; arguments after a bare '--' are passed as argv[1..]. The process exit code is the program's exit code. Read-only: cannot be combined with -o, -l/--out-lli, or -b/--bitcode.");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
     args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
@@ -194,6 +195,24 @@ int main(int argc, char* argv[])
     compiler.SetNoCache(args.hasFlag("no-cache"));
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
     compiler.SetAsan(args.hasFlag("asan"));
+
+    bool runMode = args.hasFlag("run");
+    if (runMode && (args.getOption("output") || args.getOption("out-lli") || args.getOption("bitcode")))
+    {
+        std::cerr << "Error: --run is read-only and writes nothing to disk; it cannot be combined "
+                     "with -o, -l/--out-lli, or -b/--bitcode.\n";
+        return 1;
+    }
+    // Program arguments after a bare "--" are only meaningful when JIT-executing with --run;
+    // in any other mode they would silently go nowhere, so reject them up front.
+    if (!args.passthrough().empty() && !runMode)
+    {
+        std::cerr << "Error: program arguments after '--' are only valid with --run.\n";
+        return 1;
+    }
+    compiler.SetRunMode(runMode);
+    compiler.SetRunArgs(args.passthrough());
+
     bool ok = compiler.Compile(args);
 
     writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");
@@ -203,6 +222,13 @@ int main(int argc, char* argv[])
         std::cerr << "Compilation failed.\n";
         return 1;
     }
+
+    // --run: the process exit code is the JIT'd program's exit code. Suppress the trailing
+    // "Done." so --run output is exactly what the program itself printed (plus the logo,
+    // unless --nologo).
+    if (runMode)
+        return compiler.GetJitExitCode();
+
     if (showLogo)
         std::cout << "Done.\n";
 }

@@ -42,6 +42,16 @@ public:
 		{
 			std::string arg = argv[i];
 
+			// A bare "--" ends option parsing: everything after it is collected verbatim as
+			// program arguments (passthrough), forwarded to the JIT'd program under --run.
+			// This keeps program args from being mistaken for compiler flags or source files.
+			if (arg == "--")
+			{
+				for (int j = i + 1; j < argc; ++j)
+					m_passthrough.push_back(argv[j]);
+				break;
+			}
+
 			// clang-compatible spelling for --asan. Accepted as a no-op-cost alias so
 			// existing -fsanitize=address habits/build scripts work; sets the "asan" flag.
 			if (arg == "-fsanitize=address" || arg == "--fsanitize=address")
@@ -184,6 +194,10 @@ public:
 
 	size_t positionalCount() const { return m_positionalValues.size(); }
 
+	// Program arguments collected after a bare "--" (empty if none). Meaningful only under
+	// --run, where they become argv[1..] of the JIT'd program.
+	const std::vector<std::string>& passthrough() const { return m_passthrough; }
+
 	int getOptimizationLevel() const
 	{
 		if (hasFlag("O2")) return 2;
@@ -259,6 +273,7 @@ private:
 	std::unordered_map<std::string, std::string>              m_optionValues;
 	std::unordered_map<std::string, std::vector<std::string>> m_multiOptionValues;
 	std::vector<std::string>                                  m_positionalValues;
+	std::vector<std::string>                                  m_passthrough;
 	std::string                                  m_program;
 	bool                                         m_showVersion = false;
 

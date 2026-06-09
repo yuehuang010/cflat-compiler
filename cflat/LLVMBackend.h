@@ -51,6 +51,12 @@
 #include <llvm\Support\TimeProfiler.h>
 #include <llvm\Support\TargetSelect.h>
 #include <llvm\Target\TargetMachine.h>
+#include <llvm\ExecutionEngine\Orc\LLJIT.h>          // --run JIT execution (JitRun)
+#include <llvm\ExecutionEngine\Orc\ExecutionUtils.h> // DynamicLibrarySearchGenerator
+#include <llvm\ExecutionEngine\Orc\ObjectLinkingLayer.h> // JITLink layer (--run threading/SEH)
+#include <llvm\ExecutionEngine\JITLink\JITLink.h>        // LinkGraph (SEH .pdata registration)
+#include <unordered_map>
+#include <malloc.h>  // _aligned_malloc for the emutls shim
 #include <llvm\MC\TargetRegistry.h>
 #include <llvm\MC\MCSubtargetInfo.h>
 #include <llvm\TargetParser\Host.h>
@@ -141,6 +147,117 @@ struct CompilerAbortException {
     size_t line;
     size_t column;
 };
+
+// --run (JIT) emulated-TLS support. On x86_64-pc-windows-msvc LLVM lowers thread-locals to
+// emulated TLS, which calls __emutls_get_address(control) to fetch this thread's copy of a
+// thread-local. That helper normally lives in compiler-rt (which we do not link), so for the
+// in-process JIT we provide our own, backed by a host C++ thread_local map. JitRun injects
+// &CflatEmutlsGetAddress as an absolute symbol for "__emutls_get_address".
+//
+// Limitation: per-thread blocks are freed only at process exit, not thread exit (no
+// destructor hook). Acceptable for the run-and-exit --run utility; revisit before relying on
+// --run for long-lived multi-threaded programs.
+namespace cflat_jit
+{
+    // Matches compiler-rt's __emutls_control: { size, align, object-union, value }. We only
+    // read size/align/value; the object-union slot is managed per-thread by us.
+    struct EmutlsControl { size_t size; size_t align; void* object; void* value; };
+
+    inline void* CflatEmutlsGetAddress(void* control)
+    {
+        auto* c = static_cast<EmutlsControl*>(control);
+        thread_local std::unordered_map<void*, void*> storage;
+        auto it = storage.find(control);
+        if (it != storage.end())
+            return it->second;
+
+        size_t align = c->align ? c->align : alignof(std::max_align_t);
+        void* mem = _aligned_malloc(c->size, align);
+        if (c->value) std::memcpy(mem, c->value, c->size);
+        else          std::memset(mem, 0, c->size);
+        storage.emplace(control, mem);
+        return mem;
+    }
+
+    // JITLink plugin that registers Windows x64 unwind info for JIT'd code. JITLink fixes up
+    // the .pdata section (an array of 12-byte RUNTIME_FUNCTION records, each three ADDR32NB
+    // RVA fields: function begin, function end, unwind-info), but without ORC's COFFPlatform
+    // (which needs the orc_rt runtime we do not link) nothing calls RtlAddFunctionTable - so
+    // the OS cannot find unwind data for JIT'd frames and any SEH / C++ EH / FP-trap unwind on
+    // a worker thread faults. This registers it manually.
+    //
+    // The RVAs in .pdata are relative to the image base JITLink picked. Rather than guess that
+    // base, we recover it from a .pdata relocation: a stored RVA equals (target - imageBase),
+    // so imageBase = target - storedRVA. We then hand the in-memory .pdata array straight to
+    // RtlAddFunctionTable with that base.
+    class SehRegistrationPlugin : public llvm::orc::ObjectLinkingLayer::Plugin
+    {
+    public:
+        void modifyPassConfig(llvm::orc::MaterializationResponsibility&,
+                              llvm::jitlink::LinkGraph&,
+                              llvm::jitlink::PassConfiguration& Config) override
+        {
+            // PreFixup: memory is allocated and every node - including the resolved external
+            // __ImageBase - has its final address, but fixups have not been applied yet. The
+            // JITDylib defines __ImageBase as a placeholder (address 0, just to satisfy the
+            // symbol lookup); here we rewrite it to the real image base so the ADDR32NB fixups
+            // in .pdata/.xdata compute correct, in-range 32-bit RVAs.
+            Config.PreFixupPasses.push_back(
+                [](llvm::jitlink::LinkGraph& G) { return FixImageBase(G); });
+
+            // PostFixup: relocations are applied and addresses are final (the in-process
+            // memory manager links at the executor addresses), so .pdata holds real RVAs.
+            // Unwind cannot fire until the code runs, which is after finalization, so
+            // registering here is safe.
+            Config.PostFixupPasses.push_back(
+                [](llvm::jitlink::LinkGraph& G) { return RegisterUnwindInfo(G); });
+        }
+
+        // Pure-virtual ResourceManager hooks. --run is run-and-exit, so there is no teardown:
+        // we never deregister the tables (the process owns them until it exits).
+        llvm::Error notifyFailed(llvm::orc::MaterializationResponsibility&) override
+        { return llvm::Error::success(); }
+        llvm::Error notifyRemovingResources(llvm::orc::JITDylib&, llvm::orc::ResourceKey) override
+        { return llvm::Error::success(); }
+        void notifyTransferringResources(llvm::orc::JITDylib&, llvm::orc::ResourceKey,
+                                         llvm::orc::ResourceKey) override {}
+
+    private:
+        // Lowest block address in the graph - the image base every ADDR32NB RVA is relative to.
+        // The whole graph is one contiguous-ish allocation well under 4GB, so this base keeps
+        // all RVAs non-negative and in 32-bit range.
+        static llvm::orc::ExecutorAddr LowestBlockAddress(llvm::jitlink::LinkGraph& G)
+        {
+            llvm::orc::ExecutorAddr base;
+            bool found = false;
+            for (auto& Sec : G.sections())
+                for (auto* B : Sec.blocks())
+                    if (!found || B->getAddress() < base) { base = B->getAddress(); found = true; }
+            return base; // default-constructed (0) if the graph has no blocks
+        }
+
+        // PreFixup: point the resolved __ImageBase symbol at the real image base (it is defined
+        // as a placeholder in the JITDylib only to satisfy the lookup). After this, fixups see
+        // the correct anchor. Matches the base LowestBlockAddress feeds RegisterUnwindInfo.
+        static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
+        {
+            llvm::jitlink::Symbol* sym = nullptr;
+            for (auto* S : G.external_symbols())
+                if (S->hasName() && S->getName() == "__ImageBase") { sym = S; break; }
+            if (!sym)
+                for (auto* S : G.absolute_symbols())
+                    if (S->hasName() && S->getName() == "__ImageBase") { sym = S; break; }
+            if (sym)
+                sym->getAddressable().setAddress(LowestBlockAddress(G));
+            return llvm::Error::success();
+        }
+
+        // Defined out-of-line in LLVMBackend.cpp so the RtlAddFunctionTable forward-declaration
+        // stays in a TU that does not include <winnt.h> (avoids an extern "C" overload clash
+        // with the real prototype in TUs like LspServer.cpp that do include windows.h).
+        static llvm::Error RegisterUnwindInfo(llvm::jitlink::LinkGraph& G);
+    };
+}
 
 class LLVMBackend
 {
@@ -866,6 +983,15 @@ private:
     // Intended to be paired with -g so the runtime report can name CFlat source lines.
     // Off by default; when off, codegen/linking is byte-for-byte unchanged.
     bool asan_ = false;
+
+    // --run: JIT and execute in-process instead of emitting an exe. jitExitCode_ carries the
+    // program's exit status back to main() (Compile returns bool for compile success only).
+    // runArgs_ are the program arguments (everything after a `--` on the command line),
+    // forwarded to an 'int main(int argc, char** argv)' entry as argv[1..]; argv[0] is the
+    // source file name. Empty for an 'int main()' entry.
+    bool runMode_ = false;
+    int  jitExitCode_ = 0;
+    std::vector<std::string> runArgs_;
 
     // Cross-thread sharing scan state. xthreadScanLevel_ is 0 unless --xthread-scan N
     // (N in 1..3) was passed; threadSharedTypes_ holds the struct type names found
@@ -3827,7 +3953,10 @@ private:
                     entry.deps.push_back(std::move(dep));
                 }
             }
-            if (diskCache && !cHeaderCacheDir.empty())
+            // --run is read-only: never persist the header cache to disk under run mode, even
+            // when the import opted in with a 'cache' clause (the in-memory entry below still
+            // serves this compile).
+            if (diskCache && !runMode_ && !cHeaderCacheDir.empty())
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
             cFileSigCache_[cacheKey] = std::move(entry);
@@ -4080,6 +4209,235 @@ private:
                 std::cout << "[verbose]   copied asan runtime DLL: " << asanDllToCopy
                           << " -> " << dest.string() << "\n";
         }
+        return true;
+    }
+
+    // True if a thread-spawn call is reachable from 'main', following direct calls only (a
+    // worklist BFS over the static call graph). Used by --run to reject multi-threaded programs
+    // up front. Indirect/virtual calls are not followed, but the spawn primitive itself
+    // (CreateThread / _beginthreadex) is always invoked by a direct call from the thread
+    // wrapper, so the chain main -> ... -> wrapper -> CreateThread is fully direct and caught.
+    // Reachability (not mere presence) means importing thread.cb without spawning stays allowed.
+    bool ReachesThreadSpawn()
+    {
+        auto isSpawnPrimitive = [](llvm::StringRef name) {
+            return name == "CreateThread" || name == "_beginthreadex" || name == "_beginthread";
+        };
+
+        llvm::Function* mainFn = module->getFunction("main");
+        if (!mainFn) return false;
+
+        llvm::SmallVector<llvm::Function*, 32> worklist{mainFn};
+        llvm::SmallPtrSet<llvm::Function*, 32> visited{mainFn};
+
+        while (!worklist.empty())
+        {
+            llvm::Function* fn = worklist.pop_back_val();
+            for (auto& bb : *fn)
+            {
+                for (auto& inst : bb)
+                {
+                    auto* call = llvm::dyn_cast<llvm::CallBase>(&inst);
+                    if (!call) continue;
+                    llvm::Function* callee = call->getCalledFunction();
+                    if (!callee) continue; // indirect/virtual call - not followed
+                    if (isSpawnPrimitive(callee->getName()))
+                        return true;
+                    if (callee->isDeclaration()) continue; // no body to walk into
+                    if (visited.insert(callee).second)
+                        worklist.push_back(callee);
+                }
+            }
+        }
+        return false;
+    }
+
+    // --run: JIT the in-memory module and execute its 'main' in-process, writing nothing to
+    // disk. The host process (cflat.exe) already links and initialized the dynamic CRT, so
+    // the JIT'd code resolves printf/malloc/kernel32 etc. from the DLLs already loaded into
+    // this process via a process-wide symbol generator - no CRT startup of our own is needed.
+    //
+    // Scope (prototype): single-module, host-target programs whose entry is 'int main()'.
+    // Not yet handled - C interop objects (cObjectFiles_), --c-lib import libs, and programs
+    // whose main takes argv (the 'program' construct / 'int main(move list<string>)'). Those
+    // need object/library injection and an argv marshaller respectively. 'runExitCode' returns
+    // the program's exit status; the function returns false only on a JIT setup failure.
+    bool JitRun(int& runExitCode)
+    {
+        runExitCode = 0;
+
+        // ORC needs the native target + asm printer registered (EmitExecutable registers all
+        // targets for cross-codegen; for in-process JIT only the host target is required).
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+
+        if (!module->getFunction("main"))
+        {
+            LogError("--run: no 'main' function to execute.");
+            return false;
+        }
+
+        // Determine the entry signature now, before the module is handed to the JIT (which
+        // consumes it). Two prototypes are supported: 'int main()' and
+        // 'int main(int argc, char** argv)'. The second form receives the program arguments
+        // passed after '--' on the command line.
+        llvm::FunctionType* mainTy = module->getFunction("main")->getFunctionType();
+        unsigned mainParamCount = mainTy->getNumParams();
+        bool mainTakesArgv = false;
+        if (mainParamCount == 0)
+        {
+            // int main()
+        }
+        else if (mainParamCount == 2 && mainTy->getParamType(0)->isIntegerTy() &&
+                 mainTy->getParamType(1)->isPointerTy())
+        {
+            mainTakesArgv = true; // int main(int argc, char** argv)
+        }
+        else
+        {
+            LogError("--run: 'main' must be 'int main()' or 'int main(int argc, char** argv)' "
+                     "to be executed in-process.");
+            return false;
+        }
+        if (!mainTakesArgv && !runArgs_.empty())
+        {
+            LogError("--run: program arguments were supplied after '--', but 'main' takes no "
+                     "parameters. Declare 'int main(int argc, char** argv)' to receive them.");
+            return false;
+        }
+
+        // Guard: in-process --run is single-threaded only. The 'program' construct and raw
+        // thread<T> both spawn worker threads via Win32 CreateThread, and on a JIT'd module
+        // those workers run an SEH-wrapped trampoline (__C_specific_handler) whose unwind
+        // tables are not registered by the JIT's memory manager - the worker corrupts/crashes
+        // the moment it unwinds. Rather than fault at runtime, detect a reachable spawn at the
+        // source and refuse with a helpful error. Reachability from 'main' means importing
+        // thread.cb without actually spawning stays allowed.
+        if (ReachesThreadSpawn())
+        {
+            LogError(
+                "--run cannot execute a multi-threaded program in-process: this program spawns a "
+                "thread (via the 'program' construct or thread<T>), which the in-process JIT does "
+                "not support - worker threads need Windows SEH unwind tables that the JIT cannot "
+                "register. Compile to an exe instead: cflat <input> -o <output.exe>.");
+            return false;
+        }
+
+        // Build an LLJIT for the host. JITTargetMachineBuilder::detectHost picks up the host
+        // triple, CPU, and features so the JIT'd code matches this machine.
+        auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+        if (!jtmb)
+        {
+            LogError(std::format("--run: could not detect host machine: {}",
+                                 llvm::toString(jtmb.takeError())));
+            return false;
+        }
+
+        auto jitOrErr = llvm::orc::LLJITBuilder()
+                            .setJITTargetMachineBuilder(std::move(*jtmb))
+                            .create();
+        if (!jitOrErr)
+        {
+            LogError(std::format("--run: failed to create JIT: {}",
+                                 llvm::toString(jitOrErr.takeError())));
+            return false;
+        }
+        std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jitOrErr);
+
+        // The module's data layout must match the JIT's. Set both layout and triple to the
+        // JIT's host values before handing the module over.
+        module->setDataLayout(jit->getDataLayout());
+        module->setTargetTriple(jit->getTargetTriple().str());
+
+        // Resolve external symbols (CRT, kernel32, ws2_32, ...) from the symbols already
+        // loaded into this process. GlobalPrefix from the data layout keeps name mangling
+        // consistent with the JIT (no prefix on win64, '_' on win32).
+        auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            jit->getDataLayout().getGlobalPrefix());
+        if (!gen)
+        {
+            LogError(std::format("--run: failed to install process symbol resolver: {}",
+                                 llvm::toString(gen.takeError())));
+            return false;
+        }
+        jit->getMainJITDylib().addGenerator(std::move(*gen));
+
+        // Supply __emutls_get_address (see cflat_jit::CflatEmutlsGetAddress). Emulated TLS is
+        // how the host target lowers thread-locals, and runtime.cb's allocator hooks are
+        // thread-local, so essentially every program needs this helper.
+        {
+            llvm::orc::SymbolMap syms;
+            syms[jit->mangleAndIntern("__emutls_get_address")] = llvm::orc::ExecutorSymbolDef(
+                llvm::orc::ExecutorAddr::fromPtr(&cflat_jit::CflatEmutlsGetAddress),
+                llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+            if (auto err = jit->getMainJITDylib().define(
+                    llvm::orc::absoluteSymbols(std::move(syms))))
+            {
+                LogError(std::format("--run: failed to define __emutls_get_address: {}",
+                                     llvm::toString(std::move(err))));
+                return false;
+            }
+        }
+
+        // Hand the module (and its context) to the JIT. After this the backend's module is
+        // consumed - fine, since --run executes and the process exits.
+        llvm::orc::ThreadSafeContext tsc(std::move(context));
+        if (auto err = jit->addIRModule(
+                llvm::orc::ThreadSafeModule(std::move(module), std::move(tsc))))
+        {
+            LogError(std::format("--run: failed to add module to JIT: {}",
+                                 llvm::toString(std::move(err))));
+            return false;
+        }
+
+        // Run static initializers (llvm.global_ctors / .CRT$XCU) before main.
+        if (auto err = jit->initialize(jit->getMainJITDylib()))
+        {
+            LogError(std::format("--run: static initializer execution failed: {}",
+                                 llvm::toString(std::move(err))));
+            return false;
+        }
+
+        auto mainSym = jit->lookup("main");
+        if (!mainSym)
+        {
+            LogError(std::format("--run: could not find 'main': {}",
+                                 llvm::toString(mainSym.takeError())));
+            return false;
+        }
+
+        // Dispatch on the entry signature detected above.
+        if (mainTakesArgv)
+        {
+            // Build a C-style argv: argv[0] is the program (source file) name, argv[1..] are the
+            // user's program arguments, and argv[argc] is NULL per the C convention. The backing
+            // std::strings outlive the call; std::string::data() is NUL-terminated (C++11+), so
+            // each element is a valid C string.
+            std::vector<std::string> argvStorage;
+            argvStorage.reserve(runArgs_.size() + 1);
+            argvStorage.push_back(sourceFileName.empty() ? std::string("program") : sourceFileName);
+            for (const auto& a : runArgs_)
+                argvStorage.push_back(a);
+
+            std::vector<char*> argv;
+            argv.reserve(argvStorage.size() + 1);
+            for (auto& s : argvStorage)
+                argv.push_back(s.data());
+            argv.push_back(nullptr);
+
+            auto mainPtr = mainSym->toPtr<int (*)(int, char**)>();
+            runExitCode = mainPtr(static_cast<int>(argvStorage.size()), argv.data());
+        }
+        else
+        {
+            auto mainPtr = mainSym->toPtr<int (*)()>();
+            runExitCode = mainPtr();
+        }
+
+        // Run static destructors (atexit-style) registered via the JIT.
+        if (auto err = jit->deinitialize(jit->getMainJITDylib()))
+            llvm::consumeError(std::move(err)); // best-effort; program already ran
+
         return true;
     }
 
@@ -9635,6 +9993,9 @@ public:
     bool IsVerbose() const { return verbose; }
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
     void SetAsan(bool v) { asan_ = v; }
+    void SetRunMode(bool v) { runMode_ = v; }
+    void SetRunArgs(std::vector<std::string> a) { runArgs_ = std::move(a); }
+    int  GetJitExitCode() const { return jitExitCode_; }
     void SetBatchMode(bool v) { batchMode_ = v; }
     void SetNoCache(bool v) { noCache_ = v; }
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
@@ -10233,7 +10594,9 @@ public:
 
         bool ok = CompileCHeader(headerCanon.string(), {});
 
-        if (ok && !diskHit && haveHash && !mtEc)
+        // --run is read-only: skip persisting the vcpkg header cache to disk under run mode
+        // (the in-memory cache entry from CompileCHeader still serves this compile).
+        if (ok && !diskHit && !runMode_ && haveHash && !mtEc)
         {
             CFileSigCacheEntry entryToWrite;
             bool haveEntry = false;

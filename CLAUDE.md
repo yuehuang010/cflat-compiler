@@ -65,6 +65,18 @@ x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll
 
 The compiler automatically locates `runtime.cb` next to the executable. The CFlat source uses the `.cb` extension.
 
+### In-process execution (`--run`)
+
+```bash
+# JIT-compile and run in-process - no exe on disk; exit code is the program's
+x64/Debug/cflat.exe input.cb --run
+
+# Pass arguments to the program (everything after `--` becomes argv[1..])
+x64/Debug/cflat.exe input.cb --run -- arg1 arg2
+```
+
+Entry must be `int main()` or `int main(int argc, char** argv)`. Read-only: cannot be combined with `-o`, `-l/--out-lli`, or `-b/--bitcode`, and single-threaded only (programs that spawn a `thread<T>` or use the `program` construct are rejected - compile to an exe instead). See [`doc/CLI.md`](doc/CLI.md) for the full command-line reference.
+
 ### Compiler cache (`--init`)
 
 Run once after installing or updating cflat to populate `%USERPROFILE%\.cflat\`:

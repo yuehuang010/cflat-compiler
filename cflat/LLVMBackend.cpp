@@ -34,6 +34,53 @@
 #include <cctype>
 #include <map>
 
+// Win32 unwind registration for the --run JIT (see cflat_jit::SehRegistrationPlugin). Declared
+// here, not in LLVMBackend.h, so this stays in a TU that never includes <winnt.h> - otherwise
+// the extern "C" decl would clash with the real prototype in TUs that pull in windows.h. x64
+// has a single calling convention, so the bare signature links to kernel32's export directly.
+extern "C" unsigned char RtlAddFunctionTable(
+    void* FunctionTable, unsigned long EntryCount, unsigned long long BaseAddress);
+
+llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
+{
+    auto* pdata = G.findSectionByName(".pdata");
+    if (!pdata)
+        return llvm::Error::success(); // no unwind entries (e.g. all-leaf code)
+
+    // Recover JITLink's image base from the first readable ADDR32NB relocation: a stored RVA
+    // equals (target - imageBase), so imageBase = target - storedRVA.
+    std::optional<uint64_t> imageBase;
+    for (auto* B : pdata->blocks())
+    {
+        for (auto& E : B->edges())
+        {
+            size_t off = E.getOffset();
+            if (off + 4 > (size_t)B->getSize()) continue;
+            uint32_t storedRVA = 0;
+            std::memcpy(&storedRVA, B->getContent().data() + off, 4);
+            uint64_t target = E.getTarget().getAddress().getValue() + (uint64_t)E.getAddend();
+            imageBase = target - storedRVA;
+            break;
+        }
+        if (imageBase) break;
+    }
+    if (!imageBase)
+        return llvm::Error::success(); // no relocations to anchor the base
+
+    constexpr size_t kRuntimeFunctionSize = 12; // 3 x 4-byte RVA fields
+    for (auto* B : pdata->blocks())
+    {
+        size_t count = (size_t)B->getSize() / kRuntimeFunctionSize;
+        if (count == 0) continue;
+        void* funcs = B->getAddress().toPtr<void*>();
+        if (!RtlAddFunctionTable(funcs, (unsigned long)count, *imageBase))
+            return llvm::make_error<llvm::StringError>(
+                "RtlAddFunctionTable failed registering JIT'd .pdata unwind info",
+                llvm::inconvertibleErrorCode());
+    }
+    return llvm::Error::success();
+}
+
 // Return the dequoted path from an inline `lib "..."` clause on an import declaration,
 // or "" if there is none. Used to wire `import package "x.h" lib "y.lib";` into the link.
 static std::string DequoteLibClause(CFlatParser::ImportDeclarationContext* imp)
@@ -319,8 +366,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // LoadCoreBitcodeIfFresh replaces context/module/builder with a fresh LLVM
     // context loaded from the bitcode file.  This avoids named-type conflicts with
     // the %string type pre-created by RegisterBuiltinString in Init().
+    // --run is read-only (see the run-mode note below): it touches no on-disk caches, so the
+    // import/core-bitcode cache is disabled here just like an explicit --no-cache.
     bool bitcodeLoaded = false;
-    if (!batchMode_ && !noCache_ && !runtimeDir.empty() && !skipRuntimeImport)
+    if (!batchMode_ && !noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport)
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (!bcCacheDir.empty())
@@ -663,6 +712,23 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (!CompileCFile(cPath))
                 return false;
         }
+    }
+
+    // --run: JIT and execute in-process, emitting nothing to disk. Mutually exclusive with
+    // -o (checked in main). Consumes the module, so it must come after IR/bitcode writes.
+    //
+    // NOTE: --run is read-only - it writes nothing to disk. No exe is produced; the disk-writing
+    // output flags (-o, -l/--out-lli, -b/--bitcode) are rejected up front in main(); and the
+    // on-disk caches (core/import bitcode, C-header import cache) are disabled under run mode
+    // (see the gates in Compile() above and in CompileCHeader / CompileVcpkgImport). The
+    // IR/bitcode write blocks above are therefore no-ops in run mode (their paths are empty).
+    if (runMode_)
+    {
+        llvm::TimeTraceScope runScope("JitRun", filename);
+        if (verbose) std::cout << "[verbose] JIT-executing in-process\n";
+        if (!JitRun(jitExitCode_))
+            return false;
+        return true;
     }
 
     if (exePath)
