@@ -16,9 +16,13 @@ import "view.cb";
 //         vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + a * xv[i]; }
 //     }
 //
-// Indexing through get/set/operator[] is convenient but does NOT carry the contract across two
-// spans: those bodies all reach the buffer through the same `this`, so the optimizer cannot prove
-// two spans disjoint. The local-`T[]` form above is the one that vectorizes without a check.
+// operator[] (`y[i]`) DOES carry the contract: the compiler lowers a span subscript to the `_ptr`
+// field access `y._ptr[i]`, keying the alias scope to the receiver, so two distinct spans vectorize
+// without a runtime check - the same result as the local-`T[]` form above. get()/set() do NOT carry
+// it: those method bodies reach the buffer through `this`, collapsing provenance, so the optimizer
+// cannot prove two spans disjoint. Using get()/set() inside a `vectorize` loop is a COMPILE ERROR
+// (the loop keeps a runtime alias check, which `vectorize` forbids) - bind the local-`T[]` form, or
+// use `y[i]`, instead. Outside `vectorize` they are merely slower (the runtime check stays).
 //
 // Non-owning: a span never frees _ptr. The buffer's owner (an array<T>, a `new T[n]`, ...) must
 // outlive every span over it. Obtaining a span from a raw `T*` is a compile error at `wrap` (the

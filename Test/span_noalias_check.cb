@@ -81,11 +81,12 @@ extern int main(int argc, char** argv)
     int len = ir.length();
 
     int ok = 1;
-    if (checkFunction(p, len, "@_span_axpy") == 0)  { ok = 0; }
-    if (checkFunction(p, len, "@_chunk_axpy") == 0) { ok = 0; }
+    if (checkFunction(p, len, "@_span_axpy") == 0)     { ok = 0; }
+    if (checkFunction(p, len, "@_span_idx_axpy") == 0) { ok = 0; }
+    if (checkFunction(p, len, "@_chunk_axpy") == 0)    { ok = 0; }
 
     if (ok == 1) {
-        printf("  OK: span_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");
+        printf("  OK: span_axpy, span_idx_axpy and chunk_axpy vectorized, alias-scoped, no memcheck\n");
         return 0;
     }
     return 1;

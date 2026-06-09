@@ -56,11 +56,17 @@ Semantics:
 - **Hard error on failure.** If the optimizer cannot vectorize a marked loop, the
   compile fails, e.g. `vectorize loop could not be vectorized: ...`. This catches
   the silent regression where a loop quietly stops vectorizing after an edit.
-- **Runtime alias checks are accepted.** When the compiler cannot prove the loop's
-  pointers are disjoint, the optimizer emits a runtime overlap check guarding the
-  vector path (with a scalar fallback). That still satisfies the contract.
-- A loop fails the contract when it is not vectorizable: no countable trip count
-  (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
+- **A surviving runtime alias check is also a failure.** `vectorize` promises the
+  *clean*, unconditional vector loop. When the compiler cannot prove the loop's
+  pointers disjoint, the optimizer would guard the vector path with a runtime overlap
+  test (loop versioning) plus a scalar fallback - that is rejected with
+  `vectorize loop did not vectorize cleanly: a runtime alias check remained ...`. The
+  fix is to give the optimizer the disjointness it needs: pass the buffers as
+  `span<T>` / `T[]` (noalias). For a span, index it directly (`y[i]`) or bind a local
+  `T[] v = y.data();` - using `y.get(i)` / `y.set(i, v)` inside a `vectorize` loop is a
+  compile error, because those route through the method's `this` and keep the check.
+- A loop also fails the contract when it is not vectorizable at all: no countable trip
+  count (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
   dependence (`a[k] = a[k-1] + 1`), or a non-inlinable call in the body.
 - Integer reductions (`sum += a[k]`) vectorize. Floating-point reductions also
   vectorize: the optimizer reassociates the additions (and reduces the lanes at the

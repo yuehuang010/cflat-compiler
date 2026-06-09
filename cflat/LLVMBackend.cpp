@@ -4,6 +4,7 @@
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
+#include <llvm\IR\Dominators.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
 #include <llvm\Bitcode\BitcodeReader.h>
 #include <llvm\Linker\Linker.h>
@@ -28,6 +29,7 @@
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
 #include <filesystem>
+#include <optional>
 #include <algorithm>
 #include <cctype>
 #include <map>
@@ -1268,6 +1270,26 @@ std::string ComposeVectorizeFailure(const LLVMBackend::VectorizeLoopInfo* info,
            "(needs a countable trip count, no carried dependence, and only inlinable calls)";
 }
 
+// The loop DID vectorize but LLVM had to guard the vector path with a runtime overlap test
+// (vector.memcheck) because it could not prove the pointers disjoint. `vectorize` promises a
+// clean unconditional vector loop, so this is a failure. When a span accessor is the cause,
+// point at it and prescribe the local-`T[]` fix; otherwise give the general disjointness advice.
+std::string ComposeMemcheckFailure(const LLVMBackend::VectorizeLoopInfo* info, int& outLine, int& outCol)
+{
+    if (info && info->hasSpanAccessor)
+    {
+        outLine = info->spanLine; outCol = info->spanCol;
+        std::string recv = info->spanReceiver.empty() ? std::string("the span") : ("'" + info->spanReceiver + "'");
+        std::string data = info->spanReceiver.empty() ? std::string("s") : info->spanReceiver;
+        std::string acc = info->spanAccessor == "operator[]" ? std::string("operator[]") : (info->spanAccessor + "()");
+        return "a runtime alias check remained because indexing " + recv + " through " + acc +
+               " routes through the method's `this`, so the optimizer cannot prove two spans disjoint; "
+               "bind a local view once - `T[] v = " + data + ".data();` - and index `v`";
+    }
+    return "a runtime alias check remained: LLVM could not prove the pointers disjoint; "
+           "pass the buffers as `span<T>`/`T[]` (noalias) or otherwise establish disjointness";
+}
+
 } // namespace
 
 void LLVMBackend::OptimizeModule(int optimizationLevel)
@@ -1436,6 +1458,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         for (auto& F : *module)
         {
             if (F.isDeclaration()) continue;
+            std::optional<llvm::DominatorTree> domTree;  // built lazily for this function
             for (auto& BB : F)
             {
                 auto* term = BB.getTerminator();
@@ -1445,30 +1468,53 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
 
                 auto* lineEntry = loopEntry(loopID, "cflat.vectorize.line");
                 if (!lineEntry) continue;                              // not a vectorize loop
-                if (loopEntry(loopID, "llvm.loop.isvectorized")) continue;  // vectorized: ok
+
+                // A loop carrying our hint that vectorized gains `llvm.loop.isvectorized`. That is
+                // necessary but not sufficient: if LLVM had to GUARD the vector path with a runtime
+                // overlap test (loop versioning), the loop did not vectorize cleanly. The `vectorize`
+                // contract is the clean, unconditional vector loop (Detection B) - so a surviving
+                // runtime check is a failure even though the loop technically vectorized. Detect the
+                // guard by dominance: the vector body (this latch) is reached only when the memcheck
+                // passes, so a `vector.memcheck` block dominates it; a clean vector loop has none.
+                bool memcheckGuarded = false;
+                if (loopEntry(loopID, "llvm.loop.isvectorized"))
+                {
+                    if (!domTree) domTree.emplace(F);
+                    for (auto* d = domTree->getNode(&BB); d; d = d->getIDom())
+                        if (d->getBlock()->getName().contains("memcheck")) { memcheckGuarded = true; break; }
+                    if (!memcheckGuarded) continue;                    // clean vector loop: contract satisfied
+                }
 
                 int line = 0;
                 if (lineEntry->getNumOperands() >= 2)
                     if (auto* c = llvm::mdconst::dyn_extract_or_null<llvm::ConstantInt>(lineEntry->getOperand(1)))
                         line = static_cast<int>(c->getSExtValue());
 
-                // Match the failed loop to the AST facts gathered at codegen (by
-                // line) and to LLVM's analysis remark (by function), then compose
-                // the most precise, located message.
+                // Match the loop to the AST facts gathered at codegen (by line) and to LLVM's
+                // analysis remark (by function), then compose the most precise, located message.
                 const VectorizeLoopInfo* info = nullptr;
                 for (const auto& vi : vectorizeLoops_)
                     if (vi.line == line) { info = &vi; break; }
 
-                const VectorizeRemark* remark = nullptr;
-                auto r = remarkByFn.find(F.getName().str());
-                if (r != remarkByFn.end()) remark = &r->second;
-
                 int outLine = line, outCol = info ? info->col : 0;
-                std::string reason = ComposeVectorizeFailure(info, remark, outLine, outCol);
+                std::string message;
+                if (memcheckGuarded)
+                {
+                    std::string reason = ComposeMemcheckFailure(info, outLine, outCol);
+                    message = "vectorize loop did not vectorize cleanly: " + reason;
+                }
+                else
+                {
+                    const VectorizeRemark* remark = nullptr;
+                    auto r = remarkByFn.find(F.getName().str());
+                    if (r != remarkByFn.end()) remark = &r->second;
+                    std::string reason = ComposeVectorizeFailure(info, remark, outLine, outCol);
+                    message = "vectorize loop could not be vectorized: " + reason;
+                }
 
                 currentLine = outLine;
                 currentColumn = outCol;
-                LogError("vectorize loop could not be vectorized: " + reason);
+                LogError(message);
                 // LogError does not return for a normal compile (it exits / throws).
             }
         }

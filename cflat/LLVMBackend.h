@@ -192,8 +192,47 @@ public:
         bool hasCall = false;           // a call appears in the loop body
         std::string callName;           // its callee text
         int callLine = 0, callCol = 0;  // the call site
+        // A span<T> accessor (get/set/operator[]) used in the body that routes through the
+        // method's `this` and so cannot carry the noalias contract - the precise cause when a
+        // vectorized loop still keeps a runtime alias check (the Detection-B failure below).
+        bool hasSpanAccessor = false;
+        std::string spanAccessor;       // "get", "set", or "operator[]"
+        std::string spanReceiver;       // receiver variable name (for the `.data()` hint), if known
+        int spanLine = 0, spanCol = 0;  // the accessor site
     };
     void AddVectorizeLoopInfo(const VectorizeLoopInfo& info) { vectorizeLoops_.push_back(info); }
+
+    // Field index of a noalias array-view buffer field named `_ptr` (the span<T> convention),
+    // or -1 if `typeName` is not such a wrapper. Used to (a) lower a span subscript to the field
+    // access that carries noalias and (b) recognize a span receiver for the vectorize hint. The
+    // may-alias sibling view<T> has a raw-T* `_ptr` (IsArrayView=false) and so returns -1.
+    int ArrayViewBufferFieldIndex(const std::string& typeName)
+    {
+        if (typeName.empty()) return -1;
+        const auto& ds = GetDataStructure(typeName);
+        for (int i = 0; i < (int)ds.StructFields.size(); ++i)
+            if (ds.StructFields[i].VariableName == "_ptr" && ds.StructFields[i].IsArrayView)
+                return i;
+        return -1;
+    }
+
+    // Record (first-writer-wins) that a span accessor was used inside the vectorize loop whose
+    // keyword is on `loopLine`, so a surviving runtime alias check can name it. No-op if the loop
+    // is unknown or already has an accessor recorded.
+    void NoteVectorizeSpanAccessor(int loopLine, const std::string& accessor,
+                                   const std::string& receiver, int line, int col)
+    {
+        for (auto& vi : vectorizeLoops_)
+            if (vi.line == loopLine && !vi.hasSpanAccessor)
+            {
+                vi.hasSpanAccessor = true;
+                vi.spanAccessor = accessor;
+                vi.spanReceiver = receiver;
+                vi.spanLine = line;
+                vi.spanCol = col;
+                return;
+            }
+    }
 
     struct TypeAndValue
     {

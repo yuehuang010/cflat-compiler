@@ -1,0 +1,32 @@
+// span.get()/set() inside a vectorize loop route the buffer access through the
+// method's `this`, collapsing provenance, so the optimizer cannot prove the two
+// spans disjoint and LLVM keeps a runtime alias check (vector.memcheck). The
+// `vectorize` contract is the CLEAN unconditional vector loop, so a surviving
+// runtime check is a hard error (Detection B), pointing at the accessor and
+// prescribing the local-`T[]` fix (Detection A). The spans are built from heap
+// buffers (opaque) so the loop is not constant-folded away.
+import "span.cb";
+import "cruntime.cb";
+
+void getset_axpy(double k, span<double> y, span<double> x)
+{
+    i64 n = y.length();
+    vectorize for (i64 i = 0; i < n; i = i + 1) { y.set(i, y.get(i) + k * x.get(i)); }
+}
+
+extern int main()
+{
+    i64 n = 256;
+    double[] a = new double[n];
+    double[] b = new double[n];
+    i64 i = 0;
+    while (i < n) { a[i] = (double)i; b[i] = 2.0; i = i + 1; }
+
+    span<double> y; y.wrap(a, n);
+    span<double> x; x.wrap(b, n);
+    getset_axpy(3.0, y, x);
+
+    int* ap = move a; delete[_] ap;
+    int* bp = move b; delete[_] bp;
+    return 0;
+}

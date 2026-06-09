@@ -1378,6 +1378,10 @@ private:
     // `vectorize` loop re-arms it for itself.
     bool vectorizeActive_ = false;
     int  vectorizeLine_ = 0;
+    // Line of the `vectorize` keyword whose loop body is currently being emitted (0 = none).
+    // Set across the body codegen so span-accessor lowering can attribute a noalias-defeating
+    // accessor to the enclosing vectorize loop (Detection A). Saved/restored to survive nesting.
+    int  currentVectorizeBodyLine_ = 0;
 
     // Recursively resolve a typeParameterEntry to its mangled string,
     // applying activeTypeSubstitutions and handling nested generics like Box<Box<T>>.
@@ -2903,7 +2907,12 @@ public:
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 compiler->InitializeBlock(blockInner, false);
-                ParseStatement(innerStatement);
+                {
+                    int prevBody = currentVectorizeBodyLine_;
+                    if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                    ParseStatement(innerStatement);
+                    currentVectorizeBodyLine_ = prevBody;
+                }
                 compiler->CreateContinueCall();
 
                 // The back-edge to blockCondition is now the terminator of the
@@ -2957,7 +2966,12 @@ public:
 
                     // Inner statement
                     compiler->InitializeBlock(blockInner, false);
-                    ParseStatement(innerStatement);
+                    {
+                        int prevBody = currentVectorizeBodyLine_;
+                        if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
+                        ParseStatement(innerStatement);
+                        currentVectorizeBodyLine_ = prevBody;
+                    }
                     compiler->CreateContinueCall();
 
                     // Increment
@@ -8552,6 +8566,50 @@ public:
                         auto expressCtx = dynamic_cast<CFlatParser::ExpressionContext*>(ruleContext);
                         auto rvalue = ParseExpression(expressCtx);
 
+                        // span<T> noalias fast path: lower `y[i]` to the field subscript `y._ptr[i]`.
+                        // span::operator[] reaches the buffer through `this`, so every span's element
+                        // access collapses to one origin and two distinct spans never prove disjoint at
+                        // -O2 (the documented footgun that forces `T[] yv = y.data()` first). Indexing the
+                        // `_ptr` array-view field directly keys the element's alias scope to the RECEIVER
+                        // (y vs x) via ParentVariableName, exactly as the local-`T[]` form does, restoring
+                        // the contract for the natural `y[i]`. Matched structurally - a struct with an
+                        // IsArrayView field named `_ptr` - so the may-alias sibling view<T> (whose `_ptr`
+                        // is a raw T*, IsArrayView=false) is correctly excluded and keeps method dispatch.
+                        // Requires addressable receiver storage; an rvalue span falls through to the
+                        // operator[] call (no stable origin to key, so no metadata is lost).
+                        if (rvalue && structVar.BaseType && structVar.BaseType->isStructTy())
+                        {
+                            int bufIndex = Compiler(ctx)->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName);
+                            if (bufIndex >= 0 && structVar.Storage != nullptr)
+                            {
+                                // Bind the StructData to a named ref first (lifetime-extends the
+                                // by-value temporary); indexing it inline would dangle through
+                                // vector::operator[] (a call defeats lifetime extension).
+                                const auto& spanDS = Compiler(ctx)->GetDataStructure(structVar.TypeAndValue.TypeName);
+                                const auto& bufField = spanDS.StructFields[bufIndex];
+                                namedVar = {};
+                                namedVar.Storage = Compiler(ctx)->CreateStructGEP(structVar.BaseType, structVar.Storage, (uint32_t)bufIndex);
+                                namedVar.Primary = Compiler(ctx)->CreateLoad(namedVar.Storage);
+                                namedVar.BaseType = namedVar.Primary->getType();
+                                namedVar.TypeAndValue = bufField;
+                                namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
+                                namedVar.FieldName = "_ptr";
+                                // namedVar is now the `_ptr` array-view (Pointer=true): the operator[]
+                                // guard below skips and the IsArrayView subscript branch tags the noalias
+                                // scope from the receiver origin.
+                            }
+                            else if (bufIndex >= 0 && currentVectorizeBodyLine_ != 0)
+                            {
+                                // Span subscript with no addressable receiver (an rvalue span): it falls
+                                // through to the operator[] method call, which can't carry noalias. Record
+                                // it so a surviving runtime alias check names this site (Detection A).
+                                Compiler(ctx)->NoteVectorizeSpanAccessor(currentVectorizeBodyLine_, "operator[]",
+                                    structVar.TypeAndValue.VariableName,
+                                    (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
+                            }
+                        }
+
                         // If the base is a struct value with a user-defined operator[],
                         // dispatch to it (member call with 'this' as first arg).
                         if (rvalue && !namedVar.TypeAndValue.Pointer
@@ -8728,6 +8786,21 @@ public:
                         std::string functionName = primaryIdentifier;
 
                         auto argumentList = ctx->argumentExpressionList();
+
+                        // Detection A: a span<T> get()/set() inside a vectorize loop body routes through
+                        // the method's `this`, collapsing provenance, so it cannot carry the noalias
+                        // contract. Record it (type-aware - the receiver is a noalias array-view wrapper)
+                        // so a surviving runtime alias check (Detection B) can point at it and suggest
+                        // binding a local `T[] = <recv>.data();`. operator[] is lowered to the noalias
+                        // field access for an lvalue span and handled separately for an rvalue.
+                        if (currentVectorizeBodyLine_ != 0 && (functionName == "get" || functionName == "set")
+                            && structVar.BaseType && structVar.BaseType->isStructTy()
+                            && Compiler(ctx)->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName) >= 0)
+                        {
+                            Compiler(ctx)->NoteVectorizeSpanAccessor(currentVectorizeBodyLine_, functionName,
+                                structVar.TypeAndValue.VariableName,
+                                (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine());
+                        }
 
                         // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")
                         // Returns the annotation's argument value as a string constant, or "" if absent.

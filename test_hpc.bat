@@ -43,6 +43,8 @@ echo === NEGATIVES: each must FAIL at -O2 with a specific, located reason ===
 call :expect_fail "Test\vectorize\neg_call.cb"             "calls 'printf'"
 call :expect_fail "Test\vectorize\neg_while_noncountable.cb" "no countable trip count"
 call :expect_fail "Test\vectorize\neg_carried_dep.cb"      "loop-carried dependence"
+REM Detection B: a span get/set keeps a runtime alias check -> "did not vectorize cleanly".
+call :expect_fail_msg "Test\vectorize\neg_span_getset.cb" "did not vectorize cleanly" "set() routes through the method"
 
 echo.
 echo === SPAN NOALIAS: by-value span axpy must vectorize with NO runtime alias check ===
@@ -106,6 +108,35 @@ if not errorlevel 1 (
 findstr /C:"could not be vectorized" "%LOG%" >nul
 if errorlevel 1 (
     echo   FAILED: %SRC% was rejected but without the expected vectorize diagnostic
+    set /a FAIL+=1
+    exit /b 0
+)
+findstr /C:"%WANT%" "%LOG%" >nul
+if errorlevel 1 (
+    echo   FAILED: %SRC% rejected but reason did not mention "%WANT%"
+    set /a FAIL+=1
+    exit /b 0
+)
+echo   OK: %SRC% rejected with the expected reason ^("%WANT%"^)
+exit /b 0
+
+REM Like :expect_fail but for diagnostics with a different prefix: checks the
+REM compile failed and that BOTH a marker phrase (%2) and a reason phrase (%3)
+REM appear. Used by the Detection-B memcheck case ("did not vectorize cleanly").
+:expect_fail_msg
+set SRC=%~1
+set MARK=%~2
+set WANT=%~3
+set LOG=out\vec_neg.log
+"%COMPILER%" "%SRC%" -i Test\library -o out\vec_neg.exe -O2 > "%LOG%" 2>&1
+if not errorlevel 1 (
+    echo   FAILED: %SRC% compiled at -O2 but should have been rejected
+    set /a FAIL+=1
+    exit /b 0
+)
+findstr /C:"%MARK%" "%LOG%" >nul
+if errorlevel 1 (
+    echo   FAILED: %SRC% rejected but without the expected marker "%MARK%"
     set /a FAIL+=1
     exit /b 0
 )
