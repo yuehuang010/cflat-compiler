@@ -43,6 +43,37 @@ import "threadpool.cb";
 //   double dot = parallel_reduce<double>(n, 0, 0.0, partial, addDouble);
 
 // ----------------------------------------------------------------------------
+// Hot-loop footgun guard.
+//
+// The RAW-THREAD entry points (parallel_for_n / parallel_reduce) spawn and join
+// `workers` OS threads on EVERY call. That is the right trade for an occasional
+// region, but catastrophic in a hot loop: calling them once per solver timestep
+// turns into tens of thousands of thread creations and can cost ~7x versus the
+// *_pool variants over a resident, pinned ThreadPool. The two APIs look
+// interchangeable at the call site and the raw one has the shorter name, so the
+// mistake is easy to make and silent. We count raw calls and, once the count
+// crosses a threshold that only a per-iteration call pattern reaches, print a
+// single advisory to stderr steering the user to the pool variants.
+//
+// The counter is a plain global; raw helpers are typically driven from one loop,
+// so a benign race only means the notice prints slightly late or twice - never a
+// correctness issue. Threshold chosen so a handful of legitimate one-off regions
+// never trip it.
+int  __pfor_raw_call_count = 0;
+bool __pfor_raw_warned     = false;
+
+void __pfor_raw_hotloop_check() {
+    __pfor_raw_call_count = __pfor_raw_call_count + 1;
+    if (__pfor_raw_warned) { return; }
+    if (__pfor_raw_call_count < 64) { return; }
+    __pfor_raw_warned = true;
+    char* msg = "[cflat/hpc] note: parallel_for_n / parallel_reduce (raw threads) have been called 64+ times; each call spawns and joins worker threads. In a hot loop use parallel_for_n_pool / parallel_reduce_pool with a resident pinned ThreadPool (pool.init(cores, cpu_mask_lowest(cores))) - see doc/HPC.md.\n";
+    void* hErr = GetStdHandle(-12);                 // STD_ERROR_HANDLE
+    int written = 0;
+    WriteFile(hErr, msg, (i32)strlen(msg), &written, nullptr);
+}
+
+// ----------------------------------------------------------------------------
 // parallel_for_n - run body([lo,hi)) once per worker over a partition of [0,n).
 // ----------------------------------------------------------------------------
 
@@ -84,6 +115,7 @@ int __pfor_pool_tramp(move void* raw, stop_token tok) {
 // it false when the region oversubscribes or shares cores with other work.
 void parallel_for_n(i64 n, int workers, function<void(i64, i64)> body, bool pin = false) {
     if (n <= 0) { return; }
+    __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
     if ((i64)workers > n) { workers = (int)n; }
 
@@ -197,6 +229,7 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
                      function<T(i64, i64)> partial,
                      function<T(T, T)> combine, bool pin = false) {
     if (n <= 0) { return identity; }
+    __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
     if ((i64)workers > n) { workers = (int)n; }
 

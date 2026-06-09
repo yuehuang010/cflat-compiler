@@ -114,8 +114,10 @@ simd<i32, 4> q = p * p;        // 25 per lane
 - **Vector math**: `simd<T,N>.sqrt`, `.abs`, `.min`, `.max`, `.clamp`, `.sign`, `.fma`, ... are
   static methods that apply an elementwise math op to whole vectors, each lowering to a true
   SIMD instruction (see below). FP element types only.
+- **Comparisons** (`== != < <= > >=`) yield a `simd<bool,N>` mask for use with `.select` -
+  see [Comparisons and `select`](#comparisons-and-select---branchless-masking) below.
 - It is a **primitive value**, not a struct or array - no ownership, destructor, or `move`
-  interaction. (Comparisons, lane writes, and shuffles are not yet supported.)
+  interaction. (Lane writes and shuffles are not yet supported.)
 
 ### `simd<T,N>.load` / `simd<T,N>.store` - the memory bridge
 
@@ -202,6 +204,59 @@ simd<double,4> acc = simd<double,4>.fma(inv, dx, acc);       // acc = inv*dx + a
   rather than ship a "SIMD" call that secretly runs one lane at a time. For those, keep the
   loop on `vectorize` (the auto-vectorizer makes the same call explicitly) or write a scalar
   loop.
+
+### Comparisons and `select` - branchless masking
+
+A numerical kernel is rarely all arithmetic: a stencil reflects at a wall, a clamp picks a
+branch, a solver masks out dead cells. Written as a scalar `if`, that data-dependent branch
+is exactly what stops a loop from vectorizing. `simd<T,N>` closes the gap with a **vector
+comparison** and a **branchless `select`**, so the masked body stays straight-line vector code.
+
+A comparison operator on two `simd<T,N>` values (or a vector and a splatted scalar) yields a
+**`simd<bool,N>` mask** - one `i1` lane per element, lowering to a single `vcmppd`/`pcmpgtd`:
+
+```c
+simd<double,4> u   = simd<double,4>.load(speed, i);
+simd<double,4> lim = 1.0;
+simd<bool,4>   hot = u > lim;          // vector compare -> mask (a simd<bool,N>)
+```
+
+- All six operators are supported: `== != < <= > >=`. Floating-point uses **ordered**
+  predicates (a `NaN` lane compares false); integer relations honour the operands' signedness
+  (`u32` lanes use the unsigned predicate).
+- The mask type is `simd<bool,N>` - the *one* place a `bool` element is allowed (it is not an
+  arithmetic scalar, so you cannot `+ - * /` a mask). Store it in an explicit `simd<bool,N>`
+  local, **or let `auto` deduce it**, or feed the comparison straight into `select`:
+
+  ```c
+  simd<bool,4> hot = u > lim;     // explicit
+  auto         hot = u > lim;     // auto - deduces simd<bool,4>, identical value/behaviour
+  ```
+
+`simd<T,N>.select(mask, a, b)` is the per-lane blend `mask ? a : b`, lowering to a single
+vector select (`vblendvpd`):
+
+```c
+// LBM bounce-back: solid cells reflect to the wall value, fluid cells take the relaxed
+// value. The branchy `solid ? wall : value` becomes one compare + one select - no branch,
+// so the chunked loop is pure vector code and vectorizes at -O2.
+simd<bool,4>   solid  = simd<double,4>.load(mask, i) > half;
+simd<double,4> out    = simd<double,4>.select(solid, wall, relaxed);
+simd<double,4>.store(out, fout, i);
+```
+
+- `mask` must be a `simd<bool,N>` of the **same lane count** as `a`/`b` (typically the result
+  of a comparison); `a` and `b` are `simd<T,N>` of this receiver's shape.
+- Works for **any** element type, not just floating point - blending values is type-agnostic,
+  so an integer `select` is fine.
+- Like `load`/`store`/the math ops, the explicit `<T,N>` makes the call self-describing, so it
+  composes inside larger expressions and works with `auto`.
+
+This is the missing primitive for porting a *branchy* kernel (bounce-back, masked relaxation,
+piecewise functions) to SIMD: hoist the condition into a mask, blend with `select`, and the
+inner loop has no data-dependent branch left to block vectorization. A worked end-to-end
+example (a bounce-back/relax step, with a scalar reference for bit-equality) is in
+[`eval/cfd/simd_bounceback_proof.cb`](../eval/cfd/simd_bounceback_proof.cb).
 
 ## `T[]` array-view (noalias)
 
@@ -382,6 +437,16 @@ Each helper comes in two backends:
 |---------|----------|------|
 | Raw threads | `parallel_for_n`, `parallel_reduce<T>` | Occasional region; zero setup (spawns + joins `workers` threads). |
 | Thread pool | `parallel_for_n_pool`, `parallel_reduce_pool<T>` | Region runs repeatedly (e.g. per solver timestep); reuses a `ThreadPool`'s resident workers. |
+
+> **Pick the pool variant for anything in a loop.** The two backends look interchangeable at
+> the call site, but the raw `parallel_for_n` / `parallel_reduce` **spawn and join `workers` OS
+> threads on every call**. That is fine for a one-off region; inside a hot loop (once per solver
+> timestep, say) the thread churn dominates and can cost **~7x** versus a resident pool. The rule
+> of thumb: *if the region runs more than a handful of times, use `parallel_for_n_pool` /
+> `parallel_reduce_pool` with a `ThreadPool` you `init` once* (pin it at construction -
+> `pool.init(cores, cpu_mask_lowest(cores))` - see [Pinning workers](#pinning-workers-to-cores-pin)).
+> As a safety net, the raw entry points print a one-time advisory to **stderr** once they have
+> been called 64+ times - the call pattern that is almost always the per-iteration mistake.
 
 `workers <= 0` selects a default (`hardware_concurrency()`, or the pool's worker count for the pool
 variants); `workers` is clamped to `n`. The worker body is a **capturing** lambda over its `[lo, hi)`

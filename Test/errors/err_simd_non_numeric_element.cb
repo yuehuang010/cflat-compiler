@@ -1,5 +1,9 @@
-// simd element type must be a numeric scalar (bool / i1 is rejected).
+// simd element must be a numeric scalar (i8..i64, u8..u64, float, double) or `bool` for a
+// mask. A struct element has no SIMD lowering and is rejected. (`bool` is now allowed - it is
+// the simd<bool,N> mask type produced by a vector comparison; see doc/HPC.md.)
+
+struct Foo { int x; };
 
 expect_error("simd element type must be a numeric scalar") {
-    simd<bool, 4> v;
+    simd<Foo, 4> v;
 }

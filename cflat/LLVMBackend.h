@@ -6295,9 +6295,12 @@ public:
         return gv;
     }
 
-    // Element-wise arithmetic on simd<T,N> values. Either operand may be a scalar, which is
-    // splatted across all lanes (with element-type conversion). Both vector operands must share
-    // the same lane count and element type. v1 supports + - * / only; comparisons are deferred.
+    // Element-wise arithmetic and comparison on simd<T,N> values. Either operand may be a scalar,
+    // which is splatted across all lanes (with element-type conversion). Both vector operands must
+    // share the same lane count and element type. Arithmetic (+ - * /) yields a same-shape vector;
+    // a comparison (== != < <= > >=) yields a `<N x i1>` mask (a simd<bool,N>) for use with
+    // simd<T,N>.select - the branchless primitive that lets a masked kernel (e.g. LBM bounce-back)
+    // stay straight-line and vectorize.
     llvm::Value* CreateVectorOperation(Operation op, llvm::Value* left, llvm::Value* right, bool isUnsigned = false)
     {
         auto* lvt = llvm::dyn_cast<llvm::FixedVectorType>(left->getType());
@@ -6330,8 +6333,26 @@ public:
         case Operation::Divide:   case Operation::DivideAssignment:
             return isFloat ? builder->CreateFDiv(left, right)
                  : isUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+        // Comparisons -> <N x i1> mask. FP uses ordered predicates (a NaN lane compares false);
+        // integers honour the operands' signedness for the relational ops.
+        case Operation::Equal:
+            return isFloat ? builder->CreateFCmpOEQ(left, right) : builder->CreateICmpEQ(left, right);
+        case Operation::NotEqual:
+            return isFloat ? builder->CreateFCmpONE(left, right) : builder->CreateICmpNE(left, right);
+        case Operation::Greater:
+            return isFloat ? builder->CreateFCmpOGT(left, right)
+                 : isUnsigned ? builder->CreateICmpUGT(left, right) : builder->CreateICmpSGT(left, right);
+        case Operation::GreaterEqual:
+            return isFloat ? builder->CreateFCmpOGE(left, right)
+                 : isUnsigned ? builder->CreateICmpUGE(left, right) : builder->CreateICmpSGE(left, right);
+        case Operation::Less:
+            return isFloat ? builder->CreateFCmpOLT(left, right)
+                 : isUnsigned ? builder->CreateICmpULT(left, right) : builder->CreateICmpSLT(left, right);
+        case Operation::LessEqual:
+            return isFloat ? builder->CreateFCmpOLE(left, right)
+                 : isUnsigned ? builder->CreateICmpULE(left, right) : builder->CreateICmpSLE(left, right);
         default:
-            LogError("simd supports only + - * / operators (comparisons and other operators are not yet supported)");
+            LogError("simd supports + - * / and comparisons == != < <= > >= (other operators are not yet supported)");
             return left;
         }
     }
@@ -7415,11 +7436,15 @@ public:
             if (typeAndValue.SimdLanes == 0)
                 return type;  // malformed lane count already reported; avoid a 0-width vector
             bool numeric = type->isFloatTy() || type->isDoubleTy()
-                || (type->isIntegerTy() && !type->isIntegerTy(1));  // reject bool (i1), void, struct
-            if (!numeric)
+                || (type->isIntegerTy() && !type->isIntegerTy(1));
+            // simd<bool,N> (i1 lanes) is the mask type: the result of a vector comparison and the
+            // first argument of simd<T,N>.select. It is a valid simd element even though it is not
+            // an arithmetic scalar (you cannot + - * / a mask, but you can store and select with it).
+            bool isMask = type->isIntegerTy(1);
+            if (!numeric && !isMask)
             {
                 LogError(std::format("simd element type must be a numeric scalar "
-                    "(i8..i64, u8..u64, float, double), got '{}'", resolvedTypeName));
+                    "(i8..i64, u8..u64, float, double) or bool for a mask, got '{}'", resolvedTypeName));
                 return type;
             }
             type = llvm::FixedVectorType::get(type, static_cast<unsigned>(typeAndValue.SimdLanes));

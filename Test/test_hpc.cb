@@ -451,6 +451,105 @@ int testSimdMath()
     return passed;
 }
 
+// simd<T,N> comparisons -> simd<bool,N> mask, and simd<T,N>.select(mask, a, b) branchless
+// blend. A comparison lowers to a vector compare (<N x i1>); select lowers to a single
+// vector select (vblendvps). Together they let a masked kernel - e.g. an LBM bounce-back
+// `solid ? wall : value` - stay straight-line and vectorize. See doc/HPC.md.
+int testSimdCompareSelect()
+{
+    int passed = 0;
+
+    // Load from memory so the operands are runtime values (not constant-folded).
+    double[] ad = new double[4];
+    double[] bd = new double[4];
+    ad[0] = 4.0;   ad[1] = 9.0;   ad[2] = 16.0;  ad[3] = 25.0;
+    bd[0] = 100.0; bd[1] = 200.0; bd[2] = 300.0; bd[3] = 400.0;
+    simd<double,4> a = simd<double,4>.load(ad, 0);
+    simd<double,4> b = simd<double,4>.load(bd, 0);
+    simd<double,4> thresh = 10.0;
+    simd<double,4> nine   = 9.0;
+
+    // Greater: a > 10 -> {F,F,T,T}; select(mask, a, b) = mask ? a : b -> {100,200,16,25}
+    simd<bool,4> gt = a > thresh;                       // explicit mask type round-trips
+    simd<double,4> rg = simd<double,4>.select(gt, a, b);
+    passed += Test("simd select gt lane0 (false->b)", (float)rg[0], 100.0f);
+    passed += Test("simd select gt lane2 (true->a)",  (float)rg[2], 16.0f);
+    passed += Test("simd select gt lane3 (true->a)",  (float)rg[3], 25.0f);
+
+    // Less, with the comparison written inline as the select argument (no named mask).
+    simd<double,4> rl = simd<double,4>.select(a < thresh, a, b);   // {4,9,300,400}
+    passed += Test("simd select lt lane1 (true->a)",  (float)rl[1], 9.0f);
+    passed += Test("simd select lt lane2 (false->b)", (float)rl[2], 300.0f);
+
+    // Equal / NotEqual.
+    simd<double,4> req = simd<double,4>.select(a == nine, b, a);   // {4,200,16,25}
+    passed += Test("simd select eq lane1 (true->b)",  (float)req[1], 200.0f);
+    passed += Test("simd select eq lane0 (false->a)", (float)req[0], 4.0f);
+    simd<double,4> rne = simd<double,4>.select(a != nine, b, a);   // {100,9,300,400}
+    passed += Test("simd select ne lane1 (false->a)", (float)rne[1], 9.0f);
+    passed += Test("simd select ne lane3 (true->b)",  (float)rne[3], 400.0f);
+
+    // GreaterEqual / LessEqual boundary (lane1 == 9 == thresh-ish boundary at nine).
+    simd<double,4> rge = simd<double,4>.select(a >= nine, a, b);   // a>=9 -> {F,T,T,T}
+    passed += Test("simd select ge lane0 (false->b)", (float)rge[0], 100.0f);
+    passed += Test("simd select ge lane1 (true->a)",  (float)rge[1], 9.0f);
+    simd<double,4> rle = simd<double,4>.select(a <= nine, a, b);   // a<=9 -> {T,T,F,F}
+    passed += Test("simd select le lane0 (true->a)",  (float)rle[0], 4.0f);
+    passed += Test("simd select le lane2 (false->b)", (float)rle[2], 300.0f);
+
+    // Integer compare + select (signed).
+    i32[] ai = new i32[4];
+    ai[0] = 1; ai[1] = 2; ai[2] = 3; ai[3] = 4;
+    simd<i32,4> ia = simd<i32,4>.load(ai, 0);
+    simd<i32,4> three = 3;
+    simd<i32,4> tens  = 10;
+    simd<i32,4> zeros = 0;
+    simd<i32,4> ri = simd<i32,4>.select(ia >= three, tens, zeros);  // {0,0,10,10}
+    passed += Test("simd select int ge lane1", ri[1], 0);
+    passed += Test("simd select int ge lane2", ri[2], 10);
+
+    // Unsigned compare picks the unsigned predicate (large value > small under unsigned).
+    u32[] au = new u32[4];
+    au[0] = (u32)5; au[1] = (u32)4000000000; au[2] = (u32)7; au[3] = (u32)4000000001;
+    simd<u32,4> ua  = simd<u32,4>.load(au, 0);
+    simd<u32,4> big = (u32)1000000000;
+    simd<u32,4> uOne  = (u32)1;
+    simd<u32,4> uZero = (u32)0;
+    simd<u32,4> ru = simd<u32,4>.select(ua > big, uOne, uZero);     // {0,1,0,1}
+    passed += Test("simd select uns lane0", (int)ru[0], 0);
+    passed += Test("simd select uns lane1", (int)ru[1], 1);
+
+    // The motivating kernel shape: bounce-back blend. Where a cell is "solid" replace the
+    // value with the wall value, else keep it - exactly `solid ? wall : value`, branchless.
+    double[] vald = new double[4];
+    double[] solidd = new double[4];   // 1.0 = solid, 0.0 = fluid
+    vald[0] = 1.1; vald[1] = 2.2; vald[2] = 3.3; vald[3] = 4.4;
+    solidd[0] = 0.0; solidd[1] = 1.0; solidd[2] = 0.0; solidd[3] = 1.0;
+    simd<double,4> value = simd<double,4>.load(vald, 0);
+    simd<double,4> solid = simd<double,4>.load(solidd, 0);
+    simd<double,4> wall  = 0.0;
+    simd<double,4> half  = 0.5;
+    simd<double,4> blended = simd<double,4>.select(solid > half, wall, value);  // {1.1,0,3.3,0}
+    passed += Test("simd bounce-back fluid lane0", (float)blended[0], 1.1f);
+    passed += Test("simd bounce-back solid lane1", (float)blended[1], 0.0f);
+    passed += Test("simd bounce-back fluid lane2", (float)blended[2], 3.3f);
+    passed += Test("simd bounce-back solid lane3", (float)blended[3], 0.0f);
+
+    // `auto` deduces the mask and the blended vector identically to the explicit spelling:
+    // the simd type rides the value, so the named-mask form needs no annotation. (typeof on an
+    // `auto` reports "auto" - that is universal to auto, not simd-specific - but the value,
+    // lane reads, and select behave exactly as the explicit simd<bool,4> / simd<double,4>.)
+    auto am = a > thresh;                                // auto mask (same as `gt` above)
+    auto ar = simd<double,4>.select(am, a, b);           // auto-typed select result
+    passed += Test("simd select auto-mask lane0", (float)ar[0], 100.0f);
+    passed += Test("simd select auto-mask lane2", (float)ar[2], 16.0f);
+    auto ar2 = simd<double,4>.select(a < thresh, a, b);  // auto result + inline comparison
+    passed += Test("simd select auto inline lane1", (float)ar2[1], 9.0f);
+
+    delete[] ad; delete[] bd; delete[] ai; delete[] au; delete[] vald; delete[] solidd;
+    return passed;
+}
+
 // ---------------------------------------------------------------------------
 // span<T> (noalias) and view<T> (may-alias) library types - see doc/HPC.md.
 // span rides the T[] array-view noalias metadata; view is the may-alias sibling.
@@ -585,6 +684,7 @@ extern int main(int argc, char** argv)
     passed += testSimdLoadStoreTypes();    total += 6;
     passed += testSimdLoadStoreStrided();  total += 6;
     passed += testSimdMath();              total += 25;
+    passed += testSimdCompareSelect();     total += 24;
 
     // ---- span<T> / view<T> ----
     passed += testSpanView(); total += 24;

@@ -1,0 +1,11 @@
+// simd<T,N>.select(mask, a, b) requires `mask` to be a simd<bool,N> of the same lane count
+// (the result of a vector comparison). Passing a value vector where the mask belongs is a
+// clean error, not a silent miscompile.
+extern int main()
+{
+    simd<double,4> a = 1.0;
+    simd<double,4> b = 2.0;
+    expect_error("the mask must be a simd<bool,N>") {
+        simd<double,4> r = simd<double,4>.select(a, a, b);   // `a` is not a mask
+    }
+}

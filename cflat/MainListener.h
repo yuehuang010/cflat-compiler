@@ -7896,9 +7896,31 @@ public:
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
         }
+        else if (method == "select")
+        {
+            // select(mask, a, b): per-lane `mask ? a : b`. `mask` is a simd<bool,N> (an <N x i1>,
+            // typically the result of a vector comparison like `u > zero`); `a` and `b` are
+            // simd<T,N> of this receiver's shape. Lowers to a single vector select (vblendvps/
+            // vpblendvb), the branchless primitive that lets a masked stencil (e.g. LBM bounce-back:
+            // `solid ? wall : value`) stay straight-line and vectorize. Works for any element type,
+            // not just FP - swapping values is type-agnostic.
+            if (argNVs.size() != 3)
+                LogErrorContext(ctx, "simd<T,N>.select expects (mask, a, b).");
+            llvm::Value* mask = argValue(0);
+            auto* maskTy = llvm::dyn_cast<llvm::FixedVectorType>(mask->getType());
+            if (!maskTy || !maskTy->getElementType()->isIntegerTy(1)
+                || maskTy->getNumElements() != vecTy->getNumElements())
+                LogErrorContext(ctx, "simd<T,N>.select: the mask must be a simd<bool,N> of the same lane count (produce one with a vector comparison, e.g. `a < b`).");
+            llvm::Value* a = requireSimdArg(ctx, argValue(1), 1, vecTy, method);
+            llvm::Value* b = requireSimdArg(ctx, argValue(2), 2, vecTy, method);
+            result.Primary = compiler->builder->CreateSelect(mask, a, b, "simdselect");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
         else
         {
-            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load', 'store', or a vector math op (sqrt, abs, floor, ceil, trunc, round, rint, min, max, clamp, copysign, sign, fma).", method));
+            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load', 'store', 'select', or a vector math op (sqrt, abs, floor, ceil, trunc, round, rint, min, max, clamp, copysign, sign, fma).", method));
         }
         return result;
     }
