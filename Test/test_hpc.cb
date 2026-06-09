@@ -359,6 +359,98 @@ int testSimdLoadStoreStrided()
     return passed;
 }
 
+// Elementwise vector math intrinsics on simd<T,N>: each is a static method that lowers to
+// a true SIMD instruction (sqrtps, roundps, vfmadd, minps, ...). Build inputs, apply the
+// op, read lanes back. Covers unary (sqrt/abs/floor/ceil/trunc/round/rint), binary
+// (min/max/copysign), and ternary (fma).
+int testSimdMath()
+{
+    int passed = 0;
+
+    double[] a = new double[4];
+    double[] b = new double[4];
+    a[0] = 4.0;  a[1] = 9.0;  a[2] = 16.0; a[3] = 25.0;
+    b[0] = -1.5; b[1] = 2.5;  b[2] = -3.5; b[3] = 4.5;
+    simd<double,4> va = simd<double,4>.load(a, 0);
+    simd<double,4> vb = simd<double,4>.load(b, 0);
+
+    double[] o = new double[4];
+
+    // sqrt: {2,3,4,5}
+    simd<double,4>.store(simd<double,4>.sqrt(va), o, 0);
+    passed += Test("simd sqrt lane0", (float)o[0], 2.0f);
+    passed += Test("simd sqrt lane3", (float)o[3], 5.0f);
+
+    // abs: |b| = {1.5,2.5,3.5,4.5}
+    simd<double,4>.store(simd<double,4>.abs(vb), o, 0);
+    passed += Test("simd abs lane0", (float)o[0], 1.5f);
+    passed += Test("simd abs lane2", (float)o[2], 3.5f);
+
+    // min/max of a and b (elementwise)
+    simd<double,4>.store(simd<double,4>.min(va, vb), o, 0);  // {-1.5,2.5,-3.5,4.5}
+    passed += Test("simd min lane0", (float)o[0], -1.5f);
+    passed += Test("simd min lane3", (float)o[3], 4.5f);
+    simd<double,4>.store(simd<double,4>.max(va, vb), o, 0);  // {4,9,16,25}
+    passed += Test("simd max lane0", (float)o[0], 4.0f);
+
+    // copysign: magnitude of a, sign of b -> {-4,9,-16,25}
+    simd<double,4>.store(simd<double,4>.copysign(va, vb), o, 0);
+    passed += Test("simd copysign lane0", (float)o[0], -4.0f);
+    passed += Test("simd copysign lane1", (float)o[1], 9.0f);
+
+    // fma: a*b + a
+    simd<double,4>.store(simd<double,4>.fma(va, vb, va), o, 0);
+    passed += Test("simd fma lane0", (float)o[0], -2.0f);     // 4*-1.5+4
+    passed += Test("simd fma lane3", (float)o[3], 137.5f);    // 25*4.5+25
+
+    // rounding family on a fractional buffer
+    double[] frac = new double[4];
+    frac[0] = 2.3; frac[1] = -2.3; frac[2] = 2.7; frac[3] = -2.7;
+    simd<double,4> vf = simd<double,4>.load(frac, 0);
+    simd<double,4>.store(simd<double,4>.floor(vf), o, 0);     // {2,-3,2,-3}
+    passed += Test("simd floor lane1", (float)o[1], -3.0f);
+    simd<double,4>.store(simd<double,4>.ceil(vf), o, 0);      // {3,-2,3,-2}
+    passed += Test("simd ceil lane0", (float)o[0], 3.0f);
+    simd<double,4>.store(simd<double,4>.trunc(vf), o, 0);     // {2,-2,2,-2}
+    passed += Test("simd trunc lane3", (float)o[3], -2.0f);
+    simd<double,4>.store(simd<double,4>.round(vf), o, 0);     // {2,-2,3,-3}
+    passed += Test("simd round lane2", (float)o[2], 3.0f);
+
+    // clamp(x, lo, hi) elementwise. lo=5, hi=20 over a={4,9,16,25} -> {5,9,16,20}
+    simd<double,4> lo = 5.0;
+    simd<double,4> hi = 20.0;
+    simd<double,4>.store(simd<double,4>.clamp(va, lo, hi), o, 0);
+    passed += Test("simd clamp lane0 (below lo)", (float)o[0], 5.0f);   // 4 -> 5
+    passed += Test("simd clamp lane1 (in range)", (float)o[1], 9.0f);   // 9 stays
+    passed += Test("simd clamp lane3 (above hi)", (float)o[3], 20.0f);  // 25 -> 20
+
+    // sign(x): b={-1.5,2.5,-3.5,4.5} -> {-1,1,-1,1}; plus a zero lane stays 0
+    simd<double,4>.store(simd<double,4>.sign(vb), o, 0);
+    passed += Test("simd sign neg lane0", (float)o[0], -1.0f);
+    passed += Test("simd sign pos lane1", (float)o[1], 1.0f);
+    double[] z = new double[4];
+    z[0] = 0.0; z[1] = -7.0; z[2] = 0.0; z[3] = 8.0;
+    simd<double,4>.store(simd<double,4>.sign(simd<double,4>.load(z, 0)), o, 0); // {0,-1,0,1}
+    passed += Test("simd sign zero lane0", (float)o[0], 0.0f);
+    passed += Test("simd sign zero lane2", (float)o[2], 0.0f);
+    delete[] z;
+
+    // compose: 1/sqrt(a) reciprocal-sqrt without naming an intermediate vector
+    simd<double,4> one = 1.0;
+    simd<double,4>.store(one / simd<double,4>.sqrt(va), o, 0); // {0.5, 0.333.., 0.25, 0.2}
+    passed += Test("simd rsqrt lane0", (float)o[0], 0.5f);
+    passed += Test("simd rsqrt lane2", (float)o[2], 0.25f);
+
+    // float element type
+    float[] ff = new float[4];
+    ff[0] = 9.0; ff[1] = 16.0; ff[2] = 25.0; ff[3] = 36.0;
+    simd<float,4>.store(simd<float,4>.sqrt(simd<float,4>.load(ff, 0)), ff, 0);  // {3,4,5,6}
+    passed += Test("simd sqrt float lane3", ff[3], 6.0f);
+
+    delete[] a; delete[] b; delete[] o; delete[] frac; delete[] ff;
+    return passed;
+}
+
 // ---------------------------------------------------------------------------
 // span<T> (noalias) and view<T> (may-alias) library types - see doc/HPC.md.
 // span rides the T[] array-view noalias metadata; view is the may-alias sibling.
@@ -484,6 +576,7 @@ extern int main(int argc, char** argv)
     passed += testSimdLoadStore();         total += 9;
     passed += testSimdLoadStoreTypes();    total += 6;
     passed += testSimdLoadStoreStrided();  total += 6;
+    passed += testSimdMath();              total += 25;
 
     // ---- span<T> / view<T> ----
     passed += testSpanView(); total += 21;

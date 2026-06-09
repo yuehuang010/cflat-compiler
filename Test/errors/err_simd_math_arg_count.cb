@@ -1,0 +1,10 @@
+// simd<T,N>.fma is ternary (a*b + c). Passing the wrong number of vector arguments is a
+// clean error naming the expected arity.
+extern int main()
+{
+    double[] a = new double[4];
+    simd<double,4> v = simd<double,4>.load(a, 0);
+    expect_error("expects 3 vector argument(s)") {
+        simd<double,4> r = simd<double,4>.fma(v, v);
+    }
+}

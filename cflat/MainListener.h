@@ -7762,11 +7762,102 @@ public:
             compiler->builder->CreateAlignedStore(vecVal, elemPtr, al);
             // store returns nothing
         }
+        else if (auto* intrin = LookupSimdMathIntrinsic(method))
+        {
+            // Elementwise vector math: lowers to a true SIMD instruction (sqrtps, roundps,
+            // vfmadd, minps, ...). FP-only; every operand must be the same simd<T,N>.
+            if (!elemTy->isFloatingPointTy())
+                LogErrorContext(ctx, std::format("simd<T,N>.{} requires a floating-point element type.", method));
+            if ((int)argNVs.size() != intrin->Arity)
+                LogErrorContext(ctx, std::format("simd<T,N>.{} expects {} vector argument(s).", method, intrin->Arity));
+            std::vector<llvm::Value*> ops;
+            for (int k = 0; k < intrin->Arity; k++)
+                ops.push_back(requireSimdArg(ctx, argValue(k), k, vecTy, method));
+            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), intrin->Id, {vecTy});
+            result.Primary = compiler->builder->CreateCall(fn, ops, "simdmath");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "clamp")
+        {
+            // clamp(x, lo, hi) = minnum(maxnum(x, lo), hi). Two intrinsics, all-vector.
+            if (!elemTy->isFloatingPointTy())
+                LogErrorContext(ctx, "simd<T,N>.clamp requires a floating-point element type.");
+            if (argNVs.size() != 3)
+                LogErrorContext(ctx, "simd<T,N>.clamp expects (value, lo, hi).");
+            llvm::Value* x  = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
+            llvm::Value* lo = requireSimdArg(ctx, argValue(1), 1, vecTy, method);
+            llvm::Value* hi = requireSimdArg(ctx, argValue(2), 2, vecTy, method);
+            auto* maxFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::maxnum, {vecTy});
+            auto* minFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::minnum, {vecTy});
+            llvm::Value* lower = compiler->builder->CreateCall(maxFn, {x, lo}, "simdclamplo");
+            result.Primary = compiler->builder->CreateCall(minFn, {lower, hi}, "simdclamp");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "sign")
+        {
+            // sign(x) = (x == 0) ? 0 : copysign(1, x). One intrinsic + a vector compare/select.
+            // Matches Math.sign for finite values incl. +-0; a NaN lane yields +-1 (copysign of
+            // the NaN's sign bit) rather than 0, since copysign is a pure bit op.
+            if (!elemTy->isFloatingPointTy())
+                LogErrorContext(ctx, "simd<T,N>.sign requires a floating-point element type.");
+            if (argNVs.size() != 1)
+                LogErrorContext(ctx, "simd<T,N>.sign expects (vector).");
+            llvm::Value* x = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
+            auto* one  = llvm::ConstantFP::get(vecTy, 1.0);
+            auto* zero = llvm::ConstantFP::get(vecTy, 0.0);
+            auto* csFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::copysign, {vecTy});
+            llvm::Value* magOne = compiler->builder->CreateCall(csFn, {one, x}, "simdsignmag");
+            llvm::Value* isZero = compiler->builder->CreateFCmpOEQ(x, zero, "simdsigniszero");
+            result.Primary = compiler->builder->CreateSelect(isZero, zero, magOne, "simdsign");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
         else
         {
-            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load' or 'store'.", method));
+            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load', 'store', or a vector math op (sqrt, abs, floor, ceil, trunc, round, rint, min, max, clamp, copysign, sign, fma).", method));
         }
         return result;
+    }
+
+    // Validate that a simd<T,N> static-method argument is itself a `simd<T,N>` of the same
+    // shape (the math ops take no implicit scalar splat). Returns the value for chaining.
+    llvm::Value* requireSimdArg(antlr4::ParserRuleContext* ctx, llvm::Value* v, int k,
+                                llvm::Type* vecTy, const std::string& method)
+    {
+        if (v->getType() != vecTy)
+            LogErrorContext(ctx, std::format("simd<T,N>.{}: argument {} must be a simd<T,N> of the same type.", method, k + 1));
+        return v;
+    }
+
+    // The elementwise vector-math intrinsics callable as static methods on simd<T,N>.
+    // Each maps 1:1 to an LLVM intrinsic that lowers to a real SIMD instruction (no
+    // scalarization, no libm). Arity is the number of vector operands. Transcendentals
+    // (exp/log/sin/...) are deliberately excluded: they have no hardware vector form and
+    // would scalarize to per-lane libm calls. See doc/HPC.md.
+    struct SimdMathIntrinsic { llvm::Intrinsic::ID Id; int Arity; };
+    const SimdMathIntrinsic* LookupSimdMathIntrinsic(const std::string& name)
+    {
+        static const std::unordered_map<std::string, SimdMathIntrinsic> table = {
+            {"sqrt",     {llvm::Intrinsic::sqrt,     1}},
+            {"abs",      {llvm::Intrinsic::fabs,     1}},
+            {"fabs",     {llvm::Intrinsic::fabs,     1}},
+            {"floor",    {llvm::Intrinsic::floor,    1}},
+            {"ceil",     {llvm::Intrinsic::ceil,     1}},
+            {"trunc",    {llvm::Intrinsic::trunc,    1}},
+            {"round",    {llvm::Intrinsic::round,    1}},
+            {"rint",     {llvm::Intrinsic::rint,     1}},
+            {"min",      {llvm::Intrinsic::minnum,   2}},
+            {"max",      {llvm::Intrinsic::maxnum,   2}},
+            {"copysign", {llvm::Intrinsic::copysign, 2}},
+            {"fma",      {llvm::Intrinsic::fma,      3}},
+        };
+        auto it = table.find(name);
+        return it == table.end() ? nullptr : &it->second;
     }
 
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)

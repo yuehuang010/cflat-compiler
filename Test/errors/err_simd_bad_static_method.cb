@@ -1,5 +1,5 @@
-// simd<T,N> exposes exactly two static methods, load and store. Any other member call
-// on the type is a clean error (not a crash, not silent).
+// simd<T,N> exposes load/store plus the vector-math ops (sqrt, abs, min, fma, ...). Any
+// other member call on the type is a clean error (not a crash, not silent).
 extern int main()
 {
     double[] a = new double[4];

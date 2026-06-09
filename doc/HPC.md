@@ -104,6 +104,9 @@ simd<i32, 4> q = p * p;        // 25 per lane
 - **Memory bridge**: `simd<T,N>.load` / `simd<T,N>.store` move a whole vector between a
   `simd<T,N>` and a `T[]`/`T*` buffer (see below). This is the supported way to get real data
   into and out of a vector, since individual lanes are not addressable.
+- **Vector math**: `simd<T,N>.sqrt`, `.abs`, `.min`, `.max`, `.clamp`, `.sign`, `.fma`, ... are
+  static methods that apply an elementwise math op to whole vectors, each lowering to a true
+  SIMD instruction (see below). FP element types only.
 - It is a **primitive value**, not a struct or array - no ownership, destructor, or `move`
   interaction. (Comparisons, lane writes, and shuffles are not yet supported.)
 
@@ -148,6 +151,50 @@ simd<double,4>.store(v, a, i);         // a[i .. i+4] = v's lanes
   }
   // ... handle the tail (n % 4) with scalar code ...
   ```
+
+### Vector math - `simd<T,N>.sqrt`, `.min`, `.fma`, ...
+
+Beyond `+ - * /`, the common floating-point math ops are available as static methods on the
+type. Each maps **1:1 to an LLVM vector intrinsic** that lowers to a real SIMD instruction
+(`sqrtpd`, `roundpd`, `vfmadd...`, `minpd`, ...) - no scalarization, no `libm` call. Like
+`load`/`store`, the explicit `<T,N>` makes them self-describing, so they compose and work with
+`auto`:
+
+```c
+simd<double,4> r2  = simd<double,4>.load(rsq, i);
+simd<double,4> inv = one / simd<double,4>.sqrt(r2);          // reciprocal sqrt, vectorized
+simd<double,4> acc = simd<double,4>.fma(inv, dx, acc);       // acc = inv*dx + acc, one vfmadd
+```
+
+| Method | Arity | Lowers to | Notes |
+|--------|-------|-----------|-------|
+| `sqrt(v)` | 1 | `llvm.sqrt` (`sqrtps`/`sqrtpd`) | |
+| `abs(v)` / `fabs(v)` | 1 | `llvm.fabs` | bitwise, no branch |
+| `floor` / `ceil` / `trunc` / `round` / `rint` `(v)` | 1 | `llvm.floor` etc. (`roundps`) | SSE4.1 round |
+| `min(a, b)` / `max(a, b)` | 2 | `llvm.minnum` / `maxnum` | NaN-ignoring IEEE min/max (`minpd`) |
+| `copysign(mag, sign)` | 2 | `llvm.copysign` | magnitude of `mag`, sign of `sign` |
+| `clamp(x, lo, hi)` | 3 | `maxnum` then `minnum` | `min(max(x,lo),hi)`, elementwise |
+| `sign(x)` | 1 | `copysign` + compare/select | `-1`/`0`/`+1` per lane (`+-0` -> `0`; a NaN lane -> `+-1`) |
+| `fma(a, b, c)` | 3 | `llvm.fma` (`vfmadd`) | `a*b + c`, single rounding - **see the FMA caveat below** |
+
+- **FP element types only.** These are floating-point intrinsics; calling one on an integer
+  `simd` (e.g. `simd<i32,4>.sqrt`) is a compile error.
+- **`fma` needs FMA *hardware* to be fast.** `fma` is a *single-rounded* multiply-add, so it
+  is **not** interchangeable with `a*b + c` (which rounds twice). On a target *without* an FMA
+  unit - and cflat's default build targets generic `x86-64`, which has none - LLVM cannot
+  lower `llvm.fma` to a vector `fmulpd`/`faddpd` pair without changing the result, so it falls
+  back to a **per-lane libm `fma()` call**. That is correct but slow: in the N-body kernel it
+  *halved* throughput (46 -> 19 GFLOP/s) versus plain `acc + dx*s`. Reach for `simd.fma` only
+  when you specifically need the extra precision of single rounding *and* know the target has
+  FMA; for a plain accumulate, write `acc + a*b` and let it vectorize to `fmul`+`fadd`.
+- **Every operand is a `simd<T,N>` of the same shape** - there is no implicit scalar splat
+  here (unlike `+ - * /`). Splat first if you need a constant: `simd<double,4> k = 0.5;`.
+- **Transcendentals are deliberately excluded.** `exp`, `log`, `sin`, `cos`, `pow`, ... have
+  no hardware vector form; without a vector-math runtime (SVML/libmvec, which we do not link)
+  they would scalarize to per-lane `libm` calls - a vector op in name only. They are left out
+  rather than ship a "SIMD" call that secretly runs one lane at a time. For those, keep the
+  loop on `vectorize` (the auto-vectorizer makes the same call explicitly) or write a scalar
+  loop.
 
 ## `T[]` array-view (noalias)
 
