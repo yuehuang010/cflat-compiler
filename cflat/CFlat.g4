@@ -36,6 +36,7 @@ grammar CFlat;
 primaryExpression
     : Constant
     | Identifier DoubleColon genericIdentifier   // global:: scope-escape qualifier ('global' is a contextual soft keyword, checked in the listener)
+    | simdTypeSpecifier                          // static methods on the simd type: simd<T,N>.load(...) / .store(...)
     | genericIdentifier
     | StringLiteral+
     | lambdaExpression

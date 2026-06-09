@@ -4774,6 +4774,21 @@ public:
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // The left side must resolve to an addressable storage location. A null Storage
+            // means the LHS produced a value, not an lvalue - storing through it would
+            // dereference null below (in isDerefStorage's isa<> checks). Reject it with a
+            // diagnostic instead. A simd<T,N> lane subscript (`v[i]`) is the common offender:
+            // it lowers to an extractelement value (lanes are read-only), so call that out.
+            // Bitfield writes are exempt: they legitimately carry null Storage and route
+            // the store through BitfieldStorage in bitfieldAssign below.
+            if (destination == nullptr && namedVar.BitfieldStorage == nullptr)
+            {
+                if (namedVar.Primary && llvm::isa<llvm::ExtractElementInst>(namedVar.Primary))
+                    LogErrorContext(unaryCtx, "simd<T,N> lane write 'v[i] = ...' is not supported; lanes are read-only. Build a new vector value instead.");
+                else
+                    LogErrorContext(unaryCtx, "Left side of assignment is not an addressable lvalue.");
+            }
+
             // For through-pointer dereferences (*p), Storage is a raw loaded ptr (not alloca/gep/global)
             // and BaseType holds the pointee type. All loads/stores through `destination` must use it.
             // UnionFieldType is set for union field access - it overrides the load/store type so that
@@ -7669,6 +7684,91 @@ public:
         return ret;
     }
 
+    // Build a simd<T,N> TypeAndValue from a `simd<T,N>` type-specifier node (element type +
+    // lane count), resolving a generic type parameter for the element if one is active. Mirrors
+    // the simd handling in ParseDeclarationSpecifiers.
+    LLVMBackend::TypeAndValue ParseSimdTypeSpec(CFlatParser::SimdTypeSpecifierContext* sd)
+    {
+        LLVMBackend::TypeAndValue tv;
+        std::string elemType = sd->typeSpecifier()->getText();
+        auto substIt = activeTypeSubstitutions.find(elemType);
+        if (substIt != activeTypeSubstitutions.end())
+            elemType = substIt->second;
+        uint64_t lanes = 0;
+        std::string err;
+        if (!TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err))
+            LogErrorContext(sd, err);
+        tv.TypeName = elemType;
+        tv.IsSimd = true;
+        tv.SimdLanes = lanes;
+        return tv;
+    }
+
+    // Lower `simd<T,N>.load(arr, i)` / `simd<T,N>.store(vec, arr, i)` - the explicit memory bridge
+    // for simd values. `i` is an element index (not bytes); natural element alignment is used so an
+    // arbitrary index into an ordinary buffer is safe (the buffer need not be vector-aligned). The
+    // load returns a `<N x T>`; the store writes a vector's N lanes back. See doc/HPC.md.
+    LLVMBackend::NamedVariable ParseSimdStaticMethod(
+        CFlatParser::PostfixExpressionContext* ctx, CFlatParser::SimdTypeSpecifierContext* simdSpec)
+    {
+        auto* compiler = Compiler(ctx);
+        LLVMBackend::NamedVariable result;
+
+        // Method name is the identifier after the dot; the call args are the one argument list.
+        auto identifiers = ctx->Identifier();
+        auto argLists = ctx->argumentExpressionList();
+        if (identifiers.empty() || argLists.empty())
+        {
+            LogErrorContext(ctx, "simd<T,N> supports the static calls '.load(array, index)' and '.store(vector, array, index)'.");
+            return result;
+        }
+        std::string method = identifiers[0]->getText();
+
+        LLVMBackend::TypeAndValue simdTv = ParseSimdTypeSpec(simdSpec);
+        auto* vecTy = llvm::cast<llvm::FixedVectorType>(compiler->GetType(simdTv));
+        auto* elemTy = vecTy->getElementType();
+        auto* int64Ty = compiler->builder->getInt64Ty();
+        llvm::Align al = compiler->module->getDataLayout().getABITypeAlign(elemTy);
+
+        std::vector<LLVMBackend::NamedVariable> argNVs;
+        for (auto* na : argLists[0]->argumentNamedExpression())
+            argNVs.push_back(ParseAssignmentExpressionNamed(na->assignmentExpression()));
+        auto argValue = [&](size_t i) -> llvm::Value* {
+            return argNVs[i].Primary ? argNVs[i].Primary : LoadNamedVariable(argNVs[i]);
+        };
+
+        if (method == "load")
+        {
+            if (argNVs.size() != 2)
+                LogErrorContext(ctx, "simd<T,N>.load expects (array, index).");
+            llvm::Value* basePtr = argValue(0);
+            llvm::Value* index   = compiler->CreateCast(argValue(1), int64Ty, true);
+            llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
+            result.Primary = compiler->builder->CreateAlignedLoad(vecTy, elemPtr, al, "simdload");
+            result.BaseType = vecTy;
+            result.TypeAndValue = simdTv;
+            result.Storage = nullptr;
+        }
+        else if (method == "store")
+        {
+            if (argNVs.size() != 3)
+                LogErrorContext(ctx, "simd<T,N>.store expects (vector, array, index).");
+            llvm::Value* vecVal = argValue(0);
+            if (vecVal->getType() != vecTy)
+                LogErrorContext(ctx, "simd<T,N>.store: the value's type does not match the simd<T,N> it is stored through.");
+            llvm::Value* basePtr = argValue(1);
+            llvm::Value* index   = compiler->CreateCast(argValue(2), int64Ty, true);
+            llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
+            compiler->builder->CreateAlignedStore(vecVal, elemPtr, al);
+            // store returns nothing
+        }
+        else
+        {
+            LogErrorContext(ctx, std::format("'{}' is not a static method on simd<T,N>; expected 'load' or 'store'.", method));
+        }
+        return result;
+    }
+
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
@@ -7682,6 +7782,14 @@ public:
                 | '--'
             )*
         */
+
+        // Static methods on the simd type: `simd<T,N>.load(arr, i)` and `simd<T,N>.store(vec, arr, i)`.
+        // The type args make these self-describing (T,N come from the spelling, not the LHS), so
+        // they work with `auto` and compose inside larger expressions. Intercept here before the
+        // general member-access walker, since the primary is a *type*, not a value.
+        if (auto* primaryCtx = ctx->primaryExpression())
+            if (auto* simdSpec = primaryCtx->simdTypeSpecifier())
+                return ParseSimdStaticMethod(ctx, simdSpec);
 
         if (auto primaryCtx = ctx->primaryExpression())
         {

@@ -1,0 +1,9 @@
+// simd<T,N>.store takes exactly (vector, array, index).
+extern int main()
+{
+    double[] a = new double[4];
+    simd<double,4> v = 1.0;
+    expect_error("simd<T,N>.store expects (vector, array, index)") {
+        simd<double,4>.store(v, a);
+    }
+}

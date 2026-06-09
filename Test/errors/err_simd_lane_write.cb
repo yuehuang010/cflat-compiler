@@ -1,0 +1,10 @@
+// simd<T,N> lanes are read-only: a lane subscript lowers to an extractelement
+// value, not an addressable lvalue. Writing one used to segfault the compiler
+// (null Storage dereferenced in the assignment path); it must now be a clean error.
+extern int main()
+{
+    simd<float, 4> v = 1.0;
+    expect_error("simd<T,N> lane write 'v[i] = ...' is not supported") {
+        v[1] = 2.0;
+    }
+}

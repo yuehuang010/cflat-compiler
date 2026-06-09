@@ -1,0 +1,10 @@
+// The value passed to simd<T,N>.store must match the simd<T,N> it is stored through.
+// Here a simd<float,4> is stored through simd<double,4> - rejected.
+extern int main()
+{
+    double[] a = new double[4];
+    simd<float,4> v = 1.0;
+    expect_error("does not match the simd<T,N>") {
+        simd<double,4>.store(v, a, 0);
+    }
+}

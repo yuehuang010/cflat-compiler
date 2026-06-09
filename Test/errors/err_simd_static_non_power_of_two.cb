@@ -1,0 +1,9 @@
+// The lane count on a static-method call is validated like any simd<T,N>: must be a
+// power of two. simd<double,3>.load is rejected with the power-of-two hint.
+extern int main()
+{
+    double[] a = new double[4];
+    expect_error("power of 2") {
+        auto v = simd<double,3>.load(a, 0);
+    }
+}

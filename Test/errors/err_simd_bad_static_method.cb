@@ -1,0 +1,9 @@
+// simd<T,N> exposes exactly two static methods, load and store. Any other member call
+// on the type is a clean error (not a crash, not silent).
+extern int main()
+{
+    double[] a = new double[4];
+    expect_error("is not a static method on simd<T,N>") {
+        auto v = simd<double,4>.gather(a, 0);
+    }
+}

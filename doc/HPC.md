@@ -62,9 +62,12 @@ Semantics:
 - A loop fails the contract when it is not vectorizable: no countable trip count
   (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
   dependence (`a[k] = a[k-1] + 1`), or a non-inlinable call in the body.
-- Integer reductions (`sum += a[k]`) vectorize. Floating-point reductions are not
-  supported yet (they would require reassociating the additions, which changes the
-  numeric result) and are reported as a failure.
+- Integer reductions (`sum += a[k]`) vectorize. Floating-point reductions also
+  vectorize: the optimizer reassociates the additions (and reduces the lanes at the
+  end), which reorders the sums and so can change the result in the last few ULPs.
+  Mark a loop `vectorize` only when that reassociation is acceptable. For a parallel
+  FP reduction where you want to control the accumulation explicitly, use
+  `parallel_reduce<T>` instead (see below).
 - Only counted `for` and `while` are allowed; `do`/`while` and `foreach` are rejected
   up front (`foreach` lowers to `count()`/`get()` calls that cannot vectorize).
 
@@ -96,10 +99,55 @@ simd<i32, 4> q = p * p;        // 25 per lane
 - **Construction**: a scalar initializer is *splatted* across all lanes (`simd<float,8> v = 1.0;`).
 - **Operators**: element-wise `+ - * /`. Either operand may be a scalar, which is splatted to
   match (`a * 2.0`, `10.0 - a`); both vector operands must share lane count and element type.
-- **Lane access**: `v[i]` reads lane `i`.
+- **Lane access**: `v[i]` reads lane `i`. Lanes are *read-only* - there is no lane write
+  (`v[i] = x`); build a new vector or use `simd<T,N>.load`/`.store` (below) to move data.
+- **Memory bridge**: `simd<T,N>.load` / `simd<T,N>.store` move a whole vector between a
+  `simd<T,N>` and a `T[]`/`T*` buffer (see below). This is the supported way to get real data
+  into and out of a vector, since individual lanes are not addressable.
 - It is a **primitive value**, not a struct or array - no ownership, destructor, or `move`
-  interaction. (Comparisons, lane writes, shuffles, and load/store against `T[]` are not yet
-  supported.)
+  interaction. (Comparisons, lane writes, and shuffles are not yet supported.)
+
+### `simd<T,N>.load` / `simd<T,N>.store` - the memory bridge
+
+A `simd<T,N>` lives in a register; to fill it from (or spill it to) an array you load/store the
+whole vector at once. `load` and `store` are static methods on the type itself - the `<T,N>` on
+the call makes them self-describing, so they work with `auto` and compose inside larger
+expressions:
+
+```c
+double[] a = new double[1024];
+
+auto v = simd<double,4>.load(a, i);    // v = { a[i], a[i+1], a[i+2], a[i+3] }
+v = v * v;                             // whole-vector arithmetic
+simd<double,4>.store(v, a, i);         // a[i .. i+4] = v's lanes
+```
+
+- `simd<T,N>.load(array, index)` returns a `simd<T,N>` filled from `N` contiguous elements
+  starting at `array[index]`.
+- `simd<T,N>.store(vec, array, index)` writes `vec`'s `N` lanes to `array[index .. index+N]`.
+  `vec` must be a `simd<T,N>` of the same shape as the receiver type.
+- `index` is an **element** offset, not bytes. `array` is any `T[]` or `T*`.
+- Natural **element** alignment is used (the load/store is `align alignof(T)`, not `align N*sizeof(T)`),
+  so an arbitrary index into an ordinary buffer is safe - the buffer need not be vector-aligned.
+- Because the type args are explicit, the calls nest directly - a fused load/op/store needs no
+  named temporary:
+
+  ```c
+  // square a[i .. i+4] in one expression
+  simd<double,4>.store(simd<double,4>.load(a, i) * simd<double,4>.load(a, i), a, i);
+  ```
+
+- A strided kernel walks the buffer in chunks of `N`:
+
+  ```c
+  int i = 0;
+  while (i + 4 <= n) {
+      auto c = simd<double,4>.load(a, i);
+      simd<double,4>.store(c * c, a, i);
+      i = i + 4;
+  }
+  // ... handle the tail (n % 4) with scalar code ...
+  ```
 
 ## `T[]` array-view (noalias)
 
