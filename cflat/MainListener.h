@@ -10481,11 +10481,18 @@ public:
                 if (auto* gi = primary->genericIdentifier())
                 {
                     std::string name = gi->Identifier()->getText();
+                    // NOTE: functionTable / dataStructures are deliberately NOT excluded
+                    // here. A local variable or parameter shadows a same-named function,
+                    // method, or struct, so the enclosing-scope frame search below is the
+                    // authoritative gate: if `name` resolves to a local/arg with storage we
+                    // capture it; otherwise (a real function/type reference) the search
+                    // finds nothing and we capture nothing. Excluding on functionTable here
+                    // dropped captures whose name collided with an in-scope method (e.g. a
+                    // captured `seed` when random.cb defines Random.seed), leaving the body
+                    // to reference the OUTER storage across the closure boundary.
                     if (!seenNames.count(name)
                         && !lambdaParamNames.count(name)
-                        && !compiler->globalNamedVariable.count(name)
-                        && !compiler->functionTable.count(name)
-                        && !compiler->dataStructures.count(name))
+                        && !compiler->globalNamedVariable.count(name))
                     {
                         for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                         {

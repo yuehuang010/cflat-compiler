@@ -2,7 +2,9 @@ import "test_helper.cb";
 import "hpc/parallel.cb";
 
 // Exercises core/hpc/parallel.cb: parallel_for_n (map) and parallel_reduce<T>
-// (reduction), each on both the raw-thread and the ThreadPool backend.
+// (reduction), each on both the raw-thread and the ThreadPool backend. Bodies
+// are CAPTURING lambdas - they reach their buffers/scalars directly, with no
+// context struct and no void* cast.
 
 int g_pass = 0;
 int g_total = 0;
@@ -17,23 +19,6 @@ bool approx(double a, double b) {
     if (d < 0.0) { d = -d; }
     return d < 0.000001;
 }
-
-// ---- contexts -------------------------------------------------------------
-
-struct AxpyCtx {
-    double[] y     = default;
-    double[] x     = default;
-    double   alpha = 0.0;
-};
-
-struct DotCtx {
-    double[] x = default;
-    double[] y = default;
-};
-
-struct SumCtx {
-    i64[] v = default;
-};
 
 // ---- parallel_for_n: axpy y[i] = y[i] + alpha*x[i] ------------------------
 
@@ -58,16 +43,11 @@ void testForN_thread() {
     double[] y = new double[n];
     fillAxpy(x, y, n);
 
-    AxpyCtx c;
-    c.y = y; c.x = x; c.alpha = 3.0;
-    parallel_for_n(n, 4, (i64 lo, i64 hi, void* raw) => {
-        AxpyCtx* k = (AxpyCtx*)raw;
-        double[] yy = k->y;
-        double[] xx = k->x;
-        double a = k->alpha;
+    double alpha = 3.0;
+    parallel_for_n(n, 4, (i64 lo, i64 hi) => {
         i64 i = lo;
-        while (i < hi) { yy[i] = yy[i] + a * xx[i]; i = i + 1; }
-    }, &c);
+        while (i < hi) { y[i] = y[i] + alpha * x[i]; i = i + 1; }   // x, y, alpha captured
+    });
 
     check("parallel_for_n thread axpy", checkAxpy(y, n));
     delete[_] x;
@@ -83,16 +63,11 @@ void testForN_pool() {
     ThreadPool pool;
     pool.init(4);
 
-    AxpyCtx c;
-    c.y = y; c.x = x; c.alpha = 3.0;
-    parallel_for_n_pool(&pool, n, 0, (i64 lo, i64 hi, void* raw) => {
-        AxpyCtx* k = (AxpyCtx*)raw;
-        double[] yy = k->y;
-        double[] xx = k->x;
-        double a = k->alpha;
+    double alpha = 3.0;
+    parallel_for_n_pool(&pool, n, 0, (i64 lo, i64 hi) => {
         i64 i = lo;
-        while (i < hi) { yy[i] = yy[i] + a * xx[i]; i = i + 1; }
-    }, &c);
+        while (i < hi) { y[i] = y[i] + alpha * x[i]; i = i + 1; }
+    });
 
     pool.shutdown();
     check("parallel_for_n pool axpy", checkAxpy(y, n));
@@ -100,32 +75,14 @@ void testForN_pool() {
     delete[_] y;
 }
 
-// ---- reduction kernels (named functions: a value-returning lambda passed
-//      inline as an argument does not pick up its return type, so reductions
-//      use named partial/combine functions - the realistic pattern). ---------
-
-double dotPartial(i64 lo, i64 hi, void* raw) {
-    DotCtx* k = (DotCtx*)raw;
-    double[] xx = k->x;
-    double[] yy = k->y;
-    double s = 0.0;
-    i64 j = lo;
-    while (j < hi) { s = s + xx[j] * yy[j]; j = j + 1; }
-    return s;
-}
+// ---- reduction combine functions (associative, no capture) ----------------
+// The per-chunk `partial` captures its buffers, so it is built as a typed local
+// lambda at each call site (an inline value-returning lambda passed directly as
+// an argument does not pick up its return type). `combine` needs no capture, so
+// it stays a plain named function.
 
 double addDouble(double a, double b) { return a + b; }
-
-i64 sumPartial(i64 lo, i64 hi, void* raw) {
-    SumCtx* k = (SumCtx*)raw;
-    i64[] vv = k->v;
-    i64 s = 0;
-    i64 j = lo;
-    while (j < hi) { s = s + vv[j]; j = j + 1; }
-    return s;
-}
-
-i64 addI64(i64 a, i64 b) { return a + b; }
+i64    addI64(i64 a, i64 b)          { return a + b; }
 
 // ---- parallel_reduce: dot product (double) --------------------------------
 
@@ -136,9 +93,13 @@ void testReduce_thread_dot() {
     i64 i = 0;
     while (i < n) { x[i] = 1.0; y[i] = 2.0; i = i + 1; }   // dot = 2*n
 
-    DotCtx c;
-    c.x = x; c.y = y;
-    double dot = parallel_reduce<double>(n, 4, 0.0, dotPartial, addDouble, &c);
+    function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+        double s = 0.0;
+        i64 j = lo;
+        while (j < hi) { s = s + x[j] * y[j]; j = j + 1; }   // x, y captured
+        return s;
+    };
+    double dot = parallel_reduce<double>(n, 4, 0.0, partial, addDouble);
 
     check("parallel_reduce thread dot", approx(dot, 2.0 * (double)n));
     delete[_] x;
@@ -155,9 +116,13 @@ void testReduce_pool_dot() {
     ThreadPool pool;
     pool.init(4);
 
-    DotCtx c;
-    c.x = x; c.y = y;
-    double dot = parallel_reduce_pool<double>(&pool, n, 0, 0.0, dotPartial, addDouble, &c);
+    function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+        double s = 0.0;
+        i64 j = lo;
+        while (j < hi) { s = s + x[j] * y[j]; j = j + 1; }
+        return s;
+    };
+    double dot = parallel_reduce_pool<double>(&pool, n, 0, 0.0, partial, addDouble);
 
     pool.shutdown();
     check("parallel_reduce pool dot", approx(dot, 2.0 * (double)n));
@@ -173,9 +138,13 @@ void testReduce_thread_sum() {
     i64 i = 0;
     while (i < n) { v[i] = i; i = i + 1; }   // sum 0..n-1 = n*(n-1)/2
 
-    SumCtx c;
-    c.v = v;
-    i64 sum = parallel_reduce<i64>(n, 8, (i64)0, sumPartial, addI64, &c);
+    function<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }   // v captured
+        return s;
+    };
+    i64 sum = parallel_reduce<i64>(n, 8, (i64)0, partial, addI64);
 
     i64 expect = n * (n - 1) / 2;
     check("parallel_reduce thread i64 sum", sum == expect);
@@ -189,9 +158,13 @@ void testReduce_moreWorkersThanN() {
     i64[] v = new i64[n];
     v[0] = 10; v[1] = 20; v[2] = 30;
 
-    SumCtx c;
-    c.v = v;
-    i64 sum = parallel_reduce<i64>(n, 16, (i64)0, sumPartial, addI64, &c);
+    function<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        i64 s = 0;
+        i64 j = lo;
+        while (j < hi) { s = s + v[j]; j = j + 1; }
+        return s;
+    };
+    i64 sum = parallel_reduce<i64>(n, 16, (i64)0, partial, addI64);
 
     check("parallel_reduce workers>n", sum == 60);
     delete[_] v;

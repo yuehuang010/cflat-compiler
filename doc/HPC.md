@@ -377,20 +377,20 @@ Each helper comes in two backends:
 | Thread pool | `parallel_for_n_pool`, `parallel_reduce_pool<T>` | Region runs repeatedly (e.g. per solver timestep); reuses a `ThreadPool`'s resident workers. |
 
 `workers <= 0` selects a default (`hardware_concurrency()`, or the pool's worker count for the pool
-variants); `workers` is clamped to `n`. CFlat lambdas do not capture, so the worker reads its buffers
-and scalars through a borrowed `void* ctx` (a caller-defined context struct) plus its `[lo, hi)` range.
+variants); `workers` is clamped to `n`. The worker body is a **capturing** lambda over its `[lo, hi)`
+range: CFlat lambdas capture enclosing locals by value (primitives, `simd<T,N>`, pointers, and
+`double[]` array-views copy by value; named struct locals capture by reference), so the kernel reaches
+its buffers and scalars directly - no context struct and no `void*` cast. All four helpers join/wait
+before returning, so the captured environment (which lives in the caller's frame) outlives every worker
+that runs it.
 
 ### `parallel_for_n` - parallel map
 
 ```c
-struct AxpyCtx { double[] y; double[] x; double alpha; }
-
-AxpyCtx c;  c.y = y;  c.x = x;  c.alpha = 2.5;
-parallel_for_n(n, 0, (i64 lo, i64 hi, void* raw) => {     // 0 -> hardware_concurrency()
-    AxpyCtx* k = (AxpyCtx*)raw;
-    double[] y = k->y;  double[] x = k->x;  double a = k->alpha;
-    for (i64 i = lo; i < hi; i = i + 1) { y[i] = y[i] + a * x[i]; }
-}, &c);
+double alpha = 2.5;
+parallel_for_n(n, 0, (i64 lo, i64 hi) => {               // 0 -> hardware_concurrency()
+    for (i64 i = lo; i < hi; i = i + 1) { y[i] = y[i] + alpha * x[i]; }   // y, x, alpha captured
+});
 ```
 
 The body is called once per worker (not once per element), so there is no per-element call overhead.
@@ -404,22 +404,19 @@ by `identity`) after all workers finish. Reductions are exactly the kernels that
 their only coarse parallelism - while the per-chunk `partial` loop can still be a `vectorize`/`simd`
 reduction, stacking SIMD under threads.
 
+An inline value-returning lambda passed *directly* as an argument does not pick up its return type, so
+the capturing `partial` is built as a typed local lambda first; `combine` needs no capture and stays a
+plain named function:
+
 ```c
-struct DotCtx { double[] a; double[] b; }
+double addD(double x, double y) { return x + y; }       // combine (associative, no capture)
 
-// A value-returning lambda passed inline as an argument does not pick up its
-// return type, so partial/combine are named functions (also the clearer pattern).
-double dotPartial(i64 lo, i64 hi, void* raw) {
-    DotCtx* k = (DotCtx*)raw;
-    double[] a = k->a;  double[] b = k->b;
+function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
     double s = 0.0;
-    for (i64 i = lo; i < hi; i = i + 1) { s = s + a[i] * b[i]; }
+    for (i64 i = lo; i < hi; i = i + 1) { s = s + a[i] * b[i]; }   // a, b captured
     return s;
-}
-double addD(double x, double y) { return x + y; }
-
-DotCtx c;  c.a = a;  c.b = b;
-double dot = parallel_reduce<double>(n, 4, 0.0, dotPartial, addD, &c);
+};
+double dot = parallel_reduce<double>(n, 4, 0.0, partial, addD);
 ```
 
 `combine` must be associative. Because both SIMD lane-reduction *and* the per-worker split reassociate
@@ -432,7 +429,7 @@ match the `i64` reduction):
 
 ```c
 i64 addI(i64 x, i64 y) { return x + y; }                 // combine
-i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI, &c);
+i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI);
 ```
 
 ### Pinning workers to cores (`pin`)
@@ -443,7 +440,7 @@ removes the OS scheduling jitter that otherwise caps speedup on compute-bound ke
 important knob for steady throughput (see [threading.md](threading.md)):
 
 ```c
-i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI, &c, /*pin=*/true);
+i64 count = parallel_reduce<i64>(n, 0, (i64)0, partial, addI, /*pin=*/true);
 ```
 
 Leave it `false` when the region oversubscribes the machine or shares cores with other work.
@@ -482,13 +479,12 @@ from `lo` inside `partial` - no shared state, no synchronization:
 ```c
 import "random.cb";
 
-struct PiCtx { i64 drawsPerSample; }   // 2 draws (x, y) per sample
+i64 drawsPerSample = 2;                // 2 draws (x, y) per sample
 
-i64 piPartial(i64 lo, i64 hi, void* raw) {
-    PiCtx* k = (PiCtx*)raw;
+function<i64(i64, i64)> piPartial = (i64 lo, i64 hi) => {
     Random rng = default;
-    rng.seed(0x1234567);               // same base seed on every worker...
-    rng.jump(lo * k->drawsPerSample);  // ...then jump to this chunk's window (no overlap)
+    rng.seed(0x1234567);                   // same base seed on every worker...
+    rng.jump(lo * drawsPerSample);         // ...then jump to this chunk's window (no overlap)
     i64 inside = 0;
     for (i64 i = lo; i < hi; i = i + 1) {
         double x = rng.nextDouble();
@@ -496,8 +492,8 @@ i64 piPartial(i64 lo, i64 hi, void* raw) {
         if (x * x + y * y <= 1.0) { inside = inside + 1; }
     }
     return inside;
-}
-// pi ~= 4 * parallel_reduce<i64>(n, 0, (i64)0, piPartial, addI, &ctx, true) / n
+};
+// pi ~= 4 * parallel_reduce<i64>(n, 0, (i64)0, piPartial, addI, true) / n
 ```
 
 ### Pool variants
@@ -508,7 +504,7 @@ across a hot loop:
 ```c
 ThreadPool pool;  pool.init(4);
 for (int step = 0; step < 1000; step++) {
-    double r = parallel_reduce_pool<double>(&pool, n, 0, 0.0, dotPartial, addD, &c);
+    double r = parallel_reduce_pool<double>(&pool, n, 0, 0.0, partial, addD);
     // ... use r ...
 }
 pool.shutdown();

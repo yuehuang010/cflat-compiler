@@ -10,6 +10,12 @@
 // jump() to a non-overlapping window keyed off their chunk start (O(1), exact),
 // so no two workers ever draw the same numbers. Workers are pinned to cores.
 //
+// The per-worker `partial` is a CAPTURING lambda - it reaches `seed` directly off the
+// driver's frame, so there is no context struct and no void* cast. `combine` needs no
+// capture and stays a plain named function. (A value-returning lambda passed *directly*
+// as an argument does not pick up its return type, so each partial is built as a typed
+// local first.)
+//
 // Build:  x64\Release\cflat.exe example\hpc\mc_pi.cb -o out\mc_pi.exe -O2
 // Run:    out\mc_pi.exe
 
@@ -25,61 +31,47 @@ double TRUE_PI()       { return 3.1415926535897932; }
 
 double absd(double a) { if (a < 0.0) { return -a; } return a; }
 
-// ---- contexts -------------------------------------------------------------
+// ---- combine functions (associative, no capture) --------------------------
 
-struct PiCtx  { i64 baseSeed = 0; };
-struct IntCtx { i64 baseSeed = 0; };
-
-// ---- per-worker partials --------------------------------------------------
-// A value-returning lambda passed inline does not pick up its return type
-// (per the docs), so partial/combine are named functions.
-
-i64 piPartial(i64 lo, i64 hi, void* raw) {
-    PiCtx* k = (PiCtx*)raw;
-    Random rng;
-    rng.seed(k->baseSeed);
-    rng.jump(lo * 2);          // 2 draws (x, y) per sample; window is non-overlapping
-    i64 inside = 0;
-    i64 i = lo;
-    while (i < hi) {
-        double x = rng.nextDouble();
-        double y = rng.nextDouble();
-        if (x * x + y * y <= 1.0) { inside = inside + 1; }
-        i = i + 1;
-    }
-    return inside;
-}
-i64 addI64(i64 a, i64 b) { return a + b; }
-
-double intPartial(i64 lo, i64 hi, void* raw) {
-    IntCtx* k = (IntCtx*)raw;
-    Random rng;
-    rng.seed(k->baseSeed);
-    rng.jump(lo);              // 1 draw per sample; window is non-overlapping
-    double s = 0.0;
-    i64 i = lo;
-    while (i < hi) {
-        double x = rng.nextDouble();
-        s = s + Math.exp(x);
-        i = i + 1;
-    }
-    return s;
-}
+i64    addI64(i64 a, i64 b)          { return a + b; }
 double addDouble(double a, double b) { return a + b; }
 
 // ---- drivers --------------------------------------------------------------
 
 double estimatePi(i64 n, int workers, i64 seed) {
-    PiCtx c;
-    c.baseSeed = seed;
-    i64 inside = parallel_reduce<i64>(n, workers, (i64)0, piPartial, addI64, &c, true);
+    function<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+        Random rng;
+        rng.seed(seed);            // base seed captured; same on every worker...
+        rng.jump(lo * 2);          // ...then jump to this chunk's window (no overlap)
+        i64 inside = 0;
+        i64 i = lo;
+        while (i < hi) {
+            double x = rng.nextDouble();
+            double y = rng.nextDouble();
+            if (x * x + y * y <= 1.0) { inside = inside + 1; }
+            i = i + 1;
+        }
+        return inside;
+    };
+    i64 inside = parallel_reduce<i64>(n, workers, (i64)0, partial, addI64, true);
     return 4.0 * (double)inside / (double)n;
 }
 
 double estimateIntegral(i64 n, int workers, i64 seed) {
-    IntCtx c;
-    c.baseSeed = seed;
-    double sum = parallel_reduce<double>(n, workers, 0.0, intPartial, addDouble, &c, true);
+    function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+        Random rng;
+        rng.seed(seed);
+        rng.jump(lo);              // 1 draw per sample; window is non-overlapping
+        double s = 0.0;
+        i64 i = lo;
+        while (i < hi) {
+            double x = rng.nextDouble();
+            s = s + Math.exp(x);
+            i = i + 1;
+        }
+        return s;
+    };
+    double sum = parallel_reduce<double>(n, workers, 0.0, partial, addDouble, true);
     return sum / (double)n;
 }
 

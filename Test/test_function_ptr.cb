@@ -641,6 +641,38 @@ bool testCaptureRegression()
     return result;
 }
 
+// Regression: a captured local whose NAME collides with an in-scope function or
+// method must still be captured - the local shadows the callable. The capture
+// collector used to skip any identifier present in the function table, so a captured
+// local that shared a name with a function/method was dropped, and the body then
+// referenced the OUTER frame's storage across the closure boundary (LLVM verify:
+// "instruction does not dominate all uses"). Surfaced by mc_pi.cb capturing `seed`
+// while random.cb's Random.seed method was in scope.
+bool testCaptureNameCollidesWithFunction()
+{
+    bool result = true;
+
+    // 'doubleIt' is a top-level function in this file; the same-named local must
+    // shadow it and be captured by value.
+    int doubleIt = 21;
+    function<int()> f = () => { return doubleIt + doubleIt; };
+    result &= Test("capture shadows function name", f(), 42);
+
+    // The bug only bit when a struct ctor/method call sat between the capture
+    // unpack and the captured use (Random's ctor in mc_pi). Mirror that: capture a
+    // local across a struct local + method-style write, with the captured name
+    // colliding with a function ('square').
+    int square = 5;
+    Counter acc;
+    acc.value = 0;
+    function<void()> g = () => { acc.value = acc.value + square; };
+    g();
+    g();
+    result &= Test("capture name collision w/ struct local", acc.value, 10);
+
+    return result;
+}
+
 // Regression: capturing a local T arr[N] by reference must store T* in the closure
 // (element pointer), not [N x T]*.  Wrong type caused GEP to stride by N*sizeof(T)
 // instead of sizeof(T), so arr[1], arr[2], etc. read from garbage addresses.
@@ -1028,6 +1060,7 @@ extern int main()
     total++; passed += testCaptureStructRef()          ? 1 : 0;
     total++; passed += testCaptureMultiple()           ? 1 : 0;
     total++; passed += testCaptureRegression()         ? 1 : 0;
+    total++; passed += testCaptureNameCollidesWithFunction() ? 1 : 0;
     total++; passed += testCaptureLocalArray()         ? 1 : 0;
     total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
 

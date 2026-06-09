@@ -1,0 +1,343 @@
+// nbody.cb - O(N^2) gravitational N-body simulator (an HPC evaluation of CFlat).
+//
+// Physics:
+//   - Newtonian gravity with Plummer softening: a_i = G * sum_j m_j * r_ij / (|r_ij|^2 + eps^2)^(3/2)
+//   - Velocity-Verlet (kick-drift-kick) integration: time-reversible and symplectic,
+//     so total energy is conserved to a small bounded drift rather than secularly
+//     growing. We report the relative energy drift |E1-E0|/|E0| as the correctness check.
+//
+// Data layout: STRUCT OF ARRAYS (SoA). Each physical quantity (px,py,pz, vx,vy,vz,
+//   ax,ay,az, mass) is its own `double[]` array-view. The docs (doc/HPC.md) say a
+//   `double[]` is noalias *by spelling* and that distinct views are provably disjoint,
+//   which is exactly what lets the force kernel's inner loop read px[j]/py[j]/pz[j]/mass[j]
+//   at unit stride. Both the force kernel and the integrator maps load/store those buffers
+//   explicitly as simd vectors (the force kernel adds a vector sqrt). An AoS
+//   `struct Body { double x,y,z; ... }`
+//   would interleave the components in memory, defeating both the noalias contract
+//   (one allocation, not N distinct ones) and unit-stride SIMD over a single component.
+//
+// Build:  x64\Release\cflat.exe example\hpc\nbody.cb -o out\nbody.exe -O2
+// Run:    out\nbody.exe
+
+import "hpc/parallel.cb";   // parallel_for_n_pool (across-core, over a resident pool)
+import "threadpool.cb";     // ThreadPool + cpu_mask_lowest (pinned, reused per timestep)
+import "span.cb";           // span<double> + the data()->local-T[] vectorize idiom
+import "math.cb";           // Math.sqrt
+import "time.cb";           // Stopwatch
+import "random.cb";         // Random (deterministic seed -> reproducible)
+import "thread.cb";         // hardware_concurrency()
+
+// ---- simulation parameters -------------------------------------------------
+
+double G()    { return 1.0; }      // gravitational constant (natural units)
+double EPS()  { return 0.05; }     // softening length
+double DT()   { return 0.001; }    // timestep
+
+double absd(double a) { if (a < 0.0) { return -a; } return a; }
+
+// Fan the O(N^2) force evaluation across the pool's resident, pinned workers. Unlike
+// raw parallel_for_n (which spawns and joins `workers` threads on every call), this
+// reuses the workers the pool pinned once at init() - so a per-timestep solver pays
+// thread-create/teardown zero times and keeps affinity. This is finding #3 (pin-vs-
+// pool) in action: thread reuse AND core pinning at the same time.
+//
+// `body` is the CAPTURING force kernel built in main() (it captures the SoA buffers and
+// scalars directly - no context struct, no void* cast). This call WAITS internally, so the
+// captured environment in main()'s frame safely outlives every worker that runs it.
+void computeForces(ThreadPool* pool, i64 n, int workers, function<void(i64, i64)> body) {
+    parallel_for_n_pool(pool, n, workers, body);
+}
+
+// ---- integrator maps (explicit simd<double,W> load/store) ------------------
+// These are the pure elementwise updates of velocity-Verlet: a unit-stride map over two
+// distinct noalias buffers, with no square root, so they are the textbook case for the
+// EXPLICIT simd<T,N> type. We splat the scalar coefficient once, then stride through both
+// buffers W lanes at a time with simd<double,W>.load / .store. This is the *guaranteed*
+// SIMD counterpart to a `vectorize` loop - the vector add/mul exist by construction rather
+// than depending on the optimizer. A scalar tail handles n % W.
+//
+// (Like the force kernel above, these are now fully explicit SIMD; the whole simulator runs
+//  on hand-written simd ops - load/store for the maps, plus vector sqrt + arithmetic in the
+//  kernel.)
+// SIMD width W = 4: simd<double,4> is one 256-bit (AVX) register.
+
+// v += c * a   (the Verlet half-kick, applied to one velocity component)
+void axpyVec(double c, span<double> v, span<double> a) {
+    double[] vv = v.data();
+    double[] av = a.data();
+    i64 n = v.length();
+    simd<double,4> cs = c;                       // splat c across all lanes
+    i64 i = 0;
+    while (i + 4 <= n) {
+        simd<double,4> vvec = simd<double,4>.load(vv, i);
+        simd<double,4> avec = simd<double,4>.load(av, i);
+        simd<double,4>.store(vvec + cs * avec, vv, i);
+        i = i + 4;
+    }
+    while (i < n) { vv[i] = vv[i] + c * av[i]; i = i + 1; }   // scalar tail (n % 4)
+}
+
+// x += c * v   (the Verlet drift) - same shape as the kick.
+void driftVec(double c, span<double> x, span<double> v) {
+    double[] xv = x.data();
+    double[] vv = v.data();
+    i64 n = x.length();
+    simd<double,4> cs = c;
+    i64 i = 0;
+    while (i + 4 <= n) {
+        simd<double,4> xvec = simd<double,4>.load(xv, i);
+        simd<double,4> vvec = simd<double,4>.load(vv, i);
+        simd<double,4>.store(xvec + cs * vvec, xv, i);
+        i = i + 4;
+    }
+    while (i < n) { xv[i] = xv[i] + c * vv[i]; i = i + 1; }   // scalar tail (n % 4)
+}
+
+// ---- energy (correctness check) --------------------------------------------
+// Kinetic + softened potential. O(N^2) but evaluated only twice (start/end), so it
+// is left as a straightforward scalar reduction.
+
+double totalEnergy(double[] px, double[] py, double[] pz,
+                   double[] vx, double[] vy, double[] vz,
+                   double[] mass, int n, double g, double eps2) {
+    double ke = 0.0;
+    int i = 0;
+    while (i < n) {
+        double sp = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i];
+        ke = ke + 0.5 * mass[i] * sp;
+        i = i + 1;
+    }
+    double pe = 0.0;
+    i = 0;
+    while (i < n) {
+        int j = i + 1;
+        while (j < n) {
+            double dx = px[j] - px[i];
+            double dy = py[j] - py[i];
+            double dz = pz[j] - pz[i];
+            double r = Math.sqrt(dx * dx + dy * dy + dz * dz + eps2);
+            pe = pe - g * mass[i] * mass[j] / r;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return ke + pe;
+}
+
+// ---- main ------------------------------------------------------------------
+
+extern int main() {
+    int cores = hardware_concurrency();
+    if (cores <= 0) { cores = 4; }
+
+    int n     = 8192;     // bodies
+    int steps = 10;       // integration steps
+    double dt = DT();
+    double g  = G();
+    double eps2 = EPS() * EPS();
+
+    printf("N-Body gravitational simulator (CFlat / -O2)\n");
+    printf("--------------------------------------------------------\n");
+    printf("bodies = %d   steps = %d   dt = %.4f   softening = %.3f   cores = %d\n",
+           n, steps, dt, EPS(), cores);
+    printf("layout = SoA (10 x double[] noalias array-views)\n\n");
+
+    // SoA buffers: each is a fresh, whole, distinct allocation -> noalias.
+    double[] px = new double[n];  double[] py = new double[n];  double[] pz = new double[n];
+    double[] vx = new double[n];  double[] vy = new double[n];  double[] vz = new double[n];
+    double[] ax = new double[n];  double[] ay = new double[n];  double[] az = new double[n];
+    double[] mass = new double[n];
+
+    // Deterministic random init: bodies in a unit cube about the origin, small
+    // velocities, equal mass (total mass = 1). Reproducible across runs.
+    Random rng;
+    rng.seed(0xC0FFEE);
+    double m = 1.0 / (double)n;
+    int i = 0;
+    while (i < n) {
+        px[i] = rng.nextDouble() * 2.0 - 1.0;
+        py[i] = rng.nextDouble() * 2.0 - 1.0;
+        pz[i] = rng.nextDouble() * 2.0 - 1.0;
+        vx[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.1;
+        vy[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.1;
+        vz[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.1;
+        mass[i] = m;
+        i = i + 1;
+    }
+
+    // Wrap velocity/position components as spans for the vectorized integrator maps.
+    span<double> sPx;  sPx.wrap(px, (i64)n);
+    span<double> sPy;  sPy.wrap(py, (i64)n);
+    span<double> sPz;  sPz.wrap(pz, (i64)n);
+    span<double> sVx;  sVx.wrap(vx, (i64)n);
+    span<double> sVy;  sVy.wrap(vy, (i64)n);
+    span<double> sVz;  sVz.wrap(vz, (i64)n);
+    span<double> sAx;  sAx.wrap(ax, (i64)n);
+    span<double> sAy;  sAy.wrap(ay, (i64)n);
+    span<double> sAz;  sAz.wrap(az, (i64)n);
+
+    // The O(N^2) force kernel as a CAPTURING lambda - it reaches the SoA buffers
+    // (px..mass, ax..az) and scalars (n, g, eps2) directly off main()'s frame, so there
+    // is no ForceCtx struct, no `void*` erase, and no cast/unpack. Written in EXPLICIT
+    // SIMD over the inner j-loop:
+    //   - px/py/pz/mass are unit-stride in j, so `simd<double,8>.load(px, j)` is a
+    //     contiguous vector load (no gather);
+    //   - three vector accumulators (accx/accy/accz) hold per-lane partials, horizontally
+    //     reduced to scalars after the sweep;
+    //   - the interaction math is all vector ops: delta = load - splat(pos_i), reciprocal
+    //     sqrt = oneV / simd<double,8>.sqrt(r2), accumulate = acc + dx*s.
+    // The self term j==i contributes 0 (dx=dy=dz=0), so no lane masking is needed. The
+    // across-i axis is embarrassingly parallel and fanned out over the pinned pool by
+    // computeForces. SIMD width W=8 -> two 256-bit (AVX) registers.
+    //
+    // NOTE - the accumulation is `acc + dx*s`, NOT simd<double,8>.fma(dx, s, acc): fma
+    // forces a single-rounded multiply-add, so on a target without FMA hardware (cflat's
+    // default generic x86-64) LLVM cannot fold it to fmul+fadd and emits a per-lane libm
+    // fma() CALL - which halved throughput here (46 -> 19 GFLOP/s). Plain mul+add
+    // vectorizes to fmulpd/faddpd. (See doc/HPC.md - fma is for when you need single
+    // rounding.)
+    function<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
+        simd<double,8> eps2V = eps2;     // softening, splatted once
+        simd<double,8> oneV  = 1.0;
+
+        i64 bi = lo;
+        while (bi < hi) {
+            simd<double,8> pxiV = px[bi];    // splat body-i position across all lanes
+            simd<double,8> pyiV = py[bi];
+            simd<double,8> pziV = pz[bi];
+            simd<double,8> accx = 0.0;       // per-lane partial accelerations
+            simd<double,8> accy = 0.0;
+            simd<double,8> accz = 0.0;
+
+            int j = 0;
+            while (j + 8 <= n) {
+                simd<double,8> dx = simd<double,8>.load(px, j) - pxiV;
+                simd<double,8> dy = simd<double,8>.load(py, j) - pyiV;
+                simd<double,8> dz = simd<double,8>.load(pz, j) - pziV;
+                simd<double,8> r2 = dx * dx + dy * dy + dz * dz + eps2V;
+                simd<double,8> invr  = oneV / simd<double,8>.sqrt(r2);   // vector reciprocal sqrt
+                simd<double,8> invr3 = invr * invr * invr;
+                simd<double,8> s = simd<double,8>.load(mass, j) * invr3;
+                accx = accx + dx * s;                                    // accx += dx * s
+                accy = accy + dy * s;
+                accz = accz + dz * s;
+                j = j + 8;
+            }
+
+            // Horizontal-reduce each lane partial into a scalar (lane reads).
+            double axi = accx[0] + accx[1] + accx[2] + accx[3] + accx[4] + accx[5] + accx[6] + accx[7];
+            double ayi = accy[0] + accy[1] + accy[2] + accy[3] + accy[4] + accy[5] + accy[6] + accy[7];
+            double azi = accz[0] + accz[1] + accz[2] + accz[3] + accz[4] + accz[5] + accz[6] + accz[7];
+
+            // Scalar tail for the remaining (n % 8) bodies.
+            double pxi = px[bi];  double pyi = py[bi];  double pzi = pz[bi];
+            while (j < n) {
+                double dx = px[j] - pxi;
+                double dy = py[j] - pyi;
+                double dz = pz[j] - pzi;
+                double r2 = dx * dx + dy * dy + dz * dz + eps2;
+                double invr = 1.0 / Math.sqrt(r2);
+                double s = mass[j] * (invr * invr * invr);
+                axi = axi + dx * s;
+                ayi = ayi + dy * s;
+                azi = azi + dz * s;
+                j = j + 1;
+            }
+
+            ax[bi] = g * axi;
+            ay[bi] = g * ayi;
+            az[bi] = g * azi;
+            bi = bi + 1;
+        }
+    };
+
+    // One resident, pinned worker pool for the whole run: worker i nailed to core i
+    // via cpu_mask_lowest(cores). Created ONCE here and reused by every force eval
+    // (the scaling probe and all timesteps), so we never re-spawn threads in the loop.
+    ThreadPool pool;
+    pool.init(cores, cpu_mask_lowest(cores));
+
+    // ---- parallel scaling micro-benchmark (force kernel only) -------------
+    // Time one full O(N^2) force evaluation on 1 worker vs all cores.
+    Stopwatch sw1;
+    sw1.start();
+    computeForces(&pool, (i64)n, 1, forceRange);
+    sw1.stop();
+    double t1 = sw1.elapsed().seconds();
+
+    Stopwatch swM;
+    swM.start();
+    computeForces(&pool, (i64)n, cores, forceRange);
+    swM.stop();
+    double tM = swM.elapsed().seconds();
+
+    printf("parallel scaling (single O(N^2) force eval):\n");
+    printf("  1 worker      = %.4f s\n", t1);
+    printf("  %2d workers    = %.4f s\n", cores, tM);
+    if (tM > 0.0) { printf("  speedup       = %.2fx\n\n", t1 / tM); }
+
+    // Prime accelerations and record starting energy.
+    computeForces(&pool, (i64)n, cores, forceRange);
+    double e0 = totalEnergy(px, py, pz, vx, vy, vz, mass, n, g, eps2);
+
+    double halfdt = 0.5 * dt;
+
+    Stopwatch sw;
+    sw.start();
+    int step = 0;
+    while (step < steps) {
+        // half-kick: v += (dt/2) * a
+        axpyVec(halfdt, sVx, sAx);
+        axpyVec(halfdt, sVy, sAy);
+        axpyVec(halfdt, sVz, sAz);
+        // drift: x += dt * v
+        driftVec(dt, sPx, sVx);
+        driftVec(dt, sPy, sVy);
+        driftVec(dt, sPz, sVz);
+        // recompute accelerations at new positions (the O(N^2) kernel)
+        computeForces(&pool, (i64)n, cores, forceRange);
+        // half-kick: v += (dt/2) * a
+        axpyVec(halfdt, sVx, sAx);
+        axpyVec(halfdt, sVy, sAy);
+        axpyVec(halfdt, sVz, sAz);
+        step = step + 1;
+    }
+    sw.stop();
+
+    double e1 = totalEnergy(px, py, pz, vx, vy, vz, mass, n, g, eps2);
+
+    // ---- report -----------------------------------------------------------
+    double secs = sw.elapsed().seconds();
+    double interactions = (double)n * (double)n * (double)steps;
+    double ginterPerSec = interactions / secs / 1.0e9;
+    // ~20 flops per pairwise interaction (3 sub, 3 mul + 2 add for r2, sqrt+div ~ a
+    // few, 3 mul-add for the accumulation). The standard nbody figure is 20 flop/pair.
+    double gflops = interactions * 20.0 / secs / 1.0e9;
+
+    double drift = absd(e1 - e0) / absd(e0);
+
+    printf("correctness (energy conservation):\n");
+    printf("  E_start = %.10e\n", e0);
+    printf("  E_end   = %.10e\n", e1);
+    printf("  relative drift |dE/E| = %.3e\n\n", drift);
+
+    printf("performance:\n");
+    printf("  wall time (%d steps)   = %.4f s\n", steps, secs);
+    printf("  pair interactions      = %.3e\n", interactions);
+    printf("  throughput             = %.3f G-interactions/s\n", ginterPerSec);
+    printf("  throughput             = %.2f GFLOP/s\n", gflops);
+
+    pool.shutdown();   // drain + join + release the resident workers
+
+    delete[_] px;  delete[_] py;  delete[_] pz;
+    delete[_] vx;  delete[_] vy;  delete[_] vz;
+    delete[_] ax;  delete[_] ay;  delete[_] az;
+    delete[_] mass;
+
+    if (drift < 1.0e-3) {
+        printf("\nRESULT: PASS (energy conserved to < 1e-3)\n");
+        return 0;
+    }
+    printf("\nRESULT: energy drift too large\n");
+    return 1;
+}
