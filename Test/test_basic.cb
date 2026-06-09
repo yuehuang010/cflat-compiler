@@ -222,6 +222,32 @@ bool testDefaultExpression()
     return result;
 }
 
+// Regression: a method default parameter whose bare name collides with a
+// same-named method on an UNRELATED type used to abort the compile with
+// "named argument '<Type>__' does not match any parameter". The default-param
+// forwarding wrapper leaked the leading `this` (named "<Type>__") as a NAMED
+// argument; when that forwarding call was resolved against the sibling type's
+// method it hard-errored instead of rejecting the candidate. The wrapper now
+// forwards positionally. (Repro: two types both with a method `mix`, one with a
+// default param.)
+struct DefaultParamOther {
+    int mix(int a, int b) { return a + b; }
+};
+struct DefaultParamSelf {
+    int mix(int a, int scale = 10) { return a * scale; }
+};
+
+bool testDefaultParamNameCollision()
+{
+    bool result = true;
+    DefaultParamOther o;
+    DefaultParamSelf s;
+    result &= Test("collide_other_type", o.mix(3, 4), 7);    // 3+4
+    result &= Test("collide_explicit",   s.mix(3, 2), 6);    // 3*2
+    result &= Test("collide_default",    s.mix(3), 30);      // 3*10
+    return result;
+}
+
 extern int strcmp(const char* a, const char* b);
 
 bool Test(const char* testName, const char* actual, const char* expected)
@@ -1947,6 +1973,7 @@ extern int main()
     total++; passed += testDefaultSingleParam()          ? 1 : 0;
     total++; passed += testDefaultMultipleParams()       ? 1 : 0;
     total++; passed += testDefaultExpression()           ? 1 : 0;
+    total++; passed += testDefaultParamNameCollision()   ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;
     total++; passed += testTypeof()                      ? 1 : 0;

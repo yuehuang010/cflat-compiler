@@ -446,9 +446,24 @@ important knob for steady throughput (see [threading.md](threading.md)):
 i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI, &c, /*pin=*/true);
 ```
 
-Leave it `false` when the region oversubscribes the machine or shares cores with other work. The
-`*_pool` variants do not expose `pin`: the `ThreadPool` owns its worker threads, so pin them once at
-pool construction instead.
+Leave it `false` when the region oversubscribes the machine or shares cores with other work.
+
+The `*_pool` variants take no per-call `pin`, and deliberately so: a pool task doesn't choose which
+worker runs it, so affinity has to live on the resident worker, not the submission. Pin the pool's
+workers **once** at construction via the second `init` argument:
+
+```c
+ThreadPool pool;
+pool.init(8, cpu_mask_lowest(8));   // 8 workers, worker i pinned to core i
+// ... then call parallel_for_n_pool(&pool, ...) once per timestep; workers stay pinned.
+```
+
+`init(int workers, u64 pinMask)` pins worker `i` to a single core - the `i`-th set bit of `pinMask`
+(see `__threadpool_nth_core`) - so a pool can be pinned to an arbitrary core subset, not just the low
+cores. `cpu_mask_lowest(n)` builds the mask for cores `0..n-1` (the usual one-worker-per-core layout);
+pass any bitmask for a custom set (e.g. `cpu_mask_lowest` on a P-core range to keep a solver off the
+E-cores). The plain `init(workers)` overload leaves the workers unpinned. This closes the old
+pin-vs-pool gap: a bulk-synchronous solver now gets thread reuse **and** affinity at the same time.
 
 ### Per-thread RNG for parallel Monte Carlo
 

@@ -771,6 +771,52 @@ bool testThreadPoolInProgram() {
     return result;
 }
 
+// Worker pinning (init(workers, pinMask)) plus the affinity bit helpers. The
+// affinity itself isn't directly observable from CFlat, so we assert the helper
+// math exactly and verify a PINNED pool still runs a repeated region correctly
+// across several drain cycles (the bulk-synchronous-solver pattern the pin API
+// targets: resident workers reused per timestep, each nailed to one core).
+bool testPinnedPool() {
+    bool result = true;
+
+    // cpu_mask_lowest: contiguous low-core masks.
+    result &= Test("mask lowest 4", (int)cpu_mask_lowest(4), 15);   // 0b1111
+    result &= Test("mask lowest 1", (int)cpu_mask_lowest(1), 1);
+    result &= Test("mask lowest 0", (int)cpu_mask_lowest(0), 0);
+
+    // __threadpool_nth_core over mask 0b1011 (cores 0,1,3): set bits 1,2,8, popcount 3.
+    result &= Test("nth_core 0", (int)__threadpool_nth_core((u64)11, 0), 1);
+    result &= Test("nth_core 1", (int)__threadpool_nth_core((u64)11, 1), 2);
+    result &= Test("nth_core 2", (int)__threadpool_nth_core((u64)11, 2), 8);
+    result &= Test("nth_core wrap", (int)__threadpool_nth_core((u64)11, 3), 1);   // 3 % 3 == 0
+    result &= Test("nth_core empty", (int)__threadpool_nth_core((u64)0, 5), 0);   // 0 mask -> no pin
+
+    // Pinned pool: 4 workers, one per core. Run several "timesteps" of work on
+    // the SAME resident workers and confirm the total is exact.
+    ThreadPool pool;
+    pool.init(4, cpu_mask_lowest(4));
+    result &= Test("pinned worker count", pool.workerCount(), 4);
+
+    atomic_counter counter = default;
+    int steps         = 5;
+    int tasksPerStep  = 200;
+    int step = 0;
+    while (step < steps) {
+        int i = 0;
+        while (i < tasksPerStep) {
+            AddCtx* c = new AddCtx;
+            c->counter = &counter;
+            pool.submitDetached(taskIncrement, c);
+            i++;
+        }
+        pool.drain();   // barrier between timesteps - workers stay resident/pinned
+        step++;
+    }
+    result &= Test("pinned pool task count", (int)counter.read(), steps * tasksPerStep);
+    pool.shutdown();
+    return result;
+}
+
 extern int main() {
     int total  = 0;
     int passed = 0;
@@ -795,6 +841,7 @@ extern int main() {
     total++; passed += testManyTasksStress()             ? 1 : 0;
     total++; passed += testPriorityOrdering()            ? 1 : 0;
     total++; passed += testThreadPoolInProgram()         ? 1 : 0;
+    total++; passed += testPinnedPool()                  ? 1 : 0;
 
     printf("ThreadPool tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

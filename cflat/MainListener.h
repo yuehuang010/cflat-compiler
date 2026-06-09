@@ -3599,12 +3599,22 @@ public:
             auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
             compiler->InitializeBlock(&wrapperFn->front(), false);
 
-            // Build the full argument list for the forwarding call
+            // Build the full argument list for the forwarding call. The wrapper
+            // forwards its arguments to the full function in declared order, so the
+            // call is purely POSITIONAL. We must clear each arg's VariableName: the
+            // params carry their declared names (and a method's leading `this` is
+            // named "<Type>__"), and MatchFunction treats any arg with a non-empty
+            // VariableName as a NAMED argument - which, when this forwarding call is
+            // resolved against a same-named method on an unrelated type, hard-errors
+            // ("named argument '<Type>__' does not match any parameter") instead of
+            // just rejecting that candidate.
             std::vector<LLVMBackend::NamedVariable> callArgs;
 
             for (int i = 0; i < cutoff; i++)
             {
-                callArgs.push_back(compiler->GetFunctionArgument(params[i].VariableName));
+                auto arg = compiler->GetFunctionArgument(params[i].VariableName);
+                arg.TypeAndValue.VariableName = "";   // forward positionally, never as a named arg
+                callArgs.push_back(arg);
             }
 
             for (int i = cutoff; i < (int)params.size(); i++)

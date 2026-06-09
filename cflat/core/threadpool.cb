@@ -247,10 +247,48 @@ void __threadpool_release_inflight(WorkerCtx* wctx) {
     }
 }
 
+// Affinity mask covering the lowest `n` logical cores (cores 0..n-1). The common
+// argument to ThreadPool.init(workers, pinMask): cpu_mask_lowest(workers) pins
+// worker i to core i, the standard "one worker per core" HPC layout.
+u64 cpu_mask_lowest(int n) {
+    if (n <= 0)  { return (u64)0; }
+    if (n >= 64) { return ~(u64)0; }
+    return ((u64)1 << n) - (u64)1;
+}
+
+// Single-bit affinity mask selecting the (idx mod popcount(mask))-th set bit of
+// `mask` - i.e. the core that worker `idx` should pin to when the pool is pinned.
+// Returns 0 when mask is 0 (no pinning) so callers skip the setAffinity call.
+// Pinning each worker to ONE core (not the whole set) is what removes scheduling
+// jitter for compute-bound kernels; if there are more workers than set bits the
+// modulo wraps, oversubscribing cores predictably.
+u64 __threadpool_nth_core(u64 mask, int idx) {
+    if (mask == (u64)0) { return (u64)0; }
+    // popcount(mask) via Kernighan bit-clearing.
+    int total = 0;
+    u64 t = mask;
+    while (t != (u64)0) { t = t & (t - (u64)1); total = total + 1; }
+    int target = idx % total;
+    u64 m = mask;
+    int seen = 0;
+    while (m != (u64)0) {
+        u64 low = m & (((~m)) + (u64)1);   // lowest set bit (m & -m)
+        if (seen == target) { return low; }
+        m = m & (m - (u64)1);              // clear lowest set bit
+        seen = seen + 1;
+    }
+    return (u64)0;
+}
+
 // --- ThreadPool ---------------------------------------------------------------
 //
 //   ThreadPool pool;
 //   pool.init(4);
+//
+//   // Pinned: one worker per core, resident for the pool's lifetime - ideal for a
+//   // bulk-synchronous solver that calls parallel_for_n_pool once per timestep.
+//   ThreadPool solver;
+//   solver.init(8, cpu_mask_lowest(8));
 //
 //   MyCtx* c = new MyCtx; c->in = ...;
 //   move TaskHandle* h = pool.submit(myFn, c);           // NORMAL priority
@@ -287,6 +325,11 @@ class ThreadPool {
     int            _count            = 0;
     int            _capacity         = 0;
     WorkerCtx      _ctx              = default;
+    // Affinity mask for worker pinning, set by init(workers, pinMask). 0 = no
+    // pinning (the default). When non-zero, worker i is pinned to a single core
+    // (the i-th set bit, see __threadpool_nth_core) right after it is started,
+    // and resize()'s newly-grown workers are pinned the same way.
+    u64            _pinMask          = 0;
     // Inline mode: when init() is called on a thread that already has an
     // installed __active_allocator (i.e. inside a `program`), spawning worker
     // threads is unsafe.  Worker threads start with a null __active_allocator,
@@ -297,11 +340,21 @@ class ThreadPool {
 
     // Start workerCount worker threads.  No-op if already initialised.
     //
+    // pinMask (default 0 = no pinning) is a CPU affinity bitmask. When non-zero,
+    // each worker is pinned to a SINGLE core for its whole lifetime - worker i to
+    // the i-th set bit of pinMask (see __threadpool_nth_core). Pin once here rather
+    // than per-task: pool tasks don't choose their worker, so affinity has to live
+    // on the resident worker, not the submission. This is the pool counterpart to
+    // parallel_for_n(..., pin=true), and the right fit for a region that runs
+    // repeatedly (a solver timestep) where you want BOTH thread reuse and affinity.
+    // Use cpu_mask_lowest(workerCount) for the standard one-worker-per-core layout.
+    //
     // If called inside a `program` scope (i.e. with a non-null __active_allocator),
     // the pool switches to inline mode: no worker threads are spawned and submit()
     // executes tasks synchronously on the caller's thread.  See _inlineMode.
-    void init(int workerCount) {
+    void init(int workerCount, u64 pinMask = 0) {
         if (_count > 0 || _inlineMode) { return; }
+        _pinMask = pinMask;
         // Inline-mode trigger for program-scope use was a workaround for the
         // cross-thread free hazard. With page-header-driven operator delete
         // (memory.cb) plus per-thread BucketAllocator via spawn_child
@@ -341,6 +394,9 @@ class ThreadPool {
             sc->wctx = &_ctx;
             sc->slot = i;
             _workers[i].start(__threadpool_worker, sc);   // ownership transfers to worker
+            if (_pinMask != (u64)0) {
+                _workers[i].setAffinity(__threadpool_nth_core(_pinMask, i));
+            }
             i++;
         }
     }
@@ -572,6 +628,9 @@ class ThreadPool {
                 sc->wctx = &_ctx;
                 sc->slot = j;
                 _workers[j].start(__threadpool_worker, sc);   // ownership transfers to worker
+                if (_pinMask != (u64)0) {
+                    _workers[j].setAffinity(__threadpool_nth_core(_pinMask, j));
+                }
                 j++;
             }
         } else {
@@ -677,6 +736,7 @@ class ThreadPool {
         _workerStops  = nullptr;
         _count        = 0;
         _capacity     = 0;
+        _pinMask      = 0;
         _ready.destroy();
         _stop.dispose();
         // Release the channel buffers so a subsequent init() starts clean.
