@@ -1,0 +1,19 @@
+# internal/
+
+Compiler-internal notes and hard-won gotchas. **Not** public-facing API docs - that's
+`doc/`. These capture the "why" behind non-obvious implementation choices and the traps
+that cost real debugging time. Read before touching the relevant subsystem.
+
+| File | Topic |
+|------|-------|
+| [intrinsics.md](intrinsics.md) | Adding a compiler intrinsic: call-site dispatch, the 4-edit pattern, `__X86__` guard |
+| [operator-parsing.md](operator-parsing.md) | `>>` is two tokens; Parse fns must loop over operators |
+| [function-table-method-collision.md](function-table-method-collision.md) | `IsMethod` flag stops struct methods shadowing top-level functions as fn-pointers |
+| [vectorize.md](vectorize.md) | `vectorize` keyword enforcement; root cause was missing TargetMachine/TTI in the pass builder |
+| [noalias-arrayview.md](noalias-arrayview.md) | Thin `int[]` array-view = `int*` repr + noalias by spelling; one-way bind enforcement |
+| [span-view.md](span-view.md) | `span<T>`/`view<T>`; scoped `!alias.scope`/`!noalias` metadata for by-value struct fields |
+| [simd-type.md](simd-type.md) | `simd<T,N>` primitive vector type; dual-JSON ser/deser sites; vector op dispatch traps |
+| [parallel-helpers.md](parallel-helpers.md) | `core/parallel.cb` authoring gotchas (`new T*[n]`, lambda `move`, generic-fn-as-fnptr) |
+| [asan.md](asan.md) | `--asan` Windows/COFF fixes (`asan-force-dynamic-shadow`, NoAddress globals) |
+| [lsp-parallel-scaling.md](lsp-parallel-scaling.md) | LSP parse scaling cap; ANTLR thread-local cache is a no-op; share the core parse cache |
+| [sixel-aspect.md](sixel-aspect.md) | Sixel pixel aspect-ratio correction for round circles in example renderers |

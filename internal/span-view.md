@@ -1,0 +1,36 @@
+# span<T> / view<T> window types + T[]-field noalias metadata
+
+span<T> / view<T> non-owning window types LANDED 2026-06-07. Extends [[project_noalias_design]] (the thin `T[]` array-view) with ergonomic ptr+len wrappers so kernels take one arg per buffer instead of `(ptr,len)`.
+
+**The two types** (core/span.cb, core/view.cb):
+- `span<T> { T[] _ptr; i64 _len; }` - NOALIAS, non-owning. `wrap/length/data/get/set/operator[]/as_view`. Pass BY VALUE.
+- `view<T> { T* _ptr; i64 _len; }` - MAY-ALIAS, non-owning. Same API + `slice(start,end)` (offset sub-views OK because may-alias).
+- Conversion lattice falls out of existing T[]/T* rules: span->view via `as_view()` (T[]->T* decay) OK; view->span REJECTED at `span.wrap` call-arg (T*->T[] one-way). No compiler conversion code needed.
+
+**THE BLOCKER (fixed): a `T[]` struct field did NOT get effective noalias.** LLVM `noalias` is a PARAMETER ATTRIBUTE - can't reach a pointer inside a by-value struct. Baseline: by-value span axpy = 5 vector.memcheck; by-pointer = no vectorization. FIX = emit scoped `!alias.scope`/`!noalias` METADATA on the element load/store (the mechanism the inliner uses to preserve restrict). Proven first in out/fatview.ll.
+
+**Mechanism (LLVMBackend.h + MainListener.h):**
+- TypeAndValue gains transient `int NoaliasScopeId = -1` (NOT serialized - recomputed per function).
+- Per-function: `aliasDomain_`, `aliasScopes_` (vector), `viewScopeByOrigin_` (map), all reset in `createFunctionBlock`. `#include <llvm\IR\MDBuilder.h>`.
+- `MintAliasScope()` lazily makes the anon domain + a scope; `GetOrMintViewScope(originKey)` caches by origin STRING; `AttachViewNoalias(inst, id)` sets alias.scope={own} + noalias={all others}.
+- Subscript handler (MainListener ~8385, the `IsArrayView && Pointer` branch): originKey = ParentVariableName (struct instance for `s.v[i]`) else VariableName else CallerName; stamps `elementTypeAndValue.NoaliasScopeId`.
+- Load: `TagViewElementAccess` wraps the element CreateLoad sites in LoadNamedVariable. Store: tag the StoreInst after `derefAssign` in ParseAssignmentExpression.
+- KEY soundness: key by ORIGIN not SSA value (two reads of same buffer share a scope = correctly may-alias-self). AttachViewNoalias sets alias.scope UNCONDITIONALLY (even with no sibling yet) so emission-order doesn't matter - a later sibling's noalias proves disjointness against the earlier access.
+
+**Usage rule for the guarantee (doc/HPC.md):** pass span BY VALUE, then `double[] yv = y.data();` to a LOCAL T[] and loop `yv[i]`. NOT through get/set/operator[] (they collapse provenance to `this` -> two spans share a scope -> no disjointness). NOT by pointer (buffer ptr/len reload each iter, can't vectorize). Verified: by-value+local = AVX2 `<4 x double>`, 0 memcheck.
+
+**Two GOTCHAS burned time:**
+1. ~~`T[] _ptr = default;` on a GENERIC struct field BREAKS method instantiation~~ STALE/FIXED 2026-06-08: later generic-method work fixed it; span.cb now uses `T[] _ptr = default;` like every other field (re-aligned with the "always = default" convention - NBODY_EVAL #5 resolved). Verified flipping span's field -> full test.bat + 114/114 HPC green.
+2. A STALE `%TEMP%\span.cb` shadowed the core one for ~hour of misdiagnosis. Imports resolve relative to the IMPORTING FILE'S DIR first (where /tmp test sources live), THEN runtimeDir/core (x64/<cfg>/core, the DEPLOYED copy - NOT cflat/core). Editing cflat/core/*.cb has NO effect until rebuilt (deploy step). `cflat ... -v` prints the resolved import path - check it. `string.span()` method does NOT collide with `span<T>` type (verified) - that rename was a misdiagnosis and was reverted.
+
+**Tests:** Test/test_hpc.cb testSpanView (12, -O0 correctness); Test/errors/err_view_to_span.cb (view->span reject); the -O2 IR assert (vectorized + alias.scope + NO memcheck, scoped to span_axpy via PowerShell regex) lives in **test_hpc.bat** (root harness; folded in 2026-06-07 - was briefly its own test_span.bat, then test_span.bat folded into test_vectorize.bat which was renamed test_hpc.bat since it now covers both the `vectorize` keyword AND span noalias, both HPC -O2 guarantees). Fixture: Test/span_noalias_fixture.cb. All green Release+Debug.
+
+**span.slice ADDED 2026-06-08:** `span<T>.slice(start,end)` now exists but returns `view<T>` (may-alias), NOT span<T> - an arbitrary sub-range can't keep the whole-allocation noalias contract, so the return TYPE records the dropped guarantee (`&_ptr[start]` -> view.wrap). For disjoint sub-ranges that stay span<T>, use chunk. testSpanView now 24 (+3).
+
+**OPEN TASK (deferred, the one remaining HPC ergonomics gap):** make span's `operator[]`/`get`/`set` CARRY the noalias contract (or LINT when they silently don't). Today they compile fine but silently DON'T vectorize across two spans - the methods reach the buffer through `this`, collapsing provenance, so the optimizer can't prove two spans disjoint at the call site. The fast path requires binding a local `double[] yv = y.data();` first (documented in doc/HPC.md + span.cb as the known footgun). Closing it is real CODEGEN work (thread origin-keyed noalias scopes through method bodies / `this`), NOT a library tweak - hence deferred. This was the only unfinished item when example/hpc/NBODY_EVAL.md (the customer HPC eval) was DELETED 2026-06-08; the other deferred papercut (inline value-returning lambda-arg emits void return) lives in [[project_typed_thread_ctx]].
+
+**span partition ADDED 2026-06-07 (`chunk`):** span has NO free slice that STAYS span by design (overlap breaks noalias; slice decays to view, see above), BUT has `chunk(idx, nchunks)` - disjoint balanced tiling (Rust chunks_mut analog), the data-parallel partition primitive. PURE LIBRARY: offsets the noalias T[] via the explicit `(T[])(&_ptr[start])` cast escape (see [[project-noalias-design]]; initially used a union pun, switched to the cast when it landed same day), in private `_offset()` behind chunk so user can't forge overlap. Keeps noalias: chunk_axpy verified 0 vector.memcheck at -O2 (test_hpc.bat). Distinct idx + SAME nchunks = disjoint (caller caveat: mixing nchunks can overlap). Tests: testSpanView now 21 (+9). See [[project_multithread_hpc_eval]]. NOTE inline anon unions don't parse - union must be file-scope named.
+
+**Deliberately deferred:** Phase 6 array<T> as_span/as_view + _len int->i64 (array._ptr is raw T*, can't yield a span without union pun; users bridge array->view via `v.wrap(arr.getPtr(0), arr.count())`). span split_at->(span,span) blessed intrinsic (chunk covers the partition use case now).
+
+NOTE: test_debug_info.bat was RETIRED 2026-06-07 (its Test/debug_info_fixture.cb was missing from HEAD and disk since the "Consolidate Tests" commit, so the script always failed). Deleted the script + its CLAUDE.md "Debug-Info Tests" section + the "mirrors test_debug_info.bat" comments in test_vectorize.bat/test_span.bat/span_noalias_fixture.cb. The `-g`/`--debug-info` FEATURE is untouched.

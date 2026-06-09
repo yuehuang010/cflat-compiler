@@ -1,0 +1,24 @@
+# Compiler intrinsics (rdtscp / pause / popcount / ctz / clz / prefetch / fma / likely)
+
+CFlat exposes hardware/LLVM intrinsics via call-site dispatch, NOT function-table builtins (avoids bitcode-cache re-registration). Landed set as of 2026-06-04:
+
+- x86-only (need `if const (__X86__)` guard in the .cb wrapper): `__rdtscp`, `__lfence`, `__pause`.
+- Target-independent (NO guard): `__popcount` (ctpop), `__ctz` (cttz), `__clz` (ctlz), `__prefetch`, `__fma`, `__likely`/`__unlikely` (llvm.expect).
+
+**To add a new intrinsic (4 edits):**
+1. `LLVMBackend.h`: add a `CreateX()` helper (~near `CreateRdtscp`/`CreateLfence`, line ~1840). x86 intrinsic enums need `#include <llvm/IR/IntrinsicsX86.h>` (NOT base Intrinsics.h - that was a build break). Overloaded intrinsics (ctpop/cttz/ctlz/fma/expect/prefetch) pass the type to `getDeclaration(module, id, {type})`. cttz/ctlz take a 2nd `is_zero_poison` arg = `getFalse` so X(0)==bitwidth.
+2. `MainListener.h`: add `if (functionName == "__x")` dispatch in the `RuleArgumentExpressionList` case (~line 8821, after `__lfence`). Value-arg intrinsics eval args via `ParseAssignmentExpressionNamed` then `argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV)`; set `namedVar.Primary/Storage=nullptr/BaseType/TypeAndValue.TypeName`. Zero-arg calls DO route here (grammar `argumentExpressionList` is optional-but-present).
+3. `MainListener.h`: add the `__x` name to the `kIntrinsics` set (~line 10374) or it's flagged "Undefined variable".
+4. `.cb` wrapper + `cflat.vcxproj` `<None>` DeploymentContent entry if it's a new core file.
+
+**Homes**: x86 timing -> `time.cb` (rdtscp/lfence); fma -> `math.cb`; bit ops + prefetch + likely/unlikely + **pause** -> `core/intrinsic.cb`. (pause moved OUT of mutex.cb 2026-06-04: mutex is SRW/kernel-blocking and never spins; the real pause callers are the lock-free spinners spsc_queue/channel, which now `import "intrinsic.cb"`.) The `__X86__=1` compile-time macro is set at 3 sites in `LLVMBackend.cpp` alongside `__WINDOWS__`.
+
+**pause() wired + perf-validated 2026-06-04**: pause() added to spsc_queue.cb push/pop spin-while-full/empty and channel.cb send/receive/push/pop CAS-retry tails. Benchmark `performance/perf_spin_contention.cb` (in performance.bat BENCH_FILES) - SMT-colocated 1P:1C, tiny ring=8 to force spinning. Result on IDLE machine: spsc pure-spin **~+14%** (34.6M->39.5M items/s, stable both sides); channel neutral-within-noise (its SwitchToThread yield masks it). LESSON: a first measurement on a BUSY machine showed a false 26% *regression* - always run baseline and treatment back-to-back on an idle box (git stash the core .cb to build a clean no-pause baseline exe). Theory: under SMT colocation the pure-spinning side starves the working sibling's pipeline; PAUSE yields it. Naive every-iteration PAUSE is fine here; a backoff (bare spins then PAUSE) was considered but not needed once measured clean.
+
+New core files are parsed on-import (parseTreeCache_), NOT baked into `core.bc` (that only covers runtime.cb's closure) - so a new core file needs no `--init` list change; the dir-hash in `ComputeCoreHash` handles invalidation.
+
+**MPMC contention finding 2026-06-05**: added `performance/perf_mpmc_contention.cb` (sweeps 1/2/4/8 P+C through one channel, unpinned). Hypothesis was that the many-producer CAS-storm on `_head` is where PAUSE wins. Measured baseline-vs-pause back-to-back idle: PAUSE is **NEUTRAL** across the whole sweep (1P/1C ~140M, 2P/2C ~20M, 4P/4C ~5.5M, 8P/8C ~5.1M items/s; pause within run-to-run noise, occasionally +40% at 2P/2C but not reproducible). Why no win: channel's blocking send/receive already backs off via `SwitchToThread()` every 1024 spins, and at high contention the throughput floor is CAS cache-line *coherence latency* (~165-200ns/item), not wasted spin cycles - PAUSE can't fix coherence traffic. So the ONLY clean reproducible PAUSE win remains the SMT-colocated pure-spin spsc case (+14%). Both benchmarks kept (they map where pause does/doesn't help and guard the contended path).
+
+**Decision 2026-06-05**: spin/backoff tuning (pause-vs-yield thresholds, 1024 yield count, ring size, padding) is micro-arch + core-count specific and would de-tune other machines if hard-coded - deliberately left at portable "good enough" defaults. If revisited, do it ADAPTIVELY (exp spin-count growth, or startup PAUSE-cost calibration), not magic constants. Not a tweak; a real feature for later.
+
+Tests: `Test/test_intrinsic.cb` (19 tests, per-concern functions). HPC backlog [[project_hpc_language_features]] implies more intrinsics coming (simd, aligned, vectorize).
