@@ -1961,6 +1961,40 @@ bool testTupleReturnAndDestructure()
     return result;
 }
 
+// Returns two array-views as a tuple. A tuple element may be a `T[]` array-view; each
+// element keeps the noalias contract, so the destructured locals are distinct views (the
+// !alias.scope metadata is checked by the HPC IR tests; here we verify the values).
+(int[], int[]) twoViews(int[] a)
+{
+    int[] first = a;
+    int[] second = a;
+    return (first, second);
+}
+
+bool testTupleArrayView()
+{
+    bool result = true;
+
+    int[5] backing = {10, 20, 30, 40, 50};
+    int[] v = backing;
+
+    // Sugar form (int[], int[]) destructured into array-view locals.
+    (int[] x, int[] y) = twoViews(v);
+    x[0] = 99;                       // mutate through one view
+    result &= Test("tuple_view_destr_write", y[0], 99);
+
+    int sum = 0;
+    vectorize for (i64 i = 0; i < (i64)5; i = i + 1) { sum = sum + y[i]; }
+    result &= Test("tuple_view_destr_sum", sum, 99 + 20 + 30 + 40 + 50);
+
+    // Explicit generic form tuple<int[], int[]> built from a tuple literal.
+    tuple<int[], int[]> t = (v, v);
+    t.item_0[1] = 7;
+    result &= Test("tuple_view_field_alias", t.item_1[1], 7);
+
+    return result;
+}
+
 // Phase 4: ITuple<T...> - a third-party type that implements the interface
 class MyRange : ITuple<int, int>
 {
@@ -2298,6 +2332,7 @@ extern int main()
     total++; passed += testTupleTypeSyntax()             ? 1 : 0;
     total++; passed += testTupleConstruct()              ? 1 : 0;
     total++; passed += testTupleReturnAndDestructure()   ? 1 : 0;
+    total++; passed += testTupleArrayView()              ? 1 : 0;
     total++; passed += testITuple()                      ? 1 : 0;
     total++; passed += testImplicitStringLiteral()        ? 1 : 0;
     total++; passed += testGenericFnAsValue()            ? 1 : 0;

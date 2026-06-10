@@ -316,7 +316,7 @@ tupleTypePackEntry
     ;
 
 tupleTypeEntry
-    : typeSpecifier pointer?
+    : typeSpecifier pointer? arrayTypeSuffix?   // `T[]` element = a noalias array-view member; `[N]`/`[]*` rejected in the listener
     ;
 
 functionPointerSpecifier
@@ -358,7 +358,7 @@ typeParameterList
     ;
 
 typeParameterEntry
-    : typeSpecifier pointer? Ellipsis?
+    : typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
     ;
 
 whereClause

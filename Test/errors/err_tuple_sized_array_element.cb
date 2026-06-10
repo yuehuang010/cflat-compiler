@@ -1,0 +1,10 @@
+// A sized array `T[N]` is not a valid tuple element - only the noalias array-view `T[]`
+// (and plain types / pointers) are. Must surface a real message, not an ANTLR dump.
+import "tuple.cb";
+
+extern int main()
+{
+    expect_error("'T[]' is the only bracketed form valid as a tuple element");
+    (int[3], int) t = default;
+    return 0;
+}

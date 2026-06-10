@@ -380,6 +380,29 @@ exploits it), not something specific to high-performance code.
 the compiler reports an error pointing at this pattern. Use the out-parameter form above
 instead.
 
+#### Returning a tuple of array-views
+
+When returning several arrays is cleaner than out-parameters, a tuple element may itself be a
+`T[]` array-view: `(T[], T[])` (sugar) or the explicit `tuple<T[], T[]>`. Each element keeps the
+array-view noalias contract, so destructuring the result into locals yields views the optimizer
+can still prove disjoint (each destructured local gets its own alias scope).
+
+```c
+// Split a buffer into two views and return both at once.
+(int[], int[]) halves(int[] a, int n)
+{
+    int[] lo = a;            // (illustrative - real code would slice)
+    int[] hi = a;
+    return (lo, hi);
+}
+
+(int[] x, int[] y) = halves(view, n);   // x and y are noalias array-views
+```
+
+Only the bare `T[]` form is allowed as a tuple element or generic type argument; a sized
+`T[N]` or a pointer-to-array `T[]*` is rejected with a clear message (use `T[]`, or the
+out-parameter pattern above).
+
 ### Forward References
 
 Functions can be called before they are defined - no forward declarations needed. Mutual recursion works out of the box:

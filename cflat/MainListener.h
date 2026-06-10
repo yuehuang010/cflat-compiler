@@ -65,6 +65,33 @@ static CFlatParser::ArrayPtrSuffixContext* ArrayPtrOf(Ctx* c)
 {
     return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayPtrSuffix() : nullptr;
 }
+// A type-argument position (tuple element, generic type arg) admits exactly the bare `T[]`
+// array-view among the bracket forms. Returns true for `T[]` (empty dims, no trailing '*').
+template <class Ctx>
+static bool IsArrayViewArg(Ctx* c)
+{
+    auto* dims = ArrayDimsOf(c);
+    return dims != nullptr && dims->assignmentExpression().empty() && ArrayPtrOf(c) == nullptr;
+}
+// The bracket forms that are NOT valid in a type-argument position: a sized `T[N]` or a
+// pointer-to-array `T[]*` / `T[N]*`. Returns true so the caller can emit one diagnostic.
+template <class Ctx>
+static bool IsBadArrayArg(Ctx* c)
+{
+    if (ArrayPtrOf(c) != nullptr) return true;
+    auto* dims = ArrayDimsOf(c);
+    return dims != nullptr && !dims->assignmentExpression().empty();
+}
+// Type-arg string for one tuple element: the bare type plus its reference-kind suffix
+// ("*" pointer, "[]" noalias array-view). Bad bracket forms (`[N]`, `[]*`) contribute no
+// suffix here - the authoritative tuple-sugar path rejects them with a diagnostic.
+static std::string TupleEntryArgName(CFlatParser::TupleTypeEntryContext* entry)
+{
+    std::string argName = entry->typeSpecifier()->getText();
+    if (entry->pointer() != nullptr) argName += "*";
+    else if (IsArrayViewArg(entry)) argName += "[]";
+    return argName;
+}
 
 inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
 {
@@ -108,14 +135,49 @@ static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
     return d->getText();
 }
 
-// Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr").
+// Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr",
+// "int[]" -> "intview"). A type-arg string carries its reference kind as a suffix: "*" for a
+// pointer, "[]" for a noalias array-view (see PeelTypeArgSuffix). Both must fold to symbol-safe
+// text so the mangled name stays a valid identifier.
 static std::string MangleTypeArg(const std::string& typeName)
 {
     std::string result;
-    for (char c : typeName)
-        if (c == '*') result += "ptr";
-        else result += c;
+    for (size_t i = 0; i < typeName.size(); i++)
+    {
+        if (typeName[i] == '*') result += "ptr";
+        else if (typeName[i] == '[' && i + 1 < typeName.size() && typeName[i + 1] == ']')
+        {
+            result += "view";
+            i++;  // consume the matching ']'
+        }
+        else result += typeName[i];
+    }
     return result;
+}
+
+// Peel the reference-kind suffixes off a (possibly substituted) type-arg string, recording them
+// as flags: a trailing "[]" is a noalias array-view (which is also a pointer repr), a trailing "*"
+// is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
+// were appended in source order, so peel from the right until none remain. Returns the bare base
+// type name in `name`.
+static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView)
+{
+    for (;;)
+    {
+        if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
+        {
+            arrayView = true;
+            pointer = true;
+            name.erase(name.size() - 2);
+        }
+        else if (!name.empty() && name.back() == '*')
+        {
+            pointer = true;
+            name.pop_back();
+        }
+        else
+            break;
+    }
 }
 
 // Struct/class bodies parse through the named `aggregateMember` rule (see CFlat.g4), so the
@@ -411,11 +473,7 @@ private:
                             break;
                         std::vector<std::string> typeArgs;
                         for (auto* entry : tts->tupleTypeEntry())
-                        {
-                            std::string argName = entry->typeSpecifier()->getText();
-                            if (entry->pointer() != nullptr) argName += "*";
-                            typeArgs.push_back(argName);
-                        }
+                            typeArgs.push_back(TupleEntryArgName(entry));
                         std::string mangledName = "tuple";
                         for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(arg);
                         compiler->CreateStructType(mangledName, {});
@@ -938,8 +996,12 @@ public:
         {
             resolved = typeSpec ? typeSpec->getText() : entry->getText();
         }
+        // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
+        // bracket forms are rejected in the main pass, so the forward scan just names them.
         if (entry->pointer() != nullptr)
             resolved += "*";
+        else if (IsArrayViewArg(entry))
+            resolved += "[]";
         return resolved;
     }
 
@@ -998,11 +1060,7 @@ public:
                         {
                             std::string mangledName = "tuple";
                             for (auto* entry : tts->tupleTypeEntry())
-                            {
-                                std::string argName = entry->typeSpecifier()->getText();
-                                if (entry->pointer() != nullptr) argName += "*";
-                                mangledName += "__" + MangleTypeArg(argName);
-                            }
+                                mangledName += "__" + MangleTypeArg(TupleEntryArgName(entry));
                             auto* c = Compiler(tts);
                             c->CreateStructType(mangledName, {});
                             LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
@@ -1459,6 +1517,12 @@ private:
     {
         auto* typeSpec = entry->typeSpecifier();
         bool hasPointer = entry->pointer() != nullptr;
+        // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
+        // are not valid in a type-argument position (reject with one clear message).
+        bool hasArrayView = IsArrayViewArg(entry);
+        if (IsBadArrayArg(entry))
+            LogErrorContext(entry, "'T[]' is the only bracketed form valid as a generic or tuple "
+                "type argument; a sized 'T[N]' and a pointer-to-array 'T[]*' are not");
         std::string resolved;
 
         if (typeSpec && typeSpec->genericIdentifier() && typeSpec->genericIdentifier()->genericTypeParameters())
@@ -1483,16 +1547,17 @@ private:
             auto substIt = activeTypeSubstitutions.find(resolved);
             if (substIt != activeTypeSubstitutions.end())
             {
+                // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]");
+                // peel those onto the flags so they re-encode once below.
                 resolved = substIt->second;
-                while (!resolved.empty() && resolved.back() == '*')
-                {
-                    resolved.pop_back();
-                    hasPointer = true;
-                }
+                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView);
             }
         }
 
-        if (hasPointer)
+        // Array-view wins the suffix encoding ("[]"); pointer and array-view never combine here.
+        if (hasArrayView)
+            resolved += "[]";
+        else if (hasPointer)
         {
             if (Compiler(entry)->IsInterfaceType(resolved))
                 LogErrorContext(entry, std::format("pointer '*' is not allowed on interface type '{}'", resolved));
@@ -1572,12 +1637,23 @@ private:
                     {
                         for (auto* entry : tts->tupleTypeEntry())
                         {
+                            // `(T[], ...)` element is a noalias array-view member; `[N]`/`[]*` are not.
+                            if (IsBadArrayArg(entry))
+                                LogErrorContext(entry, "'T[]' is the only bracketed form valid as a "
+                                    "tuple element; a sized 'T[N]' and a pointer-to-array 'T[]*' are not");
                             std::string argName = entry->typeSpecifier()->getText();
                             bool argPtr = entry->pointer() != nullptr;
-                            // Apply active type substitutions (e.g. T -> int inside generic body)
+                            bool argView = IsArrayViewArg(entry);
+                            // Apply active type substitutions (e.g. T -> int inside generic body); a
+                            // substituted arg may itself carry "*"/"[]" (e.g. T bound to "int[]").
                             auto substIt = activeTypeSubstitutions.find(argName);
-                            if (substIt != activeTypeSubstitutions.end()) argName = substIt->second;
-                            if (argPtr) argName += "*";
+                            if (substIt != activeTypeSubstitutions.end())
+                            {
+                                argName = substIt->second;
+                                PeelTypeArgSuffix(argName, argPtr, argView);
+                            }
+                            if (argView) argName += "[]";
+                            else if (argPtr) argName += "*";
                             typeArgs.push_back(argName);
                         }
                     }
@@ -1708,16 +1784,14 @@ private:
                     typeName = typeSpec->getText();
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
                     bool substPointer = false;
+                    bool substArrayView = false;
                     auto substIt = activeTypeSubstitutions.find(typeName);
                     if (substIt != activeTypeSubstitutions.end())
                     {
+                        // A substituted type may carry a "*" (pointer) or "[]" (noalias array-view)
+                        // suffix - e.g. a tuple pack param bound to "int[]". Extract it into flags.
                         typeName = substIt->second;
-                        // If substituted type includes pointer suffix (e.g. "Employee*"), extract it
-                        while (!typeName.empty() && typeName.back() == '*')
-                        {
-                            typeName.pop_back();
-                            substPointer = true;
-                        }
+                        PeelTypeArgSuffix(typeName, substPointer, substArrayView);
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search)
                     typeName = Compiler(declSpecs)->ResolveQualifiedName(typeName);
@@ -1732,6 +1806,13 @@ private:
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
                     declType.TypeName = typeName;
                     if (substPointer) declType.Pointer = true;
+                    if (substArrayView)
+                    {
+                        // T bound to a `T[]` arg: the field/local is a noalias array-view (a thin
+                        // pointer repr carrying the contract), exactly like a written `T[]`.
+                        declType.IsArrayView = true;
+                        declType.Pointer = true;
+                    }
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
@@ -11616,7 +11697,13 @@ public:
                 loaded = compiler->builder->CreateSExt(loaded, llvm::Type::getInt32Ty(*compiler->context));
                 elemValues.back() = loaded;
             }
-            if (nv.TypeAndValue.Pointer && !typeName.empty() && typeName.back() != '*')
+            // Encode the element's reference kind in the type-arg string so the constructed
+            // tuple mangles to the same name as its declared `(T[], ...)` / `tuple<T*, ...>` type:
+            // "[]" for a noalias array-view, "*" for a plain pointer.
+            if (nv.TypeAndValue.IsArrayView && !typeName.empty() && typeName.back() != ']')
+                typeName += "[]";
+            else if (nv.TypeAndValue.Pointer && !nv.TypeAndValue.IsArrayView
+                     && !typeName.empty() && typeName.back() != '*')
                 typeName += "*";
             typeArgs.push_back(typeName);
         }
@@ -12159,11 +12246,7 @@ public:
                     break;
                 std::vector<std::string> typeArgs;
                 for (auto* entry : tts->tupleTypeEntry())
-                {
-                    std::string argName = entry->typeSpecifier()->getText();
-                    if (entry->pointer() != nullptr) argName += "*";
-                    typeArgs.push_back(argName);
-                }
+                    typeArgs.push_back(TupleEntryArgName(entry));
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
                 if (!instantiatedGenerics.count(mangledName))
                 {

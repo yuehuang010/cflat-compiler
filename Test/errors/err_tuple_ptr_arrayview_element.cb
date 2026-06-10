@@ -1,0 +1,10 @@
+// Pointer-to-array-view `T[]*` is not a valid type anywhere, including as a tuple element.
+// Must surface a real message, not an ANTLR "no viable alternative" dump.
+import "tuple.cb";
+
+extern int main()
+{
+    expect_error("'T[]' is the only bracketed form valid as a tuple element");
+    (int[]*, int) t = default;
+    return 0;
+}
