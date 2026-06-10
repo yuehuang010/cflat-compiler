@@ -15299,9 +15299,19 @@ public:
             try
             {
                 if (hasF)
-                    return std::stof(numberPart);
-                else
-                    return std::stod(numberPart);
+                    return std::stof(numberPart);   // explicit 'f' suffix -> float
+                if (hasD)
+                    return std::stod(numberPart);   // explicit 'd' suffix -> double
+
+                // No suffix: mirror the integer rule (pick the smallest type that holds the
+                // value exactly). Use float if the literal round-trips through float without
+                // loss of precision; otherwise fall back to double. So 1.5 -> f32, but a
+                // literal like 3.141592653589793 that loses precision in float stays f64.
+                double dval = std::stod(numberPart);
+                float fval = static_cast<float>(dval);
+                if (static_cast<double>(fval) == dval)
+                    return fval;
+                return dval;
             }
             catch (...) { return 0.0; }
         }

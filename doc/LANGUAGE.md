@@ -1347,6 +1347,27 @@ float  f   = 1.5f;
 double d   = 1e3;    // 1000.0
 ```
 
+**Default literal width.** A suffix-less literal is typed as the *smallest* type that
+holds its value exactly - the literal carries no width of its own, so context (the
+target type, an overload, an enclosing expression) can still widen it:
+
+- **Integers**: `5` is `i8`, `300` is `i16`, `100000` is `i32`, and a value past `i32`
+  is `i64`. Widening to a larger type is implicit; narrowing is not.
+- **Floating point**: a no-suffix decimal is `float` (f32) when it round-trips through
+  float without loss of precision, otherwise `double` (f64). So `1.5` and `100.0` are
+  `float`, while `0.1` and `3.141592653589793` (which lose precision in float) are
+  `double`. The `f` suffix always forces `float`.
+
+```c
+auto a = 1.5;    // float  - exact in f32
+auto b = 0.1;    // double - not exact in f32
+auto c = 1.5f;   // float  - explicit suffix
+```
+
+> Because narrowing is never implicit, a literal that the compiler typed as the wider
+> form does not silently fit a narrower target: assigning `0.1` (double) to a `float`
+> needs an explicit cast, just as assigning `300` (i16) to an `i8` does.
+
 ### Built-in Identifiers
 
 ```c

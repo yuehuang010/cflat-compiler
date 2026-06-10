@@ -2041,6 +2041,7 @@ extern int main()
     total++; passed += testArrayFieldInit()              ? 1 : 0;
     total++; passed += testAlignas()                     ? 1 : 0;
     total++; passed += testConstFold()                   ? 1 : 0;
+    total++; passed += testFloatLiteralWidth()            ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -2814,6 +2815,35 @@ bool testConstFold()
     int a = 4;
     int k = 1024;
     result &= Test("fold==runtime mul", 4 * 1024 * 1024, a * k * k);
+
+    return result;
+}
+
+// =============================================================
+// Floating-point literal default width
+// =============================================================
+// Like small integer literals (1 is i8), a no-suffix decimal literal is typed as
+// the smallest float type that holds it exactly: float (f32) when it round-trips
+// through float without loss, otherwise double (f64). An explicit 'f' suffix always
+// forces float. These overloads let the literal pick the matching parameter type.
+int whichFp(float x)  { return 1; }   // float  selected
+int whichFp(double x) { return 2; }   // double selected
+
+bool testFloatLiteralWidth()
+{
+    bool result = true;
+
+    // Exact in float -> f32.
+    result &= Test("1.5 is float",    whichFp(1.5),   1);
+    result &= Test("100.0 is float",  whichFp(100.0), 1);
+    result &= Test("0.5 is float",    whichFp(0.5),   1);
+
+    // 'f' suffix forces float.
+    result &= Test("1.5f is float",   whichFp(1.5f),  1);
+
+    // Not representable exactly in float -> f64.
+    result &= Test("0.1 is double",   whichFp(0.1),                 2);
+    result &= Test("pi is double",    whichFp(3.141592653589793),   2);
 
     return result;
 }

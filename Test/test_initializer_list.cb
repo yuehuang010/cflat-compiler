@@ -6,9 +6,10 @@
 //   T[]              = {v0, v1, ...}    -> length-inferred backing array; thin T* points at elem 0
 //
 // CFlat does NOT implicitly down-convert, and the container paths (list/array/dictionary) drive
-// add()/set() through overload resolution, so a narrowing element literal does not match:
-// `list<float> = {1.5}` (1.5 is double) and `list<u8> = {255}` (literal wider than u8) are
-// intentionally rejected today. Those cases are DISABLED below pending narrowing-conversion work.
+// add()/set() through overload resolution, so a genuinely narrowing element literal does not
+// match: `list<u8> = {255}` (literal wider than u8) is intentionally rejected today, and is
+// DISABLED below pending narrowing-conversion work. Note float literals default to f32 (1.5 is
+// float, not double), so `list<float> = {1.5}` is NOT a narrow and is exercised here.
 //
 // Note: nested generic containers (list<list<int>>) are a separate, unrelated generics
 // limitation - that type does not instantiate at all today - so they are out of scope here.
@@ -42,9 +43,13 @@ extern int main()
     total++; passed += Test("list<string>[0]", ls.get(0), "alpha");
     total++; passed += Test("list<string>[2]", ls.get(2), "gamma");
 
-    // DISABLED (narrowing element literals - no implicit down-convert; pending later work):
-    //   list<u8>    lu = {1, 2, 255};      // int literal -> u8
-    //   list<float> lf = {1.5, 2.5};       // double literal -> float
+    list<float> lf = {1.5, 2.5};   // 1.5/2.5 are f32 literals -> match float element
+    total++; passed += Test("list<float> count", lf.count(), 2);
+    total++; passed += Test("list<float>[0]", lf.get(0), 1.5f);
+    total++; passed += Test("list<float>[1]", lf.get(1), 2.5f);
+
+    // DISABLED (genuine narrowing - no implicit down-convert; pending later work):
+    //   list<u8>    lu = {1, 2, 255};      // int literal -> u8 narrows
 
     // ===== array<T> =====
     array<int> ai = {1, 2, 3, 4};
@@ -54,7 +59,9 @@ extern int main()
     array<i64> al = {100, 200};                // widening: int literals -> i64 (allowed)
     total++; passed += Test("array<i64>[0]", al.get(0), (i64)100);
 
-    // DISABLED (narrowing): array<float> af = {1.5, 2.5};
+    array<float> af = {1.5, 2.5};              // f32 literals -> float element
+    total++; passed += Test("array<float>[0]", af.get(0), 1.5f);
+    total++; passed += Test("array<float>[1]", af.get(1), 2.5f);
 
     // ===== dictionary<K,V> =====
     dictionary<int, int> di = {1: 100, 2: 200, 3: 300};
@@ -92,7 +99,9 @@ extern int main()
     total++; passed += Test("bool[3][0]", fg[0], true);
     total++; passed += Test("bool[3][2]", fg[2], true);
 
-    // DISABLED (narrowing): float[3] fc = {1.5, 2.5, 3.0};
+    float[3] fc = {1.5, 2.5, 3.0};             // f32 literals
+    total++; passed += Test("float[3][0]", fc[0], 1.5f);
+    total++; passed += Test("float[3][2]", fc[2], 3.0f);
 
     // ===== length-inferred array-view T[] (thin T* over a backing array) =====
     int[] iv = {11, 22, 33};
@@ -106,7 +115,9 @@ extern int main()
     total++; passed += Test("string[] sv[0]", sv[0], "x");
     total++; passed += Test("string[] sv[1]", sv[1], "y");
 
-    // DISABLED (narrowing): float[] fv = {1.5, 2.5};
+    float[] fv = {1.5, 2.5};                   // f32 literals; thin float* over backing array
+    total++; passed += Test("float[] fv[0]", fv[0], 1.5f);
+    total++; passed += Test("float[] fv[1]", fv[1], 2.5f);
 
     if (passed == total)
     {
