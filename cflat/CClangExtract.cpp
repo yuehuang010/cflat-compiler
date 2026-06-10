@@ -193,7 +193,9 @@ namespace cflat_cinterop
 
             DeclVisitor(ASTContext& c, ExtractState& s) : ctx(c), sm(c.getSourceManager()), st(s) {}
 
-            bool LocOf(const Decl* d, std::string& file, int& line, int& col) const
+            // Resolve a decl's presumed location WITHOUT applying the in-scope filter. Returns
+            // false only on an invalid/unknown location.
+            bool LocOfRaw(const Decl* d, std::string& file, int& line, int& col) const
             {
                 SourceLocation loc = d->getLocation();
                 if (loc.isInvalid()) return false;
@@ -202,6 +204,14 @@ namespace cflat_cinterop
                 file = pl.getFilename() ? pl.getFilename() : "";
                 line = (int)pl.getLine();
                 col = (int)pl.getColumn();
+                return true;
+            }
+
+            // Location plus the in-scope gate: used by functions/enums/globals where an
+            // out-of-scope decl must be dropped outright (not part of the bound API surface).
+            bool LocOf(const Decl* d, std::string& file, int& line, int& col) const
+            {
+                if (!LocOfRaw(d, file, line, col)) return false;
                 if (st.req.requireInScope && !PathInScope(file, st.req.inScopeDirs)) return false;
                 return true;
             }
@@ -281,8 +291,12 @@ namespace cflat_cinterop
                             RawRecord nested;
                             nested.name = synTag;
                             nested.isUnion = isUnion;
+                            // A synthetic anonymous member is never independently in-scope; it is
+                            // pulled into the kept set only when its enclosing record is (via the
+                            // "struct <tag>__anon<N>" field reference the closure walk follows).
+                            nested.inScope = false;
                             std::string nf; int nl = 1, nc = 0;
-                            if (LocOf(anon, nf, nl, nc)) { nested.file = nf; nested.line = nl; nested.col = nc; }
+                            if (LocOfRaw(anon, nf, nl, nc)) { nested.file = nf; nested.line = nl; nested.col = nc; }
                             CollectFields(anon, synTag, nested);
                             st.out.records.push_back(std::move(nested));
 
@@ -310,12 +324,18 @@ namespace cflat_cinterop
             {
                 if (!rd->isThisDeclarationADefinition() || !rd->getIdentifier()) return true;
                 std::string file; int line = 1, col = 0;
-                if (!LocOf(rd, file, line, col)) return true;
+                // Collect records regardless of scope (LocOfRaw, not LocOf): an in-scope struct
+                // may reference an out-of-scope struct by value (e.g. MSG.pt is a POINT defined
+                // in the SDK shared/ dir). The backend keeps the transitive closure of in-scope
+                // records and drops the rest, so the dependency is available without registering
+                // every unrelated SDK struct.
+                if (!LocOfRaw(rd, file, line, col)) return true;
 
                 RawRecord rec;
                 rec.name = rd->getNameAsString();
                 rec.isUnion = rd->isUnion();
                 rec.file = file; rec.line = line; rec.col = col;
+                rec.inScope = !st.req.requireInScope || PathInScope(file, st.req.inScopeDirs);
                 CollectFields(rd, rec.name, rec);
                 st.out.records.push_back(std::move(rec));
                 return true;

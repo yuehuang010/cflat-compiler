@@ -237,6 +237,17 @@ bool     b = default;   // false
 MyStruct s = default;   // fields get their declared initial values
 ```
 
+A struct field that has **no declared initializer** is zero-filled (0 / `false` / `nullptr`), so `= default` always produces a fully-initialized value - no field is left holding stack garbage:
+
+```c
+struct Mixed { int a = 7; int b; int c = 9; int d; };
+
+Mixed m = default;      // a = 7, b = 0, c = 9, d = 0
+Mixed z = {};           // same - `= {}` is the empty-brace spelling of value-init
+```
+
+The recommended style is still to give every field its own `= default` at the declaration (the standard library does this throughout), but a field that slips through is zeroed rather than left undefined.
+
 ---
 
 ### Brace Initializers
@@ -397,6 +408,8 @@ int apply(function<int(int, int)> f, int a, int b) { return f(a, b); }
 
 apply(add, 5, 6);   // 11
 ```
+
+> **Passing a function to C code.** A CFlat `function<T>` is a 16-byte `{code, env}` closure, not a bare C function pointer. To pass a callback to a C function-pointer parameter (`qsort`, a Win32 `WNDPROC`, ...), pass a **non-capturing named function directly**; a lambda or a `function<>` variable is rejected at compile time because C cannot carry the closure's captured state. Win32 callbacks should also be marked `stdcall`. See [C Interop: passing a CFlat function as a C callback](C_INTEROP.md#passing-a-cflat-function-as-a-c-callback).
 
 ### Lambdas
 

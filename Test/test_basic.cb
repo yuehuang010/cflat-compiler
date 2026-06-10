@@ -1954,6 +1954,64 @@ bool testBoolArithmetic()
     return result;
 }
 
+// `= default`, `= {}`, a bare declaration, and the `new` (heap) forms must all run the default
+// constructor, which zero-fills any field that has no declared initializer (no stack/heap garbage)
+// while preserving fields that do. Regression for the default-ctor undef-seed bug.
+struct DefInitMixed  { int a = 7; int b; int c = 9; int d; };
+struct DefInitAllBare { int x; int y; i64 z; void* p; };
+
+bool testStructDefaultZeroFill()
+{
+    bool result = true;
+
+    DefInitMixed m = default;
+    result &= Test("default mixed a", m.a, 7);
+    result &= Test("default mixed b", m.b, 0);   // bare field zeroed
+    result &= Test("default mixed c", m.c, 9);
+    result &= Test("default mixed d", m.d, 0);   // bare field zeroed
+
+    DefInitMixed m2 = {};                         // empty-brace value-init
+    result &= Test("brace mixed a", m2.a, 7);
+    result &= Test("brace mixed b", m2.b, 0);
+    result &= Test("brace mixed c", m2.c, 9);
+    result &= Test("brace mixed d", m2.d, 0);
+
+    DefInitAllBare z = default;                   // all fields bare -> fully zeroed
+    result &= Test("default allbare x", z.x, 0);
+    result &= Test("default allbare y", z.y, 0);
+    result &= Test("default allbare z", z.z, (i64)0);
+    result &= Test("default allbare p null", z.p == nullptr, true);
+
+    DefInitAllBare bare;                          // bare declaration runs the same ctor
+    result &= Test("bare-decl allbare x", bare.x, 0);
+    result &= Test("bare-decl allbare p null", bare.p == nullptr, true);
+
+    // `new` (heap): malloc does not zero, so this proves the constructor initializes the fields.
+    DefInitAllBare* hz = new DefInitAllBare;
+    result &= Test("new allbare x", hz.x, 0);
+    result &= Test("new allbare z", hz.z, (i64)0);
+    result &= Test("new allbare p null", hz.p == nullptr, true);
+    delete hz;
+
+    DefInitMixed* hm = new DefInitMixed();
+    result &= Test("new mixed a", hm.a, 7);
+    result &= Test("new mixed b", hm.b, 0);
+    delete hm;
+
+    DefInitMixed* ha = new DefInitMixed[3];
+    bool arrOk = true;
+    int i = 0;
+    while (i < 3)
+    {
+        if (ha[i].a != 7 || ha[i].b != 0 || ha[i].c != 9 || ha[i].d != 0) arrOk = false;
+        i = i + 1;
+    }
+    result &= Test("new mixed[3] value-init", arrOk, true);
+    delete ha;
+
+    return result;
+}
+
 extern int main()
 {
     MyStruct my = MyStruct();
@@ -1997,6 +2055,7 @@ extern int main()
     total++; passed += testReturnDefaultPrimitives()     ? 1 : 0;
     total++; passed += testReturnDefaultPointers()       ? 1 : 0;
     total++; passed += testReturnDefaultStruct()         ? 1 : 0;
+    total++; passed += testStructDefaultZeroFill()       ? 1 : 0;
     total++; passed += testReturnDefaultString()         ? 1 : 0;
     total++; passed += testReturnDefaultConditional()    ? 1 : 0;
     total++; passed += Test("testNewDelete", testNewDelete(), 42);

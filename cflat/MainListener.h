@@ -12576,7 +12576,11 @@ public:
                     initializers.push_back(rvalue);
                 }
 
-                llvm::Value* structVal = llvm::UndefValue::get(structType);
+                // Seed with zero (not undef) so fields lacking an explicit initializer read as
+                // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
+                // do have an initializer are overwritten by CreateInsertValue below, so a
+                // fully-initialized struct optimizes to the same IR as the old undef seed.
+                llvm::Value* structVal = llvm::Constant::getNullValue(structType);
 
                 LLVMBackend::TypeAndValue myStruct;
                 myStruct.TypeName = structName;
@@ -14014,7 +14018,11 @@ public:
                 initializers.push_back(rvalue);
             }
 
-            llvm::Value* structVal = llvm::UndefValue::get(structType);
+            // Seed with zero (not undef) so fields lacking an explicit initializer read as
+            // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
+            // do have an initializer are overwritten by CreateInsertValue below, so a
+            // fully-initialized struct optimizes to the same IR as the old undef seed.
+            llvm::Value* structVal = llvm::Constant::getNullValue(structType);
             unsigned int idx = 0;
             for (auto* rvalue : initializers)
             {
@@ -14339,7 +14347,11 @@ public:
                 initializers.push_back(rvalue);
             }
 
-            llvm::Value* structVal = llvm::UndefValue::get(structType);
+            // Seed with zero (not undef) so fields lacking an explicit initializer read as
+            // 0/null after `= default` / `= {}` instead of leaking stack garbage. Fields that
+            // do have an initializer are overwritten by CreateInsertValue below, so a
+            // fully-initialized struct optimizes to the same IR as the old undef seed.
+            llvm::Value* structVal = llvm::Constant::getNullValue(structType);
             unsigned int idx = 0;
             for (auto* rvalue : initializers)
             {

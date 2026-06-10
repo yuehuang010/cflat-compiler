@@ -56,6 +56,12 @@ namespace cflat_cinterop
         std::string file;
         int line = 1;
         int col = 0;
+        // True when the record's definition is under the in-scope dirs (the bound header's own
+        // dir / the --c-include roots). Records are collected regardless of scope so that an
+        // in-scope struct's by-value dependency types (e.g. POINT in MSG, defined in the SDK's
+        // shared/ dir) can still be registered; the backend keeps the transitive closure of
+        // in-scope records and drops the rest. Always true on the requireInScope=false (.c) path.
+        bool inScope = true;
     };
 
     // typedef Name = canonical spelling of the aliased type. Mirrors CollectCTypedefsLibclang.

@@ -1160,6 +1160,10 @@ private:
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
+        // `typedef struct Tag {...} Name;` aliases (Name -> Tag) surfaced from a header bind so the
+        // user can write the typedef name (MSG) instead of the bare tag (tagMSG). Cached so a
+        // disk-cache hit replays them; empty for the .c path.
+        std::vector<std::pair<std::string, std::string>> recordAliases;
         // Populated only for deep-mode disk-cache entries; empty otherwise (shallow validation).
         std::vector<CHeaderDep> deps;
     };
@@ -2989,6 +2993,115 @@ private:
                 cTypedefMap_.emplace(t.name, t.underlying);
     }
 
+    // Surface `typedef struct Tag {...} Name;` (a by-value record typedef) as a CFlat type alias
+    // Name -> Tag, so a user can write the familiar typedef name (MSG, RECT, WNDCLASSEXA) rather
+    // than the bare clang tag (tagMSG, ...). MUST run after RegisterCRecords so the target tag is
+    // already in dataStructures. Pointer / array / scalar typedefs are left to the C type mapper.
+    // Fills `out` with the (alias, target) pairs so the disk cache can replay them on a hit.
+    void CollectRecordTypedefAliases(const cflat_cinterop::ExtractResult& raw,
+                                     std::vector<std::pair<std::string, std::string>>& out)
+    {
+        auto trim = [](std::string& x) {
+            size_t a = x.find_first_not_of(" \t");
+            size_t b = x.find_last_not_of(" \t");
+            x = (a == std::string::npos) ? std::string{} : x.substr(a, b - a + 1);
+        };
+        for (const auto& t : raw.typedefs)
+        {
+            if (t.name.empty() || t.underlying.empty() || t.name == t.underlying) continue;
+            if (t.underlying.find('*') != std::string::npos) continue;   // pointer typedef (LPMSG)
+            if (t.underlying.find('[') != std::string::npos) continue;   // array typedef
+            std::string tag = t.underlying;
+            trim(tag);
+            if (tag.rfind("const ", 0) == 0)    { tag.erase(0, 6); trim(tag); }
+            if (tag.rfind("struct ", 0) == 0)   tag.erase(0, 7);
+            else if (tag.rfind("union ", 0) == 0) tag.erase(0, 6);
+            trim(tag);
+            if (tag.empty() || tag == t.name) continue;
+            if (dataStructures.find(tag) == dataStructures.end()) continue;  // not a registered record
+            out.emplace_back(t.name, tag);
+        }
+    }
+
+    // Register record-typedef aliases (from CollectRecordTypedefAliases or a cache entry). Never
+    // shadows a real type or an existing alias (first-writer-wins).
+    void RegisterRecordAliases(const std::vector<std::pair<std::string, std::string>>& aliases)
+    {
+        for (const auto& [alias, target] : aliases)
+        {
+            if (dataStructures.find(alias) != dataStructures.end()) continue;  // real type wins
+            if (typeAliases.find(alias) != typeAliases.end()) continue;        // first-writer-wins
+            RegisterTypeAlias(alias, target);
+        }
+    }
+
+    // For a header bind, the extractor collects records both in and out of scope (see
+    // RawRecord::inScope). Registering every out-of-scope SDK struct would flood the type table,
+    // but an in-scope struct is useless if a struct it embeds BY VALUE was dropped (the in-scope
+    // struct then fails to size and is itself skipped - the cascade that made MSG/WNDCLASSEXA
+    // unavailable from windows.h). This keeps the transitive closure of in-scope records over
+    // their by-value field dependencies and drops the rest, in place.
+    void PruneRecordsToNeededClosure(std::vector<cflat_cinterop::RawRecord>& records)
+    {
+        // Last definition wins on a duplicate tag (forward decls are not definitions, so this is
+        // rare); the index just needs to resolve a referenced tag to some record we can keep.
+        std::unordered_map<std::string, size_t> byName;
+        for (size_t i = 0; i < records.size(); ++i)
+            if (!records[i].name.empty()) byName[records[i].name] = i;
+
+        // Extract the referenced record tag from a field's canonical C type spelling, but ONLY
+        // when the field embeds the aggregate by value (a pointer field is pointer-sized whether
+        // or not the pointee is registered, so it creates no sizing dependency). Returns "" for
+        // pointer / scalar / enum fields.
+        auto byValueDep = [](const std::string& ctype) -> std::string {
+            if (ctype.find('*') != std::string::npos) return {};   // pointer: no sizing dependency
+            std::string s = ctype;
+            if (auto br = s.find('['); br != std::string::npos) s = s.substr(0, br);  // drop array suffix
+            auto trim = [](std::string& x) {
+                size_t a = x.find_first_not_of(" \t");
+                size_t b = x.find_last_not_of(" \t");
+                x = (a == std::string::npos) ? std::string{} : x.substr(a, b - a + 1);
+            };
+            trim(s);
+            // Strip leading qualifiers / tag keywords to reach the bare tag name.
+            for (;;)
+            {
+                if (s.rfind("const ", 0) == 0)    { s.erase(0, 6); trim(s); continue; }
+                if (s.rfind("volatile ", 0) == 0) { s.erase(0, 9); trim(s); continue; }
+                if (s.rfind("struct ", 0) == 0)   { s.erase(0, 7); trim(s); continue; }
+                if (s.rfind("union ", 0) == 0)    { s.erase(0, 6); trim(s); continue; }
+                if (s.rfind("enum ", 0) == 0)     return {};   // enum is scalar (int-sized)
+                break;
+            }
+            return s;
+        };
+
+        std::vector<bool> needed(records.size(), false);
+        std::vector<size_t> work;
+        for (size_t i = 0; i < records.size(); ++i)
+            if (records[i].inScope) { needed[i] = true; work.push_back(i); }
+
+        while (!work.empty())
+        {
+            size_t i = work.back(); work.pop_back();
+            for (const auto& f : records[i].fields)
+            {
+                std::string dep = byValueDep(f.ctype);
+                if (dep.empty()) continue;
+                auto it = byName.find(dep);
+                if (it == byName.end() || needed[it->second]) continue;
+                needed[it->second] = true;
+                work.push_back(it->second);
+            }
+        }
+
+        std::vector<cflat_cinterop::RawRecord> kept;
+        kept.reserve(records.size());
+        for (size_t i = 0; i < records.size(); ++i)
+            if (needed[i]) kept.push_back(std::move(records[i]));
+        records.swap(kept);
+    }
+
     // Translate extracted records to CRecordEntry (field type spellings carried through).
     void MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::vector<CRecordEntry>& out)
     {
@@ -3019,6 +3132,7 @@ private:
                              std::vector<CMacroEntry>& outMacros,
                              std::vector<CFunctionMacroEntry>& outFuncMacros,
                              std::vector<CGlobalEntry>& outGlobals,
+                             std::vector<std::pair<std::string, std::string>>& outAliases,
                              const std::vector<std::string>& extraDefines = {},
                              std::vector<std::string>* outIncludes = nullptr)
     {
@@ -3055,11 +3169,19 @@ private:
             AdoptRawTypedefs(raw);
         }
 
-        // Records first, then register, so struct-by-value param/return types resolve.
+        // Records first, then register, so struct-by-value param/return types resolve. Prune to
+        // the in-scope set plus the by-value dependency closure before mapping, so the cache and
+        // the type table carry the dependency structs (e.g. POINT for MSG) but not every
+        // unrelated out-of-scope SDK struct.
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", headerPath);
+            PruneRecordsToNeededClosure(raw.records);
             MapRawRecords(raw, outRecords);
             RegisterCRecords(outRecords, headerPath);
+            // Surface `typedef struct Tag {...} Name;` as Name -> Tag aliases now that the tags
+            // are registered, so the user can write MSG/RECT/WNDCLASSEXA, not tagMSG/...
+            CollectRecordTypedefAliases(raw, outAliases);
+            RegisterRecordAliases(outAliases);
         }
 
         {
@@ -3372,6 +3494,17 @@ private:
                                            << "' of type '" << f.ctype << "'\n";
                     ok = false;
                     break;
+                }
+                // A C function-pointer field (e.g. WNDPROC lpfnWndProc in WNDCLASSEXA) occupies a
+                // single bare pointer in the C ABI. CFlat's function<T> is a 16-byte {code, env}
+                // fat closure, so keeping IsFunctionPointer here would oversize the struct and
+                // shift every following field's offset (sizeof(WNDCLASSEXA) -> 88 instead of 80).
+                // Collapse to an opaque void*; the user stores `(void*)namedFunction` into it.
+                if (tv.IsFunctionPointer)
+                {
+                    tv = TypeAndValue{};
+                    tv.TypeName = "void";
+                    tv.Pointer  = true;
                 }
                 DeclTypeAndValue d;
                 static_cast<TypeAndValue&>(d) = tv;
@@ -3845,6 +3978,7 @@ private:
         std::vector<CMacroEntry> hitMacros;
         std::vector<CFunctionMacroEntry> hitFuncMacros;
         std::vector<CGlobalEntry> hitGlobals;
+        std::vector<std::pair<std::string, std::string>> hitAliases;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -3856,14 +3990,16 @@ private:
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
-                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals; hit = true;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
+                    hitAliases = entry.recordAliases; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
                     if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
                     entry.mtime = currentMtime;
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
-                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals; hit = true;
+                    hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
+                    hitAliases = entry.recordAliases; hit = true;
                 }
             }
         }
@@ -3871,6 +4007,7 @@ private:
         {
             // Records before sigs so struct-by-value signatures resolve to the same types.
             RegisterCRecords(hitRecords, fileForLsp);
+            RegisterRecordAliases(hitAliases);
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
@@ -3896,6 +4033,7 @@ private:
                     cFileSigCache_[cacheKey] = diskEntry;
                 }
                 RegisterCRecords(diskEntry.records, fileForLsp);
+                RegisterRecordAliases(diskEntry.recordAliases);
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
                 RegisterCEnums(diskEntry.enums, fileForLsp);
                 RegisterCMacros(diskEntry.macros);
@@ -3911,6 +4049,7 @@ private:
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
+        std::vector<std::pair<std::string, std::string>> aliases;
         // Deep mode: collect the transitive include set so the disk entry can validate it.
         bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
         std::vector<std::string> includes;
@@ -3920,7 +4059,7 @@ private:
             // preprocess-only prepass for macro names). No clang-cl, no libclang.
             llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
             if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, globals,
-                                     extraDefines, wantDeps ? &includes : nullptr))
+                                     aliases, extraDefines, wantDeps ? &includes : nullptr))
                 return false;
         }
 
@@ -3935,6 +4074,7 @@ private:
             entry.macros = macros;
             entry.funcMacros = funcMacros;
             entry.globals = globals;
+            entry.recordAliases = aliases;
             // Build the transitive dependency list (deep mode): keep only paths that resolve
             // to a real file on disk - this drops the virtual stub and clang pseudo-files,
             // and dedups. A non-existent dep would otherwise poison every later validation.
@@ -8523,9 +8663,19 @@ public:
                             escFn->setLinkage(llvm::Function::ExternalLinkage);
                     if (val && val->getType()->isStructTy())
                     {
-                        // Fat struct - extract the fn ptr (field 0) and cast to expected type.
-                        auto* fnI8 = builder->CreateExtractValue(val, {0u});
-                        val = builder->CreateBitCast(fnI8, llvmParamTy, "fn_for_extern");
+                        // The argument is a CFlat closure fat struct {code, env} - a lambda or a
+                        // `function<>` variable. A C function pointer is a bare code address with
+                        // no env slot, so handing the closure across the C ABI loses the captured
+                        // state (and the code pointer expects an env argument the C caller never
+                        // supplies) - the call would read garbage and crash. C does not support
+                        // closures, so reject this instead of emitting a silent miscompile. The
+                        // supported form is a non-capturing named function passed directly, which
+                        // arrives here as a bare llvm::Function pointer (handled below).
+                        LogError(std::format(
+                            "cannot pass a lambda or 'function<>' variable to C function-pointer parameter '{}': "
+                            "a C callback is a bare code pointer and cannot carry captured state. "
+                            "Pass a non-capturing named function directly (e.g. the function's name), not a lambda or a 'function<>' variable.",
+                            candParamItr->VariableName));
                     }
                     else if (val && !val->getType()->isPointerTy())
                     {
@@ -10390,8 +10540,10 @@ public:
 
         int version = j.value("version", 0);
         // v1/v2 stored float macro values as JSON numbers, which encode inf/NaN as `null`
-        // and throw on reload; only v3 (raw-bits float encoding) is safe to consume.
-        if (version != 3) return false;
+        // and throw on reload; v3 used the raw-bits float encoding but cached only in-scope
+        // records (so an entry written before the by-value dependency closure was added would
+        // still be missing the dependency structs). v4 caches the in-scope + dependency set.
+        if (version != 4) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -10413,6 +10565,9 @@ public:
             if (j.contains("macros"))     for (const auto& m : j["macros"])     entry.macros.push_back(MacroFromJson(m));
             if (j.contains("funcMacros")) for (const auto& m : j["funcMacros"]) entry.funcMacros.push_back(FuncMacroFromJson(m));
             if (j.contains("globals"))    for (const auto& g : j["globals"])    entry.globals.push_back(GlobalFromJson(g));
+            if (j.contains("recordAliases"))
+                for (const auto& a : j["recordAliases"])
+                    entry.recordAliases.emplace_back(a.value("a", std::string{}), a.value("t", std::string{}));
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
             // Shallow entries (no "deps") skip this and rely on the top-header check above.
@@ -10447,7 +10602,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 3;
+        j["version"] = 4;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 
@@ -10469,6 +10624,10 @@ public:
         nlohmann::json globals = nlohmann::json::array();
         for (const auto& g : entry.globals) globals.push_back(GlobalToJson(g));
         j["globals"] = globals;
+        nlohmann::json recordAliases = nlohmann::json::array();
+        for (const auto& a : entry.recordAliases)
+            recordAliases.push_back({{"a", a.first}, {"t", a.second}});
+        j["recordAliases"] = recordAliases;
 
         // Deep mode only: the transitive include set for strict (transitive) validation.
         if (!entry.deps.empty())

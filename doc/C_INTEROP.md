@@ -11,6 +11,7 @@ The bundled `clang-cl.exe` / `lld-link.exe` are deployed next to `cflat.exe`, so
 - [Compiling a `.c` File (auto-extern)](#compiling-a-c-file-auto-extern)
 - [Importing a Program (`import program`)](#importing-a-program-import-program)
 - [Binding a Prebuilt C Library (`import package`)](#binding-a-prebuilt-c-library-import-package)
+- [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback)
 - [Binding via vcpkg (`import package-vcpkg`)](#binding-via-vcpkg-import-package-vcpkg)
 
 ---
@@ -93,7 +94,7 @@ import package "curl/curl.h" lib "libcurl.lib" define "CURL_STATICLIB" define "F
 - The inline `lib` clause names an import library to link (resolved relative to the importing `.cb` if relative); it applies to that line only.
 - One or more inline `define` clauses add preprocessor defines scoped to that header's AST dump, appended on top of the CLI `--c-define`. `lib` and `define` are soft keywords and must come after the string, `lib` before `define`.
 
-The compiler AST-dumps a stub that `#include`s the header and registers the externally-linkable function **declarations** plus **enum constants** (as bare globals, matching C's flat enum scope - `CURLOPT_URL`, not `Type.CURLOPT_URL`):
+The compiler AST-dumps a stub that `#include`s the header and registers the externally-linkable function **declarations**, **enum constants** (as bare globals, matching C's flat enum scope - `CURLOPT_URL`, not `Type.CURLOPT_URL`), and the header's **struct / union types**. A `typedef struct tag { ... } Name;` is usable under either name - the tag (`tagMSG`) or the typedef (`MSG`):
 
 ```c
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
@@ -108,7 +109,9 @@ extern int main()
 }
 ```
 
-A source-location filter keeps only declarations under the `--c-include` roots / the header's own directory, so the transitively-included SDK/CRT is excluded. Variadics are supported; `#define`-only constants are **not** (there is no macro in the AST). After a successful link, a sibling runtime DLL of each `--c-lib` is auto-copied next to the exe.
+A source-location filter keeps only **functions / enum constants / macros** declared under the `--c-include` roots / the header's own directory, so the transitively-included SDK/CRT API surface is excluded. **Structs are an exception**: an in-scope struct often embeds a struct defined in a sibling SDK directory by value (e.g. `MSG` contains a `POINT`, which lives in the SDK `shared/` dir), so the compiler additionally registers the transitive by-value dependency closure of the in-scope structs. You therefore get `MSG`, `RECT`, `POINT`, `WNDCLASSEXA`, ... from `import "windows.h"` without hand-declaring them. Variadics are supported. **Object-like `#define` constants are folded** and surfaced as bare globals (e.g. `WM_DESTROY`, `WS_OVERLAPPEDWINDOW`, `SW_SHOW` resolve to their numeric values), provided the macro body folds to an integer / float / string constant; a macro that does not fold to a constant (e.g. one that expands to a function name or token paste) is skipped. After a successful link, a sibling runtime DLL of each `--c-lib` is auto-copied next to the exe.
+
+A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is registered as a bare `void*`, since a C callback slot is a single pointer (CFlat's `function<T>` is a 16-byte closure and would corrupt the struct's ABI layout). Store a CFlat callback into such a field by casting the function's name: `wc.lpfnWndProc = (void*)WndProc;`. See [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback).
 
 ### System headers (e.g. `windows.h`)
 
@@ -127,6 +130,43 @@ cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL
 | `--c-define <NAME[=val]>` | Preprocessor `/D` applied to **every** clang-cl spawn (header dump, `.c` auto-extern dump, `.c` object compile) |
 
 > `--c-define` is process-wide; an inline `define` clause applies only to its own import line and is appended after the CLI defines.
+
+## Passing a CFlat function as a C callback
+
+C APIs frequently take a function pointer (a `qsort` comparator, a Win32 `WNDPROC`, ...). A C function pointer is a **bare code address**. CFlat's `function<T>` is a 16-byte `{code, env}` closure that can carry captured state, so the two are not interchangeable.
+
+**Pass a non-capturing named function directly.** Declare the C parameter as `function<R(Args)>` and hand it the function's name - the compiler lowers the bare code address across the C ABI:
+
+```c
+extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);
+
+int byInt(void* a, void* b) { return *(int*)a - *(int*)b; }
+
+extern int main()
+{
+    int[5] xs = {5, 3, 1, 4, 2};
+    qsort(&xs[0], 5u, 4u, byInt);   // OK - named function passed directly
+    return xs[0];                   // 1
+}
+```
+
+**A lambda or a `function<>` variable is rejected at compile time** when passed to a C function-pointer parameter:
+
+```c
+qsort(&xs[0], 5u, 4u, (int a, int b) => { ... });   // error: cannot pass a lambda ...
+function<int(void*,void*)> f = byInt;
+qsort(&xs[0], 5u, 4u, f);                            // error: ... or 'function<>' variable ...
+```
+
+C cannot carry the closure's env slot, so allowing this would silently drop captured state and crash. Refactor the capture into explicit parameters / globals and pass a plain named function.
+
+**Storing a callback in a C struct field** (e.g. `WNDCLASSEXA.lpfnWndProc`): the field is a bare `void*` (see above), so assign the function's address with a cast - `wc.lpfnWndProc = (void*)WndProc;`.
+
+**`stdcall` callbacks.** A Win32 callback uses the `stdcall` (WINAPI) convention. Mark the CFlat function with the `stdcall` specifier so it matches on the 32-bit target (it is a no-op on x64, but keep it for portability):
+
+```c
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam) { ... }
+```
 
 ## Binding via vcpkg (`import package-vcpkg`)
 

@@ -1,4 +1,4 @@
-// Win32 C-interop regression test. Importing the system <windows.h> header exercises two
+// Win32 C-interop regression test. Importing the system <windows.h> header exercises several
 // compiler paths that previously failed:
 //   1. Function decls reached via clang's auto-detected SDK toolchain (whose presumed paths
 //      carry doubled separators) must pass the in-scope filter - otherwise GetCurrentProcessId
@@ -6,6 +6,11 @@
 //   2. windows.h registers C unions whose members are records cflat had to abandon (an
 //      unsupported field type leaves an opaque, unsized shell). Sizing such a union used to
 //      assert ("Cannot getTypeInfo() on a type that is unsized"); it must now be skipped.
+//   3. Struct import via the by-value dependency closure: an in-scope struct (MSG, WNDCLASSEXA in
+//      um/) embeds a struct from the SDK shared/ dir (POINT/RECT) by value; the dependency must be
+//      pulled in or the in-scope struct fails to size. Typedef names (MSG, not just tagMSG) work,
+//      function-pointer fields are bare void* (correct ABI size), and object-like #define
+//      constants (WM_*, WS_*) are folded from the header bind.
 // cflat auto-resolves the Windows SDK include dir, so no --c-include flag is required.
 import "test_helper.cb";
 import "windows.h";
@@ -25,6 +30,26 @@ extern int main()
     Sleep(1);
     u32 tick2 = GetTickCount();
     total++; passed += Test("GetTickCount monotonic", tick2 >= tick1, true);
+
+    // Struct import: typedef-named Win32 structs resolve with the correct C ABI layout. POINT and
+    // RECT live in the SDK shared/ dir (out of the in-scope um/ dir); the by-value dependency
+    // closure pulls them in so MSG (embeds POINT) and WNDCLASSEXA size correctly.
+    total++; passed += Test("sizeof(POINT)", (int)sizeof(POINT), 8);
+    total++; passed += Test("sizeof(RECT)", (int)sizeof(RECT), 16);
+    total++; passed += Test("sizeof(MSG)", (int)sizeof(MSG), 48);
+    total++; passed += Test("sizeof(WNDCLASSEXA)", (int)sizeof(WNDCLASSEXA), 80);
+
+    // A C function-pointer field (WNDPROC lpfnWndProc) is a bare void*, not a 16-byte closure -
+    // otherwise WNDCLASSEXA would be 88 bytes and every following field would be misaligned.
+    WNDCLASSEXA wc = default;
+    total++; passed += Test("WNDCLASSEXA zero-init", (int)wc.cbSize, 0);
+    total++; passed += Test("WNDCLASSEXA wndproc field is null ptr", wc.lpfnWndProc == nullptr, true);
+
+    // Object-like #define constants are folded from the header bind (no hand-transcribing needed).
+    total++; passed += Test("WM_DESTROY", (int)(u32)WM_DESTROY, 2);
+    total++; passed += Test("WM_COMMAND", (int)(u32)WM_COMMAND, 0x0111);
+    total++; passed += Test("WS_OVERLAPPEDWINDOW", (u32)WS_OVERLAPPEDWINDOW == 0x00CF0000u, true);
+    total++; passed += Test("SW_SHOW", SW_SHOW, 5);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

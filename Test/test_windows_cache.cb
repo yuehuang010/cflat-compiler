@@ -2,7 +2,9 @@
 // bind into the persistent disk cache via the `cache` import clause. The first compile
 // extracts windows.h and writes %USERPROFILE%\.cflat\cheaders\<key>.json; later compiles
 // load the JSON instead of re-running the clang header parse. Either way the extracted
-// decls must be identical, so the same calls resolve and run.
+// decls must be identical, so the same calls resolve and run. The struct + macro checks
+// also verify the cached record set, the cached typedef->tag aliases (recordAliases), and
+// the cached object-like macros survive a disk-cache round-trip.
 import "test_helper.cb";
 import "windows.h" cache;
 
@@ -21,6 +23,20 @@ extern int main()
     Sleep(1);
     u32 tick2 = GetTickCount();
     total++; passed += Test("GetTickCount monotonic (cached)", tick2 >= tick1, true);
+
+    // Cached struct set + typedef aliases (recordAliases) survive the disk-cache round-trip.
+    total++; passed += Test("sizeof(POINT) (cached)", (int)sizeof(POINT), 8);
+    total++; passed += Test("sizeof(RECT) (cached)", (int)sizeof(RECT), 16);
+    total++; passed += Test("sizeof(MSG) (cached)", (int)sizeof(MSG), 48);
+    total++; passed += Test("sizeof(WNDCLASSEXA) (cached)", (int)sizeof(WNDCLASSEXA), 80);
+
+    WNDCLASSEXA wc = default;
+    total++; passed += Test("WNDCLASSEXA wndproc field is null ptr (cached)", wc.lpfnWndProc == nullptr, true);
+
+    // Cached object-like #define constants.
+    total++; passed += Test("WM_DESTROY (cached)", (int)(u32)WM_DESTROY, 2);
+    total++; passed += Test("WS_OVERLAPPEDWINDOW (cached)", (u32)WS_OVERLAPPEDWINDOW == 0x00CF0000u, true);
+    total++; passed += Test("SW_SHOW (cached)", SW_SHOW, 5);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
