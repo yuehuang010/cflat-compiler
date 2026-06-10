@@ -1,0 +1,7 @@
+// T[] cannot infer its length from an empty brace list.
+extern int main()
+{
+    expect_error("cannot infer the length of 'int[]' from an empty initializer list");
+    int[] x = {};
+    return 0;
+}

@@ -4265,9 +4265,24 @@ public:
                 if (typeAndValue.ConstArraySize > 0 &&
                     ((initializer != nullptr && initializer->LeftBrace() != nullptr) || barebraceInit))
                 {
+                    auto* arrInitList = barebraceInit ? barebraceList
+                                      : initializer->initializerList();
+
+                    // Positional fixed-array init: T[N] x = {v0, v1, ...}. Distinguished from
+                    // the value-init forms ({} / {field=v}) by elements that carry no field name.
+                    bool positionalArray = false;
+                    if (arrInitList)
+                        for (auto* fi : arrInitList->fieldInit())
+                            if (fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
+                            { positionalArray = true; break; }
+
                     if (global_scope)
                     {
                         LogErrorContext(initDecl, "array value-initializer '= {}' is not allowed at global scope");
+                    }
+                    else if (positionalArray)
+                    {
+                        EmitPositionalFixedArrayInit(name, typeAndValue, arrInitList, arraySize, line, allocList);
                     }
                     else
                     {
@@ -4311,6 +4326,21 @@ public:
                             }
                         }
                     }
+                    continue;
+                }
+
+                // Length-inferred array-view: T[] x = {v0, v1, ...}. `T[]` is a thin T*, so
+                // the brace list both provides the backing storage and infers its extent.
+                if (typeAndValue.IsArrayView &&
+                    ((initializer != nullptr && initializer->LeftBrace() != nullptr) || barebraceInit))
+                {
+                    // initializerList is optional in the grammar, so empty `{}` yields null here.
+                    auto* arrInitList = barebraceInit ? barebraceList
+                                      : initializer->initializerList();
+                    if (global_scope)
+                        LogErrorContext(initDecl, "array-view initializer '= {}' is not allowed at global scope");
+                    else
+                        EmitArrayViewInferredInit(name, typeAndValue, arrInitList, line, allocList);
                     continue;
                 }
 
@@ -4624,8 +4654,13 @@ public:
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
 
                         // Apply field initializer overrides after the default value is stored.
+                        // A brace list targeting a generic container (list/array/dictionary) is
+                        // desugared into add/init+set/set calls; otherwise it is a struct field-init.
                         if (initializer && initializer->initializerList())
-                            EmitFieldInitializer(alloc, typeAndValue.TypeName, initializer->initializerList());
+                        {
+                            if (!TryEmitContainerInitializer(alloc, typeAndValue, initializer->initializerList()))
+                                EmitFieldInitializer(alloc, typeAndValue.TypeName, initializer->initializerList());
+                        }
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
                         // mark this local as owning so the destructor frees the buffer on scope exit.
@@ -7262,6 +7297,15 @@ public:
         std::unordered_set<std::string> seen;
         for (auto* fi : ctx->fieldInit())
         {
+            // Struct field initializers are named-only ({field = value}). Positional
+            // ({value}) and key:value ({k: v}) forms are reserved for array/list/dictionary
+            // targets and are routed away before reaching here; reject them for structs.
+            if (fi->Identifier() == nullptr)
+            {
+                LogErrorContext(fi, std::format(
+                    "positional initializers are not supported for struct type '{}'; use 'field = value'", typeName));
+                continue;
+            }
             std::string fieldName = fi->Identifier()->getText();
             if (!seen.insert(fieldName).second)
             {
@@ -7277,7 +7321,7 @@ public:
                 if (b.Name == fieldName) { bfHit = &b; break; }
             if (bfHit)
             {
-                auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression());
+                auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
                 llvm::Value* val = LoadNamedVariable(rightNV);
                 if (!val) continue;
 
@@ -7317,7 +7361,7 @@ public:
                 continue;
             }
 
-            auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression());
+            auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             llvm::Value* val = LoadNamedVariable(rightNV);
             if (!val) continue;
 
@@ -7365,6 +7409,306 @@ public:
                 compiler->builder->CreateStore(val, gep);
             }
         }
+    }
+
+    // Coerce a parsed element value to the container's `string` element type.
+    // Mirrors EmitFieldInitializer's string handling: a char* string-literal constant is
+    // wrapped directly; any other char* runtime value goes through operator string(char*).
+    // On success the NV is rebuilt to carry the string aggregate via Storage.
+    void CoerceElementToString(
+        LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& nv,
+        llvm::Value*& val,
+        antlr4::ParserRuleContext* ctx)
+    {
+        if (!val || val->getType() != compiler->builder->getInt8Ty()->getPointerTo())
+            return;
+
+        llvm::Value* strVal = nullptr;
+        auto* c = llvm::dyn_cast<llvm::Constant>(val);
+        if (c && compiler->IsStringLiteralConstant(c))
+        {
+            strVal = compiler->WrapStringLiteralAsString(val);
+        }
+        else if (compiler->GetFunction("operator string"))
+        {
+            LLVMBackend::NamedVariable argNV;
+            argNV.Primary = val;
+            argNV.BaseType = val->getType();
+            argNV.TypeAndValue.TypeName = "char";
+            argNV.TypeAndValue.Pointer = true;
+            strVal = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
+        }
+        if (!strVal)
+            return;
+
+        LLVMBackend::TypeAndValue strTV;
+        strTV.TypeName = "string";
+        auto* strTy = compiler->GetType(strTV);
+        auto* strAlloca = compiler->AllocaAtEntry(strTy, nullptr, "initlist_str");
+        compiler->builder->CreateStore(strVal, strAlloca);
+
+        nv = {};
+        nv.Storage = strAlloca;
+        nv.BaseType = strTy;   // move-param handling dyn_casts BaseType; must not be null
+        nv.TypeAndValue.TypeName = "string";
+        val = strVal;
+    }
+
+    // Positional fixed-array initializer: T[N] x = {v0, v1, ...}.
+    // Zero-initializes all N slots, then stores the provided elements in order. A count
+    // greater than N is an error; a smaller count leaves the trailing slots zero-filled.
+    // Creates and registers the array local. `elemType` string literals are coerced to string.
+    void EmitPositionalFixedArrayInit(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        llvm::Value* arraySize,
+        size_t line,
+        std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
+    {
+        auto* compiler = Compiler(initList);
+        auto elements = initList->fieldInit();
+        uint64_t n = tv.ConstArraySize;
+
+        if (elements.size() > n)
+        {
+            LogErrorContext(initList, std::format(
+                "too many initializers for '{}[{}]': got {} elements", tv.TypeName, n, elements.size()));
+            return;
+        }
+
+        auto* arrAlloc = compiler->CreateLocalVariable(tv, nullptr, arraySize, line);
+        allocList.push_back(std::pair(name, arrAlloc));
+
+        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
+        auto* elemTy = arrTy->getElementType();
+        // Zero-fill the whole array so unspecified trailing slots are well-defined.
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
+
+        llvm::Value* zero = compiler->builder->getInt32(0);
+        for (size_t i = 0; i < elements.size(); i++)
+        {
+            auto* fi = elements[i];
+            auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            llvm::Value* val = LoadNamedVariable(nv);
+            if (!val) continue;
+
+            if (tv.TypeName == "string"
+                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+            {
+                LLVMBackend::NamedVariable tmp = nv;
+                CoerceElementToString(compiler, tmp, val, fi);
+            }
+
+            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+            auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
+            compiler->CreateAssignment(val, elemPtr, false, elemTy);
+        }
+    }
+
+    // Length-inferred array-view initializer: T[] x = {v0, v1, ...}.
+    // `T[]` is a thin T* (IsArrayView + Pointer), so there is no fixed extent in the type.
+    // We allocate an inline [N x T] backing array on the stack (N = the element count),
+    // fill it positionally, then point the T* local at element 0. The length N is a
+    // compile-time fact only; it is not stored at runtime, matching T[]'s thin repr.
+    void EmitArrayViewInferredInit(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        size_t line,
+        std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList)
+    {
+        auto* compiler = Compiler(initList);
+        std::vector<CFlatParser::FieldInitContext*> elements;
+        if (initList != nullptr)
+            elements = initList->fieldInit();
+
+        if (elements.empty())
+        {
+            compiler->LogError(std::format(
+                "cannot infer the length of '{}[]' from an empty initializer list; use an explicit size '{}[N]'",
+                tv.TypeName, tv.TypeName));
+            return;
+        }
+
+        // Every element must be positional (no `field =` or `key: value`).
+        for (auto* fi : elements)
+        {
+            if (fi->Identifier() != nullptr || fi->assignmentExpression().size() != 1)
+            {
+                LogErrorContext(fi, std::format(
+                    "'{}[]' uses a positional initializer list; named or 'key: value' elements are not allowed",
+                    tv.TypeName));
+                return;
+            }
+        }
+
+        // The element type is T (or T* when the declaration was T*[]): strip the
+        // array-view-ness off a copy of the declared type.
+        LLVMBackend::TypeAndValue elemTV = tv;
+        elemTV.IsArrayView = false;
+        elemTV.Pointer = tv.ElemPointer;
+        elemTV.ElemPointer = false;
+        elemTV.ConstArraySize = 0;
+        llvm::Type* elemTy = compiler->GetType(elemTV);
+
+        uint64_t n = elements.size();
+        auto* arrTy = llvm::ArrayType::get(elemTy, n);
+        auto* backing = compiler->AllocaAtEntry(arrTy, nullptr, "arrview_backing");
+
+        llvm::Value* zero = compiler->builder->getInt32(0);
+        for (size_t i = 0; i < elements.size(); i++)
+        {
+            auto* fi = elements[i];
+            auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+            llvm::Value* val = LoadNamedVariable(nv);
+            if (!val) continue;
+
+            if (tv.TypeName == "string"
+                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+            {
+                LLVMBackend::NamedVariable tmp = nv;
+                CoerceElementToString(compiler, tmp, val, fi);
+            }
+
+            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+            auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, idx }, "arrview_elem");
+            compiler->CreateAssignment(val, elemPtr, false, elemTy);
+        }
+
+        // Create the T* local and point it at element 0 of the backing array.
+        auto* alloc = compiler->CreateLocalVariable(tv, nullptr, nullptr, line);
+        allocList.push_back(std::pair(name, alloc));
+        auto* elem0 = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, zero }, "arrview_data");
+        compiler->builder->CreateStore(elem0, alloc);
+    }
+
+    // Handle brace initializers whose target is a generic container:
+    //   list<T> x       = {a, b};      -> default-construct, then x.add(a); x.add(b);
+    //   array<T> x      = {a, b};      -> default-construct, then x.init(2); x.set(0,a); x.set(1,b);
+    //   dictionary<K,V> x = {k: v};    -> default-construct, then x.set(k, v);
+    // `alloc` must already hold a default-constructed (empty) container. Returns true when
+    // `tv` names a recognized container and the list was consumed here (so the caller skips
+    // EmitFieldInitializer); false otherwise (caller falls back to struct field-init).
+    bool TryEmitContainerInitializer(
+        llvm::Value* alloc,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList)
+    {
+        auto* compiler = Compiler(initList);
+        const std::string& typeName = tv.TypeName;
+
+        const bool isList  = typeName.rfind("list__", 0) == 0;
+        const bool isArray = typeName.rfind("array__", 0) == 0;
+        const bool isDict  = typeName.rfind("dictionary__", 0) == 0;
+        if (!isList && !isArray && !isDict)
+            return false;
+
+        auto elements = initList->fieldInit();
+
+        // self NV referencing the (already default-constructed) container storage.
+        // Rebuilt per call since CreateOverloadedFunctionCall may consume/null move args.
+        auto makeSelf = [&]() {
+            LLVMBackend::NamedVariable selfNV;
+            selfNV.Storage = alloc;
+            selfNV.TypeAndValue.TypeName = typeName;
+            return selfNV;
+        };
+
+        // Parse one element expression into a NamedVariable, coercing string literals to
+        // `string` when the target element type is string. Returns false on a parse error.
+        auto parseElement = [&](CFlatParser::AssignmentExpressionContext* ax,
+                                const std::string& elemType,
+                                LLVMBackend::NamedVariable& outNV) -> bool {
+            outNV = ParseAssignmentExpressionNamed(ax);
+            llvm::Value* val = LoadNamedVariable(outNV);
+            if (!val)
+                return false;
+            if (elemType == "string")
+                CoerceElementToString(compiler, outNV, val, ax);
+            // Overload resolution falls back to BaseType when TypeName is empty (e.g. a bare
+            // literal expression); make sure one of them is populated or it dereferences null.
+            else if (outNV.TypeAndValue.TypeName.empty() && outNV.BaseType == nullptr)
+                outNV.BaseType = val->getType();
+            return true;
+        };
+
+        if (isDict)
+        {
+            // dictionary<K,V>: every element must be `key: value`.
+            // Extract K and V from the mangled name `dictionary__K__V` when it splits cleanly
+            // into exactly two parts (covers primitives and string); otherwise skip coercion.
+            std::string keyType, valType;
+            {
+                std::string args = typeName.substr(std::string("dictionary__").size());
+                size_t sep = args.find("__");
+                if (sep != std::string::npos && args.find("__", sep + 2) == std::string::npos)
+                {
+                    keyType = args.substr(0, sep);
+                    valType = args.substr(sep + 2);
+                }
+            }
+            for (auto* fi : elements)
+            {
+                if (fi->Identifier() != nullptr || fi->assignmentExpression().size() != 2)
+                {
+                    LogErrorContext(fi, std::format(
+                        "dictionary initializer requires 'key: value' pairs for type '{}'", typeName));
+                    continue;
+                }
+                LLVMBackend::NamedVariable keyNV, valNV;
+                if (!parseElement(fi->assignmentExpression(0), keyType, keyNV)) continue;
+                if (!parseElement(fi->assignmentExpression(1), valType, valNV)) continue;
+                compiler->CreateOverloadedFunctionCall("set", { makeSelf(), keyNV, valNV });
+            }
+            return true;
+        }
+
+        // list<T> / array<T>: every element must be positional.
+        const std::string elemType = isList
+            ? typeName.substr(std::string("list__").size())
+            : typeName.substr(std::string("array__").size());
+
+        for (auto* fi : elements)
+        {
+            if (fi->Identifier() != nullptr || fi->assignmentExpression().size() != 1)
+            {
+                LogErrorContext(fi, std::format(
+                    "'{}' uses a positional initializer list; named or 'key: value' elements are not allowed",
+                    typeName));
+                return true;
+            }
+        }
+
+        if (isArray)
+        {
+            // array<T> needs an explicit allocation before set(): x.init(N).
+            LLVMBackend::NamedVariable countNV;
+            countNV.Primary = compiler->builder->getInt32((uint32_t)elements.size());
+            countNV.TypeAndValue.TypeName = "int";
+            compiler->CreateOverloadedFunctionCall("init", { makeSelf(), countNV });
+
+            for (size_t i = 0; i < elements.size(); i++)
+            {
+                LLVMBackend::NamedVariable elemNV;
+                if (!parseElement(elements[i]->assignmentExpression(0), elemType, elemNV)) continue;
+                LLVMBackend::NamedVariable idxNV;
+                idxNV.Primary = compiler->builder->getInt32((uint32_t)i);
+                idxNV.TypeAndValue.TypeName = "int";
+                compiler->CreateOverloadedFunctionCall("set", { makeSelf(), idxNV, elemNV });
+            }
+            return true;
+        }
+
+        // list<T>: append each element in order.
+        for (auto* fi : elements)
+        {
+            LLVMBackend::NamedVariable elemNV;
+            if (!parseElement(fi->assignmentExpression(0), elemType, elemNV)) continue;
+            compiler->CreateOverloadedFunctionCall("add", { makeSelf(), elemNV });
+        }
+        return true;
     }
 
     LLVMBackend::NamedVariable ParseNewExpression(CFlatParser::NewExpressionContext* ctx)

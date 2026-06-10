@@ -10,6 +10,7 @@
   - [Structs](#structs)
   - [Enums](#enums)
   - [`= default` Initialization](#-default-initialization)
+  - [Brace Initializers](#brace-initializers)
 - [Functions & Core Collections](#functions--core-collections)
   - [Overloading](#overloading)
   - [Default Parameters](#default-parameters)
@@ -235,6 +236,66 @@ int      n = default;   // 0
 bool     b = default;   // false
 MyStruct s = default;   // fields get their declared initial values
 ```
+
+---
+
+### Brace Initializers
+
+A brace list `{ ... }` initializes structs, fixed-size arrays, length-inferred array-views, and
+the generic containers `list<T>` / `array<T>` / `dictionary<K,V>`. The element form depends on the
+target type.
+
+**Structs - named fields** (`field = value`, any order; omitted fields keep their declared defaults):
+
+```c
+struct Point { int x = default; int y = default; };
+
+Point p = {x = 1, y = 2};
+Point q = {y = 5};          // x stays at its default (0)
+```
+
+A *positional* list on a struct (`Point p = {1, 2}`) is a compile error - use named fields.
+
+**Fixed-size arrays `T[N]` - positional** (the size belongs to the type). Fewer elements than `N`
+leaves the trailing slots zero-filled; more than `N` is an error:
+
+```c
+int[5] a = {7, 8, 9};       // -> {7, 8, 9, 0, 0}
+int[3] b = {100, 200, 300};
+char[4] c = {72, 73, 0, 0}; // 'H', 'I'
+```
+
+**Length-inferred array-view `T[]` - positional.** `T[]` is a thin `T*`; the brace list both
+supplies the backing storage and infers its length. An empty `{}` is an error (nothing to infer
+from); use an explicit `T[N]` for a zero-length-but-sized array:
+
+```c
+int[]    v = {11, 22, 33};  // backing [3 x int]; v points at element 0
+string[] s = {"x", "y"};    // char* literals coerced to string
+```
+
+**Containers - positional for `list`/`array`, `key: value` for `dictionary`:**
+
+```c
+import "list.cb";
+import "array.cb";
+import "dictionary.cb";
+
+list<int>            li = {10, 20, 30};          // -> add() per element
+list<string>         ls = {"a", "b", "c"};       // char* literals coerced to string
+array<int>           ai = {1, 2, 3, 4};          // -> init(4) then set(i, v)
+dictionary<int,int>  di = {1: 100, 2: 200};      // -> set(k, v) per pair
+dictionary<string,string> ds = {"k": "v"};
+```
+
+An empty `{}` is valid for a container (it just yields an empty one) - unlike `T[]`, the type
+carries no length to infer.
+
+> **Element types and conversions.** Elements follow CFlat's normal conversion rules: widening
+> (e.g. `int` -> `i64`) is implicit, but there is **no implicit down-conversion**. The container
+> paths resolve `add`/`set` by overload, so a narrowing element literal does not match -
+> `list<float> = {1.5}` (the literal `1.5` is `double`) and `list<u8> = {255}` are rejected.
+> `char*` literals are the one special case: they are coerced to `string` for `string` elements.
 
 ---
 

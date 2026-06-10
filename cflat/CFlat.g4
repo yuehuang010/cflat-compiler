@@ -477,7 +477,9 @@ initializerList
     ;
 
 fieldInit
-    : Identifier '=' assignmentExpression
+    : Identifier '=' assignmentExpression               // named struct field:    {x = 1}
+    | assignmentExpression ':' assignmentExpression      // dictionary key:value:   {k: v}
+    | assignmentExpression                               // positional list/array:  {v0, v1}
     ;
 
 statement

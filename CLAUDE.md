@@ -320,8 +320,11 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
   - `T[N] name = default;` - zero-initialized
   - `T[N] name {}` or `T[N] name = {}` - value-initializes all N elements by calling the default constructor (struct types only)
   - `T[N] name {field=v, ...}` - seeded value-init; overrides the listed fields in each element
+  - `T[N] name = {v0, v1, ...}` - **positional** element list; fewer than N zero-fills the trailing slots, more than N is an error (`EmitPositionalFixedArrayInit` in `MainListener.h`)
   - Struct fields still use C-style `T name[N]` (grammar limitation at struct scope)
   - Pointer arrays use `T*[N] name` (type-first); C-style `T* name[N]` is still accepted (exempt from the C-style error since `T*[N]` was not always available)
+- **Length-inferred array-view**: `T[] name = {v0, v1, ...}` infers N from the element count. `T[]` is a thin `T*` (IsArrayView), so the brace list both allocates an inline `[N x T]` backing array and points the `T*` at element 0; N is compile-time only. Empty `{}` is an error (`EmitArrayViewInferredInit` in `MainListener.h`).
+- **Container brace init**: `list<T> x = {a, b}` (-> `add()`), `array<T> x = {a, b}` (-> `init(N)`+`set()`), `dictionary<K,V> x = {k: v}` (-> `set()`). char* literals coerce to `string`; otherwise elements follow normal conversion rules (widening implicit, **no implicit down-convert** - `list<float> = {1.5}` is rejected). Empty `{}` yields an empty container (`TryEmitContainerInitializer` in `MainListener.h`). All brace-init paths above are **local-scope only**; globals still error.
 
 ### Ownership / Lifetime (`move` keyword)
 

@@ -1,0 +1,7 @@
+// T[] takes a positional brace list; named elements are rejected.
+extern int main()
+{
+    expect_error("uses a positional initializer list; named or 'key: value' elements are not allowed");
+    int[] x = {a = 1, b = 2};
+    return 0;
+}

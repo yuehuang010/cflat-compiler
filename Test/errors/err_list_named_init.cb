@@ -1,0 +1,9 @@
+// A list uses a positional initializer list; named (field = value) elements are rejected.
+import "list.cb";
+
+extern int main()
+{
+    expect_error("uses a positional initializer list; named or 'key: value' elements are not allowed");
+    list<int> bad = {x = 1, y = 2};
+    return 0;
+}

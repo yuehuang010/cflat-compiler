@@ -1,0 +1,9 @@
+// Struct brace-init is named-only ({field = value}); a positional element is rejected.
+struct Point { int x = default; int y = default; };
+
+extern int main()
+{
+    expect_error("positional initializers are not supported for struct type");
+    Point p = {1, 2};
+    return 0;
+}

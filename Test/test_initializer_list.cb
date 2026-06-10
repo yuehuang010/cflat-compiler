@@ -1,0 +1,118 @@
+// Comprehensive positional / key:value brace-initializer tests across element types and constructs.
+//   list<T>          = {v0, v1, ...}    -> add() per element
+//   array<T>         = {v0, v1, ...}    -> init(N) then set(i, v)
+//   dictionary<K,V>  = {k: v, ...}      -> set(k, v) per pair
+//   T[N]             = {v0, v1, ...}    -> positional stores, trailing slots zero-filled
+//   T[]              = {v0, v1, ...}    -> length-inferred backing array; thin T* points at elem 0
+//
+// CFlat does NOT implicitly down-convert, and the container paths (list/array/dictionary) drive
+// add()/set() through overload resolution, so a narrowing element literal does not match:
+// `list<float> = {1.5}` (1.5 is double) and `list<u8> = {255}` (literal wider than u8) are
+// intentionally rejected today. Those cases are DISABLED below pending narrowing-conversion work.
+//
+// Note: nested generic containers (list<list<int>>) are a separate, unrelated generics
+// limitation - that type does not instantiate at all today - so they are out of scope here.
+import "string.cb";
+import "list.cb";
+import "array.cb";
+import "dictionary.cb";
+import "test_helper.cb";
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    // ===== list<T> across element types =====
+    list<int> li = {10, 20, 30};
+    total++; passed += Test("list<int> count", li.count(), 3);
+    total++; passed += Test("list<int> sum", li.get(0) + li.get(1) + li.get(2), 60);
+
+    list<i64> lbig = {1000000000000, 2000000000000};
+    total++; passed += Test("list<i64> count", lbig.count(), 2);
+    total++; passed += Test("list<i64>[1]", lbig.get(1), (i64)2000000000000);
+
+    list<bool> lbool = {true, false, true};
+    total++; passed += Test("list<bool> count", lbool.count(), 3);
+    total++; passed += Test("list<bool>[0]", lbool.get(0), true);
+    total++; passed += Test("list<bool>[1]", lbool.get(1), false);
+
+    list<string> ls = {"alpha", "beta", "gamma"};   // char* literals coerced to string
+    total++; passed += Test("list<string> count", ls.count(), 3);
+    total++; passed += Test("list<string>[0]", ls.get(0), "alpha");
+    total++; passed += Test("list<string>[2]", ls.get(2), "gamma");
+
+    // DISABLED (narrowing element literals - no implicit down-convert; pending later work):
+    //   list<u8>    lu = {1, 2, 255};      // int literal -> u8
+    //   list<float> lf = {1.5, 2.5};       // double literal -> float
+
+    // ===== array<T> =====
+    array<int> ai = {1, 2, 3, 4};
+    total++; passed += Test("array<int> count", ai.count(), 4);
+    total++; passed += Test("array<int>[3]", ai.get(3), 4);
+
+    array<i64> al = {100, 200};                // widening: int literals -> i64 (allowed)
+    total++; passed += Test("array<i64>[0]", al.get(0), (i64)100);
+
+    // DISABLED (narrowing): array<float> af = {1.5, 2.5};
+
+    // ===== dictionary<K,V> =====
+    dictionary<int, int> di = {1: 100, 2: 200, 3: 300};
+    total++; passed += Test("dict<int,int> count", di.count(), 3);
+    total++; passed += Test("dict<int,int>[2]", di.get(2), 200);
+
+    dictionary<string, string> ds = {"k1": "v1", "k2": "v2"};
+    total++; passed += Test("dict<string,string> count", ds.count(), 2);
+    total++; passed += Test("dict<string,string>[k1]", ds.get("k1"), "v1");
+    total++; passed += Test("dict<string,string>[k2]", ds.get("k2"), "v2");
+
+    dictionary<int, string> dis = {1: "one", 2: "two"};
+    total++; passed += Test("dict<int,string>[1]", dis.get(1), "one");
+
+    // DISABLED (narrowing K and V): dictionary<u8, float> duf = {1: 1.5, 2: 2.5};
+
+    // ===== fixed array T[N] =====
+    int[5] fa = {7, 8, 9};                     // partial fill: trailing slots zero-filled
+    total++; passed += Test("int[5][0]", fa[0], 7);
+    total++; passed += Test("int[5][2]", fa[2], 9);
+    total++; passed += Test("int[5][3] zero-fill", fa[3], 0);
+    total++; passed += Test("int[5][4] zero-fill", fa[4], 0);
+
+    int[3] fb = {100, 200, 300};               // fully populated
+    total++; passed += Test("int[3] sum", fb[0] + fb[1] + fb[2], 600);
+
+    i64[2] fd = {5000000000, 1};
+    total++; passed += Test("i64[2][0]", fd[0], (i64)5000000000);
+
+    char[4] fe = {72, 73, 0, 0};               // 'H', 'I' (char-from-int-constant, like C)
+    total++; passed += Test("char[4][0]", (int)fe[0], 72);
+    total++; passed += Test("char[4][1]", (int)fe[1], 73);
+
+    bool[3] fg = {true, false, true};
+    total++; passed += Test("bool[3][0]", fg[0], true);
+    total++; passed += Test("bool[3][2]", fg[2], true);
+
+    // DISABLED (narrowing): float[3] fc = {1.5, 2.5, 3.0};
+
+    // ===== length-inferred array-view T[] (thin T* over a backing array) =====
+    int[] iv = {11, 22, 33};
+    total++; passed += Test("int[] iv[0]", iv[0], 11);
+    total++; passed += Test("int[] iv[2]", iv[2], 33);
+
+    i64[] lv = {9000000000, 1};
+    total++; passed += Test("i64[] lv[0]", lv[0], (i64)9000000000);
+
+    string[] sv = {"x", "y"};
+    total++; passed += Test("string[] sv[0]", sv[0], "x");
+    total++; passed += Test("string[] sv[1]", sv[1], "y");
+
+    // DISABLED (narrowing): float[] fv = {1.5, 2.5};
+
+    if (passed == total)
+    {
+        printf("ALL %d initializer-list tests passed.\n", total);
+        return 0;
+    }
+    printf("%d of %d initializer-list tests FAILED.\n", total - passed, total);
+    return 1;
+}
