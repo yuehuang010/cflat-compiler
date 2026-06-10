@@ -15,6 +15,7 @@
   - [Overloading](#overloading)
   - [Default Parameters](#default-parameters)
   - [Named Parameters](#named-parameters)
+  - [Returning Multiple Results](#returning-multiple-results)
   - [Forward References](#forward-references)
   - [Inline Return-Block Functions](#inline-return-block-functions-experimental)
   - [Function Pointers](#function-pointers)
@@ -278,7 +279,11 @@ char[4] c = {72, 73, 0, 0}; // 'H', 'I'
 
 **Length-inferred array-view `T[]` - positional.** `T[]` is a thin `T*`; the brace list both
 supplies the backing storage and infers its length. An empty `{}` is an error (nothing to infer
-from); use an explicit `T[N]` for a zero-length-but-sized array:
+from); use an explicit `T[N]` for a zero-length-but-sized array. Note: `T[]*` and `T[N]*`
+(pointer-to-array-view / pointer-to-fixed-array) are not valid types - to return several
+results, return one `T[]` and pass extra arrays as `T[]` out-parameters and scalars as `T*`
+(see [Returning Multiple Results](#returning-multiple-results) for the pattern and the noalias
+guarantee):
 
 ```c
 int[]    v = {11, 22, 33};  // backing [3 x int]; v points at element 0
@@ -340,6 +345,40 @@ int a = sum(x: 1, y: 2, z: 3);         // in order
 int b = sum(z: 3, x: 1, y: 2);         // out of order
 int c = sum(x: 1, y: 2, 3);            // mixed with positional
 ```
+
+### Returning Multiple Results
+
+A function returns a single value, so to hand back several results, return one and pass the
+rest as **out-parameters**. The sanctioned pattern: return one `T[]`, pass any extra arrays as
+`T[]` out-parameters, and pass scalar outputs as `T*` out-parameters.
+
+```c
+// Returns the summed array; also reports how many elements it touched via an int* out-param.
+void compute(double[] a, double[] b, double[] outResult, int* outSteps)
+{
+    int i = 0;
+    while (i < 1024) { outResult[i] = a[i] + b[i]; i = i + 1; }
+    *outSteps = 1024;
+}
+```
+
+Each `T[]` parameter carries a **noalias** contract - distinct `T[]` values address distinct
+whole allocations, so the compiler stamps the `noalias` attribute on every `T[]` argument
+(each also gets its own alias scope). A scalar `T*` out-param does **not** carry noalias, which
+is correct: it points at a single cell, not a whole buffer. The emitted IR shows the
+distinction:
+
+```
+define internal void @_compute_..._(ptr noalias %a, ptr noalias %b, ptr noalias %outResult, ptr %outSteps)
+```
+
+This noalias guarantee is a general property of `T[]` (it lets the optimizer reason about
+disjointness without runtime overlap checks - see [HPC.md](HPC.md) for how the loop vectorizer
+exploits it), not something specific to high-performance code.
+
+`T[]*` (pointer-to-array-view) and `T[N]*` (pointer-to-fixed-array) are **not valid types**;
+the compiler reports an error pointing at this pattern. Use the out-parameter form above
+instead.
 
 ### Forward References
 

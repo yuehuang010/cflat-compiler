@@ -1,0 +1,9 @@
+// `(T[]*)` cast target (pointer-to-array-view) is not a valid type. The abstractDeclarator
+// path should emit the redirect diagnostic, not an ANTLR "no viable alternative" dump.
+extern int main()
+{
+    double[] a = {1.0, 2.0};
+    expect_error("pointer to array-view '(T[]*)'");
+    double[] b = (double[]*)a;
+    return 0;
+}

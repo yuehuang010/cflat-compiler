@@ -51,6 +51,21 @@ static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)
     return jump->Return() != nullptr && jump->compoundStatement() != nullptr;
 }
 
+// The grammar nests `arrayDimSpec` and the illegal trailing-'*' `arrayPtrSuffix` under a
+// shared `arrayTypeSuffix` wrapper (so the declaration and cast/sizeof paths cannot drift).
+// These unwrap it; both declarationSpecifier and abstractDeclarator expose arrayTypeSuffix().
+// A null wrapper means no brackets at all; arrayDimSpec is required when the wrapper exists.
+template <class Ctx>
+static CFlatParser::ArrayDimSpecContext* ArrayDimsOf(Ctx* c)
+{
+    return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayDimSpec() : nullptr;
+}
+template <class Ctx>
+static CFlatParser::ArrayPtrSuffixContext* ArrayPtrOf(Ctx* c)
+{
+    return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayPtrSuffix() : nullptr;
+}
+
 inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
 {
     if (opId->New())          return "operator new";
@@ -408,7 +423,7 @@ private:
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
                         declType.TypeName = mangledName;
                         declType.Pointer = declSpec->pointer() != nullptr;
-                        declType.ArraySize = declSpec->arrayDimSpec() ? declSpec->arrayDimSpec()->assignmentExpression(0) : nullptr;
+                        declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
                         break;
                     }
                     // function pointer type: function<RetType(Params)> or bare 'function'
@@ -478,9 +493,9 @@ private:
                     if (declSpec->pointer()->Star().size() >= 2)
                         declType.ElemPointer = true;
                 }
-                if (declSpec->arrayDimSpec())
+                if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
-                    auto dims = declSpec->arrayDimSpec()->assignmentExpression();
+                    auto dims = dimSpec->assignmentExpression();
                     declType.ArraySize = dims.empty() ? nullptr : dims[0];
                     for (size_t di = 1; di < dims.size(); di++)
                         declType.ExtraArrayDims.push_back(dims[di]);
@@ -491,6 +506,18 @@ private:
                         declType.IsArrayView = true;
                         declType.Pointer = true;
                     }
+                }
+                if (ArrayPtrOf(declSpec))
+                {
+                    if (declType.IsArrayView)
+                        std::cerr << std::format("error: pointer to array-view '{}[]*' is not a valid type. "
+                            "To return several results, return one 'T[]' and pass the rest as out-parameters: "
+                            "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.\n",
+                            declType.TypeName);
+                    else
+                        std::cerr << std::format("error: pointer to fixed array '{}[N]*' is not a valid type; "
+                            "pass '{}*' (a fixed array decays to a pointer to its first element).\n",
+                            declType.TypeName, declType.TypeName);
                 }
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
@@ -1571,7 +1598,7 @@ private:
                         }
                     }
                     declType.Pointer = declSpec->pointer() != nullptr;
-                    declType.ArraySize = declSpec->arrayDimSpec() ? declSpec->arrayDimSpec()->assignmentExpression(0) : nullptr;
+                    declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
                     break;
                 }
                 // function pointer type: function<RetType(Params)> or bare 'function'
@@ -1713,9 +1740,9 @@ private:
                 if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
                     declType.ElemPointer = true;
                 declType.Pointer = hasExplicitPointer || declType.Pointer;
-                if (declSpec->arrayDimSpec())
+                if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
-                    auto dims = declSpec->arrayDimSpec()->assignmentExpression();
+                    auto dims = dimSpec->assignmentExpression();
                     declType.ArraySize = dims.empty() ? nullptr : dims[0];
                     for (size_t di = 1; di < dims.size(); di++)
                         declType.ExtraArrayDims.push_back(dims[di]);
@@ -1726,6 +1753,20 @@ private:
                         declType.IsArrayView = true;
                         declType.Pointer = true;
                     }
+                }
+                if (ArrayPtrOf(declSpec))
+                {
+                    if (declType.IsArrayView)
+                        LogErrorContext(declSpec, std::format(
+                            "pointer to array-view '{}[]*' is not a valid type. "
+                            "To return several results, return one 'T[]' and pass the rest as out-parameters: "
+                            "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.",
+                            declType.TypeName));
+                    else
+                        LogErrorContext(declSpec, std::format(
+                            "pointer to fixed array '{}[N]*' is not a valid type; "
+                            "pass '{}*' (a fixed array decays to a pointer to its first element).",
+                            declType.TypeName, declType.TypeName));
                 }
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
@@ -6898,13 +6939,24 @@ public:
         // `(T[])` cast target: the noalias array-view. Empty brackets only - a sized
         // `(T[N])` is not a meaningful cast. Mirrors the declaration path: an array-view
         // is a pointer repr carrying the noalias contract.
-        if (abstractDecl && abstractDecl->arrayDimSpec())
+        if (abstractDecl)
         {
-            if (!abstractDecl->arrayDimSpec()->assignmentExpression().empty())
-                LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
-                    "use '(T[])' for the noalias array-view");
-            typeValue.IsArrayView = true;
-            typeValue.Pointer = true;
+            // `(T[]*)` / `(T[N]*)`: a trailing '*' after the brackets is never a valid type.
+            // Redirect to the array-view cast (return-early avoids a duplicate sized-array error).
+            if (ArrayPtrOf(abstractDecl))
+            {
+                LogErrorContext(ctx, "pointer to array-view '(T[]*)' is not a valid type; cast to "
+                    "the array-view '(T[])' and take its address separately if you need a pointer");
+                return typeValue;
+            }
+            if (auto* dimSpec = ArrayDimsOf(abstractDecl))
+            {
+                if (!dimSpec->assignmentExpression().empty())
+                    LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
+                        "use '(T[])' for the noalias array-view");
+                typeValue.IsArrayView = true;
+                typeValue.Pointer = true;
+            }
         }
 
         return typeValue;

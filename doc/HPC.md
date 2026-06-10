@@ -339,6 +339,12 @@ Rules:
 >   tile). The older `union { int* p; int[] v; }` type-pun still works (Fortran `EQUIVALENCE`
 >   style) but the explicit cast is preferred - it is shorter and needs no union type.
 
+To return several results from a kernel - a computed array plus auxiliary scalars - return one
+`T[]` and pass the rest as `T[]`/`T*` out-parameters. Each `T[]` parameter keeps its noalias
+contract, so the vectorizer proves the buffers pairwise disjoint without a runtime overlap
+check. See [Returning Multiple Results](LANGUAGE.md#returning-multiple-results) for the full
+pattern - it is a general language feature, not HPC-specific.
+
 ## `span<T>` (noalias) and `view<T>` (may-alias)
 
 `span<T>` and `view<T>` are two-word library wrappers that bundle a buffer pointer with a length, so

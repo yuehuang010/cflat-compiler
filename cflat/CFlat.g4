@@ -227,7 +227,7 @@ declarationSpecifiers
 
 declarationSpecifier
     : storageClassSpecifier
-    | typeSpecifier '?'? pointer? arrayDimSpec?
+    | typeSpecifier '?'? pointer? arrayTypeSuffix?
     | typeQualifier
     | functionSpecifier
     | alignmentSpecifier
@@ -235,6 +235,19 @@ declarationSpecifier
 
 arrayDimSpec
     : ('[' assignmentExpression? ']')+   // empty brackets `T[]` = thin noalias array-view; sized `T[N]` = fixed array
+    ;
+
+// `[]`/`[N]` brackets optionally followed by a trailing '*'. Shared by declarationSpecifier
+// and abstractDeclarator (cast/sizeof) so the two paths cannot drift. The trailing '*'
+// (pointer-to-array-view `T[]*` / pointer-to-fixed-array `T[N]*`) is never a valid type;
+// it is admitted here only so the listener can emit a targeted diagnostic instead of an
+// ANTLR "no viable alternative" dump.
+arrayTypeSuffix
+    : arrayDimSpec arrayPtrSuffix?
+    ;
+
+arrayPtrSuffix
+    : '*'+   // trailing '*' after '[]'/'[N]'; never a valid type - caught for a diagnostic
     ;
 
 initDeclaratorList
@@ -459,7 +472,7 @@ typeName
 
 abstractDeclarator
     : pointer
-    | pointer? arrayDimSpec   // `(T[])` cast target = the noalias array-view escape (explicit T* -> T[])
+    | pointer? arrayTypeSuffix   // `(T[])` cast target = the noalias array-view escape (explicit T* -> T[]); trailing '*' caught for a diagnostic
     ;
 
 typedefName

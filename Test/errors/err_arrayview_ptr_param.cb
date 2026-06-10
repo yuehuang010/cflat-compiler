@@ -1,0 +1,3 @@
+expect_error("pointer to array-view 'double[]*'") {
+    int solveParallel(double[]* outFinal) { return 0; }
+}
