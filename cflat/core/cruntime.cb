@@ -37,8 +37,62 @@ struct __ProgramTLS {
 thread_local __ProgramTLS __prog_tls = default;
 
 // Callers pass i64 for bufSize; cast to win_size (truncates to i32 on Win32).
+// Bit 1 (1<<1) = _CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR (from the UCRT's
+// corecrt_stdio_config.h): makes __stdio_common_vsprintf return the number of characters
+// that *would* have been written on overflow (C99 semantics) instead of the legacy -1.
+// Every printf/snprintf grow-on-overflow path below relies on this: without it the
+// truncation check `needed >= cap` never fires (-1 >= cap is false) and output past the
+// initial buffer is silently dropped.
 win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
-    return __stdio_common_vsprintf(options, buf, (win_size)bufSize, fmt, locale, ap);
+    return __stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+}
+
+// Emit `len` raw bytes to stdout. Honors the program stdout hook when one is installed
+// (so output from inside a `program` reaches its consumer), otherwise writes via WriteFile
+// to the console handle so VT escape sequences reach the ConPTY VT parser (WriteConsoleW
+// would bypass it). This is the single sink shared by printf/puts/putchar/putn/fputs/etc.
+void __stdout_write(const char* buf, int len) {
+    if (__prog_tls.stdout_hook != nullptr && !__prog_tls.stdout_in_hook) {
+        __prog_tls.stdout_in_hook = true;
+        __prog_tls.stdout_hook((char*)buf, len);  // non-owning, hook must NOT free
+        __prog_tls.stdout_in_hook = false;
+    } else {
+        int written = 0;
+        WriteFile(GetStdHandle(-11), buf, len, &written, nullptr);
+    }
+}
+
+// Emit `len` raw bytes to stderr (handle -12). The stdout hook never applies to stderr.
+void __stderr_write(const char* buf, int len) {
+    int written = 0;
+    WriteFile(GetStdHandle(-12), buf, len, &written, nullptr);
+}
+
+// Format `fmt`+args into the per-thread scratch buffer, growing it on overflow, and
+// return the formatted byte length. The buffer is owned by __prog_tls and reused across
+// calls, so the common path allocates nothing. ap is passed by value (Win x64 va_list is
+// a pointer copied to the callee), so __vsprintf_safe may be called twice on it safely.
+int __format_to_tls(const char* fmt, va_list ap) {
+    if (__prog_tls.stdout_tls_buf == nullptr) {
+        __prog_tls.stdout_tls_buf = (char*)malloc(4096);
+        __prog_tls.stdout_tls_cap = 4096;
+    }
+    int needed = __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+    if (needed >= __prog_tls.stdout_tls_cap) {
+        free(__prog_tls.stdout_tls_buf);
+        __prog_tls.stdout_tls_buf = (char*)malloc((i64)needed + 1);
+        __prog_tls.stdout_tls_cap = needed + 1;
+        __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
+    }
+    return needed;
+}
+
+// Length of a NUL-terminated string as an int (local helper; avoids pulling strlen's i32
+// return through every call site that needs a byte count).
+int __cstr_len(const char* s) {
+    int len = 0;
+    while (s[len] != '\0') len++;
+    return len;
 }
 
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
@@ -48,60 +102,18 @@ win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fm
 extern void printf(const char* fmt, ...) {
     va_list ap;
     va_start(ap);
-    if (__prog_tls.stdout_hook != nullptr && !__prog_tls.stdout_in_hook) {
-        __prog_tls.stdout_in_hook = true;
-        // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
-        int len = 0;
-        bool has_format = false;
-        while (fmt[len] != '\0') {
-            if (fmt[len] == '%') { has_format = true; break; }
-            len++;
-        }
-        if (!has_format) {
-            __prog_tls.stdout_hook((char*)fmt, len);  // non-owning, hook must NOT free
-        } else {
-            if (__prog_tls.stdout_tls_buf == nullptr) {
-                __prog_tls.stdout_tls_buf = (char*)malloc(4096);
-                __prog_tls.stdout_tls_cap = 4096;
-            }
-            int needed = __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
-            if (needed >= __prog_tls.stdout_tls_cap) {
-                free(__prog_tls.stdout_tls_buf);
-                __prog_tls.stdout_tls_buf = (char*)malloc((i64)needed + 1);
-                __prog_tls.stdout_tls_cap = needed + 1;
-                __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
-            }
-            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning - hook must NOT free buf
-        }
-        __prog_tls.stdout_in_hook = false;
+    // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
+    bool has_format = false;
+    int len = 0;
+    while (fmt[len] != '\0') {
+        if (fmt[len] == '%') { has_format = true; break; }
+        len++;
+    }
+    if (!has_format) {
+        __stdout_write(fmt, len);
     } else {
-        // Format into a buffer then write via WriteFile so that VT escape sequences
-        // reach the VT state machine. In Windows Terminal (ConPTY), WriteConsoleW
-        // sends Unicode text directly to the renderer and bypasses VT processing;
-        // WriteFile sends raw bytes that ConPTY feeds through the VT parser.
-        int len = 0;
-        bool has_format = false;
-        while (fmt[len] != '\0') {
-            if (fmt[len] == '%') { has_format = true; break; }
-            len++;
-        }
-        void* hOut = GetStdHandle(-11);
-        int written = 0;
-        if (!has_format) {
-            WriteFile(hOut, fmt, len, &written, nullptr);
-        } else {
-            char* buf = (char*)malloc(4096);
-            int cap = 4096;
-            int needed = __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
-            if (needed >= cap) {
-                free(buf);
-                cap = needed + 1;
-                buf = (char*)malloc((i64)cap);
-                __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
-            }
-            WriteFile(hOut, buf, needed, &written, nullptr);
-            free(buf);
-        }
+        int needed = __format_to_tls(fmt, ap);
+        __stdout_write(__prog_tls.stdout_tls_buf, needed);
     }
     va_end(ap);
 }
@@ -123,58 +135,19 @@ extern int snprintf(char* buf, i64 bufSize, const char* fmt, ...) {
 }
 
 extern int vprintf(const char* fmt, va_list ap) {
-    if (__prog_tls.stdout_hook != nullptr && !__prog_tls.stdout_in_hook) {
-        __prog_tls.stdout_in_hook = true;
-        // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
-        int len = 0;
-        bool has_format = false;
-        while (fmt[len] != '\0') {
-            if (fmt[len] == '%') { has_format = true; break; }
-            len++;
-        }
-        if (!has_format) {
-            __prog_tls.stdout_hook((char*)fmt, len);  // non-owning, hook must NOT free
-        } else {
-            if (__prog_tls.stdout_tls_buf == nullptr) {
-                __prog_tls.stdout_tls_buf = (char*)malloc(4096);
-                __prog_tls.stdout_tls_cap = 4096;
-            }
-            int needed = __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
-            if (needed >= __prog_tls.stdout_tls_cap) {
-                free(__prog_tls.stdout_tls_buf);
-                __prog_tls.stdout_tls_buf = (char*)malloc((i64)needed + 1);
-                __prog_tls.stdout_tls_cap = needed + 1;
-                __vsprintf_safe(0, __prog_tls.stdout_tls_buf, __prog_tls.stdout_tls_cap, fmt, nullptr, ap);
-            }
-            __prog_tls.stdout_hook(__prog_tls.stdout_tls_buf, needed);  // non-owning - hook must NOT free buf
-            len = needed;
-        }
-        __prog_tls.stdout_in_hook = false;
-        return len;
-    }
-    int len = 0;
+    // Fast path: no '%' in fmt - fmt is the literal output, skip vsprintf entirely.
     bool has_format = false;
+    int len = 0;
     while (fmt[len] != '\0') {
         if (fmt[len] == '%') { has_format = true; break; }
         len++;
     }
-    void* hOut = GetStdHandle(-11);
-    int written = 0;
     if (!has_format) {
-        WriteFile(hOut, fmt, len, &written, nullptr);
+        __stdout_write(fmt, len);
         return len;
     }
-    char* buf = (char*)malloc(4096);
-    int cap = 4096;
-    int needed = __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
-    if (needed >= cap) {
-        free(buf);
-        cap = needed + 1;
-        buf = (char*)malloc((i64)cap);
-        __vsprintf_safe(0, buf, (i64)cap, fmt, nullptr, ap);
-    }
-    WriteFile(hOut, buf, needed, &written, nullptr);
-    free(buf);
+    int needed = __format_to_tls(fmt, ap);
+    __stdout_write(__prog_tls.stdout_tls_buf, needed);
     return needed;
 }
 
@@ -184,6 +157,73 @@ extern int vsprintf(char* buf, const char* fmt, va_list ap) {
 
 extern int vsnprintf(char* buf, i64 bufSize, const char* fmt, va_list ap) {
     return __vsprintf_safe(0, buf, bufSize, fmt, nullptr, ap);
+}
+
+// === Stdout convenience output (hook-aware, VT-correct) ===
+// These route through __stdout_write, so they work inside a `program` (output reaches the
+// stdout hook) and emit raw bytes that ConPTY's VT parser sees (escape sequences work).
+
+// puts - write the string followed by a newline (matches C). Returns a non-negative value.
+extern int puts(const char* s) {
+    int len = __cstr_len(s);
+    __stdout_write(s, len);
+    char nl = '\n';
+    __stdout_write(&nl, 1);
+    return len + 1;
+}
+
+// putchar - write a single byte to stdout. Returns the character written.
+extern int putchar(int c) {
+    char b = (char)c;
+    __stdout_write(&b, 1);
+    return c;
+}
+
+// putn - write exactly `len` raw bytes to stdout (no NUL needed, no formatting). The
+// bulk primitive for terminal/graphics output: build one frame in a buffer, blast it in
+// one call. This is the documented alternative to reaching for Win32 WriteFile directly.
+extern void putn(const char* buf, int len) {
+    __stdout_write(buf, len);
+}
+
+// fputs - write a string to a stream (no trailing newline, matches C). stdout/stderr are
+// special-cased so they stay hook-aware / VT-correct; other streams go through the CRT.
+extern int fputs(const char* s, void* stream) {
+    int len = __cstr_len(s);
+    if (stream == __acrt_iob_func(1)) { __stdout_write(s, len); return len; }
+    if (stream == __acrt_iob_func(2)) { __stderr_write(s, len); return len; }
+    return fprintf(stream, "%s", s);
+}
+
+// fputc / putc - write a single byte to a stream.
+extern int fputc(int c, void* stream) {
+    char b = (char)c;
+    if (stream == __acrt_iob_func(1)) { __stdout_write(&b, 1); return c; }
+    if (stream == __acrt_iob_func(2)) { __stderr_write(&b, 1); return c; }
+    return fprintf(stream, "%c", c);
+}
+
+extern int putc(int c, void* stream) { return fputc(c, stream); }
+
+// fprintf - formatted write to a stream. stdout/stderr route through the hook-aware,
+// VT-correct sink; any other stream (e.g. a fopen'd file) goes through the UCRT backend.
+extern int fprintf(void* stream, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    int result = 0;
+    if (stream == __acrt_iob_func(1)) {
+        int needed = __format_to_tls(fmt, ap);
+        __stdout_write(__prog_tls.stdout_tls_buf, needed);
+        result = needed;
+    } else if (stream == __acrt_iob_func(2)) {
+        int needed = __format_to_tls(fmt, ap);
+        __stderr_write(__prog_tls.stdout_tls_buf, needed);
+        result = needed;
+    } else {
+        result = __stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap);
+    }
+    va_end(ap);
+    return result;
 }
 
 // === Stdin hook support ===
@@ -317,6 +357,40 @@ extern int scanf(const char* fmt, ...) {
     }
     if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __acrt_iob_func(0); }
     int result = __stdio_common_vfscanf(0, __prog_tls.cached_stdin, fmt, nullptr, ap);
+    va_end(ap);
+    return result;
+}
+
+// getchar - read one byte from stdin. Honors the program stdin hook (so it works inside a
+// `program`); otherwise reads from the real console. Returns -1 (EOF) when input is done.
+extern int getchar() {
+    if (__prog_tls.stdin_active) { return __stdin_next_char(); }
+    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __acrt_iob_func(0); }
+    return fgetc(__prog_tls.cached_stdin);
+}
+
+// getc - read one byte from a stream. When the stdin hook is active and the stream is
+// stdin, serve from the hook line-buffer; otherwise read straight from the stream.
+extern int getc(void* stream) {
+    if (__prog_tls.stdin_active && stream == __prog_tls.cached_stdin) { return __stdin_next_char(); }
+    return fgetc(stream);
+}
+
+// sscanf - parse formatted input from a string buffer. No stream/hook involved.
+extern int sscanf(const char* buf, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    int result = __vsscanf_safe(0, buf, (i64)__cstr_len(buf), fmt, nullptr, ap);
+    va_end(ap);
+    return result;
+}
+
+// fscanf - parse formatted input from a stream (e.g. a fopen'd file). For stdin inside a
+// `program`, prefer scanf/getchar, which are hook-aware; fscanf reads the raw stream.
+extern int fscanf(void* stream, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap);
+    int result = __stdio_common_vfscanf(0, stream, fmt, nullptr, ap);
     va_end(ap);
     return result;
 }

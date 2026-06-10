@@ -412,7 +412,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `fit_allocator.cb` | Fit allocation strategy |
 | `bucket_allocator.cb` | Segregated free-list allocator (size-class buckets) |
 | `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
-| `cruntime.cb` | Raw C runtime bindings (printf, memcpy, etc.) |
+| `cruntime.cb` | Raw C runtime bindings: formatted I/O (`printf`/`fprintf`/`sprintf`/`snprintf`/`scanf`/`sscanf`/`fscanf`), stdout convenience writers (`puts`, `putchar`, `putn` for raw bulk bytes, `fputs`, `fputc`/`putc`), stdin readers (`getchar`, `getc`), and `string.h`/`ctype.h` (memcpy, strlen, etc.). Stdout/stdin functions are hook-aware (work inside a `program`) and VT-correct. Use `putn(buf, len)` for bulk terminal output instead of Win32 `WriteFile`. |
 
 To add a new core library: add the `.cb` file to `core/` and add an entry in cflat.vcxproj with DeploymentContent.
 Use nullptr instead of null;

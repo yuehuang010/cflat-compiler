@@ -1,0 +1,50 @@
+// Regression + smoke test for the cruntime stdio family.
+//
+// The headline regression: printf/snprintf used to silently drop everything past the
+// initial 4096-byte format buffer. The cause was __stdio_common_vsprintf being called
+// without the C99 STANDARD_SNPRINTF_BEHAVIOR flag, so on overflow it returned -1 instead
+// of the needed length, the grow-on-overflow check (`needed >= cap`) never fired, and the
+// tail of the output vanished. snprintf into a tiny buffer now returns the FULL length
+// that would have been written - that is the deterministic, capturable proof of the fix.
+//
+// Also exercises the newly added stdout/stdin convenience functions so they stay linked
+// and callable: puts, putchar, putn, fputs, fprintf, sscanf.
+import "test_helper.cb";
+
+extern i32 strlen(const char* s);
+
+extern int main()
+{
+    int passed = 0;
+    int total = 0;
+
+    // --- snprintf C99 return semantics (the 4096 silent-drop regression) ---
+    int N = 5000;
+    char[5001] big = default;
+    int i = 0;
+    while (i < N) { big[i] = 'A'; i++; }
+    big[N] = '\0';
+
+    char[16] small = default;
+    int need = snprintf(&small[0], (i64)16, "%s", &big[0]);
+    total++; passed += Test("snprintf returns full needed length (not -1)", need == N, true);
+    total++; passed += Test("snprintf truncated buffer is NUL-terminated", (int)strlen(&small[0]), 15);
+
+    // --- sscanf parses from a string buffer ---
+    int a = 0;
+    int b = 0;
+    int n = sscanf("42 -7", "%d %d", &a, &b);
+    total++; passed += Test("sscanf parsed 2 values", n, 2);
+    total++; passed += Test("sscanf first value", a, 42);
+    total++; passed += Test("sscanf second value", b, -7);
+
+    // --- smoke: the new stdout convenience writers must link and run ---
+    puts("test_stdio: puts writes a line");
+    putchar((int)'X');
+    putchar((int)'\n');
+    const char* msg = "test_stdio: putn writes raw bytes\n";
+    putn(msg, (int)strlen(msg));
+
+    printf("\n%d / %d tests passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

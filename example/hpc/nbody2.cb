@@ -1,0 +1,376 @@
+// main.cb - realtime, colored, terminal N-body renderer.
+//
+// Adapted from example/hpc/nbody.cb (the O(N^2) SoA force kernel + Velocity-Verlet
+// integrator, parallelized across a pinned ThreadPool). This version drops the
+// energy/benchmark reporting and instead RENDERS the bodies live in the terminal
+// every frame with ANSI truecolor escapes:
+//   - 2D projection: drop the z axis (orthographic), x->column, y->row.
+//   - density char ramp ' .:-=+*#%@' picks the glyph from how many bodies land
+//     in a cell.
+//   - color: per-cell average speed mapped through a blue->cyan->green->yellow->red
+//     heat gradient (truecolor \x1b[38;2;R;G;Bm).
+//   - cursor home (\x1b[H) each frame so it animates in place.
+//
+// Build:
+//   x64\Release\cflat.exe example\customer\hpc-nbody\main.cb -i Test\library -i example\hpc -o example\customer\hpc-nbody\app.exe -O2
+// Run:
+//   example\customer\hpc-nbody\app.exe            (default 600 frames)
+//   example\customer\hpc-nbody\app.exe 120        (render 120 frames then exit)
+
+import "hpc/parallel.cb";   // parallel_for_n_pool
+import "threadpool.cb";     // ThreadPool + cpu_mask_lowest
+import "span.cb";           // span<double>
+import "math.cb";           // Math.sqrt
+import "time.cb";           // sleep
+import "random.cb";         // Random
+import "thread.cb";         // hardware_concurrency()
+import "terminal.cb";       // Terminal (VT-mode init, cursor/clear helpers)
+
+// ---- simulation parameters -------------------------------------------------
+
+double G()   { return 1.0; }
+double EPS() { return 0.05; }
+double DT()  { return 0.0015; }
+
+// ---- render config ---------------------------------------------------------
+
+int    GW()   { return 110; }    // grid width  (columns)
+int    GH()   { return 46; }     // grid height (rows)
+double VIEW() { return 1.7; }    // half-extent of the projected view in world units
+
+// ---- global render buffers -------------------------------------------------
+
+int*    g_count    = nullptr;    // bodies per cell
+double* g_speedsum = nullptr;    // sum of speeds per cell
+char*   g_out      = nullptr;    // ANSI output buffer
+int     g_out_len  = 0;
+
+// ---- output-buffer helpers (append into g_out) -----------------------------
+
+void outCh(char c) { g_out[g_out_len] = c; g_out_len = g_out_len + 1; }
+
+void outStr(const char* s) {
+    int i = 0;
+    while (s[i] != '\0') { outCh(s[i]); i = i + 1; }
+}
+
+void outInt(int n) {
+    if (n == 0) { outCh('0'); return; }
+    if (n < 0) { outCh('-'); n = -n; }
+    char[12] tmp;
+    int i = 0;
+    while (n > 0) { tmp[i] = (char)('0' + n % 10); i = i + 1; n = n / 10; }
+    int j = i - 1;
+    while (j >= 0) { outCh(tmp[j]); j = j - 1; }
+}
+
+// Append a truecolor SGR escape: ESC [ 38 ; 2 ; r ; g ; b m
+void outColor(int r, int g, int b) {
+    outStr("\033[38;2;");
+    outInt(r); outCh(';');
+    outInt(g); outCh(';');
+    outInt(b); outCh('m');
+}
+
+// Map a normalized speed t in [0,1] to a blue->cyan->green->yellow->red heat color.
+void heat(double t, int* r, int* g, int* b) {
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    // 4 segments across the hue ramp.
+    double seg = t * 4.0;
+    int s = (int)seg;
+    if (s > 3) { s = 3; }
+    double f = seg - (double)s;
+    int rr = 0; int gg = 0; int bb = 0;
+    if (s == 0)      { rr = 0;                  gg = (int)(f * 255.0);       bb = 255; }                   // blue -> cyan
+    else if (s == 1) { rr = 0;                  gg = 255;                    bb = (int)((1.0 - f) * 255.0); } // cyan -> green
+    else if (s == 2) { rr = (int)(f * 255.0);   gg = 255;                    bb = 0; }                      // green -> yellow
+    else             { rr = 255;                gg = (int)((1.0 - f) * 255.0); bb = 0; }                    // yellow -> red
+    *r = rr; *g = gg; *b = bb;
+}
+
+// ---- force kernel + integrator (from nbody.cb) -----------------------------
+
+// v += c * a   (Verlet half-kick) - explicit AVX-width SIMD over one component.
+void axpyVec(double c, span<double> v, span<double> a) {
+    double[] vv = v.data();
+    double[] av = a.data();
+    i64 n = v.length();
+    simd<double,4> cs = c;
+    i64 i = 0;
+    while (i + 4 <= n) {
+        simd<double,4> vvec = simd<double,4>.load(vv, i);
+        simd<double,4> avec = simd<double,4>.load(av, i);
+        simd<double,4>.store(vvec + cs * avec, vv, i);
+        i = i + 4;
+    }
+    while (i < n) { vv[i] = vv[i] + c * av[i]; i = i + 1; }
+}
+
+// x += c * v   (Verlet drift).
+void driftVec(double c, span<double> x, span<double> v) {
+    double[] xv = x.data();
+    double[] vv = v.data();
+    i64 n = x.length();
+    simd<double,4> cs = c;
+    i64 i = 0;
+    while (i + 4 <= n) {
+        simd<double,4> xvec = simd<double,4>.load(xv, i);
+        simd<double,4> vvec = simd<double,4>.load(vv, i);
+        simd<double,4>.store(xvec + cs * vvec, xv, i);
+        i = i + 4;
+    }
+    while (i < n) { xv[i] = xv[i] + c * vv[i]; i = i + 1; }
+}
+
+// ---- main ------------------------------------------------------------------
+
+// crude argv[1] -> int (newcomer helper; no stdlib atoi documented)
+int strToInt(const char* s) {
+    int v = 0; int i = 0; bool found = false;
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i = i + 1; }
+    return found ? v : -1;
+}
+
+extern int main(int argc, char** argv) {
+    int cores = hardware_concurrency();
+    if (cores <= 0) { cores = 4; }
+
+    int frames = 600;
+    if (argc > 1) {
+        int f = strToInt(argv[1]);
+        if (f > 0) { frames = f; }
+    }
+
+    int n      = 4096;          // bodies
+    int subSteps = 2;           // physics steps per rendered frame
+    double dt  = DT();
+    double g   = G();
+    double eps2 = EPS() * EPS();
+
+    int W = GW();
+    int H = GH();
+    double view = VIEW();
+
+    // SoA buffers - each a fresh whole allocation -> noalias.
+    double[] px = new double[n];  double[] py = new double[n];  double[] pz = new double[n];
+    double[] vx = new double[n];  double[] vy = new double[n];  double[] vz = new double[n];
+    double[] ax = new double[n];  double[] ay = new double[n];  double[] az = new double[n];
+    double[] mass = new double[n];
+
+    // Deterministic init: a rotating disk-ish cloud so the animation swirls.
+    Random rng;
+    rng.seed(0xC0FFEE);
+    double m = 1.0 / (double)n;
+    double omega = 0.6;     // initial angular velocity for swirl
+    int i = 0;
+    while (i < n) {
+        double x = rng.nextDouble() * 2.0 - 1.0;
+        double y = rng.nextDouble() * 2.0 - 1.0;
+        double z = (rng.nextDouble() * 2.0 - 1.0) * 0.3;   // flatten in z
+        px[i] = x;  py[i] = y;  pz[i] = z;
+        // tangential velocity (rotation about z) + small jitter
+        vx[i] = -y * omega + (rng.nextDouble() * 2.0 - 1.0) * 0.05;
+        vy[i] =  x * omega + (rng.nextDouble() * 2.0 - 1.0) * 0.05;
+        vz[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.05;
+        mass[i] = m;
+        i = i + 1;
+    }
+
+    // Spans for the vectorized integrator maps.
+    span<double> sPx;  sPx.wrap(px, (i64)n);
+    span<double> sPy;  sPy.wrap(py, (i64)n);
+    span<double> sPz;  sPz.wrap(pz, (i64)n);
+    span<double> sVx;  sVx.wrap(vx, (i64)n);
+    span<double> sVy;  sVy.wrap(vy, (i64)n);
+    span<double> sVz;  sVz.wrap(vz, (i64)n);
+    span<double> sAx;  sAx.wrap(ax, (i64)n);
+    span<double> sAy;  sAy.wrap(ay, (i64)n);
+    span<double> sAz;  sAz.wrap(az, (i64)n);
+
+    // Capturing O(N^2) force kernel (explicit SIMD inner loop), same as nbody.cb.
+    function<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
+        simd<double,8> eps2V = eps2;
+        i64 bi = lo;
+        while (bi < hi) {
+            simd<double,8> pxiV = px[bi];
+            simd<double,8> pyiV = py[bi];
+            simd<double,8> pziV = pz[bi];
+            simd<double,8> accx = 0.0;
+            simd<double,8> accy = 0.0;
+            simd<double,8> accz = 0.0;
+            simd<double,8> oneV = 1.0;
+
+            int j = 0;
+            while (j + 8 <= n) {
+                simd<double,8> dx = simd<double,8>.load(px, j) - pxiV;
+                simd<double,8> dy = simd<double,8>.load(py, j) - pyiV;
+                simd<double,8> dz = simd<double,8>.load(pz, j) - pziV;
+                simd<double,8> r2 = dx * dx + dy * dy + dz * dz + eps2V;
+                simd<double,8> invr  = oneV / simd<double,8>.sqrt(r2);
+                simd<double,8> invr3 = invr * invr * invr;
+                simd<double,8> s = simd<double,8>.load(mass, j) * invr3;
+                accx = accx + dx * s;
+                accy = accy + dy * s;
+                accz = accz + dz * s;
+                j = j + 8;
+            }
+            double axi = accx[0] + accx[1] + accx[2] + accx[3] + accx[4] + accx[5] + accx[6] + accx[7];
+            double ayi = accy[0] + accy[1] + accy[2] + accy[3] + accy[4] + accy[5] + accy[6] + accy[7];
+            double azi = accz[0] + accz[1] + accz[2] + accz[3] + accz[4] + accz[5] + accz[6] + accz[7];
+
+            double pxi = px[bi];  double pyi = py[bi];  double pzi = pz[bi];
+            while (j < n) {
+                double dx = px[j] - pxi;
+                double dy = py[j] - pyi;
+                double dz = pz[j] - pzi;
+                double r2 = dx * dx + dy * dy + dz * dz + eps2;
+                double invr = 1.0 / Math.sqrt(r2);
+                double s = mass[j] * (invr * invr * invr);
+                axi = axi + dx * s;
+                ayi = ayi + dy * s;
+                azi = azi + dz * s;
+                j = j + 1;
+            }
+            ax[bi] = g * axi;  ay[bi] = g * ayi;  az[bi] = g * azi;
+            bi = bi + 1;
+        }
+    };
+
+    // Resident pinned pool reused for every frame's force evaluation.
+    ThreadPool pool;
+    pool.init(cores, cpu_mask_lowest(cores));
+
+    // Allocate render buffers.
+    int cells = W * H;
+    g_count    = (int*)malloc((i64)cells * 4);
+    g_speedsum = (double*)malloc((i64)cells * 8);
+    g_out      = (char*)malloc(1048576);   // 1 MB - plenty for one frame
+
+    // Prime accelerations.
+    parallel_for_n_pool(&pool, (i64)n, cores, forceRange);
+
+    double halfdt = 0.5 * dt;
+    double scaleX = (double)W * 0.5 / view;
+    double scaleY = (double)H * 0.5 / view;
+
+    // Bring up the console through terminal.cb. Terminal.init() enables ANSI/VT
+    // processing (so our escape sequences are interpreted instead of printed as
+    // garbage), and ~Terminal() restores the original console mode automatically
+    // when `term` goes out of scope.
+    Terminal term;
+    term.init();
+    term.hideCursor();
+    term.clear();
+
+    // Raw stdout handle for bulk frame writes. printf("%s", ...) silently drops
+    // output past ~4096 bytes (its internal format buffer), and a frame is ~33 KB,
+    // so we blast the whole buffer with WriteFile like example/stars.cb does.
+    void* hOut = term._hOut;
+    int wr = 0;
+
+    const char* ramp = " .:-=+*#%@";
+    int rampMax = 9;          // last index in ramp (strlen-1)
+
+    int frame = 0;
+    while (frame < frames) {
+        // --- physics: subSteps of velocity-Verlet ---
+        int ss = 0;
+        while (ss < subSteps) {
+            // half-kick
+            axpyVec(halfdt, sVx, sAx);
+            axpyVec(halfdt, sVy, sAy);
+            axpyVec(halfdt, sVz, sAz);
+            // drift
+            driftVec(dt, sPx, sVx);
+            driftVec(dt, sPy, sVy);
+            driftVec(dt, sPz, sVz);
+            // recompute accelerations (parallel O(N^2) kernel)
+            parallel_for_n_pool(&pool, (i64)n, cores, forceRange);
+            // half-kick
+            axpyVec(halfdt, sVx, sAx);
+            axpyVec(halfdt, sVy, sAy);
+            axpyVec(halfdt, sVz, sAz);
+            ss = ss + 1;
+        }
+
+        // --- rasterize bodies into the cell grid ---
+        int c = 0;
+        while (c < cells) { g_count[c] = 0; g_speedsum[c] = 0.0; c = c + 1; }
+
+        double maxSpeed = 0.0001;
+        i = 0;
+        while (i < n) {
+            double sx = px[i];
+            double sy = py[i];
+            // orthographic projection: world (x,y) -> cell (col,row)
+            int col = (int)(sx * scaleX + (double)W * 0.5);
+            int row = (int)(sy * scaleY + (double)H * 0.5);
+            if (col >= 0 && col < W && row >= 0 && row < H) {
+                double sp = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]);
+                if (sp > maxSpeed) { maxSpeed = sp; }
+                int idx = row * W + col;
+                g_count[idx] = g_count[idx] + 1;
+                g_speedsum[idx] = g_speedsum[idx] + sp;
+            }
+            i = i + 1;
+        }
+
+        // --- build one ANSI frame in g_out ---
+        g_out_len = 0;
+        outStr("\033[H");          // cursor home
+        int prevColor = -1;
+        int row = 0;
+        while (row < H) {
+            int col = 0;
+            while (col < W) {
+                int idx = row * W + col;
+                int cnt = g_count[idx];
+                if (cnt == 0) {
+                    if (prevColor != -1) { outStr("\033[0m"); prevColor = -1; }
+                    outCh(' ');
+                } else {
+                    double avg = g_speedsum[idx] / (double)cnt;
+                    double t = avg / maxSpeed;
+                    int rr = 0; int gg = 0; int bb = 0;
+                    heat(t, &rr, &gg, &bb);
+                    int packed = (rr << 16) | (gg << 8) | bb;
+                    if (packed != prevColor) { outColor(rr, gg, bb); prevColor = packed; }
+                    int r = cnt - 1;
+                    if (r > rampMax) { r = rampMax; }
+                    outCh(ramp[r]);
+                }
+                col = col + 1;
+            }
+            outStr("\033[0m\n");
+            prevColor = -1;
+            row = row + 1;
+        }
+        outStr("\033[0mframe ");
+        outInt(frame + 1);
+        outStr(" / ");
+        outInt(frames);
+        outStr("   bodies=");
+        outInt(n);
+        outStr("  cores=");
+        outInt(cores);
+        outStr("  (color=speed)   \n");
+        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+
+        sleep(30);
+        frame = frame + 1;
+    }
+
+    free(g_count);
+    free(g_speedsum);
+    free(g_out);
+    term.showCursor();
+    term.restore();        // ~Terminal() would also do this; explicit for clarity
+
+    delete[_] px;  delete[_] py;  delete[_] pz;
+    delete[_] vx;  delete[_] vy;  delete[_] vz;
+    delete[_] ax;  delete[_] ay;  delete[_] az;
+    delete[_] mass;
+    pool.shutdown();
+    return 0;
+}
