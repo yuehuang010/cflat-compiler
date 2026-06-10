@@ -1815,6 +1815,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnsOwned = false;
     lastCallIsBonded = false;
     lastCallBondedSources.clear();
+    lastCallLambdaCaptureNames.clear();
     lastCallRequiredLocks.clear();
     lastCallParameterNames.clear();
     vectorizeLoops_.clear();

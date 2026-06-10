@@ -594,6 +594,11 @@ public:
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
+        // For a lambda literal: the (already de-duplicated) names of enclosing locals/params it
+        // captures, in capture order. Empty for non-capturing lambdas and for stored function<>
+        // values. Used to produce a precise diagnostic when a capturing lambda is illegally passed
+        // to a C function-pointer parameter (the C ABI cannot carry captured state).
+        std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
@@ -828,6 +833,13 @@ public:
 
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
+    // De-duplicated capture names of the most recently evaluated lambda literal. Set in
+    // ParseLambdaExpression and consumed when the lambda is bound as a call argument, so the
+    // C function-pointer diagnostic can name exactly what a capturing lambda captured. Uses the
+    // compiler-level channel (like lastCallBondedSources) because the lambda's NamedVariable is
+    // reduced to its value before reaching the argument list - the MainListener-level
+    // lastLambdaType side-channel is cleared too early by intervening postfix processing.
+    std::vector<std::string> lastCallLambdaCaptureNames;
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
     std::vector<std::string> lastCallParameterNames; // VariableName of each parameter of the last resolved overload
 
@@ -4950,7 +4962,9 @@ public:
         return llvm::StructType::create(*context, { ptrTy, ptrTy }, name);
     }
 
-    // Creates __shim_<name>(i8* env, original params...) that ignores env and calls original.
+    // Creates __shim_<name>(original params..., i8* env) that ignores env and calls original.
+    // Env is the trailing param (the closure ABI is env-last) so a non-capturing lambda's
+    // invoker is bitcast-compatible with a bare C function pointer; this shim mirrors that layout.
     llvm::Function* GetOrCreateFunctionShim(llvm::Function* original)
     {
         std::string shimName = "__shim_" + original->getName().str();
@@ -4959,9 +4973,10 @@ public:
         auto* origTy  = original->getFunctionType();
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
 
-        std::vector<llvm::Type*> shimParamTypes = {i8PtrTy};
+        std::vector<llvm::Type*> shimParamTypes;
         for (auto* paramTy : origTy->params())
             shimParamTypes.push_back(paramTy);
+        shimParamTypes.push_back(i8PtrTy); // env (trailing, ignored)
 
         auto* shimTy = llvm::FunctionType::get(origTy->getReturnType(), shimParamTypes, false);
         auto* shim   = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage, shimName, module.get());
@@ -4969,11 +4984,10 @@ public:
         auto* entry = llvm::BasicBlock::Create(*context, "entry", shim);
         llvm::IRBuilder<> b(entry);
 
+        // Forward every param except the trailing env to the original.
         std::vector<llvm::Value*> callArgs;
-        auto argIt = shim->arg_begin();
-        ++argIt; // skip env
-        for (; argIt != shim->arg_end(); ++argIt)
-            callArgs.push_back(&*argIt);
+        for (unsigned i = 0; i + 1 < shim->arg_size(); ++i)
+            callArgs.push_back(shim->getArg(i));
 
         if (origTy->getReturnType()->isVoidTy())
         {
@@ -4989,7 +5003,7 @@ public:
 
     // Thunk used to wrap a bare C function pointer (returned from an extern C call) as a
     // closure {thunk, env=cfnptr}. The thunk's `env` slot carries the real C function
-    // pointer at runtime; CreateIndirectCall passes env as the first arg, so the thunk
+    // pointer at runtime; CreateIndirectCall passes env as the trailing arg, so the thunk
     // reads env back, bitcasts it to the C signature, and tail-calls through it.
     // One thunk per signature - keyed by the C-compatible LLVM FunctionType.
     llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
@@ -5008,17 +5022,18 @@ public:
         if (auto* existing = module->getFunction(key)) return existing;
 
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
-        std::vector<llvm::Type*> thunkParams = { i8PtrTy };
+        std::vector<llvm::Type*> thunkParams;
         for (auto* pt : cFnTy->params()) thunkParams.push_back(pt);
+        thunkParams.push_back(i8PtrTy); // env (trailing) carries the real C fn ptr at runtime
         auto* thunkTy = llvm::FunctionType::get(cFnTy->getReturnType(), thunkParams, false);
 
         auto* thunk = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage, key, *module);
 
         llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", thunk));
-        auto* envArg = thunk->getArg(0);
+        auto* envArg = thunk->getArg((unsigned)thunk->arg_size() - 1);
         auto* fnPtr  = b.CreateBitCast(envArg, cFnTy->getPointerTo(), "cfn");
         std::vector<llvm::Value*> callArgs;
-        for (unsigned i = 1; i < thunk->arg_size(); ++i) callArgs.push_back(thunk->getArg(i));
+        for (unsigned i = 0; i + 1 < thunk->arg_size(); ++i) callArgs.push_back(thunk->getArg(i));
         if (cFnTy->getReturnType()->isVoidTy())
         {
             b.CreateCall(cFnTy, fnPtr, callArgs);
@@ -5032,7 +5047,7 @@ public:
     }
 
     // Wraps a C-returned bare function pointer in a {thunk, cfnptr-as-env} fat struct
-    // so CFlat's indirect-call machinery (which always passes env first) routes through
+    // so CFlat's indirect-call machinery (which passes env as the trailing arg) routes through
     // the thunk and reaches the real C function with the right argument layout.
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
     {
@@ -7316,13 +7331,14 @@ public:
         auto* fnPtrI8 = builder->CreateExtractValue(funcPtr, {0u}, "fn_i8");
         auto* envPtr  = builder->CreateExtractValue(funcPtr, {1u}, "env_ptr");
 
-        // Build invoker function type: (i8* env, user_params...) -> RetType
-        std::vector<llvm::Type*> paramTypes = {i8PtrTy};
+        // Build invoker function type: (user_params..., i8* env) -> RetType (env-last ABI).
+        std::vector<llvm::Type*> paramTypes;
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
             paramTypes.push_back(GetType(pTV));
         }
+        paramTypes.push_back(i8PtrTy); // env (trailing)
         TypeAndValue retTV;
         retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
@@ -7330,12 +7346,12 @@ public:
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
 
-        // Upconvert user args to match declared param types (index 0 is env, skip it).
+        // Upconvert user args to match declared param types (the trailing slot is env, skip it).
         // String literals arrive as i8* - wrap them into %string{ptr,len} when the
         // param expects a string value type.
         for (size_t i = 0; i < args.size() && i + 1 < paramTypes.size(); i++)
         {
-            auto* destTy = paramTypes[i + 1];
+            auto* destTy = paramTypes[i];
             auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
             if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                 args[i] = WrapStringLiteralAsString(args[i]);
@@ -7343,9 +7359,9 @@ public:
                 args[i] = Upconvert(args[i], destTy);
         }
 
-        // Prepend env to call args
-        std::vector<llvm::Value*> fullArgs = {envPtr};
-        fullArgs.insert(fullArgs.end(), args.begin(), args.end());
+        // Append env to call args (env-last)
+        std::vector<llvm::Value*> fullArgs(args.begin(), args.end());
+        fullArgs.push_back(envPtr);
 
         lastCallReturnType = retTV;
         auto* result = builder->CreateCall(invokerTy, fnPtr, fullArgs);
@@ -8664,18 +8680,51 @@ public:
                     if (val && val->getType()->isStructTy())
                     {
                         // The argument is a CFlat closure fat struct {code, env} - a lambda or a
-                        // `function<>` variable. A C function pointer is a bare code address with
-                        // no env slot, so handing the closure across the C ABI loses the captured
-                        // state (and the code pointer expects an env argument the C caller never
-                        // supplies) - the call would read garbage and crash. C does not support
-                        // closures, so reject this instead of emitting a silent miscompile. The
-                        // supported form is a non-capturing named function passed directly, which
-                        // arrives here as a bare llvm::Function pointer (handled below).
-                        LogError(std::format(
-                            "cannot pass a lambda or 'function<>' variable to C function-pointer parameter '{}': "
-                            "a C callback is a bare code pointer and cannot carry captured state. "
-                            "Pass a non-capturing named function directly (e.g. the function's name), not a lambda or a 'function<>' variable.",
-                            candParamItr->VariableName));
+                        // `function<>` variable. A C function pointer is a bare code address with no
+                        // env slot. The closure ABI is env-last, so the invoker of a *non-capturing*
+                        // lambda (env is the trailing param and is never read) is directly callable
+                        // as a C function pointer: the C caller simply never supplies the trailing
+                        // env arg. Detect non-capturing by a compile-time-null env field (set only
+                        // when the lambda captured nothing - see ParseLambdaExpression) and pass the
+                        // bare invoker (field 0). A capturing lambda or a `function<>` variable
+                        // cannot be statically proven non-capturing, so it loses captured state
+                        // across the C ABI and is rejected instead of silently miscompiling.
+                        auto* envField = builder->CreateExtractValue(val, {1u}, "closure_env");
+                        if (llvm::isa<llvm::ConstantPointerNull>(envField))
+                        {
+                            auto* codeField = builder->CreateExtractValue(val, {0u}, "closure_code");
+                            val = builder->CreateBitCast(codeField, llvmParamTy, "noncap_lambda_cfn");
+                        }
+                        else if (!arg.LambdaCaptureNames.empty())
+                        {
+                            // A capturing lambda literal - name what it captures so the user can see
+                            // exactly which variables to drop (or replace with a named function).
+                            // Names are already de-duplicated; show at most 5, then summarize the rest.
+                            const auto& caps = arg.LambdaCaptureNames;
+                            const size_t count = caps.size();
+                            const size_t shown = count < 5 ? count : 5;
+                            std::string list;
+                            for (size_t k = 0; k < shown; k++)
+                            {
+                                if (k != 0) list += ", ";
+                                list += caps[k];
+                            }
+                            std::string more = count > shown
+                                ? std::format(", ... (and {} more)", count - shown) : "";
+                            LogError(std::format(
+                                "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} [{}{}]. "
+                                "A C callback is a bare code pointer and cannot carry captured state - "
+                                "pass a non-capturing lambda or a named function.",
+                                candParamItr->VariableName, count, (count == 1 ? "variable" : "variables"), list, more));
+                        }
+                        else
+                        {
+                            // A stored function<> value - its captures are not known at the call site.
+                            LogError(std::format(
+                                "cannot pass to C function-pointer parameter '{}': this 'function<>' value may store captured state. "
+                                "A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
+                                candParamItr->VariableName));
+                        }
                     }
                     else if (val && !val->getType()->isPointerTy())
                     {

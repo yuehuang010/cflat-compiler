@@ -5906,23 +5906,24 @@ public:
             return;
         }
 
-        // Create/reuse __stream_write_shim(i8* env, char* data, i32 len) - casts env to stream*, calls write_bytes.
-        // The hook is non-owning: printf passes a thread-local buffer; the shim copies it via write_bytes.
+        // Create/reuse __stream_write_shim(char* data, i32 len, i8* env) - casts env to stream*, calls write_bytes.
+        // Env is the trailing param (closure ABI is env-last). The hook is non-owning: printf passes a
+        // thread-local buffer; the shim copies it via write_bytes.
         llvm::Function* shim = compiler->module->getFunction("__stream_write_shim");
         if (!shim)
         {
             auto* charPtrTy = i8PtrTy;  // char* and i8* are the same in LLVM
             auto* i32Ty     = llvm::Type::getInt32Ty(*compiler->context);
             auto* shimTy    = llvm::FunctionType::get(
-                compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy, i32Ty}, false);
+                compiler->builder->getVoidTy(), {charPtrTy, i32Ty, i8PtrTy}, false);
             shim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
                 "__stream_write_shim", *compiler->module);
             auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
             llvm::IRBuilder<> b(bb);
             auto* streamTy = compiler->GetDataStructure("stream").StructType;
-            auto* selfPtr  = b.CreateBitCast(shim->getArg(0), streamTy->getPointerTo(), "stream_self");
+            auto* selfPtr  = b.CreateBitCast(shim->getArg(2), streamTy->getPointerTo(), "stream_self");
             b.CreateCall(writeBytesFn->getFunctionType(), writeBytesFn,
-                {selfPtr, shim->getArg(1), shim->getArg(2)});
+                {selfPtr, shim->getArg(0), shim->getArg(1)});
             b.CreateRetVoid();
         }
 
@@ -5995,20 +5996,21 @@ public:
         auto* returnFn = FindStreamMethodFn(compiler, "return_buffer");
         if (returnFn)
         {
-            // Create/reuse __stream_return_buffer_shim(i8* env, char* buf) - calls stream.return_buffer.
+            // Create/reuse __stream_return_buffer_shim(char* buf, i8* env) - calls stream.return_buffer.
+            // Env is the trailing param (closure ABI is env-last).
             llvm::Function* returnShim = compiler->module->getFunction("__stream_return_buffer_shim");
             if (!returnShim)
             {
                 auto* charPtrTy = i8PtrTy;
                 auto* shimTy    = llvm::FunctionType::get(
-                    compiler->builder->getVoidTy(), {i8PtrTy, charPtrTy}, false);
+                    compiler->builder->getVoidTy(), {charPtrTy, i8PtrTy}, false);
                 returnShim = llvm::Function::Create(shimTy, llvm::Function::InternalLinkage,
                     "__stream_return_buffer_shim", *compiler->module);
                 auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", returnShim);
                 llvm::IRBuilder<> b(bb);
                 auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                auto* selfPtr  = b.CreateBitCast(returnShim->getArg(0), streamTy->getPointerTo(), "stream_self");
-                b.CreateCall(returnFn->getFunctionType(), returnFn, {selfPtr, returnShim->getArg(1)});
+                auto* selfPtr  = b.CreateBitCast(returnShim->getArg(1), streamTy->getPointerTo(), "stream_self");
+                b.CreateCall(returnFn->getFunctionType(), returnFn, {selfPtr, returnShim->getArg(0)});
                 b.CreateRetVoid();
             }
 
@@ -9116,7 +9118,9 @@ public:
                         if (prevPrimary->lambdaExpression() != nullptr)
                         {
                             namedVar.TypeAndValue = lastLambdaType;
+                            namedVar.LambdaCaptureNames = Compiler(ctx)->lastCallLambdaCaptureNames;
                             lastLambdaType = {};
+                            Compiler(ctx)->lastCallLambdaCaptureNames.clear();
                         }
 
                         if (namedVar.TypeAndValue.IsInterface)
@@ -10738,6 +10742,10 @@ public:
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondedSources = argNV.BondedSources;
+                                    // Propagate lambda capture names: when the lambda arg went through
+                                    // postfix processing, the names land on argNV (the line below covers
+                                    // the direct-arg path where they arrive via the side-channel instead).
+                                    argVar.LambdaCaptureNames = argNV.LambdaCaptureNames;
 
                                     // Preserve unsigned-integer TypeName so Upconvert can choose ZExt over SExt.
                                     if (argNV.TypeAndValue.IsUnsignedInteger() != -1)
@@ -10776,7 +10784,9 @@ public:
                                     if (lastLambdaType.IsFunctionPointer && argValue != nullptr)
                                     {
                                         argVar.TypeAndValue = lastLambdaType;
+                                        argVar.LambdaCaptureNames = Compiler(ctx)->lastCallLambdaCaptureNames;
                                         lastLambdaType = {};
+                                        Compiler(ctx)->lastCallLambdaCaptureNames.clear();
                                     }
 
                                     arguments.emplace_back(argVar);
@@ -11337,20 +11347,22 @@ public:
         // Save builder position - invoker emits into a separate LLVM function.
         auto savedState = compiler->SaveBuilderState();
 
-        // Invoker signature: (i8* __env, user_params...) -> RetType
+        // Invoker signature: (user_params..., i8* __env) -> RetType. Env is the trailing
+        // param (the closure ABI is env-last) so a non-capturing lambda's invoker is directly
+        // bitcast-compatible with a bare C function pointer at a C callback site.
         LLVMBackend::DeclTypeAndValue envParam;
         envParam.TypeName = "void"; envParam.Pointer = true; envParam.VariableName = "__env";
         std::vector<LLVMBackend::TypeAndValue> allParams;
-        allParams.push_back(envParam);
         allParams.insert(allParams.end(), params.begin(), params.end());
+        allParams.push_back(envParam);
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
 
-        // Unpack captured variables from env into the invoker's scope.
+        // Unpack captured variables from env (the trailing param) into the invoker's scope.
         if (!captures.empty() && closureStructTy)
         {
-            auto* envArg    = fn->getArg(0);
+            auto* envArg    = fn->getArg((unsigned)fn->arg_size() - 1);
             auto* closurePtr = compiler->builder->CreateBitCast(
                 envArg, closureStructTy->getPointerTo(), "closure");
 
@@ -11463,6 +11475,14 @@ public:
         LLVMBackend::NamedVariable result;
         result.Primary     = fat;
         result.TypeAndValue = tv;
+
+        // Record what this lambda captures (names are already de-duplicated by
+        // CollectLambdaCaptures) so a later attempt to pass it to a C function-pointer
+        // parameter can report exactly which variables block the conversion. Mirror it onto
+        // the compiler-level side-channel since only the value survives into the arg list.
+        for (const auto& cap : captures)
+            result.LambdaCaptureNames.push_back(cap.Name);
+        compiler->lastCallLambdaCaptureNames = result.LambdaCaptureNames;
 
         // Phase 6: Bond tracking - reference-captured variables are held by pointer.
         // The lambda borrows stack addresses that cannot outlive their source scope.

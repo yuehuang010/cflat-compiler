@@ -3,7 +3,8 @@
 // would drop the captured state and crash at runtime, so the compiler must reject it. The
 // supported form is passing a non-capturing named function directly.
 
-expect_error("cannot pass a lambda or 'function<>' variable to C function-pointer parameter") {
+// A single captured variable: the diagnostic names it exactly.
+expect_error("this lambda captured 1 variable [bias]") {
     extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);
 
     int sortFour()
@@ -14,6 +15,23 @@ expect_error("cannot pass a lambda or 'function<>' variable to C function-pointe
         qsort(&a[0], 4u, 4u, (void* x, void* y) => {
             int* ix = (int*)x; int* iy = (int*)y;
             return (*ix - *iy) * bias;
+        });
+        return a[0];
+    }
+}
+
+// More than 5 captures: the diagnostic lists the first 5 and summarizes the remainder.
+expect_error("this lambda captured 7 variables [c0, c1, c2, c3, c4, ... (and 2 more)]") {
+    extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);
+
+    int sortSeven()
+    {
+        int[2] a = {1, 0};
+        int c0 = 0; int c1 = 1; int c2 = 2; int c3 = 3;
+        int c4 = 4; int c5 = 5; int c6 = 6;
+        qsort(&a[0], 2u, 4u, (void* x, void* y) => {
+            int* ix = (int*)x; int* iy = (int*)y;
+            return (*ix - *iy) + c0 + c1 + c2 + c3 + c4 + c5 + c6;
         });
         return a[0];
     }

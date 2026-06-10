@@ -1024,6 +1024,35 @@ bool testFuncPtrMoveSignature()
     return got == 7 && g_move_fp_dtor_count == 1;
 }
 
+// ── Non-capturing lambda across the C ABI ────────────────────────────────────
+// A C function pointer is a bare code address with no env slot. The closure ABI is
+// env-last, so the invoker of a *non-capturing* lambda is directly callable as a
+// C callback - the C caller never supplies the trailing (unused) env arg. A capturing
+// lambda or a function<> variable still cannot cross the C ABI (see err_lambda_to_c_funcptr).
+
+extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);
+
+bool testNonCapturingLambdaToCFuncPtr()
+{
+    bool result = true;
+
+    int[5] a = {5, 2, 8, 1, 9};
+    // Non-capturing comparator: references only its own parameters, captures nothing.
+    qsort(&a[0], 5u, (u64)sizeof(int), (void* x, void* y) => {
+        int* ix = (int*)x;
+        int* iy = (int*)y;
+        return *ix - *iy;
+    });
+
+    result &= Test("c-funcptr lambda sort[0]", a[0], 1);
+    result &= Test("c-funcptr lambda sort[1]", a[1], 2);
+    result &= Test("c-funcptr lambda sort[2]", a[2], 5);
+    result &= Test("c-funcptr lambda sort[3]", a[3], 8);
+    result &= Test("c-funcptr lambda sort[4]", a[4], 9);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1080,6 +1109,9 @@ extern int main()
 
     // 'move' in function pointer signatures
     total++; passed += testFuncPtrMoveSignature()      ? 1 : 0;
+
+    // Non-capturing lambda across the C ABI
+    total++; passed += testNonCapturingLambdaToCFuncPtr() ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;
