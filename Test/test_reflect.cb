@@ -177,6 +177,10 @@ bool floatNear(float a, float b)
     return diff < 0.001f;
 }
 
+// Helpers for typeof-on-auto: the inferred type should follow the return type.
+i64   retI64()   { return 5; }
+float retFloat() { return 1.0f; }
+
 extern int main()
 {
     int passed = 0;
@@ -275,6 +279,86 @@ extern int main()
     total++; passed += Test("bf reflect flag (bool)", bfc.sawFlag, 2);
     total++; passed += Test("bf reflect int visits", bfc.intCount, 4);
     total++; passed += Test("bf reflect bool visits", bfc.boolCount, 1);
+
+    // =========================================================================
+    // typeof on 'auto' variables - resolves the concrete inferred type
+    // =========================================================================
+    // The inferred name follows the concrete LLVM type. Integer LITERALS take the
+    // minimal width that holds them (5 is i8, 300 is i16, ...) and a suffix-less
+    // float literal is f32 when it round-trips, else f64. When the initializer is an
+    // explicitly-typed source, the exact width AND signedness carry through (an
+    // integer literal has no unsigned info, so signedness only survives via a typed
+    // source - not via a bare literal).
+
+    // -- literals: minimal width -------------------------------------------------
+    auto litI8     = 5;                      // fits i8
+    auto litI16    = 300;                    // wider than i8 -> i16
+    auto litInt    = 100000;                 // wider than i16 -> int
+    auto litI64    = 5000000000;             // wider than i32 -> i64
+    auto litFloat  = 1.5;                    // round-trips to f32
+    auto litDouble = 3.141592653589793;      // needs f64 precision
+    auto litFloatF = 1.5f;                   // explicit suffix -> float
+    auto litBool   = true;
+    auto litChar   = 'A';                    // char literal -> i8
+    total++; passed += Test("typeof_auto_lit_i8",      typeof(litI8),     "i8");
+    total++; passed += Test("typeof_auto_lit_i16",     typeof(litI16),    "i16");
+    total++; passed += Test("typeof_auto_lit_int",     typeof(litInt),    "int");
+    total++; passed += Test("typeof_auto_lit_i64",     typeof(litI64),    "i64");
+    total++; passed += Test("typeof_auto_float",       typeof(litFloat),  "float");
+    total++; passed += Test("typeof_auto_double",      typeof(litDouble), "double");
+    total++; passed += Test("typeof_auto_float_sfx",   typeof(litFloatF), "float");
+    total++; passed += Test("typeof_auto_bool",        typeof(litBool),   "bool");
+    total++; passed += Test("typeof_auto_char",        typeof(litChar),   "i8");
+
+    // -- from explicitly-typed sources: width + signedness preserved -------------
+    i8  srcI8  = 1;   auto fromI8  = srcI8;
+    u8  srcU8  = 1;   auto fromU8  = srcU8;
+    i16 srcI16 = 1;   auto fromI16 = srcI16;
+    u32 srcU32 = 1;   auto fromU32 = srcU32;
+    i64 srcI64 = 1;   auto fromI64 = srcI64;
+    double srcD = 1;  auto fromD   = srcD;
+    total++; passed += Test("typeof_auto_from_i8",     typeof(fromI8),  "i8");
+    total++; passed += Test("typeof_auto_from_u8",     typeof(fromU8),  "u8");
+    total++; passed += Test("typeof_auto_from_i16",    typeof(fromI16), "i16");
+    total++; passed += Test("typeof_auto_from_u32",    typeof(fromU32), "u32");
+    total++; passed += Test("typeof_auto_from_i64",    typeof(fromI64), "i64");
+    total++; passed += Test("typeof_auto_from_double", typeof(fromD),   "double");
+
+    string srcStr = "x"; auto fromStr = srcStr;
+    total++; passed += Test("typeof_auto_from_string", typeof(fromStr), "string");
+
+    // -- pointers ----------------------------------------------------------------
+    auto autoIntPtr = new int[2];
+    total++; passed += Test("typeof_auto_int_ptr", typeof(autoIntPtr), "int*");
+    delete autoIntPtr;
+
+    auto autoDblPtr = new double[2];
+    total++; passed += Test("typeof_auto_double_ptr", typeof(autoDblPtr), "double*");
+    delete autoDblPtr;
+
+    auto autoPointPtr = new Point();
+    total++; passed += Test("typeof_auto_struct_ptr", typeof(autoPointPtr), "Point*");
+    delete autoPointPtr;
+
+    Point autoSrc;
+    auto autoPointVal = autoSrc;
+    total++; passed += Test("typeof_auto_struct_val", typeof(autoPointVal), "Point");
+
+    // -- chained auto / expression / call return / member access -----------------
+    auto chained = litInt;                   // auto inferred from another auto
+    total++; passed += Test("typeof_auto_of_auto", typeof(chained), "int");
+
+    auto exprSum = litI8 + litInt;           // C promotion in the expression -> int
+    total++; passed += Test("typeof_auto_expr", typeof(exprSum), "int");
+
+    auto callI64   = retI64();
+    auto callFloat = retFloat();
+    total++; passed += Test("typeof_auto_call_i64",   typeof(callI64),   "i64");
+    total++; passed += Test("typeof_auto_call_float", typeof(callFloat), "float");
+
+    Point memSrc; memSrc.x = 7;
+    auto memInt = memSrc.x;                  // member access -> field type
+    total++; passed += Test("typeof_auto_member", typeof(memInt), "int");
 
     // =========================================================================
     // JSON tests

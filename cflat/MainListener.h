@@ -4314,6 +4314,12 @@ public:
                 std::string srcBorrowedOrigin;
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
+                // Concrete type inferred from the initializer, used to resolve an 'auto'
+                // declaration's TypeName (LLVM opaque pointers cannot recover the pointee
+                // from the value type alone, so typeof/nameof need the name captured here).
+                std::string srcInferredTypeName;
+                bool srcInferredPointer = false;
+                bool srcInferredElemPointer = false;
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -4524,6 +4530,9 @@ public:
                                     && rightNV.Storage == nullptr
                                     && !rightNV.CallerName.empty();
                                 srcOwningName = rightNV.CallerName;
+                                srcInferredTypeName = rightNV.TypeAndValue.TypeName;
+                                srcInferredPointer = rightNV.TypeAndValue.Pointer;
+                                srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
@@ -4668,6 +4677,27 @@ public:
                             right = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
                         else
                             LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
+                    }
+                }
+
+                // Resolve an 'auto' declaration to the initializer's concrete type so the
+                // variable carries a real TypeName (drives typeof/nameof reflection and the
+                // LSP). Guarded by an LLVM-type equality check: only adopt the inferred name
+                // when the name-based type matches the value's actual type, leaving simd /
+                // function-pointer / array-view / generic 'auto' vars (which infer their
+                // LLVM type directly from the value) untouched.
+                if (typeAndValue.TypeName == "auto" && right != nullptr
+                    && !srcInferredTypeName.empty() && srcInferredTypeName != "auto")
+                {
+                    LLVMBackend::TypeAndValue probe = typeAndValue;
+                    probe.TypeName = srcInferredTypeName;
+                    probe.Pointer = srcInferredPointer;
+                    probe.ElemPointer = srcInferredElemPointer;
+                    if (compiler->GetType(probe) == right->getType())
+                    {
+                        typeAndValue.TypeName = srcInferredTypeName;
+                        typeAndValue.Pointer = srcInferredPointer;
+                        typeAndValue.ElemPointer = srcInferredElemPointer;
                     }
                 }
 
@@ -11583,7 +11613,16 @@ public:
             {
                 auto namedVar = ParseUnaryExpression(ue);
                 typeName = namedVar.TypeAndValue.TypeName;
-                if (namedVar.TypeAndValue.Pointer && !typeName.empty())
+                // 'auto' variables carry the literal text "auto" (or an empty
+                // string) as their declared TypeName even though the concrete
+                // type is known. Recover it from the resolved LLVM BaseType,
+                // which holds the value type even for pointer variables.
+                // Note: LLVM integer types are signless, so an 'auto' variable
+                // bound to an unsigned value reports the signed name (e.g. "int"
+                // for u32, "i8" for char) - the signedness is not recoverable here.
+                if ((typeName == "auto" || typeName.empty()) && namedVar.BaseType != nullptr)
+                    typeName = LLVMTypeToTypeName(namedVar.BaseType);
+                if (namedVar.TypeAndValue.Pointer && !typeName.empty() && typeName.back() != '*')
                     typeName += "*";
             }
 
