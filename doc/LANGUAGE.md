@@ -1078,6 +1078,51 @@ Float UFCS methods:
 (9.0f).sqrt();     // 3.0
 ```
 
+### Integer <-> pointer casts
+
+A C-style cast moves freely between any integer type, any pointer type, and across
+the two. This is essential for C interop, where the Win32 `LPARAM` / `WPARAM` /
+`HANDLE` / `HMENU` types are passed as integers that actually carry pointers or
+opaque handles:
+
+```c
+i64 lParam = ...;
+Node* p   = (Node*)lParam;     // integer -> pointer
+i64   back = (i64)p;           // pointer -> integer
+void* h    = (void*)(i64)id;   // small integer widened, then -> pointer
+Foo*  f    = (Bar*)b;          // pointer -> pointer (reinterpret, no runtime cost)
+```
+
+| Conversion | Allowed | Behavior |
+|------------|---------|----------|
+| integer -> pointer | explicit cast | the integer bits become the address; a narrower integer is zero-extended to pointer width |
+| pointer -> integer | explicit cast | the address becomes an integer; **truncated** if the target integer is narrower than a pointer |
+| pointer -> pointer | explicit cast | pure reinterpret, zero runtime cost |
+| literal `0` -> pointer | **implicit** | yields a null pointer (this is what `= default` / null-init does) |
+
+Only the integer literal `0` converts to a pointer implicitly (the null case).
+Every other integer<->pointer move requires the explicit cast - there is no
+implicit conversion of a general integer to a pointer or back.
+
+**Round-trip handles and addresses through a 64-bit integer, never `i32`.** On the
+x64 target a pointer is 64 bits, so `(i32)somePointer` silently drops the top half
+of a real handle. Use `i64` / `u64`:
+
+```c
+HANDLE h = ...;
+i64 token = (i64)h;            // safe round-trip
+HANDLE h2 = (HANDLE)token;     // recovers the original handle
+
+i32 bad = (i32)h;              // WRONG: truncates a 64-bit handle to 32 bits
+```
+
+Likewise, when widening a small integer (an enum value, a control id) into a
+pointer slot, cast it to `i64` first - `(void*)(i64)id` - so the value occupies the
+full pointer width rather than relying on the narrow integer's extension.
+
+A struct **value** cast to a pointer is rejected (use `&value` or `getPtr()`); only
+integers and other pointers reinterpret to a pointer.
+
 ---
 
 ## Null-Safety
@@ -1113,9 +1158,29 @@ const char* name = tryGetName() ?? "Unknown";
 
 ### `nullptr`
 
+`nullptr` is the null pointer constant - a pointer that points at nothing. Use it
+to initialize, clear, or compare any pointer type. CFlat spells it `nullptr` (not
+`null` or `NULL`):
+
 ```c
-Node* p = nullptr;
+Node* p = nullptr;          // explicit null initializer
+p = nullptr;                // clear a pointer
+
+if (p == nullptr) { ... }   // null check
+if (p != nullptr) { ... }   // non-null check
 ```
+
+- A pointer field with no declared initializer is already zero-filled to `nullptr`
+  by `= default`, so an explicit `= nullptr` is only needed when you want it stated.
+- The integer literal `0` also converts to a null pointer implicitly, but prefer
+  `nullptr` for clarity - it documents intent and reads as a pointer, not a number.
+- Pass `nullptr` for optional C-interop arguments that expect a pointer
+  (`GetModuleHandleA(nullptr)`, a `nullptr` window handle, etc.).
+- `nullptr` carries no ownership, so assigning it never triggers a move and is the
+  way to break a `view`/`span` bond (see [Ownership](#ownership--lifetime-move-keyword)).
+
+Dereferencing or member-accessing a `nullptr` is undefined at runtime; reach for
+the null-safe `?.` operator above when a pointer may legitimately be null.
 
 ---
 
