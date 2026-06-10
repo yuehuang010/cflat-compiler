@@ -593,6 +593,7 @@ public:
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
+        bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
         // For a lambda literal: the (already de-duplicated) names of enclosing locals/params it
         // captures, in capture order. Empty for non-capturing lambdas and for stored function<>
@@ -832,6 +833,7 @@ public:
     std::map<std::string, int> viewScopeByOrigin_; // origin name -> index into aliasScopes_
 
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
+    bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
     // De-duplicated capture names of the most recently evaluated lambda literal. Set in
     // ParseLambdaExpression and consumed when the lambda is bound as a call argument, so the
@@ -8864,6 +8866,7 @@ public:
 
         // Populate bond side-channel: collect source variable names for bond parameters.
         lastCallIsBonded = false;
+        lastCallBondByAddress = false;
         lastCallBondedSources.clear();
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
@@ -9245,7 +9248,7 @@ public:
         {
             for (const auto& [name, nv] : frame.namedVariable)
             {
-                if (nv.IsBonded)
+                if (nv.IsBonded && !nv.BondByAddress)
                 {
                     for (const auto& src : nv.BondedSources)
                     {

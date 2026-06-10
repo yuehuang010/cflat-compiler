@@ -720,6 +720,34 @@ bool testLambdaAllocaInLoop()
     return result;
 }
 
+// Regression: a capture-bond (lambda holding &source by address) must NOT block
+// reassigning the captured source. The closure stores the alloca address, so writing
+// a new value into a still-live slot is safe - the canonical double-buffer swap idiom.
+// Previously rejected with "cannot reassign 'a' while 'f' holds a bonded reference to
+// it". The bond's escape guard still fires for both bond kinds; only the in-frame
+// reassignment block is lifted for by-address capture-bonds.
+bool testCaptureBondReassign()
+{
+    bool result = true;
+
+    Counter a; a.value = 1;
+    Counter b; b.value = 2;
+
+    // Build the closure ONCE, capturing both struct locals by reference.
+    function<int()> f = () => { return a.value + b.value; };
+
+    // Double-buffer swap: reassign the captured sources. Must compile without the
+    // spurious bond-reassignment error; the closure observes the new slot contents.
+    Counter tmp = a;
+    a = b;
+    b = tmp;
+
+    // After swap a.value==2, b.value==1, so f() returns 3.
+    result &= Test("capture-bond swap then call", f(), 3);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GENERIC FUNCTION POINTER TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1092,6 +1120,7 @@ extern int main()
     total++; passed += testCaptureNameCollidesWithFunction() ? 1 : 0;
     total++; passed += testCaptureLocalArray()         ? 1 : 0;
     total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
+    total++; passed += testCaptureBondReassign()       ? 1 : 0;
 
     // Generic function pointer tests
     total++; passed += testGenericFuncPtrBasic()       ? 1 : 0;

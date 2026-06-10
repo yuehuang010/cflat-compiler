@@ -2943,6 +2943,7 @@ public:
                         compiler->lastOwningResult = false;
                         compiler->lastCallReturnsOwned = false;
                         compiler->lastCallIsBonded = false;
+                        compiler->lastCallBondByAddress = false;
                         compiler->lastCallBondedSources.clear();
                         compiler->CreateReturnCall(right);
                     }
@@ -4827,8 +4828,10 @@ public:
                         {
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsBonded = true;
+                            nv.BondByAddress = compiler->lastCallBondByAddress;
                             nv.BondedSources = compiler->lastCallBondedSources;
                             compiler->lastCallIsBonded = false;
+                            compiler->lastCallBondByAddress = false;
                             compiler->lastCallBondedSources.clear();
                         }
 
@@ -5248,6 +5251,7 @@ public:
                     }
                 }
                 compiler->lastCallIsBonded = false;
+                compiler->lastCallBondByAddress = false;
                 compiler->lastCallBondedSources.clear();
             }
 
@@ -10434,6 +10438,12 @@ public:
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = result ? result->getType() : nullptr;
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                // The call result is a fresh value; it does not inherit the
+                                // lambda's capture-bond (the closure holds &source, but the
+                                // returned value is independent).
+                                namedVar.IsBonded = false;
+                                namedVar.BondByAddress = false;
+                                namedVar.BondedSources.clear();
                                 functionArgCounter++;
                                 break;
                             }
@@ -10538,6 +10548,7 @@ public:
                                     argVar.CallerName = argNV.CallerName;
                                     argVar.TypeAndValue.IsInterface = argNV.TypeAndValue.IsInterface;
                                     argVar.IsBonded = argNV.IsBonded;
+                                    argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
 
                                     // Extract struct name if this is a struct type
@@ -10793,6 +10804,7 @@ public:
                                     argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
+                                    argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
                                     // Propagate lambda capture names: when the lambda arg went through
                                     // postfix processing, the names land on argNV (the line below covers
@@ -11548,8 +11560,13 @@ public:
         }
         if (result.IsBonded)
         {
-            compiler->lastCallIsBonded       = true;
-            compiler->lastCallBondedSources  = result.BondedSources;
+            // Kind A capture-bond: the closure holds &source (the alloca address).
+            // Reassigning source writes a still-live slot, so the reassignment block is spurious.
+            // Set BondByAddress so FindActiveBondBorrower skips the reassignment check for this kind.
+            result.BondByAddress              = true;
+            compiler->lastCallIsBonded        = true;
+            compiler->lastCallBondByAddress   = true;
+            compiler->lastCallBondedSources   = result.BondedSources;
         }
 
         return result;
