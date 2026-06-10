@@ -42,6 +42,10 @@ if errorlevel 1 (
     if errorlevel 1 ( echo ERROR: Failed to install vsce. & exit /b 1 )
 )
 
+REM Stamp the extension version from the compiler's Version.h (single source of truth)
+call node sync-version.js
+if errorlevel 1 ( echo ERROR: Version sync failed. & exit /b 1 )
+
 REM Package
 echo [4/4] Packaging extension...
 call npx vsce package --allow-missing-repository --no-git-tag-version 2>&1

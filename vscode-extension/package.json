@@ -2,7 +2,7 @@
   "name": "cflat-language",
   "displayName": "cflat Language Support",
   "description": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "cflat",
   "engines": {
     "vscode": "^1.85.0"
@@ -63,7 +63,9 @@
               "args": {
                 "type": "array",
                 "description": "Command-line arguments passed to the compiled program.",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "default": []
               },
               "cwd": {
@@ -78,7 +80,11 @@
               },
               "console": {
                 "type": "string",
-                "enum": [ "integratedTerminal", "externalTerminal", "internalConsole" ],
+                "enum": [
+                  "integratedTerminal",
+                  "externalTerminal",
+                  "internalConsole"
+                ],
                 "description": "Where to host the program's stdio.",
                 "default": "integratedTerminal"
               }

@@ -34,6 +34,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Stamp the extension version from the compiler's Version.h (single source of truth)
+call node sync-version.js
+if errorlevel 1 (
+    echo ERROR: Version sync failed.
+    exit /b 1
+)
+
 REM Install vsce if not present
 echo [3/3] Packaging extension as .vsix...
 call npx vsce --version >nul 2>&1

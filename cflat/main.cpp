@@ -71,7 +71,7 @@ int main(int argc, char* argv[])
 
     if (args.showVersion())
     {
-        std::cout << std::format("{}.{}\n", MAJOR_VERSION, MINOR_VERSION);
+        std::cout << CFLAT_VERSION_STRING "\n";
         return 0;
     }
 
@@ -102,7 +102,7 @@ int main(int argc, char* argv[])
 
     bool showLogo = !args.hasFlag("nologo");
     if (showLogo)
-        std::cout << std::format("CFlat Compiler {}.{}\n", MAJOR_VERSION, MINOR_VERSION);
+        std::cout << "CFlat Compiler " CFLAT_VERSION_STRING "\n";
 
     // -ftime-trace is a top-level switch: initialize the profiler up front so every
     // code path below (single compile or --check batch) is captured, and write the trace

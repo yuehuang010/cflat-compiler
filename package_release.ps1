@@ -1,8 +1,20 @@
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version
 )
 
 $ErrorActionPreference = "Stop"
+
+# Default the release version from the compiler's single source of truth
+# (cflat/Version.h). An explicit -Version argument still overrides this.
+if (-not $Version) {
+    $header = Get-Content "$PSScriptRoot\cflat\Version.h" -Raw
+    $major  = [regex]::Match($header, '#define\s+CFLAT_VERSION_MAJOR\s+(\d+)').Groups[1].Value
+    $minor  = [regex]::Match($header, '#define\s+CFLAT_VERSION_MINOR\s+(\d+)').Groups[1].Value
+    if (-not $major -or -not $minor) {
+        Write-Error "Could not parse version from cflat\Version.h"
+    }
+    $Version = "$major.$minor.0"
+}
 
 $releaseDir = "$PSScriptRoot\x64\Release"
 $publishDir = "$PSScriptRoot\out\publish"
