@@ -10295,7 +10295,29 @@ public:
     // without syntax errors.
     bool CheckGrammar(const std::string& filename);
 
-    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::string& explicitLib = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
+    bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
+
+    // Resolve an inline `lib "..."` clause to a link argument for cLinkLibs_. A library that
+    // ships beside the importing .cb (the Conan/vcpkg layout) is used by its full path; a
+    // bare system lib name like "user32.lib" that is not found there is passed through
+    // unqualified, so lld-link resolves it against the system lib search paths - the Windows
+    // SDK `um` dir that cflat already discovered to resolve <windows.h> is on that path.
+    static std::string ResolveCLinkLib(const std::string& lib, const std::string& importingFilePath)
+    {
+        std::filesystem::path lp(lib);
+        if (lp.is_absolute())
+            return lp.string();
+        std::filesystem::path beside = (std::filesystem::path(importingFilePath).parent_path() / lp).lexically_normal();
+        std::error_code ec;
+        if (std::filesystem::exists(beside, ec))
+            return beside.string();
+        // A relative path that names a subdirectory is a real (possibly mistyped) location -
+        // keep it normalized so lld-link's "not found" points at the resolved path. A bare
+        // filename is a system lib - pass it through for the linker's lib-path search.
+        if (lp.has_parent_path())
+            return beside.string();
+        return lib;
+    }
 
     // Vcpkg integration setters - wired from CLI flags in main.cpp.
     void SetVcpkgExe(const std::string& path)        { vcpkg_.SetExeOverride(path); }

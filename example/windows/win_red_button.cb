@@ -1,0 +1,107 @@
+// A native Win32 GUI app: a window containing a single red "Close" button.
+// Clicking the button closes the application.
+//
+// This is the canonical example of binding the Win32 API from CFlat. The
+// `import "windows.h"` line both pulls in the Win32 declarations (functions,
+// structs, and folded #define constants) and links the system import libs it
+// needs via the inline `lib { ... }` clause - no `--c-lib` paths required, since
+// a bare system lib name resolves against the same Windows SDK dir cflat used to
+// find <windows.h>:
+//
+//   x64/Release/cflat.exe example/windows/win_red_button.cb -o out/win_red_button.exe
+//   out\win_red_button.exe
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+
+// The "Close" button gets this control id; WM_COMMAND from it quits the app.
+const i32 ID_CLOSE = 100;
+
+// LRESULT CALLBACK WndProc(HWND, UINT msg, WPARAM, LPARAM).
+// stdcall keeps it ABI-correct on the 32-bit target (no-op on x64).
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    // Owner-draw: paint the button face solid red with a white "Close" label.
+    if (msg == WM_DRAWITEM)
+    {
+        DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lParam;
+        void* red = CreateSolidBrush(255u);          // RGB(255,0,0) == 0x0000FF
+        FillRect(dis->hDC, &dis->rcItem, red);
+        DeleteObject(red);
+
+        SetBkMode(dis->hDC, TRANSPARENT);
+        SetTextColor(dis->hDC, 16777215u);           // RGB(255,255,255) white
+        DrawTextA(dis->hDC, "Close", -1, &dis->rcItem,
+                  (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE));
+        return (i64)1;
+    }
+
+    if (msg == WM_COMMAND)
+    {
+        // Low word of wParam is the control id of the clicked button.
+        u32 ctlId = (u32)(wParam & (u64)0xFFFF);
+        if (ctlId == (u32)ID_CLOSE)
+        {
+            DestroyWindow(hwnd);
+            return (i64)0;
+        }
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = "CFlatRedButtonWindow";
+
+    RegisterClassExA(&wc);
+
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatRedButtonWindow",
+        "CFlat Red Button",
+        (u32)WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,       // x, y
+        320, 200,                           // width, height
+        nullptr, nullptr, hInst, nullptr);
+
+    if (hwnd == nullptr)
+    {
+        printf("CreateWindowExA failed\n");
+        return 1;
+    }
+
+    // Child button, owner-draw so we can paint it red.
+    void* hMenu = (void*)(i64)ID_CLOSE;
+    CreateWindowExA(
+        0u,
+        "BUTTON",
+        "Close",
+        (u32)(WS_VISIBLE | WS_CHILD | BS_OWNERDRAW),
+        90, 60, 140, 50,
+        hwnd, hMenu, hInst, nullptr);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    return (int)msg.wParam;
+}

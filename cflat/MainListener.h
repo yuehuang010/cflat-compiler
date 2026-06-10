@@ -2502,12 +2502,12 @@ public:
                     continue;
                 }
                 std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
-                std::string explicitLib;
+                std::vector<std::string> explicitLibs;
                 if (auto* lc = imp->libClause())
-                    if (lc->StringLiteral())
+                    for (auto* lit : lc->StringLiteral())
                     {
-                        std::string lr = lc->StringLiteral()->getText();
-                        if (lr.size() >= 2) explicitLib = lr.substr(1, lr.size() - 2);
+                        std::string lr = lit->getText();
+                        if (lr.size() >= 2) explicitLibs.push_back(lr.substr(1, lr.size() - 2));
                     }
                 std::vector<std::string> extraDefines;
                 for (auto* dc : imp->defineClause())
@@ -2516,7 +2516,7 @@ public:
                         std::string dr = dc->StringLiteral()->getText();
                         if (dr.size() >= 2) extraDefines.push_back(dr.substr(1, dr.size() - 2));
                     }
-                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "", explicitLib, extraDefines);
+                Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "", explicitLibs, extraDefines);
             }
         }
 

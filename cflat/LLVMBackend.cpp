@@ -83,13 +83,21 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
 
 // Return the dequoted path from an inline `lib "..."` clause on an import declaration,
 // or "" if there is none. Used to wire `import package "x.h" lib "y.lib";` into the link.
-static std::string DequoteLibClause(CFlatParser::ImportDeclarationContext* imp)
+// Inline `lib "..."` clause(s) on an import line. Returns every named import library in
+// source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
+// form. Empty when the import carries no lib clause. Each is resolved to a link argument
+// by ResolveCLinkLib at the header-bind site.
+static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclarationContext* imp)
 {
+    std::vector<std::string> libs;
     auto* lc = imp->libClause();
-    if (!lc || !lc->StringLiteral()) return "";
-    std::string raw = lc->StringLiteral()->getText();
-    if (raw.size() < 2) return "";
-    return raw.substr(1, raw.size() - 2);
+    if (!lc) return libs;
+    for (auto* lit : lc->StringLiteral())
+    {
+        std::string raw = lit->getText();
+        if (raw.size() >= 2) libs.push_back(raw.substr(1, raw.size() - 2));
+    }
+    return libs;
 }
 
 // Inline `define "..."` clauses on an `import package` line. Each is scoped to
@@ -493,7 +501,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                             for (const auto& gf : groupedImports)
                             {
                                 if (verbose) std::cout << "[verbose] import requested (group): " << gf << (cacheGroup ? " (cache)" : "") << "\n";
-                                if (!CompileImportedFile(filename, gf, "", "", "", {}, cacheGroup))
+                                if (!CompileImportedFile(filename, gf, "", "", {}, {}, cacheGroup))
                                     return false;
                             }
                             continue;
@@ -524,11 +532,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         std::string impExt = std::filesystem::path(importFilename).extension().string();
                         std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
                         bool isCProgram = isProgram && impExt == ".c";
-                        std::string explicitLib = DequoteLibClause(imp);
+                        std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                         std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
                         bool cacheHeader = HasCacheClause(imp);
                         if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << (cacheHeader ? " (cache)" : "") << "\n";
-                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines, cacheHeader))
+                        if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, cacheHeader))
                             return false;
 
                         if (isProgram)
@@ -852,7 +860,7 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
     return dirs;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::string& explicitLib, const std::vector<std::string>& extraDefines, bool cacheHeader)
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -960,14 +968,14 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
         if (ext == ".h" || ext == ".hpp" || ext == ".hh")
         {
-            // Inline `lib "..."` clause: resolve relative to the importing file and add
-            // it to the link line, alongside any --c-lib libraries.
-            if (!explicitLib.empty())
+            // Inline `lib "..."` (or `lib { "a", "b" }`) clause: resolve each and add it to
+            // the link line, alongside any --c-lib libraries. A library that ships beside the
+            // .cb is used by path; a bare system lib name (user32.lib, ...) is passed through
+            // for lld-link to find on the Windows SDK lib path cflat discovered for the header.
+            for (const auto& explicitLib : explicitLibs)
             {
-                std::filesystem::path lp(explicitLib);
-                if (lp.is_relative())
-                    lp = (std::filesystem::path(importingFilePath).parent_path() / lp).lexically_normal();
-                cLinkLibs_.push_back(lp.string());
+                if (explicitLib.empty()) continue;
+                cLinkLibs_.push_back(ResolveCLinkLib(explicitLib, importingFilePath));
             }
             bool ok = CompileCHeader(canonicalStr, extraDefines, cacheHeader);
             // Translate any queued function-like-macro source into generic templates so
@@ -1048,10 +1056,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                     continue;
                 }
                 std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
-                std::string nestedLib = DequoteLibClause(imp);
+                std::vector<std::string> nestedLibs = DequoteLibClauses(imp);
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << "[verbose]   nested import: " << nested << (nestedNs.empty() ? "" : " as " + nestedNs) << "\n";
-                if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLib, nestedDefines))
+                if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines))
                     return false;
             }
         }
@@ -1715,9 +1723,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string impExt = std::filesystem::path(importFilename).extension().string();
                     std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
                     bool isCProgram = isProgram && impExt == ".c";
-                    std::string explicitLib = DequoteLibClause(imp);
+                    std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                     std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
-                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLib, extraDefines))
+                    if (!CompileImportedFile(filePath, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines))
                         return false;
 
                     // Mirror Compile()'s 'import program "file.cb" as Name' handling:

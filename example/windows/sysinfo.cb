@@ -9,17 +9,15 @@
 import "windows.h";
 import "string.cb";
 
-// STD_OUTPUT_HANDLE is a #define (-11); windows.h object-like macros are not folded into
-// the AST, so spell the value directly rather than relying on the macro.
-const i32 STD_OUTPUT = -11;
-
 extern int main()
 {
     u32 pid  = GetCurrentProcessId();
     u32 tick = GetTickCount();
 
     // Write a line straight to the console via the Win32 handle (no CRT printf).
-    void* out = GetStdHandle((u32)STD_OUTPUT);
+    // STD_OUTPUT_HANDLE is a windows.h #define that folds to a constant, so it is
+    // usable directly as a bare identifier - no need to spell out its value.
+    void* out = GetStdHandle((u32)STD_OUTPUT_HANDLE);
     string banner = "Hello from windows.h via cflat C-interop!\n";
     u32 written = 0;
     WriteConsoleA(out, banner.data(), (u32)banner.length(), &written, nullptr);

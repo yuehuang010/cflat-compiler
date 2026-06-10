@@ -653,7 +653,7 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import importGroup (As Identifier)? cacheClause? ';'
+    : Import importGroup (As Identifier)? libClause? defineClause* cacheClause? ';'
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause ';'
@@ -671,10 +671,17 @@ importGroup
     | '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
-// Optional inline import library for a header binding: import package "x.h" lib "y.lib";
-// Kept as a sub-rule so importDeclaration still has a single direct StringLiteral.
+// Optional inline import library (or libraries) for a header binding:
+//   import "windows.h" lib "user32.lib";
+//   import "windows.h" lib { "user32.lib", "gdi32.lib" };   // brace list for several
+// The brace-list form mirrors the `import { "a", "b" }` group spelling and exists because
+// one header (e.g. <windows.h>) commonly fans out to several system import libs. A bare
+// library name that is not found beside the importing .cb is resolved against the system
+// lib search paths (the Windows SDK dir cflat already discovered for the header). Kept as
+// a sub-rule so importDeclaration still has a single direct StringLiteral.
 libClause
     : 'lib' StringLiteral
+    | 'lib' '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
 // Optional inline preprocessor define(s) for a header binding, scoped to THIS

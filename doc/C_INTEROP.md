@@ -86,12 +86,13 @@ Unlike a `.c` (which cflat *compiles*), a prebuilt library (libcurl, zlib, ...) 
 
 ```c
 import package "curl/curl.h";                                   // header only
-import package "curl/curl.h" lib "libcurl.lib";                 // + import lib
+import package "curl/curl.h" lib "libcurl.lib";                 // + one import lib
+import "windows.h" lib { "user32.lib", "gdi32.lib" };           // + several import libs
 import package "curl/curl.h" lib "libcurl.lib" define "CURL_STATICLIB" define "FOO=1";
 ```
 
-- The header is resolved against the `--c-include` roots. A bare `import "curl/curl.h";` (any `.h/.hpp/.hh` extension) routes to the same path.
-- The inline `lib` clause names an import library to link (resolved relative to the importing `.cb` if relative); it applies to that line only.
+- The header is resolved against the `--c-include` roots. A bare `import "curl/curl.h";` (any `.h/.hpp/.hh` extension) routes to the same path. The inline `lib` / `define` clauses work on this bare header form too - `import package` is only required when you also need an `as` alias-free header without a `.h` extension.
+- The inline `lib` clause names the import library (or libraries) to link, and applies to that line only. Use the brace form `lib { "a.lib", "b.lib" }` when one header fans out to several import libs (common for `windows.h`). Resolution: a library that ships **beside the importing `.cb`** is linked by path (the Conan/vcpkg layout); a bare **system lib name** that is not found there (e.g. `user32.lib`) is passed through to lld-link, which resolves it against the system lib search paths - the same Windows SDK lib dir cflat already discovered to find the header. So `lib { "user32.lib", "gdi32.lib" }` needs no `--c-lib` and no absolute paths.
 - One or more inline `define` clauses add preprocessor defines scoped to that header's AST dump, appended on top of the CLI `--c-define`. `lib` and `define` are soft keywords and must come after the string, `lib` before `define`.
 
 The compiler AST-dumps a stub that `#include`s the header and registers the externally-linkable function **declarations**, **enum constants** (as bare globals, matching C's flat enum scope - `CURLOPT_URL`, not `Type.CURLOPT_URL`), and the header's **struct / union types**. A `typedef struct tag { ... } Name;` is usable under either name - the tag (`tagMSG`) or the typedef (`MSG`):
@@ -115,7 +116,15 @@ A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is 
 
 ### System headers (e.g. `windows.h`)
 
-A bare `import "windows.h";` binds the system header with **no `--c-include` flag**: cflat auto-detects the latest installed Windows SDK include directory (`...\Windows Kits\10\Include\<ver>\um`, plus `shared`/`ucrt`/`winrt`) and uses it to resolve the header. The header's own directory then becomes the in-scope root, so its declarations are kept while the transitively-included CRT/MSVC headers are still filtered out. The parse itself relies on clang's in-process MSVC toolchain auto-detection, so the MSVC/UCRT/shared headers do not need to be named. `kernel32.lib` is already on the default link line; functions from other system libraries (e.g. `user32.lib` for `MessageBoxA`) still need an explicit `--c-lib`. See `example/windows/sysinfo.cb`.
+A bare `import "windows.h";` binds the system header with **no `--c-include` flag**: cflat auto-detects the latest installed Windows SDK include directory (`...\Windows Kits\10\Include\<ver>\um`, plus `shared`/`ucrt`/`winrt`) and uses it to resolve the header. The header's own directory then becomes the in-scope root, so its declarations are kept while the transitively-included CRT/MSVC headers are still filtered out. The parse itself relies on clang's in-process MSVC toolchain auto-detection, so the MSVC/UCRT/shared headers do not need to be named.
+
+`kernel32.lib` is already on the default link line. Functions from other system libraries (e.g. `user32.lib` / `gdi32.lib` for a GUI app) are linked with the inline `lib` clause, naming the bare lib filename - cflat resolves it against the SDK lib dir it already discovered, so no `--c-lib` or absolute path is needed:
+
+```c
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+```
+
+See `example/windows/sysinfo.cb` (console, kernel32 only) and `example/windows/win_red_button.cb` (a GUI window + owner-drawn red button, linking user32/gdi32 via the inline `lib` clause).
 
 The matching CLI flags supply the machine-specific paths (all repeatable):
 

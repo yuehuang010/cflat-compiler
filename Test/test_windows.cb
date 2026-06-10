@@ -11,9 +11,14 @@
 //      pulled in or the in-scope struct fails to size. Typedef names (MSG, not just tagMSG) work,
 //      function-pointer fields are bare void* (correct ABI size), and object-like #define
 //      constants (WM_*, WS_*) are folded from the header bind.
+//   4. The inline `lib { ... }` brace clause links several system import libs by bare name. A bare
+//      lib name (user32.lib, gdi32.lib) is not found beside this .cb, so it must be passed through
+//      to lld-link and resolved against the SDK lib dir cflat discovered for the header - no
+//      --c-lib / absolute path. If bare-name resolution regresses, the link fails and this test
+//      never builds; calling one function from each lib then proves both were actually linked.
 // cflat auto-resolves the Windows SDK include dir, so no --c-include flag is required.
 import "test_helper.cb";
-import "windows.h";
+import "windows.h" lib { "user32.lib", "gdi32.lib" };
 
 extern int main()
 {
@@ -50,6 +55,14 @@ extern int main()
     total++; passed += Test("WM_COMMAND", (int)(u32)WM_COMMAND, 0x0111);
     total++; passed += Test("WS_OVERLAPPEDWINDOW", (u32)WS_OVERLAPPEDWINDOW == 0x00CF0000u, true);
     total++; passed += Test("SW_SHOW", SW_SHOW, 5);
+
+    // Inline `lib { ... }` brace clause: linking the named libs by bare name worked (the exe
+    // built), and these calls prove each lib was actually linked, not just name-resolved.
+    int cx = GetSystemMetrics(0);  // SM_CXSCREEN - user32.lib
+    total++; passed += Test("GetSystemMetrics linked (user32)", cx >= 0, true);
+    void* brush = CreateSolidBrush(255u);  // RGB(255,0,0) - gdi32.lib
+    total++; passed += Test("CreateSolidBrush non-null (gdi32)", brush != nullptr, true);
+    total++; passed += Test("DeleteObject succeeded (gdi32)", DeleteObject(brush) != 0, true);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
