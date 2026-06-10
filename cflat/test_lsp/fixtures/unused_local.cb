@@ -1,0 +1,5 @@
+// $expect diagnostic message="'unusedLocal' is never used"
+extern int main() {
+    int unusedLocal = 5;
+    return 0;
+}

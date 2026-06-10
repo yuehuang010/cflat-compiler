@@ -25,6 +25,20 @@ struct SymbolDef
     std::vector<std::string> memberNames;
 };
 
+// A definition that is a candidate for the "unused code" check. Recorded during
+// analysis at each declaration site; consumed post-analysis by the LSP server,
+// which cross-references it against an identifier-occurrence scan of the document.
+struct UnusedCandidate
+{
+    std::string name;
+    SymbolKind kind = SymbolKind::Variable;
+    std::string file;
+    int line = 0;   // 1-based
+    int col = 0;    // 0-based
+    bool isExported = false;     // function/global with external linkage - never flagged
+    bool hasDestructor = false;  // local whose type has a destructor (RAII) - never flagged
+};
+
 class LspSymbolIndex
 {
 public:
@@ -45,9 +59,18 @@ public:
     const std::string* LookupVariableType(const std::string& varName) const;
     const VariableInfo* LookupVariable(const std::string& varName) const;
 
+    // Unused-code candidates (declarations that may turn out to be unreferenced).
+    void RegisterCandidate(const UnusedCandidate& cand);
+    const std::vector<UnusedCandidate>& Candidates() const { return candidates_; }
+
+    // All registered symbols, keyed by name. Used by the unused-import check to map
+    // a resolved import file to the set of symbol names it defines.
+    const std::unordered_map<std::string, SymbolDef>& Symbols() const { return symbols_; }
+
     size_t SymbolCount() const { return symbols_.size(); }
 
 private:
     std::unordered_map<std::string, SymbolDef> symbols_;
     std::unordered_map<std::string, VariableInfo> variables_;
+    std::vector<UnusedCandidate> candidates_;
 };

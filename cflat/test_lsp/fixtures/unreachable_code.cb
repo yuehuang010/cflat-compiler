@@ -1,0 +1,6 @@
+// $expect diagnostic message="unreachable code"
+extern int main() {
+    return 0;
+    int x = 1;
+    x = x + 1;
+}

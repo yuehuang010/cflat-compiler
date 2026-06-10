@@ -53,5 +53,14 @@ $outFile = "$PSScriptRoot\out\cflat-windows-x64-v$Version.zip"
 if (Test-Path $outFile) { Remove-Item $outFile -Force }
 Compress-Archive -Path "$publishDir\*" -DestinationPath $outFile
 
+# SHA256 checksum in GNU coreutils format ("<lowercase-hash>  <filename>", two
+# spaces) so users can verify with `sha256sum -c` on Linux/macOS/Git Bash, or
+# Get-FileHash on Windows.
+$sumFile  = "$outFile.sha256"
+$hash     = (Get-FileHash $outFile -Algorithm SHA256).Hash.ToLower()
+$leaf     = Split-Path $outFile -Leaf
+"$hash  $leaf`n" | Out-File $sumFile -Encoding ascii -NoNewline
+
 Write-Host "Published to: $publishDir"
 Write-Host "Archive:      $outFile"
+Write-Host "Checksum:     $sumFile"

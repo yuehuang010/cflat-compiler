@@ -39,6 +39,13 @@ void LspSymbolIndex::Clear()
 {
     symbols_.clear();
     variables_.clear();
+    candidates_.clear();
+}
+
+void LspSymbolIndex::RegisterCandidate(const UnusedCandidate& cand)
+{
+    if (cand.name.empty()) return;
+    candidates_.push_back(cand);
 }
 
 void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::string& typeName)
@@ -81,4 +88,7 @@ void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& t
     for (auto& [name, info] : variables_)
         if (info.file == fromFile)
             info.file = toFile;
+    for (auto& cand : candidates_)
+        if (cand.file == fromFile)
+            cand.file = toFile;
 }

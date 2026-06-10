@@ -1,0 +1,3 @@
+// $expect diagnostic message="'unusedArg' is never used"
+int compute(int usedArg, int unusedArg) { return usedArg; }
+extern int main() { return compute(1, 2); }

@@ -669,6 +669,23 @@ private:
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
                         sig, {}, doc);
 
+            // Record an unused-function candidate. Only free functions: struct methods
+            // can be re-emitted (and called) in another TU under monomorphization, so a
+            // method unused in this file is not provably dead. Operators are dispatched
+            // by symbol, not name token, so they never appear "used" - skip them too.
+            if (structName.empty() && !isOperatorFunc && func->directDeclarator())
+            {
+                auto* nameDecl = func->directDeclarator();
+                UnusedCandidate cand;
+                cand.name = name;
+                cand.kind = SymbolKind::Function;
+                cand.file = compiler->GetSourceFilePath();
+                cand.line = (int)nameDecl->getStart()->getLine();
+                cand.col  = (int)nameDecl->getStart()->getCharPositionInLine();
+                cand.isExported = returnType.external;  // extern -> visible to other TUs
+                s->RegisterCandidate(cand);
+            }
+
             // Also register under "TypeName.method" for dot-completion prefix lookup.
             // Operators and statics already have the qualified name; only instance methods need this.
             if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
@@ -2379,6 +2396,29 @@ public:
     {
         auto blockItems = ctx->blockItem();
 
+        // Unreachable-code hint (LSP only): a direct return/break/continue ends the
+        // block, so any items after it are dead. Report the span once and let normal
+        // codegen proceed unchanged (it already emits into a dead block harmlessly).
+        if (auto* compiler = Compiler(ctx); compiler->HasHintRegionSink())
+        {
+            for (size_t i = 0; i + 1 < blockItems.size(); ++i)
+            {
+                auto* stmt = blockItems[i]->statement();
+                if (!stmt || stmt->jumpStatement() == nullptr) continue;
+                auto* firstDead = blockItems[i + 1];
+                auto* lastDead  = blockItems.back();
+                auto* startTok  = firstDead->getStart();
+                auto* stopTok   = lastDead->getStop();
+                int endCol = (int)stopTok->getCharPositionInLine()
+                           + (int)stopTok->getText().size();
+                compiler->ReportHintRegion(
+                    (int)startTok->getLine(), (int)startTok->getCharPositionInLine(),
+                    (int)stopTok->getLine(), endCol,
+                    "unreachable code");
+                break;
+            }
+        }
+
         for (const auto& blockItem : blockItems)
         {
             auto decl = blockItem->declaration();
@@ -3722,6 +3762,30 @@ public:
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
+        // Record unused-parameter candidates. Restricted to free, non-extern functions:
+        // a method's params are constrained by interface/override conformance, and an
+        // extern function's signature is part of an external contract - flagging either
+        // would be noise. A leading underscore is the opt-out convention (`_unused`).
+        if (auto* s = compiler->GetSymbolSink();
+            s && structName.empty() && !returnType.external && paramTypeList && paramTypeList->parameterList())
+        {
+            for (auto* paramDecl : paramTypeList->parameterList()->parameterDeclaration())
+            {
+                auto* declr = paramDecl->declarator();
+                auto* dir   = declr ? declr->directDeclarator() : nullptr;
+                if (!dir) continue;
+                std::string pname = getDirectDeclName(dir);
+                if (pname.empty() || pname[0] == '_') continue;
+                UnusedCandidate cand;
+                cand.name = pname;
+                cand.kind = SymbolKind::Variable;
+                cand.file = compiler->GetSourceFilePath();
+                cand.line = (int)dir->getStart()->getLine();
+                cand.col  = (int)dir->getStart()->getCharPositionInLine();
+                s->RegisterCandidate(cand);
+            }
+        }
+
         // 'auto' return type: only supported on generic instantiations, where param
         // types are concrete and the body can be emitted under an auto-capture pass
         // that records each 'return expr;' value type instead of emitting 'ret'.
@@ -4535,6 +4599,21 @@ public:
                         LogErrorContext(direct, "thread_local is only allowed on global variables.");
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, alloc));
+
+                    // Record an unused-local candidate. RAII locals (a type with a
+                    // destructor, e.g. `lock`) are exempt: the declaration itself is the
+                    // point even when the name is never read again.
+                    if (auto* s = compiler->GetSymbolSink())
+                    {
+                        UnusedCandidate cand;
+                        cand.name = name;
+                        cand.kind = SymbolKind::Variable;
+                        cand.file = compiler->GetSourceFilePath();
+                        cand.line = (int)direct->getStart()->getLine();
+                        cand.col  = (int)direct->getStart()->getCharPositionInLine();
+                        cand.hasDestructor = compiler->TypeHasDestructor(typeAndValue.TypeName);
+                        s->RegisterCandidate(cand);
+                    }
 
                     if (right != nullptr)
                     {

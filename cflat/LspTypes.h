@@ -24,12 +24,20 @@ struct Location
     Range range;
 };
 
+// LSP DiagnosticTag values (textDocument/publishDiagnostics).
+enum DiagnosticTag
+{
+    DiagnosticTagUnnecessary = 1,  // grayed-out / faded rendering for unused code
+    DiagnosticTagDeprecated  = 2
+};
+
 struct Diagnostic
 {
     Range range;
     int severity = 1;  // 1=Error, 2=Warning, 3=Information, 4=Hint
     std::string message;
     std::string source = "cflat";
+    std::vector<int> tags;  // DiagnosticTag values; empty when none
 };
 
 struct TextEdit
@@ -66,12 +74,15 @@ inline nlohmann::json locationToJson(const Location& loc)
 
 inline nlohmann::json diagnosticToJson(const Diagnostic& d)
 {
-    return {
+    nlohmann::json obj = {
         {"range", rangeToJson(d.range)},
         {"severity", d.severity},
         {"message", d.message},
         {"source", d.source}
     };
+    if (!d.tags.empty())
+        obj["tags"] = d.tags;
+    return obj;
 }
 
 inline nlohmann::json completionItemToJson(const CompletionItem& item)

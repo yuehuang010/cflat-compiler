@@ -124,6 +124,61 @@ static std::string resolveImportPath(const std::string& sourceFilePath,
     return {};
 }
 
+// Count identifier occurrences across the document, skipping comments and string/char
+// literals so a name mentioned only in a comment never counts as a "use". This is the
+// use-set for the unused-code check: a declared name whose count is <= 1 (only the
+// declaration itself) is unreferenced. Same-named declarations in sibling scopes inflate
+// the count, which can only suppress a hint - never produce a false positive.
+std::unordered_map<std::string, int> scanIdentifierOccurrences(const std::string& text)
+{
+    std::unordered_map<std::string, int> counts;
+    auto isWordStart = [](char c) { return std::isalpha((unsigned char)c) || c == '_'; };
+    auto isWord      = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+
+    size_t i = 0, n = text.size();
+    while (i < n)
+    {
+        char c = text[i];
+        // Comments
+        if (c == '/' && i + 1 < n && text[i + 1] == '/')
+        {
+            i += 2;
+            while (i < n && text[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) i++;
+            i = (i + 1 < n) ? i + 2 : n;
+            continue;
+        }
+        // String / char literals
+        if (c == '"' || c == '\'')
+        {
+            char quote = c;
+            i++;
+            while (i < n && text[i] != quote)
+            {
+                if (text[i] == '\\') i++;  // skip escaped char
+                i++;
+            }
+            i++;  // closing quote
+            continue;
+        }
+        // Identifier
+        if (isWordStart(c))
+        {
+            size_t start = i;
+            while (i < n && isWord(text[i])) i++;
+            counts[text.substr(start, i - start)]++;
+            continue;
+        }
+        i++;
+    }
+    return counts;
+}
+
 // Extract the word (identifier) at a given 0-based line/character position in text.
 std::string extractWordAt(const std::string& text, int line, int character)
 {
@@ -335,6 +390,9 @@ private:
                 {"completionProvider", {
                     {"triggerCharacters", {".", ">", ":", "#"}}
                 }}
+                // Unused-code hints are pushed as diagnostics carrying the Unnecessary
+                // tag (see PublishDiagnostics); the client renders those faded with no
+                // extra server capability required.
             }},
             {"serverInfo", {
                 {"name", "cflat LSP"},
@@ -896,6 +954,17 @@ private:
             diag.severity = severity;
             diagnostics.push_back(diag);
         });
+        // Faded hint regions reported during analysis (e.g. unreachable code). Positions
+        // are document-relative (same text as the temp copy), so no remap is needed.
+        backend->SetHintRegionSink([&](int sl, int sc, int el, int ec, const std::string& msg)
+        {
+            lsp::Diagnostic diag;
+            diag.range    = { { sl - 1, sc }, { el - 1, ec } };
+            diag.message  = msg;
+            diag.severity = 4;  // Hint
+            diag.tags     = { lsp::DiagnosticTagUnnecessary };
+            diagnostics.push_back(diag);
+        });
         backend->SetSymbolSink(newIndex.get());
 
         bool ok = false;
@@ -922,6 +991,7 @@ private:
         else
         {
             backend->SetDiagnosticSink(nullptr);
+            backend->SetHintRegionSink(nullptr);
             backend->SetSymbolSink(nullptr);
         }
 
@@ -957,7 +1027,131 @@ private:
                           << " symbols) over partial parse (" << newCount << ")\n";
         }
 
+        // Occurrence-based unused-code hints (functions / locals / params / imports).
+        // Suppressed while the file has errors: the candidate and use sets are then
+        // incomplete (e.g. a call site in a half-typed region), which would produce
+        // spurious "unused" hints mid-edit. Unreachable-code hints are unaffected -
+        // they were already emitted by the backend during analysis.
+        if (!filePath.empty())
+        {
+            bool hasError = false;
+            for (const auto& d : diagnostics)
+                if (d.severity == 1) { hasError = true; break; }
+            if (!hasError)
+                AppendUnusedDiagnostics(text, filePath, *newIndex, diagnostics);
+        }
+
         PublishDiagnostics(uri, diagnostics);
+    }
+
+    // Build faded "never used" hints by cross-referencing the declarations recorded
+    // during analysis against an identifier-occurrence scan of the document. Only
+    // declarations in this file are considered; the linkage/RAII guards were applied
+    // at registration time (see UnusedCandidate). Underreports rather than misreports.
+    void AppendUnusedDiagnostics(const std::string& text, const std::string& filePath,
+                                 const LspSymbolIndex& index,
+                                 std::vector<lsp::Diagnostic>& out)
+    {
+        auto counts = scanIdentifierOccurrences(text);
+
+        auto addFaded = [&](int line1, int col0, int len, const std::string& msg)
+        {
+            lsp::Diagnostic d;
+            d.range    = { { line1 - 1, col0 }, { line1 - 1, col0 + len } };
+            d.message  = msg;
+            d.severity = 4;  // Hint
+            d.tags     = { lsp::DiagnosticTagUnnecessary };
+            out.push_back(std::move(d));
+        };
+
+        // Functions / locals / params declared in this file with no use beyond the
+        // declaration itself (occurrence count of 1).
+        auto isPlainIdentifier = [](const std::string& s) {
+            if (s.empty() || std::isdigit((unsigned char)s[0])) return false;
+            for (char c : s)
+                if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+            return true;
+        };
+
+        for (const auto& cand : index.Candidates())
+        {
+            if (cand.file != filePath) continue;
+            if (cand.isExported || cand.hasDestructor) continue;
+            if (cand.kind == SymbolKind::Function && cand.name == "main") continue;
+            // Non-identifier names (operators, mangled forms) can never appear as a bare
+            // token in the scan, so we cannot prove them unused - skip to stay sound.
+            if (!isPlainIdentifier(cand.name)) continue;
+
+            auto it = counts.find(cand.name);
+            int n = (it != counts.end()) ? it->second : 0;
+            if (n > 1) continue;  // referenced somewhere beyond its declaration
+
+            std::string what = (cand.kind == SymbolKind::Function)
+                ? "function '" + cand.name + "' is never used"
+                : "'" + cand.name + "' is never used";
+            addFaded(cand.line, cand.col, (int)cand.name.size(), what);
+        }
+
+        AppendUnusedImports(text, filePath, index, counts, out);
+    }
+
+    // An `import "x.cb"` is flagged when none of the symbols that file defines are
+    // referenced in this document. Caveat: a symbol used only transitively (never named
+    // here) is invisible to the text scan, so a genuinely-needed import can be flagged;
+    // the hint is faded and trivially dismissed. Unresolvable imports are left alone.
+    void AppendUnusedImports(const std::string& text, const std::string& filePath,
+                             const LspSymbolIndex& index,
+                             const std::unordered_map<std::string, int>& counts,
+                             std::vector<lsp::Diagnostic>& out)
+    {
+        // Map each canonical defining-file to the set of names it defines.
+        std::unordered_map<std::string, std::vector<std::string>> namesByFile;
+        auto canon = [](const std::string& p) -> std::string {
+            std::error_code ec;
+            auto c = std::filesystem::canonical(std::filesystem::path(p).lexically_normal(), ec);
+            return ec ? std::string{} : c.string();
+        };
+        for (const auto& [name, def] : index.Symbols())
+        {
+            if (def.file.empty() || def.file == filePath) continue;
+            std::string key = canon(def.file);
+            if (!key.empty()) namesByFile[key].push_back(name);
+        }
+
+        int lineCount = 1;
+        for (char c : text) if (c == '\n') lineCount++;
+
+        for (int line = 0; line < lineCount; ++line)
+        {
+            std::string fname = extractImportFilename(text, line);
+            if (fname.size() < 4) continue;
+            std::string ext = fname.substr(fname.size() - 3);
+            if (ext != ".cb") continue;  // only plain CFlat imports
+
+            std::string resolved = resolveImportPath(filePath, fname, importSearchDir_, runtimeDir_);
+            if (resolved.empty()) continue;
+            auto it = namesByFile.find(canon(resolved));
+            if (it == namesByFile.end() || it->second.empty()) continue;  // nothing to conclude
+
+            bool anyUsed = false;
+            for (const auto& nm : it->second)
+            {
+                auto cIt = counts.find(nm);
+                if (cIt != counts.end() && cIt->second > 0) { anyUsed = true; break; }
+            }
+            if (anyUsed) continue;
+
+            std::string lineText = getLineText(text, line);
+            int endCol = (int)lineText.size();
+            int startCol = 0;
+            while (startCol < endCol && std::isspace((unsigned char)lineText[startCol])) startCol++;
+            lsp::Diagnostic d;
+            d.range    = { { line, startCol }, { line, endCol } };
+            d.message  = "unused import '" + fname + "'";
+            d.severity = 4;  // Hint
+            d.tags     = { lsp::DiagnosticTagUnnecessary };
+            out.push_back(std::move(d));
+        }
     }
 
     void PublishDiagnostics(const std::string& uri, const std::vector<lsp::Diagnostic>& diags)

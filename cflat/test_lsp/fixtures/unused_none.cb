@@ -1,0 +1,8 @@
+// $expect no_diagnostic
+import "string.cb";
+int doubleIt(int n) { return n + n; }
+extern int main() {
+    string s = "hi";
+    int total = doubleIt(21);
+    return total + s.length();
+}

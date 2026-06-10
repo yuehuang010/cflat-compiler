@@ -1,0 +1,3 @@
+// $expect diagnostic message="'helperUnused' is never used"
+int helperUnused() { return 42; }
+extern int main() { return 0; }

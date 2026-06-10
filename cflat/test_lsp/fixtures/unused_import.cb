@@ -1,0 +1,3 @@
+// $expect diagnostic message="unused import 'list.cb'"
+import "list.cb";
+extern int main() { return 0; }

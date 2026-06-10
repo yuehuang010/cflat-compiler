@@ -1240,6 +1240,7 @@ private:
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
+    std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
 
     llvm::Function* currentFunction;
@@ -5279,6 +5280,14 @@ public:
     void RegisterDestructor(const std::string& structName, llvm::Function* fn)
     {
         dataStructures[structName].Destructor = fn;
+    }
+
+    // True if the named type has a destructor. Used by the LSP unused-locals check
+    // to skip RAII locals, whose declaration alone is the point (e.g. a `lock`).
+    bool TypeHasDestructor(const std::string& structName) const
+    {
+        auto it = dataStructures.find(structName);
+        return it != dataStructures.end() && it->second.Destructor != nullptr;
     }
 
     /// Returns i64 sizeof(type) as a compile-time constant.
@@ -10055,6 +10064,20 @@ public:
 
     void SetSymbolSink(LspSymbolIndex* sink) { symbolSink_ = sink; }
     LspSymbolIndex* GetSymbolSink() const { return symbolSink_; }
+
+    // LSP-only sink for "faded" hint regions (unused/unreachable code). Carries a full
+    // range (start..end, 1-based line / 0-based col) so the client can gray a whole span
+    // rather than a single caret. Set only in LSP mode; null during real compiles.
+    using HintRegionSink = std::function<void(int startLine, int startCol,
+                                              int endLine, int endCol,
+                                              const std::string& msg)>;
+    void SetHintRegionSink(HintRegionSink sink) { hintRegionSink_ = std::move(sink); }
+    void ReportHintRegion(int startLine, int startCol, int endLine, int endCol, const std::string& msg)
+    {
+        if (hintRegionSink_)
+            hintRegionSink_(startLine, startCol, endLine, endCol, msg);
+    }
+    bool HasHintRegionSink() const { return (bool)hintRegionSink_; }
 
     void ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
                            const std::vector<std::string>& sourceLines);
