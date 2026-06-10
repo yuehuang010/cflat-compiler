@@ -30,7 +30,12 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     void add(move T value)
     {
         if (_size >= _capacity) _grow();
-        _data[_size] = value;
+        // Move the incoming value into the slot. `value` is a move parameter (the
+        // list takes ownership), so transferring instead of copying zeroes the
+        // source; otherwise the scope-exit destructor of `value` would free a buffer
+        // the list now references - a double free for owning element types such as a
+        // nested list<list<int>>.
+        _data[_size] = move value;
         _size++;
     }
 
@@ -43,7 +48,10 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // Overwrite the element at index.  Takes ownership when T is a pointer type.
     void set(int index, move T value)
     {
-        _data[index] = value;
+        // Move the incoming value into the slot (see add() for the rationale): the
+        // move parameter must transfer ownership, not copy, so the scope-exit
+        // destructor of `value` does not free a buffer the list now references.
+        _data[index] = move value;
     }
 
     // Remove the element at index and return it, transferring ownership to the

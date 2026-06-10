@@ -2166,6 +2166,91 @@ bool testNestedGenericInnerMethod()
     return result;
 }
 
+// =============================================================
+// Recursive generic instantiation: a generic container used as the type
+// argument to another generic (e.g. list<list<int>>). Before the fix the inner
+// type argument was kept as the literal string "list<int>" and never
+// instantiated, so the outer declaration failed with "unknown type 'list<int>'".
+// =============================================================
+
+// list<list<int>> - by-value nested generic. Add inner lists, read back via
+// get(i).get(j). add() moves the inner list into the slot (ownership transfer),
+// so teardown frees each buffer exactly once.
+bool testListOfListByValue()
+{
+    bool result = true;
+    list<list<int>> ll;
+
+    list<int> a = {1, 2, 3};
+    list<int> b = {4, 5};
+    ll.add(a);
+    ll.add(b);
+
+    result &= Test("nested count",   ll.count(),         2);
+    result &= Test("nested a.count", ll.get(0).count(),  3);
+    result &= Test("nested b.count", ll.get(1).count(),  2);
+    result &= Test("nested a[0]",    ll.get(0).get(0),   1);
+    result &= Test("nested a[2]",    ll.get(0).get(2),   3);
+    result &= Test("nested b[1]",    ll.get(1).get(1),   5);
+    return result;
+}
+
+// Three levels deep: list<list<list<int>>>.
+bool testListOfListOfListByValue()
+{
+    bool result = true;
+    list<list<list<int>>> lll;
+
+    list<list<int>> inner;
+    list<int> a = {7, 8};
+    inner.add(a);
+    lll.add(inner);
+
+    result &= Test("deep count",       lll.count(),                1);
+    result &= Test("deep inner count", lll.get(0).count(),         1);
+    result &= Test("deep value",       lll.get(0).get(0).get(1),   8);
+    return result;
+}
+
+// list<list<int>*> - the idiomatic owning-pointer nesting. The outer list owns
+// the inner list pointers and frees them in its destructor.
+bool testListOfListPtr()
+{
+    bool result = true;
+    list<list<int>*> ll;
+
+    list<int>* a = new list<int>();
+    a.add(10); a.add(20); a.add(30);
+    list<int>* b = new list<int>();
+    b.add(40); b.add(50);
+    ll.add(a);
+    ll.add(b);
+
+    result &= Test("ptr count", ll.count(),         2);
+    result &= Test("ptr a[0]",  ll.get(0).get(0),  10);
+    result &= Test("ptr a[2]",  ll.get(0).get(2),  30);
+    result &= Test("ptr b[1]",  ll.get(1).get(1),  50);
+    return result;
+}
+
+// dictionary<int, list<int>*> - a generic used as the value type argument of
+// another generic.
+bool testDictOfListPtr()
+{
+    bool result = true;
+    dictionary<int, list<int>*> d;
+
+    list<int>* a = new list<int>();
+    a.add(100); a.add(200);
+    d.add(1, a);
+
+    list<int>* got = d.get(1);
+    result &= Test("dict value count", got.count(),  2);
+    result &= Test("dict value[0]",    got.get(0), 100);
+    result &= Test("dict value[1]",    got.get(1), 200);
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2222,6 +2307,10 @@ extern int main()
     total++; passed += testThisInGenericMethod()         ? 1 : 0;
     total++; passed += testGenericArgInference()         ? 1 : 0;
     total++; passed += testNestedGenericInnerMethod()    ? 1 : 0;
+    total++; passed += testListOfListByValue()           ? 1 : 0;
+    total++; passed += testListOfListOfListByValue()     ? 1 : 0;
+    total++; passed += testListOfListPtr()               ? 1 : 0;
+    total++; passed += testDictOfListPtr()               ? 1 : 0;
     total++; passed += testAutoReturn()                  ? 1 : 0;
     total++; passed += testSortInt()                     ? 1 : 0;
     total++; passed += testSortFloat()                   ? 1 : 0;

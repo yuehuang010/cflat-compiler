@@ -890,6 +890,32 @@ public:
     ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
     void SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
 
+    // Resolve a type-argument entry to the same string MainListener::ResolveTypeArgEntry
+    // would produce at the top level (no active substitutions during the forward scan),
+    // recursing into nested generics so list<int> inside list<list<int>> mangles to
+    // "list__int" rather than the literal "list<int>". A trailing pointer becomes "*"
+    // (MangleTypeArg later turns it into "ptr"), keeping shell names consistent with
+    // the main pass.
+    std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry)
+    {
+        auto* typeSpec = entry->typeSpecifier();
+        std::string resolved;
+        if (typeSpec && typeSpec->genericIdentifier() && typeSpec->genericIdentifier()->genericTypeParameters())
+        {
+            std::string innerBase = typeSpec->genericIdentifier()->Identifier()->getText();
+            resolved = innerBase;
+            for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                resolved += "__" + MangleTypeArg(ResolveForwardTypeArg(innerEntry));
+        }
+        else
+        {
+            resolved = typeSpec ? typeSpec->getText() : entry->getText();
+        }
+        if (entry->pointer() != nullptr)
+            resolved += "*";
+        return resolved;
+    }
+
     // Walk every typeSpecifier in the entire parse tree and pre-declare an opaque
     // struct type + default constructor for each generic instantiation found.
     // This ensures that Box<MyType> references inside function bodies resolve
@@ -906,7 +932,7 @@ public:
                 auto* compiler = Compiler(genericParams);
                 std::string mangledName = baseName;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
-                    mangledName += "__" + MangleTypeArg(entry->getText());
+                    mangledName += "__" + MangleTypeArg(ResolveForwardTypeArg(entry));
                 compiler->CreateStructType(mangledName, {});
                 LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                 compiler->CreateFunctionDeclaration(mangledName, returnType, {});
@@ -1416,6 +1442,12 @@ private:
             for (auto* innerEntry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             resolved = MangledGenericName(innerBase, innerArgs);
+            // A generic used as a type argument to another generic (e.g. list<int>
+            // inside list<list<int>>) must itself be instantiated; otherwise the
+            // outer instantiation's element type resolves to nothing and codegen
+            // reports "unknown type '<inner>'". Recursion above queues the deepest
+            // levels first, so inner types are registered before the outer.
+            QueueGenericInstantiation(innerBase, innerArgs, resolved);
         }
         else
         {
@@ -1440,6 +1472,35 @@ private:
             resolved += "*";
         }
         return resolved;
+    }
+
+    // Queue a generic instantiation for a known template (dedup via instantiatedGenerics).
+    // For struct/class templates the struct shell + default-ctor declaration are created
+    // immediately so the mangled type name resolves even before the body is emitted;
+    // interface templates are instantiated later by ProcessPendingInstantiations.
+    // No-op for unknown base names (e.g. an unresolved type parameter like "T").
+    void QueueGenericInstantiation(const std::string& baseName,
+                                   const std::vector<std::string>& typeArgs,
+                                   const std::string& mangledName)
+    {
+        if (instantiatedGenerics.count(mangledName))
+            return;
+        bool isStructOrClass = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
+        bool isInterface = genericInterfaceTemplates.count(baseName);
+        if (!isStructOrClass && !isInterface)
+            return;
+        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+        instantiatedGenerics.insert(mangledName);
+        if (isStructOrClass)
+        {
+            auto* c = Compiler();
+            if (!c->GetDataStructure(mangledName).StructType)
+            {
+                c->CreateStructType(mangledName, {});
+                LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
+                c->CreateFunctionDeclaration(mangledName, rt, {});
+            }
+        }
     }
 
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs)
@@ -7202,15 +7263,10 @@ public:
             // Also apply type substitutions to arguments (e.g. Box<T> with T=int -> Box__int)
             std::string base = ctx->genericIdentifier()->Identifier()->getText();
             std::vector<std::string> args;
+            // ResolveTypeArgEntry applies active substitutions AND recursively
+            // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
             for (auto* entry : ctx->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-            {
-                std::string arg = entry->getText();
-                // Apply active type substitutions to each type argument
-                auto it = activeTypeSubstitutions.find(arg);
-                if (it != activeTypeSubstitutions.end())
-                    arg = it->second;
-                args.push_back(arg);
-            }
+                args.push_back(ResolveTypeArgEntry(entry));
             return MangledGenericName(base, args);
         }
         std::string name = ctx->getText();
@@ -11918,15 +11974,10 @@ public:
                     {
                         std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
+                        // ResolveTypeArgEntry applies active substitutions AND recursively
+                        // resolves/queues nested generics (e.g. list<int> inside list<list<int>>).
                         for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                        {
-                            std::string arg = entry->getText();
-                            // Apply active type substitutions to each type argument
-                            auto it = activeTypeSubstitutions.find(arg);
-                            if (it != activeTypeSubstitutions.end())
-                                arg = it->second;
-                            typeArgs.push_back(arg);
-                        }
+                            typeArgs.push_back(ResolveTypeArgEntry(entry));
                         std::string mangledName = MangledGenericName(baseName, typeArgs);
                         if (!instantiatedGenerics.count(mangledName))
                         {
@@ -11946,14 +11997,7 @@ public:
                         std::string baseName = primaryExpr->genericIdentifier()->Identifier()->getText();
                         std::vector<std::string> typeArgs;
                         for (auto* entry : primaryExpr->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                        {
-                            std::string arg = entry->getText();
-                            // Apply active type substitutions to each type argument
-                            auto it = activeTypeSubstitutions.find(arg);
-                            if (it != activeTypeSubstitutions.end())
-                                arg = it->second;
-                            typeArgs.push_back(arg);
-                        }
+                            typeArgs.push_back(ResolveTypeArgEntry(entry));
                         std::string mangledName = MangledGenericName(baseName, typeArgs);
                         if (!instantiatedGenerics.count(mangledName))
                         {
