@@ -1105,6 +1105,12 @@ private:
         // __typeof__ probe so `(int)"x"` stays on the integer path.
         bool isString = false;
         std::string stringValue;
+        // CFlat integer type recovered from the macro's natural C type (e.g.
+        // ((DWORD)-10) -> "u32"). Empty when the natural type is unknown or not a
+        // plain integer; RegisterCMacros then falls back to width-guessing from the
+        // value. Carrying the real type lets a call site match the header's
+        // parameter type without an explicit cast (GetStdHandle(STD_INPUT_HANDLE)).
+        std::string intTypeName;
         // True when the macro's natural type is a C function-pointer (e.g.
         // #define SIG_IGN ((void(*)(int))1)). value carries the folded integer
         // bit pattern; funcPtrTV carries the parsed signature. RegisterCMacros
@@ -2993,6 +2999,8 @@ private:
             {
                 if (tv.IsFunctionPointer) { e.isFuncPtr = true; e.funcPtrTV = std::move(tv); }
                 else if (tv.Pointer && !tv.ElemPointer && tv.TypeName == "void") e.isPointer = true;
+                else if (!tv.Pointer && BitfieldStorageBits(tv.TypeName) != 0 && tv.TypeName != "bool")
+                    e.intTypeName = tv.TypeName;   // known plain integer scalar
             }
         }
         return true;
@@ -3164,6 +3172,24 @@ private:
         req.wantIncludes   = (outIncludes != nullptr);
         req.inScopeDirs.push_back(hdrDir);
         for (const auto& inc : cIncludeDirs_) req.inScopeDirs.push_back(inc);
+
+        // Windows SDK layout: <kit>/Include/<ver>/um holds the API headers, but much
+        // of the constant surface lives in the sibling shared/ dir (winerror.h
+        // ERROR_*, minwindef.h MAX_PATH, ntdef.h, ...). Without it, code copied from
+        // MSDN fails on the very first ERROR_SUCCESS. Structs already reached
+        // shared/ via the by-value dependency closure; this brings the macros, enums,
+        // and remaining records of shared/ in-scope whenever the bound header sits in
+        // an um/ dir (the inverse - a header bound from shared/ - also gets um/).
+        {
+            std::filesystem::path dir(hdrDir);
+            std::string leaf = dir.filename().string();
+            std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            if (leaf == "um")
+                req.inScopeDirs.push_back((dir.parent_path() / "shared").string());
+            else if (leaf == "shared")
+                req.inScopeDirs.push_back((dir.parent_path() / "um").string());
+        }
 
         if (verbose)
             std::cout << "[verbose] extracting C header: " << headerPath << " (clang C++ API)\n";
@@ -3654,8 +3680,21 @@ private:
                 llvm::Constant* bits = builder->getInt64((uint64_t)m.value);
                 c = llvm::ConstantExpr::getIntToPtr(bits, i8Ptr);
             }
+            else if (!m.intTypeName.empty())
+            {
+                // The macro's natural C type is a known integer: register with it, so
+                // ((DWORD)-10) is a u32 and a call site taking u32 matches without a
+                // cast (GetStdHandle(STD_INPUT_HANDLE)). Build the constant at the
+                // type's own width - truncation keeps the C bit pattern exact.
+                tv.TypeName = m.intTypeName;
+                tv.Pointer  = false;
+                unsigned bits = BitfieldStorageBits(m.intTypeName);
+                c = llvm::ConstantInt::get(llvm::IntegerType::get(*context, bits),
+                                           (uint64_t)m.value, /*isSigned*/ true);
+            }
             else
             {
+                // Natural type unknown: width-guess from the folded value.
                 bool wide = (m.value < INT32_MIN || m.value > INT32_MAX);
                 tv.TypeName = wide ? "i64" : "int";
                 tv.Pointer  = false;
@@ -6406,6 +6445,15 @@ public:
             return value;
         }
 
+        // Aggregate operand: the frontend should have decayed a fixed array to a
+        // pointer (or rejected the cast) before reaching here. Emit a diagnostic
+        // instead of a bitcast LLVM's verifier would reject.
+        if (srcType->isAggregateType())
+        {
+            LogError("cannot cast an aggregate value - a fixed array decays to a pointer to its first element");
+            return value;
+        }
+
         // Fallback: BitCast for same-size reinterpretation
         return builder->CreateBitCast(value, destType);
     }
@@ -7950,6 +7998,20 @@ public:
         }
 
         return fn;
+    }
+
+    // True when 'name' resolves to a type in the current compilation: a scalar
+    // keyword, an enum, a type alias, an interface, or a registered struct. Used by
+    // sizeof/alignof to disambiguate sizeof(Type) from sizeof(variable) - the type
+    // meaning wins, matching C.
+    bool IsKnownTypeName(const std::string& name) const
+    {
+        static const std::unordered_set<std::string> scalars = {
+            "void", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "u32",
+            "long", "i64", "u64", "float", "double", "bool", "va_list", "auto" };
+        if (scalars.count(name)) return true;
+        return enumBackingTypes.count(name) > 0 || typeAliases.count(name) > 0
+            || interfaceTable.count(name) > 0 || dataStructures.count(name) > 0;
     }
 
     llvm::Type* GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType = nullptr, bool allowPointer = true) const
@@ -10587,6 +10649,7 @@ public:
         }
         if (m.isString) { j["iss"]  = true; j["sv"]   = m.stringValue; }
         if (m.isFuncPtr){ j["isfp"] = true; j["fptv"] = TvToJson(m.funcPtrTV); }
+        if (!m.intTypeName.empty()) j["ity"] = m.intTypeName;
         return j;
     }
     static CMacroEntry MacroFromJson(const nlohmann::json& j)
@@ -10608,6 +10671,7 @@ public:
         if (m.isString) m.stringValue = j.value("sv", std::string{});
         m.isFuncPtr = j.value("isfp", false);
         if (m.isFuncPtr && j.contains("fptv")) m.funcPtrTV = TvFromJson(j["fptv"]);
+        m.intTypeName = j.value("ity", std::string{});
         return m;
     }
 
@@ -10662,7 +10726,9 @@ public:
         // and throw on reload; v3 used the raw-bits float encoding but cached only in-scope
         // records (so an entry written before the by-value dependency closure was added would
         // still be missing the dependency structs). v4 caches the in-scope + dependency set.
-        if (version != 4) return false;
+        // v5 widened the in-scope filter to the Windows SDK shared/ sibling dir (ERROR_*,
+        // MAX_PATH, ...), so a v4 entry would silently lack those constants.
+        if (version != 5) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -10721,7 +10787,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 4;
+        j["version"] = 5;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

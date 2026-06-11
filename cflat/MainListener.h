@@ -6989,6 +6989,31 @@ public:
             auto destTypeName = ParseTypeName(typeName);
             auto type = compiler->GetType(destTypeName);
 
+            // Materialize a stored operand into Primary. A fixed-size array decays to
+            // a pointer to its first element ((u8*)buf on char[N], (char**)a on
+            // char*[N]); loading the whole [N x T] aggregate would feed an invalid
+            // aggregate-to-pointer bitcast. Everything else loads with the source
+            // type so we read the correct number of bytes - loading directly with the
+            // destination type reads too many bytes from narrower fields (e.g., an
+            // i64 load from a u32 field corrupts the adjacent field).
+            auto materialize = [&](LLVMBackend::NamedVariable& nv)
+            {
+                if (nv.Primary != nullptr || nv.Storage == nullptr)
+                    return;
+                if (nv.BaseType && llvm::isa<llvm::ArrayType>(nv.BaseType))
+                {
+                    auto* arrTy = llvm::cast<llvm::ArrayType>(nv.BaseType);
+                    auto* zero = compiler->builder->getInt64(0);
+                    nv.Primary = compiler->builder->CreateGEP(arrTy, nv.Storage, {zero, zero}, "arrptr");
+                }
+                else
+                {
+                    auto srcType = compiler->GetType(nv.TypeAndValue);
+                    nv.Primary = compiler->CreateLoad(srcType, nv.Storage);
+                }
+                nv.Storage = nullptr;
+            };
+
             // If the destination is a struct type and an operator overload exists,
             // call it (e.g. (string)charPtr calls operator string(char*)).
             std::string opName = "operator " + destTypeName.TypeName;
@@ -6996,12 +7021,7 @@ public:
             {
                 auto argNV = namedVar;
                 argNV.TypeAndValue.VariableName = "";  // clear name so positional matching is used
-                if (argNV.Primary == nullptr && argNV.Storage != nullptr)
-                {
-                    auto srcType = compiler->GetType(argNV.TypeAndValue);
-                    argNV.Primary = compiler->CreateLoad(srcType, argNV.Storage);
-                    argNV.Storage = nullptr;
-                }
+                materialize(argNV);
                 auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
                 namedVar.Primary = result;
                 namedVar.Storage = nullptr;
@@ -7009,16 +7029,7 @@ public:
                 return namedVar;
             }
 
-            // Load with the source type first so we read the correct number of bytes,
-            // then cast to the destination type. The old code loaded directly with the
-            // destination type, which reads too many bytes from narrower fields
-            // (e.g., i64 load from a u32 field corrupts the adjacent field).
-            if (namedVar.Primary == nullptr && namedVar.Storage != nullptr)
-            {
-                auto srcType = compiler->GetType(namedVar.TypeAndValue);
-                namedVar.Primary = compiler->CreateLoad(srcType, namedVar.Storage);
-                namedVar.Storage = nullptr;
-            }
+            materialize(namedVar);
 
             // Explicit `(T[])p` escape: re-establish the noalias array-view from a raw
             // pointer. `T*` and `T[]` share an identical representation, so this is a pure
@@ -7204,6 +7215,25 @@ public:
                             namedVar.TypeAndValue.TypeName = "int";
                             return namedVar;
                         }
+                    }
+
+                    // sizeof(var) / alignof(var): a bare identifier that names a
+                    // variable (and not a type) measures the variable's declared
+                    // storage - most useful for fixed arrays, where sizeof(buf) on
+                    // 'char[128] buf' is 128. The type meaning wins on a name
+                    // collision, matching C. Adopting the variable's TypeAndValue
+                    // here lets the normal type path below compute the (padded)
+                    // size or alignment.
+                    if (!typeValue.Pointer
+                        && postfixText.find('.') == std::string::npos
+                        && postfixText.find('<') == std::string::npos
+                        && !compiler->IsKnownTypeName(typeValue.TypeName))
+                    {
+                        auto varNV = compiler->GetLocalVariable(typeValue.TypeName);
+                        if (varNV.Storage == nullptr && varNV.Primary == nullptr)
+                            varNV = compiler->GetGlobalVariableNV(typeValue.TypeName);
+                        if (varNV.Storage != nullptr || varNV.Primary != nullptr)
+                            typeValue = varNV.TypeAndValue;
                     }
 
                     auto* llvmType = compiler->GetType(typeValue, nullptr, true);

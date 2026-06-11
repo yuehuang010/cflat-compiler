@@ -1239,6 +1239,20 @@ sizeof(int)        // size in bytes
 alignof(MyStruct)  // alignment in bytes
 ```
 
+A variable name also works: the operand measures the variable's declared
+storage. For a fixed-size array that is the full byte capacity, which is the
+common buffer-capacity idiom in C interop:
+
+```c
+char[128] buf;
+u32 cap = (u32)sizeof(buf);   // 128
+int x = 5;
+sizeof(x)                     // 4 - same as sizeof(int)
+```
+
+On a name collision the type meaning wins, matching C. The result is typed
+`i64`.
+
 ---
 
 ## Annotations

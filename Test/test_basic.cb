@@ -1780,6 +1780,28 @@ bool testFixedArrays()
     result &= Test("fixed_struct_ptr_label0", ph->label[0], 'O');
     result &= Test("fixed_struct_ptr_count",  ph->count, 7);
 
+    // Explicit cast of a fixed array decays to a pointer to its first element
+    // (regression: the cast path loaded the whole [N x T] aggregate and emitted
+    // an aggregate-to-pointer bitcast that failed module verification).
+    u8* up = (u8*)buf;
+    result &= Test("fixed_cast_decay_elem0", (int)up[0], 10);
+    result &= Test("fixed_cast_decay_elem2", (int)up[2], 30);
+
+    // Same decay from a struct's inline array field.
+    u8* dp = (u8*)h.data;
+    result &= Test("fixed_cast_decay_field", (int)dp[1], 2);
+
+    // Decay also feeds non-pointer casts: the array's address as an integer.
+    i64 addr = (i64)buf;
+    result &= Test("fixed_cast_decay_to_int", addr != (i64)0, true);
+
+    // sizeof(variable): a fixed array measures its full byte capacity, a scalar
+    // measures its declared type (regression: any variable operand used to fail
+    // with "unknown type").
+    result &= Test("sizeof_fixed_array", (int)sizeof(buf), 8);
+    result &= Test("sizeof_scalar_var", (int)sizeof(plain), 4);
+    result &= Test("sizeof_struct_var", (int)sizeof(h), (int)sizeof(ArrayHolder));
+
     return result;
 }
 

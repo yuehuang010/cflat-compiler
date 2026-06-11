@@ -31,6 +31,15 @@ extern int main()
     void* out = GetStdHandle((u32)-11);  // STD_OUTPUT_HANDLE
     total++; passed += Test("GetStdHandle non-null", out != nullptr, true);
 
+    // A folded macro keeps its natural C type: ((DWORD)-11) is u32, not a
+    // width-guessed i64, so the call site needs no cast.
+    void* out2 = GetStdHandle(STD_OUTPUT_HANDLE);
+    total++; passed += Test("GetStdHandle(STD_OUTPUT_HANDLE) uncast", out2 == out, true);
+
+    // A pseudo-handle cast macro ((HKEY)(ULONG_PTR)((LONG)0x80000002)) folds to
+    // a void* constant.
+    total++; passed += Test("HKEY_LOCAL_MACHINE folds to pointer", HKEY_LOCAL_MACHINE != nullptr, true);
+
     u32 tick1 = GetTickCount();
     Sleep(1);
     u32 tick2 = GetTickCount();
@@ -49,6 +58,14 @@ extern int main()
     WNDCLASSEXA wc = default;
     total++; passed += Test("WNDCLASSEXA zero-init", (int)wc.cbSize, 0);
     total++; passed += Test("WNDCLASSEXA wndproc field is null ptr", wc.lpfnWndProc == nullptr, true);
+
+    // Constants from the SDK shared/ sibling dir fold too (the in-scope filter treats
+    // um/ and shared/ as one surface): winerror.h ERROR_* codes, minwindef.h MAX_PATH,
+    // and HRESULT cast macros like E_FAIL ((HRESULT)0x80004005L).
+    total++; passed += Test("ERROR_SUCCESS (shared/winerror.h)", (int)ERROR_SUCCESS, 0);
+    total++; passed += Test("ERROR_FILE_NOT_FOUND (shared/winerror.h)", (int)ERROR_FILE_NOT_FOUND, 2);
+    total++; passed += Test("MAX_PATH (shared/minwindef.h)", (int)MAX_PATH, 260);
+    total++; passed += Test("E_FAIL (HRESULT cast macro)", (u32)E_FAIL == 0x80004005u, true);
 
     // Object-like #define constants are folded from the header bind (no hand-transcribing needed).
     total++; passed += Test("WM_DESTROY", (int)(u32)WM_DESTROY, 2);
