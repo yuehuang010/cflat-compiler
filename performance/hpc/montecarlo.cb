@@ -92,7 +92,7 @@ double mc_call(double spot, double strike, double r, double sigma, double tau,
         double u1 = rng->nextDouble();
         double u2 = rng->nextDouble();
         if (u1 < 0.0000000001) u1 = 0.0000000001;   // guard log(0)
-        double z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI() * u2);
+        double z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
         double st = spot * Math.exp(drift + vol * z);
         double payoff = st - strike;
         if (payoff < 0.0) payoff = 0.0;

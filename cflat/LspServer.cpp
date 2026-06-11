@@ -516,6 +516,8 @@ private:
         if (!def) { SendResponse(id, nullptr); return; }
 
         std::string value = def->signatureMarkdown;
+        for (const auto& sig : def->overloadSignatures)
+            value += "\n\n" + sig;
         if (!def->docComment.empty())
             value += "\n\n" + def->docComment;
 

@@ -15,6 +15,27 @@ void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const st
     def.signatureMarkdown = sig;
     def.docComment = docComment;
     def.memberNames = members;
+
+    // Function overloads share one index slot. The new registration stays the
+    // primary (last-writer-wins, as before), but the signatures it displaces
+    // are carried forward so queries can report the full overload set.
+    auto it = symbols_.find(name);
+    if (it != symbols_.end() && kind == SymbolKind::Function && it->second.kind == SymbolKind::Function)
+    {
+        SymbolDef& prev = it->second;
+        def.overloadSignatures = std::move(prev.overloadSignatures);
+        if (!prev.signatureMarkdown.empty() && prev.signatureMarkdown != sig)
+        {
+            auto& sigs = def.overloadSignatures;
+            if (std::find(sigs.begin(), sigs.end(), prev.signatureMarkdown) == sigs.end())
+                sigs.push_back(prev.signatureMarkdown);
+        }
+        // The new primary may itself have been displaced earlier (re-registration).
+        std::erase(def.overloadSignatures, sig);
+        if (def.docComment.empty())
+            def.docComment = prev.docComment;
+    }
+
     symbols_[name] = std::move(def);
 }
 

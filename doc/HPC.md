@@ -342,6 +342,12 @@ Rules:
 >   is the sanctioned way to re-bless it (this is exactly how `span<T>.chunk` builds an offset
 >   tile). The older `union { int* p; int[] v; }` type-pun still works (Fortran `EQUIVALENCE`
 >   style) but the explicit cast is preferred - it is shorter and needs no union type.
+>   The contract you assert with the cast: **the element ranges actually accessed through the
+>   resulting views must be pairwise disjoint** - whole-allocation ownership is not required.
+>   Re-blessing two different rows of one row-major matrix (`(double[])&a[i*n]` and
+>   `(double[])&a[k*n]`, `i != k`, each indexed `0..n-1`) is sound and is the standard dense
+>   linear-algebra pattern; re-blessing two *overlapping* windows and writing through both in
+>   the same kernel is the lie that lets the optimizer miscompile.
 
 To return several results from a kernel - a computed array plus auxiliary scalars - return one
 `T[]` and pass the rest as `T[]`/`T*` out-parameters. Each `T[]` parameter keeps its noalias
@@ -457,6 +463,17 @@ Each helper comes in two backends:
 > `pool.init(cores, cpu_mask_lowest(cores))` - see [Pinning workers](#pinning-workers-to-cores-pin)).
 > As a safety net, the raw entry points print a one-time advisory to **stderr** once they have
 > been called 64+ times - the call pattern that is almost always the per-iteration mistake.
+
+> **Budget the dispatch: a pool fan-out/join is not free either.** One `parallel_for_n_pool`
+> call costs roughly **3-5 us per worker** in fan-out plus join (measured ~11 us at 4 workers,
+> ~30 us at 8, ~106 us at 20 on a 10C/20T desktop part) - tens of thousands of scalar flops.
+> Parallelize a region only when its work clearly dwarfs that: as a rule of thumb, **at least a
+> few hundred thousand operations per dispatch**. This bites hardest in *shrinking-work* loops -
+> a dense LU / Cholesky trailing update dispatched once per column starts large but ends with a
+> handful of rows, where the dispatch dominates and the parallel version runs *slower* than
+> serial. Use a work-based cutoff and fall back to the serial loop below it, e.g.
+> `if (rows * cols >= 262144) parallel_for_n_pool(...) else for (...)`, rather than
+> parallelizing every iteration unconditionally.
 
 `workers <= 0` selects a default (`hardware_concurrency()`, or the pool's worker count for the pool
 variants); `workers` is clamped to `n`. The worker body is a **capturing** lambda over its `[lo, hi)`
@@ -667,3 +684,9 @@ is thin and carries no length), buffers are allocated up front with `new T[n]` a
 Correctness for all eight is checked by [`Test/test_hpc_kernels.cb`](../Test/test_hpc_kernels.cb)
 (run by `test.bat`); throughput numbers and a write-up live in
 [`performance/hpc/README.md`](../performance/hpc/README.md).
+
+Two end-to-end worked examples drive these libraries the way an application would:
+[`example/hpc/poisson_cg.cb`](../example/hpc/poisson_cg.cb) assembles the 2D Poisson 5-point
+operator as a `CsrMatrix` and solves it with `Solver.cg_solve` against a manufactured solution,
+and [`example/hpc/lu_bench.cb`](../example/hpc/lu_bench.cb) benchmarks `Factor.lu_factor` on a
+diagonally dominant dense system with a normwise backward-error check via `Mat.gemv`.

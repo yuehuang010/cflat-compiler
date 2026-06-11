@@ -12,10 +12,10 @@
 //   - cursor home (\x1b[H) each frame so it animates in place.
 //
 // Build:
-//   x64\Release\cflat.exe example\customer\hpc-nbody\main.cb -i Test\library -i example\hpc -o example\customer\hpc-nbody\app.exe -O2
+//   x64\Release\cflat.exe example\hpc\nbody2.cb -o out\nbody2.exe -O2
 // Run:
-//   example\customer\hpc-nbody\app.exe            (default 600 frames)
-//   example\customer\hpc-nbody\app.exe 120        (render 120 frames then exit)
+//   out\nbody2.exe            (default 600 frames)
+//   out\nbody2.exe 120        (render 120 frames then exit)
 
 import "hpc/parallel.cb";   // parallel_for_n_pool
 import "threadpool.cb";     // ThreadPool + cpu_mask_lowest

@@ -4412,6 +4412,32 @@ public:
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
                 compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl);
 
+                // Register the declaration in the symbol index so extern-bound C
+                // runtime functions (atoi, strcmp, memcpy, ...) are discoverable
+                // via --symbol, hover, and completion like any defined function.
+                // The signature format mirrors the definition-site registration in
+                // ForwardRefScanner, so a declaration followed by a definition
+                // dedupes instead of listing as a phantom overload.
+                if (auto* s = compiler->GetSymbolSink())
+                {
+                    std::string sig = typeAndValue.TypeName + " " + direct->getText() + "(";
+                    bool first = true;
+                    for (const auto& p : declParams)
+                    {
+                        if (!first) sig += ", ";
+                        first = false;
+                        sig += p.TypeName;
+                        if (p.Pointer) sig += "*";
+                        if (!p.VariableName.empty()) sig += " " + p.VariableName;
+                    }
+                    if (ellipsis) sig += first ? "..." : ", ...";
+                    sig += ")";
+                    s->Register(SymbolKind::Function, direct->getText(),
+                                compiler->GetSourceFilePath(),
+                                (int)direct->getStart()->getLine(),
+                                (int)direct->getStart()->getCharPositionInLine(), sig);
+                }
+
                 // Declare overloads for each suffix of omitted default parameters
                 int firstDefault = -1;
                 for (int i = 0; i < (int)declParams.size(); i++)
@@ -4865,10 +4891,21 @@ public:
                     // on the variable name lands on the global itself, not on its
                     // (possibly unregistered, e.g. generic-instantiation) type.
                     if (auto* s = compiler->GetSymbolSink())
+                    {
                         s->RegisterVariable(name, typeAndValue.TypeName,
                                             compiler->GetSourceFilePath(),
                                             (int)direct->getStart()->getLine(),
                                             (int)direct->getStart()->getCharPositionInLine());
+                        // Also register as a named symbol so globals (including
+                        // namespace consts like Math.PI) show up in --symbol
+                        // queries and in their namespace's member listing.
+                        s->Register(SymbolKind::Variable, name,
+                                    compiler->GetSourceFilePath(),
+                                    (int)direct->getStart()->getLine(),
+                                    (int)direct->getStart()->getCharPositionInLine(),
+                                    std::format("{}{} {}", typeAndValue.TypeName,
+                                                typeAndValue.Pointer ? "*" : "", name));
+                    }
                 }
                 else
                 {

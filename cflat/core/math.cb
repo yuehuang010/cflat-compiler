@@ -11,9 +11,9 @@
 //     CRT symbol directly with the 'global::' scope-escape qualifier (e.g.
 //     'return global::tan(x);'), which resolves at the root scope and so cannot
 //     recurse into the Math sibling of the same name.
-//   - Constants are exposed as zero-arg functions (e.g. Math.PI()). Namespace-scope
-//     const declarations are supported (const double PI = ...; usable as Math.PI),
-//     but the function form is kept for source compatibility with existing callers.
+//   - Constants are namespace-scope const declarations (const double PI = ...;)
+//     accessed as Math.PI. A bare un-called function reference is a compile
+//     error, so the old zero-arg function form (Math.PI()) is gone for good.
 
 // -----------------------------------------------------------------
 // File-scope CRT declarations.  The Math.* wrappers below reach these
@@ -141,14 +141,14 @@ namespace Math
         return x < minVal ? minVal : (x > maxVal ? maxVal : x);
     }
 
-    // --- constants (returned as zero-arg functions; LLVM constant-folds them) ---
+    // --- constants ---
 
-    double PI()    { return 3.14159265358979323846; }
-    double TAU()   { return 6.28318530717958647692; }
-    double E()     { return 2.71828182845904523536; }
-    double SQRT2() { return 1.41421356237309504880; }
-    double LN2()   { return 0.69314718055994530941; }
-    double LN10()  { return 2.30258509299404568401; }
+    const double PI    = 3.14159265358979323846;
+    const double TAU   = 6.28318530717958647692;
+    const double E     = 2.71828182845904523536;
+    const double SQRT2 = 1.41421356237309504880;
+    const double LN2   = 0.69314718055994530941;
+    const double LN10  = 2.30258509299404568401;
 
     // --- absolute value for floating-point ---
 
@@ -323,10 +323,10 @@ namespace Math
     float lerp(float a, float b, float t)     { return a + t * (b - a); }
 
     // Convert degrees to radians.
-    double radians(double deg) { return deg * PI() / 180.0; }
-    float radians(float deg)   { return (float)(deg * PI() / 180.0); }
+    double radians(double deg) { return deg * PI / 180.0; }
+    float radians(float deg)   { return (float)(deg * PI / 180.0); }
 
     // Convert radians to degrees.
-    double degrees(double rad) { return rad * 180.0 / PI(); }
-    float degrees(float rad)   { return (float)(rad * 180.0 / PI()); }
+    double degrees(double rad) { return rad * 180.0 / PI; }
+    float degrees(float rad)   { return (float)(rad * 180.0 / PI); }
 }

@@ -6347,6 +6347,11 @@ public:
         if (srcType == destType)
             return value;
 
+        // A function address converted to a scalar is the forgot-the-parens bug
+        // ('double pi = Math.PI;') - reject before it bitcasts into garbage.
+        if (destType->isIntegerTy() || destType->isFloatingPointTy())
+            RejectBareFunctionValue(value);
+
         // Integer <-> Integer
         if (srcType->isIntegerTy() && destType->isIntegerTy())
         {
@@ -6909,6 +6914,34 @@ public:
         return scalar;
     }
 
+    // Reverse-map an IR function to its source-level name for diagnostics.
+    // Only called on the error path, so the linear scan is fine.
+    std::string FindFunctionSourceName(const llvm::Function* fn) const
+    {
+        for (const auto& [name, overloads] : functionTable)
+            for (const auto& sym : overloads)
+                if (sym.Function == fn)
+                    return name;
+        return fn->getName().str();
+    }
+
+    // A bare llvm::Function reaching value context means the user referenced a
+    // function without calling it (e.g. 'Math.PI' instead of 'Math.PI()').
+    // Without this check the address either bitcasts into a garbage scalar or
+    // trips an LLVM assert inside arithmetic codegen.
+    void RejectBareFunctionValue(llvm::Value* value) const
+    {
+        if (value == nullptr)
+            return;
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(value))
+        {
+            std::string name = FindFunctionSourceName(fn);
+            LogError(std::format(
+                "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
+                name, name));
+        }
+    }
+
     llvm::Value* CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right)
     {
         if (left == nullptr)
@@ -6923,6 +6956,9 @@ public:
     {
         if (left == nullptr)
             return right;
+
+        RejectBareFunctionValue(left);
+        RejectBareFunctionValue(right);
 
         // Pointer operations: must run before Upconvert, which would corrupt pointer/int pairs.
         if (left->getType()->isPointerTy() || right->getType()->isPointerTy())

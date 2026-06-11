@@ -1,0 +1,41 @@
+// Bare un-called function reference used as a value: 'Math.PI' (a function in
+// disguise) must not silently bitcast to a scalar or crash arithmetic codegen.
+// Regression for the forgot-the-parens bug: 'double pi = Math.PI;' compiled
+// silently (function address bitcast to a denormal double) and
+// 'Math.sin(nullary() * 0.5)' tripped an LLVM assert inside fmul.
+
+import "math.cb";
+
+double nullary() { return 3.14; }
+
+// Scalar conversion path (CreateCast): declaration initializer.
+expect_error("is a function used as a value") {
+    int test_decl()
+    {
+        double pi = nullary;
+        return 0;
+    }
+}
+
+// Arithmetic path (CreateOperation): function reference inside an expression.
+expect_error("is a function used as a value") {
+    int test_arith()
+    {
+        double x = nullary * 0.5;
+        return 0;
+    }
+}
+
+// Namespace-qualified function reference, the original customer repro shape.
+expect_error("is a function used as a value") {
+    int test_namespace_qualified()
+    {
+        double s = Math.sin * 2.0;
+        return 0;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

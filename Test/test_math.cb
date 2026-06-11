@@ -31,11 +31,11 @@ extern int main()
     total++; passed += Test("Math.sin(0.0f)",  Math.sin(0.0f),         0.0f);
     total++; passed += Test("Math.cos(0.0f)",  Math.cos(0.0f),         1.0f);
 
-    // Math.PI / constants (zero-arg functions)
-    total++; passed += Test("Math.PI()",    (float)Math.PI(),    3.14159265f);
-    total++; passed += Test("Math.E()",     (float)Math.E(),     2.71828183f);
-    total++; passed += Test("Math.SQRT2()", (float)Math.SQRT2(), 1.41421356f);
-    total++; passed += Test("Math.LN2()",   (float)Math.LN2(),   0.69314718f);
+    // Math.PI / constants (namespace consts)
+    total++; passed += Test("Math.PI",    (float)Math.PI,    3.14159265f);
+    total++; passed += Test("Math.E",     (float)Math.E,     2.71828183f);
+    total++; passed += Test("Math.SQRT2", (float)Math.SQRT2, 1.41421356f);
+    total++; passed += Test("Math.LN2",   (float)Math.LN2,   0.69314718f);
 
     // Math.abs / fabs overloads for float and double
     total++; passed += Test("Math.fabs(-3.5)", (float)Math.fabs(-3.5),   3.5f);
@@ -68,7 +68,7 @@ extern int main()
     total++; passed += Test("Math.cbrt(-8)", (float)Math.cbrt(-8.0), -2.0f);
 
     // log / log2 / log10 via llvm intrinsics
-    total++; passed += Test("Math.log(E)",      (float)Math.log(Math.E()),   1.0f);
+    total++; passed += Test("Math.log(E)",      (float)Math.log(Math.E),   1.0f);
     total++; passed += Test("Math.log2(8.0)",   (float)Math.log2(8.0),       3.0f);
     total++; passed += Test("Math.log10(100.0)",(float)Math.log10(100.0),    2.0f);
     total++; passed += Test("Math.log(1f)",      Math.log(1.0f),              0.0f);
@@ -82,7 +82,7 @@ extern int main()
     total++; passed += Test("Math.acos(1.0)",      (float)Math.acos(1.0),       0.0f);
     total++; passed += Test("Math.atan(0.0)",      (float)Math.atan(0.0),       0.0f);
     // atan2(1,1) = pi/4; compare both sides via the same float conversion to avoid literal mismatch
-    total++; passed += Test("Math.atan2(1,1)",     (float)Math.atan2(1.0, 1.0), (float)(Math.PI() / 4.0));
+    total++; passed += Test("Math.atan2(1,1)",     (float)Math.atan2(1.0, 1.0), (float)(Math.PI / 4.0));
 
     // sinh / cosh / tanh (CRT)
     total++; passed += Test("Math.sinh(0.0)", (float)Math.sinh(0.0), 0.0f);
@@ -117,7 +117,7 @@ extern int main()
 
     // radians / degrees
     total++; passed += Test("Math.radians(180)", (float)Math.radians(180.0), 3.14159265f);
-    total++; passed += Test("Math.degrees(pi)",  (float)Math.degrees(Math.PI()), 180.0f);
+    total++; passed += Test("Math.degrees(pi)",  (float)Math.degrees(Math.PI), 180.0f);
 
     // integer conversion methods
     i64 big = 0x100000000;  // 2^32

@@ -1,0 +1,132 @@
+// lu_bench.cb - dense LU benchmark over the core HPC libraries: hpc/factor.cb
+// Factor.lu_factor / forward_solve / back_solve for the factorization and
+// triangular solves, hpc/densemat.cb Mat.gemv for the residual check, and
+// hpc/vecmath.cb for the vector norms - the driver reimplements no kernel.
+//
+// Factor.lu_factor is Doolittle without pivoting, so the test matrix is made
+// strictly diagonally dominant (random off-diagonal mass in [-1, 1), diagonal
+// boosted above the row sum) - the standard setting where unpivoted LU is
+// backward stable. Verified by solving A x = b for x_true = ones and reporting
+//     ||A x - b||_inf / (||A||_inf ||x||_inf + ||b||_inf)
+// which should sit within a small multiple of machine epsilon. Reports GFLOP/s
+// using the standard 2n^3/3 flop count.
+//
+// Build:  x64\Release\cflat.exe example\hpc\lu_bench.cb -o out\lu_bench.exe -O2
+// Run:    out\lu_bench.exe [N]      (default N = 1024)
+
+import "hpc/factor.cb";    // Factor.lu_factor / forward_solve / back_solve
+import "hpc/densemat.cb";  // Mat.gemv
+import "hpc/vecmath.cb";   // Vec.fill / copy / axpy / iamax
+import "random.cb";
+import "math.cb";
+import "time.cb";
+import "cruntime.cb";      // atoi
+
+// Uniform random entries in [-1, 1), then boost each diagonal entry above its
+// row's absolute sum so the matrix is strictly diagonally dominant (no pivoting
+// needed). Deterministic via the fixed seed.
+void fillDiagDominant(double[] a, int n, i64 seedVal)
+{
+    Random rng;
+    rng.seed(seedVal);
+    for (int i = 0; i < n; i++) {
+        double rowAbs = 0.0;
+        int base = i * n;
+        for (int j = 0; j < n; j++) {
+            double v = rng.nextDouble() * 2.0 - 1.0;
+            a[base + j] = v;
+            rowAbs += Math.abs(v);
+        }
+        a[base + i] = rowAbs + 1.0;
+    }
+}
+
+// Infinity norm of an n x n row-major matrix (max absolute row sum).
+double matNormInf(double[] a, int n)
+{
+    double m = 0.0;
+    for (int i = 0; i < n; i++) {
+        double rs = 0.0;
+        int base = i * n;
+        for (int j = 0; j < n; j++) { rs += Math.abs(a[base + j]); }
+        if (rs > m) { m = rs; }
+    }
+    return m;
+}
+
+// Infinity norm of a vector, via the BLAS-1 iamax index.
+double vecNormInf(double[] x, int n)
+{
+    int i = Vec.iamax(x, n);
+    return i < 0 ? 0.0 : Math.abs(x[i]);
+}
+
+extern int main(int argc, char** argv)
+{
+    int n = 1024;
+    if (argc > 1) { int v = atoi(argv[1]); if (v > 1) { n = v; } }
+
+    printf("Dense LU factorization benchmark (CFlat core/hpc, -O2)\n");
+    printf("-------------------------------------------------------\n");
+    printf("n = %d, Doolittle (no pivoting), diagonally dominant A\n", n);
+
+    double[] a    = new double[n * n];   // the system matrix (left intact)
+    double[] lu   = new double[n * n];   // packed L (unit lower) + U
+    double[] x    = new double[n];       // computed solution
+    double[] y    = new double[n];       // intermediate L y = b
+    double[] b    = new double[n];       // rhs for x_true = all ones
+    double[] r    = new double[n];       // residual A x - b
+    double[] ones = new double[n];
+
+    fillDiagDominant(a, n, 0x5EED);
+
+    // b = A * ones  ->  x_true = ones
+    Vec.fill(ones, 1.0, n);
+    Mat.gemv(1.0, a, ones, 0.0, b, n, n);
+
+    Stopwatch sw;
+    sw.start();
+    bool ok = Factor.lu_factor(a, lu, n);
+    sw.stop();
+    double secs = sw.elapsed().seconds();
+
+    if (!ok) {
+        printf("FAIL: zero pivot (matrix singular to working precision)\n");
+        return 1;
+    }
+
+    Factor.forward_solve(lu, b, y, n, true);   // L y = b (unit diagonal)
+    Factor.back_solve(lu, y, x, n);            // U x = y
+
+    // Residual r = A x - b, then the normwise relative backward error.
+    Mat.gemv(1.0, a, x, 0.0, r, n, n);
+    Vec.axpy(-1.0, b, r, n);
+    double relRes = vecNormInf(r, n)
+                  / (matNormInf(a, n) * vecNormInf(x, n) + vecNormInf(b, n));
+
+    // Forward error against x_true = ones (not part of pass/fail; the matrix's
+    // condition number scales it).
+    double fwdErr = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = Math.abs(x[i] - 1.0);
+        if (d > fwdErr) { fwdErr = d; }
+    }
+
+    double gflops = (2.0 / 3.0) * (double)n * (double)n * (double)n / secs / 1.0e9;
+
+    printf("factor   : %.4f s   ->  %.2f GFLOP/s  (2n^3/3)\n", secs, gflops);
+    printf("residual : ||Ax-b||/( ||A|| ||x|| + ||b|| ) = %.3e\n", relRes);
+    printf("forward  : max|x - 1| = %.3e (scaled by cond(A))\n", fwdErr);
+
+    bool pass = relRes < 1.0e-12;   // ~50 eps cushion for a stable LU at this n
+
+    delete[_] a;  delete[_] lu;  delete[_] x;  delete[_] y;
+    delete[_] b;  delete[_] r;   delete[_] ones;
+
+    if (pass) {
+        printf("\nRESULT: PASS (backward-stable factorization)\n");
+        return 0;
+    }
+    printf("\nRESULT: FAIL (residual too large)\n");
+    return 1;
+}

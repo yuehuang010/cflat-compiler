@@ -1717,7 +1717,7 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 | `view.cb` | `view<T>` - non-owning **may-alias** window (`T*` + len); `slice(start,end)`; sibling of `span<T>` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
-| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding |
+| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding; constants `Math.PI`, `Math.TAU`, `Math.E`, `Math.SQRT2`, `Math.LN2`, `Math.LN10` (namespace `const` globals - no parens) |
 | `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
 | `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |

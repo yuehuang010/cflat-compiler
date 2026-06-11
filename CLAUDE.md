@@ -387,7 +387,7 @@ The `core/` directory is implicitly added to the import search path by the compi
 | `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
 | `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
-| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, `fma` (fused multiply-add), trig, rounding |
+| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, `fma` (fused multiply-add), trig, rounding; constants `Math.PI` / `TAU` / `E` / `SQRT2` / `LN2` / `LN10` |
 | `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
 | `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |

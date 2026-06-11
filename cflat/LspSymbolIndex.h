@@ -23,6 +23,10 @@ struct SymbolDef
     std::string signatureMarkdown;
     std::string docComment;
     std::vector<std::string> memberNames;
+    // Signatures of additional overloads sharing this name. The index is keyed
+    // by name, so without this only the last-registered overload is visible to
+    // --symbol queries and hover (e.g. Math.sin showed only the float form).
+    std::vector<std::string> overloadSignatures;
 };
 
 // A definition that is a candidate for the "unused code" check. Recorded during

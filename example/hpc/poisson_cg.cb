@@ -1,0 +1,126 @@
+// poisson_cg.cb - 2D Poisson problem solved with the core HPC libraries:
+// the 5-point stencil assembled as a hpc/sparse.cb CsrMatrix and handed to
+// hpc/solvers.cb Solver.cg_solve (which itself composes CsrMatrix.spmv with
+// the hpc/vecmath.cb BLAS-1 kernels - the driver reimplements no kernel).
+//
+// Manufactured solution on the unit square with homogeneous Dirichlet BCs:
+//     u(x, y) = x(1-x) y(1-y)
+//     -Lap u  = 2 [ x(1-x) + y(1-y) ] = f
+// Discretized on an N x N interior grid (h = 1/(N+1)), the linear system is
+// A u = h^2 f. Two properties make this a strong test:
+//   - u excites the full eigenspectrum of A, so CG genuinely needs O(N)
+//     iterations (a single Laplacian eigenmode like sin(pi x) sin(pi y) would
+//     converge in 1 step and test nothing);
+//   - the centered second difference is exact for quadratics, so the discrete
+//     solution equals the analytic u at the grid points up to solver tolerance.
+//
+// Build:  x64\Release\cflat.exe example\hpc\poisson_cg.cb -o out\poisson_cg.exe -O2
+// Run:    out\poisson_cg.exe [N]      (default N = 256)
+
+import "hpc/sparse.cb";    // CsrMatrix + spmv
+import "hpc/solvers.cb";   // Solver.cg_solve
+import "hpc/vecmath.cb";   // Vec.fill / nrm2
+import "math.cb";
+import "time.cb";
+import "cruntime.cb";      // atoi
+
+// Assemble the 2D Poisson 5-point operator on the N x N interior grid
+// (Dirichlet zero boundary, row-major unknowns: (r, c) -> r*N + c) in CSR:
+//     (A u)[r,c] = 4 u[r,c] - u[r-1,c] - u[r+1,c] - u[r,c-1] - u[r,c+1]
+// with out-of-range neighbors dropped (they are the zero boundary). A is SPD.
+// Column indices are emitted in ascending order, as CSR expects.
+void assemblePoisson(CsrMatrix* a, int N)
+{
+    int n = N * N;
+    int nnz = n + 4 * N * (N - 1);   // diagonal + 2 vertical + 2 horizontal couplings
+    a->alloc(n, n, nnz);
+
+    int k = 0;
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N; c++) {
+            int i = r * N + c;
+            a->row_ptr[i] = k;
+            if (r > 0)     { a->col_index[k] = i - N; a->values[k] = -1.0; k++; }
+            if (c > 0)     { a->col_index[k] = i - 1; a->values[k] = -1.0; k++; }
+            a->col_index[k] = i; a->values[k] = 4.0; k++;
+            if (c < N - 1) { a->col_index[k] = i + 1; a->values[k] = -1.0; k++; }
+            if (r < N - 1) { a->col_index[k] = i + N; a->values[k] = -1.0; k++; }
+        }
+    }
+    a->row_ptr[n] = k;
+}
+
+extern int main(int argc, char** argv)
+{
+    int N = 256;                       // interior grid points per side
+    if (argc > 1) { int a = atoi(argv[1]); if (a > 1) { N = a; } }
+    int n = N * N;
+    double h = 1.0 / (double)(N + 1);
+
+    printf("2D Poisson / conjugate gradient (CFlat core/hpc, -O2)\n");
+    printf("------------------------------------------------------\n");
+    printf("grid     = %d x %d interior (%d unknowns), h = %.6f\n", N, N, n, h);
+
+    CsrMatrix A;
+    assemblePoisson(&A, N);
+
+    double[] b      = new double[n];   // rhs: h^2 f
+    double[] u      = new double[n];   // solution (starts at 0)
+    double[] uexact = new double[n];   // analytic solution at grid points
+
+    for (int r = 0; r < N; r++) {
+        double y = (double)(r + 1) * h;
+        for (int c = 0; c < N; c++) {
+            double x = (double)(c + 1) * h;
+            uexact[r * N + c] = x * (1.0 - x) * y * (1.0 - y);
+            b[r * N + c] = h * h * 2.0 * (x * (1.0 - x) + y * (1.0 - y));
+        }
+    }
+    Vec.fill(u, 0.0, n);
+
+    // cg_solve's tol is on the absolute residual ||r||_2; scale by ||b|| so the
+    // stopping test is the usual relative one.
+    double relTol = 1.0e-10;
+    double bnorm = Vec.nrm2(b, n);
+    int maxIter = 10 * N;              // CG on this A needs O(N) iterations
+
+    Stopwatch sw;
+    sw.start();
+    double res = 0.0;
+    int iters = Solver.cg_solve(&A, b, u, n, relTol * bnorm, maxIter, &res);
+    sw.stop();
+    double secs = sw.elapsed().seconds();
+    double relRes = res / bnorm;
+
+    // Discretization error vs the analytic solution. The stencil is exact for
+    // this quadratic u, so the only error left is the unresolved CG residual;
+    // allow a generous algebraic-error cushion.
+    double maxErr = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = Math.abs(u[i] - uexact[i]);
+        if (d > maxErr) { maxErr = d; }
+    }
+    double errBound = 1.0e-8;
+
+    // Rough work estimate: per iteration 1 spmv (2 nnz flops) + 2 dot + 3 axpy-like (~10n).
+    double flops = (double)iters * (2.0 * (double)A.nnz + 10.0 * (double)n);
+
+    printf("solver   : Solver.cg_solve, rel tol = %.1e, max %d iters\n", relTol, maxIter);
+    printf("result   : %d iterations, relative residual = %.3e\n", iters, relRes);
+    printf("time     : %.4f s   (~%.2f GFLOP/s in spmv/BLAS-1 kernels)\n", secs, flops / secs / 1.0e9);
+    printf("accuracy : max|u - u_exact| = %.3e   (bound %.1e; stencil exact for quadratic u)\n", maxErr, errBound);
+
+    bool pass = (relRes <= relTol) && (maxErr <= errBound) && (iters < maxIter);
+
+    A.dispose();
+    delete[_] b;
+    delete[_] u;
+    delete[_] uexact;
+
+    if (pass) {
+        printf("\nRESULT: PASS (converged, matches analytic solution)\n");
+        return 0;
+    }
+    printf("\nRESULT: FAIL\n");
+    return 1;
+}

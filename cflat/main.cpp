@@ -79,6 +79,8 @@ static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
     std::cout << def.name << "  (" << SymbolKindName(def.kind) << ")\n";
     if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
         std::cout << "  " << def.signatureMarkdown << "\n";
+    for (const auto& sig : def.overloadSignatures)
+        std::cout << "  " << sig << "\n";
     if (def.line > 0 && !def.file.empty())
         std::cout << "  defined: " << def.file << ":" << def.line << "\n";
     if (!def.docComment.empty())
@@ -101,6 +103,8 @@ static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
             if (!m->signatureMarkdown.empty() && m->signatureMarkdown != shortName)
                 std::cout << "  :  " << m->signatureMarkdown;
             std::cout << "\n";
+            for (const auto& sig : m->overloadSignatures)
+                std::cout << "    " << m->name << "  :  " << sig << "\n";
         }
     }
 }
@@ -176,9 +180,15 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
         if (std::filesystem::is_directory(coreDir, ec))
         {
             std::vector<std::string> names;
-            for (const auto& e : std::filesystem::directory_iterator(coreDir, ec))
-                if (e.path().extension() == ".cb" && e.path().filename() != "runtime.cb")
-                    names.push_back(e.path().filename().string());
+            // Recursive: subdirectory libraries (e.g. hpc/vecmath.cb) must be
+            // searchable too, or --symbol silently hides whole library families.
+            for (const auto& e : std::filesystem::recursive_directory_iterator(coreDir, ec))
+            {
+                if (e.path().extension() != ".cb" || e.path().filename() == "runtime.cb")
+                    continue;
+                std::string rel = std::filesystem::relative(e.path(), coreDir, ec).generic_string();
+                names.push_back(rel);
+            }
             std::sort(names.begin(), names.end());
             for (const auto& n : names)
                 body += "import \"" + n + "\";\n";
