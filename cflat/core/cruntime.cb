@@ -422,6 +422,22 @@ extern int islower(int c);
 extern int toupper(int c);
 extern int tolower(int c);
 
+// === Numeric String Conversion ===
+// Parse a leading number out of a NUL-terminated string. The ato* forms return 0 on a
+// non-numeric string (no error signal); the strto* forms write the first unparsed
+// character into *endptr (pass nullptr to ignore) and take a numeric base (10, 16, ...;
+// base 0 auto-detects 0x/0 prefixes). Windows is LLP64, so C `long` is 32-bit: atol maps
+// to int and atoll/strtoll to i64.
+extern int    atoi(const char* str);
+extern int    atol(const char* str);
+extern i64    atoll(const char* str);
+extern double atof(const char* str);
+extern int    strtol(const char* str, char** endptr, int base);
+extern u32    strtoul(const char* str, char** endptr, int base);
+extern i64    strtoll(const char* str, char** endptr, int base);
+extern u64    strtoull(const char* str, char** endptr, int base);
+extern double strtod(const char* str, char** endptr);
+
 // === Math Functions (basic) ===
 extern i64 abs(i64 n);
 extern double fabs(double x);

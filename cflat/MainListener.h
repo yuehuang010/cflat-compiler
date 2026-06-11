@@ -277,6 +277,33 @@ static std::string getFunctionName(CFlatParser::FunctionDefinitionContext* ctx)
     return directDecl->getText();
 }
 
+// Build a readable one-line signature for a function definition by slicing the source
+// from the function's start up to its body, then collapsing whitespace. Used for the
+// symbol index of generic-template methods, which would otherwise record only the bare
+// name (the monomorphized instance is what carries fully-resolved parameter types).
+static std::string getFunctionSignatureText(CFlatParser::FunctionDefinitionContext* ctx)
+{
+    auto* body = ctx->compoundStatement();
+    auto* startTok = ctx->getStart();
+    if (!body || !startTok) return getFunctionName(ctx);
+    auto* input = startTok->getInputStream();
+    size_t a = startTok->getStartIndex();
+    size_t b = body->getStart()->getStartIndex();
+    if (!input || b <= a) return getFunctionName(ctx);
+
+    std::string raw = input->getText(antlr4::misc::Interval(a, b - 1));
+    std::string out;
+    bool pendingSpace = false;
+    for (char c : raw)
+    {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { pendingSpace = true; continue; }
+        if (pendingSpace && !out.empty()) out += ' ';
+        pendingSpace = false;
+        out += c;
+    }
+    return out.empty() ? getFunctionName(ctx) : out;
+}
+
 // Extract the leading doc comment block above the given declaration's start token.
 // Tier 1 (preferred): contiguous /// or /** ... */ doc comments anchored to the declaration.
 // Tier 2 (fallback): contiguous // or /* ... */ plain comments anchored to the declaration.
@@ -875,7 +902,7 @@ private:
                     s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
                                 (int)func->getStart()->getLine(),
                                 (int)func->getStart()->getCharPositionInLine(),
-                                funcName, {}, fdoc);
+                                getFunctionSignatureText(func), {}, fdoc);
                 }
             }
             return;

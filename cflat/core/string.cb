@@ -166,6 +166,38 @@ move string copy(string self, IAllocator alloc)
     return result;
 }
 
+// ── string -> number parsing ──────────────────────────────────────────────────
+// Thin wrappers over the C runtime (atoi/atoll/atof) on the string's null-terminated
+// buffer. Like their C backends these return 0 on a non-numeric string (leading
+// whitespace is skipped, a trailing non-numeric suffix is ignored) and give no error
+// signal - use toIntBase / the strto* externs in cruntime.cb when you need to detect
+// a bad parse via the end pointer.
+
+// Parse a base-10 signed 32-bit integer.
+int toInt(string self)
+{
+    return atoi(self._ptr);
+}
+
+// Parse a base-10 signed 64-bit integer.
+i64 toLong(string self)
+{
+    return atoll(self._ptr);
+}
+
+// Parse a floating-point value.
+double toDouble(string self)
+{
+    return atof(self._ptr);
+}
+
+// Parse a signed 64-bit integer in an explicit base (10, 16, ...; base 0 auto-detects
+// a 0x / 0 prefix). Unparsed suffix is ignored.
+i64 toIntBase(string self, int base)
+{
+    return strtoll(self._ptr, nullptr, base);
+}
+
 // ── string_view ───────────────────────────────────────────────────────────────
 // Non-owning view into a string's buffer.  _ptr is borrowed; never freed.
 struct string_view

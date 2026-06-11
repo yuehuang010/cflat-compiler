@@ -136,6 +136,39 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 Diagnostic message conventions: [`doc/diagnostic.md`](diagnostic.md). Threading-specific
 analysis: [`doc/threading.md`](threading.md).
 
+## Symbol lookup (`--symbol`)
+
+| Switch | Value | Description |
+|--------|-------|-------------|
+| `--symbol` | name | IDE-style quick symbol lookup, then exit (repeatable). |
+
+`--symbol` is an editor-style API search over the compiler's own symbol index - the *same*
+index that powers LSP hover, completion, and go-to-definition. It gives a scripted or agent
+caller (which has no editor) the discovery path a human gets from one.
+
+For each `--symbol` term:
+
+- **Exact match** (case-insensitive) prints the symbol's kind, signature, source location,
+  and doc comment. For a type, namespace, or interface it also lists every member with its
+  signature. Methods and fields are addressable directly, e.g. `--symbol "dictionary.set"`.
+- **No match** falls back to substring and edit-distance matching and prints the closest
+  symbols as "did you mean" suggestions (with their kind and location).
+
+**What gets indexed** depends on whether you pass a source file:
+
+- *With a positional source file* (`cflat app.cb --symbol foo`) the search covers exactly
+  what that file imports - true IDE semantics, results scoped to your program.
+- *With no source file* (`cflat --symbol foo`) the compiler synthesizes an import-all-core
+  file, so the entire standard library is searchable with zero setup.
+
+```bash
+# Look up a container type and a specific method (whole stdlib, no project needed)
+cflat.exe --symbol list --symbol "dictionary.set"
+
+# Scope the search to one program's imports
+cflat.exe app.cb -i lib --symbol Math
+```
+
 ## Informational (print and exit)
 
 | Switch | Short | Description |
