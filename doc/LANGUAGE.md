@@ -1051,6 +1051,10 @@ The `*` / `[N]` suffix is part of the alias and is folded onto the use site: `us
 then `PP* x;` yields `int**` (two pointer levels are the maximum; three is an error). A pointer
 to an aliased fixed array (`Vec3* p`) is rejected like a written `float[3]*`.
 
+A structured RHS (generic, pointer, or array) must resolve to a known type or the compiler
+errors. A bare-identifier RHS that does not name a known type is treated as a namespace alias
+(as in the first example) - so a namespace can be aliased before it is defined.
+
 ### Module Imports
 
 Split code across multiple files with `import`:
