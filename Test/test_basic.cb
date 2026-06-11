@@ -2101,6 +2101,7 @@ extern int main()
     total++; passed += testAlignas()                     ? 1 : 0;
     total++; passed += testConstFold()                   ? 1 : 0;
     total++; passed += testFloatLiteralWidth()            ? 1 : 0;
+    total++; passed += testFloatDoubleWiden()             ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -2903,6 +2904,41 @@ bool testFloatLiteralWidth()
     // Not representable exactly in float -> f64.
     result &= Test("0.1 is double",   whichFp(0.1),                 2);
     result &= Test("pi is double",    whichFp(3.141592653589793),   2);
+
+    return result;
+}
+
+// =============================================================
+// float -> double implicit widening at the literal site
+// =============================================================
+// A bare literal like 1.0 is typed `float` (smallest-type rule above), but
+// float -> double is an implicit widening conversion, so it must widen when the
+// destination is `double`. Two sites previously emitted invalid LLVM IR:
+//   1. Ternary unification: `cond ? <double> : 1.0` produced a select with one
+//      double and one float operand (verifier: "Invalid operands for select").
+//   2. A `double` global seeded from a bare float literal mismatched its type
+//      (verifier: "Global variable initializer type does not match").
+
+// Case 2: double global seeded from a bare float literal.
+double g_widenGlobal = 1.0;
+
+bool testFloatDoubleWiden()
+{
+    bool result = true;
+
+    // Global initialized from a bare float literal widened to double.
+    result &= Test("widen_global_literal", g_widenGlobal == 1.0, true);
+
+    // `c` is a loaded local, so the ternary lowers to a real `select` whose
+    // operands must unify to a common type (double).
+    bool c = true;
+
+    // Case 1: ternary mixing a double expression with a bare float literal,
+    // on each branch.
+    double x = c ? (g_widenGlobal * 2.0) : 1.0;   // double expr on taken branch
+    double y = c ? 0.0 : (g_widenGlobal * 2.0);   // bare literal on taken branch
+    result &= Test("widen_ternary_double_branch", x == 2.0, true);
+    result &= Test("widen_ternary_literal_branch", y == 0.0, true);
 
     return result;
 }

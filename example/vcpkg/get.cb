@@ -5,10 +5,9 @@
 // paths.
 import package-vcpkg "curl/curl.h" from "curl";
 
-// Auto-extern skips these because CURLcode (enum) return type is not in the
-// supported scalar/pointer subset. Declare them manually; CURLcode is int-sized.
-extern int curl_easy_setopt(void* handle, int option, ...);
-extern int curl_easy_perform(void* handle);
+// curl_easy_setopt (variadic) and curl_easy_perform are auto-externed from the
+// header - their int-sized CURLcode return maps to i32 - so no manual extern is
+// needed here.
 
 extern int main()
 {

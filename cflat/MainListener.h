@@ -5591,6 +5591,14 @@ public:
                         if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
                         else         trueValue  = compiler->Upconvert(trueValue,  ft);
                     }
+                    else if (ft->isFloatingPointTy() && tt->isFloatingPointTy())
+                    {
+                        // Widen the narrower branch (e.g. float literal 1.0 -> double).
+                        unsigned fb = ft->getScalarSizeInBits();
+                        unsigned tb = tt->getScalarSizeInBits();
+                        if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
+                        else         trueValue  = compiler->Upconvert(trueValue,  ft);
+                    }
                 }
 
                 auto* selectValue = compiler->CreateSelect(condTv.value, falseValue, trueValue);

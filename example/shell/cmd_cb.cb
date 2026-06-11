@@ -563,7 +563,12 @@ void cmdWc(list<string>* tokens)
 
 void cmdRun(list<string>* tokens)
 {
-    // Build the arg list before assigning the lambda (lambda-before-add compiler limitation).
+    process p;
+    p.exe = tokens->get(0);
+    p.onStdout = (char* buf, int len) => {
+        printf("%.*s", len, buf);
+    };
+
     list<string>* args = new list<string>;
     int i = 1;
     while (i < tokens->count())
@@ -572,12 +577,6 @@ void cmdRun(list<string>* tokens)
         args->add(arg);
         i++;
     }
-
-    process p;
-    p.exe = tokens->get(0);
-    p.onStdout = (char* buf, int len) => {
-        printf("%.*s", len, buf);
-    };
     p.run(args);
     p.WaitForExit();
     delete args;

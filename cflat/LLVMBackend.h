@@ -5904,9 +5904,17 @@ public:
             }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
             {
-                if (fpValue->getType()->getScalarSizeInBits() == destinationType->getScalarSizeInBits())
+                // Widen a narrower FP constant to the global's type. A bare float literal
+                // (1.0 is typed float) widens to a double global - float -> double is an
+                // implicit widening conversion. Narrowing is left alone so it still errors.
+                if (destinationType->isFloatingPointTy() &&
+                    fpValue->getType()->getScalarSizeInBits() < destinationType->getScalarSizeInBits())
                 {
-                    initValue = llvm::ConstantFP::get(destinationType, fpValue->getValueAPF());
+                    llvm::APFloat widened = fpValue->getValueAPF();
+                    bool losesInfo = false;
+                    widened.convert(destinationType->getFltSemantics(),
+                        llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+                    initValue = llvm::ConstantFP::get(destinationType->getContext(), widened);
                 }
             }
             // Coerce a null-value (e.g. nullptr) to the destination type when types differ.
