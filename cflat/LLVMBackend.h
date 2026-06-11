@@ -375,6 +375,13 @@ public:
         uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
         std::vector<uint64_t> ConstInnerDimensions;   // inner dimensions for multi-dim arrays (e.g. [M] in T[N][M])
 
+        // Fixed-array sizes contributed by a TYPE ALIAS (using Vec3 = float[3]). The alias string
+        // stores the folded sizes ("float[3]"); ParseDeclarationSpecifiers peels them here so the
+        // per-declarator finalization can adopt them when the declarator carries no brackets of its
+        // own (the size lives on the type, shared by every declarator). 0 / empty = no alias array.
+        uint64_t AliasArraySize = 0;
+        std::vector<uint64_t> AliasInnerDims;
+
         // simd<T,N>: builtin special-form vector type. IsSimd => TypeName is the element scalar (e.g. "float"),
         // SimdLanes is N (power of 2). Lowers to LLVM <N x T>. A primitive value (register-resident), NOT a
         // struct/array aggregate and NOT a pointer - never combined with Pointer/ConstArraySize.
@@ -8128,12 +8135,35 @@ public:
             if (it != enumBackingTypes.end())
                 resolvedTypeName = it->second;
         }
-        // Resolve user-defined type aliases
+        // Resolve user-defined type aliases. A pointer alias (using Handle = void*) keeps its
+        // trailing stars in the stored string; peel them into a local pointer-depth count and
+        // OR it onto the typeAndValue pointer flags below (storage stays string-shaped).
+        int aliasPtrDepth = 0;
+        std::vector<uint64_t> aliasArrayDims;  // outer dimension first, from an array alias
         if (!resolvedTypeName.empty())
         {
             auto it = typeAliases.find(resolvedTypeName);
             if (it != typeAliases.end())
+            {
                 resolvedTypeName = it->second;
+                // Array brackets are outermost in the stored string ("int*[3]"); peel them first.
+                std::vector<uint64_t> rev;
+                while (!resolvedTypeName.empty() && resolvedTypeName.back() == ']')
+                {
+                    size_t open = resolvedTypeName.rfind('[');
+                    if (open == std::string::npos) break;
+                    std::string num = resolvedTypeName.substr(open + 1, resolvedTypeName.size() - open - 2);
+                    if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos) break;
+                    rev.push_back(std::strtoull(num.c_str(), nullptr, 10));
+                    resolvedTypeName.erase(open);
+                }
+                for (auto rit = rev.rbegin(); rit != rev.rend(); ++rit) aliasArrayDims.push_back(*rit);
+                while (!resolvedTypeName.empty() && resolvedTypeName.back() == '*')
+                {
+                    resolvedTypeName.pop_back();
+                    aliasPtrDepth++;
+                }
+            }
         }
         // Namespace-relative type reference: a bare "_SystemInfo" inside namespace
         // os.windows resolves to "os.windows._SystemInfo". Only accept a resolution
@@ -8208,24 +8238,41 @@ public:
 
         // Apply pointer wrapping to get the element type before array wrapping.
         // This ensures char*[3] -> [3 x ptr] not [3 x i8].
-        if (allowPointer && typeAndValue.Pointer)
+        // aliasPtrDepth folds in a pointer alias's stars (using Handle = void* -> 1) so a call
+        // site that passes the un-stripped alias name still lowers correctly.
+        bool wantPointer = typeAndValue.Pointer || aliasPtrDepth >= 1;
+        bool wantElemPointer = typeAndValue.ElemPointer || aliasPtrDepth >= 2
+            || (typeAndValue.Pointer && aliasPtrDepth >= 1);
+        if (allowPointer && wantPointer)
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
             if (type->isVoidTy())
                 type = builder->getInt8Ty()->getPointerTo();
             else
                 type = type->getPointerTo();
-            if (typeAndValue.ElemPointer)
+            if (wantElemPointer)
                 type = type->getPointerTo();
         }
 
-        if (typeAndValue.ConstArraySize > 0)
+        // Prefer the explicit ConstArraySize set by the declaration handler; fall back to an
+        // array alias's dims (using Vec3 = float[3]) for call sites that pass only the alias name
+        // (sizeof(Vec3), a parameter of type Vec3) and never run the per-declarator finalization.
+        uint64_t outerDim = typeAndValue.ConstArraySize;
+        const std::vector<uint64_t>* innerDims = &typeAndValue.ConstInnerDimensions;
+        std::vector<uint64_t> aliasInner;
+        if (outerDim == 0 && !aliasArrayDims.empty())
+        {
+            outerDim = aliasArrayDims[0];
+            aliasInner.assign(aliasArrayDims.begin() + 1, aliasArrayDims.end());
+            innerDims = &aliasInner;
+        }
+        if (outerDim > 0)
         {
             // Build from innermost to outermost: T[N1][N2] -> [N1 x [N2 x T]]
             llvm::Type* inner = type;
-            for (int i = (int)typeAndValue.ConstInnerDimensions.size() - 1; i >= 0; i--)
-                inner = llvm::ArrayType::get(inner, typeAndValue.ConstInnerDimensions[i]);
-            return llvm::ArrayType::get(inner, typeAndValue.ConstArraySize);
+            for (int i = (int)innerDims->size() - 1; i >= 0; i--)
+                inner = llvm::ArrayType::get(inner, (*innerDims)[i]);
+            return llvm::ArrayType::get(inner, outerDim);
         }
 
         return type;

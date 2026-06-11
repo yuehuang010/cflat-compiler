@@ -1,0 +1,11 @@
+// A pointer alias storing two stars (int**), used with another use-site star, would need
+// three pointer levels. The Pointer + ElemPointer model caps at 2, so this must error
+// rather than silently truncate.
+using PPP = int**;
+
+extern int main()
+{
+    expect_error("caps at 2 levels");
+    PPP* y = nullptr;
+    return 0;
+}

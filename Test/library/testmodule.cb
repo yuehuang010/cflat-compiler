@@ -1,6 +1,16 @@
 // Module for import testing.
 // Defines functions, a struct, and a namespace that testfile3.c imports.
 
+import "list.cb";
+
+// Cross-file generic type alias (Tier 1): declared in this imported module and used by the
+// importer (test_module.cb). Exercises type-alias visibility across an import boundary.
+using ModuleIntList = list<int>;
+
+// Cross-file pointer (Tier 2) and array (Tier 3) aliases, used from the importer.
+using ModuleIntPtr = int*;
+using ModuleVec = i32[4];
+
 int moduleAdd(int a, int b) { return a + b; }
 int moduleMultiply(int a, int b) { return a * b; }
 

@@ -1038,6 +1038,19 @@ void myFunc()
 }
 ```
 
+An alias may also name a type form, not just a namespace - a generic instantiation, a pointer,
+or a fixed array:
+
+```c
+using IntList = list<int>;   // generic instantiation - IntList xs; xs.add(1);
+using Handle  = void*;       // pointer alias - lowers to i8*
+using Vec3    = float[3];    // fixed-array alias - Vec3 v = default; v[0] = 1.0f;
+```
+
+The `*` / `[N]` suffix is part of the alias and is folded onto the use site: `using PP = int*;`
+then `PP* x;` yields `int**` (two pointer levels are the maximum; three is an error). A pointer
+to an aliased fixed array (`Vec3* p`) is rejected like a written `float[3]*`.
+
 ### Module Imports
 
 Split code across multiple files with `import`:

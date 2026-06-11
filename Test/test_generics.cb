@@ -2285,10 +2285,58 @@ bool testDictOfListPtr()
     return result;
 }
 
+// =============================================================
+// Generic type aliases (using IntList = list<int>) - Tier 1
+// The alias value is just the mangled name (list__int), a plain string; the
+// instantiation is enqueued by the using itself (see ParseUsingDeclaration).
+// =============================================================
+
+using IntList   = list<int>;
+using FloatList = list<float>;        // list<float> is mentioned ONLY via this using
+using IntToInt  = dictionary<int, int>;
+
+// Alias used in a function signature (parameter + return).
+int aliasSum(IntList* xs)
+{
+    int sum = 0;
+    for (int v in *xs) sum += v;
+    return sum;
+}
+
+bool testGenericAlias()
+{
+    bool result = true;
+
+    IntList xs;
+    xs.add(10);
+    xs.add(20);
+    xs.add(12);
+    result &= Test("generic_alias_count", xs.count(), 3);
+    result &= Test("generic_alias_get1",  xs.get(1),  20);
+    result &= Test("generic_alias_in_fn", aliasSum(&xs), 42);
+
+    // list<float> instantiates purely from the `using FloatList = list<float>` above.
+    FloatList fs;
+    fs.add(1.5f);
+    fs.add(2.5f);
+    result &= Test("generic_alias_float_count", fs.count(), 2);
+    result &= Test("generic_alias_float_get0",  fs.get(0) == 1.5f, true);
+
+    // dictionary alias
+    IntToInt m;
+    m.add(1, 100);
+    m.add(2, 200);
+    result &= Test("generic_alias_dict_count", m.count(), 2);
+    result &= Test("generic_alias_dict_get",   m.get(2),  200);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
     int total  = 0;
+    total++; passed += testGenericAlias()                ? 1 : 0;
     total++; passed += testGenericStructs();
     total++; passed += testInterface()                   ? 1 : 0;
     total++; passed += testGenericInterface()            ? 1 : 0;

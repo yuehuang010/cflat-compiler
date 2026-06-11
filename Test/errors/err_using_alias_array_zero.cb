@@ -1,0 +1,6 @@
+// A fixed-array alias with a zero size is rejected at registration.
+expect_error("array size must be greater than zero") {
+    using Bad = float[0];
+}
+
+extern int main() { return 0; }

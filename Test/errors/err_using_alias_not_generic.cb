@@ -1,0 +1,9 @@
+// A generic-form `using` alias whose base does not name a generic template is malformed.
+// Before Tier 1 this silently degraded into a namespace alias; now it errors.
+import "list.cb";
+
+expect_error("is not a generic type") {
+    using Bad = NotAType<int>;
+}
+
+extern int main() { return 0; }

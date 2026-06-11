@@ -1751,6 +1751,86 @@ bool testPrimitiveTypeAlias()
 }
 
 // =============================================================
+// Pointer type alias tests (using Handle = void*) - Tier 2
+// The trailing '*' is stored in the alias string and peeled back onto the
+// Pointer / ElemPointer flags at the resolution site.
+// =============================================================
+
+struct AliasNode { int v = 0; };
+
+using IntPtrAlias = int*;
+using VoidPtrAlias = void*;
+using NodePtrAlias = AliasNode*;
+
+int derefIntPtrAlias(IntPtrAlias p) { return *p; }   // alias used in a parameter
+
+bool testPointerTypeAlias()
+{
+    bool result = true;
+
+    int x = 7;
+    IntPtrAlias p = &x;
+    result &= Test("ptr_alias_deref",  *p,                   7);
+    result &= Test("ptr_alias_in_fn",  derefIntPtrAlias(p),  7);
+
+    // void* alias holds any pointer and round-trips through a cast
+    VoidPtrAlias h = (void*)p;
+    result &= Test("ptr_alias_void_nonnull", h != nullptr,   true);
+    IntPtrAlias back = (int*)h;
+    result &= Test("ptr_alias_void_roundtrip", *back,        7);
+
+    // alias star + use-site star => int**
+    IntPtrAlias* pp = &p;
+    result &= Test("ptr_alias_double", **pp,                 7);
+
+    // struct pointer alias
+    AliasNode n = default;
+    n.v = 99;
+    NodePtrAlias np = &n;
+    result &= Test("ptr_alias_struct", np->v,                99);
+
+    return result;
+}
+
+// =============================================================
+// Array type alias tests (using Vec3 = float[3]) - Tier 3
+// The folded sizes are baked into the alias string ("float[3]") and re-parsed
+// onto ConstArraySize / ConstInnerDimensions at the resolution site.
+// =============================================================
+
+using Vec3Alias = i32[3];
+using Mat2Alias = i32[2][3];
+
+bool testArrayTypeAlias()
+{
+    bool result = true;
+
+    // Single-dimension array alias, zero-initialized then written
+    Vec3Alias v = default;
+    v[0] = 10; v[1] = 20; v[2] = 12;
+    result &= Test("arr_alias_elem0",  v[0],            10);
+    result &= Test("arr_alias_elem2",  v[2],            12);
+    result &= Test("arr_alias_sum",    v[0] + v[1] + v[2], 42);
+    result &= Test("arr_alias_sizeof", sizeof(Vec3Alias), 12);  // 3 * 4 bytes
+
+    // Two declarators share the aliased size (the size lives on the type)
+    Vec3Alias a = default;
+    Vec3Alias b = default;
+    a[2] = 7;
+    b[2] = 9;
+    result &= Test("arr_alias_two_decls", a[2] + b[2], 16);
+
+    // Multi-dimensional array alias
+    Mat2Alias m = default;
+    m[0][0] = 5; m[1][2] = 8;
+    result &= Test("arr_alias_md_00",    m[0][0],          5);
+    result &= Test("arr_alias_md_12",    m[1][2],          8);
+    result &= Test("arr_alias_md_sizeof", sizeof(Mat2Alias), 24);  // 2 * 3 * 4 bytes
+
+    return result;
+}
+
+// =============================================================
 // Fixed-size inline array tests (local variables and struct fields)
 // =============================================================
 
@@ -2145,6 +2225,8 @@ extern int main()
     total++; passed += testNullableTypes()               ? 1 : 0;
     total++; passed += testPointerArithmetic()           ? 1 : 0;
     total++; passed += testPrimitiveTypeAlias()          ? 1 : 0;
+    total++; passed += testPointerTypeAlias()            ? 1 : 0;
+    total++; passed += testArrayTypeAlias()              ? 1 : 0;
     total++; passed += testNestedStructClass()           ? 1 : 0;
     total++; passed += testInPlaceDtor()                 ? 1 : 0;
     total++; passed += testVariadic()                    ? 1 : 0;

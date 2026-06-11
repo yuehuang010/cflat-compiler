@@ -649,7 +649,7 @@ ifConstBlock
     ;
 
 usingDeclaration
-    : Using (Identifier | String) '=' typeSpecifier ';'
+    : Using (Identifier | String) '=' typeSpecifier pointer? arrayTypeSuffix? ';'
     ;
 
 importDeclaration

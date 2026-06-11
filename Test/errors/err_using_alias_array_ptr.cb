@@ -1,0 +1,10 @@
+// A pointer to an aliased fixed array (Vec3* where Vec3 = float[3]) is the same T[N]* ban as
+// a written 'float[3]*'; the dimension lives on the alias, but the diagnostic still fires.
+using Vec3 = float[3];
+
+extern int main()
+{
+    expect_error("pointer to fixed array 'float[N]*' is not a valid type");
+    Vec3* p = nullptr;
+    return 0;
+}

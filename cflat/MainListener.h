@@ -180,6 +180,37 @@ static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView)
     }
 }
 
+// Peel trailing '*' characters off a resolved type-alias string (e.g. "void*" -> "void"),
+// returning the pointer depth removed. A pointer alias keeps its stars in the stored string
+// (no type-descriptor struct); this re-derives the depth at the resolution site so it can be
+// OR'd onto the flat TypeAndValue.Pointer / .ElemPointer flags.
+static int PeelAliasPointerStars(std::string& name)
+{
+    int depth = 0;
+    while (!name.empty() && name.back() == '*') { name.pop_back(); depth++; }
+    return depth;
+}
+
+// Strip a trailing fixed-array suffix ("[3]" / "[3][4]") off a resolved alias string into `dims`
+// (outer dimension first). The sizes were constant-folded into digit literals at registration,
+// so only `[<digits>]` is accepted. Returns true if any bracket was peeled. Call BEFORE
+// PeelAliasPointerStars so "int*[3]" yields dims {3} over a base "int*".
+static bool PeelAliasArrayDims(std::string& name, std::vector<uint64_t>& dims)
+{
+    std::vector<uint64_t> rev;  // collected inner-to-outer (rightmost bracket first)
+    while (!name.empty() && name.back() == ']')
+    {
+        size_t open = name.rfind('[');
+        if (open == std::string::npos) break;
+        std::string num = name.substr(open + 1, name.size() - open - 2);
+        if (num.empty() || num.find_first_not_of("0123456789") != std::string::npos) break;
+        rev.push_back(std::strtoull(num.c_str(), nullptr, 10));
+        name.erase(open);
+    }
+    for (auto it = rev.rbegin(); it != rev.rend(); ++it) dims.push_back(*it);
+    return !dims.empty();
+}
+
 // Struct/class bodies parse through the named `aggregateMember` rule (see CFlat.g4), so the
 // per-kind children (declarations, methods, ...) are nested one level under aggregateMember
 // rather than being direct children of the struct/class context. These helpers flatten an
@@ -549,6 +580,9 @@ private:
                         declType.Pointer = declSpec->pointer() != nullptr;
                         break;
                     }
+                    // Pointer depth contributed by a pointer alias (using Handle = void*); peeled
+                    // from the resolved alias string below and combined with the declarator's stars.
+                    int aliasPtrDepth = 0;
                     // grammar: some Identifier occurrences were refactored into a genericIdentifier rule
                     if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                     {
@@ -572,11 +606,24 @@ private:
                     declType.TypeName = compiler->ResolveQualifiedName(typeSpec->getText());
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
+                    // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
+                    // "int*[3]" yields dims {3} over base "int*".
+                    std::vector<uint64_t> aliasDims;
+                    if (PeelAliasArrayDims(declType.TypeName, aliasDims))
+                    {
+                        declType.AliasArraySize = aliasDims[0];
+                        declType.AliasInnerDims.assign(aliasDims.begin() + 1, aliasDims.end());
+                    }
+                    aliasPtrDepth = PeelAliasPointerStars(declType.TypeName);
                 }
-                if (declSpec->pointer() != nullptr) {
-                    declType.Pointer = true;
-                    if (declSpec->pointer()->Star().size() >= 2)
-                        declType.ElemPointer = true;
+                // Combine alias pointer depth (using Handle = void*) with the declarator's stars.
+                // The Pointer + ElemPointer model caps at 2 levels; the authoritative over-cap
+                // error is emitted by the MainListener copy (this forward-ref copy clamps silently).
+                {
+                    int declStars = declSpec->pointer() != nullptr ? (int)declSpec->pointer()->Star().size() : 0;
+                    int totalPtr = aliasPtrDepth + declStars;
+                    if (totalPtr >= 1) declType.Pointer = true;
+                    if (totalPtr >= 2) declType.ElemPointer = true;
                 }
                 if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
@@ -1119,11 +1166,35 @@ public:
         else if (ctx->Identifier() != nullptr)
             alias = ctx->Identifier()->getText();
 
-        std::string target = ctx->typeSpecifier()->getText();
+        auto* typeSpec = ctx->typeSpecifier();
+        std::string target = typeSpec->getText();
+        // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
+        // they are peeled back onto the pointer flags at the resolution site (GetType /
+        // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
+        std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
+
+        // Generic RHS (using IL = list<int>): mangle to list__int, pre-declare the shell +
+        // default ctor to enqueue the instantiation (mirrors the use-site path at
+        // ParseDeclarationSpecifiers), then alias to the mangled name - still a plain string.
+        // The forward-ref pass is opportunistic: it never errors (templates may not be scanned
+        // yet); ParseUsingDeclaration is authoritative and emits the diagnostics.
+        if (typeSpec->genericIdentifier() != nullptr
+            && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr
+            && typeSpec->genericIdentifier()->Identifier() != nullptr)
+        {
+            std::string mangledName = typeSpec->genericIdentifier()->Identifier()->getText();
+            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                mangledName += "__" + MangleTypeArg(entry->getText());
+            compiler->CreateStructType(mangledName, {});
+            LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
+            compiler->CreateFunctionDeclaration(mangledName, returnType, {});
+            compiler->RegisterTypeAlias(alias, mangledName + suffix);
+            return;
+        }
 
         if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0
             || LLVMBackend::IsPrimitiveTypeName(target))
-            compiler->RegisterTypeAlias(alias, target);
+            compiler->RegisterTypeAlias(alias, target + suffix);
     }
 
     void ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx)
@@ -1642,6 +1713,9 @@ private:
             auto storageSpec = declSpec->storageClassSpecifier();
             if (typeSpec != nullptr)
             {
+                // Pointer depth from a pointer alias (using Handle = void*); peeled off the
+                // resolved alias string below and combined with the declarator's stars.
+                int aliasPtrDepth = 0;
                 // 'move' and 'bond' are soft keywords parsed as Identifiers in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
@@ -1839,6 +1913,15 @@ private:
                     }
                     // Resolve type aliases (e.g. user-defined aliases)
                     typeName = Compiler(declSpecs)->ResolveTypeAlias(typeName);
+                    // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
+                    // "int*[3]" yields dims {3} over base "int*".
+                    std::vector<uint64_t> aliasDims;
+                    if (PeelAliasArrayDims(typeName, aliasDims))
+                    {
+                        declType.AliasArraySize = aliasDims[0];
+                        declType.AliasInnerDims.assign(aliasDims.begin() + 1, aliasDims.end());
+                    }
+                    aliasPtrDepth = PeelAliasPointerStars(typeName);  // using Handle = void* -> depth 1
                     declType.TypeName = typeName;
                     if (substPointer) declType.Pointer = true;
                     if (substArrayView)
@@ -1852,10 +1935,28 @@ private:
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
-                // Pointer-to-pointer: explicit ** OR (substituted type is a pointer AND explicit *)
-                if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
-                    declType.ElemPointer = true;
-                declType.Pointer = hasExplicitPointer || declType.Pointer;
+                if (aliasPtrDepth > 0)
+                {
+                    // A pointer alias is in play: combine its depth with the declarator's stars and
+                    // any base-pointer-ness from a generic substitution. The Pointer + ElemPointer
+                    // model caps at 2 levels - 3+ is a hard error (no silent truncation).
+                    int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
+                    int totalPtr = aliasPtrDepth + declStars + (substPointer ? 1 : 0);
+                    if (totalPtr >= 3)
+                        LogErrorContext(declSpec, std::format(
+                            "pointer alias resolving to '{}' produces pointer depth {}, but the type "
+                            "model caps at 2 levels ('*'/'**'); use fewer indirections",
+                            declType.TypeName, totalPtr));
+                    declType.Pointer = totalPtr >= 1;
+                    declType.ElemPointer = totalPtr >= 2;
+                }
+                else
+                {
+                    // Pointer-to-pointer: explicit ** OR (substituted type is a pointer AND explicit *)
+                    if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
+                        declType.ElemPointer = true;
+                    declType.Pointer = hasExplicitPointer || declType.Pointer;
+                }
                 if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
                     auto dims = dimSpec->assignmentExpression();
@@ -1884,6 +1985,14 @@ private:
                             "pass '{}*' (a fixed array decays to a pointer to its first element).",
                             declType.TypeName, declType.TypeName));
                 }
+                // A pointer to an aliased fixed array (Vec3* where Vec3 = float[3]) is the same
+                // T[N]* ban, but the dimension lives on the alias, not the declarator - so the
+                // ArrayPtrOf check above misses it. Fire the diagnostic through the alias.
+                if (declType.AliasArraySize > 0 && hasExplicitPointer)
+                    LogErrorContext(declSpec, std::format(
+                        "pointer to fixed array '{}[N]*' is not a valid type; "
+                        "pass '{}*' (a fixed array decays to a pointer to its first element).",
+                        declType.TypeName, declType.TypeName));
                 declType.IsInterface = Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
                     LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
@@ -2313,19 +2422,92 @@ public:
         else if (ctx->Identifier() != nullptr)
             alias = ctx->Identifier()->getText();
 
-        std::string target = ctx->typeSpecifier()->getText();
+        auto* typeSpec = ctx->typeSpecifier();
+        std::string target = typeSpec->getText();
+        // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
+        // the stars are peeled back onto the pointer flags at the resolution site (GetType /
+        // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
+        std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
+
+        // An array alias (using Vec3 = float[3]) folds each bracketed size NOW (the alias string
+        // cannot keep a live parse node) and bakes the integers into the stored string ("float[3]").
+        // The sizes are re-parsed onto ConstArraySize / ConstInnerDimensions at the resolution site.
+        std::string arraySuffix;
+        if (auto* dimSpec = ArrayDimsOf(ctx))
+        {
+            if (ArrayPtrOf(ctx) != nullptr)
+                compiler->LogError(std::format(
+                    "using alias '{}': pointer to fixed array 'T[N]*' is not a valid type", alias));
+            auto dims = dimSpec->assignmentExpression();
+            if (dims.empty())
+                compiler->LogError(std::format(
+                    "using alias '{}': array-view 'T[]' aliases are not supported; use a fixed size 'T[N]'",
+                    alias));
+            for (auto* d : dims)
+            {
+                auto* v = ParseAssignmentExpression(d);
+                auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v);
+                if (ci == nullptr)
+                    compiler->LogError(std::format("using alias '{}': array size must be a compile-time constant", alias));
+                else if (ci->getZExtValue() == 0)
+                    compiler->LogError(std::format("using alias '{}': array size must be greater than zero", alias));
+                else
+                    arraySuffix += "[" + std::to_string(ci->getZExtValue()) + "]";
+            }
+        }
+        suffix += arraySuffix;  // pointer stars precede array brackets ("int*[3]")
+
+        // Generic RHS (using IL = list<int>): mangle to list__int and pre-declare the shell +
+        // default ctor to enqueue the instantiation, then alias to the mangled name. The base
+        // must name a generic template, else the RHS is malformed - LogError rather than
+        // silently degrading to a namespace alias (the historical bug).
+        if (typeSpec->genericIdentifier() != nullptr
+            && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr
+            && typeSpec->genericIdentifier()->Identifier() != nullptr)
+        {
+            std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
+            if (genericStructTemplates.count(baseName) == 0
+                && genericClassTemplates.count(baseName) == 0
+                && genericInterfaceTemplates.count(baseName) == 0)
+            {
+                compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a generic type",
+                                               alias, target, baseName));
+                return;
+            }
+            std::vector<std::string> typeArgs;
+            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                typeArgs.push_back(ResolveTypeArgEntry(entry));
+            std::string mangledName = MangledGenericName(baseName, typeArgs);
+            // Enqueue the instantiation (shell + default ctor created immediately, body emitted
+            // by the next ProcessPendingInstantiations) and alias to the mangled name - a string.
+            QueueGenericInstantiation(baseName, typeArgs, mangledName);
+            compiler->RegisterTypeAlias(alias, mangledName + suffix);
+            if (auto* s = compiler->GetSymbolSink())
+                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "using " + alias + " = " + target + suffix, {},
+                            ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+            return;
+        }
 
         // If the target names a known type (interface, struct, or primitive), register a type alias.
         // Otherwise treat it as a namespace alias.
         if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr
             || LLVMBackend::IsPrimitiveTypeName(target))
         {
-            compiler->RegisterTypeAlias(alias, target);
+            compiler->RegisterTypeAlias(alias, target + suffix);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + target, {},
+                            "using " + alias + " = " + target + suffix, {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+        }
+        else if (!suffix.empty())
+        {
+            // A pointer alias whose base is neither a type nor (a namespace can't take a '*')
+            // is malformed - the RHS looks like a type but resolves to nothing.
+            compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a known type",
+                                           alias, target + suffix, target));
         }
         else if (global_scope)
             compiler->RegisterNamespaceAlias(alias, target);
@@ -4414,6 +4596,10 @@ public:
             else
                 LogErrorContext(dimExpr, "array dimension must be a compile-time constant");
         }
+        // Inner dims from an array alias (using Mat = float[2][3]) when the declarator carries
+        // no brackets of its own. The sizes were folded at registration (see ParseDeclarationSpecifiers).
+        if (typeAndValue.ConstInnerDimensions.empty() && !typeAndValue.AliasInnerDims.empty())
+            typeAndValue.ConstInnerDimensions = typeAndValue.AliasInnerDims;
 
         for (auto initDecl : initDeclarVec)
         {
@@ -4524,6 +4710,12 @@ public:
                 {
                     if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(arraySize))
                         typeAndValue.ConstArraySize = ci->getZExtValue();
+                }
+                else if (typeAndValue.AliasArraySize > 0)
+                {
+                    // Size came from an array alias (using Vec3 = float[3]); the declarator has no
+                    // brackets of its own. The size lives on the type, shared by every declarator.
+                    typeAndValue.ConstArraySize = typeAndValue.AliasArraySize;
                 }
                 typeAndValue.VariableName = name;
 
