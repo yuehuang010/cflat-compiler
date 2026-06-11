@@ -8,6 +8,7 @@
 // -O2 by performance/hpc/build_hpc.bat as the suite's correctness step.
 
 import "cruntime.cb";
+import "threadpool.cb";
 import "hpc/vecmath.cb";
 import "hpc/densemat.cb";
 import "hpc/stencil.cb";
@@ -310,6 +311,93 @@ void test_factor()
     delete[_] l; delete[_] xc; delete[_] g; delete[_] bg; delete[_] xl;
 }
 
+// ---- pivoted LU (serial + pool-parallel trailing update) ----
+void test_factor_piv()
+{
+    printf("[factor_piv]\n");
+
+    // A matrix that REQUIRES pivoting: diagonally dominant except g[0][0] = 0.
+    // Unpivoted lu_factor must reject it; lu_factor_piv must solve it.
+    int n = 6;
+    double[] g = new double[n * n];
+    int seed = 7;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double rowsum = 0.0;
+        for (int j = 0; j < n; j = j + 1)
+        {
+            seed = seed * 1103515245 + 12345;
+            int vv = (seed >> 16) & 0x7fff;
+            double a = (double)(vv % 7) - 3.0;
+            g[i * n + j] = a;
+            if (i != j) rowsum = rowsum + (a < 0.0 ? -a : a);
+        }
+        g[i * n + i] = rowsum + 1.0;
+    }
+    g[0] = 0.0;   // zero leading pivot
+
+    double[] xexact = new double[n];
+    for (int i = 0; i < n; i = i + 1) xexact[i] = (double)(i + 1) * 0.5 - 1.0;
+    double[] b = new double[n];
+    mv_dense(g, xexact, b, n);
+
+    double[] lu = new double[n * n];
+    int[] piv = new int[n];
+    bool rejected = !Factor.lu_factor(g, lu, n);
+    check_int("unpivoted rejects zero pivot", rejected ? 1 : 0, 1);
+
+    bool okp = Factor.lu_factor_piv(g, lu, piv, n);
+    check_int("pivoted factors it", okp ? 1 : 0, 1);
+    double[] x = new double[n];
+    Factor.lu_solve_piv(lu, piv, b, x, n);
+    check_tol("pivoted |x - x_exact|", max_abs_diff(x, xexact, n), 0.0, 0.0000001);
+
+    delete[_] g; delete[_] xexact; delete[_] b;
+    delete[_] lu; delete[_] piv; delete[_] x;
+
+    // Pool overload: large enough that the trailing update crosses
+    // Factor.LU_PAR_MIN_WORK (rows^2 >= 262144 -> n > 513), so the parallel
+    // branch actually runs. The contract is BIT-IDENTICAL factors: each row is
+    // updated by exactly one worker in serial operation order.
+    int np = 520;
+    double[] gp = new double[np * np];
+    seed = 11;
+    for (int i = 0; i < np; i = i + 1)
+    {
+        double rowsum = 0.0;
+        for (int j = 0; j < np; j = j + 1)
+        {
+            seed = seed * 1103515245 + 12345;
+            int vv = (seed >> 16) & 0x7fff;
+            double a = (double)(vv % 9) - 4.0;
+            gp[i * np + j] = a;
+            if (i != j) rowsum = rowsum + (a < 0.0 ? -a : a);
+        }
+        gp[i * np + i] = rowsum + 1.0;
+    }
+
+    double[] luSerial = new double[np * np];
+    double[] luPool   = new double[np * np];
+    int[] pivSerial = new int[np];
+    int[] pivPool   = new int[np];
+
+    bool okSerial = Factor.lu_factor_piv(gp, luSerial, pivSerial, np);
+    ThreadPool pool;
+    pool.init(4, cpu_mask_lowest(4));
+    bool okPool = Factor.lu_factor_piv(gp, luPool, pivPool, np, &pool);
+    pool.shutdown();
+
+    check_int("serial + pool both factor", (okSerial && okPool) ? 1 : 0, 1);
+    int pivDiff = 0;
+    for (int i = 0; i < np; i = i + 1)
+        if (pivSerial[i] != pivPool[i]) pivDiff = pivDiff + 1;
+    check_int("pivot sequences identical", pivDiff, 0);
+    check_tol("pool factor bit-identical", max_abs_diff(luSerial, luPool, np * np), 0.0, 0.0000000000000001);
+
+    delete[_] gp; delete[_] luSerial; delete[_] luPool;
+    delete[_] pivSerial; delete[_] pivPool;
+}
+
 // ---- iterative sparse solvers (CG + Jacobi over a 1D Laplacian) ----
 void build_laplacian1d(CsrMatrix* a, int n)
 {
@@ -374,6 +462,7 @@ extern int main()
     test_fft();
     test_sparse();
     test_factor();
+    test_factor_piv();
     test_solvers();
     printf("\n%d / %d checks passed.\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;

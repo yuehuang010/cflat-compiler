@@ -657,7 +657,7 @@ the floating-point reductions are deliberately left scalar (a reduction reorders
 | `import "hpc/scan.cb";`     | `namespace Scan` + `Welford` | `prefix_sum_inclusive/exclusive`, `sum`/`minval`/`maxval`, streaming mean+variance |
 | `import "hpc/fft.cb";`      | `namespace FFT`     | iterative radix-2 Cooley-Tukey `fft`/`ifft` + `dft_naive` reference |
 | `import "hpc/sparse.cb";`   | `struct CsrMatrix`  | compressed sparse row matrix + `spmv` |
-| `import "hpc/factor.cb";`   | `namespace Factor`  | dense direct solvers: Cholesky / LU (Doolittle) + forward/back substitution |
+| `import "hpc/factor.cb";`   | `namespace Factor`  | dense direct solvers: Cholesky / LU (Doolittle) / LU with partial pivoting (optionally pool-parallel) + forward/back substitution |
 | `import "hpc/solvers.cb";`  | `namespace Solver`  | iterative sparse solvers: Conjugate Gradient + Jacobi over `CsrMatrix` |
 
 `factor` and `solvers` show the intended layering: `Solver.cg_solve` reimplements no kernel - every
@@ -688,5 +688,16 @@ Correctness for all eight is checked by [`Test/test_hpc_kernels.cb`](../Test/tes
 Two end-to-end worked examples drive these libraries the way an application would:
 [`example/hpc/poisson_cg.cb`](../example/hpc/poisson_cg.cb) assembles the 2D Poisson 5-point
 operator as a `CsrMatrix` and solves it with `Solver.cg_solve` against a manufactured solution,
-and [`example/hpc/lu_bench.cb`](../example/hpc/lu_bench.cb) benchmarks `Factor.lu_factor` on a
-diagonally dominant dense system with a normwise backward-error check via `Mat.gemv`.
+and [`example/hpc/lu_bench.cb`](../example/hpc/lu_bench.cb) benchmarks the three `Factor` LU
+variants (unpivoted serial, partial-pivot serial, partial-pivot pool-parallel) on a diagonally
+dominant dense system with a normwise backward-error check via `Mat.gemv`.
+
+`Factor.lu_factor_piv(a, lu, piv, n, pool = nullptr, workers = 0)` is the general-matrix entry
+point: partial pivoting removes the diagonal-dominance requirement at no measured cost, and
+passing a resident `ThreadPool*` fans the rank-1 trailing update out across cores once the
+remaining block clears `Factor.LU_PAR_MIN_WORK` (the dispatch-cost cutoff above; the shrinking
+tail of the sweep automatically stays on the calling thread). Because each trailing row is
+updated by exactly one worker in serial operation order, the pooled factorization is
+bit-identical to the serial one - no reassociated reductions, so no numeric caveat. Measured on
+a 10-core machine at `-O2`: ~2.4x over serial once the matrix falls out of L3 (n >= 2048); below
+that the serial variants are already memory-resident and the pool adds little.

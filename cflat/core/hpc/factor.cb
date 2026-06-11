@@ -1,18 +1,27 @@
 // factor.cb - dense matrix factorization + triangular solve over row-major double[].
 //
-// Two classic direct solvers, both over a flat row-major double[] (A[i*n + j]):
+// Three classic direct solvers, all over a flat row-major double[] (A[i*n + j]):
 //   - Cholesky (A = L L^T) for a symmetric positive-definite A.
-//   - LU (A = L U, Doolittle, no pivoting) for a general (diagonally dominant) A.
+//   - LU (A = L U, Doolittle, no pivoting) for a diagonally dominant A.
+//   - LU with partial pivoting (P A = L U) for a general square A; optionally
+//     fans the rank-1 trailing update out over a ThreadPool.
 // Each is paired with forward/back substitution (triangular solve) to solve Ax=b.
 //
 // Design notes:
 //   - Storage is a single contiguous double[] per matrix, indexed A[i*n + j]. The
 //     factor routines write the triangular factor into a separate double[] so the
 //     caller's original A survives.
-//   - The kernels are FP reductions (dot of two rows), so they are plain scalar
-//     loops, not `vectorize` - same rationale as dot/nrm2 in vecmath.cb.
+//   - The Cholesky/substitution kernels are FP reductions (dot of two rows), so
+//     they are plain scalar loops - same rationale as dot/nrm2 in vecmath.cb.
+//   - The pivoted LU's rank-1 trailing update is a pure map over disjoint rows;
+//     re-blessing each row as its own double[] view lets it auto-vectorize at
+//     -O2. Core deliberately does NOT use the `vectorize` keyword (its hard-error
+//     contract belongs to user code that opts in), and measurement shows the
+//     keyword adds nothing here over the auto-vectorized loop.
 
-import "math.cb";       // Math.sqrt
+import "math.cb";          // Math.sqrt / Math.abs
+import "threadpool.cb";    // ThreadPool (pool-parallel pivoted LU)
+import "hpc/parallel.cb";  // parallel_for_n_pool
 
 namespace Factor
 {
@@ -118,6 +127,117 @@ namespace Factor
             }
         }
         return true;
+    }
+
+    // Minimum trailing-update area (rows x cols) before the pivoted LU fans out
+    // over the pool. One parallel_for_n_pool dispatch costs roughly 3-5 us per
+    // worker (see doc/HPC.md "Budget the dispatch"); below this the fan-out/join
+    // costs more than it saves, so smaller updates - including the shrinking
+    // tail of every sweep - run on the calling thread.
+    const i64 LU_PAR_MIN_WORK = 262144;
+
+    // LU factorization with partial pivoting: P A = L U for a general square A
+    // (no diagonal dominance required, unlike lu_factor). lu[] gets the same
+    // packed layout as lu_factor (unit L below, U on/above the diagonal); piv[k]
+    // records the row swapped into position k, in elimination order. Returns
+    // false if a pivot column is zero to working precision (A singular).
+    //
+    // pool == nullptr (the default) runs serially. With a pool, the rank-1
+    // trailing update fans out once the remaining block clears LU_PAR_MIN_WORK;
+    // each row is updated by exactly one worker in the same operation order, so
+    // the result is BIT-IDENTICAL to the serial run (no reassociated reductions).
+    // workers <= 0 uses the pool's worker count.
+    bool lu_factor_piv(double[] a, double[] lu, int[] piv, int n,
+                       ThreadPool* pool = nullptr, int workers = 0)
+    {
+        for (int i = 0; i < n * n; i = i + 1) lu[i] = a[i];
+
+        for (int k = 0; k < n; k = k + 1)
+        {
+            // partial pivot: row p >= k with the largest |lu[p][k]|
+            int p = k;
+            double amax = Math.abs(lu[k * n + k]);
+            for (int i = k + 1; i < n; i = i + 1)
+            {
+                double v = Math.abs(lu[i * n + k]);
+                if (v > amax) { amax = v; p = i; }
+            }
+            piv[k] = p;
+            if (amax < 0.0000000001) return false;
+            if (p != k)
+            {
+                int bk = k * n;
+                int bp = p * n;
+                for (int j = 0; j < n; j = j + 1)
+                {
+                    double t = lu[bk + j]; lu[bk + j] = lu[bp + j]; lu[bp + j] = t;
+                }
+            }
+
+            // L multipliers: scale the subcolumn by 1/pivot.
+            double pivinv = 1.0 / lu[k * n + k];
+            for (int i = k + 1; i < n; i = i + 1)
+                lu[i * n + k] = lu[i * n + k] * pivinv;
+
+            // Rank-1 trailing update: row i -= m_i * row k over columns k+1..n.
+            // The trailing rows are pairwise disjoint, so re-blessing each as its
+            // own double[] view is sound (doc/HPC.md) and auto-vectorizes at -O2.
+            int kk = k;   // lambdas capture locals by value
+            double[] rowk = (double[])&lu[k * n];
+            i64 rows = (i64)(n - (k + 1));
+            if (pool != nullptr && rows * rows >= LU_PAR_MIN_WORK)
+            {
+                function<void(i64, i64)> body = (i64 lo, i64 hi) => {
+                    for (i64 ii = lo; ii < hi; ii = ii + 1)
+                    {
+                        int i = (int)ii + kk + 1;
+                        double[] rowi = (double[])&lu[i * n];
+                        double m = rowi[kk];
+                        for (int j = kk + 1; j < n; j = j + 1)
+                            rowi[j] = rowi[j] - m * rowk[j];
+                    }
+                };
+                parallel_for_n_pool(pool, rows, workers, body);
+            }
+            else
+            {
+                for (int i = k + 1; i < n; i = i + 1)
+                {
+                    double[] rowi = (double[])&lu[i * n];
+                    double m = rowi[kk];
+                    for (int j = kk + 1; j < n; j = j + 1)
+                        rowi[j] = rowi[j] - m * rowk[j];
+                }
+            }
+        }
+        return true;
+    }
+
+    // Solve A x = b from a pivoted factorization: apply the recorded row swaps
+    // to a copy of b (b itself is left intact), then unit-L forward and U back
+    // substitution in place in x.
+    void lu_solve_piv(double[] lu, int[] piv, double[] b, double[] x, int n)
+    {
+        for (int i = 0; i < n; i = i + 1) x[i] = b[i];
+        for (int k = 0; k < n; k = k + 1)
+        {
+            int p = piv[k];
+            if (p != k) { double t = x[k]; x[k] = x[p]; x[p] = t; }
+        }
+        for (int i = 0; i < n; i = i + 1)
+        {
+            double s = x[i];
+            for (int k = 0; k < i; k = k + 1)
+                s = s - lu[i * n + k] * x[k];
+            x[i] = s;
+        }
+        for (int i = n - 1; i >= 0; i = i - 1)
+        {
+            double s = x[i];
+            for (int k = i + 1; k < n; k = k + 1)
+                s = s - lu[i * n + k] * x[k];
+            x[i] = s / lu[i * n + i];
+        }
     }
 
     // Solve A x = b via LU: L y = b (unit L) then U x = y.
