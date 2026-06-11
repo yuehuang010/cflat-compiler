@@ -29,9 +29,9 @@ import "thread.cb";         // hardware_concurrency()
 
 // ---- simulation parameters -------------------------------------------------
 
-double G()    { return 1.0; }      // gravitational constant (natural units)
-double EPS()  { return 0.05; }     // softening length
-double DT()   { return 0.001; }    // timestep
+const double G = 1.0;      // gravitational constant (natural units)
+const double EPS = 0.05;     // softening length
+const double DT = 0.001;    // timestep
 
 double absd(double a) { if (a < 0.0) { return -a; } return a; }
 
@@ -132,14 +132,14 @@ extern int main() {
 
     int n     = 8192;     // bodies
     int steps = 10;       // integration steps
-    double dt = DT();
-    double g  = G();
-    double eps2 = EPS() * EPS();
+    double dt = DT;
+    double g  = G;
+    double eps2 = EPS * EPS;
 
     printf("N-Body gravitational simulator (CFlat / -O2)\n");
     printf("--------------------------------------------------------\n");
     printf("bodies = %d   steps = %d   dt = %.4f   softening = %.3f   cores = %d\n",
-           n, steps, dt, EPS(), cores);
+           n, steps, dt, EPS, cores);
     printf("layout = SoA (10 x double[] noalias array-views)\n\n");
 
     // SoA buffers: each is a fresh, whole, distinct allocation -> noalias.

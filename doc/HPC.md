@@ -69,6 +69,10 @@ Semantics:
 - A loop also fails the contract when it is not vectorizable at all: no countable trip
   count (e.g. `vectorize while (p != nullptr)` over a linked list), a loop-carried
   dependence (`a[k] = a[k-1] + 1`), or a non-inlinable call in the body.
+- This list is not exhaustive: for unusual access patterns (strided or interleaved,
+  e.g. re/im pairs in `buf[2*k]` / `buf[2*k+1]`), vectorizability may vary by pattern
+  and target. The cheap way to find out is to mark the loop `vectorize` and compile:
+  the contract either holds or fails loudly - there is no silent-scalar outcome.
 - Integer reductions (`sum += a[k]`) vectorize. Floating-point reductions also
   vectorize: the optimizer reassociates the additions (and reduces the lanes at the
   end), which reorders the sums and so can change the result in the last few ULPs.

@@ -10134,7 +10134,8 @@ public:
             while (true)
             {
                 std::string candidate = prefix + "." + name;
-                if (dataStructures.count(candidate) || interfaceTable.count(candidate) || functionTable.count(candidate))
+                if (dataStructures.count(candidate) || interfaceTable.count(candidate)
+                    || functionTable.count(candidate) || globalNamedVariable.count(candidate))
                     return candidate;
                 auto parentDot = prefix.rfind('.');
                 if (parentDot == std::string::npos)

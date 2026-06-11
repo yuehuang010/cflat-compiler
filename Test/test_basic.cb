@@ -309,6 +309,15 @@ int add(int a, int b) { return a + b + 100; }  // global add returns a different
 
 namespace MathUtils
 {
+    // Namespace globals register under their qualified name (MathUtils.nsCounter),
+    // like namespace functions: qualified access works from outside, bare sibling
+    // access works from inside, and the bare name does NOT leak outside.
+    int nsCounter = 7;
+    const int BASE = 120;
+
+    int readCounter() { return nsCounter; }
+    void bumpCounter() { nsCounter++; }
+
     int add(int a, int b) { return a + b; }
     int multiply(int a, int b) { return a * b; }
 
@@ -335,6 +344,10 @@ namespace MathUtils
         // `global::` with a dotted path resolves at the root: global::MathUtils.add
         // is the sibling-free root MathUtils.add (a+b), reached from this nested scope.
         int addViaGlobalDotted(int a, int b) { return global::MathUtils.add(a, b); }
+
+        // A bare global reference inside a nested namespace walks outward through
+        // parent namespaces: BASE resolves to MathUtils.BASE.
+        int readOuterBase() { return BASE; }
     }
 }
 
@@ -360,6 +373,16 @@ bool testNamespace()
     result &= Test("global_scope_sibling_still_local", MathUtils.addViaSibling(3, 4), 7); // 3+4
     // global:: with a dotted path resolves at the root namespace.
     result &= Test("global_scope_dotted", MathUtils.Advanced.addViaGlobalDotted(3, 4), 7); // 3+4
+    // Namespace globals: qualified read/write from outside, bare sibling access inside.
+    result &= Test("namespace_global_const", MathUtils.BASE, 120);
+    result &= Test("namespace_global_read", MathUtils.nsCounter, 7);
+    result &= Test("namespace_global_sibling_read", MathUtils.readCounter(), 7);
+    MathUtils.bumpCounter();                       // bare sibling write inside
+    result &= Test("namespace_global_sibling_write", MathUtils.nsCounter, 8);
+    MathUtils.nsCounter = 42;                      // qualified write from outside
+    result &= Test("namespace_global_qualified_write", MathUtils.readCounter(), 42);
+    result &= Test("namespace_global_alias", Math.BASE, 120);  // via `using Math = MathUtils`
+    result &= Test("namespace_global_outer_from_nested", MathUtils.Advanced.readOuterBase(), 120);
     return result;
 }
 

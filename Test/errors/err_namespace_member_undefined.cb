@@ -1,0 +1,14 @@
+// Qualified access to a name that is not a member of the namespace must be a
+// compile error, not a silent undef (regression: Cfg.W used to compile and
+// evaluate to uninitialized garbage).
+
+namespace Cfg {
+    int P = 777;
+}
+
+extern int main()
+{
+    expect_error("'Bogus' is not a member of namespace 'Cfg'.");
+    int x = Cfg.Bogus;
+    return x;
+}

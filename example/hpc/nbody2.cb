@@ -28,15 +28,15 @@ import "terminal.cb";       // Terminal (VT-mode init, cursor/clear helpers)
 
 // ---- simulation parameters -------------------------------------------------
 
-double G()   { return 1.0; }
-double EPS() { return 0.05; }
-double DT()  { return 0.0015; }
+const double G = 1.0;
+const double EPS = 0.05;
+const double DT = 0.0015;
 
 // ---- render config ---------------------------------------------------------
 
-int    GW()   { return 110; }    // grid width  (columns)
-int    GH()   { return 46; }     // grid height (rows)
-double VIEW() { return 1.7; }    // half-extent of the projected view in world units
+const int    GW = 110;    // grid width  (columns)
+const int    GH = 46;     // grid height (rows)
+const double VIEW = 1.7;    // half-extent of the projected view in world units
 
 // ---- global render buffers -------------------------------------------------
 
@@ -144,13 +144,13 @@ extern int main(int argc, char** argv) {
 
     int n      = 4096;          // bodies
     int subSteps = 2;           // physics steps per rendered frame
-    double dt  = DT();
-    double g   = G();
-    double eps2 = EPS() * EPS();
+    double dt  = DT;
+    double g   = G;
+    double eps2 = EPS * EPS;
 
-    int W = GW();
-    int H = GH();
-    double view = VIEW();
+    int W = GW;
+    int H = GH;
+    double view = VIEW;
 
     // SoA buffers - each a fresh whole allocation -> noalias.
     double[] px = new double[n];  double[] py = new double[n];  double[] pz = new double[n];

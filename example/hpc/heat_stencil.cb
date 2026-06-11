@@ -22,8 +22,8 @@ import "terminal.cb";      // Terminal (VT-mode init), WriteFile bulk output
 
 // ---- grid configuration -----------------------------------------------------
 
-int GW() { return 120; }   // grid width  (columns)
-int GH() { return 50; }    // grid height (rows)
+const int GW = 120;   // grid width  (columns)
+const int GH = 50;    // grid height (rows)
 
 // ---- ANSI output buffer (printf truncates past ~4096 bytes; build a frame and
 //      blast it with WriteFile, the idiom from example/hpc/nbody2.cb) -----------
@@ -169,8 +169,8 @@ bool strEq(const char* a, const char* b) {
 }
 
 extern int main(int argc, char** argv) {
-    int W = GW();
-    int H = GH();
+    int W = GW;
+    int H = GH;
     int n = W * H;
 
     int frames = 400;

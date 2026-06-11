@@ -11,8 +11,9 @@
 //     CRT symbol directly with the 'global::' scope-escape qualifier (e.g.
 //     'return global::tan(x);'), which resolves at the root scope and so cannot
 //     recurse into the Math sibling of the same name.
-//   - Constants are exposed as zero-arg functions (e.g. Math.PI()) because
-//     namespace-scope const declarations are not currently supported.
+//   - Constants are exposed as zero-arg functions (e.g. Math.PI()). Namespace-scope
+//     const declarations are supported (const double PI = ...; usable as Math.PI),
+//     but the function form is kept for source compatibility with existing callers.
 
 // -----------------------------------------------------------------
 // File-scope CRT declarations.  The Math.* wrappers below reach these

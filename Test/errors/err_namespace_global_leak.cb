@@ -1,0 +1,14 @@
+// A namespace-scope global registers under its qualified name (Cfg.P) and must
+// NOT leak into the root scope: the bare name from outside the namespace is an
+// undefined variable (regression: it used to resolve to an unmangled @P).
+
+namespace Cfg {
+    int P = 777;
+}
+
+extern int main()
+{
+    expect_error("Undefined variable P.");
+    int x = P;
+    return x;
+}

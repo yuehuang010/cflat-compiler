@@ -952,6 +952,27 @@ MathUtils.add(3, 4);             // 7
 MathUtils.Advanced.square(4);    // 16
 ```
 
+Namespaces can also hold global variables (including `const`). They are scoped to
+the namespace: access them as `Namespace.name` from outside, or by the bare name
+from inside the namespace (a nested namespace sees its parents' globals). The bare
+name is not visible outside the namespace, and two namespaces can each declare a
+global of the same name without colliding.
+
+```c
+namespace Cfg
+{
+    int counter = 0;
+    const int WIDTH = 120;
+
+    void bump() { counter++; }   // bare sibling access inside
+}
+
+int w = Cfg.WIDTH;   // 120 - qualified access from outside
+Cfg.counter = 5;     // qualified write
+int c = counter;     // error: 'counter' is not visible outside Cfg
+int x = Cfg.HEIGHT;  // error: 'HEIGHT' is not a member of namespace 'Cfg'
+```
+
 ### `using` Aliases
 
 ```c

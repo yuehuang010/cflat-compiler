@@ -26,8 +26,8 @@ import "math.cb";
 import "thread.cb";
 
 // True value of integral of exp(x) on [0,1] = e - 1.
-double TRUE_INTEGRAL() { return 1.7182818284590452; }
-double TRUE_PI()       { return 3.1415926535897932; }
+const double TRUE_INTEGRAL = 1.7182818284590452;
+const double TRUE_PI = 3.1415926535897932;
 
 double absd(double a) { if (a < 0.0) { return -a; } return a; }
 
@@ -103,10 +103,10 @@ extern int main() {
     double tputM = timedPi(n, cores, 12345, &piM);
 
     printf("pi estimate (1 thread)   : %.8f   abs err %.2e\n",
-           pi1, absd(pi1 - TRUE_PI()));
+           pi1, absd(pi1 - TRUE_PI));
     printf("pi estimate (%2d threads) : %.8f   abs err %.2e\n",
-           cores, piM, absd(piM - TRUE_PI()));
-    printf("true pi                  : %.8f\n", TRUE_PI());
+           cores, piM, absd(piM - TRUE_PI));
+    printf("true pi                  : %.8f\n", TRUE_PI);
     printf("\n");
     printf("throughput  1 thread     : %.1f Msamples/s\n", tput1 / 1.0e6);
     printf("throughput  %2d threads   : %.1f Msamples/s\n", cores, tputM / 1.0e6);
@@ -118,8 +118,8 @@ extern int main() {
     // ---- Monte Carlo integration ------------------------------------------
     double integ = estimateIntegral(n, cores, 999);
     printf("integral exp(x) on [0,1] : %.8f   abs err %.2e\n",
-           integ, absd(integ - TRUE_INTEGRAL()));
-    printf("true value (e - 1)       : %.8f\n", TRUE_INTEGRAL());
+           integ, absd(integ - TRUE_INTEGRAL));
+    printf("true value (e - 1)       : %.8f\n", TRUE_INTEGRAL);
 
     return 0;
 }

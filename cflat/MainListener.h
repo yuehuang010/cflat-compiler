@@ -2384,7 +2384,7 @@ public:
         }
         else if (decl != nullptr)
         {
-            ParseDeclaration(decl);
+            ParseDeclaration(decl, namespaceName);
         }
         else if (func != nullptr)
         {
@@ -4276,7 +4276,7 @@ public:
         return ParseDeclaration(declSpec, initDecl);
     }
 
-    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationContext* ctx)
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName = {})
     {
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
@@ -4287,7 +4287,7 @@ public:
 
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
-        return ParseDeclaration(declSpec, initDecl);
+        return ParseDeclaration(declSpec, initDecl, namespaceName);
     }
 
     void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx)
@@ -4346,7 +4346,7 @@ public:
         }
     }
 
-    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl)
+    std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName = {})
     {
         auto* compiler = Compiler(declSpec);
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
@@ -4428,6 +4428,12 @@ public:
             {
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
+                // A namespace-scope global registers under its qualified name (Cfg.W),
+                // mirroring namespace functions and enum members: qualified access
+                // (Cfg.W) resolves through the global table, and two namespaces can
+                // each declare the same global name without colliding in the IR.
+                if (!namespaceName.empty())
+                    name = namespaceName + "." + name;
                 // Fixed-size array local - two forms:
                 //   C-style:    T arr[N]  - size in directDeclarator
                 //   Type-first: T[N] arr  - size in declarationSpecifier (arraySize already evaluated)
@@ -8853,10 +8859,13 @@ public:
                             }
                             else
                             {
-                                // Qualified name (e.g. EnumName.Member) - try to resolve as a global
-                                // variable (enum member) or a function. Fall back to leaving
-                                // namedVar empty so later code can handle it.
+                                // Qualified name (e.g. EnumName.Member, Cfg.W) - try to resolve
+                                // as a global variable (enum member / namespace global) or a
+                                // function. Fall back to leaving namedVar empty so later code
+                                // can handle it (constructor calls, generic templates, ...).
                                 primaryIdentifier = qualifiedName;
+                                bool wasRealNamespace = !isFileAlias && Compiler(ctx)->IsNamespace(namespaceContext);
+                                std::string namespaceName = namespaceContext;
                                 namespaceContext.clear();
 
                                 auto globalNV = Compiler(ctx)->GetGlobalVariableNV(primaryIdentifier);
@@ -8872,6 +8881,21 @@ public:
                                 else
                                 {
                                     namedVar = {};
+                                    // A member of a real namespace that is not a global, a
+                                    // function, a type, a generic template, or a return-block
+                                    // cannot resolve later - error now instead of silently
+                                    // evaluating to undef.
+                                    if (wasRealNamespace
+                                        && !Compiler(ctx)->IsDataStructure(qualifiedName)
+                                        && genericFunctionTemplates.count(qualifiedName) == 0
+                                        && genericStructTemplates.count(qualifiedName) == 0
+                                        && genericClassTemplates.count(qualifiedName) == 0
+                                        && Compiler(ctx)->GetReturnBlock(qualifiedName) == nullptr)
+                                    {
+                                        LogErrorContext(ctx, std::format(
+                                            "'{}' is not a member of namespace '{}'.",
+                                            memberName, namespaceName));
+                                    }
                                 }
                             }
                         }
@@ -12036,6 +12060,10 @@ public:
         std::string nsQualified = compiler->ResolveQualifiedName(name);
         if (nsQualified != name)
         {
+            // Sibling namespace global (registered qualified, e.g. "Cfg.W").
+            auto nsGlobalNV = compiler->GetGlobalVariableNV(nsQualified);
+            if (nsGlobalNV.Storage != nullptr)
+                return nsGlobalNV;
             if (compiler->GetFunction(nsQualified))
             {
                 namedVar.Primary = compiler->GetFunctionForFuncPtr(nsQualified);
