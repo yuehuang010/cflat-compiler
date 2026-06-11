@@ -1,0 +1,248 @@
+// main.cb - 2D heat-equation stencil solver with a live ANSI terminal animation.
+//
+// Physics: explicit finite-difference Jacobi step on a temperature grid. The
+// stable explicit heat update at the diffusion-number limit (alpha*dt/h^2 = 1/4)
+// is exactly the 5-point neighbor average
+//     u_new[y,x] = (u[y-1,x] + u[y+1,x] + u[y,x-1] + u[y,x+1]) / 4
+// which is precisely Stencil.jacobi2d from core/hpc/stencil.cb, so we reuse it
+// rather than re-rolling the kernel. We double-buffer two noalias double[] grids
+// and swap each step; Dirichlet boundary conditions (cold walls) and fixed hot
+// sources are re-stamped after every step so heat keeps flowing from the sources.
+//
+// Build (vectorize is only enforced at -O2):
+//   x64\Release\cflat.exe example\hpc\heat_stencil.cb -o out\heat_stencil.exe -O2
+// Run:
+//   out\heat_stencil.exe              (animate 400 frames)
+//   out\heat_stencil.exe 120          (animate 120 frames)
+//   out\heat_stencil.exe 200 report   (no animation; throughput + convergence report)
+
+import "hpc/stencil.cb";   // Stencil.jacobi2d (5-point average == explicit heat step)
+import "time.cb";          // Stopwatch, sleep
+import "terminal.cb";      // Terminal (VT-mode init), WriteFile bulk output
+
+// ---- grid configuration -----------------------------------------------------
+
+int GW() { return 120; }   // grid width  (columns)
+int GH() { return 50; }    // grid height (rows)
+
+// ---- ANSI output buffer (printf truncates past ~4096 bytes; build a frame and
+//      blast it with WriteFile, the idiom from example/hpc/nbody2.cb) -----------
+
+char* g_out     = nullptr;
+int   g_out_len = 0;
+
+void outCh(char c) { g_out[g_out_len] = c; g_out_len = g_out_len + 1; }
+
+void outStr(const char* s) {
+    int i = 0;
+    while (s[i] != '\0') { outCh(s[i]); i = i + 1; }
+}
+
+void outInt(int n) {
+    if (n == 0) { outCh('0'); return; }
+    if (n < 0) { outCh('-'); n = -n; }
+    char[12] tmp;
+    int i = 0;
+    while (n > 0) { tmp[i] = (char)('0' + n % 10); i = i + 1; n = n / 10; }
+    int j = i - 1;
+    while (j >= 0) { outCh(tmp[j]); j = j - 1; }
+}
+
+// ESC [ 38 ; 2 ; r ; g ; b m  - truecolor foreground.
+void outColor(int r, int g, int b) {
+    outStr("\033[38;2;");
+    outInt(r); outCh(';');
+    outInt(g); outCh(';');
+    outInt(b); outCh('m');
+}
+
+// Map temperature t in [0,1] to a black->red->orange->yellow->white "hot metal" ramp.
+void heat(double t, int* r, int* g, int* b) {
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    double seg = t * 3.0;
+    int s = (int)seg;
+    if (s > 2) { s = 2; }
+    double f = seg - (double)s;
+    int rr = 0; int gg = 0; int bb = 0;
+    if (s == 0)      { rr = (int)(f * 255.0); gg = 0;                  bb = 0; }                // black -> red
+    else if (s == 1) { rr = 255;              gg = (int)(f * 255.0);   bb = 0; }                // red   -> yellow
+    else             { rr = 255;              gg = 255;                bb = (int)(f * 255.0); } // yellow-> white
+    *r = rr; *g = gg; *b = bb;
+}
+
+// ---- boundary + source conditions -------------------------------------------
+
+// Stamp the fixed temperatures into grid `u`: cold walls (Dirichlet 0 border) and
+// two fixed hot sources (a disk near the left, a bar along the bottom-centre).
+void stampSources(double[] u, int h, int w) {
+    // Cold border (Dirichlet). jacobi2d already copies the border through, but we
+    // make it explicit so the very first stamp is correct.
+    for (int x = 0; x < w; x = x + 1) { u[x] = 0.0; u[(h - 1) * w + x] = 0.0; }
+    for (int y = 0; y < h; y = y + 1) { u[y * w] = 0.0; u[y * w + w - 1] = 0.0; }
+
+    // Hot disk source.
+    int cy = h / 2;
+    int cx = w / 4;
+    int rad = h / 6;
+    for (int y = cy - rad; y <= cy + rad; y = y + 1) {
+        for (int x = cx - rad; x <= cx + rad; x = x + 1) {
+            if (y > 0 && y < h - 1 && x > 0 && x < w - 1) {
+                int dy = y - cy;
+                int dx = x - cx;
+                if (dx * dx + dy * dy <= rad * rad) { u[y * w + x] = 1.0; }
+            }
+        }
+    }
+
+    // Hot bar source along the right-centre.
+    int bx = (w * 3) / 4;
+    for (int y = cy - h / 4; y <= cy + h / 4; y = y + 1) {
+        if (y > 0 && y < h - 1 && bx > 0 && bx < w - 1) { u[y * w + bx] = 1.0; }
+    }
+}
+
+// ---- render one frame into g_out --------------------------------------------
+
+void renderFrame(double[] u, int h, int w, int frame, int frames, double maxChange) {
+    g_out_len = 0;
+    outStr("\033[H");          // cursor home
+    int prevPacked = -1;
+    for (int y = 0; y < h; y = y + 1) {
+        for (int x = 0; x < w; x = x + 1) {
+            double t = u[y * w + x];
+            int rr = 0; int gg = 0; int bb = 0;
+            heat(t, &rr, &gg, &bb);
+            int packed = (rr << 16) | (gg << 8) | bb;
+            if (packed != prevPacked) { outColor(rr, gg, bb); prevPacked = packed; }
+            // glyph by intensity so it reads even without truecolor
+            char glyph = ' ';
+            if (t > 0.80)      { glyph = '@'; }
+            else if (t > 0.55) { glyph = '#'; }
+            else if (t > 0.30) { glyph = '+'; }
+            else if (t > 0.12) { glyph = ':'; }
+            else if (t > 0.03) { glyph = '.'; }
+            outCh(glyph);
+        }
+        outStr("\033[0m\n");
+        prevPacked = -1;
+    }
+    outStr("\033[0mframe ");
+    outInt(frame + 1);
+    outStr(" / ");
+    outInt(frames);
+    outStr("   grid=");
+    outInt(w); outCh('x'); outInt(h);
+    outStr("   max|du|=0.");
+    // print maxChange to 4 decimals (it is in [0,1))
+    int mc = (int)(maxChange * 10000.0);
+    if (mc < 1000) outCh('0');
+    if (mc < 100)  outCh('0');
+    if (mc < 10)   outCh('0');
+    outInt(mc);
+    outStr("    \n");
+}
+
+// max absolute element-wise difference between two grids (convergence metric).
+double maxAbsDiff(double[] a, double[] b, int n) {
+    double m = 0.0;
+    for (int i = 0; i < n; i = i + 1) {
+        double d = a[i] - b[i];
+        if (d < 0.0) { d = -d; }
+        if (d > m) { m = d; }
+    }
+    return m;
+}
+
+// argv parse helper - returns -1 on a non-numeric arg (so a bad frame count is
+// distinguishable, which atoi's 0-on-failure cannot express).
+int strToInt(const char* s) {
+    int v = 0; int i = 0; bool found = false;
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i = i + 1; }
+    return found ? v : -1;
+}
+
+bool strEq(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] != '\0' && b[i] != '\0') { if (a[i] != b[i]) return false; i = i + 1; }
+    return a[i] == b[i];
+}
+
+extern int main(int argc, char** argv) {
+    int W = GW();
+    int H = GH();
+    int n = W * H;
+
+    int frames = 400;
+    bool report = false;
+    if (argc > 1) { int f = strToInt(argv[1]); if (f > 0) { frames = f; } }
+    if (argc > 2 && strEq(argv[2], "report")) { report = true; }
+
+    int subSteps = 4;   // jacobi sweeps per rendered frame
+
+    // Two noalias grids (fresh whole allocations) - double-buffered.
+    double[] a = new double[n];
+    double[] b = new double[n];
+
+    // Cold start, then stamp the fixed sources.
+    for (int i = 0; i < n; i = i + 1) { a[i] = 0.0; b[i] = 0.0; }
+    stampSources(a, H, W);
+
+    g_out = (char*)malloc(1048576);   // 1 MB - one frame is well under that
+
+    if (report) {
+        // Throughput + convergence: run all sweeps, time them, report.
+        int totalSweeps = frames * subSteps;
+        Stopwatch sw;
+        sw.start();
+        double maxChange = 0.0;
+        for (int s = 0; s < totalSweeps; s = s + 1) {
+            Stencil.jacobi2d(a, b, H, W);
+            stampSources(b, H, W);
+            if (s == totalSweeps - 1) { maxChange = maxAbsDiff(a, b, n); }
+            double[] tmp = a; a = b; b = tmp;   // swap
+        }
+        double secs = sw.elapsed().seconds();
+        double cells = (double)n * (double)totalSweeps;
+        printf("heat-stencil report\n");
+        printf("  grid          : %d x %d (%d cells)\n", W, H, n);
+        printf("  sweeps        : %d\n", totalSweeps);
+        printf("  time          : %.4f s\n", secs);
+        printf("  cell-updates/s: %.2f M\n", cells / secs / 1.0e6);
+        printf("  final max|du| : %.6f  (-> 0 means steady state)\n", maxChange);
+        free(g_out);
+        delete[_] a;
+        delete[_] b;
+        return 0;
+    }
+
+    // ---- live animation ----
+    Terminal term;
+    term.init();           // enables ANSI/VT; no-op if output is redirected
+    term.hideCursor();
+    term.clear();
+    void* hOut = term._hOut;
+    int wr = 0;
+
+    double maxChange = 1.0;
+    int frame = 0;
+    while (frame < frames) {
+        for (int s = 0; s < subSteps; s = s + 1) {
+            Stencil.jacobi2d(a, b, H, W);   // 5-point average == explicit heat step
+            stampSources(b, H, W);          // hold sources + cold walls fixed
+            double[] tmp = a; a = b; b = tmp;
+        }
+        maxChange = maxAbsDiff(a, b, n);    // a is newest, b is one sweep back
+        renderFrame(a, H, W, frame, frames, maxChange);
+        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+        sleep(33);
+        frame = frame + 1;
+    }
+
+    term.showCursor();
+    term.restore();
+    free(g_out);
+    delete[_] a;
+    delete[_] b;
+    return 0;
+}
