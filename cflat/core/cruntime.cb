@@ -44,7 +44,7 @@ thread_local __ProgramTLS __prog_tls = default;
 // truncation check `needed >= cap` never fires (-1 >= cap is false) and output past the
 // initial buffer is silently dropped.
 win_int __vsprintf_safe(u64 options, char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
-    return __stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
+    return os.windows.__stdio_common_vsprintf(options | (u64)2, buf, (win_size)bufSize, fmt, locale, ap);
 }
 
 // Emit `len` raw bytes to stdout. Honors the program stdout hook when one is installed
@@ -58,14 +58,14 @@ void __stdout_write(const char* buf, int len) {
         __prog_tls.stdout_in_hook = false;
     } else {
         int written = 0;
-        WriteFile(GetStdHandle(-11), buf, len, &written, nullptr);
+        os.windows.WriteFile(os.windows.GetStdHandle(-11), buf, len, &written, nullptr);
     }
 }
 
 // Emit `len` raw bytes to stderr (handle -12). The stdout hook never applies to stderr.
 void __stderr_write(const char* buf, int len) {
     int written = 0;
-    WriteFile(GetStdHandle(-12), buf, len, &written, nullptr);
+    os.windows.WriteFile(os.windows.GetStdHandle(-12), buf, len, &written, nullptr);
 }
 
 // Format `fmt`+args into the per-thread scratch buffer, growing it on overflow, and
@@ -96,7 +96,7 @@ int __cstr_len(const char* s) {
 }
 
 win_int __vsscanf_safe(u64 options, const char* buf, i64 bufSize, const char* fmt, void* locale, va_list ap) {
-    return __stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
+    return os.windows.__stdio_common_vsscanf(options, buf, (win_size)bufSize, fmt, locale, ap);
 }
 
 extern void printf(const char* fmt, ...) {
@@ -190,16 +190,16 @@ extern void putn(const char* buf, int len) {
 // special-cased so they stay hook-aware / VT-correct; other streams go through the CRT.
 extern int fputs(const char* s, void* stream) {
     int len = __cstr_len(s);
-    if (stream == __acrt_iob_func(1)) { __stdout_write(s, len); return len; }
-    if (stream == __acrt_iob_func(2)) { __stderr_write(s, len); return len; }
+    if (stream == os.windows.__acrt_iob_func(1)) { __stdout_write(s, len); return len; }
+    if (stream == os.windows.__acrt_iob_func(2)) { __stderr_write(s, len); return len; }
     return fprintf(stream, "%s", s);
 }
 
 // fputc / putc - write a single byte to a stream.
 extern int fputc(int c, void* stream) {
     char b = (char)c;
-    if (stream == __acrt_iob_func(1)) { __stdout_write(&b, 1); return c; }
-    if (stream == __acrt_iob_func(2)) { __stderr_write(&b, 1); return c; }
+    if (stream == os.windows.__acrt_iob_func(1)) { __stdout_write(&b, 1); return c; }
+    if (stream == os.windows.__acrt_iob_func(2)) { __stderr_write(&b, 1); return c; }
     return fprintf(stream, "%c", c);
 }
 
@@ -211,16 +211,16 @@ extern int fprintf(void* stream, const char* fmt, ...) {
     va_list ap;
     va_start(ap);
     int result = 0;
-    if (stream == __acrt_iob_func(1)) {
+    if (stream == os.windows.__acrt_iob_func(1)) {
         int needed = __format_to_tls(fmt, ap);
         __stdout_write(__prog_tls.stdout_tls_buf, needed);
         result = needed;
-    } else if (stream == __acrt_iob_func(2)) {
+    } else if (stream == os.windows.__acrt_iob_func(2)) {
         int needed = __format_to_tls(fmt, ap);
         __stderr_write(__prog_tls.stdout_tls_buf, needed);
         result = needed;
     } else {
-        result = __stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap);
+        result = os.windows.__stdio_common_vfprintf((u64)1, stream, fmt, nullptr, ap);
     }
     va_end(ap);
     return result;
@@ -355,7 +355,7 @@ extern int scanf(const char* fmt, ...) {
         va_end(ap);
         return result;
     }
-    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __acrt_iob_func(0); }
+    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = os.windows.__acrt_iob_func(0); }
     int result = __stdio_common_vfscanf(0, __prog_tls.cached_stdin, fmt, nullptr, ap);
     va_end(ap);
     return result;
@@ -365,7 +365,7 @@ extern int scanf(const char* fmt, ...) {
 // `program`); otherwise reads from the real console. Returns -1 (EOF) when input is done.
 extern int getchar() {
     if (__prog_tls.stdin_active) { return __stdin_next_char(); }
-    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = __acrt_iob_func(0); }
+    if (__prog_tls.cached_stdin == nullptr) { __prog_tls.cached_stdin = os.windows.__acrt_iob_func(0); }
     return fgetc(__prog_tls.cached_stdin);
 }
 

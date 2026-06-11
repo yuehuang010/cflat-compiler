@@ -210,7 +210,7 @@ extern int main()
 
     list<string> srvArgs;
     srv.run(srvArgs);
-    Sleep(50);   // give the server thread time to start listening
+    os.windows.Sleep(50);   // give the server thread time to start listening
 
     HttpClient client;
     bool ok = true;

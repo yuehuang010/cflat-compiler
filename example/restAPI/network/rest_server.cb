@@ -112,7 +112,7 @@ program RestServer {
         while (!stopToken.stop_requested())
         {
             Socket* conn = listener->accept();
-            if (conn == nullptr) { Sleep(5); continue; }
+            if (conn == nullptr) { os.windows.Sleep(5); continue; }
 
             _RestConnCtx* c = new _RestConnCtx;
             c->handle = conn->_handle;

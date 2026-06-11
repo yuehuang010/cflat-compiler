@@ -51,7 +51,7 @@ struct barrier {
         _total      = n;
         _count      = n;
         _generation = 0;
-        InitializeConditionVariable(&_cv);
+        os.windows.InitializeConditionVariable(&_cv);
     }
 
     // Arrive and block until all n threads have arrived; the barrier then resets
@@ -65,7 +65,7 @@ struct barrier {
         if (_count == 0) {
             _generation = _generation + 1;   // advance phase -> releases the waiters
             _count      = _total;            // re-arm for the next round
-            WakeAllConditionVariable(&_cv);
+            os.windows.WakeAllConditionVariable(&_cv);
             _mtx.release();
             return true;                     // leader
         }
@@ -90,7 +90,7 @@ struct barrier {
         if (_count == 0) {
             _generation = _generation + 1;
             _count      = _total;
-            WakeAllConditionVariable(&_cv);
+            os.windows.WakeAllConditionVariable(&_cv);
         }
         _mtx.release();
     }

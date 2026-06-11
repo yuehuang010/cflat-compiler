@@ -393,7 +393,7 @@ extern int main(int argc, char** argv) {
         for (int c = 0; c < w; c++) { g_wf[g_wfHead * w + c] = dbToT(colDb[c]); }
 
         renderFrame(colDb, frame, frames, peakHz);
-        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+        os.windows.WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
         sleep(33);
     }
 

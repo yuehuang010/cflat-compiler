@@ -1411,12 +1411,20 @@ public:
 
     void ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
     {
-        std::string namespaceName = ctx->Identifier()->getText();
+        std::string namespaceName;
+        for (auto* id : ctx->Identifier())
+            namespaceName += (namespaceName.empty() ? "" : ".") + id->getText();
         if (!parentNamespace.empty())
             namespaceName = parentNamespace + "." + namespaceName;
 
+        // Member signatures may reference sibling types unqualified (a struct param
+        // declared earlier in the namespace) - make the namespace visible to GetType.
+        auto* compiler = Compiler(ctx);
+        std::string savedNamespace = compiler->GetCurrentNamespace();
+        compiler->SetCurrentNamespace(namespaceName);
         for (auto* extDecl : ctx->externalDeclaration())
             ScanExternalDeclaration(extDecl, namespaceName);
+        compiler->SetCurrentNamespace(savedNamespace);
     }
 };
 
@@ -2560,10 +2568,16 @@ public:
 
     void ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {})
     {
-        std::string namespaceName = ctx->Identifier()->getText();
+        std::string namespaceName;
+        for (auto* id : ctx->Identifier())
+            namespaceName += (namespaceName.empty() ? "" : ".") + id->getText();
         if (!parentNamespace.empty())
             namespaceName = parentNamespace + "." + namespaceName;
         auto* compiler = Compiler(ctx);
+        // Register every prefix so qualified lookup can walk "os" -> "os.windows".
+        std::string prefix;
+        for (size_t pos = 0; (pos = namespaceName.find('.', pos)) != std::string::npos; pos++)
+            compiler->RegisterNamespace(namespaceName.substr(0, pos));
         compiler->RegisterNamespace(namespaceName);
 
         if (auto* s = compiler->GetSymbolSink())
@@ -2580,8 +2594,13 @@ public:
                             "namespace " + namespaceName, {}, doc);
         }
 
+        // Member declarations (extern signatures, struct fields) may reference sibling
+        // types unqualified - make the namespace visible to GetType while parsing them.
+        std::string savedNamespace = compiler->GetCurrentNamespace();
+        compiler->SetCurrentNamespace(namespaceName);
         for (auto* extDecl : ctx->externalDeclaration())
             ParseExternalDeclaration(extDecl, namespaceName);
+        compiler->SetCurrentNamespace(savedNamespace);
     }
 
     void enterExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx) override
@@ -4410,7 +4429,18 @@ public:
                 std::vector<LLVMBackend::TypeAndValue> allParams(declParams.begin(), declParams.end());
 
                 bool ellipsis = paramTypeList && paramTypeList->Ellipsis() != nullptr;
-                compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl);
+                // A declaration at namespace scope registers under its qualified name
+                // (os.windows.Sleep) so lookup is namespaced, but an extern keeps its
+                // bare linkage symbol (Sleep) - the import library only knows that name.
+                std::string declName = direct->getText();
+                std::string linkName;
+                if (!namespaceName.empty())
+                {
+                    if (typeAndValue.external)
+                        linkName = declName;
+                    declName = namespaceName + "." + declName;
+                }
+                compiler->CreateFunctionDeclaration(declName, typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl, linkName);
 
                 // Register the declaration in the symbol index so extern-bound C
                 // runtime functions (atoi, strcmp, memcpy, ...) are discoverable
@@ -4420,7 +4450,7 @@ public:
                 // dedupes instead of listing as a phantom overload.
                 if (auto* s = compiler->GetSymbolSink())
                 {
-                    std::string sig = typeAndValue.TypeName + " " + direct->getText() + "(";
+                    std::string sig = typeAndValue.TypeName + " " + declName + "(";
                     bool first = true;
                     for (const auto& p : declParams)
                     {
@@ -4432,7 +4462,7 @@ public:
                     }
                     if (ellipsis) sig += first ? "..." : ", ...";
                     sig += ")";
-                    s->Register(SymbolKind::Function, direct->getText(),
+                    s->Register(SymbolKind::Function, declName,
                                 compiler->GetSourceFilePath(),
                                 (int)direct->getStart()->getLine(),
                                 (int)direct->getStart()->getCharPositionInLine(), sig);
@@ -4447,7 +4477,7 @@ public:
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
                     std::vector<LLVMBackend::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
-                    compiler->CreateFunctionDeclaration(direct->getText(), typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl);
+                    compiler->CreateFunctionDeclaration(declName, typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl, linkName);
                 }
             }
             else if (direct != nullptr)

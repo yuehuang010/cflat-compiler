@@ -17,31 +17,31 @@ struct semaphore {
     //   initial   - starting signal count (0 = fully blocked)
     //   max_count - maximum count (typically capacity of the resource pool)
     void init(int initial, int max_count) {
-        _handle = CreateSemaphoreA(nullptr, initial, max_count, nullptr);
+        _handle = os.windows.CreateSemaphoreA(nullptr, initial, max_count, nullptr);
     }
 
     // Decrement count; block until count > 0.  (alias: acquire)
     void acquire() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(20); }  // thread-fuzz sched-point
-        WaitForSingleObject(_handle, -1);  // -1 == INFINITE
+        os.windows.WaitForSingleObject(_handle, -1);  // -1 == INFINITE
     }
 
     // Increment count by 1; wake one blocked acquire() caller.  (alias: release)
     void release() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(21); }  // thread-fuzz sched-point
-        ReleaseSemaphore(_handle, 1, nullptr);
+        os.windows.ReleaseSemaphore(_handle, 1, nullptr);
     }
 
     // Increment count by n; wake up to n blocked acquire() callers.
     void release_n(int n) {
         if (__fuzz_hook != nullptr) { __fuzz_hook(22); }  // thread-fuzz sched-point
-        ReleaseSemaphore(_handle, n, nullptr);
+        os.windows.ReleaseSemaphore(_handle, n, nullptr);
     }
 
     // Close the Win32 handle.
     void destroy() {
         if (_handle != nullptr) {
-            CloseHandle(_handle);
+            os.windows.CloseHandle(_handle);
             _handle = nullptr;
         }
     }

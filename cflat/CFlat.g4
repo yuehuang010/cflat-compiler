@@ -711,7 +711,7 @@ fromClause
     ;
 
 namespaceDefinition
-    : Namespace Identifier '{' (externalDeclaration)* '}'
+    : Namespace Identifier ('.' Identifier)* '{' (externalDeclaration)* '}'
     ;
 
 functionDefinition

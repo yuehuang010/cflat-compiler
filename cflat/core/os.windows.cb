@@ -1,5 +1,14 @@
 // Windows platform extern declarations - Win32 API and MSVC CRT.
 // Imported by os.cb when __WIN64__ or __WIN32__ is defined.
+//
+// Everything lives in the os.windows namespace so these bindings never collide
+// with an `import "windows.h"` header bind: the header's structs (INPUT_RECORD,
+// CONSOLE_SCREEN_BUFFER_INFO, ...) and bare function names register freely while
+// core code reaches its own copies as os.windows.Sleep, os.windows._INPUT_RECORD,
+// etc. Externs keep their bare linkage symbol, so both lookup names resolve to
+// the one imported function.
+// Return types deliberately match the real Win32 signatures (BOOL -> win_int);
+// a mismatch would give the shared linkage symbol two different LLVM types.
 
 // Win32 int is always 32-bit regardless of host pointer width.
 using win_int = i32;
@@ -13,298 +22,302 @@ if const (__PLATFORM__ == 64) {
     using win_usize   = u32;
 }
 
-// Win32 Threading - all Win32 API functions use __stdcall calling convention.
-extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
-extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
-extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
-extern stdcall i32       GetExitCodeThread(void* handle, i32* code);
-extern stdcall void      CloseHandle(void* handle);
-extern stdcall bool      TerminateThread(void* handle, i32 exitCode);
-extern stdcall bool      SwitchToThread();
-extern stdcall u32       GetCurrentThreadId();
-
-// Win32 Timing
-extern stdcall win_int  QueryPerformanceCounter(i64* count);
-extern stdcall win_int  QueryPerformanceFrequency(i64* freq);
-extern stdcall void     GetSystemTimeAsFileTime(i64* fileTime);
-extern stdcall void     Sleep(i32 ms);
-
-// Win32 Synchronization
-extern stdcall void     InitializeCriticalSection(void* cs);
-extern stdcall void     DeleteCriticalSection(void* cs);
-extern stdcall void     EnterCriticalSection(void* cs);
-extern stdcall void     LeaveCriticalSection(void* cs);
-extern stdcall void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
-extern stdcall void     ReleaseSemaphore(void* handle, i32 count, i32* prev);
-extern stdcall void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
-extern stdcall i32      SetEvent(void* handle);
-extern stdcall void     AcquireSRWLockExclusive(void** srw);
-extern stdcall void     ReleaseSRWLockExclusive(void** srw);
-extern stdcall void     AcquireSRWLockShared(void** srw);
-extern stdcall void     ReleaseSRWLockShared(void** srw);
-extern stdcall void     InitializeConditionVariable(void* cv);
-extern stdcall i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
-extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
-extern stdcall void     WakeConditionVariable(void* cv);
-extern stdcall void     WakeAllConditionVariable(void* cv);
-
-// Win32 SYSTEM_INFO - pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
-// x64: 48 bytes (pointers = 8 bytes); x86: 36 bytes (pointers = 4 bytes).
-struct _SystemInfo
+namespace os.windows
 {
-    u32 _oemId            = default;  //  0 - dwOemId union
-    u32 _pageSize         = default;  //  4 - dwPageSize
-    i8* _minAddr          = default;  //  8 - lpMinimumApplicationAddress (pointer-sized)
-    i8* _maxAddr          = default;  // 16/12 - lpMaximumApplicationAddress (pointer-sized)
-    i8* _procMask         = default;  // 24/16 - dwActiveProcessorMask (ULONG_PTR, pointer-sized)
-    u32 _numProc          = default;  // 32/20 - dwNumberOfProcessors
-    u32 _procType         = default;  // 36/24 - dwProcessorType
-    u32 _allocGranularity = default;  // 40/28 - dwAllocationGranularity (VirtualAlloc page size)
-    u16 _procLevel        = default;  // 44/32
-    u16 _procRevision     = default;  // 46/34
-};
 
-// Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION - pointer-sized ProcessorMask.
-// x64: 32 bytes; x86: 24 bytes. The union at offset 8/4 is interpreted as
-// CACHE_DESCRIPTOR when _relationship == RelationCache (2).
-struct _SysLogicalProcInfo
-{
-    i8* _processorMask = default;  //  0 - ULONG_PTR ProcessorMask (pointer-sized)
-    u32 _relationship  = default;  //  8/4 - LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
-    u32 _pad           = default;  // 12/8 - padding before union
-    u8  _cacheLevel    = default;  // 16/12 - CACHE_DESCRIPTOR.Level
-    u8  _cacheAssoc    = default;  // 17/13 - CACHE_DESCRIPTOR.Associativity
-    u16 _cacheLineSize = default;  // 18/14 - CACHE_DESCRIPTOR.LineSize
-    u32 _cacheSize     = default;  // 20/16 - CACHE_DESCRIPTOR.Size
-    u32 _cacheType     = default;  // 24/20 - PROCESSOR_CACHE_TYPE
-    u32 _pad2          = default;  // 28/24 - trailing pad
-};
+    // Win32 Threading - all Win32 API functions use __stdcall calling convention.
+    extern stdcall void*     CreateThread(void* attr, win_size stackSize, function<win_int(void*)> fn, void* param, i32 flags, i32* id);
+    extern stdcall win_usize SetThreadAffinityMask(void* handle, win_usize mask);
+    extern stdcall i32       WaitForSingleObject(void* handle, i32 ms);
+    extern stdcall i32       GetExitCodeThread(void* handle, i32* code);
+    extern stdcall win_int   CloseHandle(void* handle);
+    extern stdcall win_int   TerminateThread(void* handle, i32 exitCode);
+    extern stdcall win_int   SwitchToThread();
+    extern stdcall u32       GetCurrentThreadId();
 
-// Win32 Virtual Memory - dwSize is SIZE_T (win_size).
-extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
-extern stdcall void     GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
-extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
-extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
-extern stdcall void*    GetProcessHeap();
-extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
+    // Win32 Timing
+    extern stdcall win_int  QueryPerformanceCounter(i64* count);
+    extern stdcall win_int  QueryPerformanceFrequency(i64* freq);
+    extern stdcall void     GetSystemTimeAsFileTime(i64* fileTime);
+    extern stdcall void     Sleep(i32 ms);
 
-// Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
-if const (__PLATFORM__ == 32) {
-    void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect) {
-        return VirtualAlloc(lpAddress, (i32)dwSize, flAllocationType, flProtect);
+    // Win32 Synchronization
+    extern stdcall void     InitializeCriticalSection(void* cs);
+    extern stdcall void     DeleteCriticalSection(void* cs);
+    extern stdcall void     EnterCriticalSection(void* cs);
+    extern stdcall void     LeaveCriticalSection(void* cs);
+    extern stdcall void*    CreateSemaphoreA(void* attr, i32 initial, i32 max_count, void* name);
+    extern stdcall win_int  ReleaseSemaphore(void* handle, i32 count, i32* prev);
+    extern stdcall void*    CreateEventA(void* attr, i32 manual_reset, i32 initial_state, void* name);
+    extern stdcall i32      SetEvent(void* handle);
+    extern stdcall void     AcquireSRWLockExclusive(void** srw);
+    extern stdcall void     ReleaseSRWLockExclusive(void** srw);
+    extern stdcall void     AcquireSRWLockShared(void** srw);
+    extern stdcall void     ReleaseSRWLockShared(void** srw);
+    extern stdcall void     InitializeConditionVariable(void* cv);
+    extern stdcall i32      SleepConditionVariableCS(void* cv, void* cs, i32 ms);
+    extern stdcall i32      SleepConditionVariableSRW(void* cv, void** srw, i32 ms, u32 flags);
+    extern stdcall void     WakeConditionVariable(void* cv);
+    extern stdcall void     WakeAllConditionVariable(void* cv);
+
+    // Win32 SYSTEM_INFO - pointer-sized fields use i8* so layout matches Win32/Win64 ABI.
+    // x64: 48 bytes (pointers = 8 bytes); x86: 36 bytes (pointers = 4 bytes).
+    struct _SystemInfo
+    {
+        u32 _oemId            = default;  //  0 - dwOemId union
+        u32 _pageSize         = default;  //  4 - dwPageSize
+        i8* _minAddr          = default;  //  8 - lpMinimumApplicationAddress (pointer-sized)
+        i8* _maxAddr          = default;  // 16/12 - lpMaximumApplicationAddress (pointer-sized)
+        i8* _procMask         = default;  // 24/16 - dwActiveProcessorMask (ULONG_PTR, pointer-sized)
+        u32 _numProc          = default;  // 32/20 - dwNumberOfProcessors
+        u32 _procType         = default;  // 36/24 - dwProcessorType
+        u32 _allocGranularity = default;  // 40/28 - dwAllocationGranularity (VirtualAlloc page size)
+        u16 _procLevel        = default;  // 44/32
+        u16 _procRevision     = default;  // 46/34
+    };
+
+    // Win32 SYSTEM_LOGICAL_PROCESSOR_INFORMATION - pointer-sized ProcessorMask.
+    // x64: 32 bytes; x86: 24 bytes. The union at offset 8/4 is interpreted as
+    // CACHE_DESCRIPTOR when _relationship == RelationCache (2).
+    struct _SysLogicalProcInfo
+    {
+        i8* _processorMask = default;  //  0 - ULONG_PTR ProcessorMask (pointer-sized)
+        u32 _relationship  = default;  //  8/4 - LOGICAL_PROCESSOR_RELATIONSHIP (RelationCache == 2)
+        u32 _pad           = default;  // 12/8 - padding before union
+        u8  _cacheLevel    = default;  // 16/12 - CACHE_DESCRIPTOR.Level
+        u8  _cacheAssoc    = default;  // 17/13 - CACHE_DESCRIPTOR.Associativity
+        u16 _cacheLineSize = default;  // 18/14 - CACHE_DESCRIPTOR.LineSize
+        u32 _cacheSize     = default;  // 20/16 - CACHE_DESCRIPTOR.Size
+        u32 _cacheType     = default;  // 24/20 - PROCESSOR_CACHE_TYPE
+        u32 _pad2          = default;  // 28/24 - trailing pad
+    };
+
+    // Win32 Virtual Memory - dwSize is SIZE_T (win_size).
+    extern stdcall void     GetSystemInfo(_SystemInfo* lpSystemInfo);
+    extern stdcall win_int  GetLogicalProcessorInformation(_SysLogicalProcInfo* Buffer, u32* ReturnLength);
+    extern stdcall void*    VirtualAlloc(void* lpAddress, win_size dwSize, u32 flAllocationType, u32 flProtect);
+    extern stdcall win_int  VirtualFree(void* lpAddress, win_size dwSize, u32 dwFreeType);
+    extern stdcall void*    GetProcessHeap();
+    extern stdcall win_int  HeapValidate(void* hHeap, u32 dwFlags, const void* lpMem);
+
+    // Win32: callers always pass i64 for sizes; these wrappers truncate to i32 before calling the API.
+    if const (__PLATFORM__ == 32) {
+        void* VirtualAlloc(void* lpAddress, i64 dwSize, u32 flAllocationType, u32 flProtect) {
+            return VirtualAlloc(lpAddress, (i32)dwSize, flAllocationType, flProtect);
+        }
+        win_int VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType) {
+            return VirtualFree(lpAddress, (i32)dwSize, dwFreeType);
+        }
     }
-    win_int VirtualFree(void* lpAddress, i64 dwSize, u32 dwFreeType) {
-        return VirtualFree(lpAddress, (i32)dwSize, dwFreeType);
+
+    // Win32 Process Memory - PROCESS_MEMORY_COUNTERS (psapi.h).
+    // SIZE_T fields are pointer-sized (win_usize). The first SIZE_T lands at offset 8
+    // on both ABIs, so the two leading DWORDs need no trailing pad.
+    // x64: 72 bytes; x86: 40 bytes.
+    struct _ProcessMemoryCounters
+    {
+        u32       _cb                         = default;  //  0 - cb (set to sizeof before the call)
+        u32       _pageFaultCount             = default;  //  4 - PageFaultCount
+        win_usize _peakWorkingSetSize         = default;  //  8 - PeakWorkingSetSize
+        win_usize _workingSetSize             = default;  // 16/12 - WorkingSetSize (current physical RAM)
+        win_usize _quotaPeakPagedPoolUsage    = default;
+        win_usize _quotaPagedPoolUsage        = default;
+        win_usize _quotaPeakNonPagedPoolUsage = default;
+        win_usize _quotaNonPagedPoolUsage     = default;
+        win_usize _pagefileUsage              = default;  // commit charge (private bytes)
+        win_usize _peakPagefileUsage          = default;
+    };
+
+    // GetCurrentProcess returns a pseudo-handle (must NOT be passed to CloseHandle).
+    // K32GetProcessMemoryInfo is the kernel32-exported alias of psapi's
+    // GetProcessMemoryInfo, so it resolves from kernel32.lib (already linked) with no
+    // psapi.lib dependency. Available since Windows 7.
+    extern stdcall void*    GetCurrentProcess();
+    extern stdcall win_int  K32GetProcessMemoryInfo(void* process, _ProcessMemoryCounters* counters, u32 cb);
+
+    // Fill 'out' with the calling process's memory counters. Sets the required 'cb'
+    // field automatically. Returns nonzero on success (Win32 BOOL convention).
+    win_int GetProcessMemoryInfo(_ProcessMemoryCounters* out)
+    {
+        out->_cb = (u32)sizeof(_ProcessMemoryCounters);
+        return K32GetProcessMemoryInfo(GetCurrentProcess(), out, out->_cb);
     }
+
+    // Current working set (physical memory the process is using) in bytes; 0 on failure.
+    u64 GetProcessWorkingSetBytes()
+    {
+        _ProcessMemoryCounters c = default;
+        if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+        return (u64)c._workingSetSize;
+    }
+
+    // Peak working set since process start, in bytes; 0 on failure.
+    u64 GetProcessPeakWorkingSetBytes()
+    {
+        _ProcessMemoryCounters c = default;
+        if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+        return (u64)c._peakWorkingSetSize;
+    }
+
+    // Private commit charge (pagefile usage) in bytes; 0 on failure.
+    u64 GetProcessPrivateBytes()
+    {
+        _ProcessMemoryCounters c = default;
+        if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
+        return (u64)c._pagefileUsage;
+    }
+
+    // Value-returning wrapper: returns the calling process's memory counters by value.
+    // On failure an all-zero struct is returned (_cb == 0 signals the query failed).
+    _ProcessMemoryCounters GetProcessMemory()
+    {
+        _ProcessMemoryCounters c = default;
+        if (GetProcessMemoryInfo(&c) == 0) { return default; }
+        return c;
+    }
+
+    // WIN32_FIND_DATAA - mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
+    // FILETIME is two consecutive DWORDs; keeping them as i32 pairs avoids padding
+    // that would appear if we used i64 (since ftCreationTime starts at byte offset 4).
+    struct _WIN32_FIND_DATAA
+    {
+        i32 dwFileAttributes = 0;
+        i32 ftCreationTime_lo = 0;
+        i32 ftCreationTime_hi = 0;
+        i32 ftLastAccessTime_lo = 0;
+        i32 ftLastAccessTime_hi = 0;
+        i32 ftLastWriteTime_lo = 0;
+        i32 ftLastWriteTime_hi = 0;
+        i32 nFileSizeHigh = 0;
+        i32 nFileSizeLow = 0;
+        i32 dwReserved0 = 0;
+        i32 dwReserved1 = 0;
+        i8 cFileName[260] = default;
+        i8 cAlternateFileName[14] = default;
+    };
+
+    // Win32 Filesystem
+    extern void*    fopen(const char* path, const char* mode);
+    extern win_int  fclose(void* stream);
+    extern win_int  fread(i8* buf, win_int size, win_int count, void* stream);
+    extern win_int  fwrite(i8* buf, win_int size, win_int count, void* stream);
+    extern i8*      fgets(i8* buf, win_int size, void* stream);
+    extern win_int  feof(void* stream);
+    extern win_int  fseek(void* stream, win_int offset, win_int origin);
+    extern win_int  ftell(void* stream);
+    extern win_int  _unlink(const char* path);
+    extern stdcall win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
+    extern win_int  _access(const char* path, win_int mode);
+    extern win_int  _mkdir(const char* path);
+    extern win_int  _rmdir(const char* path);
+    extern i8*      _getcwd(i8* buf, win_int size);
+    extern win_int  _chdir(const char* path);
+    // HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
+    extern stdcall void*    FindFirstFileA(const char* pattern, _WIN32_FIND_DATAA* findData);
+    extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData);
+    extern stdcall win_int  FindClose(void* handle);
+    extern stdcall win_int  GetFileAttributesA(const char* path);
+    extern stdcall win_int  CopyFileA(const char* existing, const char* newPath, win_int failIfExists);
+    extern stdcall win_int  GetTempPathA(win_int bufLen, i8* buf);
+    extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, i8* tmpFileName);
+    extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
+
+    // Win32 Console
+    // _CONSOLE_CURSOR_INFO - 8 bytes (dwSize + bVisible).
+    struct _CONSOLE_CURSOR_INFO {
+        i32 size    = default;  // 0 - dwSize: cursor fill percentage (1-100)
+        i32 visible = default;  // 4 - bVisible: BOOL
+    };
+
+    // _CONSOLE_SCREEN_BUFFER_INFO - 22 bytes.
+    // All SHORT fields (i16); no padding needed since all fields are 2-byte aligned.
+    struct _CONSOLE_SCREEN_BUFFER_INFO {
+        i16 sizeX      = default;  //  0 - dwSize.X
+        i16 sizeY      = default;  //  2 - dwSize.Y
+        i16 cursorX    = default;  //  4 - dwCursorPosition.X
+        i16 cursorY    = default;  //  6 - dwCursorPosition.Y
+        i16 attributes = default;  //  8 - wAttributes
+        i16 winLeft    = default;  // 10 - srWindow.Left
+        i16 winTop     = default;  // 12 - srWindow.Top
+        i16 winRight   = default;  // 14 - srWindow.Right
+        i16 winBottom  = default;  // 16 - srWindow.Bottom
+        i16 maxX       = default;  // 18 - dwMaximumWindowSize.X
+        i16 maxY       = default;  // 20 - dwMaximumWindowSize.Y
+    };
+
+    // KEY_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
+    struct _KeyEventRecord {
+        i32 keyDown         = default;  //  0 - BOOL bKeyDown
+        i16 repeatCount     = default;  //  4 - wRepeatCount
+        i16 vkCode          = default;  //  6 - wVirtualKeyCode
+        i16 vkScan          = default;  //  8 - wVirtualScanCode
+        i16 uChar           = default;  // 10 - WCHAR/CHAR (low byte = ASCII)
+        i32 controlKeyState = default;  // 12 - dwControlKeyState
+    };
+
+    // MOUSE_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
+    struct _MouseEventRecord {
+        i16 mouseX          = default;  //  0 - dwMousePosition.X
+        i16 mouseY          = default;  //  2 - dwMousePosition.Y
+        i32 buttonState     = default;  //  4 - dwButtonState
+        i32 controlKeyState = default;  //  8 - dwControlKeyState
+        i32 eventFlags      = default;  // 12 - dwEventFlags
+    };
+
+    // Union of the two event record types.
+    union _InputEvent {
+        _KeyEventRecord   key   = default;
+        _MouseEventRecord mouse = default;
+    };
+
+    // _INPUT_RECORD - 20 bytes: eventType (2) + pad (2) + 16-byte event union.
+    struct _INPUT_RECORD {
+        i16         eventType = default;  //  0 - 1=KEY_EVENT, 2=MOUSE_EVENT
+        i16         _pad      = default;  //  2 - alignment pad before union
+        _InputEvent _event    = default;  //  4 - KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
+    };
+
+    extern stdcall void*    GetStdHandle(i32 nStdHandle);
+    extern stdcall win_int  WriteFile(void* hFile, const char* lpBuffer, i32 nNumberOfBytesToWrite, i32* lpNumberOfBytesWritten, void* lpOverlapped);
+    extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
+    extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
+    extern stdcall i32      GetConsoleOutputCP();
+    extern stdcall win_int  SetConsoleOutputCP(i32 wCodePageID);
+    extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);
+    extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
+    extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);
+    extern stdcall win_int  ReadConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+    extern stdcall win_int  PeekConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
+    extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
+    extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
+
+    // _CHAR_INFO - 4 bytes per console screen buffer cell.
+    struct _CHAR_INFO {
+        i16 ch   = default;  // 0 - WCHAR/CHAR union (low byte = ASCII)
+        i16 attr = default;  // 2 - WORD color attributes
+    };
+
+    // _SMALL_RECT - 8 bytes, used by ReadConsoleOutputA.
+    struct _SMALL_RECT {
+        i16 left   = default;
+        i16 top    = default;
+        i16 right  = default;
+        i16 bottom = default;
+    };
+
+    // dwBufferSize and dwBufferCoord are COORD values packed into i32
+    // (X in low 16 bits, Y in high 16 bits). lpReadRegion is updated on
+    // return to reflect the actual region read.
+    extern stdcall win_int  ReadConsoleOutputA(void* hConsoleOutput, _CHAR_INFO* lpBuffer, i32 dwBufferSize, i32 dwBufferCoord, _SMALL_RECT* lpReadRegion);
+
+    // MSVC CRT - cdecl (no stdcall). bufSize is SIZE_T (win_size).
+    extern void*    __acrt_iob_func(win_int fd);
+
+    // <conio.h> - read one keystroke directly from the console. Unbuffered, no
+    // echo, bypasses stdin entirely. Special keys (arrows, F-keys) arrive as a
+    // 0 or 0xE0 prefix followed by a second _getch() returning the scan code.
+    extern int      _getch();
+    extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
+    extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
+    extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
 }
-
-// Win32 Process Memory - PROCESS_MEMORY_COUNTERS (psapi.h).
-// SIZE_T fields are pointer-sized (win_usize). The first SIZE_T lands at offset 8
-// on both ABIs, so the two leading DWORDs need no trailing pad.
-// x64: 72 bytes; x86: 40 bytes.
-struct _ProcessMemoryCounters
-{
-    u32       _cb                         = default;  //  0 - cb (set to sizeof before the call)
-    u32       _pageFaultCount             = default;  //  4 - PageFaultCount
-    win_usize _peakWorkingSetSize         = default;  //  8 - PeakWorkingSetSize
-    win_usize _workingSetSize             = default;  // 16/12 - WorkingSetSize (current physical RAM)
-    win_usize _quotaPeakPagedPoolUsage    = default;
-    win_usize _quotaPagedPoolUsage        = default;
-    win_usize _quotaPeakNonPagedPoolUsage = default;
-    win_usize _quotaNonPagedPoolUsage     = default;
-    win_usize _pagefileUsage              = default;  // commit charge (private bytes)
-    win_usize _peakPagefileUsage          = default;
-};
-
-// GetCurrentProcess returns a pseudo-handle (must NOT be passed to CloseHandle).
-// K32GetProcessMemoryInfo is the kernel32-exported alias of psapi's
-// GetProcessMemoryInfo, so it resolves from kernel32.lib (already linked) with no
-// psapi.lib dependency. Available since Windows 7.
-extern stdcall void*    GetCurrentProcess();
-extern stdcall win_int  K32GetProcessMemoryInfo(void* process, _ProcessMemoryCounters* counters, u32 cb);
-
-// Fill 'out' with the calling process's memory counters. Sets the required 'cb'
-// field automatically. Returns nonzero on success (Win32 BOOL convention).
-win_int GetProcessMemoryInfo(_ProcessMemoryCounters* out)
-{
-    out->_cb = (u32)sizeof(_ProcessMemoryCounters);
-    return K32GetProcessMemoryInfo(GetCurrentProcess(), out, out->_cb);
-}
-
-// Current working set (physical memory the process is using) in bytes; 0 on failure.
-u64 GetProcessWorkingSetBytes()
-{
-    _ProcessMemoryCounters c = default;
-    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
-    return (u64)c._workingSetSize;
-}
-
-// Peak working set since process start, in bytes; 0 on failure.
-u64 GetProcessPeakWorkingSetBytes()
-{
-    _ProcessMemoryCounters c = default;
-    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
-    return (u64)c._peakWorkingSetSize;
-}
-
-// Private commit charge (pagefile usage) in bytes; 0 on failure.
-u64 GetProcessPrivateBytes()
-{
-    _ProcessMemoryCounters c = default;
-    if (GetProcessMemoryInfo(&c) == 0) { return (u64)0; }
-    return (u64)c._pagefileUsage;
-}
-
-// Value-returning wrapper: returns the calling process's memory counters by value.
-// On failure an all-zero struct is returned (_cb == 0 signals the query failed).
-_ProcessMemoryCounters GetProcessMemory()
-{
-    _ProcessMemoryCounters c = default;
-    if (GetProcessMemoryInfo(&c) == 0) { return default; }
-    return c;
-}
-
-// WIN32_FIND_DATAA - mirrored from winbase.h (320 bytes, matches Win32/Win64 ABI).
-// FILETIME is two consecutive DWORDs; keeping them as i32 pairs avoids padding
-// that would appear if we used i64 (since ftCreationTime starts at byte offset 4).
-struct _WIN32_FIND_DATAA
-{
-    i32 dwFileAttributes = 0;
-    i32 ftCreationTime_lo = 0;
-    i32 ftCreationTime_hi = 0;
-    i32 ftLastAccessTime_lo = 0;
-    i32 ftLastAccessTime_hi = 0;
-    i32 ftLastWriteTime_lo = 0;
-    i32 ftLastWriteTime_hi = 0;
-    i32 nFileSizeHigh = 0;
-    i32 nFileSizeLow = 0;
-    i32 dwReserved0 = 0;
-    i32 dwReserved1 = 0;
-    i8 cFileName[260] = default;
-    i8 cAlternateFileName[14] = default;
-};
-
-// Win32 Filesystem
-extern void*    fopen(const char* path, const char* mode);
-extern win_int  fclose(void* stream);
-extern win_int  fread(i8* buf, win_int size, win_int count, void* stream);
-extern win_int  fwrite(i8* buf, win_int size, win_int count, void* stream);
-extern i8*      fgets(i8* buf, win_int size, void* stream);
-extern win_int  feof(void* stream);
-extern win_int  fseek(void* stream, win_int offset, win_int origin);
-extern win_int  ftell(void* stream);
-extern win_int  _unlink(const char* path);
-extern stdcall win_int  MoveFileExA(const char* existing, const char* newPath, win_int flags);
-extern win_int  _access(const char* path, win_int mode);
-extern win_int  _mkdir(const char* path);
-extern win_int  _rmdir(const char* path);
-extern i8*      _getcwd(i8* buf, win_int size);
-extern win_int  _chdir(const char* path);
-// HANDLE is pointer-sized (void*); INVALID_HANDLE_VALUE = (void*)-1.
-extern stdcall void*    FindFirstFileA(const char* pattern, _WIN32_FIND_DATAA* findData);
-extern stdcall win_int  FindNextFileA(void* handle, _WIN32_FIND_DATAA* findData);
-extern stdcall win_int  FindClose(void* handle);
-extern stdcall win_int  GetFileAttributesA(const char* path);
-extern stdcall win_int  CopyFileA(const char* existing, const char* newPath, win_int failIfExists);
-extern stdcall win_int  GetTempPathA(win_int bufLen, i8* buf);
-extern stdcall win_int  GetTempFileNameA(const char* pathName, const char* prefix, win_int unique, i8* tmpFileName);
-extern stdcall win_int  GetFullPathNameA(const char* fileName, win_int bufLen, i8* buf, void* filePart);
-
-// Win32 Console
-// _CONSOLE_CURSOR_INFO - 8 bytes (dwSize + bVisible).
-struct _CONSOLE_CURSOR_INFO {
-    i32 size    = default;  // 0 - dwSize: cursor fill percentage (1-100)
-    i32 visible = default;  // 4 - bVisible: BOOL
-};
-
-// _CONSOLE_SCREEN_BUFFER_INFO - 22 bytes.
-// All SHORT fields (i16); no padding needed since all fields are 2-byte aligned.
-struct _CONSOLE_SCREEN_BUFFER_INFO {
-    i16 sizeX      = default;  //  0 - dwSize.X
-    i16 sizeY      = default;  //  2 - dwSize.Y
-    i16 cursorX    = default;  //  4 - dwCursorPosition.X
-    i16 cursorY    = default;  //  6 - dwCursorPosition.Y
-    i16 attributes = default;  //  8 - wAttributes
-    i16 winLeft    = default;  // 10 - srWindow.Left
-    i16 winTop     = default;  // 12 - srWindow.Top
-    i16 winRight   = default;  // 14 - srWindow.Right
-    i16 winBottom  = default;  // 16 - srWindow.Bottom
-    i16 maxX       = default;  // 18 - dwMaximumWindowSize.X
-    i16 maxY       = default;  // 20 - dwMaximumWindowSize.Y
-};
-
-// KEY_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
-struct _KeyEventRecord {
-    i32 keyDown         = default;  //  0 - BOOL bKeyDown
-    i16 repeatCount     = default;  //  4 - wRepeatCount
-    i16 vkCode          = default;  //  6 - wVirtualKeyCode
-    i16 vkScan          = default;  //  8 - wVirtualScanCode
-    i16 uChar           = default;  // 10 - WCHAR/CHAR (low byte = ASCII)
-    i32 controlKeyState = default;  // 12 - dwControlKeyState
-};
-
-// MOUSE_EVENT_RECORD - 16 bytes at offset 4 inside INPUT_RECORD.
-struct _MouseEventRecord {
-    i16 mouseX          = default;  //  0 - dwMousePosition.X
-    i16 mouseY          = default;  //  2 - dwMousePosition.Y
-    i32 buttonState     = default;  //  4 - dwButtonState
-    i32 controlKeyState = default;  //  8 - dwControlKeyState
-    i32 eventFlags      = default;  // 12 - dwEventFlags
-};
-
-// Union of the two event record types.
-union _InputEvent {
-    _KeyEventRecord   key   = default;
-    _MouseEventRecord mouse = default;
-};
-
-// _INPUT_RECORD - 20 bytes: eventType (2) + pad (2) + 16-byte event union.
-struct _INPUT_RECORD {
-    i16         eventType = default;  //  0 - 1=KEY_EVENT, 2=MOUSE_EVENT
-    i16         _pad      = default;  //  2 - alignment pad before union
-    _InputEvent _event    = default;  //  4 - KEY_EVENT_RECORD or MOUSE_EVENT_RECORD
-};
-
-extern stdcall void*    GetStdHandle(i32 nStdHandle);
-extern stdcall win_int  WriteFile(void* hFile, const char* lpBuffer, i32 nNumberOfBytesToWrite, i32* lpNumberOfBytesWritten, void* lpOverlapped);
-extern stdcall win_int  GetConsoleMode(void* hConsoleHandle, i32* lpMode);
-extern stdcall win_int  SetConsoleMode(void* hConsoleHandle, i32 dwMode);
-extern stdcall i32      GetConsoleOutputCP();
-extern stdcall win_int  SetConsoleOutputCP(i32 wCodePageID);
-extern stdcall win_int  SetConsoleCursorInfo(void* hConsoleOutput, _CONSOLE_CURSOR_INFO* lpConsoleCursorInfo);
-extern stdcall win_int  GetConsoleScreenBufferInfo(void* hConsoleOutput, _CONSOLE_SCREEN_BUFFER_INFO* lpConsoleScreenBufferInfo);
-extern stdcall win_int  GetNumberOfConsoleInputEvents(void* hConsoleInput, i32* lpcNumberOfEvents);
-extern stdcall win_int  ReadConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
-extern stdcall win_int  PeekConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsRead);
-extern stdcall win_int  WriteConsoleInputA(void* hConsoleInput, _INPUT_RECORD* lpBuffer, i32 nLength, i32* lpNumberOfEventsWritten);
-extern stdcall win_int  FlushConsoleInputBuffer(void* hConsoleInput);
-
-// _CHAR_INFO - 4 bytes per console screen buffer cell.
-struct _CHAR_INFO {
-    i16 ch   = default;  // 0 - WCHAR/CHAR union (low byte = ASCII)
-    i16 attr = default;  // 2 - WORD color attributes
-};
-
-// _SMALL_RECT - 8 bytes, used by ReadConsoleOutputA.
-struct _SMALL_RECT {
-    i16 left   = default;
-    i16 top    = default;
-    i16 right  = default;
-    i16 bottom = default;
-};
-
-// dwBufferSize and dwBufferCoord are COORD values packed into i32
-// (X in low 16 bits, Y in high 16 bits). lpReadRegion is updated on
-// return to reflect the actual region read.
-extern stdcall win_int  ReadConsoleOutputA(void* hConsoleOutput, _CHAR_INFO* lpBuffer, i32 dwBufferSize, i32 dwBufferCoord, _SMALL_RECT* lpReadRegion);
-
-// MSVC CRT - cdecl (no stdcall). bufSize is SIZE_T (win_size).
-extern void*    __acrt_iob_func(win_int fd);
-
-// <conio.h> - read one keystroke directly from the console. Unbuffered, no
-// echo, bypasses stdin entirely. Special keys (arrows, F-keys) arrive as a
-// 0 or 0xE0 prefix followed by a second _getch() returning the scan code.
-extern int      _getch();
-extern win_int  __stdio_common_vfprintf(u64 options, void* stream, const char* fmt, void* locale, va_list ap);
-extern win_int  __stdio_common_vsprintf(u64 options, char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);
-extern win_int  __stdio_common_vsscanf(u64 options, const char* buf, win_size bufSize, const char* fmt, void* locale, va_list ap);

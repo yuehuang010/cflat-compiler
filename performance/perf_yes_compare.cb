@@ -225,8 +225,8 @@ program StreamConsumer
     int main(move list<string> args)
     {
         char* buf = (char*)malloc(256);
-        void* stdinStream = __acrt_iob_func(0);
-        while (fgets(buf, 256, stdinStream) != nullptr) { count = count + (i64)1; }
+        void* stdinStream = os.windows.__acrt_iob_func(0);
+        while (os.windows.fgets(buf, 256, stdinStream) != nullptr) { count = count + (i64)1; }
         free(buf);
         return 0;
     }

@@ -351,6 +351,23 @@ namespace MathUtils
     }
 }
 
+// Dotted namespace declaration: `namespace a.b { }` declares the nested chain in
+// one line. An extern inside a namespace registers under the qualified lookup
+// name (sysapi.win.GetCurrentProcessId) but keeps its bare linkage symbol, so it
+// binds to the same imported C function. A namespace function signature may
+// reference a sibling struct unqualified.
+namespace sysapi.win
+{
+    extern stdcall u32 GetCurrentProcessId();
+
+    struct Box2 {
+        int w = default;
+        int h = default;
+    };
+
+    int area(Box2* b) { return b->w * b->h; }
+}
+
 using Math = MathUtils;          // global alias for top-level namespace
 using MathAdv = MathUtils.Advanced;  // global alias for nested namespace
 
@@ -383,6 +400,11 @@ bool testNamespace()
     result &= Test("namespace_global_qualified_write", MathUtils.readCounter(), 42);
     result &= Test("namespace_global_alias", Math.BASE, 120);  // via `using Math = MathUtils`
     result &= Test("namespace_global_outer_from_nested", MathUtils.Advanced.readOuterBase(), 120);
+    // Dotted namespace declaration + extern with bare linkage inside a namespace.
+    result &= Test("dotted_ns_extern", sysapi.win.GetCurrentProcessId() != 0, true);
+    sysapi.win.Box2 bx;
+    bx.w = 3; bx.h = 5;
+    result &= Test("dotted_ns_struct_sibling_sig", sysapi.win.area(&bx), 15);
     return result;
 }
 

@@ -73,6 +73,22 @@ extern int main()
     total++; passed += Test("WS_OVERLAPPEDWINDOW", (u32)WS_OVERLAPPEDWINDOW == 0x00CF0000u, true);
     total++; passed += Test("SW_SHOW", SW_SHOW, 5);
 
+    // Console structs are no longer shadowed by core: cflat's own bindings live in
+    // the os.windows namespace, so the header's MSDN-shaped definitions register -
+    // typedef names, nested COORD/SMALL_RECT fields and all.
+    total++; passed += Test("sizeof(COORD)", (int)sizeof(COORD), 4);
+    total++; passed += Test("sizeof(CONSOLE_SCREEN_BUFFER_INFO)", (int)sizeof(CONSOLE_SCREEN_BUFFER_INFO), 22);
+    CONSOLE_SCREEN_BUFFER_INFO csbi = default;
+    csbi.dwSize.X = 80;
+    csbi.srWindow.Bottom = 24;
+    total++; passed += Test("CONSOLE_SCREEN_BUFFER_INFO nested fields", (int)csbi.dwSize.X + (int)csbi.srWindow.Bottom, 104);
+
+    // Core's namespaced extern and the header's bare name share one linkage
+    // symbol - both lookup names must reach the same imported function.
+    u32 tidCore = os.windows.GetCurrentThreadId();
+    u32 tidHdr  = GetCurrentThreadId();
+    total++; passed += Test("os.windows extern == header extern", tidCore == tidHdr, true);
+
     // Inline `lib { ... }` brace clause: linking the named libs by bare name worked (the exe
     // built), and these calls prove each lib was actually linked, not just name-resolved.
     int cx = GetSystemMetrics(0);  // SM_CXSCREEN - user32.lib

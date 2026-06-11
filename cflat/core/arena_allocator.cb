@@ -425,7 +425,7 @@ class ArenaAllocator : IAllocator
 
         // Foreign pointer - only CRT-free if it lives on the CRT heap. No header
         // read here, so a foreign pointer is never dereferenced.
-        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+        if (os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr))
             free(ptr);
     }
 

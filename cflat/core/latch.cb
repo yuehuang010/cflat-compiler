@@ -22,7 +22,7 @@ struct latch {
     // Must be called before count_down() or wait().
     void init(int n) {
         // manual_reset=1, initial_state=0 (not yet signaled)
-        _event = CreateEventA(nullptr, 1, 0, nullptr);
+        _event = os.windows.CreateEventA(nullptr, 1, 0, nullptr);
         _count = n;
     }
 
@@ -31,7 +31,7 @@ struct latch {
         if (__fuzz_hook != nullptr) { __fuzz_hook(30); }  // thread-fuzz sched-point
         i64 remaining = __atomic_counter_decrement(&_count);
         if (remaining == 0) {
-            SetEvent(_event);
+            os.windows.SetEvent(_event);
         }
     }
 
@@ -40,14 +40,14 @@ struct latch {
     void wait() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(31); }  // thread-fuzz sched-point
         if (__atomic_counter_read(&_count) > 0) {
-            WaitForSingleObject(_event, -1);
+            os.windows.WaitForSingleObject(_event, -1);
         }
     }
 
     // Release OS resources.
     void destroy() {
         if (_event != nullptr) {
-            CloseHandle(_event);
+            os.windows.CloseHandle(_event);
             _event = nullptr;
         }
     }

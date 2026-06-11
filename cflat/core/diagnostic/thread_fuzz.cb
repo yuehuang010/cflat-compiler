@@ -60,7 +60,7 @@ i64 __fuzz_splitmix64(__FuzzTLS* s) {
 // than a shared, racy RNG.
 void __fuzz_on_syncpoint(int site) {
     if (!__fuzz_tls.inited) {
-        __fuzz_tls.rng    = __fuzz_global_seed ^ (i64)GetCurrentThreadId();
+        __fuzz_tls.rng    = __fuzz_global_seed ^ (i64)os.windows.GetCurrentThreadId();
         __fuzz_tls.inited = true;
     }
     __fuzz_tls.counter = __fuzz_tls.counter + 1;
@@ -68,8 +68,8 @@ void __fuzz_on_syncpoint(int site) {
     i64 rr = r ^ (r >> 63);                 // clear sign bit so modulo is non-negative
     if ((rr % __fuzz_global_period) == 0) {
         // Pick one of two cheap perturbations from another bit of the draw.
-        if (((r >> 8) & 1) != 0) { SwitchToThread(); }
-        else                     { Sleep(0); }
+        if (((r >> 8) & 1) != 0) { os.windows.SwitchToThread(); }
+        else                     { os.windows.Sleep(0); }
     }
 }
 
@@ -91,7 +91,7 @@ namespace ThreadFuzz {
             // No seed supplied - draw one from entropy and print it so any crash
             // this run uncovers can be replayed via CFLAT_FUZZ_SEED.
             i64 entropy = 0;
-            QueryPerformanceCounter(&entropy);
+            os.windows.QueryPerformanceCounter(&entropy);
             __fuzz_global_seed = entropy;
         }
         printf("[thread_fuzz] enabled: seed=%lld period=%lld\n",

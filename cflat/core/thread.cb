@@ -108,8 +108,8 @@ stdcall int __thread_trampoline_move(void* param) {
 // Equivalent to std::thread::hardware_concurrency().
 // Returns 0 if the value cannot be determined.
 int hardware_concurrency() {
-    _SystemInfo info = default;
-    GetSystemInfo(&info);
+    os.windows._SystemInfo info = default;
+    os.windows.GetSystemInfo(&info);
     return (int)info._numProc;
 }
 
@@ -130,7 +130,7 @@ struct Thread {
         args->_fpConfig = fpConfig;
         _args = args;
         i32 id = 0;
-        _handle = CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
+        _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline, _args, 0, &id);
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -158,7 +158,7 @@ struct Thread {
         args->_fpConfig = fpConfig;
         _args = (void*)args;
         i32 id = 0;
-        _handle = CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
+        _handle = os.windows.CreateThread(nullptr, 0, __thread_trampoline_move, _args, 0, &id);
         if (_handle == nullptr) {
             free((void*)_args);
             _args = nullptr;
@@ -170,10 +170,10 @@ struct Thread {
     // Blocks until the thread exits. Returns the thread's exit code.
     i32 join() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(42); }  // thread-fuzz sched-point
-        WaitForSingleObject(_handle, -1);  // -1 == INFINITE
+        os.windows.WaitForSingleObject(_handle, -1);  // -1 == INFINITE
         i32 code = 0;
-        GetExitCodeThread(_handle, &code);
-        CloseHandle(_handle);
+        os.windows.GetExitCodeThread(_handle, &code);
+        os.windows.CloseHandle(_handle);
         free((void*)_args);
         _handle   = nullptr;
         _args     = nullptr;
@@ -184,11 +184,11 @@ struct Thread {
     // Returns true if the thread exited within timeout_ms; does full cleanup and
     // sets _exitCode. Returns false on timeout; all handles remain intact.
     bool try_join(i32 timeout_ms) {
-        i32 result = WaitForSingleObject(_handle, timeout_ms);
+        i32 result = os.windows.WaitForSingleObject(_handle, timeout_ms);
         if (result == 0) {
             i32 code = 0;
-            GetExitCodeThread(_handle, &code);
-            CloseHandle(_handle);
+            os.windows.GetExitCodeThread(_handle, &code);
+            os.windows.CloseHandle(_handle);
             free((void*)_args);
             _handle   = nullptr;
             _args     = nullptr;
@@ -204,9 +204,9 @@ struct Thread {
     void setAffinity(u64 mask) {
         if (_handle != nullptr) {
             if const (__PLATFORM__ == 64) {
-                SetThreadAffinityMask(_handle, mask);
+                os.windows.SetThreadAffinityMask(_handle, mask);
             } else {
-                SetThreadAffinityMask(_handle, (u32)mask);
+                os.windows.SetThreadAffinityMask(_handle, (u32)mask);
             }
         }
     }
@@ -215,8 +215,8 @@ struct Thread {
     // use only when cooperative cancellation is not possible.
     void terminate() {
         if (_handle != nullptr) {
-            TerminateThread(_handle, -1);
-            CloseHandle(_handle);
+            os.windows.TerminateThread(_handle, -1);
+            os.windows.CloseHandle(_handle);
             free((void*)_args);
             _handle = nullptr;
             _args   = nullptr;

@@ -154,7 +154,7 @@ extern int main()
 
     list<string> srvArgs;
     srv.run(srvArgs);
-    Sleep(100);   // let the listener come up
+    os.windows.Sleep(100);   // let the listener come up
 
     printf("Concurrency sweep (client threads)\n");
     printf("----------------------------------\n");

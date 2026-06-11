@@ -355,7 +355,7 @@ extern int main(int argc, char** argv) {
         outStr("  cores=");
         outInt(cores);
         outStr("  (color=speed)   \n");
-        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+        os.windows.WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
 
         sleep(30);
         frame++;

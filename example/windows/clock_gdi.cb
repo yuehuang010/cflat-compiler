@@ -1,0 +1,137 @@
+// A native Win32 GUI app: an analog clock drawn with GDI, redrawn every second.
+//
+// What this exercises in the C-interop layer:
+//   - The full WM_PAINT cycle: BeginPaint/EndPaint with a PAINTSTRUCT out-param.
+//   - GDI object lifecycle: CreatePen / SelectObject / DeleteObject, Ellipse,
+//     MoveToEx / LineTo.
+//   - SetTimer + WM_TIMER driving InvalidateRect for a once-a-second repaint.
+//   - GetLocalTime filling a SYSTEMTIME struct; GetClientRect filling a RECT.
+//   - Mixing Win32 drawing with the CFlat standard library (math.cb trig).
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/clock_gdi.cb -o out/clock_gdi.exe
+//   out\clock_gdi.exe
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "math.cb";
+
+const i32 IDT_TICK = 1;
+
+// Draw one clock hand: a line from the center, rotated to `turns` of a full
+// circle (0.0 = 12 o'clock, 0.25 = 3 o'clock), `frac` of the radius long.
+void DrawHand(void* hdc, int cx, int cy, int radius, double turns, double frac)
+{
+    double angle = turns * Math.TAU - Math.PI / 2.0;
+    int x = cx + (int)(Math.cos(angle) * radius * frac);
+    int y = cy + (int)(Math.sin(angle) * radius * frac);
+    MoveToEx(hdc, cx, cy, nullptr);
+    LineTo(hdc, x, y);
+}
+
+void PaintClock(void* hwnd)
+{
+    PAINTSTRUCT ps = default;
+    void* hdc = BeginPaint(hwnd, &ps);
+
+    RECT rc = default;
+    GetClientRect(hwnd, &rc);
+    int cx = (rc.right - rc.left) / 2;
+    int cy = (rc.bottom - rc.top) / 2;
+    int radius = (cx < cy ? cx : cy) - 10;
+    if (radius < 10)
+        radius = 10;
+
+    // Face.
+    void* facePen = CreatePen(PS_SOLID, 2, 0u);          // black, 2px
+    void* old = SelectObject(hdc, facePen);
+    Ellipse(hdc, cx - radius, cy - radius, cx + radius, cy + radius);
+
+    SYSTEMTIME st = default;
+    GetLocalTime(&st);
+
+    // Hour and minute hands reuse the face pen; the second hand gets a thin
+    // red one. SelectObject returns the previous pen so it can be restored.
+    double hours   = (double)(st.wHour % 12u) / 12.0 + (double)st.wMinute / 720.0;
+    double minutes = (double)st.wMinute / 60.0 + (double)st.wSecond / 3600.0;
+    double seconds = (double)st.wSecond / 60.0;
+    DrawHand(hdc, cx, cy, radius, hours, 0.5);
+    DrawHand(hdc, cx, cy, radius, minutes, 0.8);
+
+    void* secondPen = CreatePen(PS_SOLID, 1, 255u);      // RGB(255,0,0) red
+    SelectObject(hdc, secondPen);
+    DrawHand(hdc, cx, cy, radius, seconds, 0.9);
+
+    SelectObject(hdc, old);
+    DeleteObject(facePen);
+    DeleteObject(secondPen);
+
+    EndPaint(hwnd, &ps);
+}
+
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_PAINT)
+    {
+        PaintClock(hwnd);
+        return (i64)0;
+    }
+
+    if (msg == WM_TIMER)
+    {
+        // Invalidate the whole client area; TRUE erases the background so the
+        // previous hands disappear.
+        InvalidateRect(hwnd, nullptr, 1);
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        KillTimer(hwnd, (u64)IDT_TICK);
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hbrBackground = GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = "CFlatClockWindow";
+
+    RegisterClassExA(&wc);
+
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatClockWindow",
+        "CFlat GDI Clock",
+        (u32)WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        300, 320,
+        nullptr, nullptr, hInst, nullptr);
+
+    if (hwnd == nullptr)
+    {
+        printf("CreateWindowExA failed\n");
+        return 1;
+    }
+
+    SetTimer(hwnd, (u64)IDT_TICK, 1000u, nullptr);
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    return (int)msg.wParam;
+}

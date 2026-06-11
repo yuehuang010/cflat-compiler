@@ -73,7 +73,7 @@ extern int main()
 
     list<string> srvArgs;
     srv.run(srvArgs);
-    Sleep(50);
+    os.windows.Sleep(50);
 
     HttpClient client;
     bool ok = true;

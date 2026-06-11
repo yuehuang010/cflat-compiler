@@ -234,7 +234,7 @@ extern int main(int argc, char** argv) {
         }
         maxChange = maxAbsDiff(a, b, n);    // a is newest, b is one sweep back
         renderFrame(a, H, W, frame, frames, maxChange);
-        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+        os.windows.WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
         sleep(33);
         frame++;
     }

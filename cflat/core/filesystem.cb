@@ -18,32 +18,32 @@ class File
 
     bool openRead(string path)
     {
-        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
-        _handle = fopen(path.data(), "rb");
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
+        _handle = os.windows.fopen(path.data(), "rb");
         if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool openWrite(string path)
     {
-        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
-        _handle = fopen(path.data(), "wb");
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
+        _handle = os.windows.fopen(path.data(), "wb");
         if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool openAppend(string path)
     {
-        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
-        _handle = fopen(path.data(), "ab");
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
+        _handle = os.windows.fopen(path.data(), "ab");
         if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
 
     bool open(string path, string mode)
     {
-        if (_handle != nullptr) { __handle_tracker_remove(_handle); fclose(_handle); }
-        _handle = fopen(path.data(), mode.data());
+        if (_handle != nullptr) { __handle_tracker_remove(_handle); os.windows.fclose(_handle); }
+        _handle = os.windows.fopen(path.data(), mode.data());
         if (_handle != nullptr) __handle_tracker_add(_handle);
         return _handle != nullptr;
     }
@@ -53,13 +53,13 @@ class File
         if (_handle != nullptr)
         {
             __handle_tracker_remove(_handle);
-            fclose(_handle);
+            os.windows.fclose(_handle);
             _handle = nullptr;
         }
     }
 
     bool isOpen() { return _handle != nullptr; }
-    bool atEnd()  { return _handle != nullptr && feof(_handle) != 0; }
+    bool atEnd()  { return _handle != nullptr && os.windows.feof(_handle) != 0; }
 
     // Read one line, stripping trailing \r and \n. Returns "" at EOF.
     // Uses fgetc so there is no line-length limit.
@@ -95,11 +95,11 @@ class File
     string readAll()
     {
         if (_handle == nullptr) return "";
-        fseek(_handle, 0, 2);
-        int isz = ftell(_handle);
-        fseek(_handle, 0, 0);
+        os.windows.fseek(_handle, 0, 2);
+        int isz = os.windows.ftell(_handle);
+        os.windows.fseek(_handle, 0, 0);
         i8* buf = new i8[isz + 1];
-        fread(buf, 1, isz, _handle);
+        os.windows.fread(buf, 1, isz, _handle);
         buf[isz] = 0;
         string s;
         s._ptr = buf;
@@ -111,7 +111,7 @@ class File
     int readBytes(i8* buf, int count)
     {
         if (_handle == nullptr) return 0;
-        return fread(buf, 1, count, _handle);
+        return os.windows.fread(buf, 1, count, _handle);
     }
 
     // Write a string to the file. Returns true if all bytes were written.
@@ -120,7 +120,7 @@ class File
         if (_handle == nullptr) return false;
         int len = text.length();
         if (len == 0) return true;
-        int written = fwrite(text.data(), 1, len, _handle);
+        int written = os.windows.fwrite(text.data(), 1, len, _handle);
         return written == len;
     }
 
@@ -136,7 +136,7 @@ class File
     int writeBytes(i8* buf, int count)
     {
         if (_handle == nullptr) return 0;
-        return fwrite(buf, 1, count, _handle);
+        return os.windows.fwrite(buf, 1, count, _handle);
     }
 
     // Flush write buffers to the OS. Returns true on success.
@@ -150,36 +150,36 @@ class File
     bool seek(int offset, int origin)
     {
         if (_handle == nullptr) return false;
-        return fseek(_handle, offset, origin) == 0;
+        return os.windows.fseek(_handle, offset, origin) == 0;
     }
 
     // Return the current file position, or -1 if the handle is closed.
     int tell()
     {
         if (_handle == nullptr) return -1;
-        return ftell(_handle);
+        return os.windows.ftell(_handle);
     }
 
     // Return the total file size in bytes without changing the read position.
     int size()
     {
         if (_handle == nullptr) return -1;
-        int cur = ftell(_handle);
-        fseek(_handle, 0, 2);
-        int sz = ftell(_handle);
-        fseek(_handle, cur, 0);
+        int cur = os.windows.ftell(_handle);
+        os.windows.fseek(_handle, 0, 2);
+        int sz = os.windows.ftell(_handle);
+        os.windows.fseek(_handle, cur, 0);
         return sz;
     }
 
     static bool exists(string path)
     {
-        return _access(path.data(), 0) == 0;
+        return os.windows._access(path.data(), 0) == 0;
     }
 
     // Return true if path names an existing regular file (not a directory).
     static bool isFile(string path)
     {
-        win_int attrs = GetFileAttributesA(path.data());
+        win_int attrs = os.windows.GetFileAttributesA(path.data());
         if (attrs == (i32)-1) return false;
         return (attrs & 16) == 0;
     }
@@ -187,25 +187,25 @@ class File
     // Return true if path names an existing directory.
     static bool isDirectory(string path)
     {
-        win_int attrs = GetFileAttributesA(path.data());
+        win_int attrs = os.windows.GetFileAttributesA(path.data());
         if (attrs == (i32)-1) return false;
         return (attrs & 16) != 0;
     }
 
     static bool remove(string path)
     {
-        return _unlink(path.data()) == 0;
+        return os.windows._unlink(path.data()) == 0;
     }
 
     static bool move(string src, string dst)
     {
-        return MoveFileExA(src.data(), dst.data(), 1) != 0;  // MOVEFILE_REPLACE_EXISTING
+        return os.windows.MoveFileExA(src.data(), dst.data(), 1) != 0;  // MOVEFILE_REPLACE_EXISTING
     }
 
     // Copy src to dst, overwriting dst if it exists.
     static bool copy(string src, string dst)
     {
-        return CopyFileA(src.data(), dst.data(), 0) != 0;
+        return os.windows.CopyFileA(src.data(), dst.data(), 0) != 0;
     }
 
     // Read the entire file at path in one call.
@@ -271,7 +271,7 @@ class File
         if (_handle != nullptr)
         {
             __handle_tracker_remove(_handle);
-            fclose(_handle);
+            os.windows.fclose(_handle);
         }
     }
 };
@@ -404,7 +404,7 @@ class Path
     static string getAbsolute(string path)
     {
         i8* buf = new i8[4096];
-        win_int len = GetFullPathNameA(path.data(), 4096, buf, nullptr);
+        win_int len = os.windows.GetFullPathNameA(path.data(), 4096, buf, nullptr);
         if (len == 0 || len >= 4096) { delete[] buf; return path; }
         string s;
         s._ptr = buf;
@@ -416,7 +416,7 @@ class Path
     static string getTempPath()
     {
         i8* buf = new i8[260];
-        win_int len = GetTempPathA(260, buf);
+        win_int len = os.windows.GetTempPathA(260, buf);
         if (len == 0) { delete[] buf; return ""; }
         if (len > 0 && buf[len - 1] == '\\') { buf[len - 1] = 0; len--; }
         string s;
@@ -431,10 +431,10 @@ class Path
     static string getTempFile(string prefix)
     {
         i8* tmpDir = new i8[260];
-        win_int tlen = GetTempPathA(260, tmpDir);
+        win_int tlen = os.windows.GetTempPathA(260, tmpDir);
         if (tlen == 0) { delete[] tmpDir; return ""; }
         i8* buf = new i8[260];
-        win_int ok = GetTempFileNameA(tmpDir, prefix.data(), 0, buf);
+        win_int ok = os.windows.GetTempFileNameA(tmpDir, prefix.data(), 0, buf);
         delete[] tmpDir;
         if (ok == 0) { delete[] buf; return ""; }
         string s;
@@ -471,9 +471,9 @@ class Directory
         return s;
     }
 
-    bool exists()  { return _access(_pathPtr, 0) == 0; }
-    bool create()  { return _mkdir(_pathPtr) == 0; }
-    bool remove()  { return _rmdir(_pathPtr) == 0; }
+    bool exists()  { return os.windows._access(_pathPtr, 0) == 0; }
+    bool create()  { return os.windows._mkdir(_pathPtr) == 0; }
+    bool remove()  { return os.windows._rmdir(_pathPtr) == 0; }
 
     list<string>* list()          { return Directory.list(path()); }
     list<string>* listFiles()     { return Directory.listFiles(path()); }
@@ -488,17 +488,17 @@ class Directory
 
     static bool exists(string path)
     {
-        return _access(path.data(), 0) == 0;
+        return os.windows._access(path.data(), 0) == 0;
     }
 
-    static bool create(string path) { return _mkdir(path.data()) == 0; }
-    static bool remove(string path) { return _rmdir(path.data()) == 0; }
+    static bool create(string path) { return os.windows._mkdir(path.data()) == 0; }
+    static bool remove(string path) { return os.windows._rmdir(path.data()) == 0; }
 
     // Return the process current working directory.
     static string getCurrent()
     {
         i8* buf = new i8[4096];
-        i8* result = _getcwd(buf, 4096);
+        i8* result = os.windows._getcwd(buf, 4096);
         if (result == nullptr)
         {
             delete[] buf;
@@ -512,7 +512,7 @@ class Directory
 
     static bool setCurrent(string path)
     {
-        return _chdir(path.data()) == 0;
+        return os.windows._chdir(path.data()) == 0;
     }
 
     // List all entries (files and subdirs) in path, excluding . and ..
@@ -545,8 +545,8 @@ class Directory
     // Returns true if path exists after the call.
     static bool createAll(string path)
     {
-        if (_mkdir(path.data()) == 0) return true;
-        if (_access(path.data(), 0) == 0) return true;
+        if (os.windows._mkdir(path.data()) == 0) return true;
+        if (os.windows._access(path.data(), 0) == 0) return true;
 
         i32 len = path.length();
         i8* buf = new i8[len + 1];
@@ -563,7 +563,7 @@ class Directory
                 {
                     i8 saved = buf[i];
                     buf[i] = 0;
-                    _mkdir(buf);
+                    os.windows._mkdir(buf);
                     buf[i] = saved;
                 }
             }
@@ -571,7 +571,7 @@ class Directory
         }
 
         delete[] buf;
-        return _access(path.data(), 0) == 0;
+        return os.windows._access(path.data(), 0) == 0;
     }
 
     // Return the system temporary directory path (no trailing backslash).
@@ -588,8 +588,8 @@ class Directory
     {
         list<string>* result = new list<string>;
         string pattern = path + "\\*";
-        _WIN32_FIND_DATAA* findData = new _WIN32_FIND_DATAA;
-        void* handle = FindFirstFileA(pattern.data(), findData);
+        os.windows._WIN32_FIND_DATAA* findData = new os.windows._WIN32_FIND_DATAA;
+        void* handle = os.windows.FindFirstFileA(pattern.data(), findData);
         if (handle == (void*)(i64)-1)
         {
             delete findData;
@@ -610,8 +610,8 @@ class Directory
                 entry._len = len;
                 result->add(entry);
             }
-        } while (FindNextFileA(handle, findData) != 0);
-        FindClose(handle);
+        } while (os.windows.FindNextFileA(handle, findData) != 0);
+        os.windows.FindClose(handle);
         delete findData;
         return result;
     }
@@ -624,7 +624,7 @@ class Directory
         {
             string name = entries->get(i);
             string fullPath = Path.combine(path, name);
-            win_int attrs = GetFileAttributesA(fullPath.data());
+            win_int attrs = os.windows.GetFileAttributesA(fullPath.data());
             bool isDir = attrs != (i32)-1 && (attrs & 16) != 0;
             if (isDir) Directory._collectRecursive(fullPath, result);
             result->add(fullPath);

@@ -301,7 +301,7 @@ For a full language reference, see [`doc/LANGUAGE.md`](doc/LANGUAGE.md).
 
 - **Generics**: `struct Box<T> { T value = default; }` - monomorphized at compile time
 - **Interfaces**: `interface IReadable { int Read(); }` with VTable dispatch; fat pointer layout `{i8* vtable, i8* data}`
-- **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`
+- **Namespaces**: `namespace Math { ... }` with qualified access `Math.square()`; dotted form `namespace os.windows { ... }` declares the nested chain. An `extern` inside a namespace registers under the qualified lookup name but keeps its bare linkage symbol - core's `os.windows.Sleep` and a header-imported bare `Sleep` bind to the same imported function. Core's Win32/CRT bindings all live in `os.windows`, so `import "windows.h"` registers its structs (CONSOLE_SCREEN_BUFFER_INFO, INPUT_RECORD, ...) unshadowed.
 - **Type aliases**: `using M = Math` - expands at reference time
 - **Module system**: `import "file.cb"` for multi-file compilation; `import { "a.cb", "b.cb" };` is a grouped shorthand for several plain imports on one line (each entry routes exactly like a bare `import "x";` - same `.cb`/`.h`/`.c` dispatch, no per-entry `lib`/`define`). A trailing `cache` on a group applies to **every** entry (`import { "a.h", "b.h" } cache;` caches both - a no-op for `.cb`/`.c` entries). `as` is meaningful only on a single-entry group (one alias cannot name many files).
 - **Sized integers**: `i8, i16, i32, i64, u8, u16, u32, u64`; C aliases map to fixed widths

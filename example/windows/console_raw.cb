@@ -1,0 +1,89 @@
+// Raw console input: switch stdin out of line mode and read key events
+// directly, echoing what was pressed until ESC quits.
+//
+// What this exercises in the C-interop layer:
+//   - MSDN-shaped structs straight from windows.h: CONSOLE_SCREEN_BUFFER_INFO
+//     with its nested COORD/SMALL_RECT fields (csbi.dwSize.X), exactly as the
+//     documentation writes them. Core's own console bindings live in the
+//     os.windows namespace, so the header's definitions register unshadowed.
+//   - Header constants folded from windows.h: STD_*_HANDLE, ENABLE_* mode
+//     flags, KEY_EVENT, VK_ESCAPE - no hand-transcribed magic numbers.
+//   - A small struct passed BY VALUE: SetConsoleCursorPosition takes a 4-byte
+//     COORD by value (an ABI edge - not a pointer).
+//   - One deliberate exception: INPUT_RECORD embeds an anonymous union, which
+//     C interop cannot import by value (the type is registered as an opaque
+//     shell - usable only through a pointer). Core's flattened equivalent,
+//     os.windows._INPUT_RECORD, covers the read loop instead.
+//
+// Build & run (needs a real console - exits politely if stdin is redirected):
+//   x64/Release/cflat.exe example/windows/console_raw.cb -o out/console_raw.exe
+//   out\console_raw.exe
+import "windows.h" cache;
+
+extern int main()
+{
+    void* hin  = GetStdHandle(STD_INPUT_HANDLE);
+    void* hout = GetStdHandle(STD_OUTPUT_HANDLE);
+
+    // If stdin is a pipe/file (e.g. running under a test harness), console-mode
+    // calls fail - report and exit cleanly instead of hanging on input.
+    i32 oldMode = 0;
+    if (GetConsoleMode(hin, &oldMode) == 0)
+    {
+        printf("stdin is not a console; nothing to do.\n");
+        return 0;
+    }
+
+    // Raw mode: no line buffering, no automatic echo.
+    i32 rawMode = oldMode & ~(i32)(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    SetConsoleMode(hin, rawMode);
+
+    // Where is the cursor now? This is the header's struct, fields named
+    // exactly as MSDN documents them - nested COORD and SMALL_RECT included.
+    CONSOLE_SCREEN_BUFFER_INFO csbi = default;
+    GetConsoleScreenBufferInfo(hout, &csbi);
+    printf("buffer %dx%d, cursor at (%d,%d)\n",
+           (int)csbi.dwSize.X, (int)csbi.dwSize.Y,
+           (int)csbi.dwCursorPosition.X, (int)csbi.dwCursorPosition.Y);
+
+    printf("Raw key mode - press keys (ESC quits):\n");
+
+    while (true)
+    {
+        // INPUT_RECORD's anonymous union cannot be imported by value, so the
+        // read loop uses core's flattened layout from the os.windows namespace.
+        os.windows._INPUT_RECORD rec = default;
+        i32 count = 0;
+        if (os.windows.ReadConsoleInputA(hin, &rec, 1, &count) == 0 || count == 0)
+            break;
+
+        // Only key-down events; ignore mouse/resize/focus records and releases.
+        if (rec.eventType != (i16)KEY_EVENT)
+            continue;
+        if (rec._event.key.keyDown == 0)
+            continue;
+
+        int vk = (int)rec._event.key.vkCode & 0xFFFF;
+        int ch = (int)rec._event.key.uChar & 0xFF;   // low byte is the ASCII char
+
+        if (vk == VK_ESCAPE)
+            break;
+
+        if (ch >= 32 && ch < 127)
+            printf("  key '%c'  (vk=0x%02X, repeat=%d)\n", ch, vk,
+                   (int)rec._event.key.repeatCount);
+        else
+            printf("  key vk=0x%02X (non-printable)\n", vk);
+    }
+
+    // Park the cursor where it started - SetConsoleCursorPosition takes the
+    // 4-byte COORD struct by value, exercising the small-struct ABI path.
+    COORD home = default;
+    home.X = csbi.dwCursorPosition.X;
+    home.Y = csbi.dwCursorPosition.Y;
+    SetConsoleCursorPosition(hout, home);
+    printf("\nback at (%d,%d), restoring console mode.\n", (int)home.X, (int)home.Y);
+
+    SetConsoleMode(hin, oldMode);
+    return 0;
+}

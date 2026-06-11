@@ -51,8 +51,8 @@ struct stream {
         _writePos = 0;
         _cvFull  = malloc((i64)8);  // sizeof(CONDITION_VARIABLE) == ptr-sized
         _cvEmpty = malloc((i64)8);
-        InitializeConditionVariable(_cvFull);
-        InitializeConditionVariable(_cvEmpty);
+        os.windows.InitializeConditionVariable(_cvFull);
+        os.windows.InitializeConditionVariable(_cvEmpty);
         _mu.acquire();
         _emptyPool = _bufB;    // seed: bufB ready for first swap
         _mu.release();
@@ -67,7 +67,7 @@ struct stream {
         while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
         _pendingFull = _writeBuf;
         _pendingLen  = _writePos;
-        WakeConditionVariable(_cvFull);
+        os.windows.WakeConditionVariable(_cvFull);
 
         while (_emptyPool == nullptr) { _mu.sleep_cv(_cvEmpty); }
         _writeBuf  = _emptyPool;
@@ -88,7 +88,7 @@ struct stream {
             while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
             _pendingFull = data;
             _pendingLen  = len;
-            WakeConditionVariable(_cvFull);
+            os.windows.WakeConditionVariable(_cvFull);
             _mu.release();
             return;
         }
@@ -121,7 +121,7 @@ struct stream {
             while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
             _pendingFull = buf;
             _pendingLen  = len;
-            WakeConditionVariable(_cvFull);
+            os.windows.WakeConditionVariable(_cvFull);
             _mu.release();
             return;
         }
@@ -146,7 +146,7 @@ struct stream {
         if (_pendingFull == nullptr) { _mu.release(); return nullptr; }
         char* buf    = _pendingFull;
         _pendingFull = nullptr;
-        WakeConditionVariable(_cvFull);   // unblock producer waiting for the slot to clear
+        os.windows.WakeConditionVariable(_cvFull);   // unblock producer waiting for the slot to clear
         _mu.release();
         return buf;
     }
@@ -160,7 +160,7 @@ struct stream {
         char* buf    = _pendingFull;
         out_len[0]   = _pendingLen;
         _pendingFull = nullptr;
-        WakeConditionVariable(_cvFull);
+        os.windows.WakeConditionVariable(_cvFull);
         _mu.release();
         return buf;
     }
@@ -171,7 +171,7 @@ struct stream {
         if (buf == _bufA || buf == _bufB) {
             _mu.acquire();
             _emptyPool = buf;
-            WakeConditionVariable(_cvEmpty);
+            os.windows.WakeConditionVariable(_cvEmpty);
             _mu.release();
         } else {
             free((void*)buf);
@@ -192,13 +192,13 @@ struct stream {
             _pendingFull = _writeBuf;
             _pendingLen  = _writePos;
             _writePos    = 0;
-            WakeConditionVariable(_cvFull);
+            os.windows.WakeConditionVariable(_cvFull);
             _mu.release();
         }
         _mu.acquire();
         while (_pendingFull != nullptr) { _mu.sleep_cv(_cvFull); }
         _eof = true;
-        WakeConditionVariable(_cvFull);
+        os.windows.WakeConditionVariable(_cvFull);
         _mu.release();
     }
 

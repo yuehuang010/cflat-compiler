@@ -1,0 +1,72 @@
+// Read Windows version information from the registry (advapi32.dll).
+//
+// What this exercises in the C-interop layer:
+//   - A second system import lib (advapi32.lib) linked by bare name via the
+//     inline `lib` clause - resolved against the SDK lib dir, no --c-lib needed.
+//   - Opaque handle out-param: RegOpenKeyExA returns the opened HKEY through
+//     a pointer-to-handle parameter.
+//   - The classic in/out DWORD* buffer-size protocol of RegQueryValueExA and
+//     RegEnumValueA (caller passes capacity, callee writes back actual size).
+//   - KEY_* / ERROR_* / REG_* #define constants folded from the header bind
+//     (ERROR_* live in the SDK shared/ dir, folded since the in-scope filter
+//     learned the um/ <-> shared/ sibling relationship).
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/registry_dump.cb -o out/registry_dump.exe
+//   out\registry_dump.exe
+import "windows.h" lib "advapi32.lib" cache;
+
+extern int main()
+{
+    // HKEY_LOCAL_MACHINE is a pseudo-handle macro (a cast expression); the header
+    // bind folds it to a void* constant, so it is usable directly.
+    void* key = nullptr;
+    i32 rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                           "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                           0u, (u32)KEY_READ, &key);
+    if (rc != ERROR_SUCCESS)
+    {
+        printf("RegOpenKeyExA failed: %d\n", rc);
+        return 1;
+    }
+
+    // Query two well-known string values with the size-negotiation protocol.
+    // sizeof(buf) on a fixed array gives its byte capacity.
+    char[128] product;
+    u32 type = 0;
+    u32 size = (u32)sizeof(product);
+    rc = RegQueryValueExA(key, "ProductName", nullptr, &type, product, &size);
+    if (rc == ERROR_SUCCESS && type == (u32)REG_SZ)
+        printf("ProductName : %s\n", product);
+
+    char[64] build;
+    size = (u32)sizeof(build);
+    rc = RegQueryValueExA(key, "CurrentBuild", nullptr, &type, build, &size);
+    if (rc == ERROR_SUCCESS && type == (u32)REG_SZ)
+        printf("CurrentBuild: %s\n", build);
+
+    // Enumerate the first few values under the key - RegEnumValueA writes the
+    // value name and data back through caller-supplied buffers, again with
+    // in/out lengths.
+    printf("\nFirst values under CurrentVersion:\n");
+    u32 index = 0;
+    while (index < 5u)
+    {
+        char[256] name;
+        u32 nameLen = (u32)sizeof(name);
+        char[256] data;
+        u32 dataLen = (u32)sizeof(data);
+        rc = RegEnumValueA(key, index, name, &nameLen, nullptr, &type, data, &dataLen);
+        if (rc != ERROR_SUCCESS)
+            break;
+
+        if (type == (u32)REG_SZ)
+            printf("  %-24s = %s\n", name, data);
+        else
+            printf("  %-24s (type %u, %u bytes)\n", name, type, dataLen);
+        index++;
+    }
+
+    RegCloseKey(key);
+    return 0;
+}

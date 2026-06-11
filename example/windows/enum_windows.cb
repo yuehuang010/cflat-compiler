@@ -1,0 +1,56 @@
+// Enumerate all top-level windows and print the visible, titled ones.
+//
+// What this exercises in the C-interop layer:
+//   - Passing a CFlat function as a C callback *parameter* (EnumWindows takes a
+//     WNDENUMPROC) - not just storing it in a struct field like a WndProc.
+//   - Round-tripping user state through the LPARAM cookie: the callback gets a
+//     pointer to a CFlat struct on the caller's stack and mutates it.
+//   - Filling a caller-supplied char buffer (GetWindowTextA) from a fixed-size
+//     CFlat array that decays to char*.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/enum_windows.cb -o out/enum_windows.exe
+//   out\enum_windows.exe
+import "windows.h" lib "user32.lib" cache;
+
+// State shared with the callback, passed by pointer through LPARAM.
+struct EnumStats
+{
+    int total = 0;      // every top-level window seen
+    int printed = 0;    // visible windows with a non-empty title
+};
+
+// BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam).
+// Return nonzero to keep enumerating, zero to stop early.
+// stdcall keeps it ABI-correct on the 32-bit target (no-op on x64).
+stdcall i32 OnWindow(void* hwnd, i64 lParam)
+{
+    EnumStats* stats = (EnumStats*)lParam;
+    stats->total++;
+
+    if (IsWindowVisible(hwnd) == 0)
+        return 1;
+
+    char[256] title;
+    int len = GetWindowTextA(hwnd, title, 256);
+    if (len <= 0)
+        return 1;
+
+    stats->printed++;
+    printf("  %p  %s\n", hwnd, title);
+
+    // Stop after a screenful - this is a demo, not a window manager.
+    if (stats->printed >= 20)
+        return 0;
+    return 1;
+}
+
+extern int main()
+{
+    EnumStats stats;
+    printf("Visible top-level windows:\n");
+    EnumWindows((void*)OnWindow, (i64)&stats);
+    printf("\n%d visible/titled shown, %d total enumerated.\n",
+           stats.printed, stats.total);
+    return stats.total > 0 ? 0 : 1;
+}

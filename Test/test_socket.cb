@@ -44,7 +44,7 @@ extern int main()
     Thread* srv = new Thread;
     srv->start(serverThread, nullptr);
 
-    Sleep(50);
+    os.windows.Sleep(50);
 
     Socket* c = new Socket;
     if (!c->createTcp())

@@ -113,7 +113,7 @@ struct MouseEvent {
 // (ICANON/ECHO off) and read one byte from stdin.
 
 int readKey() {
-    return _getch();
+    return os.windows._getch();
 }
 
 // ── Terminal ─────────────────────────────────────────────────────────────────
@@ -132,25 +132,25 @@ struct Terminal {
     // false return - they just become no-ops or degrade gracefully.
     bool init() {
         // STD_OUTPUT_HANDLE = (DWORD)(-11), STD_INPUT_HANDLE = (DWORD)(-10)
-        _hOut = GetStdHandle(-11);
-        _hIn  = GetStdHandle(-10);
+        _hOut = os.windows.GetStdHandle(-11);
+        _hIn  = os.windows.GetStdHandle(-10);
         if (_hOut == nullptr || _hIn == nullptr) return false;
 
-        if (GetConsoleMode(_hOut, &_savedOut) == 0) return false;
-        if (GetConsoleMode(_hIn,  &_savedIn)  == 0) return false;
+        if (os.windows.GetConsoleMode(_hOut, &_savedOut) == 0) return false;
+        if (os.windows.GetConsoleMode(_hIn,  &_savedIn)  == 0) return false;
 
         // Add ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x04) to existing output flags.
-        SetConsoleMode(_hOut, _savedOut | 0x04);
+        os.windows.SetConsoleMode(_hOut, _savedOut | 0x04);
 
         // Switch to UTF-8 output so Unicode characters (e.g. ▀ for image rendering)
         // are encoded correctly. Saved and restored in restore().
-        _savedCP = GetConsoleOutputCP();
-        SetConsoleOutputCP(65001);
+        _savedCP = os.windows.GetConsoleOutputCP();
+        os.windows.SetConsoleOutputCP(65001);
 
         // ENABLE_EXTENDED_FLAGS (0x80) | ENABLE_MOUSE_INPUT (0x10).
         // Clears ENABLE_QUICK_EDIT_MODE (required for mouse events to arrive),
         // disables echo/line-buffering, and enables mouse event delivery.
-        SetConsoleMode(_hIn, 0x90);
+        os.windows.SetConsoleMode(_hIn, 0x90);
 
         _active = true;
         return true;
@@ -160,9 +160,9 @@ struct Terminal {
     // times. Also called automatically by ~Terminal().
     void restore() {
         if (_active) {
-            SetConsoleMode(_hOut, _savedOut);
-            SetConsoleMode(_hIn,  _savedIn);
-            SetConsoleOutputCP(_savedCP);
+            os.windows.SetConsoleMode(_hOut, _savedOut);
+            os.windows.SetConsoleMode(_hIn,  _savedIn);
+            os.windows.SetConsoleOutputCP(_savedCP);
             _active = false;
         }
     }
@@ -174,26 +174,26 @@ struct Terminal {
     bool supportsSixel() {
         if (!_active) return false;
 
-        FlushConsoleInputBuffer(_hIn);
+        os.windows.FlushConsoleInputBuffer(_hIn);
         printf("\033[c");
         fflush(nullptr);
 
-        Sleep(150);
+        os.windows.Sleep(150);
 
         char[128] resp;
         int  rlen = 0;
 
         i32 count = 0;
-        GetNumberOfConsoleInputEvents(_hIn, &count);
+        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
         while (count > 0 && rlen < 127) {
-            _INPUT_RECORD rec;
+            os.windows._INPUT_RECORD rec;
             i32 read = 0;
-            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
             if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 char c = (char)(rec._event.key.uChar & 0xFF);
                 if (c != '\0') { resp[rlen] = c; rlen++; }
             }
-            GetNumberOfConsoleInputEvents(_hIn, &count);
+            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
         }
         resp[rlen] = '\0';
 
@@ -227,26 +227,26 @@ struct Terminal {
         *cellH = 16;
         if (!_active) return;
 
-        FlushConsoleInputBuffer(_hIn);
+        os.windows.FlushConsoleInputBuffer(_hIn);
         printf("\033[16t");
         fflush(nullptr);
 
-        Sleep(150);
+        os.windows.Sleep(150);
 
         char[128] resp;
         int  rlen = 0;
 
         i32 count = 0;
-        GetNumberOfConsoleInputEvents(_hIn, &count);
+        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
         while (count > 0 && rlen < 127) {
-            _INPUT_RECORD rec;
+            os.windows._INPUT_RECORD rec;
             i32 read = 0;
-            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
+            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) break;
             if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 char c = (char)(rec._event.key.uChar & 0xFF);
                 if (c != '\0') { resp[rlen] = c; rlen++; }
             }
-            GetNumberOfConsoleInputEvents(_hIn, &count);
+            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
         }
         resp[rlen] = '\0';
 
@@ -308,8 +308,8 @@ struct Terminal {
         *width  = 0;
         *height = 0;
         if (_hOut == nullptr) return false;
-        _CONSOLE_SCREEN_BUFFER_INFO info;
-        if (GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
+        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
         *width  = (int)(info.winRight  - info.winLeft + 1);
         *height = (int)(info.winBottom - info.winTop  + 1);
         return true;
@@ -320,7 +320,7 @@ struct Terminal {
     bool pollKey(KeyEvent* out) {
         if (_hIn == nullptr) return false;
         i32 count = 0;
-        GetNumberOfConsoleInputEvents(_hIn, &count);
+        os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
         if (count == 0) return false;
         return _readNextKey(out, false);
     }
@@ -335,13 +335,13 @@ struct Terminal {
     // Discards queued key events. Returns false when the queue has no mouse events.
     bool pollMouse(MouseEvent* out) {
         if (_hIn == nullptr) return false;
-        _INPUT_RECORD rec;
+        os.windows._INPUT_RECORD rec;
         i32 read = 0;
         while (true) {
             i32 count = 0;
-            GetNumberOfConsoleInputEvents(_hIn, &count);
+            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
             if (count == 0) return false;
-            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
             if (rec.eventType == 2) {
                 _fillMouse(out, &rec._event.mouse);
                 _adjustMouseCoords(out);
@@ -357,13 +357,13 @@ struct Terminal {
     // you don't need that struct filled.
     bool pollEvent(i32* eventType, KeyEvent* key, MouseEvent* mouse) {
         if (_hIn == nullptr) return false;
-        _INPUT_RECORD rec;
+        os.windows._INPUT_RECORD rec;
         i32 read = 0;
         while (true) {
             i32 count = 0;
-            GetNumberOfConsoleInputEvents(_hIn, &count);
+            os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
             if (count == 0) return false;
-            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
             if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 *eventType = 1;
                 if (key != nullptr) {
@@ -393,15 +393,15 @@ struct Terminal {
     // block=true  - keeps reading (discarding non-key and key-up events) until a key-down arrives.
     // block=false - reads only already-queued events; returns false when the queue is drained.
     bool _readNextKey(KeyEvent* out, bool block) {
-        _INPUT_RECORD rec;
+        os.windows._INPUT_RECORD rec;
         i32 read = 0;
         while (true) {
             if (!block) {
                 i32 count = 0;
-                GetNumberOfConsoleInputEvents(_hIn, &count);
+                os.windows.GetNumberOfConsoleInputEvents(_hIn, &count);
                 if (count == 0) return false;
             }
-            if (ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
+            if (os.windows.ReadConsoleInputA(_hIn, &rec, 1, &read) == 0 || read == 0) return false;
             // eventType == 1 is KEY_EVENT; keyDown != 0 filters out key-release events.
             if (rec.eventType == 1 && rec._event.key.keyDown != 0) {
                 out->keyDown      = true;
@@ -415,7 +415,7 @@ struct Terminal {
         return false;
     }
 
-    void _fillMouse(MouseEvent* out, _MouseEventRecord* rec) {
+    void _fillMouse(MouseEvent* out, os.windows._MouseEventRecord* rec) {
         out->x           = rec->mouseX;
         out->y           = rec->mouseY;
         out->buttonState = rec->buttonState;
@@ -428,8 +428,8 @@ struct Terminal {
     // moveTo() and the board layout code.
     void _adjustMouseCoords(MouseEvent* out) {
         if (_hOut == nullptr) return;
-        _CONSOLE_SCREEN_BUFFER_INFO info;
-        if (GetConsoleScreenBufferInfo(_hOut, &info) == 0) return;
+        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return;
         out->x = (i16)(out->x - info.winLeft);
         out->y = (i16)(out->y - info.winTop);
     }
@@ -473,7 +473,7 @@ void termPixel(int tr, int tg, int tb, int br, int bg, int bb) {
 // TerminalDriver.snapshot(). Rows and columns are 1-based.
 
 struct TerminalSnapshot {
-    _CHAR_INFO* _buf = nullptr;
+    os.windows._CHAR_INFO* _buf = nullptr;
     int width        = 0;
     int height       = 0;
 
@@ -565,7 +565,7 @@ struct TerminalDriver {
     // Inject a single key-down event. controlState is the dwControlKeyState
     // bitmask (e.g. 0x04 = LEFT_CTRL_PRESSED). Pass 0 for a plain keystroke.
     void injectKey(i16 vkCode, char ch, i32 controlState) {
-        _INPUT_RECORD rec;
+        os.windows._INPUT_RECORD rec;
         rec.eventType                        = 1;   // KEY_EVENT
         rec._pad                             = 0;
         rec._event.key.keyDown               = 1;
@@ -575,7 +575,7 @@ struct TerminalDriver {
         rec._event.key.uChar                 = (i16)ch;
         rec._event.key.controlKeyState       = controlState;
         i32 written = 0;
-        WriteConsoleInputA(_hIn, &rec, 1, &written);
+        os.windows.WriteConsoleInputA(_hIn, &rec, 1, &written);
     }
 
     // Inject a plain key-down with no modifier keys.
@@ -604,14 +604,14 @@ struct TerminalDriver {
     // output handle is not a real console (e.g. redirected in CI).
     bool snapshot(TerminalSnapshot* out) {
         if (_hOut == nullptr) return false;
-        _CONSOLE_SCREEN_BUFFER_INFO info;
-        if (GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
+        os.windows._CONSOLE_SCREEN_BUFFER_INFO info;
+        if (os.windows.GetConsoleScreenBufferInfo(_hOut, &info) == 0) return false;
 
         int w = (int)(info.winRight  - info.winLeft  + 1);
         int h = (int)(info.winBottom - info.winTop   + 1);
 
         if (out->_buf != nullptr) free((void*)out->_buf);
-        out->_buf   = (_CHAR_INFO*)malloc((i64)(w * h * 4));
+        out->_buf   = (os.windows._CHAR_INFO*)malloc((i64)(w * h * 4));
         out->width  = w;
         out->height = h;
 
@@ -619,12 +619,12 @@ struct TerminalDriver {
         i32 bufSize  = (i32)w | ((i32)h << 16);  // buffer dimensions
         i32 bufCoord = 0;                          // read from cell (0,0) of our buffer
 
-        _SMALL_RECT region;
+        os.windows._SMALL_RECT region;
         region.left   = info.winLeft;
         region.top    = info.winTop;
         region.right  = info.winRight;
         region.bottom = info.winBottom;
 
-        return ReadConsoleOutputA(_hOut, out->_buf, bufSize, bufCoord, &region) != 0;
+        return os.windows.ReadConsoleOutputA(_hOut, out->_buf, bufSize, bufCoord, &region) != 0;
     }
 };

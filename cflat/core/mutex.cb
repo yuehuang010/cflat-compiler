@@ -19,18 +19,18 @@ struct mutex {
 
     void acquire() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(1); }  // thread-fuzz sched-point
-        AcquireSRWLockExclusive(&_srw);
+        os.windows.AcquireSRWLockExclusive(&_srw);
     }
 
     void release() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(2); }  // thread-fuzz sched-point
-        ReleaseSRWLockExclusive(&_srw);
+        os.windows.ReleaseSRWLockExclusive(&_srw);
     }
 
     // Atomically release the lock and sleep on cv until woken, then reacquire.
     // Pass INFINITE (-1) for ms to block indefinitely.
     void sleep_cv(void* cv) {
-        SleepConditionVariableSRW(cv, &_srw, -1, (u32)0);
+        os.windows.SleepConditionVariableSRW(cv, &_srw, -1, (u32)0);
     }
 
     // No-op - SRW locks require no cleanup (no kernel object, no heap allocation).

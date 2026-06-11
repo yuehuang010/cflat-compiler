@@ -30,7 +30,7 @@ i64 _timeQpcFreq = 0;
 i64 _timeGetQpcFreq()
 {
     if (_timeQpcFreq == 0)
-        QueryPerformanceFrequency(&_timeQpcFreq);
+        os.windows.QueryPerformanceFrequency(&_timeQpcFreq);
     return _timeQpcFreq;
 }
 
@@ -47,7 +47,7 @@ i64 _qpcToTicks(i64 qpc)
 i64 _qpcNow()
 {
     i64 count = 0;
-    QueryPerformanceCounter(&count);
+    os.windows.QueryPerformanceCounter(&count);
     return count;
 }
 
@@ -117,7 +117,7 @@ struct TimePoint
     static TimePoint now()
     {
         TimePoint tp;
-        GetSystemTimeAsFileTime(&tp._ticks);
+        os.windows.GetSystemTimeAsFileTime(&tp._ticks);
         return tp;
     }
 
@@ -243,7 +243,7 @@ struct Timer
 void sleep(i64 ms)
 {
     if (ms > 0)
-        Sleep((i32)ms);
+        os.windows.Sleep((i32)ms);
 }
 
 // Emit an LFENCE: a load fence that also serializes the instruction stream.

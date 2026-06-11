@@ -42,22 +42,22 @@ class BlockAllocator : IAllocator
     void _init()
     {
         // --- page size from GetSystemInfo ---
-        _SystemInfo* sysInfo = (_SystemInfo*)malloc(sizeof(_SystemInfo));
-        GetSystemInfo(sysInfo);
+        os.windows._SystemInfo* sysInfo = (os.windows._SystemInfo*)malloc(sizeof(os.windows._SystemInfo));
+        os.windows.GetSystemInfo(sysInfo);
         _pageSize = sysInfo->_allocGranularity;
         free((void*)sysInfo);
 
         // --- L3 cache line size from GetLogicalProcessorInformation ---
         u32 len = 0;
-        GetLogicalProcessorInformation(nullptr, &len);   // first call: query required buffer size
-        _SysLogicalProcInfo* buf = (_SysLogicalProcInfo*)malloc((i64)len);
-        GetLogicalProcessorInformation(buf, &len);
+        os.windows.GetLogicalProcessorInformation(nullptr, &len);   // first call: query required buffer size
+        os.windows._SysLogicalProcInfo* buf = (os.windows._SysLogicalProcInfo*)malloc((i64)len);
+        os.windows.GetLogicalProcessorInformation(buf, &len);
 
-        i64 count = (i64)len / (i64)sizeof(_SysLogicalProcInfo);
+        i64 count = (i64)len / (i64)sizeof(os.windows._SysLogicalProcInfo);
         int i = 0;
         while (i < (int)count)
         {
-            _SysLogicalProcInfo* e = buf + i;
+            os.windows._SysLogicalProcInfo* e = buf + i;
             if (e->_relationship == 2 && e->_cacheLevel == 3)  // RelationCache, Level 3
             {
                 _blockSize = (i64)e->_cacheLineSize;

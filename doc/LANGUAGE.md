@@ -952,6 +952,23 @@ MathUtils.add(3, 4);             // 7
 MathUtils.Advanced.square(4);    // 16
 ```
 
+A dotted name declares the nested chain in one line - `namespace os.windows { ... }`
+is equivalent to `namespace os { namespace windows { ... } }`.
+
+Namespaces can also hold `extern` declarations. The function registers under its
+qualified lookup name but keeps its bare linkage symbol, so the namespace isolates
+the *name*, not the import: core's `os.windows.Sleep` and a header-imported bare
+`Sleep` bind to the same Win32 function.
+
+```c
+namespace os.windows
+{
+    extern stdcall void Sleep(i32 ms);   // links against "Sleep"
+}
+
+os.windows.Sleep(10);   // qualified lookup, bare linkage
+```
+
 Namespaces can also hold global variables (including `const`). They are scoped to
 the namespace: access them as `Namespace.name` from outside, or by the bare name
 from inside the namespace (a nested namespace sees its parents' globals). The bare

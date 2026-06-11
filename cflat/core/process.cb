@@ -114,7 +114,7 @@ int __process_reader_fn(void* rawCtx) {
         ctx->callback(buf, (int)nRead);
     }
     free((void*)buf);
-    CloseHandle(ctx->pipe);
+    os.windows.CloseHandle(ctx->pipe);
     free((void*)ctx);
     return 0;
 }
@@ -129,10 +129,10 @@ int __process_writer_fn(void* rawCtx) {
         if (line == nullptr) break;
         i32 len = (i32)strlen(line);
         i32 written = 0;
-        WriteFile(ctx->pipe, line, len, &written, nullptr);
+        os.windows.WriteFile(ctx->pipe, line, len, &written, nullptr);
         free((void*)line);
     }
-    CloseHandle(ctx->pipe);
+    os.windows.CloseHandle(ctx->pipe);
     free((void*)ctx);
     return 0;
 }
@@ -232,10 +232,10 @@ class process : IProcess {
         _thread_handle = pi.hThread;
 
         // Close the child-side pipe ends - the child holds them now.
-        CloseHandle(_stdout_write);
+        os.windows.CloseHandle(_stdout_write);
         _stdout_write = nullptr;
         if (_want_stdin) {
-            CloseHandle(_stdin_read);
+            os.windows.CloseHandle(_stdin_read);
             _stdin_read = nullptr;
         }
 
@@ -272,7 +272,7 @@ class process : IProcess {
     // Block until the process exits.  Joins I/O threads and captures exitCode.
     void WaitForExit() {
         if (_proc_handle == nullptr) return;
-        WaitForSingleObject(_proc_handle, -1);
+        os.windows.WaitForSingleObject(_proc_handle, -1);
         if (_has_reader) { _reader.join(); _has_reader = false; }
         if (_has_writer) { _writer.join(); _has_writer = false; }
         i32 code = 0;
@@ -284,7 +284,7 @@ class process : IProcess {
     // Wait up to ms milliseconds.  Returns true if the process exited.
     bool WaitForExit(int ms) {
         if (_proc_handle == nullptr) return true;
-        i32 result = WaitForSingleObject(_proc_handle, (i32)ms);
+        i32 result = os.windows.WaitForSingleObject(_proc_handle, (i32)ms);
         if (result != 0) return false;
         if (_has_reader) { _reader.join(); _has_reader = false; }
         if (_has_writer) { _writer.join(); _has_writer = false; }
@@ -300,7 +300,7 @@ class process : IProcess {
     bool WaitForExit(stop_token tok) {
         if (_proc_handle == nullptr) return true;
         while (!tok.stop_requested()) {
-            i32 result = WaitForSingleObject(_proc_handle, 50);
+            i32 result = os.windows.WaitForSingleObject(_proc_handle, 50);
             if (result == 0) {
                 if (_has_reader) { _reader.join(); _has_reader = false; }
                 if (_has_writer) { _writer.join(); _has_writer = false; }
@@ -325,12 +325,12 @@ class process : IProcess {
 
     // Close any remaining Win32 handles.  Safe to call multiple times.
     void _closeHandles() {
-        if (_proc_handle   != nullptr) { CloseHandle(_proc_handle);   _proc_handle   = nullptr; }
-        if (_thread_handle != nullptr) { CloseHandle(_thread_handle); _thread_handle = nullptr; }
-        if (_stdout_read   != nullptr) { CloseHandle(_stdout_read);   _stdout_read   = nullptr; }
-        if (_stdout_write  != nullptr) { CloseHandle(_stdout_write);  _stdout_write  = nullptr; }
-        if (_stdin_read    != nullptr) { CloseHandle(_stdin_read);    _stdin_read    = nullptr; }
-        if (_stdin_write   != nullptr) { CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
+        if (_proc_handle   != nullptr) { os.windows.CloseHandle(_proc_handle);   _proc_handle   = nullptr; }
+        if (_thread_handle != nullptr) { os.windows.CloseHandle(_thread_handle); _thread_handle = nullptr; }
+        if (_stdout_read   != nullptr) { os.windows.CloseHandle(_stdout_read);   _stdout_read   = nullptr; }
+        if (_stdout_write  != nullptr) { os.windows.CloseHandle(_stdout_write);  _stdout_write  = nullptr; }
+        if (_stdin_read    != nullptr) { os.windows.CloseHandle(_stdin_read);    _stdin_read    = nullptr; }
+        if (_stdin_write   != nullptr) { os.windows.CloseHandle(_stdin_write);   _stdin_write   = nullptr; }
     }
 
     ~process() {

@@ -409,7 +409,7 @@ class BucketAllocator : IAllocator
         // lives on the CRT heap; HeapValidate guards against vmem-backed blocks
         // from other allocators that would corrupt the CRT heap. No page-header
         // read here, so a foreign pointer is never dereferenced.
-        if (HeapValidate(GetProcessHeap(), 0u, ptr))
+        if (os.windows.HeapValidate(os.windows.GetProcessHeap(), 0u, ptr))
             free(ptr);
     }
 

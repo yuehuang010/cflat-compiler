@@ -1,0 +1,10 @@
+// A C-imported record the extractor had to abandon (INPUT_RECORD embeds an
+// anonymous union) registers as an unsized opaque shell. Declaring one by
+// value must be a clean diagnostic, not an LLVM module-verification failure.
+import "windows.h" cache;
+
+extern int main()
+{
+    expect_error("has an incomplete layout");
+    INPUT_RECORD rec = default;
+}

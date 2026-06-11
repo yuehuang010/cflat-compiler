@@ -81,8 +81,8 @@ class FitAllocator : IAllocator
 
     void _init()
     {
-        _SystemInfo* si = (_SystemInfo*)malloc((i64)sizeof(_SystemInfo));
-        GetSystemInfo(si);
+        os.windows._SystemInfo* si = (os.windows._SystemInfo*)malloc((i64)sizeof(os.windows._SystemInfo));
+        os.windows.GetSystemInfo(si);
         _pageSize = (i64)si->_pageSize;
         free((void*)si);
 

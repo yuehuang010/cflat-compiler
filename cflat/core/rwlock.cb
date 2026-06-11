@@ -22,31 +22,31 @@ struct rwlock {
 
     // Acquire a shared (read) lock - many readers can hold this simultaneously.
     void acquire_read() {
-        AcquireSRWLockShared(&_lock);
+        os.windows.AcquireSRWLockShared(&_lock);
     }
 
     // Release a shared (read) lock.
     void release_read() {
-        ReleaseSRWLockShared(&_lock);
+        os.windows.ReleaseSRWLockShared(&_lock);
     }
 
     // Acquire an exclusive (write) lock - no other readers or writers allowed.
     void acquire_write() {
-        AcquireSRWLockExclusive(&_lock);
+        os.windows.AcquireSRWLockExclusive(&_lock);
     }
 
     // Release an exclusive (write) lock.
     void release_write() {
-        ReleaseSRWLockExclusive(&_lock);
+        os.windows.ReleaseSRWLockExclusive(&_lock);
     }
 
     // acquire() / release() are exclusive-lock aliases so that
     // lock (rw) { } works as a write lock.
     void acquire() {
-        AcquireSRWLockExclusive(&_lock);
+        os.windows.AcquireSRWLockExclusive(&_lock);
     }
 
     void release() {
-        ReleaseSRWLockExclusive(&_lock);
+        os.windows.ReleaseSRWLockExclusive(&_lock);
     }
 };

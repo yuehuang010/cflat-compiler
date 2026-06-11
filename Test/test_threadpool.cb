@@ -88,7 +88,7 @@ int taskCancellable(move void* raw, stop_token tok) {
     CancelCtx* c = (CancelCtx*)raw;
     while (!tok.stop_requested()) {
         c->iterations->increment();
-        SwitchToThread();
+        os.windows.SwitchToThread();
     }
     *c->sawCancel = true;
     return 0;
@@ -346,7 +346,7 @@ bool testCancellation() {
     // would set stop before the loop ran even one iteration, leaving
     // iterations==0 and failing spuriously.  Spinning on the first increment
     // makes "ran some iterations" deterministic.
-    while (iterations.read() == 0) { SwitchToThread(); }
+    while (iterations.read() == 0) { os.windows.SwitchToThread(); }
     h->cancel();
     h->wait();
 

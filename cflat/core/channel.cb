@@ -225,7 +225,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_head);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
         }
     }
 
@@ -249,7 +249,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;
@@ -291,7 +291,7 @@ class channel<T>
             }
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
         }
         return false;
     }
@@ -314,7 +314,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_head);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
         }
     }
 
@@ -336,7 +336,7 @@ class channel<T>
             pause();   // contended retry - hint the spin so the SMT sibling runs
             pos   = __atomic_i64_load(&_tail);
             spins = spins + (i64)1;
-            if (spins == (i64)1024) { SwitchToThread(); spins = (i64)0; }
+            if (spins == (i64)1024) { os.windows.SwitchToThread(); spins = (i64)0; }
         }
         T sentinel = default;
         return sentinel;

@@ -61,7 +61,7 @@ struct TaskHandle {
     // each check - cheap for short tasks, but it keeps one logical CPU hot for
     // the whole wait.  For long-running tasks prefer wait_for() with a budget.
     void wait() {
-        while (done.load() == 0) { SwitchToThread(); }
+        while (done.load() == 0) { os.windows.SwitchToThread(); }
     }
 
     // Block until the task completes or the timeout elapses.
@@ -71,7 +71,7 @@ struct TaskHandle {
         deadline.start(milliseconds);
         while (done.load() == 0) {
             if (deadline.isExpired()) { return false; }
-            SwitchToThread();
+            os.windows.SwitchToThread();
         }
         return true;
     }
@@ -81,7 +81,7 @@ struct TaskHandle {
     // failure paths set done=1 manually so this never blocks for a handle that
     // was never enqueued.
     ~TaskHandle() {
-        while (done.load() == 0) { SwitchToThread(); }
+        while (done.load() == 0) { os.windows.SwitchToThread(); }
         _cancelSrc.dispose();
     }
 };
@@ -136,21 +136,21 @@ struct TaskResult<T> {
     // Block until the result is ready and return it.
     // Only valid after a successful set(); check hasFailed() if the task may fail.
     T get() {
-        while (_ready.load() < 2) { SwitchToThread(); }
+        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
         _ready.acquire((i32 v) => { });   // acquire fence; pairs with release in set()
         return _value;
     }
 
     // True if fail() was called instead of set().
     bool hasFailed() {
-        while (_ready.load() < 2) { SwitchToThread(); }
+        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
         _ready.acquire((i32 v) => { });
         return _failed;
     }
 
     // Block until set() or fail() has been called.  Does not consume the result.
     void wait() {
-        while (_ready.load() < 2) { SwitchToThread(); }
+        while (_ready.load() < 2) { os.windows.SwitchToThread(); }
     }
 
     // Non-blocking poll - true if set() or fail() has been called and the
@@ -242,7 +242,7 @@ void __threadpool_release_inflight(WorkerCtx* wctx) {
     i64 remaining = wctx->inflight->decrement();
     if (remaining == 0) {
         wctx->mtx->acquire();
-        WakeAllConditionVariable(wctx->drainCv);
+        os.windows.WakeAllConditionVariable(wctx->drainCv);
         wctx->mtx->release();
     }
 }
@@ -374,7 +374,7 @@ class ThreadPool {
         _qHigh.init(THREADPOOL_QUEUE_CAPACITY);
         _qNormal.init(THREADPOOL_QUEUE_CAPACITY);
         _qLow.init(THREADPOOL_QUEUE_CAPACITY);
-        InitializeConditionVariable(&_drainCv);
+        os.windows.InitializeConditionVariable(&_drainCv);
         _workerIds   = new u32[workerCount];
         _workerStops = new stop_source[workerCount];
         int j = 0;
@@ -655,7 +655,7 @@ class ThreadPool {
                     k++;
                 } else {
                     _ready.release();
-                    SwitchToThread();
+                    os.windows.SwitchToThread();
                 }
             }
             _count = newCount;
@@ -664,7 +664,7 @@ class ThreadPool {
 
     // True if the calling thread is one of this pool's workers.
     bool _isWorkerThread() {
-        u32 tid = GetCurrentThreadId();
+        u32 tid = os.windows.GetCurrentThreadId();
         int i = 0;
         while (i < _count) {
             if (_workerIds[i] == tid) { return true; }
@@ -701,7 +701,7 @@ class ThreadPool {
                     i64 inf      = _inflight.read();
                     i64 draining = _drainingWorkers.read();
                     if (inf <= draining) { break; }
-                    SwitchToThread();
+                    os.windows.SwitchToThread();
                 }
             }
             _drainingWorkers.decrement();
@@ -838,7 +838,7 @@ int __threadpool_worker(move void* raw) {
     stop_token myStop   = wctx->workerStops[slot].get_token();
 
     // Register this thread's ID so drain() can detect worker-calls-drain.
-    wctx->workerIds[slot] = GetCurrentThreadId();
+    wctx->workerIds[slot] = os.windows.GetCurrentThreadId();
 
     while (!poolStop.stop_requested()) {
         wctx->ready->acquire();
@@ -857,7 +857,7 @@ int __threadpool_worker(move void* raw) {
             // channel<T> - producer mid-publish).  Forward the token so
             // another worker can retry; see channel.cb pairing pattern.
             wctx->ready->release();
-            SwitchToThread();
+            os.windows.SwitchToThread();
         }
     }
     wctx->workerIds[slot] = (u32)0;   // signal exit to resize() / _isWorkerThread()

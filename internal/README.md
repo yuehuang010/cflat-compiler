@@ -17,3 +17,4 @@ that cost real debugging time. Read before touching the relevant subsystem.
 | [asan.md](asan.md) | `--asan` Windows/COFF fixes (`asan-force-dynamic-shadow`, NoAddress globals) |
 | [lsp-parallel-scaling.md](lsp-parallel-scaling.md) | LSP parse scaling cap; ANTLR thread-local cache is a no-op; share the core parse cache |
 | [sixel-aspect.md](sixel-aspect.md) | Sixel pixel aspect-ratio correction for round circles in example renderers |
+| [core-deploy-staleness.md](core-deploy-staleness.md) | test.bat runs the core deployed at `x64/<cfg>/core/`, not `cflat/core/` - rebuild after core edits or tests validate stale stdlib |

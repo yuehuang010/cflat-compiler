@@ -6040,6 +6040,17 @@ public:
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
         auto type = GetType(typeValue, autoType);
+        // An abandoned C-imported record (a field type the extractor could not map,
+        // e.g. INPUT_RECORD's inline anonymous union) is registered as an unsized
+        // opaque shell. It cannot live on the stack - diagnose instead of emitting
+        // IR that fails module verification.
+        if (!typeValue.Pointer && type != nullptr && type->isStructTy() && !type->isSized())
+        {
+            LogError(std::format(
+                "type '{}' has an incomplete layout (a field type C interop could not import); "
+                "it can only be used through a pointer", typeValue.TypeName));
+            type = builder->getInt8Ty();  // sized placeholder; the error already aborts the compile
+        }
         // A fixed-size array's dimension is already encoded in `type` (GetType
         // returns [N x T], or [N x [M x T]] for multi-dim). Passing that same N
         // again as the alloca element-count would allocate N copies of [N x T] -
@@ -7715,7 +7726,10 @@ public:
         }
     }
 
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false)
+    // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
+    // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
+    // table under the qualified lookup name but must link against the bare C symbol.
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, const std::string& linkageName = {})
     {
         // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
         // are lowered (coerce-to-int / byval / sret) per the Win64 or Win32 MSVC ABI. If the
@@ -7731,10 +7745,19 @@ public:
         llvm::FunctionType* functionType = useRecipe
             ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
             : GetFunctionType(returnType, arguments, varargs, external);
-        std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
+        std::string mangledName = external ? (linkageName.empty() ? functionName : linkageName)
+                                           : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (module->getFunction(mangledName) != nullptr)
-            return;
+        {
+            // A repeat declaration under the same lookup name is a no-op. A *different*
+            // lookup name for an already-emitted linkage symbol (core's os.windows.Sleep
+            // and a header-imported bare Sleep) still registers below, reusing the
+            // existing llvm::Function via getOrInsertFunction.
+            for (const auto& sym : functionTable[functionName])
+                if (sym.UniqueName == mangledName)
+                    return;
+        }
 
         auto funcCallee = module->getOrInsertFunction(mangledName, functionType);
         llvm::Value* calleeValue = funcCallee.getCallee();
@@ -8038,6 +8061,18 @@ public:
             auto it = typeAliases.find(resolvedTypeName);
             if (it != typeAliases.end())
                 resolvedTypeName = it->second;
+        }
+        // Namespace-relative type reference: a bare "_SystemInfo" inside namespace
+        // os.windows resolves to "os.windows._SystemInfo". Only accept a resolution
+        // that names a type, so a sibling function never hijacks a type name.
+        if (!resolvedTypeName.empty()
+            && dataStructures.find(resolvedTypeName) == dataStructures.end()
+            && interfaceTable.count(resolvedTypeName) == 0)
+        {
+            std::string nsResolved = ResolveQualifiedName(resolvedTypeName);
+            if (nsResolved != resolvedTypeName
+                && (dataStructures.count(nsResolved) || interfaceTable.count(nsResolved)))
+                resolvedTypeName = nsResolved;
         }
 
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }

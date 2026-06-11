@@ -75,8 +75,8 @@ list<string>* gatherMatches(i8* buf, int tokenStart, int len, int* outStubLen)
     patBuf[k] = 0;
 
     list<string>* matches = new list<string>;
-    _WIN32_FIND_DATAA* fd = new _WIN32_FIND_DATAA;
-    void* handle = FindFirstFileA(patBuf, fd);
+    os.windows._WIN32_FIND_DATAA* fd = new os.windows._WIN32_FIND_DATAA;
+    void* handle = os.windows.FindFirstFileA(patBuf, fd);
     if (handle != (void*)(i64)-1)
     {
         bool more = true;
@@ -99,9 +99,9 @@ list<string>* gatherMatches(i8* buf, int tokenStart, int len, int* outStubLen)
                 s._len = outLen;
                 matches->add(s);
             }
-            if (FindNextFileA(handle, fd) == 0) more = false;
+            if (os.windows.FindNextFileA(handle, fd) == 0) more = false;
         }
-        FindClose(handle);
+        os.windows.FindClose(handle);
     }
     delete fd;
     delete[] patBuf;
@@ -333,8 +333,8 @@ void cmdDir(list<string>* args)
     string absPath = Path.getAbsolute(path);
 
     string pattern = absPath + "\\*";
-    _WIN32_FIND_DATAA* fd = new _WIN32_FIND_DATAA;
-    void* handle = FindFirstFileA(pattern.data(), fd);
+    os.windows._WIN32_FIND_DATAA* fd = new os.windows._WIN32_FIND_DATAA;
+    void* handle = os.windows.FindFirstFileA(pattern.data(), fd);
     if (handle == (void*)(i64)-1)
     {
         printf("File Not Found\n");
@@ -366,9 +366,9 @@ void cmdDir(list<string>* args)
             totalBytes += size;
             fileCount++;
         }
-    } while (FindNextFileA(handle, fd) != 0);
+    } while (os.windows.FindNextFileA(handle, fd) != 0);
 
-    FindClose(handle);
+    os.windows.FindClose(handle);
     delete fd;
 
     printf("\n  %d file(s)   %lld bytes\n", fileCount, totalBytes);

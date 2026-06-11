@@ -126,6 +126,10 @@ import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
 
 See `example/windows/sysinfo.cb` (console, kernel32 only) and `example/windows/win_red_button.cb` (a GUI window + owner-drawn red button, linking user32/gdi32 via the inline `lib` clause).
 
+Core's own Win32/CRT bindings live in the `os.windows` namespace, so they never collide with the header bind: `import "windows.h"` registers its structs under the MSDN names (`CONSOLE_SCREEN_BUFFER_INFO` with nested `dwSize.X`, `COORD`, ...) while core code reaches its own flattened copies as `os.windows._CONSOLE_SCREEN_BUFFER_INFO` etc. A namespaced `extern` keeps its bare linkage symbol, so `os.windows.Sleep` and the header's bare `Sleep` resolve to the same imported function.
+
+A record the extractor cannot fully map - e.g. `INPUT_RECORD`, which embeds an *anonymous union* - registers as an opaque, unsized shell: usable through a pointer, but declaring one **by value** is a compile error ("incomplete layout"). Use core's flattened `os.windows._INPUT_RECORD` for by-value console input records (see `example/windows/console_raw.cb`).
+
 The matching CLI flags supply the machine-specific paths (all repeatable):
 
 ```bash
