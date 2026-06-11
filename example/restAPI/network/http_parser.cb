@@ -218,7 +218,7 @@ i8* _http_urldecode(i8* buf, int start, int len)
             int val = _http_hexval(buf[i + 1]) * 16 + _http_hexval(buf[i + 2]);
             result[ri] = (i8)val;
             ri++;
-            i = i + 3;
+            i += 3;
         }
         else
         {
@@ -322,7 +322,7 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
     {
         if (buf[pos] == '\r' && buf[pos + 1] == '\n')
         {
-            pos = pos + 2;
+            pos += 2;
             headersEnd = true;
         }
         else
@@ -408,7 +408,7 @@ HttpClientResponse* parseHttpResponse(i8* buf, int len)
     {
         if (buf[pos] == '\r' && buf[pos + 1] == '\n')
         {
-            pos = pos + 2;
+            pos += 2;
             headersEnd = true;
         }
         else

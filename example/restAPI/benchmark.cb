@@ -69,7 +69,7 @@ int clientThread(void* raw)
         else
             ctx->failCount = ctx->failCount + 1;
         if (resp != nullptr) delete resp;
-        i = i + 1;
+        i++;
     }
     return 0;
 }
@@ -93,17 +93,17 @@ void runRow(int clientCount, int requestsPerClient)
         ctxs[i].requestCount = requestsPerClient;
         ctxs[i].successCount = 0;
         ctxs[i].failCount    = 0;
-        i = i + 1;
+        i++;
     }
 
     Stopwatch sw;
     sw.start();
 
     i = 0;
-    while (i < clientCount) { ths[i].start(clientThread, &ctxs[i]); i = i + 1; }
+    while (i < clientCount) { ths[i].start(clientThread, &ctxs[i]); i++; }
 
     i = 0;
-    while (i < clientCount) { ths[i].join(); i = i + 1; }
+    while (i < clientCount) { ths[i].join(); i++; }
 
     sw.stop();
 
@@ -112,9 +112,9 @@ void runRow(int clientCount, int requestsPerClient)
     i = 0;
     while (i < clientCount)
     {
-        success = success + ctxs[i].successCount;
-        fail    = fail    + ctxs[i].failCount;
-        i = i + 1;
+        success += ctxs[i].successCount;
+        fail += ctxs[i].failCount;
+        i++;
     }
 
     int totalRequests = clientCount * requestsPerClient;

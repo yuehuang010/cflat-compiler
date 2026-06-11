@@ -183,7 +183,7 @@ bool updateMissiles()
         if (m->alive) {
             if (inExplosion(m->col, m->row)) {
                 m->alive = false;
-                g_score  = g_score + 10 * g_wave;
+                g_score += 10 * g_wave;
             } else if (m->row >= BOARD_H - 2) {
                 return false;
             }

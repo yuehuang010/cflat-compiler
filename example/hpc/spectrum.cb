@@ -1,0 +1,409 @@
+// spectrum.cb - real-time FFT spectrum analyzer with a truecolor terminal waterfall.
+//
+// DSP pipeline (per frame):
+//   1. Synthesize HOP new samples of a test signal - two steady tones (one with a
+//      slow tremolo), a triangle-sweep chirp, and low-level white noise - into a
+//      sliding window of the most recent N samples.
+//   2. Apply a Hann window (vectorize loop - three noalias double[] views, so the
+//      multiply is provably clean) and pack into the interleaved complex layout
+//      fft.cb expects (re=buf[2k], im=buf[2k+1]).
+//   3. FFT.fft (radix-2 Cooley-Tukey from core/hpc/fft.cb), then per-bin magnitude
+//      -> dB, normalized so a full-scale tone sits at 0 dB with a 60 dB floor.
+//   4. Render: a bar spectrum of the current frame on top, a scrolling waterfall
+//      (rows = past frames, color = intensity) below. Frequency axis is linear,
+//      0 .. SR/2 across the terminal width.
+//
+// Build (vectorize is only enforced at -O2):
+//   x64\Release\cflat.exe example\hpc\spectrum.cb -o out\spectrum.exe -O2
+// Run:
+//   out\spectrum.exe              (animate 600 frames)
+//   out\spectrum.exe 200          (animate 200 frames)
+//   out\spectrum.exe 0 report     (no animation; FFT correctness + throughput report)
+
+import "hpc/fft.cb";       // FFT.fft / FFT.ifft / FFT.dft_naive
+import "math.cb";          // Math.sin, Math.sqrt, Math.log10, Math.PI
+import "random.cb";        // Random (white-noise source, report-mode test signal)
+import "time.cb";          // Stopwatch, sleep
+import "terminal.cb";      // Terminal (VT-mode init), WriteFile bulk output
+
+// ---- analyzer configuration -------------------------------------------------
+
+int    FFT_N()   { return 1024; }     // FFT size (power of two)
+int    HOP()     { return 256; }      // new samples per frame (75% overlap)
+double SR()      { return 8000.0; }   // notional sample rate, Hz (Nyquist 4 kHz)
+double DB_FLOOR(){ return -60.0; }    // bottom of the displayed dynamic range
+
+int GW()    { return 120; }   // display width (columns = frequency axis)
+int BAR_H() { return 14; }    // bar-spectrum rows
+int WF_H()  { return 32; }    // waterfall rows (history depth)
+
+// ---- ANSI output buffer (printf truncates past ~4096 bytes; build a frame and
+//      blast it with WriteFile, the idiom from example/hpc/heat_stencil.cb) ----
+
+char* g_out     = nullptr;
+int   g_out_len = 0;
+
+void outCh(char c) { g_out[g_out_len] = c; g_out_len++; }
+
+void outStr(const char* s) {
+    int i = 0;
+    while (s[i] != '\0') { outCh(s[i]); i++; }
+}
+
+void outInt(int n) {
+    if (n == 0) { outCh('0'); return; }
+    if (n < 0) { outCh('-'); n = -n; }
+    char[12] tmp;
+    int i = 0;
+    while (n > 0) { tmp[i] = (char)('0' + n % 10); i++; n /= 10; }
+    int j = i - 1;
+    while (j >= 0) { outCh(tmp[j]); j--; }
+}
+
+// ESC [ 38 ; 2 ; r ; g ; b m  - truecolor foreground.
+void outColor(int r, int g, int b) {
+    outStr("\033[38;2;");
+    outInt(r); outCh(';');
+    outInt(g); outCh(';');
+    outInt(b); outCh('m');
+}
+
+// ---- color ramps -------------------------------------------------------------
+
+// Waterfall intensity t in [0,1]: black -> blue -> cyan -> green -> yellow -> red.
+void wfColor(double t, int* r, int* g, int* b) {
+    if (t < 0.0) { t = 0.0; }
+    if (t > 1.0) { t = 1.0; }
+    double seg = t * 5.0;
+    int s = (int)seg;
+    if (s > 4) { s = 4; }
+    double f = seg - (double)s;
+    int c = (int)(f * 255.0);
+    int rr = 0; int gg = 0; int bb = 0;
+    if (s == 0)      { rr = 0;       gg = 0;       bb = c; }          // black -> blue
+    else if (s == 1) { rr = 0;       gg = c;       bb = 255; }        // blue  -> cyan
+    else if (s == 2) { rr = 0;       gg = 255;     bb = 255 - c; }    // cyan  -> green
+    else if (s == 3) { rr = c;       gg = 255;     bb = 0; }          // green -> yellow
+    else             { rr = 255;     gg = 255 - c; bb = 0; }          // yellow-> red
+    *r = rr; *g = gg; *b = bb;
+}
+
+// Bar color by height fraction h in [0,1]: green -> yellow -> red (VU-meter style).
+void barColor(double h, int* r, int* g, int* b) {
+    if (h < 0.0) { h = 0.0; }
+    if (h > 1.0) { h = 1.0; }
+    if (h < 0.6) { *r = (int)(h / 0.6 * 255.0); *g = 255; *b = 0; }
+    else         { *r = 255; *g = 255 - (int)((h - 0.6) / 0.4 * 255.0); *b = 0; }
+}
+
+// ---- signal synthesis --------------------------------------------------------
+
+// Sliding window of the most recent N samples; phase accumulators persist across
+// frames so tones and the chirp are continuous at frame boundaries.
+double[] g_sig = nullptr;
+
+double g_ph1   = 0.0;   // 440 Hz tone (tremolo)
+double g_ph2   = 0.0;   // 1750 Hz tone (steady)
+double g_phC   = 0.0;   // chirp phase
+double g_fC    = 150.0; // chirp instantaneous frequency, Hz
+double g_fCdir = 1.0;   // sweep direction
+double g_tremT = 0.0;   // tremolo clock, seconds
+
+Random g_rng = default;
+
+double TAU() { return 6.28318530717958647692; }
+
+// Shift the window left by `count` and synthesize `count` fresh samples at the end.
+void genSamples(int count) {
+    int n = FFT_N();
+    for (int i = 0; i < n - count; i++) { g_sig[i] = g_sig[i + count]; }
+
+    double dt = 1.0 / SR();
+    double d1 = TAU() * 440.0 * dt;
+    double d2 = TAU() * 1750.0 * dt;
+    double sweepPerSample = 3300.0 / (SR() * 4.0);  // 150 -> 3450 Hz in ~4 s
+
+    for (int i = n - count; i < n; i++) {
+        // tremolo: 440 Hz tone amplitude wobbles at 0.4 Hz
+        double trem = 0.45 + 0.35 * Math.sin(TAU() * 0.4 * g_tremT);
+        double s = trem * Math.sin(g_ph1)
+                 + 0.30 * Math.sin(g_ph2)
+                 + 0.50 * Math.sin(g_phC)
+                 + 0.02 * (g_rng.nextDouble() * 2.0 - 1.0);
+        g_sig[i] = s;
+
+        g_ph1 += d1;            if (g_ph1 > TAU()) { g_ph1 -= TAU(); }
+        g_ph2 += d2;            if (g_ph2 > TAU()) { g_ph2 -= TAU(); }
+        g_phC += TAU() * g_fC * dt;
+        if (g_phC > TAU()) { g_phC -= TAU(); }
+        g_fC += g_fCdir * sweepPerSample;
+        if (g_fC > 3450.0) { g_fC = 3450.0; g_fCdir = -1.0; }
+        if (g_fC < 150.0)  { g_fC = 150.0;  g_fCdir = 1.0; }
+        g_tremT += dt;
+    }
+}
+
+// ---- spectrum computation ------------------------------------------------------
+
+// dB per display column for the current window. Returns the peak bin's frequency.
+double computeSpectrum(double[] win, double[] windowed, double[] buf, double[] colDb) {
+    int n = FFT_N();
+
+    // Hann window: three distinct double[] views -> provably disjoint, clean vector loop.
+    vectorize for (int i = 0; i < n; i++) {
+        windowed[i] = g_sig[i] * win[i];
+    }
+
+    // Pack real samples into the interleaved complex layout (stride-2 store; the
+    // interleaving keeps this one scalar, which is fine - the FFT dominates).
+    for (int i = 0; i < n; i++) { buf[2 * i] = windowed[i]; buf[2 * i + 1] = 0.0; }
+
+    FFT.fft(buf, n);
+
+    // Full-scale reference: a unit-amplitude tone under a Hann window peaks at N/4.
+    double ref = (double)n / 4.0;
+    int bins = n / 2;
+    int w = GW();
+
+    double peakMag = 0.0;
+    int peakBin = 0;
+    for (int c = 0; c < w; c++) {
+        int b0 = c * bins / w;
+        int b1 = (c + 1) * bins / w;
+        if (b1 <= b0) { b1 = b0 + 1; }
+        double m = 0.0;
+        for (int k = b0; k < b1; k++) {
+            double re = buf[2 * k];
+            double im = buf[2 * k + 1];
+            double mag = Math.sqrt(re * re + im * im);
+            if (mag > m) { m = mag; }
+            if (mag > peakMag) { peakMag = mag; peakBin = k; }
+        }
+        double db = 20.0 * Math.log10(m / ref + 1.0e-9);
+        if (db < DB_FLOOR()) { db = DB_FLOOR(); }
+        if (db > 0.0) { db = 0.0; }
+        colDb[c] = db;
+    }
+    return (double)peakBin * SR() / (double)n;
+}
+
+// ---- rendering -----------------------------------------------------------------
+
+// Waterfall history ring: WF_H rows of GW intensities; g_wfHead is the newest row.
+double[] g_wf     = nullptr;
+int      g_wfHead = 0;
+
+// Map dB in [DB_FLOOR, 0] to intensity [0,1].
+double dbToT(double db) { return (db - DB_FLOOR()) / (0.0 - DB_FLOOR()); }
+
+void renderFrame(double[] colDb, int frame, int frames, double peakHz) {
+    int w = GW();
+    g_out_len = 0;
+    outStr("\033[H");
+
+    // -- bar spectrum (rows top-down) --
+    int bh = BAR_H();
+    for (int row = bh - 1; row >= 0; row--) {
+        int prevPacked = -1;
+        for (int c = 0; c < w; c++) {
+            double t = dbToT(colDb[c]);
+            int h = (int)(t * (double)bh + 0.5);
+            if (h > row) {
+                int rr = 0; int gg = 0; int bb = 0;
+                barColor((double)(row + 1) / (double)bh, &rr, &gg, &bb);
+                int packed = (rr << 16) | (gg << 8) | bb;
+                if (packed != prevPacked) { outColor(rr, gg, bb); prevPacked = packed; }
+                outCh(row + 1 == h ? '=' : '#');
+            } else {
+                outCh(' ');
+            }
+        }
+        outStr("\033[0m\n");
+    }
+
+    // -- frequency axis --
+    outStr("0Hz");
+    for (int c = 3; c < w - 6; c++) { outCh(c % 10 == 0 ? '+' : '-'); }
+    outInt((int)(SR() / 2.0)); outStr("Hz\n");
+
+    // -- waterfall (newest at top, scrolling down) --
+    int wfh = WF_H();
+    for (int row = 0; row < wfh; row++) {
+        int src = (g_wfHead - row + wfh) % wfh;
+        int prevPacked = -1;
+        for (int c = 0; c < w; c++) {
+            double t = g_wf[src * w + c];
+            int rr = 0; int gg = 0; int bb = 0;
+            wfColor(t, &rr, &gg, &bb);
+            int packed = (rr << 16) | (gg << 8) | bb;
+            if (packed != prevPacked) { outColor(rr, gg, bb); prevPacked = packed; }
+            char glyph = ' ';
+            if (t > 0.85)      { glyph = '@'; }
+            else if (t > 0.65) { glyph = '#'; }
+            else if (t > 0.45) { glyph = '+'; }
+            else if (t > 0.28) { glyph = ':'; }
+            else if (t > 0.12) { glyph = '.'; }
+            outCh(glyph);
+        }
+        outStr("\033[0m\n");
+    }
+
+    // -- status line --
+    outStr("frame ");
+    outInt(frame + 1); outStr(" / "); outInt(frames);
+    outStr("   N="); outInt(FFT_N());
+    outStr("  hop="); outInt(HOP());
+    outStr("  peak ~"); outInt((int)peakHz); outStr(" Hz");
+    outStr("  chirp "); outInt((int)g_fC); outStr(" Hz    \n");
+}
+
+// ---- report mode: correctness + throughput ---------------------------------------
+
+double maxAbsDiff2n(double[] a, double[] b, int total) {
+    double m = 0.0;
+    for (int i = 0; i < total; i++) {
+        double d = a[i] - b[i];
+        if (d < 0.0) { d = -d; }
+        if (d > m) { m = d; }
+    }
+    return m;
+}
+
+int runReport() {
+    int n = FFT_N();
+    int total = 2 * n;
+
+    // Random complex test signal.
+    Random rng;
+    rng.seed(12345);
+    double[] sig  = new double[total];
+    double[] orig = new double[total];
+    double[] ref  = new double[total];
+    for (int i = 0; i < total; i++) {
+        sig[i] = rng.nextDouble() * 2.0 - 1.0;
+        orig[i] = sig[i];
+    }
+
+    // Correctness 1: radix-2 FFT vs the O(N^2) reference DFT.
+    FFT.dft_naive(orig, ref, n);
+    FFT.fft(sig, n);
+    double errDft = maxAbsDiff2n(sig, ref, total);
+
+    // Correctness 2: ifft(fft(x)) round-trip recovers the input.
+    FFT.ifft(sig, n);
+    double errRt = maxAbsDiff2n(sig, orig, total);
+
+    // Throughput: fft/ifft pairs keep magnitudes bounded, so the loop can run hot.
+    int pairs = 20000;
+    Stopwatch sw;
+    sw.start();
+    for (int i = 0; i < pairs; i++) {
+        FFT.fft(sig, n);
+        FFT.ifft(sig, n);
+    }
+    double secs = sw.elapsed().seconds();
+    int transforms = pairs * 2;
+    // Standard FFT cost model: 5 * N * log2(N) flops per complex transform.
+    double log2n = Math.log2((double)n);
+    double gflops = 5.0 * (double)n * log2n * (double)transforms / secs / 1.0e9;
+
+    printf("fft report (N = %d)\n", n);
+    printf("  max |fft - dft_naive|   : %.3e\n", errDft);
+    printf("  max |ifft(fft(x)) - x|  : %.3e\n", errRt);
+    printf("  transforms              : %d\n", transforms);
+    printf("  time                    : %.4f s\n", secs);
+    printf("  transforms/s            : %.0f\n", (double)transforms / secs);
+    printf("  Msamples/s              : %.1f\n", (double)transforms * (double)n / secs / 1.0e6);
+    printf("  est. GFLOP/s            : %.2f\n", gflops);
+
+    int fail = 0;
+    if (errDft > 1.0e-6 || errRt > 1.0e-9) {
+        printf("FAIL: error above tolerance\n");
+        fail = 1;
+    } else {
+        printf("PASS\n");
+    }
+    delete[_] sig;
+    delete[_] orig;
+    delete[_] ref;
+    return fail;
+}
+
+// ---- argv helpers (same idiom as heat_stencil.cb) ---------------------------------
+
+int strToInt(const char* s) {
+    int v = 0; int i = 0; bool found = false;
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i++; }
+    return found ? v : -1;
+}
+
+bool strEq(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] != '\0' && b[i] != '\0') { if (a[i] != b[i]) return false; i++; }
+    return a[i] == b[i];
+}
+
+// ---- main --------------------------------------------------------------------------
+
+extern int main(int argc, char** argv) {
+    int frames = 600;
+    bool report = false;
+    if (argc > 1) { int f = strToInt(argv[1]); if (f > 0) { frames = f; } }
+    if (argc > 2 && strEq(argv[2], "report")) { report = true; }
+
+    if (report) { return runReport(); }
+
+    int n = FFT_N();
+    int w = GW();
+
+    g_sig = new double[n];
+    for (int i = 0; i < n; i++) { g_sig[i] = 0.0; }
+    g_rng.seed(42);
+
+    // Precompute the Hann window: 0.5 - 0.5*cos(2*pi*i/(N-1)).
+    double[] win = new double[n];
+    for (int i = 0; i < n; i++) {
+        win[i] = 0.5 - 0.5 * Math.cos(TAU() * (double)i / (double)(n - 1));
+    }
+
+    double[] windowed = new double[n];
+    double[] buf      = new double[2 * n];
+    double[] colDb    = new double[w];
+
+    int wfh = WF_H();
+    g_wf = new double[wfh * w];
+    for (int i = 0; i < wfh * w; i++) { g_wf[i] = 0.0; }
+
+    g_out = (char*)malloc(2097152);   // 2 MB - one frame is well under that
+
+    Terminal term;
+    term.init();           // enables ANSI/VT; no-op if output is redirected
+    term.hideCursor();
+    term.clear();
+    void* hOut = term._hOut;
+    int wr = 0;
+
+    for (int frame = 0; frame < frames; frame++) {
+        genSamples(HOP());
+        double peakHz = computeSpectrum(win, windowed, buf, colDb);
+
+        // Push this frame's intensities into the waterfall ring.
+        g_wfHead = (g_wfHead + 1) % wfh;
+        for (int c = 0; c < w; c++) { g_wf[g_wfHead * w + c] = dbToT(colDb[c]); }
+
+        renderFrame(colDb, frame, frames, peakHz);
+        WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
+        sleep(33);
+    }
+
+    term.showCursor();
+    term.restore();
+    free(g_out);
+    delete[_] g_sig;
+    delete[_] win;
+    delete[_] windowed;
+    delete[_] buf;
+    delete[_] colDb;
+    delete[_] g_wf;
+    return 0;
+}

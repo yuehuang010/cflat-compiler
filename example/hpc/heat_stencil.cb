@@ -31,11 +31,11 @@ int GH() { return 50; }    // grid height (rows)
 char* g_out     = nullptr;
 int   g_out_len = 0;
 
-void outCh(char c) { g_out[g_out_len] = c; g_out_len = g_out_len + 1; }
+void outCh(char c) { g_out[g_out_len] = c; g_out_len++; }
 
 void outStr(const char* s) {
     int i = 0;
-    while (s[i] != '\0') { outCh(s[i]); i = i + 1; }
+    while (s[i] != '\0') { outCh(s[i]); i++; }
 }
 
 void outInt(int n) {
@@ -43,9 +43,9 @@ void outInt(int n) {
     if (n < 0) { outCh('-'); n = -n; }
     char[12] tmp;
     int i = 0;
-    while (n > 0) { tmp[i] = (char)('0' + n % 10); i = i + 1; n = n / 10; }
+    while (n > 0) { tmp[i] = (char)('0' + n % 10); i++; n /= 10; }
     int j = i - 1;
-    while (j >= 0) { outCh(tmp[j]); j = j - 1; }
+    while (j >= 0) { outCh(tmp[j]); j--; }
 }
 
 // ESC [ 38 ; 2 ; r ; g ; b m  - truecolor foreground.
@@ -78,15 +78,15 @@ void heat(double t, int* r, int* g, int* b) {
 void stampSources(double[] u, int h, int w) {
     // Cold border (Dirichlet). jacobi2d already copies the border through, but we
     // make it explicit so the very first stamp is correct.
-    for (int x = 0; x < w; x = x + 1) { u[x] = 0.0; u[(h - 1) * w + x] = 0.0; }
-    for (int y = 0; y < h; y = y + 1) { u[y * w] = 0.0; u[y * w + w - 1] = 0.0; }
+    for (int x = 0; x < w; x++) { u[x] = 0.0; u[(h - 1) * w + x] = 0.0; }
+    for (int y = 0; y < h; y++) { u[y * w] = 0.0; u[y * w + w - 1] = 0.0; }
 
     // Hot disk source.
     int cy = h / 2;
     int cx = w / 4;
     int rad = h / 6;
-    for (int y = cy - rad; y <= cy + rad; y = y + 1) {
-        for (int x = cx - rad; x <= cx + rad; x = x + 1) {
+    for (int y = cy - rad; y <= cy + rad; y++) {
+        for (int x = cx - rad; x <= cx + rad; x++) {
             if (y > 0 && y < h - 1 && x > 0 && x < w - 1) {
                 int dy = y - cy;
                 int dx = x - cx;
@@ -97,7 +97,7 @@ void stampSources(double[] u, int h, int w) {
 
     // Hot bar source along the right-centre.
     int bx = (w * 3) / 4;
-    for (int y = cy - h / 4; y <= cy + h / 4; y = y + 1) {
+    for (int y = cy - h / 4; y <= cy + h / 4; y++) {
         if (y > 0 && y < h - 1 && bx > 0 && bx < w - 1) { u[y * w + bx] = 1.0; }
     }
 }
@@ -108,8 +108,8 @@ void renderFrame(double[] u, int h, int w, int frame, int frames, double maxChan
     g_out_len = 0;
     outStr("\033[H");          // cursor home
     int prevPacked = -1;
-    for (int y = 0; y < h; y = y + 1) {
-        for (int x = 0; x < w; x = x + 1) {
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
             double t = u[y * w + x];
             int rr = 0; int gg = 0; int bb = 0;
             heat(t, &rr, &gg, &bb);
@@ -146,7 +146,7 @@ void renderFrame(double[] u, int h, int w, int frame, int frames, double maxChan
 // max absolute element-wise difference between two grids (convergence metric).
 double maxAbsDiff(double[] a, double[] b, int n) {
     double m = 0.0;
-    for (int i = 0; i < n; i = i + 1) {
+    for (int i = 0; i < n; i++) {
         double d = a[i] - b[i];
         if (d < 0.0) { d = -d; }
         if (d > m) { m = d; }
@@ -158,13 +158,13 @@ double maxAbsDiff(double[] a, double[] b, int n) {
 // distinguishable, which atoi's 0-on-failure cannot express).
 int strToInt(const char* s) {
     int v = 0; int i = 0; bool found = false;
-    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i = i + 1; }
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i++; }
     return found ? v : -1;
 }
 
 bool strEq(const char* a, const char* b) {
     int i = 0;
-    while (a[i] != '\0' && b[i] != '\0') { if (a[i] != b[i]) return false; i = i + 1; }
+    while (a[i] != '\0' && b[i] != '\0') { if (a[i] != b[i]) return false; i++; }
     return a[i] == b[i];
 }
 
@@ -185,7 +185,7 @@ extern int main(int argc, char** argv) {
     double[] b = new double[n];
 
     // Cold start, then stamp the fixed sources.
-    for (int i = 0; i < n; i = i + 1) { a[i] = 0.0; b[i] = 0.0; }
+    for (int i = 0; i < n; i++) { a[i] = 0.0; b[i] = 0.0; }
     stampSources(a, H, W);
 
     g_out = (char*)malloc(1048576);   // 1 MB - one frame is well under that
@@ -196,7 +196,7 @@ extern int main(int argc, char** argv) {
         Stopwatch sw;
         sw.start();
         double maxChange = 0.0;
-        for (int s = 0; s < totalSweeps; s = s + 1) {
+        for (int s = 0; s < totalSweeps; s++) {
             Stencil.jacobi2d(a, b, H, W);
             stampSources(b, H, W);
             if (s == totalSweeps - 1) { maxChange = maxAbsDiff(a, b, n); }
@@ -227,7 +227,7 @@ extern int main(int argc, char** argv) {
     double maxChange = 1.0;
     int frame = 0;
     while (frame < frames) {
-        for (int s = 0; s < subSteps; s = s + 1) {
+        for (int s = 0; s < subSteps; s++) {
             Stencil.jacobi2d(a, b, H, W);   // 5-point average == explicit heat step
             stampSources(b, H, W);          // hold sources + cold walls fixed
             double[] tmp = a; a = b; b = tmp;
@@ -236,7 +236,7 @@ extern int main(int argc, char** argv) {
         renderFrame(a, H, W, frame, frames, maxChange);
         WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
         sleep(33);
-        frame = frame + 1;
+        frame++;
     }
 
     term.showCursor();

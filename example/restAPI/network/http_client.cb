@@ -80,7 +80,7 @@ class HttpClient {
         {
             int n = s->recv(&respbuf[total], 65535 - total);
             if (n <= 0) done = true;
-            else total = total + n;
+            else total += n;
         }
         delete s;
 

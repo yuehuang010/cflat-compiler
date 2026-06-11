@@ -72,9 +72,9 @@ void axpyVec(double c, span<double> v, span<double> a) {
         simd<double,4> vvec = simd<double,4>.load(vv, i);
         simd<double,4> avec = simd<double,4>.load(av, i);
         simd<double,4>.store(vvec + cs * avec, vv, i);
-        i = i + 4;
+        i += 4;
     }
-    while (i < n) { vv[i] = vv[i] + c * av[i]; i = i + 1; }   // scalar tail (n % 4)
+    while (i < n) { vv[i] += c * av[i]; i++; }   // scalar tail (n % 4)
 }
 
 // x += c * v   (the Verlet drift) - same shape as the kick.
@@ -88,9 +88,9 @@ void driftVec(double c, span<double> x, span<double> v) {
         simd<double,4> xvec = simd<double,4>.load(xv, i);
         simd<double,4> vvec = simd<double,4>.load(vv, i);
         simd<double,4>.store(xvec + cs * vvec, xv, i);
-        i = i + 4;
+        i += 4;
     }
-    while (i < n) { xv[i] = xv[i] + c * vv[i]; i = i + 1; }   // scalar tail (n % 4)
+    while (i < n) { xv[i] += c * vv[i]; i++; }   // scalar tail (n % 4)
 }
 
 // ---- energy (correctness check) --------------------------------------------
@@ -104,8 +104,8 @@ double totalEnergy(double[] px, double[] py, double[] pz,
     int i = 0;
     while (i < n) {
         double sp = vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i];
-        ke = ke + 0.5 * mass[i] * sp;
-        i = i + 1;
+        ke += 0.5 * mass[i] * sp;
+        i++;
     }
     double pe = 0.0;
     i = 0;
@@ -116,10 +116,10 @@ double totalEnergy(double[] px, double[] py, double[] pz,
             double dy = py[j] - py[i];
             double dz = pz[j] - pz[i];
             double r = Math.sqrt(dx * dx + dy * dy + dz * dz + eps2);
-            pe = pe - g * mass[i] * mass[j] / r;
-            j = j + 1;
+            pe -= g * mass[i] * mass[j] / r;
+            j++;
         }
-        i = i + 1;
+        i++;
     }
     return ke + pe;
 }
@@ -162,7 +162,7 @@ extern int main() {
         vy[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.1;
         vz[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.1;
         mass[i] = m;
-        i = i + 1;
+        i++;
     }
 
     // Wrap velocity/position components as spans for the vectorized integrator maps.
@@ -218,10 +218,10 @@ extern int main() {
                 simd<double,8> invr  = oneV / simd<double,8>.sqrt(r2);   // vector reciprocal sqrt
                 simd<double,8> invr3 = invr * invr * invr;
                 simd<double,8> s = simd<double,8>.load(mass, j) * invr3;
-                accx = accx + dx * s;                                    // accx += dx * s
-                accy = accy + dy * s;
-                accz = accz + dz * s;
-                j = j + 8;
+                accx += dx * s;
+                accy += dy * s;
+                accz += dz * s;
+                j += 8;
             }
 
             // Horizontal-reduce each lane partial into a scalar (lane reads).
@@ -238,16 +238,16 @@ extern int main() {
                 double r2 = dx * dx + dy * dy + dz * dz + eps2;
                 double invr = 1.0 / Math.sqrt(r2);
                 double s = mass[j] * (invr * invr * invr);
-                axi = axi + dx * s;
-                ayi = ayi + dy * s;
-                azi = azi + dz * s;
-                j = j + 1;
+                axi += dx * s;
+                ayi += dy * s;
+                azi += dz * s;
+                j++;
             }
 
             ax[bi] = g * axi;
             ay[bi] = g * ayi;
             az[bi] = g * azi;
-            bi = bi + 1;
+            bi++;
         }
     };
 
@@ -300,7 +300,7 @@ extern int main() {
         axpyVec(halfdt, sVx, sAx);
         axpyVec(halfdt, sVy, sAy);
         axpyVec(halfdt, sVz, sAz);
-        step = step + 1;
+        step++;
     }
     sw.stop();
 

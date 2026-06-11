@@ -47,11 +47,11 @@ int     g_out_len  = 0;
 
 // ---- output-buffer helpers (append into g_out) -----------------------------
 
-void outCh(char c) { g_out[g_out_len] = c; g_out_len = g_out_len + 1; }
+void outCh(char c) { g_out[g_out_len] = c; g_out_len++; }
 
 void outStr(const char* s) {
     int i = 0;
-    while (s[i] != '\0') { outCh(s[i]); i = i + 1; }
+    while (s[i] != '\0') { outCh(s[i]); i++; }
 }
 
 void outInt(int n) {
@@ -59,9 +59,9 @@ void outInt(int n) {
     if (n < 0) { outCh('-'); n = -n; }
     char[12] tmp;
     int i = 0;
-    while (n > 0) { tmp[i] = (char)('0' + n % 10); i = i + 1; n = n / 10; }
+    while (n > 0) { tmp[i] = (char)('0' + n % 10); i++; n /= 10; }
     int j = i - 1;
-    while (j >= 0) { outCh(tmp[j]); j = j - 1; }
+    while (j >= 0) { outCh(tmp[j]); j--; }
 }
 
 // Append a truecolor SGR escape: ESC [ 38 ; 2 ; r ; g ; b m
@@ -102,9 +102,9 @@ void axpyVec(double c, span<double> v, span<double> a) {
         simd<double,4> vvec = simd<double,4>.load(vv, i);
         simd<double,4> avec = simd<double,4>.load(av, i);
         simd<double,4>.store(vvec + cs * avec, vv, i);
-        i = i + 4;
+        i += 4;
     }
-    while (i < n) { vv[i] = vv[i] + c * av[i]; i = i + 1; }
+    while (i < n) { vv[i] += c * av[i]; i++; }
 }
 
 // x += c * v   (Verlet drift).
@@ -118,9 +118,9 @@ void driftVec(double c, span<double> x, span<double> v) {
         simd<double,4> xvec = simd<double,4>.load(xv, i);
         simd<double,4> vvec = simd<double,4>.load(vv, i);
         simd<double,4>.store(xvec + cs * vvec, xv, i);
-        i = i + 4;
+        i += 4;
     }
-    while (i < n) { xv[i] = xv[i] + c * vv[i]; i = i + 1; }
+    while (i < n) { xv[i] += c * vv[i]; i++; }
 }
 
 // ---- main ------------------------------------------------------------------
@@ -128,7 +128,7 @@ void driftVec(double c, span<double> x, span<double> v) {
 // crude argv[1] -> int (newcomer helper; no stdlib atoi documented)
 int strToInt(const char* s) {
     int v = 0; int i = 0; bool found = false;
-    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i = i + 1; }
+    while (s[i] >= '0' && s[i] <= '9') { v = v * 10 + s[i] - '0'; found = true; i++; }
     return found ? v : -1;
 }
 
@@ -174,7 +174,7 @@ extern int main(int argc, char** argv) {
         vy[i] =  x * omega + (rng.nextDouble() * 2.0 - 1.0) * 0.05;
         vz[i] = (rng.nextDouble() * 2.0 - 1.0) * 0.05;
         mass[i] = m;
-        i = i + 1;
+        i++;
     }
 
     // Spans for the vectorized integrator maps.
@@ -210,10 +210,10 @@ extern int main(int argc, char** argv) {
                 simd<double,8> invr  = oneV / simd<double,8>.sqrt(r2);
                 simd<double,8> invr3 = invr * invr * invr;
                 simd<double,8> s = simd<double,8>.load(mass, j) * invr3;
-                accx = accx + dx * s;
-                accy = accy + dy * s;
-                accz = accz + dz * s;
-                j = j + 8;
+                accx += dx * s;
+                accy += dy * s;
+                accz += dz * s;
+                j += 8;
             }
             double axi = accx[0] + accx[1] + accx[2] + accx[3] + accx[4] + accx[5] + accx[6] + accx[7];
             double ayi = accy[0] + accy[1] + accy[2] + accy[3] + accy[4] + accy[5] + accy[6] + accy[7];
@@ -227,13 +227,13 @@ extern int main(int argc, char** argv) {
                 double r2 = dx * dx + dy * dy + dz * dz + eps2;
                 double invr = 1.0 / Math.sqrt(r2);
                 double s = mass[j] * (invr * invr * invr);
-                axi = axi + dx * s;
-                ayi = ayi + dy * s;
-                azi = azi + dz * s;
-                j = j + 1;
+                axi += dx * s;
+                ayi += dy * s;
+                azi += dz * s;
+                j++;
             }
             ax[bi] = g * axi;  ay[bi] = g * ayi;  az[bi] = g * azi;
-            bi = bi + 1;
+            bi++;
         }
     };
 
@@ -291,12 +291,12 @@ extern int main(int argc, char** argv) {
             axpyVec(halfdt, sVx, sAx);
             axpyVec(halfdt, sVy, sAy);
             axpyVec(halfdt, sVz, sAz);
-            ss = ss + 1;
+            ss++;
         }
 
         // --- rasterize bodies into the cell grid ---
         int c = 0;
-        while (c < cells) { g_count[c] = 0; g_speedsum[c] = 0.0; c = c + 1; }
+        while (c < cells) { g_count[c] = 0; g_speedsum[c] = 0.0; c++; }
 
         double maxSpeed = 0.0001;
         i = 0;
@@ -310,10 +310,10 @@ extern int main(int argc, char** argv) {
                 double sp = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i] + vz[i] * vz[i]);
                 if (sp > maxSpeed) { maxSpeed = sp; }
                 int idx = row * W + col;
-                g_count[idx] = g_count[idx] + 1;
-                g_speedsum[idx] = g_speedsum[idx] + sp;
+                g_count[idx]++;
+                g_speedsum[idx] += sp;
             }
-            i = i + 1;
+            i++;
         }
 
         // --- build one ANSI frame in g_out ---
@@ -340,11 +340,11 @@ extern int main(int argc, char** argv) {
                     if (r > rampMax) { r = rampMax; }
                     outCh(ramp[r]);
                 }
-                col = col + 1;
+                col++;
             }
             outStr("\033[0m\n");
             prevColor = -1;
-            row = row + 1;
+            row++;
         }
         outStr("\033[0mframe ");
         outInt(frame + 1);
@@ -358,7 +358,7 @@ extern int main(int argc, char** argv) {
         WriteFile(hOut, g_out, g_out_len, &wr, nullptr);
 
         sleep(30);
-        frame = frame + 1;
+        frame++;
     }
 
     free(g_count);

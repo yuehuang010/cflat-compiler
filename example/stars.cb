@@ -109,7 +109,7 @@ void sxRun(char c, int n) {
     char[12] tmp;
     int  i = 0;
     int  v = n;
-    while (v > 0) { tmp[i] = (char)('0' + v % 10); i++; v = v / 10; }
+    while (v > 0) { tmp[i] = (char)('0' + v % 10); i++; v /= 10; }
     int j = i - 1;
     while (j >= 0) { sxCh(tmp[j]); j--; }
     sxCh(c);
@@ -120,7 +120,7 @@ void sxInt(int n) {
     char[12] tmp;
     int  i = 0;
     int  v = n;
-    while (v > 0) { tmp[i] = (char)('0' + v % 10); i++; v = v / 10; }
+    while (v > 0) { tmp[i] = (char)('0' + v % 10); i++; v /= 10; }
     int j = i - 1;
     while (j >= 0) { sxCh(tmp[j]); j--; }
 }

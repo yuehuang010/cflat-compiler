@@ -214,8 +214,8 @@ bool spawnPiece(int piece)
 bool tryMove(int dr, int dc)
 {
     if (!collides(g_piece, g_rot, g_row + dr, g_col + dc)) {
-        g_row = g_row + dr;
-        g_col = g_col + dc;
+        g_row += dr;
+        g_col += dc;
         return true;
     }
     return false;
@@ -393,8 +393,8 @@ extern int main()
             else if (key.vkCode == (i16)VK_UP)     { tryRotate(); }
             else if (key.vkCode == (i16)VK_SPACE) {
                 int dropped = 0;
-                while (tryMove(1, 0)) { dropped = dropped + 1; }
-                g_score = g_score + dropped * 2;
+                while (tryMove(1, 0)) { dropped++; }
+                g_score += dropped * 2;
             }
         }
 
@@ -404,8 +404,8 @@ extern int main()
             if (!tryMove(1, 0)) {
                 lockPiece();
                 int cleared = clearLines();
-                g_lines = g_lines + cleared;
-                g_score = g_score + cleared * cleared * 100 * g_level;
+                g_lines += cleared;
+                g_score += cleared * cleared * 100 * g_level;
                 g_level = g_lines / 10 + 1;
                 int nextPiece = g_next;
                 g_next = rng.nextInt(0, 6);

@@ -48,8 +48,8 @@ double estimatePi(i64 n, int workers, i64 seed) {
         while (i < hi) {
             double x = rng.nextDouble();
             double y = rng.nextDouble();
-            if (x * x + y * y <= 1.0) { inside = inside + 1; }
-            i = i + 1;
+            if (x * x + y * y <= 1.0) { inside++; }
+            i++;
         }
         return inside;
     };
@@ -66,8 +66,8 @@ double estimateIntegral(i64 n, int workers, i64 seed) {
         i64 i = lo;
         while (i < hi) {
             double x = rng.nextDouble();
-            s = s + Math.exp(x);
-            i = i + 1;
+            s += Math.exp(x);
+            i++;
         }
         return s;
     };
