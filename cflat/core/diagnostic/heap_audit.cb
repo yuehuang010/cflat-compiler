@@ -29,6 +29,7 @@ import "heap_audit.c";
 // these take precedence over the .c auto-extern (first-writer-wins).
 extern void cflat_heap_audit_alloc(void* p, u64 size);
 extern void cflat_heap_audit_free(void* p);
+extern u64 cflat_heap_audit_report_leaks();
 
 namespace HeapAudit {
 
@@ -38,5 +39,17 @@ namespace HeapAudit {
         __alloc_audit_hook = cflat_heap_audit_alloc;
         __free_audit_hook  = cflat_heap_audit_free;
         printf("[heap_audit] enabled\n");
+    }
+
+    // Scan the audit table for allocations still live (operator new with no matching
+    // operator delete) and print each ptr/size to stderr; returns the live count.
+    // Call at a quiescent point (e.g. after a scope has exited) to assert leak-freedom.
+    //
+    // Honest limits (same as enable()): only allocations made AFTER enable() that flow
+    // through operator new/delete are tracked. A buffer freed via a raw allocator path
+    // that bypasses operator delete will look live here; pointers allocated before
+    // enable() are not tracked. This is a debug oracle, not a proof for arbitrary code.
+    u64 reportLeaks() {
+        return cflat_heap_audit_report_leaks();
     }
 };

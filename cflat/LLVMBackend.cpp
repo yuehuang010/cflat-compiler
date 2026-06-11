@@ -1821,6 +1821,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnsOwned = false;
     lastOwningResult = false;
     currentFunctionReturnsOwned = false;
+    pendingOwnedStringTemps.clear();
     lastCallIsBonded = false;
     lastCallBondedSources.clear();
     lastCallLambdaCaptureNames.clear();

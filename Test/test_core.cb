@@ -1073,6 +1073,287 @@ int testStringView()
     return passed;
 }
 
+// ── string API (Phases 1-4) ──────────────────────────────────────────────────
+
+// Consumes an owned string (e.g. a chained-concat result) by value-move and returns
+// its length. Exercises the move-string-parameter ownership-transfer path of the
+// chained-concat temporary cleanup: the callee frees the buffer, so the caller must
+// NOT also free it. Regression for the chained-concat intermediate leak
+// (see internal/string-concat-temp-flush.md).
+int consumeMoveLen(move string s)
+{
+    return s.length();
+}
+
+int testStringAPI()
+{
+    int passed = 0;
+
+    // -- Phase 1: Non-allocating queries --
+
+    string hello = "hello";
+    string empty = "";
+
+    passed += Test("isEmpty false",     hello.isEmpty(), false);
+    passed += Test("isEmpty true",      empty.isEmpty(), true);
+
+    passed += Test("charAt 0",          hello.charAt(0), (i8)'h');
+    passed += Test("charAt 4",          hello.charAt(4), (i8)'o');
+    passed += Test("charAt clamp neg",  hello.charAt(-1), (i8)'h');
+    passed += Test("charAt clamp over", hello.charAt(99), (i8)'o');
+    passed += Test("charAt empty",      empty.charAt(0),  (i8)0);
+
+    string hay = "abcabc";
+    passed += Test("indexOf found",     hay.indexOf("bc"), 1);
+    passed += Test("indexOf from",      hay.indexOf("bc", 2), 4);
+    passed += Test("indexOf absent",    hay.indexOf("xyz"), -1);
+    passed += Test("indexOf empty hay", empty.indexOf("x"), -1);
+    passed += Test("indexOf char",      hay.indexOf((i8)'c'), 2);
+
+    passed += Test("lastIndexOf found",  hay.lastIndexOf("bc"), 4);
+    passed += Test("lastIndexOf absent", hay.lastIndexOf("zz"), -1);
+    passed += Test("lastIndexOf char",   hay.lastIndexOf((i8)'a'), 3);
+
+    passed += Test("contains yes",  hay.contains("abc"), true);
+    passed += Test("contains no",   hay.contains("xyz"), false);
+    passed += Test("contains empty haystack", empty.contains("x"), false);
+
+    string prefix = "hello world";
+    passed += Test("startsWith yes",    prefix.startsWith("hello"), true);
+    passed += Test("startsWith no",     prefix.startsWith("world"), false);
+    passed += Test("startsWith empty",  prefix.startsWith(""), true);
+    passed += Test("endsWith yes",      prefix.endsWith("world"), true);
+    passed += Test("endsWith no",       prefix.endsWith("hello"), false);
+    passed += Test("endsWith empty",    prefix.endsWith(""), true);
+
+    passed += Test("compare equal",  compare("abc", "abc"), 0);
+    passed += Test("compare less",   compare("abc", "abd") < 0, true);
+    passed += Test("compare greater",compare("abd", "abc") > 0, true);
+    passed += Test("compare len",    compare("ab", "abc") < 0, true);
+
+    string sa = "alpha";
+    string sb = "beta";
+    passed += Test("operator< yes",  sa < sb, true);
+    passed += Test("operator< no",   sb < sa, false);
+    passed += Test("operator> yes",  sb > sa, true);
+    passed += Test("operator> no",   sa > sb, false);
+
+    // sort a list<string> using < to verify ordering
+    list<string> words;
+    words.add("cherry"); words.add("apple"); words.add("banana");
+    // bubble sort
+    int n = words.count();
+    int ii = 0;
+    while (ii < n - 1)
+    {
+        int jj = 0;
+        while (jj < n - 1 - ii)
+        {
+            if (words.get(jj) > words.get(jj + 1))
+            {
+                string tmp = words.get(jj).copy();
+                words.set(jj, words.get(jj + 1).copy());
+                words.set(jj + 1, move tmp);
+            }
+            jj++;
+        }
+        ii++;
+    }
+    passed += Test("sort[0]", words.get(0), "apple");
+    passed += Test("sort[1]", words.get(1), "banana");
+    passed += Test("sort[2]", words.get(2), "cherry");
+
+    // -- Phase 2: Allocating transforms --
+
+    string src = "Hello World";
+    string sub1 = src.substring(6);
+    passed += Test("substring from",    sub1, "World");
+    string sub2 = src.substring(0, 5);
+    passed += Test("substring 0,5",     sub2, "Hello");
+    string sub3 = src.substring(0, 0);
+    passed += Test("substring len0",    sub3, "");
+    string sub4 = src.substring(100);
+    passed += Test("substring clamp",   sub4, "");
+    string sub5 = empty.substring(0);
+    passed += Test("substring empty",   sub5, "");
+
+    string repSrc1 = "aabbcc";
+    string rep1 = repSrc1.replace("bb", "XX");
+    passed += Test("replace mid",       rep1, "aaXXcc");
+    string repSrc2 = "aaaa";
+    string rep2 = repSrc2.replace("aa", "b");
+    passed += Test("replace overlap",   rep2, "bb");
+    string repSrc3 = "hello";
+    string rep3 = repSrc3.replace("xyz", "abc");
+    passed += Test("replace absent",    rep3, "hello");
+    string rep4 = repSrc3.replace("", "x");
+    passed += Test("replace empty old", rep4, "hello");
+
+    string upSrc = "Hello World";
+    string up1 = upSrc.toUpper();
+    passed += Test("toUpper",  up1, "HELLO WORLD");
+    string lo1 = upSrc.toLower();
+    passed += Test("toLower",  lo1, "hello world");
+    string up2 = empty.toUpper();
+    passed += Test("toUpper empty", up2, "");
+
+    string trimSrc1 = "  hello  ";
+    string trim1 = trimSrc1.trim();
+    passed += Test("trim",      trim1, "hello");
+    string trimSrc2 = "  hello";
+    string trim2 = trimSrc2.trimStart();
+    passed += Test("trimStart", trim2, "hello");
+    string trimSrc3 = "hello  ";
+    string trim3 = trimSrc3.trimEnd();
+    passed += Test("trimEnd",   trim3, "hello");
+    string trim4 = empty.trim();
+    passed += Test("trim empty", trim4, "");
+    string trimSrc4 = "   ";
+    string trim5 = trimSrc4.trim();
+    passed += Test("trim all space", trim5, "");
+
+    string padSrc1 = "hi";
+    string pl1 = padSrc1.padLeft(5);
+    passed += Test("padLeft",       pl1, "   hi");
+    string padSrc2 = "hello";
+    string pl2 = padSrc2.padLeft(3);
+    passed += Test("padLeft no-op", pl2, "hello");
+    string pr1 = padSrc1.padRight(5);
+    passed += Test("padRight",      pr1, "hi   ");
+    string pr2 = padSrc2.padRight(3);
+    passed += Test("padRight no-op",pr2, "hello");
+
+    // reversed concat: "lit" + string
+    string revPart = src.substring(6);
+    string rev1 = "Hello, " + revPart;
+    passed += Test("reverse concat",    rev1, "Hello, World");
+
+    // -- Phase 3: split / join --
+
+    string splitSrc1 = "a,b,c";
+    list<string> parts = splitSrc1.split(",");
+    passed += Test("split count",   parts.count(), 3);
+    passed += Test("split[0]",      parts.get(0),  "a");
+    passed += Test("split[1]",      parts.get(1),  "b");
+    passed += Test("split[2]",      parts.get(2),  "c");
+
+    string splitSrc2 = "a,b,";
+    list<string> trail = splitSrc2.split(",");
+    passed += Test("split trailing count", trail.count(), 3);
+    passed += Test("split trailing last",  trail.get(2),  "");
+
+    string splitSrc3 = "hello";
+    list<string> noSep = splitSrc3.split(",");
+    passed += Test("split no match count", noSep.count(), 1);
+    passed += Test("split no match[0]",    noSep.get(0),  "hello");
+
+    list<string> emptyParts = empty.split(",");
+    passed += Test("split empty input count", emptyParts.count(), 1);
+    passed += Test("split empty input[0]",    emptyParts.get(0),  "");
+
+    // split by char
+    string splitSrc4 = "x:y:z";
+    list<string> byChar = splitSrc4.split((i8)':');
+    passed += Test("split char count", byChar.count(), 3);
+    passed += Test("split char[0]",    byChar.get(0),  "x");
+    passed += Test("split char[2]",    byChar.get(2),  "z");
+
+    // join round-trip
+    string joined = join(",", parts);
+    passed += Test("join round-trip", joined, "a,b,c");
+
+    list<string> one;
+    one.add("only");
+    string j1 = join(",", one);
+    passed += Test("join single",  j1, "only");
+
+    list<string> none;
+    string j2 = join(",", none);
+    passed += Test("join empty",   j2, "");
+
+    // -- Phase 4: toString conversions (primitive -> string) --
+
+    i64 n64 = 9876543210;
+    string si64 = n64.toString();
+    passed += Test("toString i64", si64, "9876543210");
+
+    u64 nu64 = 18446744073709551615;
+    string su64 = nu64.toString();
+    passed += Test("toString u64", su64, "18446744073709551615");
+
+    double dblVal = 3.14;
+    string sdbl = dblVal.toString();
+    passed += Test("toString double", sdbl, "3.14");
+
+    bool trueVal = true;
+    bool falseVal = false;
+    string sbt = trueVal.toString();
+    passed += Test("toString bool true",  sbt, "true");
+    string sbf = falseVal.toString();
+    passed += Test("toString bool false", sbf, "false");
+
+    // toString(base): radix conversion (hex / binary)
+    i64 hexVal = 255;
+    string shex = hexVal.toString(16);
+    passed += Test("toString base16", shex, "ff");
+
+    // interpolation with i64 / double / bool
+    i64 bigN = 123456789012345;
+    passed += Test("interp i64", "{bigN}", "123456789012345");
+
+    double pi = 3.14159;
+    passed += Test("interp double", "{pi}", "3.14159");
+
+    bool flag = true;
+    passed += Test("interp bool", "{flag}", "true");
+
+    // stringbuilder: append(i64), append(double)
+    stringbuilder sbb;
+    sbb.append((i64)1234567890123);
+    passed += Test("sb append i64", sbb.toString(), "1234567890123");
+
+    sbb.clear();
+    sbb.append(2.718);
+    passed += Test("sb append double", sbb.toString(), "2.718");
+
+    // stringbuilder: append(string_view)
+    string svsrc = "hello world";
+    string_view* sv = svsrc.view();
+    sbb.clear();
+    sbb.append(*sv);
+    passed += Test("sb append string_view", sbb.toString(), "hello world");
+    delete sv;
+
+    // ownership: result of allocating fn bound to inner scope, confirmed freed
+    // (UFCS on a string literal works for single-arg calls but use a variable to be safe)
+    {
+        string padSrc = "  padded  ";
+        string inner = padSrc.trim();
+        passed += Test("ownership inner scope", inner, "padded");
+    }
+
+    // chained concat: the unnamed intermediates (e.g. (a+b) of a+b+c) must be freed
+    // at end-of-expression while the final result stays correct. Regression for the
+    // chained-concat intermediate leak (see internal/string-concat-temp-flush.md;
+    // run under --asan / HeapAudit to confirm the intermediates are freed, not just
+    // that the result is right).
+    {
+        string ca = "foo";
+        string cb = "bar";
+        string cc = "baz";
+        string cd = "qux";
+        string chain3 = ca + cb + cc;
+        passed += Test("concat chain3", chain3, "foobarbaz");
+        string chain4 = ca + cb + cc + cd;
+        passed += Test("concat chain4", chain4, "foobarbazqux");
+        // a chain consumed directly by a move string parameter (ownership transfers
+        // to the callee; the caller must drop the temporary from its cleanup list).
+        passed += Test("concat chain move-param", consumeMoveLen(ca + cb + cc), 9);
+    }
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -1108,6 +1389,7 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
+    r = testStringAPI();        passed += r; total += 89;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

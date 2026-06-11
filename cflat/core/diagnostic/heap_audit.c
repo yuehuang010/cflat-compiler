@@ -205,6 +205,42 @@ void cflat_heap_audit_free(void* p)
 }
 
 // ---------------------------------------------------------------------------
+// Leak scan. Walk the whole table under the lock and report every slot still in
+// the LIVE state - an allocation through operator new with no matching operator
+// delete. Prints "ptr=0x... size=..." per leak to stderr and returns the count.
+//
+// Honest limits (same as the double-free path): only allocations made AFTER
+// enable() that flow through operator new/delete are tracked. A still-LIVE entry
+// at program exit is a leak; a buffer freed via a raw allocator path that bypasses
+// operator delete will look LIVE here (false positive) - so this is a debug oracle,
+// not a proof of leak-freedom for arbitrary code.
+unsigned long long cflat_heap_audit_report_leaks(void)
+{
+    if (!cflat_ha_lock_ready) return 0;
+    unsigned long long liveCount = 0;
+    EnterCriticalSection(&cflat_ha_lock);
+    for (unsigned int i = 0; i < CFLAT_HA_SLOTS; ++i)
+    {
+        cflat_ha_slot* slot = &cflat_ha_table[i];
+        if (slot->state != CFLAT_HA_STATE_LIVE)
+            continue;
+        liveCount++;
+        char line[160];
+        int pos = 0;
+        cflat_ha_append_(line, sizeof(line), &pos,
+                         "*** cflat heap-audit: LEAK ptr=0x");
+        cflat_ha_append_hex_(line, sizeof(line), &pos,
+                             (unsigned long long)(ULONG_PTR)slot->key, 0);
+        cflat_ha_append_(line, sizeof(line), &pos, " size=");
+        cflat_ha_append_dec_(line, sizeof(line), &pos, slot->size);
+        cflat_ha_append_(line, sizeof(line), &pos, " ***\n");
+        cflat_ha_write_stderr_(line);
+    }
+    LeaveCriticalSection(&cflat_ha_lock);
+    return liveCount;
+}
+
+// ---------------------------------------------------------------------------
 // One-time CRITICAL_SECTION init via a CRT initializer (runs before main, single
 // threaded). Mirrors crashdump.c's .CRT$XCU registration.
 // ---------------------------------------------------------------------------

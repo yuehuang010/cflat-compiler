@@ -2675,6 +2675,12 @@ public:
                 compiler->SetCurrentDebugLocation(destructuring->getStart()->getLine());
                 ParseDestructuringDeclaration(destructuring);
             }
+
+            // End of a full expression / statement: free any owned-string temporaries
+            // (e.g. the unnamed (a + b) intermediate of a chained concat) that were not
+            // claimed by a named local or a move parameter. Mirrors C++ temporary
+            // lifetime - destroyed at the statement's semicolon.
+            compiler->FlushOwnedStringTemps();
         }
     }
 
@@ -3072,6 +3078,13 @@ public:
                         compiler->lastCallIsBonded = false;
                         compiler->lastCallBondByAddress = false;
                         compiler->lastCallBondedSources.clear();
+                        // The returned value (e.g. the final string of `return a + b + c;`)
+                        // is moved to the caller - drop it from the temporary cleanup list
+                        // so we do not free a buffer the caller now owns. Any other owned-
+                        // string intermediates of the return expression must be freed before
+                        // the ret terminates the block.
+                        compiler->UnregisterOwnedStringTemp(right);
+                        compiler->FlushOwnedStringTemps();
                         compiler->CreateReturnCall(right);
                     }
                     else
@@ -4770,6 +4783,16 @@ public:
                                 else
                                     right = compiler->WrapStringLiteralAsString(right);
                             }
+                            // A primitive assigned to a string is no longer an implicit conversion
+                            // (it mirrors the rejected `(string)primitive` cast). Direct the user to
+                            // value.toString() instead of emitting an invalid scalar->struct cast.
+                            else if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
+                                && (right->getType()->isIntegerTy() || right->getType()->isFloatingPointTy()))
+                            {
+                                LogErrorContext(assignmentExpression, "cannot assign a primitive value to "
+                                    "'string'; call 'value.toString()' instead (string interpolation \"{x}\" "
+                                    "and '+' concatenation still convert automatically)");
+                            }
                             // Bare 'function' type inference: infer signature from the assigned function value.
                             if (right && typeAndValue.IsFunctionPointer && typeAndValue.FuncPtrReturnTypeName.empty())
                             {
@@ -4982,6 +5005,10 @@ public:
                         {
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsOwningString = true;
+                            // The named local now owns this buffer and frees it on scope
+                            // exit; drop it from the unnamed-temporary cleanup list so it
+                            // is not also freed at end-of-expression (double free).
+                            compiler->UnregisterOwnedStringTemp(right);
                             compiler->lastCallReturnsOwned = false;
                         }
 
@@ -5358,6 +5385,15 @@ public:
             // Reset the flag so it doesn't leak into the next declaration in this scope.
             compiler->lastOwningResult = false;
             auto right = LoadNamedVariable(rightNV);
+
+            // A plain assignment moves the RHS value into the named lvalue; if it was an
+            // owned-string temporary (e.g. `s = a + b + c;`) the lvalue now holds it, so
+            // drop it from the unnamed-temporary cleanup list - freeing it at end of
+            // expression would leave the lvalue dangling (UAF / double free). Intermediate
+            // concat temporaries stay queued and are still freed. Only for plain '='; a
+            // compound '+=' RHS is a true intermediate that must be freed.
+            if (operatorText == "=" && right != nullptr)
+                compiler->UnregisterOwnedStringTemp(right);
 
             // Wrap named function in closure fat struct when assigning to a function<T> variable.
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
@@ -6851,6 +6887,20 @@ public:
         }
     }
 
+    // If an operator overload (e.g. operator+) just returned an owned heap string as an
+    // unnamed SSA temporary, register it for end-of-full-expression cleanup. This is the
+    // intermediate (a + b) of a chained concat a + b + c: it is consumed as the next
+    // operator's argument and never bound to a named local, so without this its buffer
+    // leaks. The named-local binding path and the move-string-parameter path unregister
+    // the temporary they take ownership of, so only true intermediates are freed here.
+    void TrackOwnedStringOperatorResult(LLVMBackend* compiler, llvm::Value* result)
+    {
+        if (result == nullptr || !compiler->lastCallReturnsOwned) return;
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        if (strTy != nullptr && result->getType() == strTy)
+            compiler->RegisterOwnedStringTemp(result);
+    }
+
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
         antlr4::ParserRuleContext* ctx)
@@ -6939,7 +6989,9 @@ public:
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.Primary = tempAlloca;
 
-            return compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            TrackOwnedStringOperatorResult(compiler, result);
+            return result;
         }
         else
         {
@@ -6951,7 +7003,9 @@ public:
             thisNV.Primary  = lvalue;
             thisNV.BaseType = structTy;
 
-            return compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            TrackOwnedStringOperatorResult(compiler, result);
+            return result;
         }
 
         return nullptr;
@@ -7052,6 +7106,24 @@ public:
                 auto argNV = namedVar;
                 argNV.TypeAndValue.VariableName = "";  // clear name so positional matching is used
                 materialize(argNV);
+
+                // A bare `(string)primitive` cast is no longer a public conversion - a
+                // primitive's NamedVariable here is an integer/floating-point scalar value
+                // (char*/IString operands are pointer/struct values and still cast). Direct
+                // the user to value.toString(); interpolation "{x}" and string concatenation
+                // keep working because they reach the internal operator string hook by name,
+                // not through this cast path. (This also covers the former literal-cast crash.)
+                if (destTypeName.TypeName == "string" && argNV.Primary != nullptr
+                    && (argNV.Primary->getType()->isIntegerTy()
+                        || argNV.Primary->getType()->isFloatingPointTy()))
+                {
+                    LogErrorContext(ctx, "cannot cast a primitive value to 'string'; call "
+                        "'value.toString()' instead (string interpolation \"{x}\" and '+' "
+                        "concatenation still convert automatically)");
+                    namedVar.TypeAndValue = destTypeName;
+                    return namedVar;
+                }
+
                 auto result = compiler->CreateOverloadedFunctionCall(opName, { argNV });
                 namedVar.Primary = result;
                 namedVar.Storage = nullptr;
@@ -9234,12 +9306,24 @@ public:
                             static const std::unordered_set<std::string> intConvert = {
                                 "to_i8","to_u8","to_i16","to_u16","to_i32","to_u32","to_i64","to_u64"
                             };
-                            return intConvert.count(terminal->getText()) > 0;
+                            if (intConvert.count(terminal->getText()) > 0) return true;
+                            // UFCS: a primitive (integer-like, incl. bool) base calling a free
+                            // function by name - e.g. n.toString(), n.toString(16). The base value
+                            // stays in namedVar and is pushed as the self argument when '()' is
+                            // dispatched below. Float bases are already covered above.
+                            bool baseIsIntegerLike =
+                                namedVar.TypeAndValue.IsInteger() >= 0
+                                || namedVar.TypeAndValue.TypeName == "bool"
+                                || (namedVar.Primary != nullptr
+                                    && namedVar.Primary->getType()->isIntegerTy());
+                            if (baseIsIntegerLike && Compiler(ctx)->GetFunction(terminal->getText()))
+                                return true;
+                            return false;
                         }())
                         {
-                            // Method name on a primitive float/double or integer conversion
-                            // (e.g. f.round(), (-2.5f).abs(), x.to_i32(), x.to_u64()).
-                            // Record the method name; the base value stays in namedVar.
+                            // Method name on a primitive float/double, an integer conversion, or a
+                            // free-function UFCS call (e.g. f.round(), (-2.5f).abs(), x.to_i32(),
+                            // n.toString()). Record the method name; the base value stays in namedVar.
                             // Actual dispatch happens when '()' is processed below.
                             primaryIdentifier = terminal->getText();
                         }
@@ -10893,6 +10977,22 @@ public:
                                         structVar = {};
                                         break;
                                     }
+                                }
+
+                                // General UFCS on a primitive: dispatch `value.func(args)` to a free
+                                // function `func(value, args)` (e.g. n.toString(), n.toString(16)). The
+                                // float/int intrinsic attempts above take precedence; this only runs when
+                                // none matched. The value becomes the self argument via structVar so the
+                                // normal dispatch below pushes it as the first argument.
+                                if (primVal != nullptr
+                                    && (primVal->getType()->isIntegerTy() || primVal->getType()->isFloatingPointTy())
+                                    && Compiler(ctx)->GetFunction(primaryIdentifier))
+                                {
+                                    LLVMBackend::NamedVariable selfArg;
+                                    selfArg.Primary  = primVal;
+                                    selfArg.BaseType = primVal->getType();
+                                    selfArg.TypeAndValue.TypeName = namedVar.TypeAndValue.TypeName;
+                                    structVar = selfArg;
                                 }
                             }
 

@@ -135,11 +135,43 @@ string result = "hello " + g;     // "hello world"
 
 For incremental building, use `stringbuilder` - a mutable, growable buffer with `append`, `appendCStr`, `appendChar`, `clear`, and `toString`.
 
-Define `operator string(T)` to convert arbitrary types to `string`; the core library provides conversions from `char*`, `i32`, and any `IString`.
+The standard library provides a broad set of string operations. A few examples to show the flavor:
+
+```c
+// Searching and testing
+s.indexOf("lo");          // 3, or -1 if absent
+s.startsWith("hel");      // true
+s.contains("ell");        // true
+bool ordered = s < t;     // lexicographic order
+
+// Allocating transforms - result is owned, freed at scope exit
+string upper = s.toUpper();
+string trimmed = s.trim();
+string part = s.substring(1, 3);
+string fixed = s.replace("ell", "ELL");
+
+// Split and join
+list<string> parts = "a,b,c".split(",");
+string joined = join("-", parts);         // "a-b-c"
+```
+
+Use LSP hover or `cflat.exe --symbol <name>` to browse the full API surface.
+
+Stringify a primitive explicitly with `value.toString()` (and `value.toString(base)` for an integer radix). A bare `(string)value` cast on a primitive is rejected - this keeps the owning heap allocation visible and matches C#/Java/Rust/Go:
+
+```c
+i64 n = 42;
+string s = n.toString();        // "42"
+string hex = n.toString(16);    // "2a"
+double d = 3.14;
+string sd = d.toString();       // "3.14"
+```
+
+For your own types, implement `IString` (`string ToString()`); string interpolation and concatenation pick it up automatically.
 
 #### String interpolation
 
-Any string literal containing `{expr}` is automatically treated as an interpolated string - no prefix required. Each `{expr}` segment is converted to `string` via `operator string` and the segments are concatenated at runtime:
+Any string literal containing `{expr}` is automatically treated as an interpolated string - no prefix required. Each `{expr}` segment is converted to `string` (primitives via their built-in stringification, custom types via `IString`) and the segments are concatenated at runtime:
 
 ```c
 string name = "World";
@@ -153,7 +185,7 @@ string b = "bar";
 string both = "{a} and {b}";        // "foo and bar"
 ```
 
-Any type with `operator string` (including `IString` implementors) works inside `{}`:
+Any `IString` implementor works inside `{}`:
 
 ```c
 struct Point : IString

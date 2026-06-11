@@ -1,0 +1,8 @@
+// A primitive assigned to a `string` (no cast) is likewise not an implicit
+// conversion - it used to emit an invalid scalar->struct LLVM cast (assert). It must
+// now direct the user to value.toString().
+import "string.cb";
+
+expect_error("cannot assign a primitive value to 'string'") {
+    void f() { i64 n = 5; string s = n; }
+}

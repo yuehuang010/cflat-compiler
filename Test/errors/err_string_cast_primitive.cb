@@ -1,0 +1,8 @@
+// A bare `(string)primitive` cast is no longer a public conversion - the user is
+// directed to value.toString(). Covers both a typed variable operand and (the case
+// that used to segfault the compiler) a bare literal operand.
+import "string.cb";
+
+expect_error("cannot cast a primitive value to 'string'") {
+    void f() { double d = 3.14; string s = (string)d; }
+}

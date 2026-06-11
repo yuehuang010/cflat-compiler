@@ -821,6 +821,17 @@ public:
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
 
+    // Owned-string SSA temporaries produced by a ReturnsOwned call (e.g. the unnamed
+    // (a + b) intermediate of a chained concat a + b + c) that are consumed as a
+    // sub-expression rather than bound to a named local. They have no NamedVariable
+    // and so are invisible to EmitDestructorsForScope; without explicit cleanup their
+    // heap buffer leaks. Each entry pairs the SSA string value with the basic block it
+    // was created in (for dominance safety at flush time). Registered by the additive /
+    // operator lowering, removed when a named local or a `move string` parameter claims
+    // ownership, and freed at end-of-full-expression (C++ temporary semantics) via
+    // FlushOwnedStringTemps. See internal/string-concat-intermediate-leak.md.
+    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedStringTemps;
+
     // T[] array-view noalias metadata (per-function, reset in createFunctionBlock). aliasDomain_ is
     // the single anonymous alias domain for the current function; aliasScopes_ holds one anonymous
     // scope per distinct view ORIGIN (parameter / field) seen in the function body. A view's element
@@ -1409,6 +1420,60 @@ private:
 
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);
+    }
+
+    // Record an owned-string SSA temporary for end-of-full-expression cleanup. Called
+    // by the operator lowering when an operator+ (ReturnsOwned string) result is NOT
+    // bound to a named local. `value` must be the %string struct value the call returned.
+    void RegisterOwnedStringTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        pendingOwnedStringTemps.emplace_back(value, builder->GetInsertBlock());
+    }
+
+    // Remove an owned-string temporary from the pending-cleanup list because some other
+    // construct has taken ownership of it: a named local (its destructor will free it on
+    // scope exit) or a `move string` parameter (the callee frees it). Prevents a double
+    // free of the same buffer.
+    void UnregisterOwnedStringTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        std::erase_if(pendingOwnedStringTemps,
+            [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
+    }
+
+    // Free every owned-string temporary still pending at the end of a full expression,
+    // mirroring C++ temporary lifetime (destroyed at the semicolon). Only temporaries
+    // created in the CURRENT basic block are freed - one created across a branch (e.g. in
+    // a loop condition) would not dominate this insert point, so it is dropped rather than
+    // emitted as invalid IR (a rare leak, documented in the bug note). The list is always
+    // cleared so temporaries never carry across statements. No-op if the current block is
+    // already terminated (e.g. after a return emitted the frees itself).
+    void FlushOwnedStringTemps()
+    {
+        if (pendingOwnedStringTemps.empty()) return;
+
+        auto* curBlock = builder->GetInsertBlock();
+        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
+        if (!terminated)
+        {
+            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+            for (auto& [value, bb] : pendingOwnedStringTemps)
+            {
+                if (value == nullptr || bb != curBlock) continue;     // dominance safety
+                if (strTy == nullptr || value->getType() != strTy) continue;
+                EnsureStringDtorRegistered();
+                auto it = dataStructures.find("string");
+                if (it == dataStructures.end() || it->second.Destructor == nullptr) continue;
+                // The destructor takes a string*; spill the SSA value to an entry-block
+                // alloca (never a loop body - see AllocaAtEntry) and free through it.
+                auto* tmp = AllocaAtEntry(strTy, nullptr, "concat.tmp");
+                builder->CreateStore(value, tmp);
+                builder->CreateCall(it->second.Destructor->getFunctionType(),
+                                    it->second.Destructor, { tmp });
+            }
+        }
+        pendingOwnedStringTemps.clear();
     }
 
     void EmitDestructorsForScope(const StackState& frame)
@@ -6317,6 +6382,14 @@ public:
     /// <returns>Returns -1 for in compatible type, 0 for same, positive number for possible Upconvert.</returns>
     int CompareUpconvert(llvm::Type* srcType, llvm::Type* destType) const
     {
+        // A typeless operand (e.g. a bare literal cast through an operator overload,
+        // whose NamedVariable carries only Primary - no BaseType, no TypeName) reaches
+        // here with a null srcType. Treat it as incompatible (-1) rather than
+        // dereferencing null: the caller then reports a clean "no overload matches"
+        // diagnostic instead of segfaulting. See internal/string-literal-cast-crash.md.
+        if (srcType == nullptr || destType == nullptr)
+            return -1;
+
         if (srcType->isPointerTy() && destType->isPointerTy())
         {
             return 0;
@@ -9023,6 +9096,13 @@ public:
         {
             if (candidate.Parameters[i].IsMove)
             {
+                // A `move string` argument transfers ownership to the callee, which frees
+                // it on return. If the argument is an unnamed owned-string temporary (e.g.
+                // a chained-concat result passed directly), drop it from the end-of-
+                // expression cleanup list so it is not also freed by the caller.
+                if (candidate.Parameters[i].TypeName == "string")
+                    UnregisterOwnedStringTemp(matched[i].Primary);
+
                 // Interface fat-ptr parameters (non-pointer) borrow the caller's data - don't zero it.
                 // The fat-ptr holds a reference to the caller's struct; zeroing would corrupt that data.
                 bool isInterfaceBorrow = candidate.Parameters[i].IsInterface && !candidate.Parameters[i].IsInterfacePointer;

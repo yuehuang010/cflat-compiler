@@ -1,0 +1,8 @@
+// Regression: a non-integer literal cast to `string` used to segfault the compiler
+// (raw access violation in overload resolution - CompareUpconvert on a null operand
+// type). It must now be a clean diagnostic, not a crash.
+import "string.cb";
+
+expect_error("cannot cast a primitive value to 'string'") {
+    void f() { string s = (string)true; }
+}
