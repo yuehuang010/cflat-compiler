@@ -3,12 +3,99 @@
 // A matrix is a flat `double[]` in row-major order plus its (rows, cols); the caller
 // owns the storage. Kernels take noalias views so the optimizer needs no alias guards.
 //
-//   gemv : y = alpha * A*x + beta * y          (matrix-vector)
-//   gemm : C = alpha * A*B + beta * C          (matrix-matrix, ikj order)
-//   transpose                                    (B = A^T)
+//   gemv    : y = alpha * A*x + beta * y        (matrix-vector)
+//   gemm    : C = alpha * A*B + beta * C        (matrix-matrix, cache-blocked)
+//   gemm_ld : gemm over sub-blocks of larger matrices (explicit leading dimensions)
+//   transpose                                   (B = A^T)
 //
-// gemm uses the cache-friendly i-k-j loop order: the innermost loop is a stride-1 map
-// over a row of B accumulated into a row of C (an axpy), which vectorizes at -O2.
+// gemm is cache-blocked: the output C is tiled GEMM_MB x GEMM_NB, and for each output
+// tile the A and B sub-blocks of each GEMM_KB k-slab are packed into small contiguous
+// scratch buffers before a tight i-p-j kernel runs over the packed tiles. Packing keeps
+// the kernel's working set resident in cache (no large-stride B accesses) and the packed
+// rows are distinct allocations, so the stride-1 inner loop auto-vectorizes at -O2.
+// Core deliberately does NOT use the `vectorize` keyword (its hard-error contract
+// belongs to user code that opts in) - same policy as hpc/factor.cb.
+
+import "threadpool.cb";    // ThreadPool (pool-parallel gemm)
+import "hpc/parallel.cb";  // parallel_for_n_pool
+
+// Compute one GEMM output tile: C[i0..i0+mblk, j0..j0+nblk] = beta * C + alpha * A*B
+// restricted to that tile, walking k in GEMM_KB slabs (kstep) in ascending order so the
+// per-element accumulation order is deterministic and independent of tile ownership.
+// packA (mblk x kblk, alpha folded in) and packB (kblk x nblk) are caller scratch of at
+// least GEMM_MB*kstep and kstep*GEMM_NB doubles. Top-level (not in namespace Mat) so the
+// pool-parallel lambda in gemm_ld can call it directly.
+void __mat_gemm_tile(double alpha, double[] a, int lda, double[] b, int ldb,
+                     double beta, double[] c, int ldc, int k, int kstep,
+                     int i0, int mblk, int j0, int nblk,
+                     double[] packA, double[] packB)
+{
+    // beta-scale this C tile once, before any k slab accumulates into it.
+    for (int i = 0; i < mblk; i = i + 1)
+    {
+        double[] crow = (double[])&c[(i0 + i) * ldc + j0];
+        for (int j = 0; j < nblk; j = j + 1)
+            crow[j] = beta * crow[j];
+    }
+
+    for (int kb0 = 0; kb0 < k; kb0 = kb0 + kstep)
+    {
+        int kblk = k - kb0;
+        if (kblk > kstep) kblk = kstep;
+
+        // Pack alpha*A tile (mblk x kblk): contiguous rows, alpha folded in once.
+        for (int i = 0; i < mblk; i = i + 1)
+        {
+            double[] arow = (double[])&a[(i0 + i) * lda + kb0];
+            double[] prow = (double[])&packA[i * kblk];
+            for (int p = 0; p < kblk; p = p + 1)
+                prow[p] = alpha * arow[p];
+        }
+        // Pack B tile (kblk x nblk): the kernel's B rows become stride-1 and cache-hot.
+        for (int p = 0; p < kblk; p = p + 1)
+        {
+            double[] brow = (double[])&b[(kb0 + p) * ldb + j0];
+            double[] qrow = (double[])&packB[p * nblk];
+            for (int j = 0; j < nblk; j = j + 1)
+                qrow[j] = brow[j];
+        }
+        // Tight kernel over the packed tiles: i-p-j, stride-1 axpy rows (vectorizes).
+        // p is unrolled by 4 so each C row is loaded/stored once per FOUR k terms
+        // instead of once per term (the kernel is C-traffic bound otherwise). The
+        // chained left-to-right adds accumulate each element's k terms in exactly
+        // the same ascending-k order as four separate single-p passes, so the
+        // result is bit-identical to the unrolled-by-1 form.
+        for (int i = 0; i < mblk; i = i + 1)
+        {
+            double[] crow = (double[])&c[(i0 + i) * ldc + j0];
+            double[] prow = (double[])&packA[i * kblk];
+            int p = 0;
+            while (p + 4 <= kblk)
+            {
+                double av0 = prow[p];
+                double av1 = prow[p + 1];
+                double av2 = prow[p + 2];
+                double av3 = prow[p + 3];
+                double[] q0 = (double[])&packB[p * nblk];
+                double[] q1 = (double[])&packB[(p + 1) * nblk];
+                double[] q2 = (double[])&packB[(p + 2) * nblk];
+                double[] q3 = (double[])&packB[(p + 3) * nblk];
+                for (int j = 0; j < nblk; j = j + 1)
+                    crow[j] = crow[j] + av0 * q0[j] + av1 * q1[j]
+                                      + av2 * q2[j] + av3 * q3[j];
+                p = p + 4;
+            }
+            while (p < kblk)
+            {
+                double av = prow[p];
+                double[] qrow = (double[])&packB[p * nblk];
+                for (int j = 0; j < nblk; j = j + 1)
+                    crow[j] = crow[j] + av * qrow[j];
+                p = p + 1;
+            }
+        }
+    }
+}
 
 namespace Mat
 {
@@ -25,28 +112,87 @@ namespace Mat
         }
     }
 
-    // C = alpha * A*B + beta * C.  A is (m x k), B is (k x n), C is (m x n), all row-major.
-    // i-k-j order: stride-1 inner map over B's row k into C's row i -> vectorizes.
-    void gemm(double alpha, double[] a, double[] b, double beta, double[] c,
-              int m, int k, int n)
-    {
-        // Apply beta to C first (pure scale; vectorizes over the whole buffer).
-        int total = m * n;
-        vectorize for (int t = 0; t < total; t = t + 1)
-            c[t] = beta * c[t];
+    // GEMM cache-block sizes, sized for this generation of x64 cores (48KB L1d / 1MB L2
+    // per core). Per k-slab the kernel touches a 64x64 C tile (32KB, ~L1-resident), a
+    // packed 64x256 alpha*A tile (128KB) and a packed 256x64 B tile (128KB) - ~288KB
+    // total, comfortably inside L2 with room for the streamed source rows.
+    const int GEMM_MB = 64;     // C tile rows
+    const int GEMM_NB = 64;     // C tile cols
+    const int GEMM_KB = 256;    // k slab depth
 
-        for (int i = 0; i < m; i = i + 1)
-        {
-            int crow = i * n;
-            int arow = i * k;
-            for (int p = 0; p < k; p = p + 1)
+    // Minimum m*k*n (i.e. half the multiply-add flops) before gemm fans out over the
+    // pool. One parallel_for_n_pool dispatch costs roughly 3-5 us per worker (see
+    // doc/HPC.md "Budget the dispatch"); below this the fan-out/join costs more than
+    // it saves. Same rationale and scale as Factor.LU_PAR_MIN_WORK.
+    const i64 GEMM_PAR_MIN_WORK = 262144;
+
+    // C = alpha * A*B + beta * C over sub-blocks of larger row-major matrices: each
+    // operand has an explicit leading dimension (row stride in elements), so a view
+    // re-blessed at a sub-block origin - e.g. (double[])&lu[i0 * n + j0] with ld = n -
+    // addresses an m x k block whose rows are n apart. gemm() forwards here with the
+    // leading dimensions equal to the row lengths.
+    //
+    // The element ranges the three views actually touch must be pairwise disjoint
+    // (the usual re-blessing contract, doc/HPC.md); A and B may be sub-blocks of the
+    // same allocation as C provided the regions do not overlap.
+    //
+    // pool == nullptr (the default) runs serially. With a pool, the OUTPUT tiles are
+    // partitioned over the workers once the total work clears GEMM_PAR_MIN_WORK; each
+    // output element is computed by exactly one worker in the same per-tile operation
+    // order as the serial run, so the pooled result is BIT-IDENTICAL to serial.
+    // workers <= 0 uses the pool's worker count.
+    void gemm_ld(double alpha, double[] a, int lda, double[] b, int ldb,
+                 double beta, double[] c, int ldc, int m, int k, int n,
+                 ThreadPool* pool = nullptr, int workers = 0)
+    {
+        if (m <= 0 || n <= 0) return;
+
+        int mb = GEMM_MB;
+        int nb = GEMM_NB;
+        int kstep = GEMM_KB;
+        int ntn = (n + nb - 1) / nb;                    // tiles per C row
+        i64 tiles = (i64)((m + mb - 1) / mb) * (i64)ntn;
+
+        // Scratch is sized for one k slab; a smaller k shrinks it.
+        int kcap = k < kstep ? k : kstep;
+        if (kcap < 1) kcap = 1;
+
+        // One worker runs this once per [lo,hi) range of flat tile indices, with its
+        // own pack scratch (allocated per worker, outside the tile loop - the hot
+        // path never allocates). Serial is body(0, tiles): identical order, identical
+        // result. Locals below are captured by value.
+        function<void(i64, i64)> body = (i64 lo, i64 hi) => {
+            double[] packA = new double[mb * kcap];
+            double[] packB = new double[kcap * nb];
+            for (i64 t = lo; t < hi; t = t + 1)
             {
-                double aval = alpha * a[arow + p];
-                int brow = p * n;
-                vectorize for (int j = 0; j < n; j = j + 1)
-                    c[crow + j] = c[crow + j] + aval * b[brow + j];
+                int ti = (int)(t / (i64)ntn);
+                int tj = (int)(t % (i64)ntn);
+                int i0 = ti * mb;
+                int j0 = tj * nb;
+                int mblk = m - i0; if (mblk > mb) mblk = mb;
+                int nblk = n - j0; if (nblk > nb) nblk = nb;
+                __mat_gemm_tile(alpha, a, lda, b, ldb, beta, c, ldc, k, kstep,
+                                i0, mblk, j0, nblk, packA, packB);
             }
-        }
+            delete[_] packA;
+            delete[_] packB;
+        };
+
+        if (pool != nullptr && tiles > 1 && (i64)m * (i64)k * (i64)n >= GEMM_PAR_MIN_WORK)
+            parallel_for_n_pool(pool, tiles, workers, body);
+        else
+            body(0, tiles);
+    }
+
+    // C = alpha * A*B + beta * C.  A is (m x k), B is (k x n), C is (m x n), all
+    // row-major and contiguous. Cache-blocked (see gemm_ld); pass a ThreadPool* to
+    // partition the output tiles across cores (bit-identical to the serial run).
+    void gemm(double alpha, double[] a, double[] b, double beta, double[] c,
+              int m, int k, int n,
+              ThreadPool* pool = nullptr, int workers = 0)
+    {
+        gemm_ld(alpha, a, k, b, n, beta, c, n, m, k, n, pool, workers);
     }
 
     // B = A^T.  A is (m x n) row-major, B is (n x m) row-major.

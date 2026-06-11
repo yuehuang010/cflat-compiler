@@ -102,6 +102,83 @@ void test_densemat()
     delete[_] a; delete[_] xv; delete[_] yv; delete[_] b; delete[_] c; delete[_] at;
 }
 
+// Naive reference gemm: C = alpha * A*B + beta * C, plain triple loop.
+void gemm_naive_ref(double alpha, double[] a, double[] b, double beta, double[] c,
+                    int m, int k, int n)
+{
+    for (int i = 0; i < m; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int p = 0; p < k; p = p + 1)
+                s = s + a[i * k + p] * b[p * n + j];
+            c[i * n + j] = alpha * s + beta * c[i * n + j];
+        }
+}
+
+// Deterministic pseudo-random fill in roughly [-4.5, 4.5] (same LCG as the factor tests).
+int fill_lcg(double[] buf, int count, int seed)
+{
+    for (int i = 0; i < count; i = i + 1)
+    {
+        seed = seed * 1103515245 + 12345;
+        int v = (seed >> 16) & 0x7fff;
+        buf[i] = (double)(v % 10) - 4.5;
+    }
+    return seed;
+}
+
+// ---- cache-blocked gemm: odd (non-multiple-of-block) sizes, alpha/beta, pool ----
+void test_gemm_blocked()
+{
+    printf("[gemm_blocked]\n");
+
+    // m and n straddle the 64-wide C tiles; k = 300 crosses the 256-deep k slab,
+    // so ragged edges of every blocking dimension (and the unroll-by-4 k tail) run.
+    int m = 67; int k = 300; int n = 71;
+    double[] a  = new double[m * k];
+    double[] b  = new double[k * n];
+    double[] c0 = new double[m * n];   // shared initial C, so beta has something to scale
+    int seed = 1234;
+    seed = fill_lcg(a, m * k, seed);
+    seed = fill_lcg(b, k * n, seed);
+    seed = fill_lcg(c0, m * n, seed);
+
+    double[] c   = new double[m * n];
+    double[] ref = new double[m * n];
+
+    // alpha=1, beta=0 (plain product)
+    for (int i = 0; i < m * n; i = i + 1) { c[i] = c0[i]; ref[i] = c0[i]; }
+    Mat.gemm(1.0, a, b, 0.0, c, m, k, n);
+    gemm_naive_ref(1.0, a, b, 0.0, ref, m, k, n);
+    check_tol("gemm a=1 b=0 vs naive", max_abs_diff(c, ref, m * n), 0.0, 0.000000001);
+
+    // alpha=2, beta=0.5 (general scaling)
+    for (int i = 0; i < m * n; i = i + 1) { c[i] = c0[i]; ref[i] = c0[i]; }
+    Mat.gemm(2.0, a, b, 0.5, c, m, k, n);
+    gemm_naive_ref(2.0, a, b, 0.5, ref, m, k, n);
+    check_tol("gemm a=2 b=0.5 vs naive", max_abs_diff(c, ref, m * n), 0.0, 0.000000001);
+
+    // alpha=-1, beta=1 (the blocked-LU trailing-update shape)
+    for (int i = 0; i < m * n; i = i + 1) { c[i] = c0[i]; ref[i] = c0[i]; }
+    Mat.gemm(-1.0, a, b, 1.0, c, m, k, n);
+    gemm_naive_ref(-1.0, a, b, 1.0, ref, m, k, n);
+    check_tol("gemm a=-1 b=1 vs naive", max_abs_diff(c, ref, m * n), 0.0, 0.000000001);
+
+    // Pooled gemm partitions OUTPUT tiles only, so it must be bit-identical to
+    // serial. m*k*n = 1.43M clears Mat.GEMM_PAR_MIN_WORK, so the pool really runs.
+    double[] cp = new double[m * n];
+    for (int i = 0; i < m * n; i = i + 1) { c[i] = c0[i]; cp[i] = c0[i]; }
+    Mat.gemm(2.0, a, b, 0.5, c, m, k, n);
+    ThreadPool pool;
+    pool.init(4, cpu_mask_lowest(4));
+    Mat.gemm(2.0, a, b, 0.5, cp, m, k, n, &pool);
+    pool.shutdown();
+    check_tol("gemm pool bit-identical", max_abs_diff(c, cp, m * n), 0.0, 0.0000000000000001);
+
+    delete[_] a; delete[_] b; delete[_] c0; delete[_] c; delete[_] ref; delete[_] cp;
+}
+
 // ---- stencils ----
 void test_stencil()
 {
@@ -355,10 +432,10 @@ void test_factor_piv()
     delete[_] g; delete[_] xexact; delete[_] b;
     delete[_] lu; delete[_] piv; delete[_] x;
 
-    // Pool overload: large enough that the trailing update crosses
-    // Factor.LU_PAR_MIN_WORK (rows^2 >= 262144 -> n > 513), so the parallel
-    // branch actually runs. The contract is BIT-IDENTICAL factors: each row is
-    // updated by exactly one worker in serial operation order.
+    // Pool overload: n = 520 routes to the blocked path (n >= LU_BLOCK_MIN_N) and
+    // its gemm trailing updates clear Mat.GEMM_PAR_MIN_WORK, so the parallel branch
+    // actually runs. The contract is BIT-IDENTICAL factors: each output element is
+    // computed by exactly one worker in serial operation order.
     int np = 520;
     double[] gp = new double[np * np];
     seed = 11;
@@ -396,6 +473,103 @@ void test_factor_piv()
 
     delete[_] gp; delete[_] luSerial; delete[_] luPool;
     delete[_] pivSerial; delete[_] pivPool;
+}
+
+// In-test reference: the classic UNBLOCKED pivoted LU sweep (a verbatim copy of the
+// small-n algorithm), so the blocked path can be checked against it independently of
+// the library's internal dispatch threshold.
+bool lu_piv_unblocked_ref(double[] a, double[] lu, int[] piv, int n)
+{
+    for (int i = 0; i < n * n; i = i + 1) lu[i] = a[i];
+    for (int k = 0; k < n; k = k + 1)
+    {
+        int p = k;
+        double amax = lu[k * n + k]; if (amax < 0.0) amax = -amax;
+        for (int i = k + 1; i < n; i = i + 1)
+        {
+            double v = lu[i * n + k]; if (v < 0.0) v = -v;
+            if (v > amax) { amax = v; p = i; }
+        }
+        piv[k] = p;
+        if (amax < 0.0000000001) return false;
+        if (p != k)
+        {
+            int bk = k * n; int bp = p * n;
+            for (int j = 0; j < n; j = j + 1)
+            {
+                double t = lu[bk + j]; lu[bk + j] = lu[bp + j]; lu[bp + j] = t;
+            }
+        }
+        double pivinv = 1.0 / lu[k * n + k];
+        for (int i = k + 1; i < n; i = i + 1)
+            lu[i * n + k] = lu[i * n + k] * pivinv;
+        for (int i = k + 1; i < n; i = i + 1)
+        {
+            double mlt = lu[i * n + k];
+            for (int j = k + 1; j < n; j = j + 1)
+                lu[i * n + j] = lu[i * n + j] - mlt * lu[k * n + j];
+        }
+    }
+    return true;
+}
+
+// ---- blocked pivoted LU (n >= Factor.LU_BLOCK_MIN_N routes to the blocked path) ----
+void test_factor_piv_blocked()
+{
+    printf("[factor_piv_blocked]\n");
+
+    // n = 400 crosses LU_BLOCK_MIN_N (384) and is not a multiple of the 128-wide
+    // panel, so the ragged last panel runs. Plain random entries (no diagonal
+    // dominance), so the pivot search genuinely swaps rows.
+    int n = 400;
+    double[] g = new double[n * n];
+    fill_lcg(g, n * n, 77);
+
+    double[] luRef = new double[n * n];
+    double[] luBlk = new double[n * n];
+    double[] luPool = new double[n * n];
+    int[] pivRef  = new int[n];
+    int[] pivBlk  = new int[n];
+    int[] pivPool = new int[n];
+
+    bool okRef = lu_piv_unblocked_ref(g, luRef, pivRef, n);
+    bool okBlk = Factor.lu_factor_piv(g, luBlk, pivBlk, n);
+    ThreadPool pool;
+    pool.init(4, cpu_mask_lowest(4));
+    bool okPool = Factor.lu_factor_piv(g, luPool, pivPool, n, &pool);
+    pool.shutdown();
+    check_int("ref + blocked + pool factor", (okRef && okBlk && okPool) ? 1 : 0, 1);
+
+    // Same pivot sequence as the unblocked sweep.
+    int pivDiff = 0;
+    for (int i = 0; i < n; i = i + 1)
+        if (pivRef[i] != pivBlk[i]) pivDiff = pivDiff + 1;
+    check_int("blocked pivots match unblocked", pivDiff, 0);
+
+    // Factor matches the unblocked sweep elementwise to tight tolerance (blocked
+    // accumulation may round differently in principle; bit-identity not required).
+    check_tol("blocked factor vs unblocked", max_abs_diff(luRef, luBlk, n * n), 0.0, 0.000000000001);
+
+    // Pooled blocked run must be BIT-IDENTICAL to the serial blocked run (the gemm
+    // trailing update partitions over output tiles only).
+    int pivDiffP = 0;
+    for (int i = 0; i < n; i = i + 1)
+        if (pivBlk[i] != pivPool[i]) pivDiffP = pivDiffP + 1;
+    check_int("pool pivots match serial", pivDiffP, 0);
+    check_tol("pool blocked bit-identical", max_abs_diff(luBlk, luPool, n * n), 0.0, 0.0000000000000001);
+
+    // And the packed layout still solves: A x = b for a known x via lu_solve_piv.
+    double[] xexact = new double[n];
+    for (int i = 0; i < n; i = i + 1) xexact[i] = (double)(i % 13) * 0.25 - 1.5;
+    double[] b = new double[n];
+    mv_dense(g, xexact, b, n);
+    double[] x = new double[n];
+    Factor.lu_solve_piv(luBlk, pivBlk, b, x, n);
+    check_tol("blocked solve |x - x_exact|", max_abs_diff(x, xexact, n), 0.0, 0.000001);
+
+    delete[_] g; delete[_] luRef; delete[_] luBlk; delete[_] luPool;
+    delete[_] pivRef; delete[_] pivBlk; delete[_] pivPool;
+    delete[_] xexact; delete[_] b; delete[_] x;
 }
 
 // ---- iterative sparse solvers (CG + Jacobi over a 1D Laplacian) ----
@@ -457,12 +631,14 @@ extern int main()
     printf("=== CFlat single-threaded HPC library suite ===\n\n");
     test_vecmath();
     test_densemat();
+    test_gemm_blocked();
     test_stencil();
     test_scan();
     test_fft();
     test_sparse();
     test_factor();
     test_factor_piv();
+    test_factor_piv_blocked();
     test_solvers();
     printf("\n%d / %d checks passed.\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;

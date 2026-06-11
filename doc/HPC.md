@@ -652,7 +652,7 @@ the floating-point reductions are deliberately left scalar (a reduction reorders
 | Import | Exposes | Contents |
 |--------|---------|----------|
 | `import "hpc/vecmath.cb";`  | `namespace Vec`     | BLAS-1: `axpy`, `scal`, `copy`, `fill`, `dot`, `asum`, `nrm2`, `iamax` |
-| `import "hpc/densemat.cb";` | `namespace Mat`     | BLAS-2/3: `gemv`, `gemm` (i-k-j), `transpose` over row-major `double[]` |
+| `import "hpc/densemat.cb";` | `namespace Mat`     | BLAS-2/3: `gemv`, `gemm` (cache-blocked, optionally pool-parallel), `gemm_ld` (sub-block / leading-dimension variant), `transpose` over row-major `double[]` |
 | `import "hpc/stencil.cb";`  | `namespace Stencil` | `jacobi1d`, `laplace1d`, `jacobi2d` (5-point), `boxblur2d` (3x3) |
 | `import "hpc/scan.cb";`     | `namespace Scan` + `Welford` | `prefix_sum_inclusive/exclusive`, `sum`/`minval`/`maxval`, streaming mean+variance |
 | `import "hpc/fft.cb";`      | `namespace FFT`     | iterative radix-2 Cooley-Tukey `fft`/`ifft` + `dft_naive` reference |
@@ -692,12 +692,34 @@ and [`example/hpc/lu_bench.cb`](../example/hpc/lu_bench.cb) benchmarks the three
 variants (unpivoted serial, partial-pivot serial, partial-pivot pool-parallel) on a diagonally
 dominant dense system with a normwise backward-error check via `Mat.gemv`.
 
+`Mat.gemm(alpha, a, b, beta, c, m, k, n, pool = nullptr, workers = 0)` is cache-blocked: the
+output C is tiled 64x64 (`GEMM_MB`/`GEMM_NB`, sized so a tile stays ~L1-resident on a 48KB L1d),
+and for each tile the A and B sub-blocks of each 256-deep k slab (`GEMM_KB`) are packed into
+small contiguous scratch buffers - ~288KB per k step, comfortably inside a 1MB L2 - before a
+tight unrolled kernel runs over the packed tiles. Each element accumulates its k terms in
+ascending order, so the result is deterministic. Passing a resident `ThreadPool*` partitions
+the OUTPUT tiles across workers once `m*k*n` clears `Mat.GEMM_PAR_MIN_WORK` (the dispatch-cost
+cutoff above); each output element is computed by exactly one worker in the serial per-tile
+operation order, so the pooled product is bit-identical to the serial one. Measured at `-O2`
+on a 10-core machine: ~21 GFLOP/s serial and ~55 GFLOP/s pooled (8 workers) at n = 1024-2048,
+flat across sizes - the naive i-k-j loop it replaced fell off a cliff once B left cache.
+`Mat.gemm_ld` is the same kernel with explicit leading dimensions (row strides), for operating
+on sub-blocks of a larger matrix - e.g. a view re-blessed at `(double[])&lu[i0 * n + j0]` with
+`ld = n`; `gemm` forwards to it with the leading dimensions equal to the row lengths.
+
 `Factor.lu_factor_piv(a, lu, piv, n, pool = nullptr, workers = 0)` is the general-matrix entry
-point: partial pivoting removes the diagonal-dominance requirement at no measured cost, and
-passing a resident `ThreadPool*` fans the rank-1 trailing update out across cores once the
-remaining block clears `Factor.LU_PAR_MIN_WORK` (the dispatch-cost cutoff above; the shrinking
-tail of the sweep automatically stays on the calling thread). Because each trailing row is
-updated by exactly one worker in serial operation order, the pooled factorization is
-bit-identical to the serial one - no reassociated reductions, so no numeric caveat. Measured on
-a 10-core machine at `-O2`: ~2.4x over serial once the matrix falls out of L3 (n >= 2048); below
-that the serial variants are already memory-resident and the pool adds little.
+point: partial pivoting removes the diagonal-dominance requirement at no measured cost. At
+n >= `Factor.LU_BLOCK_MIN_N` (384) it switches to a blocked right-looking algorithm: panel
+factor over `LU_NB` (128) columns with the classic pivoted rank-1 logic, a unit-L triangular
+solve for the panel's block row of U, then ONE `Mat.gemm_ld` trailing update (alpha = -1,
+beta = 1) per panel - which keeps the dominant update compute-bound instead of streaming the
+whole trailing matrix per column. The pivot sequence and the packed L/U layout match the
+unblocked sweep exactly (`lu_solve_piv` works on either), and a `ThreadPool*` passed through
+parallelizes the trailing gemm over output tiles, so the pooled factorization stays
+bit-identical to the serial blocked one - no reassociated reductions, so no numeric caveat.
+Below the threshold the small-n unblocked sweep runs as before (its pool path fans the rank-1
+update out per row over `LU_PAR_MIN_WORK`). Measured at `-O2` on the same machine, the old
+serial sweep decayed from ~10.6 GFLOP/s at n = 1024 to ~3.3 at n = 3072 once the matrix left
+L3; the blocked path holds ~16.3 / 16.6 / 18.4 GFLOP/s at n = 1024 / 2048 / 3072 serial and
+~24 / 35 / 40 GFLOP/s pooled (8 workers) - roughly 5.6x serial and 3.4x pooled over the old
+numbers at n = 3072.

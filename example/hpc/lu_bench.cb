@@ -6,9 +6,10 @@
 // Three variants of the same solve, selectable as argv[2]:
 //   serial - Factor.lu_factor      Doolittle, no pivoting (needs the diagonally
 //                                  dominant test matrix built here)
-//   piv    - Factor.lu_factor_piv  partial pivoting, serial
-//   pool   - Factor.lu_factor_piv  partial pivoting, rank-1 trailing update
-//                                  fanned out over a pinned ThreadPool
+//   piv    - Factor.lu_factor_piv  partial pivoting, serial (blocked right-looking
+//                                  with a gemm trailing update at large n)
+//   pool   - Factor.lu_factor_piv  partial pivoting, trailing update fanned out
+//                                  over a pinned ThreadPool
 //   all    - run the three back to back (the default)
 // The pivoted factor is bit-identical between piv and pool (each row is updated
 // by exactly one worker in serial operation order), so their residuals match.
@@ -154,7 +155,7 @@ extern int main(int argc, char** argv)
     if (runPool) {
         ThreadPool pool;
         int workers = hardware_concurrency();
-        if (workers > 8) { workers = 8; }   // rank-1 update saturates memory BW early
+        if (workers > 8) { workers = 8; }   // gemm trailing update scales to ~8 here
         pool.init(workers, cpu_mask_lowest(workers));
         sw.start();
         bool ok = Factor.lu_factor_piv(a, lu, piv, n, &pool);

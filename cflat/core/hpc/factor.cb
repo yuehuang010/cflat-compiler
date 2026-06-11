@@ -3,8 +3,9 @@
 // Three classic direct solvers, all over a flat row-major double[] (A[i*n + j]):
 //   - Cholesky (A = L L^T) for a symmetric positive-definite A.
 //   - LU (A = L U, Doolittle, no pivoting) for a diagonally dominant A.
-//   - LU with partial pivoting (P A = L U) for a general square A; optionally
-//     fans the rank-1 trailing update out over a ThreadPool.
+//   - LU with partial pivoting (P A = L U) for a general square A; blocked
+//     right-looking (gemm trailing update) at large n, and optionally fans the
+//     trailing update out over a ThreadPool.
 // Each is paired with forward/back substitution (triangular solve) to solve Ax=b.
 //
 // Design notes:
@@ -22,6 +23,7 @@
 import "math.cb";          // Math.sqrt / Math.abs
 import "threadpool.cb";    // ThreadPool (pool-parallel pivoted LU)
 import "hpc/parallel.cb";  // parallel_for_n_pool
+import "hpc/densemat.cb";  // Mat.gemm_ld (blocked LU trailing update)
 
 namespace Factor
 {
@@ -136,22 +138,50 @@ namespace Factor
     // tail of every sweep - run on the calling thread.
     const i64 LU_PAR_MIN_WORK = 262144;
 
+    // Pivoted LU goes blocked (right-looking, gemm trailing update) once n reaches
+    // this; below it the matrix is cache-resident and the simple unblocked sweep is
+    // already at full speed, so the blocked path's packing overhead would only cost
+    // (measured: blocked is ~15% slower at n=256, ahead from n=384 on).
+    const int LU_BLOCK_MIN_N = 384;
+
+    // Panel width for the blocked pivoted LU. 128 keeps the panel sweep (n x 128)
+    // streaming-friendly while making each trailing gemm deep enough (k = 128) to
+    // amortize its tile packing; 64-256 all measure within a few percent.
+    const int LU_NB = 128;
+
     // LU factorization with partial pivoting: P A = L U for a general square A
     // (no diagonal dominance required, unlike lu_factor). lu[] gets the same
     // packed layout as lu_factor (unit L below, U on/above the diagonal); piv[k]
     // records the row swapped into position k, in elimination order. Returns
     // false if a pivot column is zero to working precision (A singular).
     //
-    // pool == nullptr (the default) runs serially. With a pool, the rank-1
-    // trailing update fans out once the remaining block clears LU_PAR_MIN_WORK;
-    // each row is updated by exactly one worker in the same operation order, so
-    // the result is BIT-IDENTICAL to the serial run (no reassociated reductions).
-    // workers <= 0 uses the pool's worker count.
+    // n >= LU_BLOCK_MIN_N uses a blocked right-looking algorithm (panel factor +
+    // triangular solve + one Mat.gemm_ld trailing update per panel) that keeps the
+    // update compute-bound out of cache; smaller n runs the classic unblocked
+    // sweep. Both produce the same pivot sequence and the same packed layout
+    // (lu_solve_piv works on either); the factors agree to rounding.
+    //
+    // pool == nullptr (the default) runs serially. With a pool, the trailing
+    // update fans out (per row when unblocked, per output tile inside the blocked
+    // gemm) once the remaining work clears the LU_PAR_MIN_WORK / GEMM_PAR_MIN_WORK
+    // cutoffs; each element is updated by exactly one worker in the same operation
+    // order, so the result is BIT-IDENTICAL to the serial run of the same path
+    // (no reassociated reductions). workers <= 0 uses the pool's worker count.
     bool lu_factor_piv(double[] a, double[] lu, int[] piv, int n,
                        ThreadPool* pool = nullptr, int workers = 0)
     {
         for (int i = 0; i < n * n; i = i + 1) lu[i] = a[i];
 
+        if (n >= LU_BLOCK_MIN_N)
+            return __lu_piv_blocked(lu, piv, n, pool, workers);
+        return __lu_piv_unblocked(lu, piv, n, pool, workers);
+    }
+
+    // The classic unblocked pivoted sweep (rank-1 trailing update per column),
+    // operating in place on lu[] (already a copy of A). Small-n path.
+    bool __lu_piv_unblocked(double[] lu, int[] piv, int n,
+                            ThreadPool* pool, int workers)
+    {
         for (int k = 0; k < n; k = k + 1)
         {
             // partial pivot: row p >= k with the largest |lu[p][k]|
@@ -209,6 +239,100 @@ namespace Factor
                         rowi[j] = rowi[j] - m * rowk[j];
                 }
             }
+        }
+        return true;
+    }
+
+    // Blocked right-looking pivoted LU, in place on lu[] (already a copy of A).
+    // Per panel of LU_NB columns:
+    //   (a) panel factor - the existing pivoted rank-1 logic restricted to the
+    //       panel's columns (full-column pivot search, full-row swaps recorded in
+    //       piv exactly as the unblocked sweep does);
+    //   (b) the row swaps were applied across the whole matrix in (a), so the
+    //       already-computed L (left of the panel) and the not-yet-touched right
+    //       part stay consistent - same piv contract as unblocked;
+    //   (c) triangular solve U12 = L11^-1 * A12 (unit L from the panel) to form
+    //       the panel's block row of U;
+    //   (d) trailing update A22 -= L21 * U12 as ONE Mat.gemm_ld call (alpha = -1,
+    //       beta = 1) over the strided sub-blocks of lu[] (ld = n), passing the
+    //       pool through so the dominant update parallelizes over output tiles.
+    // Every elimination step applies the same per-element operations in the same
+    // ascending-k order as the unblocked sweep, so the pivot sequence matches it
+    // and serial-vs-pooled blocked runs are bit-identical.
+    bool __lu_piv_blocked(double[] lu, int[] piv, int n,
+                          ThreadPool* pool, int workers)
+    {
+        for (int k0 = 0; k0 < n; k0 = k0 + LU_NB)
+        {
+            int ib = n - k0;
+            if (ib > LU_NB) ib = LU_NB;
+            int kend = k0 + ib;
+
+            // (a)+(b) panel factor with partial pivoting over columns k0..kend.
+            for (int k = k0; k < kend; k = k + 1)
+            {
+                // partial pivot: row p >= k with the largest |lu[p][k]|
+                int p = k;
+                double amax = Math.abs(lu[k * n + k]);
+                for (int i = k + 1; i < n; i = i + 1)
+                {
+                    double v = Math.abs(lu[i * n + k]);
+                    if (v > amax) { amax = v; p = i; }
+                }
+                piv[k] = p;
+                if (amax < 0.0000000001) return false;
+                if (p != k)
+                {
+                    int bk = k * n;
+                    int bp = p * n;
+                    for (int j = 0; j < n; j = j + 1)
+                    {
+                        double t = lu[bk + j]; lu[bk + j] = lu[bp + j]; lu[bp + j] = t;
+                    }
+                }
+
+                // L multipliers: scale the subcolumn by 1/pivot.
+                double pivinv = 1.0 / lu[k * n + k];
+                for (int i = k + 1; i < n; i = i + 1)
+                    lu[i * n + k] = lu[i * n + k] * pivinv;
+
+                // Rank-1 update restricted to the panel's remaining columns.
+                double[] rowk = (double[])&lu[k * n];
+                for (int i = k + 1; i < n; i = i + 1)
+                {
+                    double[] rowi = (double[])&lu[i * n];
+                    double m = rowi[k];
+                    for (int j = k + 1; j < kend; j = j + 1)
+                        rowi[j] = rowi[j] - m * rowk[j];
+                }
+            }
+
+            if (kend >= n) break;   // last panel: no block row / trailing update
+
+            // (c) U12 = L11^-1 * A12: unit-L forward substitution over the panel
+            // rows, columns kend..n. Step p applies exactly the operations the
+            // unblocked sweep's column-p rank-1 would apply to these rows.
+            for (int p = k0; p < kend; p = p + 1)
+            {
+                double[] rowp = (double[])&lu[p * n];
+                for (int i = p + 1; i < kend; i = i + 1)
+                {
+                    double[] rowi = (double[])&lu[i * n];
+                    double m = rowi[p];
+                    for (int j = kend; j < n; j = j + 1)
+                        rowi[j] = rowi[j] - m * rowp[j];
+                }
+            }
+
+            // (d) A22 -= L21 * U12, one blocked gemm over sub-blocks of lu[]
+            // (rows strided by n). The three re-blessed views touch pairwise
+            // disjoint element ranges (L21 / U12 / A22), per the re-blessing
+            // contract in doc/HPC.md.
+            int mtrail = n - kend;
+            Mat.gemm_ld(-1.0, (double[])&lu[kend * n + k0], n,
+                        (double[])&lu[k0 * n + kend], n,
+                        1.0, (double[])&lu[kend * n + kend], n,
+                        mtrail, ib, mtrail, pool, workers);
         }
         return true;
     }
