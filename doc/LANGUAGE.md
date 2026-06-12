@@ -1115,19 +1115,33 @@ import { "utils.cb", "math/vector.cb" };
 import { "sqlite3.h", "sqlite3.c" };   // binds the header, compiles the .c (see C Interop)
 ```
 
-Each entry routes exactly like a bare `import "x";` (the `.cb` / `.h` / `.c` dispatch is per
-entry), so a group can mix CFlat sources and C inputs. A trailing comma is allowed. Group
-entries take no per-entry `lib` / `define`. A trailing `cache` applies to **every** entry of
-the group:
+A `.cb` or `.c` entry routes exactly like a bare `import "x";` (the dispatch is per entry), so a
+group can mix CFlat sources and C inputs. A trailing comma is allowed.
+
+The **C-header entries of a group share one translation unit**: the extraction stub `#include`s
+each header in listed order, so an earlier entry satisfies a later one's prerequisites. This is
+how you bind a header that is not self-contained on its own - e.g. `tlhelp32.h` needs
+`windows.h` included first:
+
+```c
+import { "windows.h", "tlhelp32.h" } lib { "user32.lib", "gdi32.lib" };
+```
+
+cflat has no built-in knowledge of any specific header; the dependency lives entirely in your
+source. (A bare `import "tlhelp32.h";` fails with a diagnostic suggesting this grouped form.)
+Each header still registers only the decls in its own directory, so the group does not
+over-expose. See [C Interop](C_INTEROP.md) for details.
+
+Group-level `lib`, `define`, and `cache` clauses apply to the **whole group**:
 
 ```c
 import { "windows.h", "shlwapi.h" } cache;   // both headers opt into the disk cache
 ```
 
-(`cache` is a no-op for `.cb` / `.c` entries - only the `.h` header-bind path consults it.)
-An `as` alias is meaningful only when the group holds a single filename, since one alias cannot
-name several files; use separate `import` lines when you need an alias, `lib`, or `define` on a
-specific file.
+(`cache` is a no-op for `.cb` / `.c` entries - only the `.h` header-bind path consults it; the
+group's header entries are folded into the cache key together.) An `as` alias is meaningful only
+when the group holds a single filename, since one alias cannot name several files; use separate
+`import` lines when you need an alias or a per-entry `lib` / `define`.
 
 #### Import alias (`as`)
 

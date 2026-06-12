@@ -114,6 +114,26 @@ A source-location filter keeps only **functions / enum constants / macros** decl
 
 A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is registered as a bare `void*`, since a C callback slot is a single pointer (CFlat's `function<T>` is a 16-byte closure and would corrupt the struct's ABI layout). Store a CFlat callback into such a field by casting the function's name: `wc.lpfnWndProc = (void*)WndProc;`. See [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback).
 
+A **fixed-size array struct field** (e.g. `CHAR szExeFile[260]` in `PROCESSENTRY32`) is registered as an inline CFlat array, not decayed to a pointer, so the C ABI `sizeof` is exact - `sizeof(PROCESSENTRY32)` is 304, not the 40 a decayed pointer would give. Only positive integer extents become inline arrays; an incomplete `[]` still decays to a pointer, and a field whose element type cannot be mapped abandons the whole record (an opaque shell that errors on use - never a silent size change).
+
+#### Non-self-contained headers (grouped import)
+
+Some headers are **not self-contained**: they use types (`HANDLE`, `DWORD`, ...) without including the header that defines them, relying on the translation unit having included a prerequisite first. The classic case is `tlhelp32.h`, which assumes `windows.h` was included before it. Bound on its own, clang cannot resolve the base types, drops every dependent function declaration, and the import fails with a loud diagnostic:
+
+```
+C header 'TlHelp32.h' does not compile on its own (unknown type name 'HANDLE'). It likely
+needs a prerequisite header included first. Import them together as one group so they share a
+single translation unit, e.g. import { "prerequisite.h", "TlHelp32.h" };
+```
+
+cflat has **no built-in knowledge** of which header is the prerequisite - that belongs in your source. Express the dependency with a **grouped import**: the C-header entries of a group are extracted as **one translation unit**, the stub `#include`s each entry in listed order, so an earlier entry satisfies a later one's prerequisites:
+
+```c
+import { "windows.h", "tlhelp32.h" } lib { "user32.lib", "gdi32.lib" };
+```
+
+Each header still registers only the decls that live in its own directory (the union of the group's header directories, plus the SDK `um/`<->`shared/` sibling expansion), so the group does not over-expose. Group-level `lib`, `define`, and `cache` clauses apply to the whole group; non-header (`.cb`/`.c`) entries in the same group route individually as usual. The grouped header set is folded into the cache key, so a header bound standalone never collides with the same header bound after a prerequisite.
+
 ### System headers (e.g. `windows.h`)
 
 A bare `import "windows.h";` binds the system header with **no `--c-include` flag**: cflat auto-detects the latest installed Windows SDK include directory (`...\Windows Kits\10\Include\<ver>\um`, plus `shared`/`ucrt`/`winrt`) and uses it to resolve the header. The header's own directory then becomes the in-scope root, so its declarations are kept while the transitively-included CRT/MSVC headers are still filtered out. The parse itself relies on clang's in-process MSVC toolchain auto-detection, so the MSVC/UCRT/shared headers do not need to be named.

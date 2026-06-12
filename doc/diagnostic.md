@@ -59,7 +59,7 @@ When that happens, fall back to `-g` and the fuzzer/heap-audit tools.
 
 ## `-g` - in-process symbolized crash backtrace
 
-Building with `-g` (DWARF/PDB debug info) links `core/crashdump.c`, which installs
+Building with `-g` (DWARF/PDB debug info) links `core/diagnostic/crashdump.c`, which installs
 a last-chance exception filter via a CRT dynamic initializer. On any unhandled
 exception (access violation, etc.) it prints the exception kind plus a numbered,
 DbgHelp-symbolized backtrace - cflat function names and source lines resolved from

@@ -609,7 +609,7 @@ expectErrorStatement
     ;
 
 expectErrorDeclaration
-    : 'expect_error' '(' StringLiteral ')' '{' externalDeclaration+ '}'
+    : 'expect_error' '(' StringLiteral ')' ('{' externalDeclaration+ '}' | ';')
     ;
 
 compilationUnit

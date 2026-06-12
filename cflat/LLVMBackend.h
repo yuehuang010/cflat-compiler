@@ -1213,6 +1213,11 @@ private:
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
+    // File-scope bare-semicolon expect_error("..."); armed before ProcessImports so it can
+    // catch import-time diagnostics (e.g. the orphan-header error). Non-empty while pending;
+    // a match throws ExpectedErrorReceived (caught in Compile), an unmatched one at end of
+    // compilation is the did-not-occur failure. See Compile() in LLVMBackend.cpp.
+    std::string fileScopeExpectedError_;
 
     // Compile-time macros (constant throughout compilation, set early)
     struct CompileTimeMacro
@@ -2574,7 +2579,7 @@ private:
         return true;
     }
 
-    // Compile the in-process crash-handler (core/crashdump.c) into a temporary object
+    // Compile the in-process crash-handler (core/diagnostic/crashdump.c) into a temporary object
     // recorded in cObjectFiles_ for EmitExecutable to link. Used only under -g, where a
     // PDB is produced and DbgHelp can symbolize CFlat frames at runtime.
     //
@@ -2591,7 +2596,7 @@ private:
         }
 
         llvm::SmallString<256> srcPath(runtimeDir);
-        llvm::sys::path::append(srcPath, "core", "crashdump.c");
+        llvm::sys::path::append(srcPath, "core", "diagnostic", "crashdump.c");
         if (!llvm::sys::fs::exists(srcPath))
         {
             LogError(std::format("crash handler source not found: '{}'.", srcPath.str().str()));
@@ -2754,6 +2759,45 @@ private:
             out.FuncPtrParams.push_back(fp);
         }
         return true;
+    }
+
+    // Extract fixed-array dimensions ("[N]") from a C field type spelling, returning the
+    // element spelling with those groups removed and the dimensions in declaration order.
+    // Only positive integer extents are treated as fixed arrays; an incomplete "[]" or a
+    // non-numeric extent is left verbatim (the caller's mapper then applies the usual
+    // array->pointer decay). Used by RegisterCRecords so a struct field like
+    // `char szExeFile[260]` lays out as an inline 260-byte array (correct sizeof), NOT a
+    // decayed pointer - which would silently shrink the struct.
+    static std::string StripFixedArrayDims(const std::string& ctype, std::vector<uint64_t>& dims)
+    {
+        std::string elem;
+        size_t i = 0;
+        while (i < ctype.size())
+        {
+            if (ctype[i] == '[')
+            {
+                size_t close = ctype.find(']', i);
+                if (close == std::string::npos) { elem += ctype.substr(i); break; }
+                std::string inner = ctype.substr(i + 1, close - i - 1);
+                size_t a = inner.find_first_not_of(" \t");
+                size_t b = inner.find_last_not_of(" \t");
+                std::string num = (a == std::string::npos) ? std::string{} : inner.substr(a, b - a + 1);
+                bool allDigits = !num.empty() &&
+                    std::all_of(num.begin(), num.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+                if (allDigits)
+                {
+                    dims.push_back(std::strtoull(num.c_str(), nullptr, 10));
+                    i = close + 1;
+                    continue;
+                }
+                elem += ctype.substr(i, close - i + 1);  // keep non-numeric extent verbatim
+                i = close + 1;
+                continue;
+            }
+            elem += ctype[i++];
+        }
+        while (!elem.empty() && (elem.back() == ' ' || elem.back() == '\t')) elem.pop_back();
+        return elem;
     }
 
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
@@ -3220,7 +3264,16 @@ private:
     // front so struct-by-value signatures resolve. (Formerly a libclang decl+name parse plus a
     // separate value-fold parse; now a single full parse via the clang C++ API.) Returns false
     // on a hard parse failure.
-    bool ExtractCHeaderClang(const std::string& headerPath,
+    // Extract decls from one or more C headers that share a single translation unit. The stub
+    // `#include`s each header in `headerPaths` order, so an earlier entry can satisfy a later
+    // one's prerequisites - this is how a grouped import `import {"windows.h","tlhelp32.h"};`
+    // makes tlhelp32.h's HANDLE/DWORD resolve without the compiler knowing any header by name.
+    // A plain single-header import passes a one-element list. The in-scope registration set is
+    // the union, over every header, of its own directory plus the Windows SDK um/<->shared/
+    // sibling expansion (and the --c-include roots), so each header contributes only decls that
+    // live under those roots. If the parse hits a missing-prerequisite error inside a header,
+    // nothing is registered and *outPrereqFailure is set so the caller can fail loudly.
+    bool ExtractCHeaderClang(const std::vector<std::string>& headerPaths,
                              std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                              std::vector<CRecordEntry>& outRecords,
                              std::vector<CMacroEntry>& outMacros,
@@ -3228,49 +3281,83 @@ private:
                              std::vector<CGlobalEntry>& outGlobals,
                              std::vector<std::pair<std::string, std::string>>& outAliases,
                              const std::vector<std::string>& extraDefines = {},
-                             std::vector<std::string>* outIncludes = nullptr)
+                             std::vector<std::string>* outIncludes = nullptr,
+                             bool* outPrereqFailure = nullptr,
+                             std::string* outPrereqMsg = nullptr)
     {
-        const std::string hdrDir = std::filesystem::path(headerPath).parent_path().string();
-        std::string fwd = headerPath;
-        std::replace(fwd.begin(), fwd.end(), '\\', '/');
+        if (headerPaths.empty()) return false;
+
+        // The first header's directory anchors the clang driver's primary -I; every header's
+        // directory (plus its SDK sibling) is added to the in-scope set below. The primary header
+        // also labels the TimeTrace scopes and attributes registered decls for LSP go-to-def.
+        const std::string& headerPath = headerPaths.front();
+        const std::string primaryDir = std::filesystem::path(headerPath).parent_path().string();
+
+        std::string source;
+        for (const auto& h : headerPaths)
+        {
+            std::string fwd = h;
+            std::replace(fwd.begin(), fwd.end(), '\\', '/');
+            source += "#include \"" + fwd + "\"\n";
+        }
 
         cflat_cinterop::ExtractRequest req;
         req.mainFileName   = "cflat_hdr_stub.c";
-        req.source         = "#include \"" + fwd + "\"\n";
-        req.args           = BuildClangDriverArgs(hdrDir, extraDefines, /*errorRecovery*/ true);
+        req.source         = source;
+        req.args           = BuildClangDriverArgs(primaryDir, extraDefines, /*errorRecovery*/ true);
         req.wantMacros     = true;
         req.requireInScope = true;
         req.skipFunctionBodies = true;   // headers: declarations only - skip inline bodies
         req.wantIncludes   = (outIncludes != nullptr);
-        req.inScopeDirs.push_back(hdrDir);
-        for (const auto& inc : cIncludeDirs_) req.inScopeDirs.push_back(inc);
 
-        // Windows SDK layout: <kit>/Include/<ver>/um holds the API headers, but much
-        // of the constant surface lives in the sibling shared/ dir (winerror.h
-        // ERROR_*, minwindef.h MAX_PATH, ntdef.h, ...). Without it, code copied from
-        // MSDN fails on the very first ERROR_SUCCESS. Structs already reached
-        // shared/ via the by-value dependency closure; this brings the macros, enums,
-        // and remaining records of shared/ in-scope whenever the bound header sits in
-        // an um/ dir (the inverse - a header bound from shared/ - also gets um/).
+        // In-scope set = union over the group of each header's dir + the Windows SDK um/<->shared/
+        // sibling expansion. The Windows SDK splits its API surface across um/ (functions, most
+        // structs) and shared/ (winerror.h ERROR_*, minwindef.h MAX_PATH, ntdef.h, ...); code
+        // copied from MSDN fails on the very first ERROR_SUCCESS without the sibling. This is a
+        // generic directory-layout rule, not knowledge of any specific header.
+        auto addScopeDir = [&](const std::string& d) {
+            for (const auto& e : req.inScopeDirs) if (e == d) return;
+            req.inScopeDirs.push_back(d);
+        };
+        for (const auto& h : headerPaths)
         {
-            std::filesystem::path dir(hdrDir);
-            std::string leaf = dir.filename().string();
-            std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+            std::filesystem::path hdrDirPath = std::filesystem::path(h).parent_path();
+            addScopeDir(hdrDirPath.string());
+            std::string dirLeaf = hdrDirPath.filename().string();
+            std::transform(dirLeaf.begin(), dirLeaf.end(), dirLeaf.begin(),
                            [](unsigned char c) { return (char)std::tolower(c); });
-            if (leaf == "um")
-                req.inScopeDirs.push_back((dir.parent_path() / "shared").string());
-            else if (leaf == "shared")
-                req.inScopeDirs.push_back((dir.parent_path() / "um").string());
+            if (dirLeaf == "um")
+                addScopeDir((hdrDirPath.parent_path() / "shared").string());
+            else if (dirLeaf == "shared")
+                addScopeDir((hdrDirPath.parent_path() / "um").string());
         }
+        for (const auto& inc : cIncludeDirs_) addScopeDir(inc);
 
         if (verbose)
-            std::cout << "[verbose] extracting C header: " << headerPath << " (clang C++ API)\n";
+        {
+            std::cout << "[verbose] extracting C header"
+                      << (headerPaths.size() > 1 ? " group" : "") << ":";
+            for (const auto& h : headerPaths) std::cout << " " << h;
+            std::cout << " (clang C++ API)\n";
+        }
 
         cflat_cinterop::ExtractResult raw;
         std::string err;
         if (!cflat_cinterop::ExtractCInterop(req, raw, err))
         {
             if (verbose) std::cout << "[verbose]   C header extraction failed: " << err << "\n";
+            return false;
+        }
+
+        // A missing-prerequisite error inside a header (unknown type 'HANDLE', ...) means clang
+        // dropped the dependent declarations; registering the error-recovered remnants would
+        // silently expose a partial, wrong-sized API. Refuse and let the caller suggest a group.
+        if (raw.prereqErrors > 0)
+        {
+            if (outPrereqFailure) *outPrereqFailure = true;
+            if (outPrereqMsg) *outPrereqMsg = raw.firstPrereqError;
+            if (verbose)
+                std::cout << "[verbose]   header is not self-contained: " << raw.firstPrereqError << "\n";
             return false;
         }
 
@@ -3598,7 +3685,13 @@ private:
             for (const auto& f : r.fields)
             {
                 TypeAndValue tv;
-                if (!MapCTypeToTypeAndValue(f.ctype, tv))
+                // Fixed-size array field (e.g. `char szExeFile[260]`): strip the [N] extents
+                // and map the element type, then re-apply the dimensions as an inline array.
+                // The shared mapper decays any `[...]` to a pointer (correct for a function
+                // parameter, wrong for a struct field), so the extents are peeled here first.
+                std::vector<uint64_t> arrDims;
+                std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
+                if (!MapCTypeToTypeAndValue(elemSpelling, tv))
                 {
                     if (verbose) std::cout << "[verbose]   skipping C " << (r.isUnion ? "union" : "struct")
                                            << " '" << r.name
@@ -3606,6 +3699,11 @@ private:
                                            << "' of type '" << f.ctype << "'\n";
                     ok = false;
                     break;
+                }
+                if (!arrDims.empty())
+                {
+                    tv.ConstArraySize = arrDims[0];
+                    tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                 }
                 // A C function-pointer field (e.g. WNDPROC lpfnWndProc in WNDCLASSEXA) occupies a
                 // single bare pointer in the C ABI. CFlat's function<T> is a 16-byte {code, env}
@@ -4070,32 +4168,103 @@ private:
     // EmitExecutable. Results are cached per header+include-dir set, mirroring
     // ExtractCSignatures. Runs in LSP mode too (registration only), so headers contribute
     // hover / completion / go-to-definition.
+    // Loud, actionable diagnostic for a header that does not compile on its own because it
+    // relies on a prerequisite header having been included first (the classic Windows SDK leaf
+    // case: tlhelp32.h uses HANDLE/DWORD without including the header that defines them). The
+    // compiler does not know which header is the prerequisite - that belongs in the user's
+    // source - so the message teaches the grouped-import fix generically. Only fires for a
+    // standalone single-header import; a header already in a group that still fails names the
+    // group so the user can fix the order or add the missing prerequisite.
+    void ReportOrphanHeader(const std::vector<std::string>& headerPaths, const std::string& clangErr)
+    {
+        std::string name = std::filesystem::path(headerPaths.front()).filename().string();
+        std::string detail = clangErr.empty() ? "a required type is undefined" : clangErr;
+        if (headerPaths.size() > 1)
+        {
+            std::string grp;
+            for (size_t i = 0; i < headerPaths.size(); ++i)
+                grp += (i ? ", \"" : "\"") + std::filesystem::path(headerPaths[i]).filename().string() + "\"";
+            LogError(std::format(
+                "C header '{}' did not compile in this group ({}). Reorder the group so the "
+                "prerequisite header comes first, or add the missing one: import {{ {} }};",
+                name, detail, grp));
+            return;
+        }
+        LogError(std::format(
+            "C header '{}' does not compile on its own ({}). It likely needs a prerequisite "
+            "header included first. Import them together as one group so they share a single "
+            "translation unit, e.g. import {{ \"prerequisite.h\", \"{}\" }};",
+            name, detail, name));
+    }
+
+    // Single-header convenience wrapper - the common case (one `import "x.h";`).
     bool CompileCHeader(const std::string& headerPath, const std::vector<std::string>& extraDefines = {},
                         bool diskCache = false)
     {
-        llvm::SmallString<256> realPath;
-        std::string fileForLsp = headerPath;
-        if (!llvm::sys::fs::real_path(headerPath, realPath))
-            fileForLsp = realPath.str().str();
+        return CompileCHeaderGroup(std::vector<std::string>{ headerPath }, extraDefines, diskCache);
+    }
 
-        // Fold the include-dir set and defines into the cache key: the same header under
-        // different --c-include roots or --c-define values can expose different decls.
-        // Per-import `define` clauses are folded too, so two imports of the same header
-        // with different inline defines do not collide on a stale cache entry.
-        std::string cacheKey = fileForLsp;
+    // Bind one or more C headers that share a single translation unit (a grouped import
+    // `import {"windows.h","tlhelp32.h"};`). The headers are extracted together so an earlier
+    // entry satisfies a later one's prerequisites; registration scope stays per the union of
+    // their directories (see ExtractCHeaderClang). The cache key folds the full ordered list,
+    // so a header extracted standalone never collides with the same header extracted after a
+    // prerequisite. Freshness folds every group member's mtime/hash.
+    bool CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
+                             const std::vector<std::string>& extraDefines = {},
+                             bool diskCache = false)
+    {
+        if (headerPaths.empty()) return true;
+
+        // Real path per header for cache identity + LSP attribution; the first is the primary
+        // (labels diagnostics / attributes registered decls, mirroring the single-header path).
+        std::vector<std::string> realPaths;
+        realPaths.reserve(headerPaths.size());
+        for (const auto& h : headerPaths)
+        {
+            llvm::SmallString<256> rp;
+            realPaths.push_back(!llvm::sys::fs::real_path(h, rp) ? rp.str().str() : h);
+        }
+        const std::string& fileForLsp = realPaths.front();
+
+        // Fold the ordered header list, the include-dir set and the defines into the cache key:
+        // the same header under different --c-include roots / --c-define values, or extracted
+        // standalone vs. after a prerequisite header, can expose different decls and must not
+        // collide on a stale entry.
+        std::string cacheKey;
+        for (const auto& rp : realPaths)       cacheKey += "|H" + rp;
         for (const auto& inc : cIncludeDirs_)  cacheKey += "|I" + inc;
         for (const auto& def : cDefines_)      cacheKey += "|D" + def;
         for (const auto& def : extraDefines)   cacheKey += "|d" + def;
 
+        // Combined freshness across the group: max mtime + a fold of every member's content
+        // hash, so a change to any header in the group invalidates the entry.
         uint64_t currentHash = 0;
         bool haveHash = false;
         auto hashNow = [&]() -> uint64_t {
-            if (!haveHash) { HashFileContents(fileForLsp, currentHash); haveHash = true; }
+            if (!haveHash)
+            {
+                currentHash = 14695981039346656037ULL;
+                for (const auto& rp : realPaths)
+                {
+                    uint64_t h = 0;
+                    HashFileContents(rp, h);
+                    currentHash ^= h; currentHash *= 1099511628211ULL;
+                }
+                haveHash = true;
+            }
             return currentHash;
         };
 
         std::error_code mtEc;
-        auto currentMtime = std::filesystem::last_write_time(fileForLsp, mtEc);
+        std::filesystem::file_time_type currentMtime{};
+        for (const auto& rp : realPaths)
+        {
+            std::error_code ec;
+            auto mt = std::filesystem::last_write_time(rp, ec);
+            if (ec) { mtEc = ec; break; }
+            if (mt > currentMtime) currentMtime = mt;
+        }
 
         std::vector<CSigEntry> hitSigs;
         std::vector<CEnumEntry> hitEnums;
@@ -4148,7 +4317,7 @@ private:
         uint64_t diskKey = 0;
         if (diskCache && !mtEc && !cHeaderCacheDir.empty())
         {
-            diskKey = CHeaderDiskCacheKey(fileForLsp, cIncludeDirs_, cDefines_, extraDefines);
+            diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines);
             CFileSigCacheEntry diskEntry;
             if (TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry))
             {
@@ -4182,10 +4351,17 @@ private:
             // Functions / enums / records / object-like macro values / function-like macros are
             // all produced by the clang C++ API extractor in one full parse (+ a cheap
             // preprocess-only prepass for macro names). No clang-cl, no libclang.
-            llvm::TimeTraceScope extractScope("CHeaderExtract", headerPath);
-            if (!ExtractCHeaderClang(headerPath, sigs, enums, records, macros, funcMacros, globals,
-                                     aliases, extraDefines, wantDeps ? &includes : nullptr))
+            llvm::TimeTraceScope extractScope("CHeaderExtract", fileForLsp);
+            bool prereqFailure = false;
+            std::string prereqMsg;
+            if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
+                                     aliases, extraDefines, wantDeps ? &includes : nullptr,
+                                     &prereqFailure, &prereqMsg))
+            {
+                if (prereqFailure)
+                    ReportOrphanHeader(headerPaths, prereqMsg);
                 return false;
+            }
         }
 
         if (!mtEc)
@@ -4335,7 +4511,7 @@ private:
 
         // Under -g a PDB is produced beside the exe, so DbgHelp can symbolize CFlat
         // frames at runtime. Compile the in-process crash handler and link it in (with
-        // dbghelp.lib below). Best-effort: if the handler compile fails (e.g. core/crashdump.c
+        // dbghelp.lib below). Best-effort: if the handler compile fails (e.g. core/diagnostic/crashdump.c
         // not deployed or clang-cl missing), CompileCrashHandlerObject logs via LogError and
         // returns false; we then skip the handler-specific link args so the link still
         // succeeds and still produces the PDB - just without the in-process backtrace.
@@ -9567,6 +9743,22 @@ public:
         }
     }
 
+    // Mark a pre-declared string local as owning its heap buffer. Used when a plain
+    // assignment (`s = expr`) stores an owned heap string into an already-declared
+    // string local: the local now owns the buffer and must free it on scope exit
+    // (mirrors the IsOwningString propagation in the declaration-with-initializer path).
+    void MarkVariableOwningString(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.IsOwningString = true; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.IsOwningString = true; return; }
+        }
+    }
+
     // Snapshots the IsMoved flag for all variables in all active scopes.
     std::map<std::string, bool> SaveMovedState() const
     {
@@ -10566,6 +10758,23 @@ public:
 
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
 
+    // Resolve an import filename against the same search order CompileImportedFile uses
+    // (importing dir, LSP source dir, -i dir, --c-include roots, runtime core, Windows SDK).
+    // Returns true with the canonical path in `outCanonical`; on failure logs the not-found
+    // error (unless `quiet`) and returns false.
+    bool ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
+                           std::string& outCanonical, bool quiet = false);
+
+    // Handle a grouped import `import { "a", "b" } lib {...} define ...;`. Non-header entries
+    // (.cb/.c) route individually in listed order; every header entry (.h/.hpp/.hh) is bound as
+    // ONE translation unit so an earlier header satisfies a later one's prerequisites. Group
+    // `lib`/`define` clauses apply to the whole group.
+    bool CompileImportGroup(const std::string& importingFilePath,
+                            const std::vector<std::string>& entries,
+                            const std::vector<std::string>& groupLibs,
+                            const std::vector<std::string>& groupDefines,
+                            bool cacheGroup);
+
     // Resolve an inline `lib "..."` clause to a link argument for cLinkLibs_. A library that
     // ships beside the importing .cb (the Conan/vcpkg layout) is used by its full path; a
     // bare system lib name like "user32.lib" that is not found there is passed through
@@ -10644,11 +10853,22 @@ public:
                                         const std::vector<std::string>& defines,
                                         const std::vector<std::string>& extraDefines)
     {
+        return CHeaderDiskCacheKey(std::vector<std::string>{ fileForLsp },
+                                   includeDirs, defines, extraDefines);
+    }
+
+    // Group form: folds the full ordered header list so a header bound standalone never shares
+    // a disk-cache slot with the same header bound after a prerequisite (different decl set).
+    static uint64_t CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
+                                        const std::vector<std::string>& includeDirs,
+                                        const std::vector<std::string>& defines,
+                                        const std::vector<std::string>& extraDefines)
+    {
         uint64_t h = 14695981039346656037ULL;
         auto fold = [&h](const std::string& s) {
             for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
         };
-        fold(fileForLsp);
+        for (const auto& hp : headerPaths)   { fold("|H"); fold(hp); }
         for (const auto& inc : includeDirs)  { fold("|I"); fold(inc); }
         for (const auto& def : defines)      { fold("|D"); fold(def); }
         for (const auto& def : extraDefines) { fold("|d"); fold(def); }
@@ -11097,7 +11317,8 @@ public:
         std::string fileForLsp = headerCanon.string();
         if (!llvm::sys::fs::real_path(fileForLsp, realPathBuf))
             fileForLsp = realPathBuf.str().str();
-        std::string inMemKey = fileForLsp;
+        // Mirror the in-memory cache key CompileCHeaderGroup builds (single-header form).
+        std::string inMemKey = "|H" + fileForLsp;
         for (const auto& inc : cIncludeDirs_) inMemKey += "|I" + inc;
         for (const auto& def : cDefines_)     inMemKey += "|D" + def;
 

@@ -1085,6 +1085,14 @@ int consumeMoveLen(move string s)
     return s.length();
 }
 
+// Helper for the if/else owned-string regression below: returns an owned copy
+// chosen by branch. The helper-return form was the customer's known-good workaround.
+move string pickName(u32 i)
+{
+    if (i == 0u) { string a = "known"; return a.copy(); }
+    else         { string b = "other"; return b.copy(); }
+}
+
 int testStringAPI()
 {
     int passed = 0;
@@ -1399,6 +1407,62 @@ int testStringAPI()
         passed += Test("charptr concat chain", cc3, "foobarfoo");
     }
 
+    // Regression (plan-01): assigning an owned string to the SAME pre-declared local
+    // in both branches of an if/else inside a loop. The stale lastCallReturnsOwned
+    // flag from the if-branch assignment used to leak into the else-branch's
+    // `string b = ...;` declaration, falsely marking that literal-backed local as
+    // owning - its scope-exit destructor then freed a string literal -> heap
+    // corruption (0xC0000374) on the second iteration. ASan-clean now.
+    {
+        u32 i = 0u;
+        i32 hits = 0;
+        string last = default;
+        while (i < 4u)
+        {
+            string name = default;
+            if (i == 0u) { string a = "known"; name = a.copy(); }
+            else         { string b = "other"; name = b.copy(); }
+            if (!name.isEmpty()) hits = hits + 1;
+            last = name.copy();
+            i = i + 1u;
+        }
+        passed += Test("if/else owned-string loop iterations", hits, 4);
+        passed += Test("if/else owned-string last value", last, "other");
+    }
+    // Bare-if override form (assign unconditionally, then override in a bare if) -
+    // the customer reported this variant ran clean; keep it as a guard.
+    {
+        u32 i = 0u;
+        string name = default;
+        while (i < 2u)
+        {
+            name = "default";
+            if (i == 1u) { string c = "override"; name = c.copy(); }
+            i = i + 1u;
+        }
+        passed += Test("bare-if override owned-string", name, "override");
+    }
+    // Helper-return form (each branch returns an owned string from a helper).
+    {
+        string n0 = pickName(0u);
+        string n1 = pickName(1u);
+        passed += Test("helper-return owned-string 0", n0, "known");
+        passed += Test("helper-return owned-string 1", n1, "other");
+    }
+    // Regression (plan-03): a method call on a parenthesized (cast) expression. The
+    // receiver is a by-value struct with no addressable storage; it used to fail with
+    // "unknown function '((string)buf)'". Materializing it to a temp now lets the method
+    // dispatch find the struct receiver.
+    {
+        char[8] cbuf = default;
+        cbuf[0] = (char)'h'; cbuf[1] = (char)'i'; cbuf[2] = (char)0;
+        string ms = ((string)cbuf).copy();
+        passed += Test("method on cast expr (copy)", ms, "hi");
+        passed += Test("method on cast expr (length)", ((string)cbuf).length(), 2);
+        string pv = "wrapped";
+        passed += Test("method on parenthesized value", (pv).copy(), "wrapped");
+    }
+
     return passed;
 }
 
@@ -1437,7 +1501,7 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
-    r = testStringAPI();        passed += r; total += 98;
+    r = testStringAPI();        passed += r; total += 106;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

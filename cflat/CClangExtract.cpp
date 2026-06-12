@@ -478,11 +478,53 @@ namespace cflat_cinterop
             }
         };
 
+        // Diagnostic consumer that silently swallows everything (like IgnoringDiagConsumer) but
+        // tallies the "unknown type name" errors that originate inside an #included header rather
+        // than in our in-memory stub. That pattern is the fingerprint of a non-self-contained
+        // header missing a prerequisite include; the header-bind path turns it into a helpful
+        // "import them as one group" diagnostic. The intentional macro-probe errors all sit in
+        // the main stub file, so isInMainFile() filters them out.
+        class PrereqDiagConsumer : public DiagnosticConsumer
+        {
+        public:
+            unsigned prereqErrors = 0;
+            std::string firstPrereqError;
+
+            void HandleDiagnostic(DiagnosticsEngine::Level level, const Diagnostic& info) override
+            {
+                // Deliberately do NOT chain to DiagnosticConsumer::HandleDiagnostic: the base
+                // increments NumErrors, and CompilerInstance::ExecuteAction returns false when
+                // the client reports errors - which would turn the intentional macro-probe
+                // errors into a whole-extraction failure. Like IgnoringDiagConsumer, we swallow
+                // the diagnostic and only keep our own prerequisite tally.
+                if (level < DiagnosticsEngine::Error) return;
+
+                llvm::SmallString<256> msg;
+                info.FormatDiagnostic(msg);
+                if (msg.str().find("unknown type name") == llvm::StringRef::npos) return;
+
+                // Errors in the in-memory stub (the macro probes) are not header prerequisites.
+                if (info.hasSourceManager())
+                {
+                    const SourceManager& sm = info.getSourceManager();
+                    if (info.getLocation().isValid() && sm.isInMainFile(info.getLocation()))
+                        return;
+                }
+
+                ++prereqErrors;
+                if (firstPrereqError.empty()) firstPrereqError = msg.str().str();
+            }
+        };
+
         // Build a CompilerInstance from driver args + an optional in-memory main file, then run
         // `action`. When `source` is non-empty it is remapped onto req.mainFileName; otherwise
-        // req.realPath is parsed from disk.
+        // req.realPath is parsed from disk. When `outPrereqErrors` is non-null it receives the
+        // count (and `outFirstPrereqError` the text) of missing-prerequisite errors seen in the
+        // parse - used by the header-bind path to detect a header that needs a grouped import.
         bool RunAction(const ExtractRequest& req, const std::string& source,
-                       FrontendAction& action, std::string& err)
+                       FrontendAction& action, std::string& err,
+                       unsigned* outPrereqErrors = nullptr,
+                       std::string* outFirstPrereqError = nullptr)
         {
             const std::string& inputName = source.empty() ? req.realPath : req.mainFileName;
             if (inputName.empty()) { err = "no input file"; return false; }
@@ -517,7 +559,10 @@ namespace cflat_cinterop
 
             CompilerInstance ci;
             ci.setInvocation(invocation);
-            ci.createDiagnostics(new IgnoringDiagConsumer(), /*own*/ true);
+            // Own the consumer via the engine, but keep a raw pointer so the prereq tally can be
+            // read back after the parse (the engine, hence the consumer, outlives this scope).
+            PrereqDiagConsumer* prereqConsumer = new PrereqDiagConsumer();
+            ci.createDiagnostics(prereqConsumer, /*own*/ true);
 
             if (!source.empty())
             {
@@ -530,6 +575,8 @@ namespace cflat_cinterop
                 llvm::TimeTraceScope execScope("ExecuteFrontend", inputName);
                 if (!ci.ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
             }
+            if (outPrereqErrors) *outPrereqErrors = prereqConsumer->prereqErrors;
+            if (outFirstPrereqError) *outFirstPrereqError = prereqConsumer->firstPrereqError;
             return true;
         }
     } // namespace
@@ -578,7 +625,7 @@ namespace cflat_cinterop
         {
             llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
             ExtractAction extract(st);
-            return RunAction(req, fullSource, extract, err);
+            return RunAction(req, fullSource, extract, err, &out.prereqErrors, &out.firstPrereqError);
         }
     }
 }

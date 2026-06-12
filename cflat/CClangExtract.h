@@ -140,6 +140,17 @@ namespace cflat_cinterop
         std::vector<RawMacro> macros;
         std::vector<RawFuncMacro> funcMacros;
         std::vector<std::string> includedFiles;  // populated only when req.wantIncludes
+
+        // Count of "unknown type name" errors raised inside an #included header (not the
+        // in-memory stub itself). This is the signature of a non-self-contained header that
+        // relies on a prerequisite being included first (e.g. tlhelp32.h needs windows.h):
+        // the missing base type (HANDLE/DWORD/...) makes clang drop the dependent function
+        // declarations. The header-bind path uses this to fail loudly and suggest grouping
+        // the prerequisite, instead of silently registering the error-recovered remnants.
+        // Stub-local errors (the intentional macro-probe "type name where an expression was
+        // expected" diagnostics) are excluded by source location, so they do not inflate it.
+        unsigned prereqErrors = 0;
+        std::string firstPrereqError;            // formatted text of the first such error
     };
 
     // Parse the TU once and fill `out`. Returns false only on a hard failure to build a TU;

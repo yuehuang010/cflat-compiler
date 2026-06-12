@@ -1,0 +1,11 @@
+// A non-self-contained SDK leaf header bound on its own must fail loudly with the
+// orphan-header diagnostic (it suggests grouping it with its prerequisite so they share
+// one translation unit). tlhelp32.h uses HANDLE/DWORD/CHAR[] without including the header
+// that defines them, so a bare import cannot compile.
+//
+// This is an import-time diagnostic (raised during ProcessImports, before the listener
+// walk). The bare-semicolon expect_error at file scope is armed before imports run, so the
+// error is matched here rather than aborting the compile. Depends on the same auto-resolved
+// Windows SDK headers as test_windows.cb - acceptable on any dev box that can run that test.
+expect_error("does not compile on its own");
+import "tlhelp32.h";

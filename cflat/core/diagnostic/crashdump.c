@@ -22,6 +22,12 @@
 #include <dbghelp.h>
 #include <string.h>
 
+// fflush is declared by hand instead of including <stdio.h>: the UCRT header emits
+// inline definitions of sprintf/vsprintf into this object, which collide at link time
+// with the strong sprintf/vsprintf a cflat program defines via cruntime.cb. The CRT's
+// FILE* parameter is type-erased to void*; only fflush(NULL) is used here.
+int __cdecl fflush(void* stream);
+
 // Append a NUL-terminated string to buf at *pos, never overflowing cap.
 static void cflat_append_(char* buf, int cap, int* pos, const char* s)
 {
@@ -112,6 +118,11 @@ static void cflat_print_frame_(HANDLE process, int index, DWORD64 addr)
 
 static LONG WINAPI cflat_crash_filter_(EXCEPTION_POINTERS* info)
 {
+    // Flush buffered stdio FIRST so any output the program printed before the fault
+    // survives (cflat's printf goes through the CRT's buffered stdout). Without this the
+    // last lines before a crash are commonly lost, masking where the program got to.
+    fflush(NULL);
+
     DWORD code = info->ExceptionRecord->ExceptionCode;
 
     const char* name = "UNKNOWN_EXCEPTION";
@@ -126,6 +137,13 @@ static LONG WINAPI cflat_crash_filter_(EXCEPTION_POINTERS* info)
         case EXCEPTION_FLT_DIVIDE_BY_ZERO:    name = "FLT_DIVIDE_BY_ZERO"; break;
         case EXCEPTION_DATATYPE_MISALIGNMENT: name = "DATATYPE_MISALIGNMENT"; break;
         case EXCEPTION_IN_PAGE_ERROR:         name = "IN_PAGE_ERROR"; break;
+        // Fail-fast NTSTATUS codes (not in winnt.h as EXCEPTION_* macros). These are raised
+        // via __fastfail / RtlFailFast and usually bypass the unhandled-exception filter
+        // entirely (straight to the kernel), so this handler rarely sees them - but when it
+        // does (e.g. a heap check that routes through RaiseException), label them readably
+        // instead of printing a bare hex code.
+        case 0xC0000374:                      name = "HEAP_CORRUPTION"; break;
+        case 0xC0000409:                      name = "STACK_BUFFER_OVERRUN"; break;
         default:                              name = "UNKNOWN_EXCEPTION"; break;
     }
 

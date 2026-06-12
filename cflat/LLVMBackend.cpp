@@ -483,6 +483,33 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             return false;
         }
 
+        // Arm a file-scope bare-semicolon `expect_error("...");` BEFORE imports run, so a
+        // diagnostic raised during ProcessImports (e.g. the orphan-header error) is matched
+        // rather than aborting the compile. Only the bare form (no inner declarations) is
+        // handled here; the scoped-block form is processed by the listener walk as before.
+        // First writer wins - a file declares at most one such expectation.
+        if (auto* tu = computeUnit->translationUnit())
+        {
+            for (auto* decl : tu->externalDeclaration())
+            {
+                auto* ee = decl->expectErrorDeclaration();
+                if (ee && ee->externalDeclaration().empty())
+                {
+                    std::string raw = ee->StringLiteral()->getText();
+                    fileScopeExpectedError_ = raw.substr(1, raw.size() - 2);  // strip quotes
+                    expectedError = fileScopeExpectedError_;
+                    expectedErrorScopeDepth = SIZE_MAX;
+                    break;
+                }
+            }
+        }
+
+        // ProcessImports / ForwardRefScan / the code-gen walk can all raise the armed
+        // file-scope expectation. ExpectedErrorReceived is thrown only on a match (PASS already
+        // printed by LogError), so catching it here and returning success is correct.
+        try
+        {
+
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
         {
@@ -497,13 +524,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         auto groupedImports = DequoteImportGroup(imp);
                         if (groupedImports.size() > 1)
                         {
-                            bool cacheGroup = HasCacheClause(imp);
-                            for (const auto& gf : groupedImports)
-                            {
-                                if (verbose) std::cout << "[verbose] import requested (group): " << gf << (cacheGroup ? " (cache)" : "") << "\n";
-                                if (!CompileImportedFile(filename, gf, "", "", {}, {}, cacheGroup))
-                                    return false;
-                            }
+                            if (verbose) std::cout << "[verbose] import requested (group of " << groupedImports.size() << ")\n";
+                            if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
+                                                    DequoteDefineClauses(imp), HasCacheClause(imp)))
+                                return false;
                             continue;
                         }
                         // Single filename: from the importGroup (plain/`as`/`cache` form) or,
@@ -602,6 +626,22 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
+
+        }
+        catch (const ExpectedErrorReceived&)
+        {
+            // A file-scope expectation matched somewhere in imports / scan / walk. The PASS
+            // line is already printed; report success so --check counts the file as passing.
+            return true;
+        }
+
+        // The armed file-scope expectation never fired (had it fired, the catch above would
+        // have returned). That is the did-not-occur failure for this negative test.
+        if (!fileScopeExpectedError_.empty())
+        {
+            std::cout << std::format("FAIL: expected error '{}' did not occur\n", fileScopeExpectedError_);
+            FailCompilation("expected error did not occur");
+        }
     }
 
     {
@@ -860,7 +900,10 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
     return dirs;
 }
 
-bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
+// Resolve an import filename against the search order described in the header. Logs the
+// not-found error (unless quiet) and returns false on failure.
+bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
+                                    std::string& outCanonical, bool quiet)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
     auto importPath = (importingDir / importFilename).lexically_normal();
@@ -905,16 +948,89 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
     if (ec)
     {
-        std::cerr << "Error: imported file not found: " << importFilename
-                  << " (searched relative to '" << importingDir.string() << "'"
-                  << (sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'")
-                  << (importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'")
-                  << (cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)")
-                  << (runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'")
-                  << ").\n";
+        if (!quiet)
+            std::cerr << "Error: imported file not found: " << importFilename
+                      << " (searched relative to '" << importingDir.string() << "'"
+                      << (sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'")
+                      << (importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'")
+                      << (cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)")
+                      << (runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'")
+                      << ").\n";
         return false;
     }
-    auto canonicalStr = canonical.string();
+    outCanonical = canonical.string();
+    return true;
+}
+
+// Bind a grouped import `import { "a", "b" } lib {...} define ...;`. Non-header entries route
+// individually (each like a plain `import "x";`) in listed order; every header entry of the
+// group is bound as ONE translation unit, in listed order, so an earlier header satisfies a
+// later one's prerequisites (the explicit replacement for the old windows.h prepend special
+// case). Group-level `lib`/`define`/`cache` clauses apply to the whole header group.
+bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
+                                     const std::vector<std::string>& entries,
+                                     const std::vector<std::string>& groupLibs,
+                                     const std::vector<std::string>& groupDefines,
+                                     bool cacheGroup)
+{
+    std::vector<std::string> headerCanonicals;
+    bool anyNewHeader = false;
+    for (const auto& entry : entries)
+    {
+        std::string ext = std::filesystem::path(entry).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        const bool isHeader = (ext == ".h" || ext == ".hpp" || ext == ".hh");
+        if (!isHeader)
+        {
+            // .cb / .c entries are independent - route each like a plain `import "x";`.
+            if (!CompileImportedFile(importingFilePath, entry))
+                return false;
+            continue;
+        }
+        // Header entry: resolve, then defer to the single grouped extraction below. Dedup applies
+        // to REGISTRATION, never to the TU inclusion context: every listed header must still be
+        // #included (in listed order) so an earlier entry satisfies a later one's prerequisites.
+        // An already-imported header keeps its place in the include list - its decls are skipped
+        // at registration time (first-writer-wins in RegisterC*). Dropping it here would strip the
+        // group's prerequisite context and re-orphan the remaining entries.
+        std::string canonicalStr;
+        if (!ResolveImportPath(importingFilePath, entry, canonicalStr))
+            return false;
+        headerCanonicals.push_back(canonicalStr);
+        if (importedFiles.count(canonicalStr))
+        {
+            if (verbose) std::cout << "[verbose]   group header already imported - kept for include context, registration skipped: " << canonicalStr << "\n";
+            continue;
+        }
+        importedFiles.insert(canonicalStr);
+        anyNewHeader = true;
+    }
+
+    if (headerCanonicals.empty())
+        return true;   // group held only .cb/.c entries (already routed)
+    if (!anyNewHeader)
+    {
+        // Every header in the group was already imported elsewhere (a repeated group, or one
+        // following standalone imports of all its members) - fully redundant, nothing to register.
+        if (verbose) std::cout << "[verbose]   group fully redundant - all headers already imported\n";
+        return true;
+    }
+
+    // Group-level `lib` clauses link against the whole group (e.g. user32.lib + gdi32.lib).
+    for (const auto& lib : groupLibs)
+        if (!lib.empty())
+            cLinkLibs_.push_back(ResolveCLinkLib(lib, importingFilePath));
+
+    bool ok = CompileCHeaderGroup(headerCanonicals, groupDefines, cacheGroup);
+    if (ok) ProcessPendingMacroSources();
+    return ok;
+}
+
+bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
+{
+    std::string canonicalStr;
+    if (!ResolveImportPath(importingFilePath, importFilename, canonicalStr))
+        return false;
     // Check circular import first (file currently being processed).
     auto cycleIt = std::find(importStack.begin(), importStack.end(), canonicalStr);
     if (cycleIt != importStack.end())
@@ -1027,16 +1143,15 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             if (auto* imp = decl->importDeclaration())
             {
-                // Grouped import `import { "a", "b" };` - expand to plain nested imports.
+                // Grouped import `import { "a", "b" };` - one TU for header entries, individual
+                // routing for .cb/.c entries (see CompileImportGroup).
                 auto groupedImports = DequoteImportGroup(imp);
                 if (groupedImports.size() > 1)
                 {
-                    for (const auto& gf : groupedImports)
-                    {
-                        if (verbose) std::cout << "[verbose]   nested import (group): " << gf << "\n";
-                        if (!CompileImportedFile(canonicalStr, gf))
-                            return false;
-                    }
+                    if (verbose) std::cout << "[verbose]   nested import (group of " << groupedImports.size() << ")\n";
+                    if (!CompileImportGroup(canonicalStr, groupedImports, DequoteLibClauses(imp),
+                                            DequoteDefineClauses(imp), HasCacheClause(imp)))
+                        return false;
                     continue;
                 }
                 std::string nested;
@@ -1693,13 +1808,14 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         if (auto* tu = computeUnit->translationUnit()) {
             for (auto* decl : tu->externalDeclaration()) {
                 if (auto* imp = decl->importDeclaration()) {
-                    // Grouped import `import { "a", "b" };` - expand to plain imports.
+                    // Grouped import `import { "a", "b" };` - one TU for header entries (see
+                    // CompileImportGroup); .cb/.c entries route individually.
                     auto groupedImports = DequoteImportGroup(imp);
                     if (groupedImports.size() > 1)
                     {
-                        for (const auto& gf : groupedImports)
-                            if (!CompileImportedFile(filePath, gf))
-                                return false;
+                        if (!CompileImportGroup(filePath, groupedImports, DequoteLibClauses(imp),
+                                                DequoteDefineClauses(imp), HasCacheClause(imp)))
+                            return false;
                         continue;
                     }
                     std::string importFilename;
@@ -1807,6 +1923,7 @@ void LLVMBackend::ResetForReanalysis()
     lambdaCounter = 0;
     expectedError.clear();
     expectedErrorScopeDepth = SIZE_MAX;
+    fileScopeExpectedError_.clear();
     currentFunction = nullptr;
     autoVaListAlloca = nullptr;
     returnCapture = std::nullopt;

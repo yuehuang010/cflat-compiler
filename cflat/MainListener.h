@@ -1464,6 +1464,11 @@ public:
         }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
+            // Bare-semicolon file-scope form (no inner declarations) is armed before
+            // ProcessImports in LLVMBackend::Compile; leave that standing expectation
+            // untouched here. Only the scoped-block form has declarations to scan.
+            if (expectErrDecl->externalDeclaration().empty())
+                return;
             // Set expectedError so errors during the scan are caught rather than aborting.
             std::string rawText = expectErrDecl->StringLiteral()->getText();
             rawText = rawText.substr(1, rawText.size() - 2); // strip surrounding quotes
@@ -2604,35 +2609,41 @@ public:
         }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
-            // Scoped block form at file scope: expect_error("msg") { functionDef / structDef / ... }
-            std::string rawText = expectErrDecl->StringLiteral()->getText();
-            compilerLLVM->expectedError = ProcessRawText(rawText);
-            compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
-
-            bool errorReceived = false;
-            try
+            // Bare-semicolon file-scope form (no inner declarations): armed before imports in
+            // LLVMBackend::Compile (so it can catch import-time diagnostics); the match and the
+            // did-not-occur check both happen there. Nothing to do during the walk.
+            if (!expectErrDecl->externalDeclaration().empty())
             {
-                for (auto* extDecl : expectErrDecl->externalDeclaration())
-                    ParseExternalDeclaration(extDecl, namespaceName);
-            }
-            catch (const ExpectedErrorReceived&)
-            {
-                errorReceived = true;
-                compilerLLVM->AbortFunctionBlocks(0);
-                compilerLLVM->ClearCurrentSubprogram();
-                compilerLLVM->expectedError.clear();
+                // Scoped block form at file scope: expect_error("msg") { functionDef / structDef / ... }
+                std::string rawText = expectErrDecl->StringLiteral()->getText();
+                compilerLLVM->expectedError = ProcessRawText(rawText);
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
-            }
 
-            if (!errorReceived && !compilerLLVM->expectedError.empty())
-            {
-                std::cout << std::format("FAIL: expected error '{}' did not occur\n",
-                                          compilerLLVM->expectedError);
-                compilerLLVM->expectedError.clear();
-                if (compilerLLVM->diagnosticSink_)
-                    throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
-                else
-                    compilerLLVM->FailCompilation("expected error did not occur");
+                bool errorReceived = false;
+                try
+                {
+                    for (auto* extDecl : expectErrDecl->externalDeclaration())
+                        ParseExternalDeclaration(extDecl, namespaceName);
+                }
+                catch (const ExpectedErrorReceived&)
+                {
+                    errorReceived = true;
+                    compilerLLVM->AbortFunctionBlocks(0);
+                    compilerLLVM->ClearCurrentSubprogram();
+                    compilerLLVM->expectedError.clear();
+                    compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                }
+
+                if (!errorReceived && !compilerLLVM->expectedError.empty())
+                {
+                    std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                              compilerLLVM->expectedError);
+                    compilerLLVM->expectedError.clear();
+                    if (compilerLLVM->diagnosticSink_)
+                        throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
+                    else
+                        compilerLLVM->FailCompilation("expected error did not occur");
+                }
             }
         }
 
@@ -2678,19 +2689,35 @@ public:
         {
             if (auto* imp = extDecl->importDeclaration())
             {
-                // Grouped import `import { "a", "b" };` inside an if-const branch - expand
-                // to plain imports (no alias/lib/define/cache, like a bare `import "x";`).
+                // Grouped import `import { "a", "b" };` inside an if-const branch - header
+                // entries share one TU; .cb/.c route individually (see CompileImportGroup).
                 if (auto* grp = imp->importGroup())
                 {
                     auto lits = grp->StringLiteral();
                     if (lits.size() > 1)
                     {
+                        std::vector<std::string> entries;
                         for (auto* lit : lits)
                         {
                             std::string gr = lit->getText();
-                            if (gr.size() < 2) continue;
-                            Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, gr.substr(1, gr.size() - 2));
+                            if (gr.size() >= 2) entries.push_back(gr.substr(1, gr.size() - 2));
                         }
+                        std::vector<std::string> grpLibs;
+                        if (auto* lc = imp->libClause())
+                            for (auto* lit : lc->StringLiteral())
+                            {
+                                std::string lr = lit->getText();
+                                if (lr.size() >= 2) grpLibs.push_back(lr.substr(1, lr.size() - 2));
+                            }
+                        std::vector<std::string> grpDefines;
+                        for (auto* dc : imp->defineClause())
+                            if (dc->StringLiteral())
+                            {
+                                std::string dr = dc->StringLiteral()->getText();
+                                if (dr.size() >= 2) grpDefines.push_back(dr.substr(1, dr.size() - 2));
+                            }
+                        Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
+                                                       grpLibs, grpDefines, imp->cacheClause() != nullptr);
                         continue;
                     }
                 }
@@ -5586,6 +5613,21 @@ public:
             // compound '+=' RHS is a true intermediate that must be freed.
             if (operatorText == "=" && right != nullptr)
                 compiler->UnregisterOwnedStringTemp(right);
+
+            // Ownership of an owned heap string returned by the RHS (e.g. copy() /
+            // operator+) transfers to the assigned-to string local: mark it owning so
+            // the scope-exit destructor frees the buffer. Crucially, also CONSUME the
+            // lastCallReturnsOwned flag here. Unlike the declaration path (which clears
+            // it), a plain assignment used to leave it set, so the next declaration in
+            // an adjacent scope (e.g. `string b = "literal";` in the else branch after
+            // `name = a.copy();` in the if branch) would falsely inherit ownership and
+            // its scope-exit destructor would free a string literal -> heap corruption.
+            if (operatorText == "=" && compiler->lastCallReturnsOwned)
+            {
+                if (NamedVarIsString(namedVar) && !namedVar.CallerName.empty())
+                    compiler->MarkVariableOwningString(namedVar.CallerName);
+                compiler->lastCallReturnsOwned = false;
+            }
 
             // Wrap named function in closure fat struct when assigning to a function<T> variable.
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
@@ -9717,6 +9759,30 @@ public:
                             if (prevPrimary->expression() != nullptr && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
                             lastParenExprType = {};
+
+                            // A parenthesized expression yielding a by-VALUE known struct
+                            // (e.g. `((string)buf)`) has its value in Primary but no addressable
+                            // storage, so a following `.method()` could not establish a struct
+                            // receiver and fell back to treating the primary text as a function
+                            // name ("unknown function '((string)buf)'"). Materialize the value into
+                            // a temp alloca and set BaseType so the struct-receiver branch below
+                            // picks it up - matching the two-statement `string t = (string)buf;
+                            // t.copy()` workaround.
+                            if (namedVar.Primary != nullptr && namedVar.Storage == nullptr
+                                && namedVar.BaseType == nullptr
+                                && !namedVar.TypeAndValue.Pointer
+                                && !namedVar.TypeAndValue.TypeName.empty())
+                            {
+                                auto sd = Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                                if (sd.StructType != nullptr
+                                    && namedVar.Primary->getType() == sd.StructType)
+                                {
+                                    namedVar.BaseType = sd.StructType;
+                                    auto* tmp = Compiler(ctx)->CreateAlloca(sd.StructType);
+                                    Compiler(ctx)->builder->CreateStore(namedVar.Primary, tmp);
+                                    namedVar.Storage = tmp;
+                                }
+                            }
                         }
 
                         // If the primary was a lambda, propagate its function-pointer type.

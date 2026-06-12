@@ -17,8 +17,23 @@
 //      --c-lib / absolute path. If bare-name resolution regresses, the link fails and this test
 //      never builds; calling one function from each lib then proves both were actually linked.
 // cflat auto-resolves the Windows SDK include dir, so no --c-include flag is required.
+//   5. A non-self-contained SDK leaf header (tlhelp32.h uses HANDLE/DWORD/CHAR[] without
+//      including the header that defines them) binds correctly when grouped with its
+//      prerequisite: `import {"windows.h", "tlhelp32.h"}` forms ONE translation unit (the
+//      stub includes windows.h before tlhelp32.h), so tlhelp32.h's base types resolve. It
+//      registers its functions (CreateToolhelp32Snapshot/Process32First/Next) and lays out
+//      its fixed-size array struct field (CHAR szExeFile[260]) inline so
+//      sizeof(PROCESSENTRY32) == 304, not a decayed-pointer 40. The compiler has no built-in
+//      knowledge of windows.h - the dependency is expressed entirely in this source.
 import "test_helper.cb";
-import "windows.h" lib { "user32.lib", "gdi32.lib" };
+// A standalone `import "windows.h";` BEFORE the group must not strip windows.h from the
+// group's inclusion context. Dedup applies to registration only - the group stub still
+// #includes windows.h (so tlhelp32.h's HANDLE/DWORD prerequisites resolve) while windows.h's
+// already-registered decls are skipped. Without this, windows.h was dropped from the group
+// and tlhelp32.h extracted alone, failing as an orphan. The assertions below (the toolhelp
+// walk and sizeof(PROCESSENTRY32) == 304) prove tlhelp32 still binds correctly.
+import "windows.h";
+import {"windows.h", "tlhelp32.h"} lib { "user32.lib", "gdi32.lib" };
 
 extern int main()
 {
@@ -96,6 +111,26 @@ extern int main()
     void* brush = CreateSolidBrush(255u);  // RGB(255,0,0) - gdi32.lib
     total++; passed += Test("CreateSolidBrush non-null (gdi32)", brush != nullptr, true);
     total++; passed += Test("DeleteObject succeeded (gdi32)", DeleteObject(brush) != 0, true);
+
+    // tlhelp32.h leaf-header bind: fixed-size array struct field (CHAR szExeFile[260]) must
+    // be laid out inline so the C ABI size is right (304, not the decayed-pointer 40 that
+    // silently dropped the array). PROCESSENTRY32 is a typedef for tagPROCESSENTRY32.
+    total++; passed += Test("sizeof(PROCESSENTRY32) array field", (int)sizeof(PROCESSENTRY32), 304);
+
+    // The toolhelp functions are auto-registered from the header (no hand-written extern):
+    // snapshot the process list and enumerate it. Process32First fails with ERROR_BAD_LENGTH
+    // unless dwSize is the true 304-byte size, so a successful walk also proves the layout.
+    void* snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0u);
+    total++; passed += Test("CreateToolhelp32Snapshot non-null", snap != INVALID_HANDLE_VALUE, true);
+    PROCESSENTRY32 pe = default;
+    pe.dwSize = (u32)sizeof(PROCESSENTRY32);
+    int procCount = 0;
+    if (Process32First(snap, &pe) != 0) {
+        procCount = procCount + 1;
+        while (Process32Next(snap, &pe) != 0) procCount = procCount + 1;
+    }
+    CloseHandle(snap);
+    total++; passed += Test("Process32First/Next enumerated processes", procCount > 0, true);
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
