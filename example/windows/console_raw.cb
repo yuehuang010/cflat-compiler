@@ -10,10 +10,11 @@
 //     flags, KEY_EVENT, VK_ESCAPE - no hand-transcribed magic numbers.
 //   - A small struct passed BY VALUE: SetConsoleCursorPosition takes a 4-byte
 //     COORD by value (an ABI edge - not a pointer).
-//   - One deliberate exception: INPUT_RECORD embeds an anonymous union, which
-//     C interop cannot import by value (the type is registered as an opaque
-//     shell - usable only through a pointer). Core's flattened equivalent,
-//     os.windows._INPUT_RECORD, covers the read loop instead.
+//   - INPUT_RECORD's nested unnamed unions: the header declares
+//     `union {...} Event;` and, inside KEY_EVENT_RECORD, `union {...} uChar;`.
+//     Both are named members of unnamed types, so access spells out the
+//     documented path: rec.Event.KeyEvent.uChar.AsciiChar - exactly as MSDN
+//     writes it.
 //
 // Build & run (needs a real console - exits politely if stdin is redirected):
 //   x64/Release/cflat.exe example/windows/console_raw.cb -o out/console_raw.exe
@@ -50,28 +51,29 @@ extern int main()
 
     while (true)
     {
-        // INPUT_RECORD's anonymous union cannot be imported by value, so the
-        // read loop uses core's flattened layout from the os.windows namespace.
-        os.windows._INPUT_RECORD rec = default;
-        i32 count = 0;
-        if (os.windows.ReadConsoleInputA(hin, &rec, 1, &count) == 0 || count == 0)
+        // The header's own INPUT_RECORD imports by value - its unnamed unions
+        // (Event, and uChar inside KEY_EVENT_RECORD) are accessed through the
+        // member names MSDN documents.
+        INPUT_RECORD rec = default;
+        u32 count = 0;
+        if (ReadConsoleInputA(hin, &rec, 1u, &count) == 0 || count == 0)
             break;
 
         // Only key-down events; ignore mouse/resize/focus records and releases.
-        if (rec.eventType != (i16)KEY_EVENT)
+        if (rec.EventType != (u16)KEY_EVENT)
             continue;
-        if (rec._event.key.keyDown == 0)
+        if (rec.Event.KeyEvent.bKeyDown == 0)
             continue;
 
-        int vk = (int)rec._event.key.vkCode & 0xFFFF;
-        int ch = (int)rec._event.key.uChar & 0xFF;   // low byte is the ASCII char
+        int vk = (int)rec.Event.KeyEvent.wVirtualKeyCode;
+        int ch = (int)rec.Event.KeyEvent.uChar.AsciiChar & 0xFF;
 
         if (vk == VK_ESCAPE)
             break;
 
         if (ch >= 32 && ch < 127)
             printf("  key '%c'  (vk=0x%02X, repeat=%d)\n", ch, vk,
-                   (int)rec._event.key.repeatCount);
+                   (int)rec.Event.KeyEvent.wRepeatCount);
         else
             printf("  key vk=0x%02X (non-printable)\n", vk);
     }

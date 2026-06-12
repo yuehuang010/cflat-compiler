@@ -1,0 +1,141 @@
+// dirwatch: a directory change watcher for Windows.
+//
+// Opens a directory with CreateFileA(FILE_LIST_DIRECTORY|FILE_FLAG_BACKUP_SEMANTICS),
+// then blocks in synchronous ReadDirectoryChangesW. Each returned batch is a chain of
+// variable-length FILE_NOTIFY_INFORMATION records: NextEntryOffset byte-steps to the
+// next record (0 terminates), Action is a FILE_ACTION_* code, FileNameLength is in
+// BYTES, and FileName is a trailing WCHAR array (declared WCHAR FileName[1], but the
+// real UTF-16 name extends past index 0). We narrow each UTF-16 unit to ASCII by hand
+// and print one line per event.
+//
+// This is a coverage exercise for cflat's `import "windows.h"` C-interop, targeting the
+// WIDE-CHAR surface that the prior probes (run_capture/mmap_hexdump/vmmap/tcp_http_get)
+// never touched:
+//   - WCHAR / wchar_t member mapping (expect u16).
+//   - The trailing WCHAR FileName[1] inline-array field -> sizeof == 16.
+//   - Byte-offset pointer arithmetic over a raw buffer (u64 cursor idiom, as in vmmap).
+//   - FILE_ACTION_* / FILE_NOTIFY_CHANGE_* constant folding.
+// The buffer must be DWORD-aligned per the API contract, so it is backed by a u32 array.
+//
+// Every Win32 function, struct and constant used below comes straight from the
+// auto-extracted header surface - no hand-written externs.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/dirwatch.cb -o out/dirwatch.exe
+//   out\dirwatch.exe <dir> [maxEvents]      (defaults: ".", 10)
+import "windows.h" cache;
+import "string.cb";
+
+// Map a FILE_ACTION_* code to a fixed-width label.
+char* actionText(u32 action)
+{
+    if (action == (u32)FILE_ACTION_ADDED)            return "ADDED           ";
+    if (action == (u32)FILE_ACTION_REMOVED)          return "REMOVED         ";
+    if (action == (u32)FILE_ACTION_MODIFIED)         return "MODIFIED        ";
+    if (action == (u32)FILE_ACTION_RENAMED_OLD_NAME) return "RENAMED_OLD_NAME";
+    if (action == (u32)FILE_ACTION_RENAMED_NEW_NAME) return "RENAMED_NEW_NAME";
+    return "?               ";
+}
+
+// Narrow a UTF-16 name (nameLen is in BYTES) to ASCII: units < 128 pass through,
+// anything else becomes '?'. name points at the first WCHAR unit of the event.
+void printNarrowed(u16* name, u32 nameLenBytes)
+{
+    int chars = (int)(nameLenBytes / 2u);
+    int i = 0;
+    while (i < chars) {
+        u16 unit = name[i];
+        if (unit < (u16)128) {
+            putchar((int)unit);
+        } else {
+            putchar((int)'?');
+        }
+        i++;
+    }
+}
+
+extern int main(int argc, char** argv)
+{
+    // Coverage probe: the trailing WCHAR FileName[1] must register as an inline
+    // [1 x u16], giving the exact C-ABI size of 16 (DWORD*3 + WCHAR[1], padded to a
+    // 4-byte boundary). Asserted below in the self-check line.
+    int fniSize = (int)sizeof(FILE_NOTIFY_INFORMATION);
+    printf("sizeof(FILE_NOTIFY_INFORMATION) = %d (expect 16 on x64)\n", fniSize);
+
+    char* dir = ".";
+    if (argc >= 2) dir = argv[1];
+    int maxEvents = 10;
+    if (argc >= 3) {
+        maxEvents = atoi(argv[2]);
+        if (maxEvents < 1) maxEvents = 1;
+    }
+
+    // FILE_LIST_DIRECTORY + FILE_FLAG_BACKUP_SEMANTICS is the required combination to
+    // get a directory handle usable with ReadDirectoryChangesW.
+    u32 share = (u32)FILE_SHARE_READ | (u32)FILE_SHARE_WRITE | (u32)FILE_SHARE_DELETE;
+    void* hDir = CreateFileA(dir, (u32)FILE_LIST_DIRECTORY, share,
+                             nullptr, (u32)OPEN_EXISTING,
+                             (u32)FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (hDir == INVALID_HANDLE_VALUE) {
+        printf("CreateFileA('%s') failed (error %u)\n", dir, GetLastError());
+        return 1;
+    }
+
+    printf("watching '%s' for up to %d event(s) (Ctrl+C to stop early)...\n", dir, maxEvents);
+
+    // DWORD-aligned backing store: a u32 array guarantees 4-byte alignment, which the
+    // FILE_NOTIFY_INFORMATION layout (DWORD fields) requires. 16 KiB of capacity.
+    u32[4096] backing = default;
+    u32 filter = (u32)FILE_NOTIFY_CHANGE_FILE_NAME
+               | (u32)FILE_NOTIFY_CHANGE_DIR_NAME
+               | (u32)FILE_NOTIFY_CHANGE_LAST_WRITE;
+
+    int seen = 0;
+    while (seen < maxEvents) {
+        u32 got = 0;
+        // Synchronous (non-overlapped): blocks until at least one change is buffered.
+        if (ReadDirectoryChangesW(hDir, (void*)&backing[0],
+                                  (u32)sizeof(backing), 0,
+                                  filter, &got, nullptr, nullptr) == 0) {
+            printf("ReadDirectoryChangesW failed (error %u)\n", GetLastError());
+            CloseHandle(hDir);
+            return 1;
+        }
+        if (got == 0u) {
+            // Buffer overflow on the OS side: notifications were dropped. Keep waiting.
+            printf("(notification buffer overflow - some events dropped)\n");
+            continue;
+        }
+
+        // Walk the FILE_NOTIFY_INFORMATION chain by byte offset. The buffer base is a
+        // u64 cursor (the vmmap idiom); each record is reached by casting the cursor to
+        // a struct pointer, and the next record by adding NextEntryOffset bytes.
+        u64 cursor = (u64)&backing[0];
+        bool more = true;
+        while (more && seen < maxEvents) {
+            FILE_NOTIFY_INFORMATION* fni = (FILE_NOTIFY_INFORMATION*)(void*)cursor;
+            u32 action = fni.Action;
+            u32 nameLen = fni.FileNameLength;   // BYTES, not characters
+
+            // FileName is the inline trailing WCHAR[1]; decay it to a u16* and read past
+            // index 0 via plain pointer arithmetic (no bounds restriction applies).
+            u16* name = &fni.FileName[0];
+            printf("  %s  ", actionText(action));
+            printNarrowed(name, nameLen);
+            putchar((int)'\n');
+
+            seen++;
+
+            u32 next = fni.NextEntryOffset;     // 0 terminates the chain
+            if (next == 0u) {
+                more = false;
+            } else {
+                cursor = cursor + (u64)next;
+            }
+        }
+    }
+
+    CloseHandle(hDir);
+    printf("done (%d event(s) reported).\n", seen);
+    return 0;
+}

@@ -132,6 +132,25 @@ extern int main()
     CloseHandle(snap);
     total++; passed += Test("Process32First/Next enumerated processes", procCount > 0, true);
 
+    // WCHAR (wide-char) surface: WCHAR maps to u16 (2 bytes), NOT a 4-byte wchar_t. A
+    // WCHAR[N] struct field is laid out inline at 2 bytes/unit, so the C ABI size halves
+    // versus a 4-byte mapping. WIN32_FIND_DATAW (WCHAR cFileName[260] + cAlternateFileName[14])
+    // is the discriminator: 44 header bytes + (260+14)*2 = 592. A 4-byte WCHAR would be 1140.
+    // The CHAR sibling WIN32_FIND_DATAA proves the same field at 1 byte/unit -> 320.
+    total++; passed += Test("sizeof(WIN32_FIND_DATAW) WCHAR=2 bytes", (int)sizeof(WIN32_FIND_DATAW), 592);
+    total++; passed += Test("sizeof(WIN32_FIND_DATAA) CHAR=1 byte", (int)sizeof(WIN32_FIND_DATAA), 320);
+    // FILE_NOTIFY_INFORMATION's trailing WCHAR FileName[1] registers as an inline [1 x u16];
+    // 3 DWORDs (12) + WCHAR[1] (2) padded to a 4-byte boundary == 16.
+    total++; passed += Test("sizeof(FILE_NOTIFY_INFORMATION) trailing WCHAR[1]", (int)sizeof(FILE_NOTIFY_INFORMATION), 16);
+    // The WCHAR field is a real 16-bit lvalue: write a unit, read it back, and confirm the
+    // element stride is 2 bytes via pointer arithmetic (a 4-byte WCHAR would give stride 4 and
+    // silently misdecode every wide name - which the dirwatch example relies on being 2).
+    FILE_NOTIFY_INFORMATION fni = default;
+    fni.FileName[0] = (u16)0x0041;   // 'A'
+    u16* fniName = &fni.FileName[0];
+    total++; passed += Test("WCHAR field round-trip (u16 lvalue)", (int)fniName[0], 65);
+    total++; passed += Test("WCHAR element stride is 2 bytes", (int)((u64)&fniName[1] - (u64)&fniName[0]), 2);
+
     // LARGE_INTEGER / ULARGE_INTEGER: a union whose members include an unnamed (C11 anonymous)
     // nested struct `struct { DWORD LowPart; LONG HighPart; }`. The C-interop extractor flattens
     // the anonymous member into a synthetic sub-record; field access resolves LowPart/HighPart

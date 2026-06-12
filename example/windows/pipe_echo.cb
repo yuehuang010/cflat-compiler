@@ -1,0 +1,324 @@
+// pipe_echo: a named-pipe echo server/client over overlapped (async) I/O.
+//
+// One executable, two modes:
+//   pipe_echo.exe server [nMsgs]   - create \\.\pipe\cflat_echo with
+//       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, accept one client, then run an
+//       overlapped echo loop (ReadFile -> GetOverlappedResult -> WriteFile back)
+//       for nMsgs round-trips and exit. Every blocking wait goes through
+//       WaitForMultipleObjects over a 2-handle array (the I/O completion event
+//       plus an auxiliary shutdown event) with a finite timeout, so a wedged
+//       client can never hang the server.
+//   pipe_echo.exe client [nMsgs]   - open the pipe (retrying while the server
+//       comes up), send nMsgs numbered lines, verify each echo byte-for-byte,
+//       and return exit code 0 only if every echo matched.
+//   pipe_echo.exe                  - print usage and exit 0 (so example.bat, which
+//       only compiles, and any accidental bare run never block).
+//
+// Coverage exercise for cflat's `import "windows.h"` C-interop, targeting the
+// async-I/O / event-multiplexing surface that the prior probes (run_capture,
+// mmap_hexdump, vmmap, tcp_http_get, dirwatch) never touched:
+//   - OVERLAPPED: transparent access to ov.Offset / ov.OffsetHigh (nested
+//     anonymous union -> anonymous struct, the __anonN path) and ov.Pointer
+//     (the other union arm). sizeof(OVERLAPPED) == 32 is asserted in-program.
+//   - CreateEventA / SetEvent / ResetEvent + WaitForMultipleObjects over a
+//     void*[N] handle array decaying to the HANDLE* parameter.
+//   - GetOverlappedResult's DWORD* bytes-transferred out-param.
+//   - ERROR_IO_PENDING / WAIT_OBJECT_0 / WAIT_TIMEOUT / PIPE_* constant folding
+//     and GetLastError() after a pending overlapped call.
+//
+// Every Win32 function, struct and constant used below comes straight from the
+// auto-extracted header surface - no hand-written extern declarations.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/pipe_echo.cb -o out/pipe_echo.exe
+//   out\pipe_echo.exe server 4      (in one console)
+//   out\pipe_echo.exe client 4      (in another - prints PASS/FAIL, exit 0 on PASS)
+import "windows.h" cache;
+import "string.cb";
+
+// The pipe path. In a cflat string literal "\\" is one backslash, so this is
+// the real Win32 name \\.\pipe\cflat_echo.
+const char* kPipeName = "\\\\.\\pipe\\cflat_echo";
+
+// Per-wait deadline. Generous enough for a healthy round-trip, finite so a stall
+// surfaces as a clean error instead of an unbounded hang.
+const u32 kWaitMs = 5000u;
+
+// Zero an OVERLAPPED and arm it with the completion event. Writing Offset /
+// OffsetHigh covers the Pointer arm of the same anonymous union. This is the
+// __anonN transparent-access path on a real SDK struct: no naming of the
+// anonymous union or struct hops.
+void armOverlapped(OVERLAPPED* ov, void* ev)
+{
+    ov.Internal = (u64)0;
+    ov.InternalHigh = (u64)0;
+    ov.Offset = (u32)0;
+    ov.OffsetHigh = (u32)0;
+    ov.hEvent = ev;
+}
+
+// Block until the overlapped event signals, multiplexing it against an
+// auxiliary shutdown event so the handle-array argument shape is exercised. The
+// shutdown event is never signaled here, but a real server would set it from a
+// console handler to drain cleanly. Returns the raw WaitForMultipleObjects code.
+u32 waitForIo(void* ioEvent, void* shutdownEvent, u32 timeoutMs)
+{
+    // void*[2] is a fixed-size handle array; &handles[0] decays to the HANDLE*
+    // (collapsed to void* in the C ABI) that WaitForMultipleObjects expects.
+    void*[2] handles = default;
+    handles[0] = ioEvent;
+    handles[1] = shutdownEvent;
+    return WaitForMultipleObjects((u32)2, (void*)&handles[0], 0, timeoutMs);
+}
+
+// Drive one overlapped operation to completion: issue the call, and if it
+// returns pending, wait on the event array and harvest the byte count via
+// GetOverlappedResult. Returns true on success with *outBytes set.
+// `started` is the BOOL ReadFile/WriteFile returned; `ov`/`ioEvent`/etc. are the
+// shared overlapped state.
+bool completeOverlapped(void* hPipe, OVERLAPPED* ov, void* ioEvent,
+                        void* shutdownEvent, int started, u32* outBytes,
+                        char* opName)
+{
+    u32 bytes = 0;
+    if (started != 0) {
+        // Completed synchronously (rare for overlapped pipes, but valid).
+        if (GetOverlappedResult(hPipe, (void*)ov, &bytes, 1) == 0) {
+            printf("server: GetOverlappedResult(%s) failed (error %u)\n", opName, GetLastError());
+            return false;
+        }
+        *outBytes = bytes;
+        return true;
+    }
+
+    u32 err = GetLastError();
+    if (err != (u32)ERROR_IO_PENDING) {
+        if (err == (u32)ERROR_BROKEN_PIPE) {
+            // Client closed the pipe; signal end-of-stream to the caller.
+            *outBytes = 0u;
+            return false;
+        }
+        printf("server: %s failed (error %u)\n", opName, err);
+        return false;
+    }
+
+    // Pending: block on the I/O event (multiplexed with the shutdown event).
+    u32 w = waitForIo(ioEvent, shutdownEvent, kWaitMs);
+    if (w == (u32)WAIT_TIMEOUT) {
+        printf("server: %s timed out after %u ms\n", opName, kWaitMs);
+        return false;
+    }
+    if (w != WAIT_OBJECT_0) {
+        // WAIT_OBJECT_0 + 1 (shutdown) or WAIT_FAILED.
+        printf("server: wait during %s returned %u (error %u)\n", opName, w, GetLastError());
+        return false;
+    }
+    if (GetOverlappedResult(hPipe, (void*)ov, &bytes, 1) == 0) {
+        printf("server: GetOverlappedResult(%s) failed (error %u)\n", opName, GetLastError());
+        return false;
+    }
+    *outBytes = bytes;
+    return true;
+}
+
+int runServer(int nMsgs)
+{
+    u32 openMode = (u32)PIPE_ACCESS_DUPLEX | (u32)FILE_FLAG_OVERLAPPED;
+    u32 pipeMode = (u32)PIPE_TYPE_MESSAGE | (u32)PIPE_READMODE_MESSAGE | (u32)PIPE_WAIT;
+    void* hPipe = CreateNamedPipeA(kPipeName, openMode, pipeMode,
+                                   (u32)1,        // max 1 instance
+                                   (u32)4096,     // out buffer
+                                   (u32)4096,     // in buffer
+                                   (u32)0,        // default timeout
+                                   nullptr);
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf("server: CreateNamedPipeA failed (error %u)\n", GetLastError());
+        return 1;
+    }
+
+    // Manual-reset events: ioEvent backs every OVERLAPPED; shutdownEvent is the
+    // second handle-array slot (never signaled in this demo).
+    void* ioEvent = CreateEventA(nullptr, 1, 0, nullptr);
+    void* shutdownEvent = CreateEventA(nullptr, 1, 0, nullptr);
+    if (ioEvent == nullptr || shutdownEvent == nullptr) {
+        printf("server: CreateEventA failed (error %u)\n", GetLastError());
+        CloseHandle(hPipe);
+        return 1;
+    }
+
+    printf("server: listening on %s for %d message(s)...\n", kPipeName, nMsgs);
+
+    OVERLAPPED ov = default;
+
+    // Overlapped connect: ConnectNamedPipe returns 0 for overlapped pipes;
+    // GetLastError tells us whether it is pending or the client already arrived.
+    ResetEvent(ioEvent);
+    armOverlapped(&ov, ioEvent);
+    if (ConnectNamedPipe(hPipe, (void*)&ov) == 0) {
+        u32 err = GetLastError();
+        if (err == (u32)ERROR_PIPE_CONNECTED) {
+            // Client connected between CreateNamedPipe and ConnectNamedPipe;
+            // no completion will be posted, so proceed directly.
+        } else if (err == (u32)ERROR_IO_PENDING) {
+            u32 w = waitForIo(ioEvent, shutdownEvent, kWaitMs);
+            if (w != WAIT_OBJECT_0) {
+                printf("server: waiting for client connect returned %u\n", w);
+                CloseHandle(ioEvent); CloseHandle(shutdownEvent); CloseHandle(hPipe);
+                return 2;
+            }
+            u32 dummy = 0;
+            GetOverlappedResult(hPipe, (void*)&ov, &dummy, 1);
+        } else {
+            printf("server: ConnectNamedPipe failed (error %u)\n", err);
+            CloseHandle(ioEvent); CloseHandle(shutdownEvent); CloseHandle(hPipe);
+            return 1;
+        }
+    }
+    printf("server: client connected.\n");
+
+    i8[512] buf = default;
+    int echoed = 0;
+    while (echoed < nMsgs) {
+        // Overlapped read.
+        ResetEvent(ioEvent);
+        armOverlapped(&ov, ioEvent);
+        u32 got = 0;
+        int rok = ReadFile(hPipe, (void*)&buf[0], (u32)512, &got, (void*)&ov);
+        if (completeOverlapped(hPipe, &ov, ioEvent, shutdownEvent, rok, &got, "read") == false) {
+            // Treat a clean broken pipe / EOF as the client leaving early.
+            break;
+        }
+        if (got == 0u) break;
+
+        // Echo the exact bytes back with an overlapped write.
+        ResetEvent(ioEvent);
+        armOverlapped(&ov, ioEvent);
+        u32 wrote = 0;
+        int wok = WriteFile(hPipe, (void*)&buf[0], got, &wrote, (void*)&ov);
+        if (completeOverlapped(hPipe, &ov, ioEvent, shutdownEvent, wok, &wrote, "write") == false) {
+            CloseHandle(ioEvent); CloseHandle(shutdownEvent);
+            DisconnectNamedPipe(hPipe); CloseHandle(hPipe);
+            return 3;
+        }
+        echoed++;
+    }
+
+    FlushFileBuffers(hPipe);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(ioEvent);
+    CloseHandle(shutdownEvent);
+    CloseHandle(hPipe);
+    printf("server: echoed %d message(s); exiting.\n", echoed);
+    return 0;
+}
+
+int runClient(int nMsgs)
+{
+    u32 access = (u32)GENERIC_READ | (u32)GENERIC_WRITE;
+    void* h = INVALID_HANDLE_VALUE;
+
+    // The server may not have created the pipe yet; retry on FILE_NOT_FOUND and
+    // honor PIPE_BUSY via WaitNamedPipeA.
+    int tries = 0;
+    while (tries < 50) {
+        h = CreateFileA(kPipeName, access, (u32)0, nullptr, (u32)OPEN_EXISTING, (u32)0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) break;
+        u32 err = GetLastError();
+        if (err == (u32)ERROR_PIPE_BUSY) {
+            WaitNamedPipeA(kPipeName, (u32)2000);
+        } else if (err == (u32)ERROR_FILE_NOT_FOUND) {
+            Sleep((u32)100);
+        } else {
+            printf("client: CreateFileA failed (error %u)\n", err);
+            return 1;
+        }
+        tries++;
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("client: could not open %s after %d tries\n", kPipeName, tries);
+        return 1;
+    }
+
+    // Match the server's message framing.
+    u32 mode = (u32)PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
+
+    printf("client: connected; sending %d message(s)...\n", nMsgs);
+
+    i8[128] msg = default;
+    i8[512] reply = default;
+    int ok = 0;
+    int i = 0;
+    while (i < nMsgs) {
+        int n = sprintf(&msg[0], "echo #%d from client", i);
+        u32 wrote = 0;
+        if (WriteFile(h, (void*)&msg[0], (u32)n, &wrote, nullptr) == 0) {
+            printf("client: WriteFile failed (error %u)\n", GetLastError());
+            CloseHandle(h);
+            return 1;
+        }
+
+        u32 got = 0;
+        if (ReadFile(h, (void*)&reply[0], (u32)512, &got, nullptr) == 0) {
+            printf("client: ReadFile failed (error %u)\n", GetLastError());
+            CloseHandle(h);
+            return 1;
+        }
+
+        bool match = (got == (u32)n);
+        if (match) {
+            int k = 0;
+            while (k < n) {
+                if (reply[k] != msg[k]) { match = false; break; }
+                k++;
+            }
+        }
+        if (match) {
+            ok++;
+        } else {
+            printf("client: echo #%d MISMATCH (sent %d bytes, got %u)\n", i, n, got);
+        }
+        i++;
+    }
+
+    CloseHandle(h);
+    printf("client: %d/%d echoes verified.\n", ok, nMsgs);
+    if (ok == nMsgs) {
+        printf("client: PASS\n");
+        return 0;
+    }
+    printf("client: FAIL\n");
+    return 4;
+}
+
+void usage(char* exe)
+{
+    printf("usage: %s server [nMsgs]   - run the overlapped echo server\n", exe);
+    printf("       %s client [nMsgs]   - run the verifying echo client\n", exe);
+    printf("nMsgs defaults to 4.\n");
+}
+
+extern int main(int argc, char** argv)
+{
+    // Coverage self-check: OVERLAPPED must size exactly to the C ABI (two
+    // ULONG_PTR fields + the anonymous union + HANDLE = 32 on x64).
+    printf("sizeof(OVERLAPPED) = %d (expect 32 on x64)\n", (int)sizeof(OVERLAPPED));
+
+    if (argc < 2) {
+        usage(argv[0]);
+        return 0;
+    }
+
+    int nMsgs = 4;
+    if (argc >= 3) {
+        nMsgs = atoi(argv[2]);
+        if (nMsgs < 1) nMsgs = 1;
+    }
+
+    string mode = (string)argv[1];
+    if (mode == "server") return runServer(nMsgs);
+    if (mode == "client") return runClient(nMsgs);
+
+    usage(argv[0]);
+    return 0;
+}

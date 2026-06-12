@@ -3775,16 +3775,47 @@ private:
             std::vector<BitfieldInfo> packedBitfields;
             bool anyBitfields = false;
             for (const auto& tv : fields) { if (tv.IsBitfield) { anyBitfields = true; break; } }
+            // Save the semantic field list (original names + CFlat-mapped types) before
+            // PackBitfields replaces individual bitfield entries with __bfN storage slots.
+            // Used only for per-field symbol registration below; skipped when there are no
+            // bitfields because fields itself is unchanged in that case.
+            std::vector<DeclTypeAndValue> prePackFields;
             if (anyBitfields)
+            {
+                prePackFields = fields;
                 fields = PackBitfields(fields, packedBitfields);
+            }
             if (r.isUnion)
                 CreateUnionType(r.name, fields);
             else
                 CreateStructType(r.name, fields, 0,
                     anyBitfields ? &packedBitfields : nullptr);
             if (auto* s = GetSymbolSink())
+            {
                 s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
                             (r.isUnion ? "union " : "struct ") + r.name);
+                // Register per-field symbols so --symbol detail and LSP hover list members.
+                // For bitfield records use prePackFields (semantic names before packing);
+                // for plain records fields itself is unchanged.
+                const auto& symFields = anyBitfields ? prePackFields : fields;
+                for (const auto& f : symFields)
+                {
+                    if (f.VariableName.empty()) continue;  // skip unnamed padding markers
+                    std::string annSig;
+                    for (uint64_t d : f.ConstInnerDimensions)
+                        annSig += "[" + std::to_string(d) + "] ";
+                    if (f.ConstArraySize > 0)
+                        annSig = "[" + std::to_string(f.ConstArraySize) + "] " + annSig;
+                    std::string typeSig = f.TypeName;
+                    if (f.Pointer) typeSig += "*";
+                    if (f.ElemPointer) typeSig += "*";
+                    std::string fieldSig = annSig + typeSig + " " + f.VariableName;
+                    if (f.IsBitfield && f.BitWidth > 0)
+                        fieldSig += ":" + std::to_string(f.BitWidth);
+                    s->Register(SymbolKind::Field, r.name + "." + f.VariableName,
+                                fileForLsp, r.line, 0, fieldSig);
+                }
+            }
         }
 
         if (verbose)
