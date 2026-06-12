@@ -38,6 +38,17 @@ extern int main()
     total++; passed += Test("WS_OVERLAPPEDWINDOW (cached)", (u32)WS_OVERLAPPEDWINDOW == 0x00CF0000u, true);
     total++; passed += Test("SW_SHOW (cached)", SW_SHOW, 5);
 
+    // Bitfields inside C11 anonymous members survive the disk-cache round-trip: the synthetic
+    // anonymous sub-record's bitfield side-table must serialize/deserialize so transparent
+    // access (PROCESS_MITIGATION_ASLR_POLICY.EnableHighEntropy, an offset bit) still resolves.
+    total++; passed += Test("sizeof(PROCESS_MITIGATION_ASLR_POLICY) (cached)", (int)sizeof(PROCESS_MITIGATION_ASLR_POLICY), 4);
+    PROCESS_MITIGATION_ASLR_POLICY aslr = default;
+    aslr.Flags = 0u;
+    aslr.EnableHighEntropy = 1u;  // bit 2
+    total++; passed += Test("ASLR transparent bitfield write -> Flags (cached)", (u32)aslr.Flags, 4u);
+    aslr.Flags = 0xFu;
+    total++; passed += Test("ASLR transparent bitfield read (cached)", (u32)aslr.DisallowStrippedImages, 1u);
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

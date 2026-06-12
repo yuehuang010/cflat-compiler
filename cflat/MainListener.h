@@ -9117,6 +9117,64 @@ public:
         return it == table.end() ? nullptr : &it->second;
     }
 
+    // Emit a bitfield READ from a storage word and return a fully-configured NamedVariable. The
+    // returned variable carries BitfieldStorage/Offset/Width/Unsigned so the assignment codegen
+    // (bitfieldAssign) can do the read-modify-write store on the WRITE path. This is the single
+    // source of truth for bitfield access masking/shift, shared by the normal member-access path
+    // and the transparent anonymous-member path (do not duplicate the mask/shift logic).
+    LLVMBackend::NamedVariable EmitBitfieldAccess(
+        LLVMBackend* compiler,
+        llvm::Value* storagePtr,
+        llvm::Type* storageTy,
+        const LLVMBackend::BitfieldInfo& bf,
+        const std::string& parentVariableName,
+        const std::string& owningStructName)
+    {
+        auto* word = compiler->CreateLoad(storageTy, storagePtr);
+        unsigned w = bf.BitWidth;
+        unsigned off = bf.BitOffset;
+        unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
+        bool isUnsigned = bf.IsUnsigned || bf.TypeName == "bool";
+        // Sign-aware extraction. Unsigned: (word >> off) & ((1<<w)-1). Signed: shift the
+        // bitfield's MSB up to the word MSB, then arithmetic-shift right to sign-extend.
+        llvm::Value* shifted;
+        if (isUnsigned)
+        {
+            auto* shr = compiler->builder->CreateLShr(word, llvm::ConstantInt::get(word->getType(), off));
+            uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+            shifted = compiler->builder->CreateAnd(shr, llvm::ConstantInt::get(word->getType(), mask));
+        }
+        else
+        {
+            unsigned leftShift = storageBits - w - off;
+            auto* shl = compiler->builder->CreateShl(word, llvm::ConstantInt::get(word->getType(), leftShift));
+            shifted = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(word->getType(), storageBits - w));
+        }
+
+        LLVMBackend::DeclTypeAndValue bfType{};
+        bfType.TypeName = bf.TypeName;
+        bfType.VariableName = bf.Name;
+        bfType.IsBitfield = true;
+        bfType.BitWidth = bf.BitWidth;
+        bfType.BitOffset = bf.BitOffset;
+        bfType.StorageFieldIndex = bf.StorageFieldIndex;
+
+        LLVMBackend::NamedVariable nv{};
+        nv.Primary = shifted;
+        nv.BaseType = shifted->getType();
+        nv.Storage = nullptr;  // bitfields have no addressable storage
+        nv.TypeAndValue = bfType;
+        nv.TypeAndValue.ParentVariableName = parentVariableName;
+        nv.OwningStructName = owningStructName;
+        nv.FieldName = bf.Name;
+        nv.BitfieldStorage = storagePtr;
+        nv.BitfieldStorageType = storageTy;
+        nv.BitfieldOffset = bf.BitOffset;
+        nv.BitfieldWidth = bf.BitWidth;
+        nv.BitfieldUnsigned = isUnsigned;
+        return nv;
+    }
+
     // C11 transparent anonymous-member access: resolve `base.fieldName` where `fieldName` is not
     // a direct field of `base` but lives inside an anonymous (synthetic "__anonN") struct/union
     // member - possibly nested. The C-interop extractor flattens a C11 anonymous member to a
@@ -9141,7 +9199,14 @@ public:
         // field indices from the top record down to (and including) the leaf field: every element
         // but the last is an anonymous-member index in its parent record; the last is the leaf
         // field's index in the deepest record.
+        // A bitfield declared inside an anonymous member lives in the inner record's Bitfield
+        // side-table (not StructFields, which only holds the synthetic `__bfN` storage slots).
+        // When the DFS resolves the leaf to a bitfield, `bitfieldHit` captures it (by value -
+        // GetDataStructure returns a copy, so a pointer into `inner` would dangle) and the leaf
+        // chain element is the storage slot's StructFields index.
         std::vector<int> chain;
+        bool isBitfieldHit = false;
+        LLVMBackend::BitfieldInfo bitfieldHit{};
         std::function<bool(const LLVMBackend::StructData&)> dfs =
             [&](const LLVMBackend::StructData& sd) -> bool
         {
@@ -9157,6 +9222,17 @@ public:
                     {
                         chain.push_back(i);
                         chain.push_back(k);
+                        return true;
+                    }
+                }
+                for (const auto& b : inner.Bitfields)
+                {
+                    if (b.Name == fieldName)
+                    {
+                        isBitfieldHit = true;
+                        bitfieldHit = b;
+                        chain.push_back(i);
+                        chain.push_back((int)b.StorageFieldIndex);
                         return true;
                     }
                 }
@@ -9181,6 +9257,24 @@ public:
                 ptr = compiler->CreateStructGEP(curType, ptr, (unsigned)chain[k]);
             curType = compiler->GetType(anonField);
             curSd = compiler->GetDataStructure(anonField.TypeName);
+        }
+
+        // Bitfield leaf: chain.back() is the storage-word slot in the deepest record. GEP to that
+        // word (union arms alias at offset 0; struct fields need a StructGEP) and reuse the shared
+        // bitfield codegen so the read masks/shifts and the write goes through bitfieldAssign.
+        if (isBitfieldHit)
+        {
+            const auto& storageField = curSd.StructFields[chain.back()];
+            auto* storageTy = compiler->GetType(storageField);
+            llvm::Value* storagePtr = curSd.IsUnion
+                ? ptr
+                : compiler->CreateStructGEP(curType, ptr, (unsigned)chain.back());
+            out = EmitBitfieldAccess(compiler, storagePtr, storageTy, bitfieldHit,
+                                     structVar.TypeAndValue.VariableName,
+                                     structVar.TypeAndValue.TypeName);
+            out.IsBorrowed = structVar.IsBorrowed;
+            out.BorrowedOrigin = structVar.BorrowedOrigin;
+            return true;
         }
 
         const auto& leafField = curSd.StructFields[chain.back()];
@@ -9502,52 +9596,11 @@ public:
                                 const auto& storageField = dataStructure.StructFields[bfHit->StorageFieldIndex];
                                 auto* storageTy = compiler->GetType(storageField);
                                 auto* storagePtr = compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, bfHit->StorageFieldIndex);
-                                auto* word = compiler->CreateLoad(storageTy, storagePtr);
-
-                                unsigned w = bfHit->BitWidth;
-                                unsigned off = bfHit->BitOffset;
-                                unsigned storageBits = (unsigned)word->getType()->getIntegerBitWidth();
-                                // Sign-aware extraction: ((word << (storageBits-w-off)) >> (storageBits-w))
-                                // works for both signed (arithmetic shift) and unsigned (logical shift).
-                                llvm::Value* shifted;
-                                if (bfHit->IsUnsigned || bfHit->TypeName == "bool")
-                                {
-                                    // word >> off  &  ((1<<w)-1)
-                                    auto* shr = compiler->builder->CreateLShr(word, llvm::ConstantInt::get(word->getType(), off));
-                                    uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
-                                    shifted = compiler->builder->CreateAnd(shr, llvm::ConstantInt::get(word->getType(), mask));
-                                }
-                                else
-                                {
-                                    // Signed: shift left to put the bitfield's MSB at the word MSB,
-                                    // then arithmetic shift right by (storageBits-w) to sign-extend.
-                                    unsigned leftShift = storageBits - w - off;
-                                    auto* shl = compiler->builder->CreateShl(word, llvm::ConstantInt::get(word->getType(), leftShift));
-                                    shifted = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(word->getType(), storageBits - w));
-                                }
-
-                                // Reconstruct a DeclTypeAndValue describing the bitfield as its declared type.
-                                LLVMBackend::DeclTypeAndValue bfType{};
-                                bfType.TypeName = bfHit->TypeName;
-                                bfType.VariableName = bfHit->Name;
-                                bfType.IsBitfield = true;
-                                bfType.BitWidth = bfHit->BitWidth;
-                                bfType.BitOffset = bfHit->BitOffset;
-                                bfType.StorageFieldIndex = bfHit->StorageFieldIndex;
-
-                                namedVar = {};
-                                namedVar.Primary = shifted;
-                                namedVar.BaseType = shifted->getType();
-                                namedVar.Storage = nullptr;  // bitfields have no addressable storage
-                                namedVar.TypeAndValue = bfType;
-                                namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
-                                namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
-                                namedVar.FieldName = primaryIdentifier;
-                                namedVar.BitfieldStorage = storagePtr;
-                                namedVar.BitfieldStorageType = storageTy;
-                                namedVar.BitfieldOffset = bfHit->BitOffset;
-                                namedVar.BitfieldWidth = bfHit->BitWidth;
-                                namedVar.BitfieldUnsigned = bfHit->IsUnsigned || bfHit->TypeName == "bool";
+                                // Shared read/write masking lives in EmitBitfieldAccess (single source
+                                // of truth; the transparent anonymous-member path uses it too).
+                                namedVar = EmitBitfieldAccess(compiler, storagePtr, storageTy, *bfHit,
+                                                              structVar.TypeAndValue.VariableName,
+                                                              structVar.TypeAndValue.TypeName);
                                 continue;
                             }
 
