@@ -1,10 +1,19 @@
-// A C-imported record the extractor had to abandon (INPUT_RECORD embeds an
-// anonymous union) registers as an unsized opaque shell. Declaring one by
-// value must be a clean diagnostic, not an LLVM module-verification failure.
+// A C-imported record the extractor still has to abandon registers as an unsized
+// opaque shell. Declaring one by value must be a clean diagnostic, not an LLVM
+// module-verification failure.
+//
+// userCLIPFORMAT (wtypes.h) embeds, by value, the MIDL/RPC wire-marshaling union
+// `union __MIDL_IWinTypes_0001 { DWORD dwValue; wchar_t* pwszName; } u;`. That
+// nested tagged union is one of the wtypes.h `__MIDL_IWinTypes_*` family the C
+// interop extractor cannot map, so it stays unsized and the enclosing record is
+// abandoned - exactly the incomplete-layout path this test guards. (The earlier
+// array-of-unnamed-struct case, RETRIEVAL_POINTERS_BUFFER.Extents[1], now imports
+// fine - see Test/test_windows.cb - so this test was repointed at a record that
+// remains genuinely unmappable.)
 import "windows.h" cache;
 
 extern int main()
 {
     expect_error("has an incomplete layout");
-    INPUT_RECORD rec = default;
+    userCLIPFORMAT rec = default;
 }

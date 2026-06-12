@@ -3592,6 +3592,23 @@ private:
         return true;
     }
 
+    // Render a "= value" suffix for a folded C integer constant's --symbol / hover
+    // signature, so the discoverable type carries its compile-time value too
+    // (GENERIC_READ is `u32 GENERIC_READ = 0x80000000`, not just `u32 GENERIC_READ`).
+    // Unsigned integer types render in hex masked to their width - the flag/mask idiom
+    // these constants almost always express; signed integer types render in decimal.
+    static std::string ConstIntValueSuffix(const std::string& typeName, long long value)
+    {
+        bool isUnsigned = !typeName.empty() && typeName[0] == 'u';  // u8/u16/u32/u64
+        if (isUnsigned)
+        {
+            unsigned bits = BitfieldStorageBits(typeName);
+            uint64_t mask = (bits == 0 || bits >= 64) ? ~0ull : ((1ull << bits) - 1);
+            return std::format(" = 0x{:x}", (uint64_t)value & mask);
+        }
+        return std::format(" = {}", value);
+    }
+
     // Register C enum constants as bare global int constants - matching C's flat enum
     // scope (the user writes CURLOPT_URL, not CURLoption.CURLOPT_URL). Built directly via
     // builder->getIntN to sidestep CreateConstant's stoi limitation on wide values.
@@ -3616,7 +3633,7 @@ private:
 
             if (auto* s = GetSymbolSink())
                 s->Register(SymbolKind::Variable, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col,
-                            tv.TypeName + " " + e.name);
+                            tv.TypeName + " " + e.name + ConstIntValueSuffix(tv.TypeName, e.value));
         }
         if (verbose)
             std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
@@ -3789,6 +3806,9 @@ private:
             TypeAndValue tv;
             tv.VariableName = m.name;
             llvm::Constant* c = nullptr;
+            // Compile-time value rendered into the --symbol / hover signature so the
+            // folded constant is discoverable at the use site (no defensive casts).
+            std::string valSuffix;
             if (m.isString)
             {
                 // String-literal macro (e.g. #define VERSION "1.2.3"). Intern the literal
@@ -3799,6 +3819,7 @@ private:
                 tv.Pointer  = true;
                 llvm::Value* strGv = CreateGlobalString(".cmacro." + m.name, m.stringValue);
                 c = llvm::cast<llvm::Constant>(strGv);
+                valSuffix = std::format(" = \"{}\"", m.stringValue);
             }
             else if (m.isFloat)
             {
@@ -3808,6 +3829,7 @@ private:
                 tv.TypeName = "double";
                 tv.Pointer  = false;
                 c = llvm::ConstantFP::get(builder->getDoubleTy(), m.floatValue);
+                valSuffix = std::format(" = {}", m.floatValue);
             }
             else if (m.isFuncPtr)
             {
@@ -3849,6 +3871,9 @@ private:
                 llvm::Type* i8Ptr = llvm::PointerType::get(*context, 0);
                 llvm::Constant* bits = builder->getInt64((uint64_t)m.value);
                 c = llvm::ConstantExpr::getIntToPtr(bits, i8Ptr);
+                // Sentinel pointers are bit patterns (INVALID_HANDLE_VALUE = -1); show
+                // the full 64-bit pattern in hex, matching how the C macro reads.
+                valSuffix = std::format(" = 0x{:x}", (uint64_t)m.value);
             }
             else if (!m.intTypeName.empty())
             {
@@ -3861,6 +3886,7 @@ private:
                 unsigned bits = BitfieldStorageBits(m.intTypeName);
                 c = llvm::ConstantInt::get(llvm::IntegerType::get(*context, bits),
                                            (uint64_t)m.value, /*isSigned*/ true);
+                valSuffix = ConstIntValueSuffix(tv.TypeName, m.value);
             }
             else
             {
@@ -3871,13 +3897,14 @@ private:
                 c = wide
                     ? static_cast<llvm::Constant*>(builder->getInt64((uint64_t)m.value))
                     : static_cast<llvm::Constant*>(builder->getInt32((uint32_t)(int32_t)m.value));
+                valSuffix = ConstIntValueSuffix(tv.TypeName, m.value);
             }
             CreateGlobalVariable(tv, c);
             ++registered;
 
             if (auto* s = GetSymbolSink())
                 s->Register(SymbolKind::Variable, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
-                            tv.TypeName + (tv.Pointer ? "* " : " ") + m.name);
+                            tv.TypeName + (tv.Pointer ? "* " : " ") + m.name + valSuffix);
         }
         if (verbose && !macros.empty())
             std::cout << "[verbose]   registered " << registered << " C macro constant(s) (of "
@@ -11110,7 +11137,13 @@ public:
         // still be missing the dependency structs). v4 caches the in-scope + dependency set.
         // v5 widened the in-scope filter to the Windows SDK shared/ sibling dir (ERROR_*,
         // MAX_PATH, ...), so a v4 entry would silently lack those constants.
-        if (version != 5) return false;
+        // v6 synthesizes a tag/record for a named field of an unnamed record type (the
+        // _LARGE_INTEGER `u` shape), so a v5 entry would still carry the unmappable
+        // "struct X::(unnamed at ...)" ctype that abandons the whole record.
+        // v7 extends that synthesis to an *array* of an unnamed record element
+        // (RETRIEVAL_POINTERS_BUFFER.Extents[1]); a v6 entry would still have dropped that
+        // field and left the enclosing record an incomplete shell.
+        if (version != 7) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -11169,7 +11202,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 5;
+        j["version"] = 7;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

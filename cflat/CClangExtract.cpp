@@ -310,7 +310,55 @@ namespace cflat_cinterop
 
                     RawField rf;
                     rf.name = f->getNameAsString();
-                    rf.ctype = CanonicalSpelling(ctx, f->getType());
+
+                    // Named field whose type is a *truly unnamed* (no tag, no typedef-for-linkage
+                    // name) record - the `_LARGE_INTEGER::u` shape: `struct { DWORD LowPart;
+                    // LONG HighPart; } u;`. Its canonical spelling is the unusable
+                    // "struct X::(unnamed at ...)" which MapCTypeToTypeAndValue rejects, abandoning
+                    // the whole record. Synthesize a tag and register the inner record (exactly like
+                    // the anonymous-member path), but keep the field's real name so the member is
+                    // reached via `o.u.LowPart`. This is distinct from a C11 anonymous member
+                    // (handled above): that injects its members transparently; this one does not.
+                    //
+                    // The same shape also occurs *inside an array*: RETRIEVAL_POINTERS_BUFFER has
+                    // `struct { LARGE_INTEGER NextVcn; LARGE_INTEGER Lcn; } Extents[1];`. Peel the
+                    // constant-array extents off first so the unnamed element record gets the same
+                    // synthetic tag, then re-append the `[N]...` suffix so RegisterCRecords lays it
+                    // out as an inline array of the synthetic record (exact C ABI size). The element
+                    // is still a named field, so access is `o.Extents[i].NextVcn` - non-transparent.
+                    std::string arrSuffix;
+                    QualType elemTy = f->getType();
+                    while (const ConstantArrayType* cat = ctx.getAsConstantArrayType(elemTy))
+                    {
+                        arrSuffix += "[" + std::to_string(cat->getSize().getZExtValue()) + "]";
+                        elemTy = cat->getElementType();
+                    }
+                    const RecordType* nrt = elemTy->getAs<RecordType>();
+                    const RecordDecl* nrd = nrt ? nrt->getDecl()->getDefinition() : nullptr;
+                    if (nrd && !nrd->getIdentifier() && !nrd->getTypedefNameForAnonDecl()
+                        && !nrd->isAnonymousStructOrUnion())
+                    {
+                        const int idx = anonIdx++;
+                        const std::string synTag = tag + "__anon" + std::to_string(idx);
+                        const bool isUnion = nrd->isUnion();
+
+                        RawRecord nested;
+                        nested.name = synTag;
+                        nested.isUnion = isUnion;
+                        nested.inScope = false;
+                        std::string nf; int nl = 1, nc = 0;
+                        if (LocOfRaw(nrd, nf, nl, nc)) { nested.file = nf; nested.line = nl; nested.col = nc; }
+                        CollectFields(nrd, synTag, nested);
+                        st.out.records.push_back(std::move(nested));
+
+                        rf.ctype = (isUnion ? "union " : "struct ") + synTag
+                                 + (arrSuffix.empty() ? std::string{} : " " + arrSuffix);
+                    }
+                    else
+                    {
+                        rf.ctype = CanonicalSpelling(ctx, f->getType());
+                    }
+
                     if (f->isBitField())
                     {
                         rf.isBitfield = true;

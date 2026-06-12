@@ -9117,6 +9117,114 @@ public:
         return it == table.end() ? nullptr : &it->second;
     }
 
+    // C11 transparent anonymous-member access: resolve `base.fieldName` where `fieldName` is not
+    // a direct field of `base` but lives inside an anonymous (synthetic "__anonN") struct/union
+    // member - possibly nested. The C-interop extractor flattens a C11 anonymous member to a
+    // synthetic "__anonN" sub-record (e.g. _LARGE_INTEGER's unnamed DUMMYSTRUCTNAME struct), so
+    // reaching `li.LowPart` means walking through `li.__anon0.LowPart`. Builds the chained
+    // GEP/load and returns an lvalue NamedVariable identical to the explicit form. Only "__anonN"
+    // members are searched (real named members like `u` are NOT transparent). Returns false
+    // (leaving `out` untouched) when no anonymous member exposes `fieldName`.
+    bool ResolveTransparentAnonField(
+        antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& structVar,
+        const std::string& fieldName,
+        LLVMBackend::NamedVariable& out)
+    {
+        auto* compiler = Compiler(ctx);
+        // Transparent access needs an addressable base to GEP through the anonymous member chain.
+        if (!structVar.Storage) return false;
+        auto* topStructTy = llvm::dyn_cast_or_null<llvm::StructType>(structVar.BaseType);
+        if (!topStructTy) return false;
+
+        // Depth-first search through anonymous (__anonN) members for `fieldName`. `chain` holds the
+        // field indices from the top record down to (and including) the leaf field: every element
+        // but the last is an anonymous-member index in its parent record; the last is the leaf
+        // field's index in the deepest record.
+        std::vector<int> chain;
+        std::function<bool(const LLVMBackend::StructData&)> dfs =
+            [&](const LLVMBackend::StructData& sd) -> bool
+        {
+            for (int i = 0; i < (int)sd.StructFields.size(); ++i)
+            {
+                const auto& f = sd.StructFields[i];
+                if (f.VariableName.rfind("__anon", 0) != 0) continue;  // only transparent members
+                const auto& inner = compiler->GetDataStructure(f.TypeName);
+                if (!inner.StructType) continue;
+                for (int k = 0; k < (int)inner.StructFields.size(); ++k)
+                {
+                    if (inner.StructFields[k].VariableName == fieldName)
+                    {
+                        chain.push_back(i);
+                        chain.push_back(k);
+                        return true;
+                    }
+                }
+                chain.push_back(i);
+                if (dfs(inner)) return true;
+                chain.pop_back();
+            }
+            return false;
+        };
+        if (!dfs(compiler->GetDataStructure(topStructTy)) || chain.empty())
+            return false;
+
+        // Walk the chain, advancing the base pointer through each anonymous-member hop. A union
+        // member sits at offset 0 (pointer unchanged); a struct member needs a StructGEP by index.
+        llvm::Value* ptr = structVar.Storage;
+        LLVMBackend::StructData curSd = compiler->GetDataStructure(topStructTy);
+        llvm::Type* curType = topStructTy;
+        for (size_t k = 0; k + 1 < chain.size(); ++k)
+        {
+            const auto& anonField = curSd.StructFields[chain[k]];
+            if (!curSd.IsUnion)
+                ptr = compiler->CreateStructGEP(curType, ptr, (unsigned)chain[k]);
+            curType = compiler->GetType(anonField);
+            curSd = compiler->GetDataStructure(anonField.TypeName);
+        }
+
+        const auto& leafField = curSd.StructFields[chain.back()];
+        auto* leafLLVMType = compiler->GetType(leafField);
+        out = {};
+        if (curSd.IsUnion)
+        {
+            // Leaf lives directly in an anonymous union arm: it aliases at offset 0.
+            out.Storage = ptr;
+            out.UnionFieldType = leafLLVMType;
+            if (llvm::isa<llvm::ArrayType>(leafLLVMType))
+            {
+                out.Primary = nullptr;
+                out.BaseType = leafLLVMType;
+            }
+            else
+            {
+                out.Primary = compiler->CreateLoad(leafLLVMType, ptr);
+                out.BaseType = out.Primary->getType();
+            }
+        }
+        else
+        {
+            out.Storage = compiler->CreateStructGEP(curType, ptr, (unsigned)chain.back());
+            if (llvm::isa<llvm::ArrayType>(leafLLVMType))
+            {
+                out.Primary = nullptr;
+                out.BaseType = leafLLVMType;
+            }
+            else
+            {
+                out.Primary = compiler->CreateLoad(out.Storage);
+                out.BaseType = out.Primary->getType();
+            }
+        }
+        out.TypeAndValue = leafField;
+        out.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+        out.OwningStructName = structVar.TypeAndValue.TypeName;
+        out.FieldName = fieldName;
+        out.IsBorrowed = structVar.IsBorrowed;
+        out.BorrowedOrigin = structVar.BorrowedOrigin;
+        return true;
+    }
+
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
@@ -9586,6 +9694,15 @@ public:
                             {
                                 // Not a field - could be a member function or an extension method template.
                                 namedVar = {};
+                            }
+                            else if (LLVMBackend::NamedVariable anonNV;
+                                     ResolveTransparentAnonField(ctx, structVar, primaryIdentifier, anonNV))
+                            {
+                                // C11 transparent anonymous-member access: the field lives inside an
+                                // anonymous (synthetic "__anonN") struct/union member of the base
+                                // (e.g. LARGE_INTEGER's LowPart/HighPart). Resolved as if written
+                                // base.__anonN.field.
+                                namedVar = anonNV;
                             }
                             else
                             {

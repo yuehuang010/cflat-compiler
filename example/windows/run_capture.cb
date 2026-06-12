@@ -1,0 +1,119 @@
+// run_capture: launch a child process and capture its stdout through an
+// anonymous pipe, echoing the captured bytes to our own stdout.
+//
+// This is a coverage exercise for cflat's `import "windows.h"` C-interop: every
+// Win32 struct (SECURITY_ATTRIBUTES, STARTUPINFOA, PROCESS_INFORMATION),
+// function (CreatePipe, CreateProcessA, ReadFile, ...) and constant
+// (STARTF_USESTDHANDLES, HANDLE_FLAG_INHERIT, STD_INPUT_HANDLE, INFINITE) used
+// below comes straight from the auto-extracted header surface - no hand-written
+// extern declarations for Win32 APIs.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/run_capture.cb -o out/run_capture.exe
+//   out\run_capture.exe cmd /c "echo hello"
+//   out\run_capture.exe cmd /c "exit 42"
+//   out\run_capture.exe cmd /c dir
+//   out\run_capture.exe --sizeof          (prints struct sizes and exits)
+import "windows.h" cache;
+import "string.cb";
+
+// Join argv[1..] into a single command line. Any argument containing a space is
+// re-quoted so e.g. `cmd /c "echo a b"` survives the round-trip.
+string buildCommandLine(int argc, char** argv)
+{
+    stringbuilder sb;
+    int i = 1;
+    while (i < argc) {
+        if (i > 1) sb.appendChar((i8)' ');
+        char* arg = argv[i];
+        bool hasSpace = strchr(arg, (int)' ') != nullptr;
+        if (hasSpace) sb.appendChar((i8)'"');
+        sb.appendCStr(arg);
+        if (hasSpace) sb.appendChar((i8)'"');
+        i++;
+    }
+    string result = (string)sb.data();   // owned copy of the assembled bytes
+    return result;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        printf("Usage: run_capture <command> [args...]\n");
+        printf("       run_capture --sizeof\n");
+        return 1;
+    }
+
+    // Diagnostic mode: verify the auto-extracted struct sizes match the C ABI.
+    if ((string)argv[1] == "--sizeof") {
+        printf("sizeof(SECURITY_ATTRIBUTES) = %d (expect 24)\n", (int)sizeof(SECURITY_ATTRIBUTES));
+        printf("sizeof(STARTUPINFOA)        = %d (expect 104)\n", (int)sizeof(STARTUPINFOA));
+        printf("sizeof(PROCESS_INFORMATION) = %d (expect 24)\n", (int)sizeof(PROCESS_INFORMATION));
+        return 0;
+    }
+
+    string cmdline = buildCommandLine(argc, argv);
+
+    // Inheritable pipe: the child writes to hWrite, we read from hRead.
+    SECURITY_ATTRIBUTES sa = default;
+    sa.nLength = (u32)sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = 1;            // TRUE
+    sa.lpSecurityDescriptor = nullptr;
+
+    void* hRead = nullptr;
+    void* hWrite = nullptr;
+    if (CreatePipe(&hRead, &hWrite, &sa, 0u) == 0) {
+        printf("CreatePipe failed (error %u)\n", GetLastError());
+        return 1;
+    }
+
+    // Keep our read end out of the child's inherited handle set.
+    if (SetHandleInformation(hRead, (u32)HANDLE_FLAG_INHERIT, 0u) == 0) {
+        printf("SetHandleInformation failed (error %u)\n", GetLastError());
+        return 1;
+    }
+
+    STARTUPINFOA si = default;
+    si.cb = (u32)sizeof(STARTUPINFOA);
+    si.dwFlags = (u32)STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+    si.hStdInput = GetStdHandle((u32)STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi = default;
+
+    // bInheritHandles = TRUE so the child inherits hWrite (and the std handles).
+    if (CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, 1,
+                       0u, nullptr, nullptr, &si, &pi) == 0) {
+        printf("CreateProcessA failed (error %u)\n", GetLastError());
+        CloseHandle(hRead);
+        CloseHandle(hWrite);
+        return 1;
+    }
+
+    // Critical: drop the parent's copy of the write end. While it stays open,
+    // ReadFile below would never see a broken pipe and would block forever.
+    CloseHandle(hWrite);
+
+    // Drain the pipe until the child closes its write end (ReadFile -> FALSE).
+    i8[4096] buf = default;
+    u32 got = 0;
+    while (ReadFile(hRead, &buf[0], 4096u, &got, nullptr) != 0) {
+        if (got == 0u) break;
+        putn(&buf[0], (int)got);
+    }
+
+    WaitForSingleObject(pi.hProcess, (u32)INFINITE);
+
+    u32 code = 0;
+    if (GetExitCodeProcess(pi.hProcess, &code) == 0) {
+        printf("GetExitCodeProcess failed (error %u)\n", GetLastError());
+        code = 1u;
+    }
+
+    CloseHandle(hRead);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return (int)code;
+}

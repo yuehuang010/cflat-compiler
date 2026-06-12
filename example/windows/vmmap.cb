@@ -1,0 +1,175 @@
+// vmmap: an address-space walker for the current process (a tiny VMMap clone).
+//
+// Walks the user-mode virtual address space of the current process with
+// VirtualQueryEx, printing one line per memory region: base address, size,
+// state (committed/reserved/free), page protection, and type (image/mapped/
+// private). Runs of free regions are collapsed to keep the output readable.
+// Ends with totals and a set of self-validation checks.
+//
+// This is a coverage exercise for cflat's `import "windows.h"` C-interop. The
+// headline probe is MEMORY_BASIC_INFORMATION: it mixes pointer-width members
+// (PVOID BaseAddress/AllocationBase, SIZE_T RegionSize - all 8 bytes on x64)
+// with DWORD/WORD members, so it exercises 8-byte struct-member correctness and
+// the WORD member's padding. sizeof must be 48 on x64. The other probe is
+// pointer arithmetic on opaque addresses: advancing the cursor by RegionSize
+// when BaseAddress is a void*.
+//
+// Every Win32 function, struct and constant used below comes straight from the
+// auto-extracted header surface - no hand-written externs.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/vmmap.cb -o out/vmmap.exe
+//   out\vmmap.exe
+import "windows.h" cache;
+import "string.cb";
+
+// Decode the State field to a short fixed-width label.
+char* stateText(u32 state)
+{
+    if ((state & (u32)MEM_COMMIT) != 0u)  return "COMMIT ";
+    if ((state & (u32)MEM_RESERVE) != 0u) return "RESERVE";
+    if ((state & (u32)MEM_FREE) != 0u)    return "FREE   ";
+    return "?      ";
+}
+
+// Decode the Type field. Free regions have no type.
+char* typeText(u32 state, u32 type)
+{
+    if ((state & (u32)MEM_FREE) != 0u)    return "-      ";
+    if ((type & (u32)MEM_IMAGE) != 0u)    return "IMAGE  ";
+    if ((type & (u32)MEM_MAPPED) != 0u)   return "MAPPED ";
+    if ((type & (u32)MEM_PRIVATE) != 0u)  return "PRIVATE";
+    return "?      ";
+}
+
+// Decode the Protect field. The base access bits are mutually exclusive; the
+// PAGE_GUARD / PAGE_NOCACHE / PAGE_WRITECOMBINE bits are modifiers OR'd on top.
+string protectText(u32 protect)
+{
+    if (protect == 0u) return "-";
+
+    u32 guard = protect & (u32)PAGE_GUARD;
+    u32 nocache = protect & (u32)PAGE_NOCACHE;
+    u32 base = protect & ~((u32)PAGE_GUARD | (u32)PAGE_NOCACHE | (u32)PAGE_WRITECOMBINE);
+
+    string s = "?";
+    if (base == (u32)PAGE_NOACCESS)               s = "NOACCESS";
+    else if (base == (u32)PAGE_READONLY)          s = "R--";
+    else if (base == (u32)PAGE_READWRITE)         s = "RW-";
+    else if (base == (u32)PAGE_WRITECOPY)         s = "RWC";
+    else if (base == (u32)PAGE_EXECUTE)           s = "--X";
+    else if (base == (u32)PAGE_EXECUTE_READ)      s = "R-X";
+    else if (base == (u32)PAGE_EXECUTE_READWRITE) s = "RWX";
+    else if (base == (u32)PAGE_EXECUTE_WRITECOPY) s = "RWCX";
+
+    if (guard != 0u)   s = s + "+G";
+    if (nocache != 0u) s = s + "+NC";
+    return s;
+}
+
+extern int main()
+{
+    // A local on the stack; the walker must later find this address inside a
+    // committed, private region. Captured as a u64 before the walk.
+    int marker = 0xC0FFEE;
+    u64 markerAddr = (u64)&marker;
+
+    // Coverage probe: MEMORY_BASIC_INFORMATION must size to 48 bytes on x64
+    // (PVOID*2 + DWORD + WORD(+pad) + SIZE_T + DWORD*3).
+    int mbiSize = (int)sizeof(MEMORY_BASIC_INFORMATION);
+    printf("sizeof(MEMORY_BASIC_INFORMATION) = %d (expect 48 on x64)\n\n", mbiSize);
+
+    void* hProc = GetCurrentProcess();
+
+    printf("%-18s %-12s %-8s %-8s %-9s\n",
+           "BASE", "SIZE", "STATE", "TYPE", "PROTECT");
+    printf("%-18s %-12s %-8s %-8s %-9s\n",
+           "----", "----", "-----", "----", "-------");
+
+    u64 addr = (u64)0;
+    u64 totalCommit = (u64)0;
+    u64 totalReserve = (u64)0;
+    u64 totalFree = (u64)0;
+    int regionCount = 0;
+
+    // Self-validation accumulators.
+    bool tileOk = true;          // each base == previous base + previous size
+    bool alignOk = true;         // every RegionSize nonzero and 4096-aligned
+    bool markerFound = false;    // marker lands in a COMMIT + PRIVATE region
+    u64 expectedNext = (u64)0;   // where the next region must start
+
+    // Collapse consecutive MEM_FREE regions into a single printed line.
+    bool inFreeRun = false;
+    u64 freeRunBase = (u64)0;
+    u64 freeRunSize = (u64)0;
+
+    MEMORY_BASIC_INFORMATION mbi = default;
+    while (VirtualQueryEx(hProc, (void*)addr, (void*)&mbi, (u64)sizeof(MEMORY_BASIC_INFORMATION)) != (u64)0) {
+        u64 base = (u64)mbi.BaseAddress;
+        u64 size = mbi.RegionSize;
+        u32 state = mbi.State;
+        u32 type = mbi.Type;
+        u32 protect = mbi.Protect;
+
+        // Tiling: this region must start exactly where the last one ended.
+        if (regionCount > 0 && base != expectedNext) tileOk = false;
+        // Alignment: nonzero and a multiple of the 4 KiB page size.
+        if (size == (u64)0 || (size & (u64)4095) != (u64)0) alignOk = false;
+
+        if ((state & (u32)MEM_COMMIT) != 0u)  totalCommit = totalCommit + size;
+        if ((state & (u32)MEM_RESERVE) != 0u) totalReserve = totalReserve + size;
+        if ((state & (u32)MEM_FREE) != 0u)    totalFree = totalFree + size;
+
+        // Does our stack marker live in this region? It should be COMMIT+PRIVATE.
+        if (markerAddr >= base && markerAddr < base + size) {
+            bool committed = (state & (u32)MEM_COMMIT) != 0u;
+            bool privatePage = (type & (u32)MEM_PRIVATE) != 0u;
+            if (committed && privatePage) markerFound = true;
+        }
+
+        bool isFree = (state & (u32)MEM_FREE) != 0u;
+        if (isFree) {
+            // Accumulate the free run; emit it when a non-free region arrives.
+            if (!inFreeRun) {
+                inFreeRun = true;
+                freeRunBase = base;
+                freeRunSize = (u64)0;
+            }
+            freeRunSize = freeRunSize + size;
+        } else {
+            if (inFreeRun) {
+                printf("%016llX   %10llu  %-8s %-8s %-9s\n",
+                       freeRunBase, freeRunSize, "FREE   ", "-      ", "-");
+                inFreeRun = false;
+            }
+            string prot = protectText(protect);
+            printf("%016llX   %10llu  %-8s %-8s %-9s\n",
+                   base, size, stateText(state), typeText(state, type), prot.data());
+        }
+
+        regionCount = regionCount + 1;
+        expectedNext = base + size;
+        addr = base + size;
+    }
+    if (inFreeRun) {
+        printf("%016llX   %10llu  %-8s %-8s %-9s\n",
+               freeRunBase, freeRunSize, "FREE   ", "-      ", "-");
+    }
+
+    printf("\n");
+    printf("regions:   %d\n", regionCount);
+    printf("committed: %llu bytes (%llu MiB)\n", totalCommit, totalCommit / (u64)1048576);
+    printf("reserved:  %llu bytes (%llu MiB)\n", totalReserve, totalReserve / (u64)1048576);
+    printf("free:      %llu bytes (%llu MiB)\n", totalFree, totalFree / (u64)1048576);
+
+    printf("\nself-validation:\n");
+    bool sizeOk = mbiSize == 48;
+    printf("  [%s] sizeof(MEMORY_BASIC_INFORMATION) == 48\n", sizeOk ? "PASS" : "FAIL");
+    printf("  [%s] regions tile the address space (no gaps/overlaps)\n", tileOk ? "PASS" : "FAIL");
+    printf("  [%s] every RegionSize nonzero and 4096-aligned\n", alignOk ? "PASS" : "FAIL");
+    printf("  [%s] stack marker found in a COMMIT+PRIVATE region\n", markerFound ? "PASS" : "FAIL");
+
+    bool allOk = sizeOk && tileOk && alignOk && markerFound && regionCount > 0;
+    printf("\n%s\n", allOk ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED");
+    return allOk ? 0 : 1;
+}

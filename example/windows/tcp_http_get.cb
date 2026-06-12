@@ -1,0 +1,169 @@
+// tcp_http_get: a minimal blocking TCP/HTTP-1.0 client for Windows.
+//
+// Resolves a host with getaddrinfo, opens a TCP socket, sends a bare HTTP/1.0
+// GET, and streams the raw response (status line, headers, body) to stdout.
+//
+// This is a coverage exercise for cflat's C-header interop against the WINSOCK
+// header family - the first probe outside windows.h proper. Every socket struct
+// (WSADATA, sockaddr_in, in_addr, addrinfo), function (WSAStartup, getaddrinfo,
+// socket, connect, send, recv, htons, ...) and constant used below comes straight
+// from the auto-extracted header surface - no hand-written extern declarations.
+//
+// The import binds the winsock header family and links ws2_32 via the inline
+// `lib` clause (no --c-lib needed - a bare system lib name passes through to
+// lld-link, which finds it on the SDK lib dir cflat discovered for the header).
+// ws2tcpip.h self-includes winsock2.h in this SDK, but the grouped form is used
+// to express the documented prerequisite explicitly and stays robust if an older
+// SDK splits them.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/tcp_http_get.cb -o out/tcp_http_get.exe
+//   out\tcp_http_get.exe                       (defaults: example.com /)
+//   out\tcp_http_get.exe example.com /
+//   out\tcp_http_get.exe neverdns.invalid /    (failure path - clean error, exit 1)
+//   out\tcp_http_get.exe --probe               (prints the struct-size diagnostic)
+import {"winsock2.h", "ws2tcpip.h"} lib "ws2_32.lib" cache;
+import "string.cb";
+
+// Winsock numeric constants. AF_INET / SOCK_STREAM / IPPROTO_TCP all fold to
+// `int` from the header, but spelling them here keeps the call sites readable and
+// lets the diagnostic mode run without resolving anything.
+const int kAfInet = 2;       // AF_INET
+const int kSockStream = 1;   // SOCK_STREAM
+const int kIpprotoTcp = 6;   // IPPROTO_TCP
+
+extern int main(int argc, char** argv)
+{
+    // Diagnostic mode: confirm the auto-extracted struct sizes match the C ABI.
+    // WSADATA is the headline probe - it embeds fixed-size char arrays
+    // (szDescription[257], szSystemStatus[129]), which the importer lays out
+    // inline, so sizeof must be exact (408 on x64).
+    if (argc >= 2 && (string)argv[1] == "--probe") {
+        printf("sizeof(WSADATA)     = %d (expect 408)\n", (int)sizeof(WSAData));
+        printf("sizeof(sockaddr_in) = %d (expect 16)\n", (int)sizeof(sockaddr_in));
+        printf("sizeof(sockaddr)    = %d (expect 16)\n", (int)sizeof(sockaddr));
+        printf("sizeof(in_addr)     = %d (expect 4)\n", (int)sizeof(in_addr));
+        printf("sizeof(addrinfo)    = %d (expect 48)\n", (int)sizeof(addrinfo));
+        return 0;
+    }
+
+    char* host = "example.com";
+    char* path = "/";
+    if (argc >= 2) host = argv[1];
+    if (argc >= 3) path = argv[2];
+
+    // WSAStartup wants MAKEWORD(2,2). MAKEWORD is a function-like macro, so it
+    // does NOT fold to a constant in C interop - we compute the request word
+    // (0x0202 = version 2.2) by hand. WSADATA imports by value despite its
+    // fixed-size char-array fields; its PWSADATA out-param collapsed to void*, so
+    // we hand it the address with a (void*) cast (same idiom as GetFileSizeEx).
+    WSAData wsa = default;
+    int startup = WSAStartup((u16)0x0202, (void*)&wsa);
+    if (startup != 0) {
+        printf("WSAStartup failed (%d)\n", startup);
+        return 1;
+    }
+
+    // Resolve the host with getaddrinfo (the addrinfo struct is self-referential
+    // via ai_next, and ai_addr is a sockaddr* - both extract cleanly). Pass port
+    // 80 as the service string so the resolved sockaddr is fully formed; we still
+    // build our own sockaddr_in below to exercise htons + the cast.
+    addrinfo hints = default;
+    hints.ai_family = kAfInet;
+    hints.ai_socktype = kSockStream;
+    hints.ai_protocol = kIpprotoTcp;
+
+    addrinfo* resolved = nullptr;
+    int gai = getaddrinfo(host, "80", (void*)&hints, (void*)&resolved);
+    if (gai != 0) {
+        // getaddrinfo returns the WSA error code directly; mirror it via
+        // WSAGetLastError for parity with the rest of the failure paths.
+        printf("getaddrinfo('%s') failed (%d, WSA error %d)\n", host, gai, WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+
+    // Pull the resolved IPv4 address out of the first result. ai_addr is a
+    // sockaddr*; for an AF_INET result it really points at a sockaddr_in, so we
+    // cast it to read the 4-byte network-order address out of the nested union.
+    sockaddr_in* resolvedIn = (sockaddr_in*)resolved.ai_addr;
+    u32 netAddr = resolvedIn.sin_addr.S_un.S_addr;
+    u8* ipBytes = (u8*)&netAddr;
+    printf("resolved %s -> %u.%u.%u.%u\n", host,
+           (u32)ipBytes[0], (u32)ipBytes[1], (u32)ipBytes[2], (u32)ipBytes[3]);
+
+    freeaddrinfo((void*)resolved);
+
+    // socket() returns a SOCKET (u64). INVALID_SOCKET folds to a u64 ((SOCKET)~0),
+    // so it compares directly.
+    u64 sock = socket(kAfInet, kSockStream, kIpprotoTcp);
+    if (sock == INVALID_SOCKET) {
+        printf("socket() failed (WSA error %d)\n", WSAGetLastError());
+        WSACleanup();
+        return 1;
+    }
+
+    // Build the destination address by hand. htons resolved as a real callable
+    // function (u16 htons(u16)) in this SDK - not an inlined macro - so the
+    // host-to-network byte swap of the port is a plain call. sin_addr's value is
+    // already network order, copied straight from the resolved result.
+    sockaddr_in dest = default;
+    dest.sin_family = (i16)kAfInet;
+    dest.sin_port = htons((u16)80);
+    dest.sin_addr.S_un.S_addr = netAddr;
+
+    // connect takes a (sockaddr*); the parameter collapsed to void* in the C ABI,
+    // so the sockaddr_in -> sockaddr cast is just (void*)&dest.
+    if (connect(sock, (void*)&dest, (int)sizeof(sockaddr_in)) == SOCKET_ERROR) {
+        printf("connect to %s:80 failed (WSA error %d)\n", host, WSAGetLastError());
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    // Assemble and send a minimal HTTP/1.0 request. Connection: close tells the
+    // server to drop the socket when done, so our recv loop terminates on a clean
+    // zero-length read.
+    stringbuilder sb;
+    sb.appendCStr("GET ");
+    sb.appendCStr(path);
+    sb.appendCStr(" HTTP/1.0\r\nHost: ");
+    sb.appendCStr(host);
+    sb.appendCStr("\r\nConnection: close\r\n\r\n");
+    string request = (string)sb.data();
+
+    int reqLen = (int)request.length();
+    int sent = send(sock, request.data(), reqLen, 0);
+    if (sent == SOCKET_ERROR) {
+        printf("send failed (WSA error %d)\n", WSAGetLastError());
+        closesocket(sock);
+        WSACleanup();
+        return 1;
+    }
+
+    // Drain the response. recv returns 0 on a graceful close and SOCKET_ERROR
+    // (-1) on failure; anything positive is a byte count we echo verbatim.
+    i8[4096] buf = default;
+    int total = 0;
+    while (true) {
+        int got = recv(sock, &buf[0], 4096, 0);
+        if (got == 0) break;                 // peer closed - done
+        if (got == SOCKET_ERROR) {
+            printf("\nrecv failed (WSA error %d)\n", WSAGetLastError());
+            closesocket(sock);
+            WSACleanup();
+            return 1;
+        }
+        putn(&buf[0], got);
+        total = total + got;
+    }
+
+    closesocket(sock);
+    WSACleanup();
+
+    if (total == 0) {
+        printf("(no data received)\n");
+        return 1;
+    }
+    return 0;
+}

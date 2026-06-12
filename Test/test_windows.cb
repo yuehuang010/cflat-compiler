@@ -132,6 +132,56 @@ extern int main()
     CloseHandle(snap);
     total++; passed += Test("Process32First/Next enumerated processes", procCount > 0, true);
 
+    // LARGE_INTEGER / ULARGE_INTEGER: a union whose members include an unnamed (C11 anonymous)
+    // nested struct `struct { DWORD LowPart; LONG HighPart; }`. The C-interop extractor flattens
+    // the anonymous member into a synthetic sub-record; field access resolves LowPart/HighPart
+    // transparently (C11 semantics), so QuadPart and the Low/High halves overlay at the right
+    // offsets. Before the fix the named member 'u' (a field of the same unnamed struct type) made
+    // the mapper abandon the whole union, leaving it incomplete and cascading to every struct that
+    // embeds it by value (QUOTA_LIMITS, TOKEN_STATISTICS, ...).
+    total++; passed += Test("sizeof(LARGE_INTEGER)", (int)sizeof(LARGE_INTEGER), 8);
+    LARGE_INTEGER li = default;
+    li.QuadPart = 0x1122334455667788;
+    total++; passed += Test("LARGE_INTEGER.LowPart overlay (transparent)", (u32)li.LowPart == 0x55667788u, true);
+    total++; passed += Test("LARGE_INTEGER.HighPart overlay (transparent)", (int)li.HighPart, 0x11223344);
+    // The named member 'u' (same unnamed struct type) is reached non-transparently as `li.u.field`.
+    total++; passed += Test("LARGE_INTEGER.u.LowPart (named member of unnamed type)", (u32)li.u.LowPart == 0x55667788u, true);
+    // Writing a transparent half mutates the overlapping QuadPart bytes.
+    li.LowPart = 0xDEADBEEFu;
+    total++; passed += Test("LARGE_INTEGER half write aliases QuadPart", (u32)li.QuadPart == 0xDEADBEEFu, true);
+
+    total++; passed += Test("sizeof(ULARGE_INTEGER)", (int)sizeof(ULARGE_INTEGER), 8);
+    ULARGE_INTEGER uli = default;
+    uli.QuadPart = 0x99AABBCCDDEEFF00;
+    total++; passed += Test("ULARGE_INTEGER.LowPart overlay (transparent)", (u32)uli.LowPart == 0xDDEEFF00u, true);
+    total++; passed += Test("ULARGE_INTEGER.HighPart overlay (transparent)", (u32)uli.HighPart == 0x99AABBCCu, true);
+
+    // By-value embedding now sizes correctly (was a dropped record before the fix): QUOTA_LIMITS is
+    // five SIZE_T fields (5*8) plus a LARGE_INTEGER (8) = 48.
+    total++; passed += Test("sizeof(QUOTA_LIMITS) embeds LARGE_INTEGER", (int)sizeof(QUOTA_LIMITS), 48);
+
+    // Array of an *unnamed* struct (winioctl.h RETRIEVAL_POINTERS_BUFFER):
+    //   DWORD ExtentCount; LARGE_INTEGER StartingVcn;
+    //   struct { LARGE_INTEGER NextVcn; LARGE_INTEGER Lcn; } Extents[1];
+    // The unnamed element record is synthesized into a `<tag>__anonN` sub-record and the field is
+    // laid out as an inline array of it, so the C ABI size is exact: 4 (DWORD) + 4 pad + 8
+    // (StartingVcn) + 16 (one {LARGE_INTEGER, LARGE_INTEGER} element) = 32. Before the fix the
+    // array-of-unnamed-struct field was dropped and the whole record left an incomplete shell.
+    total++; passed += Test("sizeof(RETRIEVAL_POINTERS_BUFFER) array-of-unnamed-struct",
+                            (int)sizeof(RETRIEVAL_POINTERS_BUFFER), 32);
+    RETRIEVAL_POINTERS_BUFFER rpb = default;
+    rpb.ExtentCount = 1u;
+    // Write/read a field of the synthetic array element (also exercises a LARGE_INTEGER nested
+    // INSIDE the synthetic sub-record).
+    rpb.Extents[0].NextVcn.QuadPart = 0x1122334455667788;
+    total++; passed += Test("RETRIEVAL_POINTERS_BUFFER.Extents[0].NextVcn.QuadPart",
+                            (u64)rpb.Extents[0].NextVcn.QuadPart == 0x1122334455667788u, true);
+    // Transparent C11 overlay still resolves on the LARGE_INTEGER nested in the array element:
+    // Lcn.LowPart is the low 32 bits of Lcn.QuadPart.
+    rpb.Extents[0].Lcn.QuadPart = 0x00000000DEADBEEF;
+    total++; passed += Test("RETRIEVAL_POINTERS_BUFFER.Extents[0].Lcn.LowPart (transparent overlay)",
+                            (u32)rpb.Extents[0].Lcn.LowPart == 0xDEADBEEFu, true);
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

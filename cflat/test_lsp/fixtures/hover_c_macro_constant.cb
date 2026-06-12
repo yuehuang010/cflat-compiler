@@ -1,0 +1,4 @@
+// $cursor line=1 col=36
+// $expect hover contains="0x80000000"
+import "windows.h";
+extern int main() { u32 access = GENERIC_READ; return (int)access; }

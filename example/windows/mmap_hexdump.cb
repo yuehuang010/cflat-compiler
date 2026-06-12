@@ -1,0 +1,157 @@
+// mmap_hexdump: a memory-mapped-file hexdump utility for Windows.
+//
+// Opens a file with CreateFileA, queries its size via GetFileSizeEx, maps it into
+// memory with CreateFileMapping/MapViewOfFile, and prints a classic 16-byte-per-row
+// hexdump with an ASCII gutter.
+//
+// This is a coverage exercise for cflat's `import "windows.h"` C-interop. The
+// headline probe is UNION handling via LARGE_INTEGER (an i64 QuadPart overlaying a
+// {u32 LowPart, i32 HighPart} pair). LARGE_INTEGER imports correctly: its unnamed
+// (C11 anonymous) nested struct is flattened so LowPart/HighPart are reached
+// transparently (li.LowPart), and the whole union sizes to 8 bytes. GetFileSizeEx is
+// handed a real LARGE_INTEGER (its PLARGE_INTEGER parameter collapses to void* in the
+// C ABI, so the address is passed with a (void*) cast).
+//
+// Every Win32 function, constant and the INVALID_HANDLE_VALUE pseudo-handle macro
+// used below comes straight from the auto-extracted header surface - no hand-written
+// externs.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/windows/mmap_hexdump.cb -o out/mmap_hexdump.exe
+//   out\mmap_hexdump.exe somefile.txt
+//   out\mmap_hexdump.exe somefile.bin 64
+//   out\mmap_hexdump.exe --probe            (prints the union-overlay diagnostic)
+import "windows.h" cache;
+import "string.cb";
+
+// Print one hexdump row: an 8-digit offset, up to 16 hex bytes, then the ASCII
+// gutter (printable chars verbatim, everything else as '.').
+void dumpRow(u8* base, i64 offset, int rowLen)
+{
+    printf("%08X  ", (u32)offset);
+
+    int i = 0;
+    while (i < 16) {
+        if (i < rowLen) {
+            u8 b = base[offset + (i64)i];
+            printf("%02X ", (u32)b);
+        } else {
+            printf("   ");
+        }
+        if (i == 7) printf(" ");      // gap between the two 8-byte halves
+        i++;
+    }
+
+    printf(" |");
+    i = 0;
+    while (i < rowLen) {
+        u8 b = base[offset + (i64)i];
+        if (b >= (u8)32 && b < (u8)127) {
+            putchar((int)b);
+        } else {
+            putchar((int)'.');
+        }
+        i++;
+    }
+    printf("|\n");
+}
+
+extern int main(int argc, char** argv)
+{
+    // Diagnostic: LARGE_INTEGER imports as a real union. Set QuadPart and read the
+    // overlapping Low/High halves transparently through the flattened anonymous member.
+    if (argc >= 2 && (string)argv[1] == "--probe") {
+        LARGE_INTEGER q = default;
+        q.QuadPart = 0x1122334455667788;
+        printf("LARGE_INTEGER union imported (nested anonymous struct flattened).\n");
+        printf("QuadPart/LowPart/HighPart overlay (sizeof=%d):\n", (int)sizeof(LARGE_INTEGER));
+        printf("  QuadPart = 0x%016llX\n", q.QuadPart);
+        printf("  LowPart  = 0x%08X (expect 55667788)\n", q.LowPart);
+        printf("  HighPart = 0x%08X (expect 11223344)\n", (u32)q.HighPart);
+        return 0;
+    }
+
+    if (argc < 2) {
+        printf("Usage: mmap_hexdump <file> [max_bytes]\n");
+        printf("       mmap_hexdump --probe\n");
+        return 1;
+    }
+
+    char* path = argv[1];
+    i64 maxBytes = (i64)256;
+    if (argc >= 3) {
+        maxBytes = (i64)atoi(argv[2]);
+        if (maxBytes < (i64)0) maxBytes = (i64)0;
+    }
+
+    void* hFile = CreateFileA(path, (u32)GENERIC_READ, (u32)FILE_SHARE_READ,
+                              nullptr, (u32)OPEN_EXISTING, (u32)FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        printf("CreateFileA('%s') failed (error %u)\n", path, GetLastError());
+        return 1;
+    }
+
+    // GetFileSizeEx wants a PLARGE_INTEGER, which C interop collapsed to void*; hand it
+    // a real LARGE_INTEGER by address. The Low/High halves overlay QuadPart via the
+    // flattened anonymous member, so reading them back confirms the C-ABI union layout.
+    LARGE_INTEGER sizeLi = default;
+    if (GetFileSizeEx(hFile, (void*)&sizeLi) == 0) {
+        printf("GetFileSizeEx failed (error %u)\n", GetLastError());
+        CloseHandle(hFile);
+        return 1;
+    }
+    i64 fileSize = sizeLi.QuadPart;
+    u32 lowPart = sizeLi.LowPart;
+    i32 highPart = sizeLi.HighPart;
+    i64 recombined = ((i64)((u32)highPart) << (i64)32) | (i64)lowPart;
+    printf("file: %s\n", path);
+    printf("size: %lld bytes  (LowPart=%u, HighPart=%d, recombined=%lld)\n",
+           fileSize, lowPart, highPart, recombined);
+    if (recombined != fileSize) {
+        printf("WARNING: Low/High halves do NOT overlay the i64 size!\n");
+    }
+
+    if (fileSize == (i64)0) {
+        // CreateFileMappingA fails on a zero-length file; nothing to dump.
+        printf("(empty file - nothing to dump)\n");
+        CloseHandle(hFile);
+        return 0;
+    }
+
+    void* hMap = CreateFileMappingA(hFile, nullptr, (u32)PAGE_READONLY, 0u, 0u, nullptr);
+    if (hMap == nullptr) {
+        printf("CreateFileMappingA failed (error %u)\n", GetLastError());
+        CloseHandle(hFile);
+        return 1;
+    }
+
+    void* view = MapViewOfFile(hMap, (u32)FILE_MAP_READ, 0u, 0u, (u64)0);
+    if (view == nullptr) {
+        printf("MapViewOfFile failed (error %u)\n", GetLastError());
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return 1;
+    }
+
+    i64 dumpLen = fileSize;
+    if (dumpLen > maxBytes) dumpLen = maxBytes;
+    printf("dumping %lld of %lld bytes:\n", dumpLen, fileSize);
+
+    u8* bytes = (u8*)view;
+    i64 offset = (i64)0;
+    while (offset < dumpLen) {
+        i64 remain = dumpLen - offset;
+        int rowLen = 16;
+        if (remain < (i64)16) rowLen = (int)remain;
+        dumpRow(bytes, offset, rowLen);
+        offset = offset + (i64)16;
+    }
+    if (dumpLen < fileSize) {
+        printf("... (%lld more bytes not shown)\n", fileSize - dumpLen);
+    }
+
+    UnmapViewOfFile(view);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    return 0;
+}
