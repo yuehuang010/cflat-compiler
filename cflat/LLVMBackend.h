@@ -8619,6 +8619,19 @@ public:
                     auto candidateParam = GetType(*candidateParamItr);
                     result = CompareUpconvert(arg.BaseType, candidateParam);
 
+                    // Opaque pointers make every pointer pair look identical to CompareUpconvert.
+                    // An argument whose CFlat type is unknown (empty TypeName - primitive pointers
+                    // like '&boolVar') binding to a pointer-to-struct parameter is only an IMPLICIT
+                    // match, never a perfect one: a perfect match here would let a method's 'this'
+                    // swallow any pointer in a free call (e.g. readLine(&eof) resolving to
+                    // File.readLine with the bool* as 'this') and beat the exact free overload.
+                    // nullptr stays a perfect match for any pointer parameter.
+                    if (result == 0 && candidateParamItr->Pointer
+                        && IsDataStructure(candidateParamItr->TypeName)
+                        && arg.BaseType && arg.BaseType->isPointerTy()
+                        && !(arg.Primary && llvm::isa<llvm::ConstantPointerNull>(arg.Primary)))
+                        result = 1;
+
                     // Interface upcast: struct value (TypeName empty, BaseType is struct) to interface param
                     if (result < 0 && candidateParamItr->IsInterface && arg.BaseType)
                     {

@@ -1,0 +1,1686 @@
+// fsh.cb - Flat Shell, a complete interactive shell written in CFlat
+//
+// Features:
+//   - Line editor: cursor movement (left/right/home/end), mid-line insert,
+//     backspace, delete; command history (up/down arrows) persisted to
+//     %USERPROFILE%\.fsh_history; tab completion for files and builtins.
+//   - %VAR% environment expansion (incl. %ERRORLEVEL% from the last command).
+//   - Aliases: alias name=value, unalias name.
+//   - Pipelines:  a | b | c   (real concurrent child processes)
+//   - Redirection: cmd < in.txt > out.txt >> append.txt
+//   - Chaining:    a && b,  a || b
+//   - Background:  cmd args &   with jobs / fg <id> / kill <id>
+//
+// Built-in commands (run "help" inside the shell for the full list):
+//   cd dir set echo type copy move del mkdir rmdir ren cls pwd ver wc
+//   alias unalias history where jobs fg kill help exit
+//
+// Builtins run in-process and cannot be piped, redirected, or backgrounded
+// (prefix with "cmd /c" if you need that). External commands inherit the
+// console directly, so interactive child programs work. Commands that
+// CreateProcessA cannot find are retried through "cmd /c", which makes
+// .bat/.cmd files and cmd built-ins work transparently.
+//
+// Build:
+//   x64/Debug/cflat.exe example/shell/fsh.cb -i cflat/core -o out/fsh.exe
+// Run:
+//   out\fsh.exe
+
+import "string.cb";
+import "filesystem.cb";
+import "list.cb";
+import "terminal.cb";
+
+// Utility builtins live in their own files and are pulled in as programs (like
+// wc), each running in-process on a managed thread that shares the shell's
+// console and working directory. Shell-control builtins that mutate fsh's own
+// state (cd, set, alias, history, jobs, ...) stay inline below.
+import program "wc.cb"    as Wc;
+import program "echo.cb"  as EchoApp;
+import program "pwd.cb"   as PwdApp;
+import program "cls.cb"   as ClsApp;
+import program "type.cb"  as TypeApp;
+import program "copy.cb"  as CopyApp;
+import program "move.cb"  as MoveApp;
+import program "ren.cb"   as RenApp;
+import program "del.cb"   as DelApp;
+import program "mkdir.cb" as MkdirApp;
+import program "rmdir.cb" as RmdirApp;
+import program "dir.cb"   as DirApp;
+import program "where.cb" as WhereApp;
+
+// ── Win32 externs not already in os.windows.cb ────────────────────────────────
+
+extern stdcall i32  GetEnvironmentVariableA(const char* name, char* buf, i32 size);
+extern stdcall i32  SetEnvironmentVariableA(const char* name, const char* value);
+extern stdcall i8*  GetEnvironmentStringsA();
+extern stdcall i32  FreeEnvironmentStringsA(i8* env);
+extern stdcall i32  ExpandEnvironmentStringsA(const char* src, char* dst, i32 size);
+
+extern stdcall i32 CreateProcessA(
+    const char* lpApplicationName,
+    char*       lpCommandLine,
+    void*       lpProcessAttributes,
+    void*       lpThreadAttributes,
+    i32         bInheritHandles,
+    i32         dwCreationFlags,
+    void*       lpEnvironment,
+    const char* lpCurrentDirectory,
+    void*       lpStartupInfo,
+    void*       lpProcessInformation);
+
+extern stdcall i32   GetExitCodeProcess(void* hProcess, i32* lpExitCode);
+extern stdcall i32   TerminateProcess(void* hProcess, i32 uExitCode);
+extern stdcall i32   CreatePipe(void** hReadPipe, void** hWritePipe, void* lpPipeAttributes, i32 nSize);
+extern stdcall i32   SetHandleInformation(void* hObject, i32 dwMask, i32 dwFlags);
+extern stdcall void* CreateFileA(const char* name, i32 access, i32 share, void* sa, i32 disposition, i32 flags, void* template_);
+extern stdcall i32   SetFilePointer(void* hFile, i32 distLow, i32* distHigh, i32 method);
+
+// ── Win32 structs (x64 layouts, same as core/process.cb) ─────────────────────
+
+// SECURITY_ATTRIBUTES - 24 bytes on x64; bInheritHandle=1 so pipe/file handles
+// created with it can be passed to children.
+struct FshSecAttrs {
+    i32   nLength              = 12;
+    i32   _pad0                = 0;
+    void* lpSecurityDescriptor = nullptr;
+    i32   bInheritHandle       = 1;
+    i32   _pad1                = 0;
+};
+
+// STARTUPINFOA - 104 bytes on x64.
+struct FshStartupInfo {
+    i32   cb              = 104;
+    i32   _pad0           = 0;
+    void* lpReserved      = nullptr;
+    void* lpDesktop       = nullptr;
+    void* lpTitle         = nullptr;
+    i32   dwX             = 0;
+    i32   dwY             = 0;
+    i32   dwXSize         = 0;
+    i32   dwYSize         = 0;
+    i32   dwXCountChars   = 0;
+    i32   dwYCountChars   = 0;
+    i32   dwFillAttribute = 0;
+    i32   dwFlags         = 0;
+    i16   wShowWindow     = 0;
+    i16   cbReserved2     = 0;
+    i32   _pad1           = 0;
+    void* lpReserved2     = nullptr;
+    void* hStdInput       = nullptr;
+    void* hStdOutput      = nullptr;
+    void* hStdError       = nullptr;
+};
+
+// PROCESS_INFORMATION - 24 bytes on x64.
+struct FshProcInfo {
+    void* hProcess    = nullptr;
+    void* hThread     = nullptr;
+    i32   dwProcessId = 0;
+    i32   dwThreadId  = 0;
+};
+
+// ── Shell state ───────────────────────────────────────────────────────────────
+
+// One background job: the handles of every stage in its pipeline.
+// The last handle is the last stage - its exit determines "done" and the code.
+struct Job {
+    int           id       = 0;
+    i32           pid      = 0;       // pid of the last stage
+    string        cmdline  = default;
+    // Process handles stored as i64, not void*: a list<void*> is an owning
+    // pointer list whose destructor would free() each element - but these are
+    // OS handles, not heap allocations. i64 keeps the list a value type.
+    list<i64>*    handles  = nullptr;
+};
+
+list<string>* gHistory     = nullptr;
+list<string>* gAliasNames  = nullptr;
+list<string>* gAliasValues = nullptr;
+list<Job*>*   gJobs        = nullptr;
+int  gNextJobId = 1;
+int  gLastExit  = 0;
+int  gExitCode  = 0;
+bool gRunning   = true;
+bool gColor     = false;
+
+// ── Small helpers ─────────────────────────────────────────────────────────────
+
+// Make an owned string from a raw buffer (copies len bytes).
+string makeString(i8* buf, int len)
+{
+    i8* nb = new i8[len + 1];
+    int i = 0;
+    while (i < len) { nb[i] = buf[i]; i++; }
+    nb[len] = 0;
+    string s;
+    s._ptr = nb;
+    s._len = len;
+    return s;
+}
+
+string intToString(int v)
+{
+    if (v == 0) return "0";
+    bool neg = v < 0;
+    if (neg) v = -v;
+    i8[16] digits;
+    int n = 0;
+    while (v > 0) { digits[n] = (i8)('0' + v % 10); n++; v = v / 10; }
+    stringbuilder sb;
+    if (neg) sb.appendChar('-');
+    while (n > 0) { n--; sb.appendChar(digits[n]); }
+    return sb.toString();
+}
+
+// Case-insensitive comparison of a CFlat string against a C literal.
+bool eqCI(string a, const char* b)
+{
+    int alen = a.length();
+    int blen = strlen(b);
+    if (alen != blen) return false;
+    i8* ap = a.data();
+    int i = 0;
+    while (i < alen)
+    {
+        if (tolower((int)(u8)ap[i]) != tolower((int)(u8)b[i])) return false;
+        i++;
+    }
+    return true;
+}
+
+// Join argv[start..) with single spaces.
+string joinArgs(list<string>* argv, int start)
+{
+    stringbuilder sb;
+    int i = start;
+    while (i < argv->count())
+    {
+        if (i > start) sb.appendChar(' ');
+        sb.append(argv->get(i));
+        i++;
+    }
+    return sb.toString();
+}
+
+// ── Prompt ───────────────────────────────────────────────────────────────────
+
+void printPrompt()
+{
+    string cwd = Directory.getCurrent();
+    if (gColor)
+        printf("\033[1;36mfsh\033[0m \033[33m%s\033[0m> ", cwd.data());
+    else
+        printf("fsh %s> ", cwd.data());
+}
+
+// True only when stdin is a real console. When fsh's stdin is redirected (a
+// pipe or file), _getch() cannot block for interactive editing and the read
+// loop would spin forever, so the REPL refuses to run in that case. Uses the
+// same GetConsoleMode probe as Terminal.init() in core/terminal.cb.
+bool stdinIsConsole()
+{
+    void* h = os.windows.GetStdHandle(-10);
+    if (h == nullptr) return false;
+    i32 mode = 0;
+    return os.windows.GetConsoleMode(h, &mode) != 0;
+}
+
+// Try to enable ANSI escape processing on stdout for the colored prompt.
+// ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x04.
+void enableVT()
+{
+    void* h = os.windows.GetStdHandle(-11);
+    if (h == nullptr) return;
+    i32 mode = 0;
+    if (os.windows.GetConsoleMode(h, &mode) == 0) return;
+    if (os.windows.SetConsoleMode(h, mode | 0x04) != 0) gColor = true;
+}
+
+// ── Tab completion ────────────────────────────────────────────────────────────
+
+// Find the start index of the last whitespace-separated token in buf[0..len).
+int findTokenStart(i8* buf, int len)
+{
+    int i = len;
+    while (i > 0 && isspace((int)(u8)buf[i - 1]) == 0) i--;
+    return i;
+}
+
+// True if the token starting at tokenStart is in command position: the start
+// of the line, or right after a pipe / chain operator.
+bool atCommandPosition(i8* buf, int tokenStart)
+{
+    int i = tokenStart - 1;
+    while (i >= 0 && isspace((int)(u8)buf[i]) != 0) i--;
+    if (i < 0) return true;
+    return buf[i] == '|' || buf[i] == '&';
+}
+
+// Add builtin command names that case-insensitively start with stub[0..stubLen).
+void addBuiltinMatches(list<string>* matches, i8* stub, int stubLen)
+{
+    const char* names = "cd dir set echo type copy move del erase mkdir md rmdir rd ren rename cls clear wc pwd ver alias unalias history where jobs fg kill help exit";
+    int i = 0;
+    while (names[i] != 0)
+    {
+        int s = i;
+        while (names[i] != 0 && names[i] != ' ') i++;
+        int wlen = i - s;
+        if (stubLen <= wlen)
+        {
+            bool ok = true;
+            int k = 0;
+            while (k < stubLen)
+            {
+                if (tolower((int)(u8)stub[k]) != tolower((int)(u8)names[s + k])) { ok = false; break; }
+                k++;
+            }
+            if (ok) matches->add(makeString((i8*)(names + s), wlen));
+        }
+        while (names[i] == ' ') i++;
+    }
+}
+
+// Gather filesystem completions for the path-prefix buf[tokenStart..len).
+// Writes the length of the filename stub (the part after the last slash) to
+// *outStubLen. Directory matches have a trailing backslash appended.
+list<string>* gatherMatches(i8* buf, int tokenStart, int len, int* outStubLen)
+{
+    // Split the prefix into "<dir>\" and "<stub>".
+    int slashEnd = tokenStart;
+    int i = tokenStart;
+    while (i < len)
+    {
+        if (buf[i] == '\\' || buf[i] == '/') slashEnd = i + 1;
+        i++;
+    }
+
+    int dirLen  = slashEnd - tokenStart;
+    int stubLen = len - slashEnd;
+    *outStubLen = stubLen;
+
+    // pattern = "<dir>\<stub>*"
+    int patLen = dirLen + stubLen + 1;
+    i8* patBuf = new i8[patLen + 1];
+    int k = 0;
+    while (k < dirLen)  { patBuf[k] = buf[tokenStart + k];     k++; }
+    while (k < dirLen + stubLen) { patBuf[k] = buf[slashEnd + (k - dirLen)]; k++; }
+    patBuf[k] = '*'; k++;
+    patBuf[k] = 0;
+
+    list<string>* matches = new list<string>;
+    os.windows._WIN32_FIND_DATAA* fd = new os.windows._WIN32_FIND_DATAA;
+    void* handle = os.windows.FindFirstFileA(patBuf, fd);
+    if (handle != (void*)(i64)-1)
+    {
+        bool more = true;
+        while (more)
+        {
+            i8* nm = fd->cFileName;
+            bool isDot = strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0;
+            if (!isDot)
+            {
+                int nlen = (int)strlen(nm);
+                bool isDir = (fd->dwFileAttributes & 16) != 0;
+                int outLen = isDir ? nlen + 1 : nlen;
+                i8* nb = new i8[outLen + 1];
+                int j = 0;
+                while (j < nlen) { nb[j] = nm[j]; j++; }
+                if (isDir) { nb[nlen] = '\\'; nb[nlen + 1] = 0; }
+                else        { nb[nlen] = 0; }
+                string s;
+                s._ptr = nb;
+                s._len = outLen;
+                matches->add(s);
+            }
+            if (os.windows.FindNextFileA(handle, fd) == 0) more = false;
+        }
+        os.windows.FindClose(handle);
+    }
+    delete fd;
+    delete[] patBuf;
+
+    // In command position with no directory part, builtins complete too.
+    if (dirLen == 0 && atCommandPosition(buf, tokenStart))
+        addBuiltinMatches(matches, buf + tokenStart, stubLen);
+
+    return matches;
+}
+
+// Append a character to the input buffer and echo it. Returns the new length.
+int appendChar(i8* buf, int len, int cap, i8 c)
+{
+    if (len >= cap - 1) return len;
+    buf[len] = c;
+    printf("%c", (int)(u8)c);
+    return len + 1;
+}
+
+// Tab-complete the last token in buf[0..*lenPtr). The cursor must be at the
+// end of the line. Updates *lenPtr in place, echoes any added characters, and
+// (on ambiguity) lists the alternatives and redraws the prompt.
+void handleTab(i8* buf, int* lenPtr, int cap)
+{
+    int len = *lenPtr;
+    int tokenStart = findTokenStart(buf, len);
+    int stubLen = 0;
+    list<string>* matches = gatherMatches(buf, tokenStart, len, &stubLen);
+    int n = matches->count();
+
+    if (n == 0) { delete matches; return; }
+
+    if (n == 1)
+    {
+        string m = matches->get(0);
+        i8* mp = m.data();
+        int mlen = m.length();
+        int j = stubLen;
+        while (j < mlen) { *lenPtr = appendChar(buf, *lenPtr, cap, mp[j]); j++; }
+        delete matches;
+        return;
+    }
+
+    // Multiple matches: extend the buffer by the common-prefix characters.
+    string first = matches->get(0);
+    int cpLen = first.length();
+    int mi = 1;
+    while (mi < n)
+    {
+        string s = matches->get(mi);
+        int slen = s.length();
+        int limit = cpLen < slen ? cpLen : slen;
+        i8* a = first.data();
+        i8* b = s.data();
+        int k = 0;
+        while (k < limit && tolower((int)(u8)a[k]) == tolower((int)(u8)b[k])) k++;
+        cpLen = k;
+        mi++;
+    }
+
+    if (cpLen > stubLen)
+    {
+        i8* fp = first.data();
+        int j = stubLen;
+        while (j < cpLen) { *lenPtr = appendChar(buf, *lenPtr, cap, fp[j]); j++; }
+    }
+    else
+    {
+        // No further common prefix - list alternatives and redraw.
+        printf("\n");
+        int mj = 0;
+        while (mj < n) { printf("%s  ", matches->get(mj).data()); mj++; }
+        printf("\n");
+        printPrompt();
+        int j = 0;
+        while (j < *lenPtr) { printf("%c", (int)(u8)buf[j]); j++; }
+    }
+
+    delete matches;
+}
+
+// ── Line editor ───────────────────────────────────────────────────────────────
+// Echo uses only printable characters, '\b', and spaces, so it works in any
+// console without VT processing.
+
+// Insert c at the cursor, echo the shifted tail, and park the cursor after c.
+void edInsert(i8* buf, int* len, int* cursor, int cap, i8 c)
+{
+    if (*len >= cap - 1) return;
+    int i = *len;
+    while (i > *cursor) { buf[i] = buf[i - 1]; i--; }
+    buf[*cursor] = c;
+    (*len)++;
+    i = *cursor;
+    while (i < *len) { printf("%c", (int)(u8)buf[i]); i++; }
+    (*cursor)++;
+    i = *len;
+    while (i > *cursor) { printf("\b"); i--; }
+}
+
+// Remove the character before the cursor and redraw the tail.
+void edBackspace(i8* buf, int* len, int* cursor)
+{
+    if (*cursor == 0) return;
+    int i = *cursor - 1;
+    while (i < *len - 1) { buf[i] = buf[i + 1]; i++; }
+    (*cursor)--;
+    (*len)--;
+    printf("\b");
+    i = *cursor;
+    while (i < *len) { printf("%c", (int)(u8)buf[i]); i++; }
+    printf(" ");
+    i = *len + 1;
+    while (i > *cursor) { printf("\b"); i--; }
+}
+
+// Remove the character under the cursor and redraw the tail.
+void edDelete(i8* buf, int* len, int* cursor)
+{
+    if (*cursor >= *len) return;
+    int i = *cursor;
+    while (i < *len - 1) { buf[i] = buf[i + 1]; i++; }
+    (*len)--;
+    i = *cursor;
+    while (i < *len) { printf("%c", (int)(u8)buf[i]); i++; }
+    printf(" ");
+    i = *len + 1;
+    while (i > *cursor) { printf("\b"); i--; }
+}
+
+// Replace the whole edit buffer with s (used by history navigation).
+void edReplace(i8* buf, int* len, int* cursor, int cap, string s)
+{
+    while (*cursor > 0) { printf("\b"); (*cursor)--; }
+    int newLen = s.length();
+    if (newLen > cap - 1) newLen = cap - 1;
+    i8* sp = s.data();
+    int i = 0;
+    while (i < newLen) { buf[i] = sp[i]; printf("%c", (int)(u8)sp[i]); i++; }
+    if (newLen < *len)
+    {
+        int pad = *len - newLen;
+        i = 0;
+        while (i < pad) { printf(" ");  i++; }
+        i = 0;
+        while (i < pad) { printf("\b"); i++; }
+    }
+    *len = newLen;
+    *cursor = newLen;
+}
+
+// Read one line from stdin in raw character mode with editing, history, and
+// tab completion. Sets *eof on Ctrl+Z.
+string readLine(bool* eof)
+{
+    i8[1024] buf;
+    int len = 0;
+    int cursor = 0;
+    int histPos = gHistory->count();
+    *eof = false;
+
+    while (true)
+    {
+        int c = readKey();
+        if (c == 13)                              // Enter
+        {
+            printf("\n");
+            break;
+        }
+        else if (c == 26)                         // Ctrl+Z -> EOF
+        {
+            printf("\n");
+            *eof = true;
+            len = 0;
+            break;
+        }
+        else if (c == 8 || c == 127)              // Backspace
+        {
+            edBackspace(buf, &len, &cursor);
+        }
+        else if (c == 9)                          // Tab (only at end of line)
+        {
+            if (cursor == len) { handleTab(buf, &len, 1024); cursor = len; }
+        }
+        else if (c == 0 || c == 0xE0)             // Function/arrow key prefix
+        {
+            int sc = readKey();
+            if (sc == 75)                         // Left
+            {
+                if (cursor > 0) { printf("\b"); cursor--; }
+            }
+            else if (sc == 77)                    // Right
+            {
+                if (cursor < len) { printf("%c", (int)(u8)buf[cursor]); cursor++; }
+            }
+            else if (sc == 71)                    // Home
+            {
+                while (cursor > 0) { printf("\b"); cursor--; }
+            }
+            else if (sc == 79)                    // End
+            {
+                while (cursor < len) { printf("%c", (int)(u8)buf[cursor]); cursor++; }
+            }
+            else if (sc == 115)                   // Ctrl+Left - to start of previous word
+            {
+                while (cursor > 0 && buf[cursor - 1] == ' ') { printf("\b"); cursor--; }
+                while (cursor > 0 && buf[cursor - 1] != ' ') { printf("\b"); cursor--; }
+            }
+            else if (sc == 116)                   // Ctrl+Right - to start of next word
+            {
+                while (cursor < len && buf[cursor] != ' ') { printf("%c", (int)(u8)buf[cursor]); cursor++; }
+                while (cursor < len && buf[cursor] == ' ') { printf("%c", (int)(u8)buf[cursor]); cursor++; }
+            }
+            else if (sc == 83)                    // Delete
+            {
+                edDelete(buf, &len, &cursor);
+            }
+            else if (sc == 72)                    // Up - older history
+            {
+                if (histPos > 0)
+                {
+                    histPos--;
+                    edReplace(buf, &len, &cursor, 1024, gHistory->get(histPos));
+                }
+            }
+            else if (sc == 80)                    // Down - newer history
+            {
+                if (histPos < gHistory->count())
+                {
+                    histPos++;
+                    if (histPos == gHistory->count())
+                        edReplace(buf, &len, &cursor, 1024, "");
+                    else
+                        edReplace(buf, &len, &cursor, 1024, gHistory->get(histPos));
+                }
+            }
+        }
+        else if (c >= 32 && c < 127)              // Printable
+        {
+            edInsert(buf, &len, &cursor, 1024, (i8)c);
+        }
+    }
+
+    return makeString(buf, len);
+}
+
+// ── History persistence ───────────────────────────────────────────────────────
+
+string historyPath()
+{
+    i8* buf = new i8[1024];
+    i32 n = GetEnvironmentVariableA("USERPROFILE", buf, 1024);
+    if (n == 0 || n >= 1024)
+    {
+        delete[] buf;
+        return ".fsh_history";
+    }
+    string dir = makeString(buf, (int)n);
+    delete[] buf;
+    return dir + "\\.fsh_history";
+}
+
+void loadHistory()
+{
+    string path = historyPath();
+    if (!File.exists(path)) return;
+    string content = File.readAllText(path);
+    list<string> lines = content.split((i8)'\n');
+    int start = 0;
+    if (lines.count() > 500) start = lines.count() - 500;  // cap what we keep
+    int i = start;
+    while (i < lines.count())
+    {
+        string line = lines.get(i).trim();
+        if (line.length() > 0) gHistory->add(line);
+        i++;
+    }
+}
+
+void appendHistory(string line)
+{
+    File.appendAllText(historyPath(), line + "\n");
+}
+
+// ── Expansion ─────────────────────────────────────────────────────────────────
+
+// Expand %VAR% references. %ERRORLEVEL% works because the last exit code is
+// exported as a real environment variable first.
+string expandEnv(string line)
+{
+    string el = intToString(gLastExit);
+    SetEnvironmentVariableA("ERRORLEVEL", el.data());
+
+    if (line.indexOf((i8)'%') < 0) return line;
+
+    i8* buf = new i8[8192];
+    i32 n = ExpandEnvironmentStringsA(line.data(), buf, 8192);
+    if (n == 0 || n > 8192)
+    {
+        delete[] buf;
+        return line;
+    }
+    string out = makeString(buf, (int)(n - 1));  // n includes the terminator
+    delete[] buf;
+    return out;
+}
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+// Splits on whitespace; double-quoted spans become part of a single word token.
+// The operators | < > >> && || & are emitted as their own tokens (kind 1) when
+// they appear outside quotes. Everything else is a word (kind 0).
+
+void tokenizeLine(string line, list<string>* tokens, list<int>* kinds)
+{
+    i8* p = line.data();
+    int len = line.length();
+    int i = 0;
+    while (i < len)
+    {
+        while (i < len && isspace((int)(u8)p[i]) != 0) i++;
+        if (i >= len) break;
+
+        i8 c = p[i];
+        if (c == '|' || c == '&')
+        {
+            if (i + 1 < len && p[i + 1] == c)
+            {
+                string op = c == '|' ? "||" : "&&";
+                tokens->add(op);
+                i += 2;
+            }
+            else
+            {
+                string op = c == '|' ? "|" : "&";
+                tokens->add(op);
+                i++;
+            }
+            kinds->add(1);
+            continue;
+        }
+        if (c == '<')
+        {
+            tokens->add("<");
+            kinds->add(1);
+            i++;
+            continue;
+        }
+        if (c == '>')
+        {
+            if (i + 1 < len && p[i + 1] == '>') { tokens->add(">>"); i += 2; }
+            else                                { tokens->add(">");  i++;   }
+            kinds->add(1);
+            continue;
+        }
+
+        stringbuilder tok;
+        bool sawQuote = false;
+        while (i < len)
+        {
+            c = p[i];
+            if (isspace((int)(u8)c) != 0) break;
+            if (c == '|' || c == '&' || c == '<' || c == '>') break;
+            if (c == '"')
+            {
+                sawQuote = true;
+                i++;
+                while (i < len && p[i] != '"') { tok.appendChar(p[i]); i++; }
+                if (i < len) i++;  // closing quote
+            }
+            else
+            {
+                tok.appendChar(c);
+                i++;
+            }
+        }
+        if (tok.length() > 0 || sawQuote)
+        {
+            tokens->add(tok.toString());
+            kinds->add(0);
+        }
+    }
+}
+
+// If the first token is an alias name, splice the alias body in its place.
+void expandAlias(list<string>* tokens, list<int>* kinds)
+{
+    if (tokens->count() == 0 || kinds->get(0) != 0) return;
+    string first = tokens->get(0);
+
+    int a = 0;
+    while (a < gAliasNames->count())
+    {
+        if (eqCI(first, gAliasNames->get(a).data()))
+        {
+            list<string>* nt = new list<string>;
+            list<int>*    nk = new list<int>;
+            tokenizeLine(gAliasValues->get(a), nt, nk);
+            int j = 1;
+            while (j < tokens->count())
+            {
+                nt->add(tokens->get(j));
+                nk->add(kinds->get(j));
+                j++;
+            }
+            tokens->clear();
+            kinds->clear();
+            j = 0;
+            while (j < nt->count())
+            {
+                tokens->add(nt->get(j));
+                kinds->add(nk->get(j));
+                j++;
+            }
+            delete nt;
+            delete nk;
+            return;
+        }
+        a++;
+    }
+}
+
+// ── Pipeline stage ────────────────────────────────────────────────────────────
+
+struct Stage {
+    list<string>* argv    = nullptr;
+    string        inFile  = default;
+    string        outFile = default;
+    bool          hasIn   = false;
+    bool          hasOut  = false;
+    bool          append  = false;
+};
+
+void freeStage(move Stage* st)
+{
+    list<string>* argv = move st->argv;
+    if (argv != nullptr) delete argv;
+    delete st;
+}
+
+// Parse tokens[s..e) into argv plus < / > / >> redirections.
+// Returns nullptr (after printing an error) on bad syntax.
+Stage* parseStage(list<string>* tokens, list<int>* kinds, int s, int e)
+{
+    Stage* st = new Stage;
+    st->argv = new list<string>;
+    bool ok = true;
+    int i = s;
+    while (ok && i < e)
+    {
+        if (kinds->get(i) == 1)
+        {
+            string op = tokens->get(i);
+            if (i + 1 >= e || kinds->get(i + 1) != 0)
+            {
+                printf("fsh: syntax error: '%s' requires a file name\n", op.data());
+                ok = false;
+            }
+            else if (eqCI(op, "<"))  { st->inFile  = tokens->get(i + 1); st->hasIn  = true; }
+            else if (eqCI(op, ">"))  { st->outFile = tokens->get(i + 1); st->hasOut = true; st->append = false; }
+            else if (eqCI(op, ">>")) { st->outFile = tokens->get(i + 1); st->hasOut = true; st->append = true;  }
+            else
+            {
+                printf("fsh: unexpected '%s'\n", op.data());
+                ok = false;
+            }
+            i += 2;
+        }
+        else
+        {
+            st->argv->add(tokens->get(i));
+            i++;
+        }
+    }
+    if (ok && st->argv->count() == 0)
+    {
+        printf("fsh: empty command\n");
+        ok = false;
+    }
+    if (ok) return st;
+    freeStage(st);
+    return nullptr;
+}
+
+// ── Process spawning ──────────────────────────────────────────────────────────
+
+// Build a quoted command line from argv; optionally prefixed with "cmd /c ".
+char* buildCmdline(list<string>* argv, bool viaCmd)
+{
+    stringbuilder sb;
+    if (viaCmd) sb.append("cmd /c ");
+    int i = 0;
+    while (i < argv->count())
+    {
+        if (i > 0) sb.appendChar(' ');
+        string a = argv->get(i);
+        bool q = a.length() == 0 || a.contains(" ");
+        if (q) sb.appendChar('"');
+        sb.append(a);
+        if (q) sb.appendChar('"');
+        i++;
+    }
+    string s = sb.toString();
+    char* buf = (char*)malloc(s.length() + 1);
+    memcpy(buf, s.data(), s.length() + 1);
+    return buf;
+}
+
+// Spawn one pipeline stage wired to the given std handles. On failure the
+// command is retried through "cmd /c" so .bat/.cmd files and cmd built-ins
+// work. Returns false if both attempts fail.
+bool spawnStage(list<string>* argv, void* hIn, void* hOut, bool background, void** outProc, i32* outPid)
+{
+    FshStartupInfo si;
+    si.dwFlags    = 0x100;  // STARTF_USESTDHANDLES
+    si.hStdInput  = hIn;
+    si.hStdOutput = hOut;
+    si.hStdError  = os.windows.GetStdHandle(-12);
+
+    // CREATE_NEW_PROCESS_GROUP keeps Ctrl+C in the console from reaching
+    // background jobs.
+    i32 flags = background ? 0x200 : 0;
+
+    FshProcInfo pi;
+    char* cmdline = buildCmdline(argv, false);
+    i32 ok = CreateProcessA(nullptr, cmdline, nullptr, nullptr, 1, flags,
+                            nullptr, nullptr, &si, &pi);
+    free((void*)cmdline);
+
+    if (ok == 0)
+    {
+        cmdline = buildCmdline(argv, true);
+        ok = CreateProcessA(nullptr, cmdline, nullptr, nullptr, 1, flags,
+                            nullptr, nullptr, &si, &pi);
+        free((void*)cmdline);
+    }
+    if (ok == 0) return false;
+
+    os.windows.CloseHandle(pi.hThread);
+    *outProc = pi.hProcess;
+    *outPid  = pi.dwProcessId;
+    return true;
+}
+
+// Open a redirection file with an inheritable handle. Returns nullptr on failure.
+// GENERIC_READ=0x80000000 GENERIC_WRITE=0x40000000 FILE_SHARE_READ=1
+// CREATE_ALWAYS=2 OPEN_EXISTING=3 OPEN_ALWAYS=4 FILE_ATTRIBUTE_NORMAL=0x80 FILE_END=2
+void* openRedirect(string path, bool forInput, bool append)
+{
+    FshSecAttrs sa;
+    void* h;
+    if (forInput)
+        h = CreateFileA(path.data(), (i32)0x80000000, 1, &sa, 3, 0x80, nullptr);
+    else if (append)
+    {
+        h = CreateFileA(path.data(), (i32)0x40000000, 1, &sa, 4, 0x80, nullptr);
+        if (h != (void*)(i64)-1) SetFilePointer(h, 0, nullptr, 2);
+    }
+    else
+        h = CreateFileA(path.data(), (i32)0x40000000, 1, &sa, 2, 0x80, nullptr);
+    if (h == (void*)(i64)-1) return nullptr;
+    return h;
+}
+
+// ── Background jobs ───────────────────────────────────────────────────────────
+
+void closeJob(move Job* job)
+{
+    int k = 0;
+    while (k < job->handles->count())
+    {
+        os.windows.CloseHandle((void*)job->handles->get(k));
+        k++;
+    }
+    list<i64>* handles = move job->handles;
+    delete handles;
+    delete job;
+}
+
+// Report and remove finished background jobs. Called before each prompt.
+void reapJobs()
+{
+    int i = 0;
+    while (i < gJobs->count())
+    {
+        Job* job = gJobs->get(i);
+        void* last = (void*)job->handles->get(job->handles->count() - 1);
+        if (os.windows.WaitForSingleObject(last, 0) == 0)
+        {
+            i32 code = 0;
+            GetExitCodeProcess(last, &code);
+            printf("[%d] finished (exit %d): %s\n", job->id, (int)code, job->cmdline.data());
+            Job* owned = gJobs->take(i);
+            closeJob(owned);
+        }
+        else
+        {
+            i++;
+        }
+    }
+}
+
+// ── External pipeline execution ───────────────────────────────────────────────
+
+// Spawn every stage of the pipeline, wiring stage N's stdout to stage N+1's
+// stdin via anonymous pipes. Foreground: waits for all stages and returns the
+// last stage's exit code. Background: registers a Job and returns 0.
+int runExternalPipeline(list<string>* tokens, list<int>* kinds,
+                        list<int>* stageStarts, list<int>* stageEnds,
+                        bool background, string displayCmd)
+{
+    void* conIn  = os.windows.GetStdHandle(-10);
+    void* conOut = os.windows.GetStdHandle(-11);
+
+    int nStages = stageStarts->count();
+    list<i64>* procs = new list<i64>;
+    i32  lastPid  = 0;
+    void* prevRead = nullptr;   // read end of the previous junction's pipe
+    bool failed = false;
+
+    int s = 0;
+    while (s < nStages && !failed)
+    {
+        Stage* st = parseStage(tokens, kinds, stageStarts->get(s), stageEnds->get(s));
+        if (st == nullptr) { failed = true; break; }
+
+        void* hIn      = conIn;
+        void* hOut     = conOut;
+        void* nextRead = nullptr;
+
+        if (isBuiltinName(st->argv->get(0)))
+        {
+            printf("fsh: builtin '%s' cannot be used in a pipeline (try: cmd /c ...)\n",
+                   st->argv->get(0).data());
+            failed = true;
+        }
+
+        // This stage's stdin: the previous pipe, overridden by < redirection.
+        if (!failed)
+        {
+            if (s > 0) { hIn = prevRead; prevRead = nullptr; }
+            if (st->hasIn)
+            {
+                void* f = openRedirect(st->inFile, true, false);
+                if (f == nullptr)
+                {
+                    printf("fsh: cannot open '%s'\n", st->inFile.data());
+                    failed = true;
+                }
+                else
+                {
+                    if (hIn != conIn) os.windows.CloseHandle(hIn);
+                    hIn = f;
+                }
+            }
+        }
+
+        // This stage's stdout: a new pipe to the next stage, overridden by >.
+        // The pipe's read end is hidden from this child (non-inheritable) so
+        // it cannot hold its own input pipe open; it becomes inheritable when
+        // the consuming stage spawns.
+        if (!failed && s < nStages - 1)
+        {
+            void* r = nullptr;
+            void* w = nullptr;
+            FshSecAttrs sa;
+            CreatePipe(&r, &w, &sa, 0);
+            SetHandleInformation(r, 1, 0);   // HANDLE_FLAG_INHERIT off
+            hOut = w;
+            nextRead = r;
+        }
+        if (!failed && st->hasOut)
+        {
+            void* f = openRedirect(st->outFile, false, st->append);
+            if (f == nullptr)
+            {
+                printf("fsh: cannot open '%s'\n", st->outFile.data());
+                failed = true;
+            }
+            else
+            {
+                // Close the pipe write end - the next stage reads EOF.
+                if (hOut != conOut) os.windows.CloseHandle(hOut);
+                hOut = f;
+            }
+        }
+
+        if (!failed)
+        {
+            // Un-hide the pipe read end this child consumes as stdin.
+            if (hIn != conIn) SetHandleInformation(hIn, 1, 1);
+
+            void* hProc = nullptr;
+            i32 pid = 0;
+            if (spawnStage(st->argv, hIn, hOut, background, &hProc, &pid))
+            {
+                procs->add((i64)hProc);
+                lastPid = pid;
+            }
+            else
+            {
+                printf("fsh: '%s' is not recognized as a command\n", st->argv->get(0).data());
+                failed = true;
+            }
+        }
+
+        // Parent must drop its copies of the child's ends right away, or pipe
+        // readers never see EOF.
+        if (hIn  != conIn)  os.windows.CloseHandle(hIn);
+        if (hOut != conOut) os.windows.CloseHandle(hOut);
+        if (failed)
+        {
+            if (nextRead != nullptr) os.windows.CloseHandle(nextRead);
+        }
+        else
+        {
+            prevRead = nextRead;
+        }
+
+        freeStage(st);
+        s++;
+    }
+
+    if (prevRead != nullptr) os.windows.CloseHandle(prevRead);
+
+    int code = 0;
+    if (!failed && background)
+    {
+        int jobId = gNextJobId;
+        gNextJobId++;
+        Job* job = new Job;
+        job->id      = jobId;
+        job->pid     = lastPid;
+        job->cmdline = displayCmd;
+        job->handles = new list<i64>;
+        int k = 0;
+        while (k < procs->count())
+        {
+            job->handles->add(procs->get(k));
+            k++;
+        }
+        gJobs->add(job);
+        printf("[%d] %d started: %s\n", jobId, (int)lastPid, displayCmd.data());
+    }
+    else
+    {
+        // Foreground (or cleanup after a mid-pipeline failure): wait on every
+        // spawned stage; the last one's exit code is the pipeline's.
+        int i = 0;
+        while (i < procs->count())
+        {
+            void* h = (void*)procs->get(i);
+            os.windows.WaitForSingleObject(h, -1);
+            i32 c = 0;
+            GetExitCodeProcess(h, &c);
+            code = (int)c;
+            os.windows.CloseHandle(h);
+            i++;
+        }
+    }
+    delete procs;
+    return failed ? 1 : code;
+}
+
+// ── Builtins ──────────────────────────────────────────────────────────────────
+
+// Run an imported utility program in-process, forwarding argv[0..] as its
+// argument list, and return its exit code. Used by the builtins whose
+// implementations live in their own .cb files (echo, dir, type, ...).
+int runApp(IProcess p, list<string>* argv)
+{
+    list<string> args;
+    int i = 0;
+    while (i < argv->count())
+    {
+        args.add("" + argv->get(i));
+        i++;
+    }
+    p.run(args);
+    p.WaitForExit();
+    return p.exitCode();
+}
+
+int cmdCd(list<string>* argv)
+{
+    if (argv->count() < 2)
+    {
+        string cwd = Directory.getCurrent();
+        printf("%s\n", cwd.data());
+        return 0;
+    }
+    string target = argv->get(1);
+    if (!Directory.setCurrent(target))
+    {
+        printf("The system cannot find the path specified: %s\n", target.data());
+        return 1;
+    }
+    return 0;
+}
+
+int cmdPwd(list<string>* argv)   { PwdApp a;   IProcess p = a; return runApp(p, argv); }
+int cmdDir(list<string>* argv)   { DirApp a;   IProcess p = a; return runApp(p, argv); }
+
+int cmdSet(list<string>* argv)
+{
+    if (argv->count() < 2)
+    {
+        // Print all environment variables.
+        i8* envBlock = GetEnvironmentStringsA();
+        if (envBlock == nullptr) return 1;
+        int pos = 0;
+        while (envBlock[pos] != 0)
+        {
+            // Skip Windows-internal entries that start with '='.
+            if (envBlock[pos] != '=')
+                printf("%s\n", envBlock + pos);
+            while (envBlock[pos] != 0) pos++;
+            pos++;
+        }
+        FreeEnvironmentStringsA(envBlock);
+        return 0;
+    }
+
+    string arg = joinArgs(argv, 1);
+    int eq = arg.indexOf((i8)'=');
+
+    if (eq < 0)
+    {
+        // set NAME - display current value.
+        i8* buf = new i8[4096];
+        i32 len = GetEnvironmentVariableA(arg.data(), buf, 4096);
+        if (len == 0)
+        {
+            printf("Environment variable %s is not defined.\n", arg.data());
+            delete[] buf;
+            return 1;
+        }
+        printf("%s=%s\n", arg.data(), buf);
+        delete[] buf;
+        return 0;
+    }
+
+    // set NAME=VALUE  (empty value unsets the variable)
+    string name  = arg.substring(0, eq);
+    string value = arg.substring(eq + 1);
+    if (value.length() == 0)
+        SetEnvironmentVariableA(name.data(), nullptr);
+    else
+        SetEnvironmentVariableA(name.data(), value.data());
+    return 0;
+}
+
+int cmdEcho(list<string>* argv)  { EchoApp a;  IProcess p = a; return runApp(p, argv); }
+int cmdType(list<string>* argv)  { TypeApp a;  IProcess p = a; return runApp(p, argv); }
+int cmdCopy(list<string>* argv)  { CopyApp a;  IProcess p = a; return runApp(p, argv); }
+int cmdMove(list<string>* argv)  { MoveApp a;  IProcess p = a; return runApp(p, argv); }
+int cmdDel(list<string>* argv)   { DelApp a;   IProcess p = a; return runApp(p, argv); }
+int cmdMkdir(list<string>* argv) { MkdirApp a; IProcess p = a; return runApp(p, argv); }
+int cmdRmdir(list<string>* argv) { RmdirApp a; IProcess p = a; return runApp(p, argv); }
+int cmdRen(list<string>* argv)   { RenApp a;   IProcess p = a; return runApp(p, argv); }
+int cmdCls(list<string>* argv)   { ClsApp a;   IProcess p = a; return runApp(p, argv); }
+
+int cmdVer()
+{
+    printf("Flat Shell (fsh) v1.0 - a CFlat example shell\n");
+    return 0;
+}
+
+int cmdWc(list<string>* argv)    { Wc w;       IProcess p = w; return runApp(p, argv); }
+
+int cmdAlias(list<string>* argv)
+{
+    if (argv->count() < 2)
+    {
+        if (gAliasNames->count() == 0)
+        {
+            printf("No aliases defined.\n");
+            return 0;
+        }
+        int i = 0;
+        while (i < gAliasNames->count())
+        {
+            printf("%s=%s\n", gAliasNames->get(i).data(), gAliasValues->get(i).data());
+            i++;
+        }
+        return 0;
+    }
+
+    string text = joinArgs(argv, 1);
+    int eq = text.indexOf((i8)'=');
+    if (eq < 0)
+    {
+        int i = 0;
+        while (i < gAliasNames->count())
+        {
+            if (eqCI(text, gAliasNames->get(i).data()))
+            {
+                printf("%s=%s\n", gAliasNames->get(i).data(), gAliasValues->get(i).data());
+                return 0;
+            }
+            i++;
+        }
+        printf("fsh: alias not found: %s\n", text.data());
+        return 1;
+    }
+
+    string name  = text.substring(0, eq).trim();
+    string value = text.substring(eq + 1).trim();
+    if (name.length() == 0)
+    {
+        printf("Usage: alias <name>=<command>\n");
+        return 1;
+    }
+
+    // Replace if it exists, otherwise add.
+    int i = 0;
+    while (i < gAliasNames->count())
+    {
+        if (eqCI(name, gAliasNames->get(i).data()))
+        {
+            if (value.length() == 0)
+            {
+                gAliasNames->removeAt(i);
+                gAliasValues->removeAt(i);
+            }
+            else
+            {
+                string copy = "" + value;
+                gAliasValues->set(i, copy);
+            }
+            return 0;
+        }
+        i++;
+    }
+    if (value.length() == 0)
+    {
+        printf("fsh: alias not found: %s\n", name.data());
+        return 1;
+    }
+    gAliasNames->add(name);
+    gAliasValues->add(value);
+    return 0;
+}
+
+int cmdUnalias(list<string>* argv)
+{
+    if (argv->count() < 2) { printf("Usage: unalias <name>\n"); return 1; }
+    string name = argv->get(1);
+    int i = 0;
+    while (i < gAliasNames->count())
+    {
+        if (eqCI(name, gAliasNames->get(i).data()))
+        {
+            gAliasNames->removeAt(i);
+            gAliasValues->removeAt(i);
+            return 0;
+        }
+        i++;
+    }
+    printf("fsh: alias not found: %s\n", name.data());
+    return 1;
+}
+
+int cmdHistory()
+{
+    int i = 0;
+    while (i < gHistory->count())
+    {
+        printf("%5d  %s\n", i + 1, gHistory->get(i).data());
+        i++;
+    }
+    return 0;
+}
+
+int cmdWhere(list<string>* argv) { WhereApp a; IProcess p = a; return runApp(p, argv); }
+
+int cmdJobs()
+{
+    if (gJobs->count() == 0)
+    {
+        printf("No background jobs.\n");
+        return 0;
+    }
+    int i = 0;
+    while (i < gJobs->count())
+    {
+        Job* job = gJobs->get(i);
+        printf("[%d] pid %d running: %s\n", job->id, (int)job->pid, job->cmdline.data());
+        i++;
+    }
+    return 0;
+}
+
+int cmdFg(list<string>* argv)
+{
+    if (argv->count() < 2) { printf("Usage: fg <job-id>\n"); return 1; }
+    string idArg = argv->get(1);
+    int id = idArg.toInt();
+    int i = 0;
+    while (i < gJobs->count())
+    {
+        Job* job = gJobs->get(i);
+        if (job->id == id)
+        {
+            int code = 0;
+            int k = 0;
+            while (k < job->handles->count())
+            {
+                void* h = (void*)job->handles->get(k);
+                os.windows.WaitForSingleObject(h, -1);
+                i32 c = 0;
+                GetExitCodeProcess(h, &c);
+                code = (int)c;
+                k++;
+            }
+            printf("[%d] finished (exit %d): %s\n", job->id, code, job->cmdline.data());
+            Job* owned = gJobs->take(i);
+            closeJob(owned);
+            return code;
+        }
+        i++;
+    }
+    printf("fsh: no such job: %d\n", id);
+    return 1;
+}
+
+int cmdKill(list<string>* argv)
+{
+    if (argv->count() < 2) { printf("Usage: kill <job-id>\n"); return 1; }
+    string idArg = argv->get(1);
+    int id = idArg.toInt();
+    int i = 0;
+    while (i < gJobs->count())
+    {
+        Job* job = gJobs->get(i);
+        if (job->id == id)
+        {
+            int k = 0;
+            while (k < job->handles->count())
+            {
+                TerminateProcess((void*)job->handles->get(k), 1);
+                k++;
+            }
+            printf("[%d] killed: %s\n", job->id, job->cmdline.data());
+            Job* owned = gJobs->take(i);
+            closeJob(owned);
+            return 0;
+        }
+        i++;
+    }
+    printf("fsh: no such job: %d\n", id);
+    return 1;
+}
+
+int cmdHelp()
+{
+    printf("Flat Shell (fsh) - built-in commands:\n\n");
+    printf("  cd [path]           Show or change the current directory\n");
+    printf("  pwd                 Print the current directory\n");
+    printf("  dir [path]          List directory contents\n");
+    printf("  set [VAR[=VALUE]]   Show or set environment variables\n");
+    printf("  echo [text]         Print text to the screen\n");
+    printf("  type <file>         Display a file's contents\n");
+    printf("  copy <src> <dst>    Copy a file\n");
+    printf("  move <src> <dst>    Move a file\n");
+    printf("  del <file> ...      Delete one or more files\n");
+    printf("  mkdir <path>        Create a directory\n");
+    printf("  rmdir <path>        Remove an empty directory\n");
+    printf("  ren <old> <new>     Rename a file or directory\n");
+    printf("  cls                 Clear the screen\n");
+    printf("  wc <file> ...       Count lines, words, and characters\n");
+    printf("  where <command>     Locate a command on PATH\n");
+    printf("  alias [name=value]  List, show, or define aliases\n");
+    printf("  unalias <name>      Remove an alias\n");
+    printf("  history             Show command history\n");
+    printf("  jobs                List background jobs\n");
+    printf("  fg <id>             Wait for a background job\n");
+    printf("  kill <id>           Terminate a background job\n");
+    printf("  ver                 Show the shell version\n");
+    printf("  help                Show this list\n");
+    printf("  exit [code]         Quit the shell\n");
+    printf("\nSyntax:\n");
+    printf("  a | b | c           Pipe stdout of one command into the next\n");
+    printf("  cmd < in > out      Redirect stdin / stdout (>> appends)\n");
+    printf("  a && b,  a || b     Run b only if a succeeded / failed\n");
+    printf("  cmd args &          Run in the background (see jobs/fg/kill)\n");
+    printf("  %%VAR%%               Environment expansion (incl. %%ERRORLEVEL%%)\n");
+    printf("\nLine editing: arrows, Home/End, Del, Tab completion, Up/Down history.\n");
+    printf("Any other input runs as an external process (retried via cmd /c).\n");
+    printf("Builtins cannot be piped, redirected, or backgrounded.\n");
+    return 0;
+}
+
+bool isBuiltinName(string cmd)
+{
+    return eqCI(cmd, "exit")  || eqCI(cmd, "cd")      || eqCI(cmd, "dir")
+        || eqCI(cmd, "set")   || eqCI(cmd, "echo")    || eqCI(cmd, "type")
+        || eqCI(cmd, "copy")  || eqCI(cmd, "move")    || eqCI(cmd, "del")
+        || eqCI(cmd, "erase") || eqCI(cmd, "mkdir")   || eqCI(cmd, "md")
+        || eqCI(cmd, "rmdir") || eqCI(cmd, "rd")      || eqCI(cmd, "ren")
+        || eqCI(cmd, "rename")|| eqCI(cmd, "cls")     || eqCI(cmd, "clear")
+        || eqCI(cmd, "wc")    || eqCI(cmd, "pwd")     || eqCI(cmd, "ver")
+        || eqCI(cmd, "alias") || eqCI(cmd, "unalias") || eqCI(cmd, "history")
+        || eqCI(cmd, "where") || eqCI(cmd, "jobs")    || eqCI(cmd, "fg")
+        || eqCI(cmd, "kill")  || eqCI(cmd, "help")    || eqCI(cmd, "/?");
+}
+
+int runBuiltinCmd(string cmd, list<string>* argv)
+{
+    if (eqCI(cmd, "exit"))
+    {
+        gRunning = false;
+        if (argv->count() > 1)
+        {
+            string codeArg = argv->get(1);
+            gExitCode = codeArg.toInt();
+        }
+        return gExitCode;
+    }
+    if (eqCI(cmd, "cd"))                            return cmdCd(argv);
+    if (eqCI(cmd, "pwd"))                           return cmdPwd(argv);
+    if (eqCI(cmd, "dir"))                           return cmdDir(argv);
+    if (eqCI(cmd, "set"))                           return cmdSet(argv);
+    if (eqCI(cmd, "echo"))                          return cmdEcho(argv);
+    if (eqCI(cmd, "type"))                          return cmdType(argv);
+    if (eqCI(cmd, "copy"))                          return cmdCopy(argv);
+    if (eqCI(cmd, "move"))                          return cmdMove(argv);
+    if (eqCI(cmd, "del")   || eqCI(cmd, "erase"))   return cmdDel(argv);
+    if (eqCI(cmd, "mkdir") || eqCI(cmd, "md"))      return cmdMkdir(argv);
+    if (eqCI(cmd, "rmdir") || eqCI(cmd, "rd"))      return cmdRmdir(argv);
+    if (eqCI(cmd, "ren")   || eqCI(cmd, "rename"))  return cmdRen(argv);
+    if (eqCI(cmd, "cls")   || eqCI(cmd, "clear"))   return cmdCls(argv);
+    if (eqCI(cmd, "wc"))                            return cmdWc(argv);
+    if (eqCI(cmd, "ver"))                           return cmdVer();
+    if (eqCI(cmd, "alias"))                         return cmdAlias(argv);
+    if (eqCI(cmd, "unalias"))                       return cmdUnalias(argv);
+    if (eqCI(cmd, "history"))                       return cmdHistory();
+    if (eqCI(cmd, "where"))                         return cmdWhere(argv);
+    if (eqCI(cmd, "jobs"))                          return cmdJobs();
+    if (eqCI(cmd, "fg"))                            return cmdFg(argv);
+    if (eqCI(cmd, "kill"))                          return cmdKill(argv);
+    if (eqCI(cmd, "help")  || eqCI(cmd, "/?"))      return cmdHelp();
+    return 1;
+}
+
+// ── Pipeline / chain execution ────────────────────────────────────────────────
+
+// Run one pipeline from tokens[start..end): split stages on '|', detect a
+// trailing '&', and dispatch builtins or spawn externals. Returns exit code.
+int runPipeline(list<string>* tokens, list<int>* kinds, int start, int end)
+{
+    // Trailing '&' marks the whole pipeline as background.
+    bool background = false;
+    int e = end;
+    if (e > start && kinds->get(e - 1) == 1 && eqCI(tokens->get(e - 1), "&"))
+    {
+        background = true;
+        e--;
+    }
+    // Any other '&' is misplaced (fsh uses Unix-style background, not the
+    // cmd.exe command separator).
+    int i = start;
+    while (i < e)
+    {
+        if (kinds->get(i) == 1 && eqCI(tokens->get(i), "&"))
+        {
+            printf("fsh: unexpected '&' (background '&' must end the command)\n");
+            return 1;
+        }
+        i++;
+    }
+    if (e <= start)
+    {
+        printf("fsh: empty command\n");
+        return 1;
+    }
+
+    // Split stages on '|'.
+    list<int>* stageStarts = new list<int>;
+    list<int>* stageEnds   = new list<int>;
+    int segStart = start;
+    i = start;
+    bool syntaxOk = true;
+    while (i <= e)
+    {
+        bool isPipe = i < e && kinds->get(i) == 1 && eqCI(tokens->get(i), "|");
+        if (i == e || isPipe)
+        {
+            if (segStart >= i)
+            {
+                printf("fsh: syntax error near '|'\n");
+                syntaxOk = false;
+                break;
+            }
+            stageStarts->add(segStart);
+            stageEnds->add(i);
+            segStart = i + 1;
+        }
+        i++;
+    }
+    if (!syntaxOk)
+    {
+        delete stageStarts;
+        delete stageEnds;
+        return 1;
+    }
+
+    // Single-stage builtins run in-process - no pipes, redirection, or '&'.
+    if (stageStarts->count() == 1)
+    {
+        Stage* st = parseStage(tokens, kinds, stageStarts->get(0), stageEnds->get(0));
+        if (st == nullptr)
+        {
+            delete stageStarts;
+            delete stageEnds;
+            return 1;
+        }
+        string cmd = st->argv->get(0);
+        bool isBuiltin = isBuiltinName(cmd);
+        int code = 0;
+        if (isBuiltin)
+        {
+            if (background || st->hasIn || st->hasOut)
+            {
+                printf("fsh: builtin '%s' cannot be redirected or backgrounded (try: cmd /c ...)\n", cmd.data());
+                code = 1;
+            }
+            else
+            {
+                code = runBuiltinCmd(cmd, st->argv);
+            }
+        }
+        freeStage(st);
+        if (isBuiltin)
+        {
+            delete stageStarts;
+            delete stageEnds;
+            return code;
+        }
+    }
+
+    string displayCmd = joinArgs(tokens, 0);  // good enough for job listings
+    int code = runExternalPipeline(tokens, kinds, stageStarts, stageEnds,
+                                   background, displayCmd);
+    delete stageStarts;
+    delete stageEnds;
+    return code;
+}
+
+// Split the token list on && / || and run each pipeline with shell semantics.
+void executeLine(string line)
+{
+    list<string>* tokens = new list<string>;
+    list<int>*    kinds  = new list<int>;
+    tokenizeLine(line, tokens, kinds);
+    if (tokens->count() == 0)
+    {
+        delete tokens;
+        delete kinds;
+        return;
+    }
+    expandAlias(tokens, kinds);
+
+    int n = tokens->count();
+    int segStart = 0;
+    int connector = 0;   // 0 = first segment, 1 = after &&, 2 = after ||
+    while (segStart <= n && gRunning)
+    {
+        if (segStart == n) break;
+        int j = segStart;
+        while (j < n)
+        {
+            if (kinds->get(j) == 1
+                && (eqCI(tokens->get(j), "&&") || eqCI(tokens->get(j), "||")))
+                break;
+            j++;
+        }
+
+        bool run = true;
+        if (connector == 1 && gLastExit != 0) run = false;
+        if (connector == 2 && gLastExit == 0) run = false;
+        if (run)
+        {
+            if (segStart >= j)
+            {
+                printf("fsh: empty command in chain\n");
+                gLastExit = 1;
+            }
+            else
+            {
+                gLastExit = runPipeline(tokens, kinds, segStart, j);
+            }
+        }
+
+        if (j < n) connector = eqCI(tokens->get(j), "&&") ? 1 : 2;
+        segStart = j + 1;
+    }
+
+    delete tokens;
+    delete kinds;
+}
+
+// ── REPL ──────────────────────────────────────────────────────────────────────
+
+extern int main(int argc, char** argv)
+{
+    // fsh is interactive: its line editor reads keystrokes with _getch(), which
+    // only blocks on a real console. With redirected stdin (a pipe or file) the
+    // read loop would spin forever, so refuse to run rather than flood output.
+    if (!stdinIsConsole())
+    {
+        printf("fsh: stdin is not an interactive console; fsh needs a real terminal.\n");
+        return 1;
+    }
+
+    gHistory     = new list<string>;
+    gAliasNames  = new list<string>;
+    gAliasValues = new list<string>;
+    gJobs        = new list<Job*>;
+
+    enableVT();
+    loadHistory();
+
+    printf("Flat Shell (fsh) v1.0  (type 'help' for commands, 'exit' to quit)\n\n");
+
+    while (gRunning)
+    {
+        reapJobs();
+        printPrompt();
+
+        bool eof = false;
+        string line = readLine(&eof);
+        if (eof) break;
+
+        string trimmed = line.trim();
+        if (trimmed.length() == 0) continue;
+
+        string histCopy = "" + trimmed;
+        gHistory->add(histCopy);
+        appendHistory(trimmed);
+
+        string expanded = expandEnv(trimmed);
+        executeLine(expanded);
+    }
+
+    return gExitCode;
+}

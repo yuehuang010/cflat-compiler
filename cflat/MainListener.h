@@ -1538,6 +1538,9 @@ private:
     // carries the cast TypeAndValue when the primary is a parenthesized cast expression,
     // enabling ((Struct*)ptr)->field member access without a named intermediate variable.
     LLVMBackend::TypeAndValue lastParenExprType;
+    // Companion to lastParenExprType: the storage (lvalue address) of a parenthesized
+    // expression, so postfix ++/-- on a parenthesized lvalue (e.g. '(*p)++') can write back.
+    llvm::Value* lastParenExprStorage = nullptr;
 
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
@@ -9480,6 +9483,10 @@ public:
                             PlusPlus[namedVar.Storage].first++;
                             PlusPlus[namedVar.Storage].second = et;
                         }
+                        else
+                        {
+                            LogErrorContext(ctx, "'++' requires an addressable operand (a variable, field, element, or dereferenced pointer)");
+                        }
                         break;
                     }
                     case CFlatParser::MinusMinus:
@@ -9497,6 +9504,10 @@ public:
                             }
                             PlusPlus[namedVar.Storage].first--;
                             PlusPlus[namedVar.Storage].second = et;
+                        }
+                        else
+                        {
+                            LogErrorContext(ctx, "'--' requires an addressable operand (a variable, field, element, or dereferenced pointer)");
                         }
                         break;
                     }
@@ -9956,7 +9967,12 @@ public:
                             // so that chained member access (e.g. ((Struct*)ptr)->field) works.
                             if (prevPrimary->expression() != nullptr && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
+                            // A parenthesized lvalue keeps its storage so postfix ++/-- can write
+                            // back to it (e.g. '(*p)++' increments the pointee, not a temp copy).
+                            if (prevPrimary->expression() != nullptr)
+                                namedVar.Storage = lastParenExprStorage;
                             lastParenExprType = {};
+                            lastParenExprStorage = nullptr;
 
                             // A parenthesized expression yielding a by-VALUE known struct
                             // (e.g. `((string)buf)`) has its value in Primary but no addressable
@@ -12638,6 +12654,7 @@ public:
             auto nv = ParseAssignmentExpressionNamed(expressionCtx->assignmentExpression());
             ProcessPlusPlus();
             lastParenExprType = nv.TypeAndValue;
+            lastParenExprStorage = nv.Storage;
             return LoadNamedVariable(nv);
         }
         else if (stringLiteral.size() > 0)

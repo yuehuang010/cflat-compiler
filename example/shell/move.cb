@@ -1,0 +1,19 @@
+// move.cb - move a file.
+//
+// Build: x64/Debug/cflat.exe example/shell/move.cb -o out/move.exe
+// Run:   out\move.exe src dst
+
+import "filesystem.cb";
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 3) { printf("Usage: move <src> <dst>\n"); return 1; }
+    string src = (string)argv[1];
+    string dst = (string)argv[2];
+    if (!File.move(src, dst))
+    {
+        printf("Failed to move '%s' to '%s'\n", src.data(), dst.data());
+        return 1;
+    }
+    return 0;
+}

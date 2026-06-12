@@ -1,0 +1,13 @@
+// pwd.cb - print the current working directory.
+//
+// Build: x64/Debug/cflat.exe example/shell/pwd.cb -o out/pwd.exe
+// Run:   out\pwd.exe
+
+import "filesystem.cb";
+
+extern int main(int argc, char** argv)
+{
+    string cwd = Directory.getCurrent();
+    printf("%s\n", cwd.data());
+    return 0;
+}

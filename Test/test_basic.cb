@@ -1398,9 +1398,29 @@ bool testGlobalStructPtrMethod()
 // Overload resolution tests (float, string types)
 // =============================================================
 
+// Regression: a struct method must not win overload resolution for a free call
+// whose argument is a primitive pointer. With opaque pointers, readBack(&boolVar)
+// once resolved to ReadBackBox.readBack() with the bool* bound as 'this' (the
+// fsh shell's readLine(&eof) silently called File.readLine on a stack bool).
+struct ReadBackBox
+{
+    void* _handle = nullptr;
+    int readBack() { return -1; }
+};
+
+int readBack(bool* flag)
+{
+    *flag = true;
+    return 7;
+}
+
 bool testOverloadResolution()
 {
     bool result = true;
+
+    bool flag = false;
+    result &= Test("free fn beats method this", readBack(&flag), 7);
+    result &= Test("free fn wrote through ptr", flag, true);
     result &= Test("int overload",        42,    42);
     result &= Test("bool overload",       true,  true);
     result &= Test("char* overload",      "hello", "hello");
@@ -2293,6 +2313,8 @@ extern int main()
 // Pointer arithmetic tests
 // =============================================================
 
+void incThroughPtr(int* p) { (*p)++; }
+
 bool testPointerArithmetic()
 {
     bool result = true;
@@ -2325,6 +2347,17 @@ bool testPointerArithmetic()
     // p-- decrements by sizeof(int)
     p--;
     result &= Test("int* p-- elem", *p, 20);
+
+    // (*p)++ / (*p)-- increment the POINTEE, not the pointer. Regression: the
+    // parenthesized deref lost its storage, so the increment silently no-op'd
+    // (fsh's edInsert (*len)++ never advanced and the line editor dropped keys).
+    (*p)++;
+    result &= Test("(*p)++ pointee", arr[1], 21);
+    result &= Test("(*p)++ ptr unmoved", *p, 21);
+    (*p)--;
+    result &= Test("(*p)-- pointee", arr[1], 20);
+    incThroughPtr(&arr[2]);
+    result &= Test("(*param)++ writes back", arr[2], 31);
 
     // p += n
     int* q = arr;

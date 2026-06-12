@@ -1,0 +1,80 @@
+// where.cb - locate a command in the current directory and on %PATH%.
+//
+// Searches the current directory first, then each %PATH% entry. A name with an
+// extension is checked as-is; a bare name is probed with .exe/.bat/.cmd.
+//
+// Build: x64/Debug/cflat.exe example/shell/where.cb -o out/where.exe
+// Run:   out\where.exe cmd
+
+import "filesystem.cb";
+
+extern stdcall i32 GetEnvironmentVariableA(const char* name, char* buf, i32 size);
+
+// Make an owned string from a raw buffer (copies len bytes).
+string makeString(i8* buf, int len)
+{
+    i8* nb = new i8[len + 1];
+    int i = 0;
+    while (i < len) { nb[i] = buf[i]; i++; }
+    nb[len] = 0;
+    string s;
+    s._ptr = nb;
+    s._len = len;
+    return s;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 2) { printf("Usage: where <command>\n"); return 1; }
+    string name = (string)argv[1];
+    bool hasExt = name.indexOf((i8)'.') >= 0;
+
+    // Search order: current directory, then each %PATH% entry.
+    list<string> dirs;
+    dirs.add(Directory.getCurrent());
+    i8* pbuf = new i8[32768];
+    i32 plen = GetEnvironmentVariableA("PATH", pbuf, 32768);
+    if (plen > 0 && plen < 32768)
+    {
+        string pathVar = makeString(pbuf, (int)plen);
+        list<string> parts = pathVar.split((i8)';');
+        int i = 0;
+        while (i < parts.count())
+        {
+            string d = parts.get(i).trim();
+            if (d.length() > 0) dirs.add(d);
+            i++;
+        }
+    }
+    delete[] pbuf;
+
+    bool found = false;
+    int d = 0;
+    while (d < dirs.count())
+    {
+        int e = 0;
+        while (e < 4)
+        {
+            string candidate = dirs.get(d) + "\\" + name;
+            if (e == 1) candidate = candidate + ".exe";
+            if (e == 2) candidate = candidate + ".bat";
+            if (e == 3) candidate = candidate + ".cmd";
+            // A name with an extension is checked as-is only; one without
+            // skips the bare check.
+            bool check = hasExt ? e == 0 : e != 0;
+            if (check && File.isFile(candidate))
+            {
+                printf("%s\n", candidate.data());
+                found = true;
+            }
+            e++;
+        }
+        d++;
+    }
+    if (!found)
+    {
+        printf("INFO: Could not find '%s'.\n", name.data());
+        return 1;
+    }
+    return 0;
+}

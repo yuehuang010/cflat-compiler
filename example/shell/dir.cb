@@ -1,0 +1,55 @@
+// dir.cb - list directory contents (cmd.exe-style).
+//
+// Build: x64/Debug/cflat.exe example/shell/dir.cb -o out/dir.exe
+// Run:   out\dir.exe [path]
+
+import "filesystem.cb";
+
+extern int main(int argc, char** argv)
+{
+    string path = argc >= 2 ? (string)argv[1] : Directory.getCurrent();
+    string absPath = Path.getAbsolute(path);
+
+    string pattern = absPath + "\\*";
+    os.windows._WIN32_FIND_DATAA* fd = new os.windows._WIN32_FIND_DATAA;
+    void* handle = os.windows.FindFirstFileA(pattern.data(), fd);
+    if (handle == (void*)(i64)-1)
+    {
+        printf("File Not Found\n");
+        delete fd;
+        return 1;
+    }
+
+    printf(" Directory of %s\n\n", absPath.data());
+
+    int fileCount = 0;
+    int dirCount  = 0;
+    i64 totalBytes = 0;
+
+    do {
+        i8* name  = fd->cFileName;
+        bool isDir = (fd->dwFileAttributes & 16) != 0;
+        bool isDot = strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+
+        if (isDot) { }
+        else if (isDir)
+        {
+            printf("%-40s <DIR>\n", name);
+            dirCount++;
+        }
+        else
+        {
+            i64 size = ((i64)(u32)fd->nFileSizeHigh << 32) | (i64)(u32)fd->nFileSizeLow;
+            printf("%-40s %12lld\n", name, size);
+            totalBytes += size;
+            fileCount++;
+        }
+    } while (os.windows.FindNextFileA(handle, fd) != 0);
+
+    os.windows.FindClose(handle);
+    delete fd;
+
+    printf("\n  %d file(s)   %lld bytes\n", fileCount, totalBytes);
+    printf("  %d dir(s)\n", dirCount);
+    return 0;
+}

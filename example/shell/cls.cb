@@ -1,0 +1,10 @@
+// cls.cb - clear the screen via ANSI escapes.
+//
+// Build: x64/Debug/cflat.exe example/shell/cls.cb -o out/cls.exe
+// Run:   out\cls.exe
+
+extern int main(int argc, char** argv)
+{
+    printf("\033[2J\033[H");
+    return 0;
+}

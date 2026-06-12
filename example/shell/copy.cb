@@ -1,0 +1,20 @@
+// copy.cb - copy a file.
+//
+// Build: x64/Debug/cflat.exe example/shell/copy.cb -o out/copy.exe
+// Run:   out\copy.exe src dst
+
+import "filesystem.cb";
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 3) { printf("Usage: copy <src> <dst>\n"); return 1; }
+    string src = (string)argv[1];
+    string dst = (string)argv[2];
+    if (!File.copy(src, dst))
+    {
+        printf("Failed to copy '%s' to '%s'\n", src.data(), dst.data());
+        return 1;
+    }
+    printf("        1 file(s) copied.\n");
+    return 0;
+}
