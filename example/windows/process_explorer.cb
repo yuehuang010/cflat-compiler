@@ -1,0 +1,105 @@
+// process_explorer: a tiny tasklist clone for Windows.
+//
+// Enumerates all running processes with the Toolhelp32 snapshot API, collects
+// them into CFlat containers, sorts them, and prints formatted columns:
+// PID, parent PID, parent exe name, thread count, exe name.
+//
+// Build & run:
+//   x64/Debug/cflat.exe example/windows/process_explorer.cb -o out/process_explorer.exe
+//   out\process_explorer.exe
+//
+// windows.h + tlhelp32.h are bound as ONE group: tlhelp32.h is not self-contained (it uses
+// HANDLE/DWORD without including the header that defines them), so windows.h must be included
+// first in the same translation unit. The `cache` clause persists the extracted decls.
+import {"windows.h", "tlhelp32.h"} cache;   // PROCESSENTRY32 + CreateToolhelp32Snapshot/Process32First/Next
+import "string.cb";
+import "list.cb";
+import "dictionary.cb";
+
+// PROCESSENTRY32 (ANSI, 304 bytes incl. szExeFile[260]) and the
+// CreateToolhelp32Snapshot / Process32First / Process32Next functions are all
+// registered directly from the grouped tlhelp32.h import above - no hand-written
+// struct or externs needed.
+
+// One row of the final table.
+struct ProcInfo
+{
+    u32 pid = default;
+    u32 ppid = default;
+    u32 threads = default;
+    string name = default;
+};
+
+bool byNameThenPid(ProcInfo a, ProcInfo b)
+{
+    if (a.name == b.name)
+        return a.pid < b.pid;
+    return a.name < b.name;
+}
+
+extern int main()
+{
+    // Kernel pseudo-processes have no exe image; give them friendly names.
+    // (dictionary brace init: key: value pairs.)
+    dictionary<u32, string> wellKnown = {0: "[System Idle]", 4: "[System]"};
+
+    void* snap = CreateToolhelp32Snapshot((u32)TH32CS_SNAPPROCESS, 0u);
+    if (snap == INVALID_HANDLE_VALUE) {
+        printf("CreateToolhelp32Snapshot failed (error %u)\n", GetLastError());
+        return 1;
+    }
+
+    list<ProcInfo> procs;
+    dictionary<u32, string> nameByPid;   // pid -> exe name, for the parent column
+
+    PROCESSENTRY32 pe = default;
+    pe.dwSize = (u32)sizeof(PROCESSENTRY32);
+    i32 ok = Process32First(snap, &pe);
+    while (ok != 0) {
+        ProcInfo info;
+        info.pid = pe.th32ProcessID;
+        info.ppid = pe.th32ParentProcessID;
+        info.threads = pe.cntThreads;
+        // szExeFile is a C char array; toString() copies its bytes into an owned
+        // string. pe reuses the buffer each iteration, so the owned copy is what
+        // keeps the row's name stable.
+        info.name = pe.szExeFile.toString();
+        if (wellKnown.contains(info.pid)) {
+            // Kernel pseudo-processes report unhelpful image names; override.
+            info.name = wellKnown.get(info.pid).copy();
+        }
+        nameByPid.set(info.pid, info.name.copy());
+        procs.add(info);
+        ok = Process32Next(snap, &pe);
+    }
+    CloseHandle(snap);
+    procs.sort(byNameThenPid);
+
+    printf("%-7s %-7s %-26s %8s  %s\n", "PID", "PPID", "PARENT NAME", "THREADS", "NAME");
+    printf("%-7s %-7s %-26s %8s  %s\n", "-----", "-----", "-----------", "-------", "----");
+
+    u32 totalThreads = 0;
+    for (ProcInfo p in procs) {
+        string parentName = "?";
+        if (nameByPid.contains(p.ppid))
+            parentName = nameByPid.get(p.ppid);
+        printf("%-7u %-7u %-26s %8u  %s\n",
+               p.pid, p.ppid, parentName.data(), p.threads, p.name.data());
+        totalThreads = totalThreads + p.threads;
+    }
+
+    // Small thread-count histogram, using positional fixed-size array init.
+    u32[4] limit = {9u, 49u, 199u, 0xFFFFFFFFu};
+    u32[4] bucket = {0u, 0u, 0u, 0u};
+    for (ProcInfo p in procs) {
+        int b = 0;
+        while (p.threads > limit[b])
+            b++;
+        bucket[b] = bucket[b] + 1u;
+    }
+    printf("\nthreads/process: <=9: %u   10-49: %u   50-199: %u   200+: %u\n",
+           bucket[0], bucket[1], bucket[2], bucket[3]);
+
+    printf("%d processes, %u threads total\n", procs.count(), totalThreads);
+    return procs.count() > 0 ? 0 : 1;
+}

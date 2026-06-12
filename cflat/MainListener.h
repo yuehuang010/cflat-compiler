@@ -5629,6 +5629,34 @@ public:
                 compiler->lastCallReturnsOwned = false;
             }
 
+            // Implicit char* -> string coercion on assignment: `s = "lit";` / `s = charPtr;`
+            // and the struct-field form `r.name = buf;`. Mirrors the declaration initializer
+            // path (ParseDeclaration) so assigning a raw c-string to an EXISTING string runs
+            // through operator string(const char*) - which sets _ptr AND _len = strlen(s) -
+            // instead of storing the bare pointer with _len left 0. The resulting wrap is
+            // non-owning, identical to the initializer form. Fires only when the LHS is a
+            // non-pointer string and the RHS loaded to a raw i8*; string-to-string and all
+            // other assignments are untouched.
+            if (operatorText == "=" && right && NamedVarIsString(namedVar)
+                && !namedVar.TypeAndValue.Pointer
+                && right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+            {
+                auto* c = llvm::dyn_cast<llvm::Constant>(right);
+                if (c && compiler->IsStringLiteralConstant(c))
+                    right = compiler->WrapStringLiteralAsString(right);
+                else if (compiler->GetFunction("operator string"))
+                {
+                    LLVMBackend::NamedVariable argNV;
+                    argNV.Primary = right;
+                    argNV.BaseType = right->getType();
+                    argNV.TypeAndValue.TypeName = "char";
+                    argNV.TypeAndValue.Pointer = true;
+                    right = compiler->CreateOverloadedFunctionCall("operator string", { argNV });
+                }
+                else
+                    right = compiler->WrapStringLiteralAsString(right);
+            }
+
             // Wrap named function in closure fat struct when assigning to a function<T> variable.
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
                 && right && !right->getType()->isStructTy())
@@ -11236,6 +11264,60 @@ public:
                         }
                         else
                         {
+                            // UFCS on a `char*` / `char[N]` receiver: decay the receiver to an i8*
+                            // and bind it as the `self` argument so `p.toString()` dispatches to a
+                            // free function `toString(char* self)`. A `char[N]` receiver decays to a
+                            // pointer to its first element (the array alloca address), mirroring how a
+                            // char array decays in argument position. Scoped to a `char` element type
+                            // and gated on an actual `char* self` candidate, so a char* never
+                            // coerce-matches a `string self` overload (the inbound char*->string wrap
+                            // stays out of method-receiver binding). Runs before the integer/float
+                            // primitive intercept below because a `char` pointer is "integer-like" by
+                            // TypeName yet must not be treated as a scalar value receiver.
+                            if (!structVar.BaseType && !primaryIdentifier.empty()
+                                && namedVar.TypeAndValue.TypeName == "char")
+                            {
+                                bool charPtrRecv = namedVar.TypeAndValue.Pointer
+                                    && !namedVar.TypeAndValue.IsArrayView;
+                                bool charArrRecv = !namedVar.TypeAndValue.Pointer
+                                    && namedVar.TypeAndValue.ConstArraySize > 0
+                                    && namedVar.Storage != nullptr;
+
+                                auto hasCharPtrSelf = [&]() -> bool {
+                                    auto it = Compiler(ctx)->functionTable.find(primaryIdentifier);
+                                    if (it == Compiler(ctx)->functionTable.end()) return false;
+                                    for (const auto& sym : it->second)
+                                        if (!sym.Parameters.empty()
+                                            && sym.Parameters[0].TypeName == "char"
+                                            && sym.Parameters[0].Pointer)
+                                            return true;
+                                    return false;
+                                };
+
+                                if ((charPtrRecv || charArrRecv) && hasCharPtrSelf())
+                                {
+                                    // Array alloca address already points at element 0 (opaque ptr);
+                                    // a char* receiver loads its stored pointer value.
+                                    llvm::Value* charPtr = charArrRecv
+                                        ? namedVar.Storage
+                                        : (namedVar.Storage ? Compiler(ctx)->CreateLoad(namedVar.Storage)
+                                                            : namedVar.Primary);
+                                    if (charPtr != nullptr)
+                                    {
+                                        // Mirror a normal char* argument: leave TypeName empty so
+                                        // overload scoring routes through CompareUpconvert on the
+                                        // pointer BaseType (a `char` TypeName would let the integer-rank
+                                        // path perfect-match a scalar i8/char param). Pointer flag is
+                                        // carried for accuracy; the scorer keys off BaseType here.
+                                        LLVMBackend::NamedVariable selfArg;
+                                        selfArg.Primary  = charPtr;
+                                        selfArg.BaseType = charPtr->getType();
+                                        selfArg.TypeAndValue.Pointer = true;
+                                        structVar = selfArg;
+                                    }
+                                }
+                            }
+
                             // Intercept primitive method calls:
                             //   float/double: f.round(), (-2.5f).abs(), etc.
                             //   integer:      x.to_i32(), n.to_u64(), etc.

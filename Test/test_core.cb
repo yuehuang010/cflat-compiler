@@ -772,6 +772,8 @@ int testDictRehash()
 
 // ── string / stringbuilder / string_view ─────────────────────────────────────
 
+struct StringRow { string name = default; };
+
 int testString()
 {
     int passed = 0;
@@ -800,6 +802,44 @@ int testString()
 
     sb.clear();
     passed += Test("sb after clear length", sb.length(), 0);
+
+    // char* -> string coercion must apply on ASSIGNMENT to an existing string, not just
+    // on initialization: `s = buf;` and `r.name = buf;` must route through operator
+    // string(const char*) so _len = strlen(buf), not stay 0 (raw-pointer store bug).
+    char[16] cbuf = {'a', 'b', 'c', '\0'};
+
+    string assignInit = cbuf;
+    passed += Test("char* init length", assignInit.length(), 3);
+
+    string assignLocal = default;
+    assignLocal = cbuf;
+    passed += Test("char* assign local length", assignLocal.length(), 3);
+    passed += Test("char* assign local data",   assignLocal.data(),   "abc");
+
+    StringRow row;
+    row.name = cbuf;
+    passed += Test("char* assign field length", row.name.length(), 3);
+    passed += Test("char* assign field data",   row.name.data(),   "abc");
+
+    // Method-call syntax on a char* / char[N] receiver dispatches to
+    // toString(const char* self), yielding an OWNED string copy of the C bytes.
+    char* litPtr = "abc";
+    string fromPtr = litPtr.toString();
+    passed += Test("char* toString length", fromPtr.length(), 3);
+    passed += Test("char* toString data",   fromPtr.data(),   "abc");
+
+    char[16] mbuf = {'a', 'b', 'c', '\0'};
+    string fromArr = mbuf.toString();
+    passed += Test("char[N] toString length", fromArr.length(), 3);
+    passed += Test("char[N] toString data",   fromArr.data(),   "abc");
+
+    // The call copies the bytes and leaves the source buffer untouched.
+    passed += Test("char[N] toString source intact", (int)mbuf[0], (int)'a');
+
+    // The result is owned: mutating the source after the call must not change it
+    // (a non-owning wrap would alias the buffer and change with it).
+    mbuf[0] = 'Z';
+    passed += Test("char[N] toString owned", fromArr.data(), "abc");
 
     return passed;
 }
@@ -1494,7 +1534,7 @@ extern int main()
     r = testStack();            passed += r; total += 8;
     r = testQueue();            passed += r; total += 8;
     r = testFor();              passed += r; total += 10;
-    r = testString();           passed += r; total += 11;
+    r = testString();           passed += r; total += 22;
     r = testStringConcat();     passed += r; total += 10;
     r = testStringIString();    passed += r; total += 4;
     r = testStringInterpolation(); passed += r; total += 6;

@@ -155,6 +155,19 @@ move string toString(i64 self, i32 base)
     return result;
 }
 
+// Owned string copy of a NUL-terminated C string; the source buffer is not
+// consumed or freed - the bytes are copied and the caller owns the result. Reach
+// it with method-call syntax on a char* / char[N] receiver: `pe.szExeFile.toString()`.
+// (`char*` and `const char*` are the same type to the compiler - TypeName "char";
+// the const is a documentation-only qualifier, matching operator string below.)
+move string toString(const char* self)
+{
+    string borrowed = default;
+    borrowed._ptr = self;
+    borrowed._len = strlen(self);
+    return borrowed.copy();
+}
+
 // ── operator string conversions (internal interpolation/coercion hook) ───────
 //
 // These are used by the compiler for string interpolation "{x}" and for
