@@ -13,7 +13,7 @@ if errorlevel 1 (
 )
 where code >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: 'code' (VSCode CLI) not found on PATH.
+    echo ERROR: 'code' ^(VSCode CLI^) not found on PATH.
     echo        Ensure VSCode is installed and "code" is added to PATH.
     echo        In VSCode: Ctrl+Shift+P -> "Shell Command: Install 'code' command in PATH"
     exit /b 1
@@ -74,7 +74,7 @@ if errorlevel 1 (
 echo.
 echo === Extension installed successfully! ===
 echo   Name   : %VSIX_FILE%
-echo   Reload VSCode (Ctrl+Shift+P -> "Developer: Reload Window") to activate.
+echo   Reload VSCode ^(Ctrl+Shift+P -^> "Developer: Reload Window"^) to activate.
 echo.
 echo TIP: After reloading, open a .cb file to activate the language server.
 echo      Set cflat.executablePath in Settings if auto-detect doesn't find your build.

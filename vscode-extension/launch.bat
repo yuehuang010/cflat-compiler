@@ -9,7 +9,7 @@ REM Check for VSCode
 where code >nul 2>&1
 if errorlevel 1 (
     echo ERROR: 'code' not found on PATH.
-    echo        In VSCode: Ctrl+Shift+P -> "Shell Command: Install 'code' command in PATH"
+    echo        In VSCode: Ctrl+Shift+P -^> "Shell Command: Install 'code' command in PATH"
     exit /b 1
 )
 
@@ -53,7 +53,7 @@ echo VSCode launched. A new window should appear momentarily.
 echo.
 echo Tips:
 echo   - Open a .cb file to activate the language server.
-echo   - View -> Output -> "cflat Language Server" to see server logs.
+echo   - View -^> Output -^> "cflat Language Server" to see server logs.
 echo   - Press F5 inside the extension source to attach the debugger (port 6009).
 echo   - Run build.bat and restart VSCode to pick up code changes.
 echo.
