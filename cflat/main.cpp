@@ -248,6 +248,9 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
         else
         {
             std::cout << "'" << term << "': no exact match.\n";
+            if (!tempPath.empty())
+                std::cout << "  (no source file given, only showing symbols from core libraries; "
+                             "pass a .cb that imports your headers to search them)\n";
             PrintSymbolSuggestions(index, term);
         }
     }

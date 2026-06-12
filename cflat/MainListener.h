@@ -10148,8 +10148,21 @@ public:
                             // Check BaseType first so pointer-element arrays (char*[N]) don't fall
                             // into the pointer-arithmetic branch below.
                             llvm::Value* zero = Compiler(ctx)->builder->getInt64(0);
-                            namedVar.Storage = Compiler(ctx)->builder->CreateGEP(
+                            llvm::Value* elemPtr = Compiler(ctx)->builder->CreateGEP(
                                 arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr");
+                            // When the array lives in a GLOBAL, the base pointer is a constant, so a
+                            // constant index (e.g. g[0], whose all-zero GEP is a no-op) folds the GEP
+                            // back into a Constant - the GlobalVariable itself or a ConstantExpr. Such
+                            // a result loses element-type provenance: every consumer that recovers the
+                            // type from storage (GetTypeFromStorage, used by load and store) would then
+                            // see the whole [N x T] aggregate, not the element type. Force a real GEP
+                            // instruction so the element type is recoverable, matching how a local
+                            // array (alloca base, never folded) already behaves.
+                            if (llvm::isa<llvm::Constant>(elemPtr))
+                                elemPtr = Compiler(ctx)->builder->Insert(
+                                    llvm::GetElementPtrInst::CreateInBounds(
+                                        arrTy, namedVar.Storage, {zero, rvalue}, "arrayelemptr"));
+                            namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
                         }

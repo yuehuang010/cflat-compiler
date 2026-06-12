@@ -1,0 +1,434 @@
+// Minesweeper - a native Win32 GUI game written in CFlat.
+//
+// A classic 9x9 / 10-mine Minesweeper rendered with GDI in a real window:
+//   - Left-click  : reveal a cell (flood-fills empty regions)
+//   - Right-click : toggle a flag
+//   - F2          : new game (also: click anywhere after the game ends)
+// First click is always safe - mines are placed after the first reveal.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/customer/minesweeper-win32/main.cb -i Test/library -o example/customer/minesweeper-win32/app.exe
+//   example\customer\minesweeper-win32\app.exe
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "random.cb";
+import "array.cb";
+
+// -- Board constants --------------------------------------------------------
+const int BOARD_W    = 9;
+const int BOARD_H    = 9;
+const int MINE_COUNT = 10;
+const int CELL       = 32;    // pixels per cell
+const int HEADER_H   = 44;    // status bar height in pixels
+
+// -- Game state -------------------------------------------------------------
+// Flat arrays indexed by (row * BOARD_W + col).
+//   g_state  - 0 = hidden, 1 = revealed, 2 = flagged
+//   g_mines  - 0 = safe,   1 = mine
+//   g_counts - neighbouring mine count (0-8)
+// NOTE: these are heap-backed `array<int>` containers, initialised in main().
+// Global *fixed-size* arrays (`int[N] g = default;`) miscompile today - see the
+// friction report - so we use the standard-library container instead.
+array<int> g_state  = default;
+array<int> g_mines  = default;
+array<int> g_counts = default;
+
+int    g_flagsLeft  = 0;
+int    g_revealed   = 0;
+bool   g_gameOver   = false;
+bool   g_won        = false;
+bool   g_firstClick = true;
+Random g_rng        = default;
+
+// -- Helpers ----------------------------------------------------------------
+int idx(int col, int row) { return row * BOARD_W + col; }
+
+bool inBounds(int col, int row)
+{
+    return col >= 0 && col < BOARD_W && row >= 0 && row < BOARD_H;
+}
+
+// RGB(r,g,b) packed the way GDI wants it (0x00BBGGRR).
+u32 rgb(int r, int g, int b)
+{
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+// -- Mine placement ---------------------------------------------------------
+void placeMines(int safeCol, int safeRow)
+{
+    int placed = 0;
+    while (placed < MINE_COUNT)
+    {
+        int c = g_rng.nextInt(0, BOARD_W - 1);
+        int r = g_rng.nextInt(0, BOARD_H - 1);
+        // Keep a 3x3 safe zone around the first click.
+        if (c >= safeCol - 1 && c <= safeCol + 1 &&
+            r >= safeRow - 1 && r <= safeRow + 1) continue;
+        if (g_mines.get(idx(c, r)) != 0) continue;
+        g_mines.set(idx(c, r), 1);
+        placed++;
+    }
+
+    int row = 0;
+    while (row < BOARD_H)
+    {
+        int col = 0;
+        while (col < BOARD_W)
+        {
+            int count = 0;
+            int dr = -1;
+            while (dr <= 1)
+            {
+                int dc = -1;
+                while (dc <= 1)
+                {
+                    if ((dr != 0 || dc != 0) &&
+                        inBounds(col + dc, row + dr) &&
+                        g_mines.get(idx(col + dc, row + dr)) != 0)
+                        count++;
+                    dc++;
+                }
+                dr++;
+            }
+            g_counts.set(idx(col, row), count);
+            col++;
+        }
+        row++;
+    }
+}
+
+// -- Flood reveal -----------------------------------------------------------
+void floodReveal(int col, int row)
+{
+    if (!inBounds(col, row)) return;
+    if (g_state.get(idx(col, row)) != 0) return;   // revealed or flagged
+    g_state.set(idx(col, row), 1);
+    g_revealed++;
+    if (g_counts.get(idx(col, row)) != 0) return;  // stop at numbered cells
+    int dr = -1;
+    while (dr <= 1)
+    {
+        int dc = -1;
+        while (dc <= 1)
+        {
+            if (dr != 0 || dc != 0)
+                floodReveal(col + dc, row + dr);
+            dc++;
+        }
+        dr++;
+    }
+}
+
+void reveal(int col, int row)
+{
+    if (!inBounds(col, row)) return;
+    if (g_state.get(idx(col, row)) != 0) return;   // flagged or revealed
+
+    if (g_firstClick)
+    {
+        g_firstClick = false;
+        placeMines(col, row);
+    }
+
+    if (g_mines.get(idx(col, row)) != 0)
+    {
+        g_state.set(idx(col, row), 1);
+        g_gameOver = true;
+        return;
+    }
+
+    floodReveal(col, row);
+
+    if (g_revealed == BOARD_W * BOARD_H - MINE_COUNT)
+    {
+        g_won = true;
+        g_gameOver = true;
+    }
+}
+
+void toggleFlag(int col, int row)
+{
+    if (!inBounds(col, row)) return;
+    int s = g_state.get(idx(col, row));
+    if (s == 1) return;   // revealed - cannot flag
+    if (s == 2)
+    {
+        g_state.set(idx(col, row), 0);
+        g_flagsLeft++;
+    }
+    else
+    {
+        g_state.set(idx(col, row), 2);
+        g_flagsLeft--;
+    }
+}
+
+void resetGame()
+{
+    int total = BOARD_W * BOARD_H;
+    int i = 0;
+    while (i < total)
+    {
+        g_state.set(i, 0);
+        g_mines.set(i, 0);
+        g_counts.set(i, 0);
+        i++;
+    }
+    g_flagsLeft  = MINE_COUNT;
+    g_revealed   = 0;
+    g_gameOver   = false;
+    g_won        = false;
+    g_firstClick = true;
+}
+
+// -- Rendering --------------------------------------------------------------
+// Classic Minesweeper number colours.
+u32 numberColor(int n)
+{
+    if (n == 1) return rgb(0, 0, 255);
+    if (n == 2) return rgb(0, 130, 0);
+    if (n == 3) return rgb(220, 0, 0);
+    if (n == 4) return rgb(0, 0, 128);
+    if (n == 5) return rgb(128, 0, 0);
+    if (n == 6) return rgb(0, 128, 128);
+    if (n == 7) return rgb(30, 30, 30);
+    return rgb(128, 128, 128);
+}
+
+// Draw a 1px frame around rc in the given colour.
+void frame(void* hdc, RECT* rc, u32 color)
+{
+    void* br = CreateSolidBrush(color);
+    FrameRect(hdc, rc, br);
+    DeleteObject(br);
+}
+
+// Fill rc solid with the given colour.
+void fill(void* hdc, RECT* rc, u32 color)
+{
+    void* br = CreateSolidBrush(color);
+    FillRect(hdc, rc, br);
+    DeleteObject(br);
+}
+
+void drawCenteredText(void* hdc, RECT* rc, char* text, u32 color)
+{
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, color);
+    DrawTextA(hdc, text, -1, rc,
+              (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE));
+}
+
+void drawCell(void* hdc, int col, int row)
+{
+    int x = col * CELL;
+    int y = HEADER_H + row * CELL;
+
+    RECT rc = default;
+    rc.left   = x;
+    rc.top    = y;
+    rc.right  = x + CELL;
+    rc.bottom = y + CELL;
+
+    int s     = g_state.get(idx(col, row));
+    int mine  = g_mines.get(idx(col, row));
+    int count = g_counts.get(idx(col, row));
+
+    if (s == 1)
+    {
+        // Revealed.
+        if (mine != 0)
+        {
+            fill(hdc, &rc, rgb(200, 40, 40));   // hit mine
+            drawCenteredText(hdc, &rc, "*", rgb(255, 255, 255));
+        }
+        else
+        {
+            fill(hdc, &rc, rgb(210, 210, 210));
+            if (count != 0)
+            {
+                char[2] buf = default;
+                buf[0] = (char)('0' + count);
+                buf[1] = (char)0;
+                drawCenteredText(hdc, &rc, &buf[0], numberColor(count));
+            }
+        }
+        frame(hdc, &rc, rgb(160, 160, 160));
+    }
+    else
+    {
+        // Hidden or flagged. After game over reveal unflagged mines.
+        if (g_gameOver && mine != 0 && s != 2)
+        {
+            fill(hdc, &rc, rgb(190, 190, 190));
+            drawCenteredText(hdc, &rc, "*", rgb(40, 40, 40));
+        }
+        else
+        {
+            fill(hdc, &rc, rgb(170, 170, 170));
+            if (s == 2)
+                drawCenteredText(hdc, &rc, "F", rgb(200, 0, 0));
+        }
+        frame(hdc, &rc, rgb(120, 120, 120));
+    }
+}
+
+void paint(void* hwnd)
+{
+    PAINTSTRUCT ps = default;
+    void* hdc = BeginPaint(hwnd, &ps);
+
+    // Header background.
+    RECT hr = default;
+    hr.left   = 0;
+    hr.top    = 0;
+    hr.right  = BOARD_W * CELL;
+    hr.bottom = HEADER_H;
+    fill(hdc, &hr, rgb(60, 60, 70));
+
+    // Status text.
+    char[64] status = default;
+    if (g_won)
+        wsprintfA(&status[0], "YOU WIN!  Mines: %d", g_flagsLeft);
+    else if (g_gameOver)
+        wsprintfA(&status[0], "GAME OVER - F2 to restart");
+    else
+        wsprintfA(&status[0], "Mines left: %d   (F2 = new game)", g_flagsLeft);
+
+    RECT tr = default;
+    tr.left   = 10;
+    tr.top    = 0;
+    tr.right  = BOARD_W * CELL;
+    tr.bottom = HEADER_H;
+    u32 statusColor = rgb(255, 255, 255);
+    if (g_won) statusColor = rgb(120, 255, 120);
+    else if (g_gameOver) statusColor = rgb(255, 140, 140);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, statusColor);
+    DrawTextA(hdc, &status[0], -1, &tr,
+              (u32)(DT_LEFT | DT_VCENTER | DT_SINGLELINE));
+
+    // Board.
+    int row = 0;
+    while (row < BOARD_H)
+    {
+        int col = 0;
+        while (col < BOARD_W)
+        {
+            drawCell(hdc, col, row);
+            col++;
+        }
+        row++;
+    }
+
+    EndPaint(hwnd, &ps);
+}
+
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_PAINT)
+    {
+        paint(hwnd);
+        return (i64)0;
+    }
+
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN)
+    {
+        int px = (int)(i16)(lParam & (i64)0xFFFF);
+        int py = (int)(i16)((lParam >> 16) & (i64)0xFFFF);
+
+        if (g_gameOver)
+        {
+            // Any click after the game ends starts a new one.
+            resetGame();
+            InvalidateRect(hwnd, nullptr, 1);
+            return (i64)0;
+        }
+
+        int col = px / CELL;
+        int row = (py - HEADER_H) / CELL;
+        if (py >= HEADER_H && inBounds(col, row))
+        {
+            if (msg == WM_LBUTTONDOWN) reveal(col, row);
+            else                       toggleFlag(col, row);
+            InvalidateRect(hwnd, nullptr, 1);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_KEYDOWN)
+    {
+        if ((int)wParam == VK_F2)
+        {
+            resetGame();
+            InvalidateRect(hwnd, nullptr, 1);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    g_rng.seedFromTime();
+    g_state.init(BOARD_W * BOARD_H);
+    g_mines.init(BOARD_W * BOARD_H);
+    g_counts.init(BOARD_W * BOARD_H);
+    resetGame();
+
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = "CFlatMinesweeper";
+
+    RegisterClassExA(&wc);
+
+    // Size the window so the client area exactly holds header + board.
+    RECT want = default;
+    want.left   = 0;
+    want.top    = 0;
+    want.right  = BOARD_W * CELL;
+    want.bottom = HEADER_H + BOARD_H * CELL;
+    AdjustWindowRect(&want, (u32)WS_OVERLAPPEDWINDOW, 0);
+
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatMinesweeper",
+        "CFlat Minesweeper",
+        (u32)WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        want.right - want.left,
+        want.bottom - want.top,
+        nullptr, nullptr, hInst, nullptr);
+
+    if (hwnd == nullptr)
+    {
+        printf("CreateWindowExA failed\n");
+        return 1;
+    }
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    return (int)msg.wParam;
+}

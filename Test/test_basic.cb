@@ -1849,6 +1849,14 @@ int sumFixedBuf(i8* buf, int len)
     return sum;
 }
 
+// Global (file-scope) fixed-size arrays. Regression: indexing a global array
+// folded the all-zero element GEP (e.g. gFixedArr[0]) back onto the GlobalVariable
+// symbol, so the read loaded the whole [N x T] aggregate and module verification
+// failed ("return type does not match operand type" / "Invalid bitcast"). Globals
+// must index to the element exactly like locals do.
+int[81] gFixedArr = default;
+int*[3] gPtrArr = default;
+
 bool testFixedArrays()
 {
     bool result = true;
@@ -1903,6 +1911,32 @@ bool testFixedArrays()
     result &= Test("sizeof_fixed_array", (int)sizeof(buf), 8);
     result &= Test("sizeof_scalar_var", (int)sizeof(plain), 4);
     result &= Test("sizeof_struct_var", (int)sizeof(h), (int)sizeof(ArrayHolder));
+
+    // Global (file-scope) fixed array: write then read back a constant index
+    // (the all-zero GEP that used to fold onto the GlobalVariable symbol).
+    gFixedArr[0] = 11;
+    gFixedArr[80] = 22;
+    result &= Test("fixed_global_elem0", gFixedArr[0], 11);
+    result &= Test("fixed_global_elemN", gFixedArr[80], 22);
+
+    // Global fixed array: variable-index write and a loop sum.
+    int gi = 0;
+    while (gi < 81) { gFixedArr[gi] = gi; gi++; }
+    int gsum = 0;
+    gi = 0;
+    while (gi < 81) { gsum += gFixedArr[gi]; gi++; }
+    result &= Test("fixed_global_loop_sum", gsum, 3240);  // 0+1+...+80
+
+    // Global fixed array decays to a pointer (its first element's address).
+    // After the loop above, gFixedArr[i] == i.
+    int* gp = (int*)gFixedArr;
+    result &= Test("fixed_global_decay_elem0", gp[0], 0);
+    result &= Test("fixed_global_decay_elem5", gp[5], 5);
+
+    // Global array of pointers (int*[3]): store an address, read through it.
+    int gpval = 99;
+    gPtrArr[0] = &gpval;
+    result &= Test("fixed_global_ptrarr", *gPtrArr[0], 99);
 
     return result;
 }

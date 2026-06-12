@@ -63,6 +63,7 @@ extern int main()
     wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
     wc.lpfnWndProc   = (void*)WndProc;
     wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
     wc.hbrBackground = GetStockObject(WHITE_BRUSH);
     wc.lpszClassName = "CFlatRedButtonWindow";
 
