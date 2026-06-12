@@ -169,6 +169,45 @@ string sd = d.toString();       // "3.14"
 
 For your own types, implement `IString` (`string ToString()`); string interpolation and concatenation pick it up automatically.
 
+#### `char*` and `string`: the c-string boundary
+
+`char*` (a raw C string) and `string` are distinct types that meet under a deliberate set of rules.
+
+**Coercion is one-way.** `char*` -> `string` is implicit everywhere - call arguments, `==`, `+`, declaration initializers - by wrapping the pointer in a non-owning `string` (the `_len` comes from `strlen`). `string` -> `char*` is *never* implicit; call `.data()` to hand a `string` to a C API. The asymmetry is intentional: an implicit outbound decay would silently hand off a borrow whose lifetime matters, exactly where it matters most (extern C calls).
+
+```c
+extern void takesCStr(char* s);   // a C function
+string s = "hello";
+takesCStr(s.data());              // explicit - the borrow is visible
+```
+
+**Wrapping a `char*` borrows; it does not copy.** `(string)charPtr` (and the implicit coercion) produce a non-owning `string` that aliases the original buffer - it is *not* freed when that `string` goes out of scope, and it must not outlive the buffer it points at. To take ownership of an independent copy, call `.copy()`:
+
+```c
+string borrowed = (string)cptr;       // aliases cptr's bytes; do not outlive cptr
+string owned     = ((string)cptr).copy();  // independent heap copy, freed at scope exit
+```
+
+Moving a borrowed `string` into a container is safe: `list<string>::add` / `dictionary::set` take `move string` and heap-copy a non-owning argument at the call site, so the container owns its own copy and freeing it never touches the borrowed buffer.
+
+**`char* == char*` compares pointers, not content.** A `char*` is a raw C pointer, so `==` is pointer identity (`p == nullptr` and identity checks work as in C). Note that the compiler interns identical string literals to a single pointer, so two `"hello"` literals can *look* like a content compare while two heap buffers with the same bytes do not. To compare content, wrap one side so the `string` overload (`memcmp` over `_len`) runs, or use `strcmp`:
+
+```c
+bool sameContent = (string)a == b;    // value-compares the bytes
+```
+
+`string == string` is byte-exact over the tracked length, so it correctly handles embedded NUL bytes (unlike `strcmp`).
+
+**`char* + char*` concatenates.** Pointer + pointer has no meaning in C, so `+` on two c-strings allocates a fresh owned buffer and concatenates (the caller frees it). `ptr + int` remains pointer arithmetic.
+
+```c
+char* a = "foo";
+char* b = "bar";
+string r = a + b;        // "foobar" - owned, freed at scope exit
+```
+
+**The cast rule, unified.** `(string)charPtr` is legal because it is a non-allocating borrow (no hidden cost). `(string)primitive` is rejected because it would hide a heap allocation - use `value.toString()` so the allocation is visible. The two rules are one principle: a `string` cast is allowed exactly when it does not allocate.
+
 #### String interpolation
 
 Any string literal containing `{expr}` is automatically treated as an interpolated string - no prefix required. Each `{expr}` segment is converted to `string` (primitives via their built-in stringification, custom types via `IString`) and the segments are concatenated at runtime:

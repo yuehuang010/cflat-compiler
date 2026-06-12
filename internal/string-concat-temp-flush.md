@@ -23,7 +23,12 @@ of the full expression (the statement's semicolon).
 the string SSA value plus the block it was created in.
 
 - **Register**: `TrackOwnedStringOperatorResult` (MainListener) pushes every owned-string
-  operator result. Called from *both* return paths of `TryBinaryOperatorOverload`.
+  operator result. Called from *both* return paths of `TryBinaryOperatorOverload`, AND
+  from the `char* + char*` concat branch in `ParseAdditiveExpression` (which dispatches
+  `operator+(const char*, const char*)` manually because `TryBinaryOperatorOverload`
+  only fires off a struct lvalue - both operands there are raw i8*). Any future site
+  that calls an owned-string-returning operator outside `TryBinaryOperatorOverload`
+  must register its result the same way or the temp leaks.
 - **Unregister** (whoever takes ownership, to avoid a double free):
   - named-local init (`ParseDeclaration`, `IsOwningString` branch);
   - plain `=` assignment (`ParseAssignmentExpression`, guard `operatorText == "="` - a

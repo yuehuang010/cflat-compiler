@@ -4,6 +4,27 @@ Cross-cutting design intent that is NOT derivable from the code and must survive
 refactors. A "clean-up" that violates one of these is a regression, not an improvement.
 Language *usage* belongs in `doc/LANGUAGE.md`, not here.
 
+## `char*` / `string` coercion is asymmetric on purpose
+
+`char*` -> `string` is implicit everywhere (call args, `==`, `+`, decl-init); it wraps the
+pointer in a NON-OWNING `string` (`strlen` for `_len`, no allocation). `string` -> `char*`
+is NEVER implicit - callers must spell `.data()`. Do NOT add an implicit `string` -> `char*`
+decay, however symmetric it looks: the outbound direction hands off a borrow whose lifetime
+matters (the buffer is owned by the `string`), and the place it matters most is extern C
+calls, where a silent decay would hide the hand-off. The inbound wrap is cheap and safe (a
+borrow that the language already tracks as non-owning via `IsOwningString == false`); the
+outbound decay is not, so it stays explicit. Related invariants, all verified 2026-06-11:
+
+- A `string` wrapped from `char*` is non-owning and is never freed by its own scope exit.
+  Moving it into a `list<string>` / `dictionary` is safe because the `move string`
+  parameter path in `CreateOverloadedFunctionCall` heap-copies a non-owning argument at the
+  call site, so the container owns its copy (the container dtor never frees the borrow).
+- `char* == char*` is pointer identity (a raw C type); keep it. Content comparison goes
+  through the `string` `operator==` (`memcmp` over `_len`), reached by wrapping one side.
+- `(string)charPtr` is allowed (non-allocating borrow); `(string)primitive` is banned
+  (hidden allocation - use `value.toString()`). One principle: a `string` cast is legal iff
+  it does not allocate. The usage rules live in `doc/LANGUAGE.md` (strings section).
+
 ## No type meta system - types are strings
 
 A CFlat type is a plain string (`TypeAndValue.TypeName`) plus a few flat flags

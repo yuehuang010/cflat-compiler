@@ -18,5 +18,5 @@ that cost real debugging time. Read before touching the relevant subsystem.
 | [lsp-parallel-scaling.md](lsp-parallel-scaling.md) | LSP parse scaling cap; ANTLR thread-local cache is a no-op; share the core parse cache |
 | [sixel-aspect.md](sixel-aspect.md) | Sixel pixel aspect-ratio correction for round circles in example renderers |
 | [core-deploy-staleness.md](core-deploy-staleness.md) | test.bat runs the core deployed at `x64/<cfg>/core/`, not `cflat/core/` - rebuild after core edits or tests validate stale stdlib |
-| [developer-note.md](developer-note.md) | Standing design decisions: no type meta system (types are strings + flat flags); `using` alias string-only resolution - the 3 suffix-peel sites that must stay in sync, the intentional bare-identifier namespace fallthrough |
+| [developer-note.md](developer-note.md) | Standing design decisions: no type meta system (types are strings + flat flags); `using` alias string-only resolution - the 3 suffix-peel sites, the intentional bare-identifier namespace fallthrough; `char*`/`string` one-way coercion (no implicit `.data()` decay; non-owning wrap is move-copied into containers) |
 | [string-concat-temp-flush.md](string-concat-temp-flush.md) | Owned-string temporary cleanup model: register on operator result, unregister on every owner sink (double-free trap), flush same-block only |

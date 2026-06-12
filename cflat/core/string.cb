@@ -169,8 +169,11 @@ string operator string(IString s)
     return s->ToString();
 }
 
-// Wrap a raw C string pointer into a non-owning string value.
-string operator string(char* s)
+// Wrap a raw C string pointer into a non-owning string value. The result borrows `s`
+// (no allocation); it must not outlive the buffer. Call `.copy()` to take ownership.
+// `const char*` matches the operator+ family - char* and const char* are the same type
+// to the compiler (TypeName "char"); the const is a documentation-only qualifier here.
+string operator string(const char* s)
 {
     string result = default;
     result._ptr = s;
@@ -213,7 +216,11 @@ move string operator string(double d)
 bool operator==(string a, string b)
 {
     if (a._len != b._len) return false;
-    return strcmp(a._ptr, b._ptr) == 0;
+    // Compare over the tracked byte length (memcmp), not strcmp: strcmp stops at the
+    // first embedded NUL, so "a\0b" and "a\0c" would wrongly compare equal. This matches
+    // compare()/operator</operator>, which are also length-based, and honors the type's
+    // binary/UTF-8 storage contract.
+    return memcmp(a._ptr, b._ptr, (i64)a._len) == 0;
 }
 
 bool operator!=(string a, string b)
@@ -306,6 +313,26 @@ string operator+(const char* a, string b)
     return result;
 }
 
+// Concatenate two raw C strings: cstr + cstr. Pointer + pointer has no meaning in C, so
+// the `+` spelling is free to mean "concatenate" here (whereas `ptr + int` stays pointer
+// arithmetic). The result owns a freshly allocated buffer; the caller frees it.
+string operator+(const char* a, const char* b)
+{
+    i32 alen  = strlen(a);
+    i32 blen  = strlen(b);
+    i32 total = alen + blen;
+    i8* buf   = new i8[total + 1];
+    i32 i = 0;
+    while (i < alen) { buf[i] = a[i]; i++; }
+    i32 j = 0;
+    while (j < blen) { buf[alen + j] = b[j]; j++; }
+    buf[total] = 0;
+    string result = default;
+    result._ptr = buf;
+    result._len = total;
+    return result;
+}
+
 // Concatenate a string with any IString: s + istring_value
 string operator+(string a, IString b)
 {
@@ -365,6 +392,12 @@ move string copy(string self, IAllocator alloc)
 // whitespace is skipped, a trailing non-numeric suffix is ignored) and give no error
 // signal - use toIntBase / the strto* externs in cruntime.cb when you need to detect
 // a bad parse via the end pointer.
+//
+// NUL-termination: these read `_ptr` as a C string, so they assume it is NUL-terminated.
+// That holds for literals, char* wraps, and owned copies (substring/copy/trim/... all
+// write a trailing 0). It is NOT guaranteed for a hand-built slice or a string_view-backed
+// value whose `_ptr` points into the middle of a larger buffer - parse a `.copy()` of such
+// a value, or bound the read yourself, to avoid scanning past `_len`.
 
 // Parse a base-10 signed 32-bit integer.
 int toInt(string self)
@@ -788,6 +821,10 @@ struct stringbuilder
         return result;
     }
 
+    // ToString() mirrors the IString method name (capital-T) so a stringbuilder satisfies
+    // the IString ToString() convention used by the operator string / operator+ hooks.
+    // toString() is the canonical builder method; keep both - they are intentionally the
+    // same body under the two spellings.
     string ToString()
     {
         return toString();

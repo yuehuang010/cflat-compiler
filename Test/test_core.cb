@@ -1351,6 +1351,54 @@ int testStringAPI()
         passed += Test("concat chain move-param", consumeMoveLen(ca + cb + cc), 9);
     }
 
+    // Item 1: operator== must honor the tracked byte length (memcmp), not stop at an
+    // embedded NUL the way strcmp does. Build the strings by hand via _ptr/_len so the
+    // bytes after the NUL differ. The heap buffers are owned i8* locals - freed at block
+    // exit; the strings are non-owning wrappers over them (no double free).
+    {
+        i8* nb1 = new i8[4]; nb1[0] = (i8)'a'; nb1[1] = (i8)0; nb1[2] = (i8)'b'; nb1[3] = (i8)0;
+        i8* nb2 = new i8[4]; nb2[0] = (i8)'a'; nb2[1] = (i8)0; nb2[2] = (i8)'c'; nb2[3] = (i8)0;
+        i8* nb3 = new i8[4]; nb3[0] = (i8)'a'; nb3[1] = (i8)0; nb3[2] = (i8)'b'; nb3[3] = (i8)0;
+        string en1 = default; en1._ptr = nb1; en1._len = 3;
+        string en2 = default; en2._ptr = nb2; en2._len = 3;
+        string en3 = default; en3._ptr = nb3; en3._len = 3;
+        passed += Test("embedded-NUL == differ",       en1 == en2, false);
+        passed += Test("embedded-NUL compare nonzero",  en1.compare(en2) != 0, true);
+        passed += Test("embedded-NUL == equal",         en1 == en3, true);
+    }
+
+    // Item 5: a borrowed (non-owning) string wrapped from a char* and moved into a list
+    // is heap-copied at the move call site, so the list owns its own copy. Freeing the
+    // list on scope exit must not touch the borrowed literal buffer (ASan-clean). Also
+    // exercises Item 2: (string)charPtr value-compares a string by content.
+    {
+        char* rawLit = "borrowed-buf";
+        {
+            list<string> bl = default;
+            string bw = (string)rawLit;
+            bl.add(move bw);
+            passed += Test("borrowed into list survives", bl.get(0), "borrowed-buf");
+            passed += Test("(string)charPtr == string",   (string)rawLit == bl.get(0), true);
+            // bl destructor frees its owned element copy here.
+        }
+        // The borrowed literal buffer must still be valid after the list is destroyed.
+        passed += Test("borrowed buffer still alive", (string)rawLit, "borrowed-buf");
+    }
+
+    // Item 3: char* + char* concatenates (operator+(const char*, const char*)) instead of
+    // erroring with the old toString() advice. char* + literal and chained concat too; the
+    // owned intermediates are freed at end-of-expression (ASan-clean).
+    {
+        char* cp = "foo";
+        char* cq = "bar";
+        string cc1 = cp + cq;
+        passed += Test("charptr + charptr", cc1, "foobar");
+        string cc2 = cp + "X";
+        passed += Test("charptr + literal", cc2, "fooX");
+        string cc3 = cp + cq + cp;
+        passed += Test("charptr concat chain", cc3, "foobarfoo");
+    }
+
     return passed;
 }
 
@@ -1389,7 +1437,7 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
-    r = testStringAPI();        passed += r; total += 89;
+    r = testStringAPI();        passed += r; total += 98;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

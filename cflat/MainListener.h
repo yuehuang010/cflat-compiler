@@ -6840,6 +6840,42 @@ public:
                 else
                 {
                     auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+
+                    // char* + char* -> concatenate (operator+(const char*, const char*)).
+                    // TryBinaryOperatorOverload can't reach this case: it dispatches off a
+                    // struct lvalue, but both operands here are raw i8* pointers. Pointer +
+                    // pointer has no C meaning, so claiming `+` for concat is safe; `ptr +
+                    // int` arithmetic is handled by the branch above and never reaches here.
+                    // An operand is a c-string when its element type is i8, or when it is a
+                    // constant string-literal pointer (which carries no element type). Both
+                    // must qualify so int* + int* still falls through to the arithmetic error.
+                    auto isCStr = [&](llvm::Value* v, llvm::Type* et) -> bool {
+                        if (et && et->isIntegerTy(8)) return true;
+                        if (auto* c = llvm::dyn_cast<llvm::Constant>(v))
+                            return Compiler(ctx)->stringLiteralLenByPtr.count(c) > 0;
+                        return false;
+                    };
+                    if (overload == nullptr && op == "+"
+                        && lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy()
+                        && isCStr(lvalue, elemType) && isCStr(rvalue, rv.elemType))
+                    {
+                        LLVMBackend::NamedVariable leftNV;
+                        leftNV.Primary  = lvalue;
+                        leftNV.BaseType = lvalue->getType();
+                        leftNV.TypeAndValue.TypeName = "char";
+                        leftNV.TypeAndValue.Pointer  = true;
+                        LLVMBackend::NamedVariable rightNV;
+                        rightNV.Primary  = rvalue;
+                        rightNV.BaseType = rvalue->getType();
+                        rightNV.TypeAndValue.TypeName = "char";
+                        rightNV.TypeAndValue.Pointer  = true;
+                        overload = Compiler(ctx)->CreateOverloadedFunctionCall("operator+", { leftNV, rightNV });
+                        // Owned result: track it as an end-of-expression temporary so a
+                        // bare `a + b` or a chained intermediate is freed (it is unregistered
+                        // when bound to a named local / moved). See string-concat-temp-flush.md.
+                        TrackOwnedStringOperatorResult(Compiler(ctx), overload);
+                    }
+
                     lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
                     lu = lu || ru;
                     elemType = nullptr;  // arithmetic result is no longer a pointer
