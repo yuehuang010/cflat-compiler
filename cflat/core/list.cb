@@ -48,6 +48,20 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     // Overwrite the element at index.  Takes ownership when T is a pointer type.
     void set(int index, move T value)
     {
+        // Free/destruct the element being overwritten first, or an owning element
+        // leaks: a pointer element's pointee, or a value-type element with owned
+        // buffers (e.g. string, or a nested container). Mirrors dictionary<K,V>.set.
+        // Slot assignment below is a raw overwrite (no implicit LHS destructor - the
+        // same property removeAt()/_grow() rely on), so this does not double-free.
+        // For primitive T the value-type branch's `.~()` is a no-op.
+        if const (is_pointer(T))
+        {
+            if (_data[index] != nullptr) delete _data[index];
+        }
+        else
+        {
+            _data[index].~();
+        }
         // Move the incoming value into the slot (see add() for the rationale): the
         // move parameter must transfer ownership, not copy, so the scope-exit
         // destructor of `value` does not free a buffer the list now references.
@@ -72,12 +86,17 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Remove the element at index, shifting subsequent elements left.
-    // When T is a pointer type, the removed element is freed automatically
-    // (destructor called + memory released).  For value types this is a no-op.
+    // When T is a pointer type, the removed element is freed (destructor called +
+    // memory released). For a value-type element with owned buffers (e.g. string or
+    // a nested container) the element is destructed in place so it does not leak;
+    // for a primitive T the `.~()` is a no-op. The shift below is a raw overwrite,
+    // so destructing index first does not double-free.
     void removeAt(int index)
     {
         if const (is_pointer(T))
             delete _data[index];
+        else
+            _data[index].~();
         int i = index;
         while (i < _size - 1)
         {
@@ -93,9 +112,11 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _size;
     }
 
-    // Remove all elements. Pointer elements are freed; value-type elements are not
-    // individually destructed (CFlat has no in-place destructor call syntax).
-    // Backing buffer is kept - capacity is unchanged.
+    // Remove all elements. Pointer elements are freed; value-type elements with
+    // owned buffers (e.g. string or a nested container) are destructed in place via
+    // `.~()` so they do not leak (primitive elements: no-op). This matches what the
+    // destructor's `delete[_size] _data` does per element, and mirrors
+    // dictionary<K,V>.clear. Backing buffer is kept - capacity is unchanged.
     void clear()
     {
         if const (is_pointer(T))
@@ -104,6 +125,15 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             while (i < _size)
             {
                 if (_data[i] != nullptr) delete _data[i];
+                i++;
+            }
+        }
+        else
+        {
+            int i = 0;
+            while (i < _size)
+            {
+                _data[i].~();
                 i++;
             }
         }

@@ -1086,6 +1086,25 @@ move string padRight(string self, i32 width)
 
 // ── Phase 3: split / join ────────────────────────────────────────────────────
 
+// Build an OWNED string from the byte range [src, src+len). The `move` return
+// type is what flags the result owning, so when it is added to a list<string>
+// the list's destructor frees the buffer. Building a part inline as a plain
+// `string part = default; part._ptr = buf;` local does NOT mark it owning (the
+// static ownership tracker only flags `move`-returns / operator+ results), so a
+// part added that way would leak on the list's destruction - route every split
+// part through this helper instead.
+move string _str_owned_range(i8* src, i32 len)
+{
+    i8* buf = new i8[len + 1];
+    i32 k = 0;
+    while (k < len) { buf[k] = src[k]; k++; }
+    buf[len] = 0;
+    string part = default;
+    part._ptr = buf;
+    part._len = len;
+    return part;
+}
+
 // Split self around every occurrence of sep (string separator).
 // Each part is an owned copy added to the returned list.
 // Trailing separators produce a trailing empty element
@@ -1118,25 +1137,11 @@ move list<string> split(string self, string sep)
         {
             // No more separators: append the remainder and stop.
             i32 partLen = slen - pos;
-            i8* buf = new i8[partLen + 1];
-            i32 k = 0;
-            while (k < partLen) { buf[k] = sp[pos + k]; k++; }
-            buf[partLen] = 0;
-            string part = default;
-            part._ptr = buf;
-            part._len = partLen;
-            out.add(move part);
+            out.add(_str_owned_range(sp + pos, partLen));
             break;
         }
         i32 partLen = found - pos;
-        i8* buf = new i8[partLen + 1];
-        i32 k = 0;
-        while (k < partLen) { buf[k] = sp[pos + k]; k++; }
-        buf[partLen] = 0;
-        string part = default;
-        part._ptr = buf;
-        part._len = partLen;
-        out.add(move part);
+        out.add(_str_owned_range(sp + pos, partLen));
         pos = found + dlen;
     }
     return move out;
@@ -1162,25 +1167,11 @@ move list<string> split(string self, i8 sep)
         if (found < 0)
         {
             i32 partLen = slen - pos;
-            i8* buf = new i8[partLen + 1];
-            i32 k = 0;
-            while (k < partLen) { buf[k] = sp[pos + k]; k++; }
-            buf[partLen] = 0;
-            string part = default;
-            part._ptr = buf;
-            part._len = partLen;
-            out.add(move part);
+            out.add(_str_owned_range(sp + pos, partLen));
             break;
         }
         i32 partLen = found - pos;
-        i8* buf = new i8[partLen + 1];
-        i32 k = 0;
-        while (k < partLen) { buf[k] = sp[pos + k]; k++; }
-        buf[partLen] = 0;
-        string part = default;
-        part._ptr = buf;
-        part._len = partLen;
-        out.add(move part);
+        out.add(_str_owned_range(sp + pos, partLen));
         pos = found + 1;
     }
     return move out;
