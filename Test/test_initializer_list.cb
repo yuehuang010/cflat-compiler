@@ -119,6 +119,44 @@ extern int main()
     total++; passed += Test("float[] fv[0]", fv[0], 1.5f);
     total++; passed += Test("float[] fv[1]", fv[1], 2.5f);
 
+    // ===== identifier / expression elements =====
+    // Regression: a bare-identifier element (e.g. `{ e0 }`) was parsed with its
+    // VariableName set and the synthesized add()/set() then treated it as a NAMED
+    // argument ("named argument 'e0' does not match any parameter"). Literal elements
+    // worked; identifier elements did not. All container forms must accept them.
+    int e0 = 10;
+    int e1 = 20;
+    list<int> lid = {e0, e1, e0 + e1};
+    total++; passed += Test("list<int> ident elems count", lid.count(), 3);
+    total++; passed += Test("list<int> ident elems[2]", lid.get(2), 30);
+
+    array<int> aid = {e0, e1};
+    total++; passed += Test("array<int> ident elems[1]", aid.get(1), 20);
+
+    int dk = 5;
+    dictionary<int, int> did = {dk: e0, 6: e1};
+    total++; passed += Test("dict<int,int> ident key/val", did.get(5), 10);
+
+    string se = "elem";                        // owning local moved positionally into list
+    list<string> lse = {se};
+    total++; passed += Test("list<string> ident elem", lse.get(0), "elem");
+
+    // ===== array<string> ownership (regression: double-free / heap corruption) =====
+    // array<T>.set() copy-assigned an owning element while the by-value parameter's
+    // scope-exit destructor freed the same buffer. The array brace-initializer drives
+    // set() per element, so populating + destructing array<string> corrupted the heap.
+    // Build, overwrite, and let it destruct inside a scope; then allocate again so any
+    // heap corruption from the buggy path would surface here.
+    {
+        array<string> sarr = {"aa", "bb", "cc"};
+        total++; passed += Test("array<string>[0]", sarr.get(0), "aa");
+        total++; passed += Test("array<string>[2]", sarr.get(2), "cc");
+        sarr.set(1, "OVER");
+        total++; passed += Test("array<string> overwrite", sarr.get(1), "OVER");
+    }
+    list<string> afterArr = {"x", "y", "z"};   // alloc after array<string> destruct
+    total++; passed += Test("post array<string> alloc ok", afterArr.count(), 3);
+
     if (passed == total)
     {
         printf("ALL %d initializer-list tests passed.\n", total);

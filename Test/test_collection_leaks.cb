@@ -1,0 +1,112 @@
+// Regression tests for the "Fix string/list/dictionary ownership leaks + double-free"
+// change. Each fixed path is exercised over mixed/nested data structures and asserted
+// for both correct behavior AND leak-freedom via the HeapAudit oracle (every operator
+// new is recorded, every operator delete checked; reportLeaks() must return 0 and a
+// double free aborts deterministically). HeapAudit needs an -o build, which test.bat
+// uses. The bugs this guards against:
+//
+//   1. string.split() built each part inline as `string p = default; p._ptr = buf;`,
+//      which the static ownership tracker does NOT mark owning - so parts added to the
+//      returned list<string> leaked on the list's destruction. Fix routes every part
+//      through the `move`-returning _str_owned_range() helper.
+//   2. list<T>.set / removeAt / clear did not destruct an overwritten/removed/cleared
+//      VALUE-TYPE element that owns buffers (string, or a nested container) - it leaked.
+//      (Only pointer elements were freed before.)
+//   3. dictionary<K,V>.add / set stored the incoming `move V` with a plain copy-assign,
+//      so `value`'s scope-exit destructor freed a buffer the slot now aliased - a double
+//      free for a value-type V with a real destructor (e.g. a nested list<string>).
+import "string.cb";
+import "list.cb";
+import "dictionary.cb";
+import "diagnostic/heap_audit.cb";
+import "test_helper.cb";
+
+extern int main()
+{
+    HeapAudit.enable();
+
+    int passed = 0;
+    int total = 0;
+
+    // === Bug 1: string.split() parts are owned by the returned list ===
+    // The list and all of its split-produced string elements must free on scope exit.
+    {
+        string csv = "alpha,beta,gamma,delta";
+        list<string> parts = csv.split(",");
+        total++; passed += Test("split count", parts.count(), 4);
+        total++; passed += Test("split[0]", parts.get(0), "alpha");
+        total++; passed += Test("split[3]", parts.get(3), "delta");
+
+        // char separator overload + trailing-empty element path
+        string path = "a/b/c/";
+        list<string> segs = path.split('/');
+        total++; passed += Test("split(char) trailing-empty count", segs.count(), 4);
+        total++; passed += Test("split(char)[2]", segs.get(2), "c");
+        total++; passed += Test("split(char) trailing empty", segs.get(3), "");
+    }
+
+    // === Bug 2a: list<string>.set overwrites and frees the old owning element ===
+    {
+        list<string> ls = {"aaa", "bbb", "ccc"};
+        ls.set(1, "OVERWRITTEN");          // old "bbb" must be destructed, new value moved in
+        total++; passed += Test("list set value", ls.get(1), "OVERWRITTEN");
+        total++; passed += Test("list set keeps count", ls.count(), 3);
+    }
+
+    // === Bug 2b: list<string>.removeAt frees the removed owning element ===
+    {
+        list<string> ls = {"a", "b", "c", "d"};
+        ls.removeAt(1);                    // "b" destructed in place, tail shifts left
+        total++; passed += Test("removeAt count", ls.count(), 3);
+        total++; passed += Test("removeAt shift", ls.get(1), "c");
+    }
+
+    // === Bug 2c: list<string>.clear frees every owning element, buffer reusable ===
+    {
+        list<string> ls = {"x", "y", "z"};
+        ls.clear();                        // all three destructed
+        total++; passed += Test("clear count", ls.count(), 0);
+        ls.add("reused");                  // reuse the kept backing buffer after clear
+        total++; passed += Test("reuse after clear", ls.get(0), "reused");
+    }
+
+    // === Bug 3a: dictionary<string,string> overwrite/add move the value (no double free) ===
+    // string V has a real destructor, so a copy-assign of the move param would double free.
+    {
+        dictionary<string, string> d = {"k1": "v1"};
+        d.set("k1", "v2");                 // overwrite same key: old "v1" freed, "v2" moved in
+        total++; passed += Test("dict<str,str> overwrite", d.get("k1"), "v2");
+        d.add("k2", "x");                  // add new (move)
+        total++; passed += Test("dict<str,str> add", d.get("k2"), "x");
+        total++; passed += Test("dict<str,str> count", d.count(), 2);
+    }
+
+    // === Bug 3b: dictionary with a NESTED container value (list<string>) ===
+    // The headline double-free case: V owns buffers transitively. add()/set() must move.
+    {
+        dictionary<int, list<string>> d = default;
+        list<string> v1 = {"p", "q"};
+        d.add(1, move v1);                 // value moved into slot; v1 zeroed
+        total++; passed += Test("dict nested add count", d.get(1).count(), 2);
+
+        list<string> v2 = {"r", "s", "t"};
+        d.set(1, move v2);                 // overwrite: old list<string> destructed, new moved in
+        total++; passed += Test("dict nested overwrite count", d.get(1).count(), 3);
+        total++; passed += Test("dict nested overwrite elem", d.get(1).get(2), "t");
+
+        d.remove(1);                       // value-type V destructed on remove
+        total++; passed += Test("dict nested remove", d.count(), 0);
+    }
+
+    // === Leak oracle: everything above must have freed on scope exit ===
+    u64 leaks = HeapAudit.reportLeaks();
+    total++; passed += Test("HeapAudit live allocations", (i64)leaks, (i64)0);
+
+    if (passed == total)
+    {
+        printf("ALL %d collection-leak regression tests passed.\n", total);
+        return 0;
+    }
+    printf("%d of %d collection-leak regression tests FAILED.\n", total - passed, total);
+    return 1;
+}

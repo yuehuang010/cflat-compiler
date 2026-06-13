@@ -364,6 +364,7 @@ MigrationBackup/
 # Claude
 .claude/
 internal/plan/
+fuzz/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd

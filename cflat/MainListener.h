@@ -8553,6 +8553,12 @@ public:
             // literal expression); make sure one of them is populated or it dereferences null.
             else if (outNV.TypeAndValue.TypeName.empty() && outNV.BaseType == nullptr)
                 outNV.BaseType = val->getType();
+            // Elements are forwarded positionally into add()/set(). A bare-identifier element
+            // (e.g. `list<int> a = { x }`) parses with VariableName set to the identifier, which
+            // MatchFunction would treat as a NAMED argument ("named argument 'x' does not match
+            // any parameter"). Clear it so every element is passed positionally. (Same idiom as
+            // the forwarding-wrapper path above.)
+            outNV.TypeAndValue.VariableName = "";
             return true;
         };
 
