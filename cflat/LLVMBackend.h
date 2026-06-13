@@ -9222,6 +9222,16 @@ public:
                 {
                     // Materialize a pointer to the struct value
                     auto structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
+                    // Defensive: a hand-built NamedVariable with no BaseType and no resolvable
+                    // TypeName yields a null/void type here; allocating it would crash LLVM.
+                    // Report the bad call instead of forging an invalid alloca.
+                    if (structTy == nullptr || structTy->isVoidTy())
+                    {
+                        LogError(std::format(
+                            "call to '{}': argument {} (interface parameter '{}') has no resolved type",
+                            functionName, argIndex, candParamItr->VariableName));
+                        return nullptr;
+                    }
                     auto tempAlloca = AllocaAtEntry(structTy, nullptr);
                     builder->CreateStore(arg.Primary, tempAlloca);
                     dataPtr = tempAlloca;
@@ -9531,7 +9541,11 @@ public:
                 }
                 if (srcStorage != nullptr && !isInterfaceBorrow)
                 {
-                    if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcBaseTy))
+                    // dyn_cast_or_null: a hand-built NamedVariable may carry storage but a null
+                    // BaseType. A bare dyn_cast on a null type dereferences null and segfaults
+                    // the compiler (the pre-existing list<string>-json crash); _or_null treats a
+                    // missing type as "no match" and falls through to the diagnostic below.
+                    if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
                     {
                         // Pointer move param: null the caller's storage.
                         builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
@@ -9539,6 +9553,7 @@ public:
                     else if (candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString)
                     {
                         // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
+                        // (Does not need srcBaseTy - the string layout is looked up by name.)
                         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
                         if (strTy)
                         {
@@ -9547,10 +9562,19 @@ public:
                             builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
                         }
                     }
-                    else if (auto* stTy = llvm::dyn_cast<llvm::StructType>(srcBaseTy))
+                    else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
                     {
                         // Struct move param: zero the caller's entire struct so its destructor is a no-op.
                         builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
+                    }
+                    else if (srcBaseTy == nullptr && candidate.Parameters[i].TypeName != "string")
+                    {
+                        // We have caller storage to clear but no type telling us how. This can only
+                        // arise from a malformed (hand-built) argument; emit a clear diagnostic
+                        // rather than leaving a stale value that a later destructor would double-free.
+                        LogError(std::format(
+                            "call to '{}': 'move' argument {} has no resolved type, so its source "
+                            "storage cannot be cleared after the move", functionName, i));
                     }
                 }
                 // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
