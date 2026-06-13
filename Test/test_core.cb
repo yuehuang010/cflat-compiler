@@ -203,6 +203,51 @@ int testArray()
     }
     passed += Test("heap array<Tracked> dtor count", g_dtor_count, 4);
 
+    // raw 'new string[n]' array: slots are zero-initialized (safe default) and can be
+    // read/written; the buffer is freed with 'delete[_]' (no per-element string dtor,
+    // which would corrupt the heap since 'string' has no ownership flag - see the
+    // err_delete_string_array negative test). Proves the safe-management path works.
+    string* codes = new string[4];
+    codes[1] = "hello";
+    codes[3] = "world";
+    passed += Test("new string[n] slot read 1", codes[1], "hello");
+    passed += Test("new string[n] slot read 3", codes[3], "world");
+    passed += Test("new string[n] unset slot length 0", codes[0].length(), 0);
+    delete[_] codes;   // free buffer only; no per-element string dtors (would corrupt)
+
+    // L2 regression: a raw array-free whose target is a CAST expression must compile
+    // and free the underlying buffer exactly once. 'delete[_] (string*)expr' used to
+    // assert the compiler (the pointer cast wrongly invoked the value conversion
+    // 'operator string'); once that was fixed, the cast path still dropped the source
+    // alloca, so the owning local was freed here AND again at scope exit -> heap
+    // corruption. A cast target must behave exactly like 'delete[_] localPtr'.
+    string* castCodes = new string[4];
+    castCodes[2] = "cast";
+    passed += Test("delete[_] cast-target read", castCodes[2], "cast");
+    delete[_] (string*)castCodes;   // frees once: no compiler assert, no double free
+
+    int* castInts = new int[8];
+    castInts[0] = 7;
+    delete[_] (int*)castInts;       // primitive buffer, cast-target raw free, clean
+
+    // B1: an unsigned narrow cast used as an array index must ZERO-extend. A byte
+    // value >= 128 is negative as i8, so without the unsigned widen (u8)b would
+    // sign-extend to a negative GEP offset and silently mis-index. Each high byte
+    // must land in its own slot (regression for the dogfooding silent-wrong bug).
+    int[256] freq;
+    for (int i = 0; i < 256; i++) freq[i] = 0;
+    i8[4] bytes;
+    bytes[0] = (i8)200;   // 0xC8
+    bytes[1] = (i8)255;   // 0xFF
+    bytes[2] = (i8)127;   // 0x7F (positive - control)
+    bytes[3] = (i8)10;
+    for (int i = 0; i < 4; i++)
+        freq[(u8)bytes[i]] = freq[(u8)bytes[i]] + 1;
+    passed += Test("u8 array index slot 200", freq[200], 1);
+    passed += Test("u8 array index slot 255", freq[255], 1);
+    passed += Test("u8 array index slot 127", freq[127], 1);
+    passed += Test("u8 array index slot 10",  freq[10],  1);
+
     return passed;
 }
 
@@ -261,6 +306,15 @@ int testList()
 
 // ── list<T> ICopyable (copy / copy(IAllocator)) ──────────────────────────────
 
+// X4 Part 1: the SAFE way to store an owning container into a struct field is '.copy()'
+// (an independent buffer). A plain `values = v` shallow-copy is rejected at compile time -
+// see Test/errors/err_container_copy_into_field.cb.
+class IntListHolder
+{
+    list<int> values = default;
+    void fill(list<int> v) { values = v.copy(); }
+};
+
 int testListCopy()
 {
     int passed = 0;
@@ -311,6 +365,20 @@ int testListCopy()
     list<int> empty;
     list<int> emptyDup = empty.copy();
     passed += Test("list<int> empty copy count", emptyDup.count(), 0);
+
+    // X4 Part 1: storing a list COPY into a struct field is the safe pattern - the field
+    // owns an independent buffer, so source and field each free exactly once (no double-free,
+    // no STATUS_HEAP_CORRUPTION). Reaching this line (clean teardown) is itself the proof.
+    {
+        list<int> src;
+        src.add(10); src.add(20); src.add(30);
+        IntListHolder h;
+        h.fill(src);                          // h.values = src.copy()
+        passed += Test("list copy-into-field count",  h.values.count(), 3);
+        passed += Test("list copy-into-field get[2]", h.values.get(2), 30);
+        src.set(0, 999);                      // mutating the source must not disturb the field
+        passed += Test("list copy-into-field isolates source", h.values.get(0), 10);
+    }   // h and src both destruct here - each frees its own buffer once
 
     return passed;
 }
@@ -1647,10 +1715,10 @@ extern int main()
 
     int r;
 
-    r = testArray();            passed += r; total += 14;
+    r = testArray();            passed += r; total += 22;
     r = testMemberDtor();       passed += r; total += 8;
     r = testList();             passed += r; total += 15;
-    r = testListCopy();         passed += r; total += 16;
+    r = testListCopy();         passed += r; total += 19;
     r = testHashset();          passed += r; total += 19;
     r = testHashsetNegative();  passed += r; total += 12;
     r = testHashsetTombstone(); passed += r; total += 7;

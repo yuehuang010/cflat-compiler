@@ -151,6 +151,62 @@ void testReduce_thread_sum() {
     delete[_] v;
 }
 
+// ---- I2 regression: by-reference struct capture + overloaded operator -----
+// A named struct local captured by reference inside a parallel_for_n lambda,
+// used with an overloaded operator (vec3 * double), used to emit `fmul ptr,
+// double` (the captured reference was treated as the struct value) and fail
+// module verification. The operator must now lower the same as on an ordinary
+// struct local. We assert the parallel result is byte-identical to a serial
+// computation of the same expression.
+
+struct vec3
+{
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    vec3 operator*(double s) { vec3 r; r.x = x * s; r.y = y * s; r.z = z * s; return r; }
+    vec3 operator+(vec3 o)   { vec3 r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; return r; }
+};
+
+void testForN_capturedStructOperator() {
+    i64 n = 1000;
+    vec3 base = default;
+    base.x = 1.5; base.y = -2.0; base.z = 0.25;
+    vec3 bias = default;
+    bias.x = 0.1; bias.y = 0.2; bias.z = 0.3;
+
+    double[] par = new double[n];
+    double[] ser = new double[n];
+
+    // Serial reference.
+    i64 i = 0;
+    while (i < n) {
+        vec3 v = base * (double)i + bias;   // overloaded * and + on captured structs
+        ser[i] = v.x + v.y + v.z;
+        i = i + 1;
+    }
+
+    // Parallel: base and bias are named struct locals -> captured by reference.
+    parallel_for_n(n, 4, (i64 lo, i64 hi) => {
+        i64 j = lo;
+        while (j < hi) {
+            vec3 v = base * (double)j + bias;
+            par[j] = v.x + v.y + v.z;
+            j = j + 1;
+        }
+    });
+
+    bool same = true;
+    i = 0;
+    while (i < n) {
+        if (!approx(par[i], ser[i])) { same = false; }
+        i = i + 1;
+    }
+    check("parallel_for_n captured-struct overloaded operator == serial", same);
+    delete[_] par;
+    delete[_] ser;
+}
+
 // ---- edge: more workers than elements -------------------------------------
 
 void testReduce_moreWorkersThanN() {
@@ -177,6 +233,7 @@ extern int main() {
     testReduce_pool_dot();
     testReduce_thread_sum();
     testReduce_moreWorkersThanN();
+    testForN_capturedStructOperator();
 
     printf("%d/%d passed\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;

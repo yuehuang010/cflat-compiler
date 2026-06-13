@@ -24,6 +24,7 @@
 #include <variant>
 #include <format>
 #include <unordered_set>
+#include <set>
 #include <iostream>
 #include <cstdlib>
 #include <filesystem>
@@ -599,6 +600,7 @@ public:
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        std::set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
@@ -827,6 +829,7 @@ public:
     bool lastOwningResult = false;           // set by ParseNewExpression/ParseMoveExpression; consumed by ParseDeclaration
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
+    std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
 
     // When returning a struct VALUE local whose full-destructor frees members (e.g. owned
     // string fields), the by-value snapshot carries those member pointers to the caller, so
@@ -1646,7 +1649,7 @@ private:
         return id;
     }
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false)
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false, const std::string& returnTypeName = "")
     {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -1666,6 +1669,7 @@ private:
         stackState.functionName = friendlyName;
         currentFunctionReturnsOwned = returnsOwned;
         currentFunctionReturnIsArrayView = returnIsArrayView;
+        currentFunctionReturnTypeName = returnTypeName;
         // Reset the per-function alias-scope registry; scopes from a prior function must never leak.
         aliasDomain_ = nullptr;
         aliasScopes_.clear();
@@ -8361,7 +8365,7 @@ public:
             }
         }
 
-        createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView);
+        createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView, returnType.TypeName);
 
         if (diBuilder && diFile && line > 0)
         {
@@ -9533,7 +9537,11 @@ public:
                 // Look up the source by name so we still null its alloca and prevent a double-free.
                 llvm::Value* srcStorage = matched[i].Storage;
                 llvm::Type*  srcBaseTy  = matched[i].BaseType;
-                if (srcStorage == nullptr && !matched[i].CallerName.empty())
+                bool isFieldAccess = !matched[i].FieldName.empty();
+                // The CallerName fallback resolves the BASE variable's storage; do NOT use it
+                // for a field access or it would null the base pointer instead of the field.
+                // A field access already carries its own (GEP) Storage.
+                if (srcStorage == nullptr && !isFieldAccess && !matched[i].CallerName.empty())
                 {
                     auto ref = FindVariableStorage(matched[i].CallerName);
                     srcStorage = ref.Storage;
@@ -9577,8 +9585,9 @@ public:
                             "storage cannot be cleared after the move", functionName, i));
                     }
                 }
-                // Compile-time: mark the caller's variable as moved so subsequent reads are rejected.
+                // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
+                // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
                 if (!matched[i].CallerName.empty() && srcStorage != nullptr &&
                     !isInterfaceBorrow && srcBaseTy != nullptr)
                 {
@@ -9586,7 +9595,12 @@ public:
                     bool isOwningStr = candidate.Parameters[i].TypeName == "string" && matched[i].IsOwningString;
                     bool isStruct = llvm::isa<llvm::StructType>(srcBaseTy);
                     if (isPtr || isOwningStr || isStruct)
-                        MarkVariableMoved(matched[i].CallerName);
+                    {
+                        if (isFieldAccess)
+                            MarkVariableFieldMoved(matched[i].CallerName, matched[i].FieldName);
+                        else
+                            MarkVariableMoved(matched[i].CallerName);
+                    }
                 }
             }
         }
@@ -9956,6 +9970,48 @@ public:
         }
     }
 
+    // Per-field move tracking. Moving a struct sub-path (e.g. `node->left`) into a 'move'
+    // parameter must mark ONLY that field as moved, not the whole base variable - otherwise
+    // a sibling access (`node->right`) or the base itself is wrongly rejected as use-after-
+    // move. This is what lets legitimate recursive owning-pointer-tree code compile.
+    void MarkVariableFieldMoved(const std::string& name, const std::string& field)
+    {
+        if (name.empty() || field.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.MovedFields.insert(field); return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.MovedFields.insert(field); return; }
+        }
+    }
+
+    // Reassigning a field (`node->left = ...`) makes it live again.
+    void MarkVariableFieldUnmoved(const std::string& name, const std::string& field)
+    {
+        if (name.empty() || field.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.MovedFields.erase(field); return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.MovedFields.erase(field); return; }
+        }
+    }
+
+    // Compile-time use-after-move subject for a (possibly field-access) variable. Returns the
+    // name to report if the variable - or, for a field access, the specific field - was moved,
+    // or an empty string if it is still live. A field-access NamedVariable is built from the
+    // base variable's scope lookup, so it inherits both IsMoved and MovedFields: a fully-moved
+    // base poisons all field reads, while a single moved field poisons only that field.
+    std::string MovedUseSubject(const NamedVariable& nv) const
+    {
+        if (nv.IsMoved) return nv.CallerName;
+        if (!nv.FieldName.empty() && nv.MovedFields.count(nv.FieldName))
+            return nv.CallerName + "." + nv.FieldName;
+        return "";
+    }
+
     // Mark a pre-declared string local as owning its heap buffer. Used when a plain
     // assignment (`s = expr`) stores an owned heap string into an already-declared
     // string local: the local now owns the buffer and must free it on scope exit
@@ -9972,54 +10028,66 @@ public:
         }
     }
 
-    // Snapshots the IsMoved flag for all variables in all active scopes.
-    std::map<std::string, bool> SaveMovedState() const
+    // Snapshot of per-variable and per-field move state across active scopes (used to keep
+    // move tracking sound across if/else branches).
+    struct MovedStateSnapshot
     {
-        std::map<std::string, bool> state;
+        std::map<std::string, bool> moved;
+        std::map<std::string, std::set<std::string>> movedFields;
+    };
+
+    // Snapshots the IsMoved flag and per-field moved set for all variables in all active scopes.
+    MovedStateSnapshot SaveMovedState() const
+    {
+        MovedStateSnapshot state;
         for (const auto& frame : stackNamedVariable)
         {
             for (const auto& [name, nv] : frame.functionArgument)
-                state[name] = nv.IsMoved;
+                { state.moved[name] = nv.IsMoved; state.movedFields[name] = nv.MovedFields; }
             for (const auto& [name, nv] : frame.namedVariable)
-                state[name] = nv.IsMoved;
+                { state.moved[name] = nv.IsMoved; state.movedFields[name] = nv.MovedFields; }
         }
         return state;
     }
 
-    // Restores the IsMoved flag from a snapshot (only for variables still in scope).
-    void RestoreMovedState(const std::map<std::string, bool>& state)
+    // Restores the move state from a snapshot (only for variables still in scope).
+    void RestoreMovedState(const MovedStateSnapshot& state)
     {
+        auto restoreOne = [&](const std::string& name, NamedVariable& nv) {
+            if (auto it = state.moved.find(name); it != state.moved.end())
+                nv.IsMoved = it->second;
+            if (auto it = state.movedFields.find(name); it != state.movedFields.end())
+                nv.MovedFields = it->second;
+        };
         for (auto& frame : stackNamedVariable)
         {
-            for (auto& [name, nv] : frame.functionArgument)
-                if (auto it = state.find(name); it != state.end())
-                    nv.IsMoved = it->second;
-            for (auto& [name, nv] : frame.namedVariable)
-                if (auto it = state.find(name); it != state.end())
-                    nv.IsMoved = it->second;
+            for (auto& [name, nv] : frame.functionArgument) restoreOne(name, nv);
+            for (auto& [name, nv] : frame.namedVariable) restoreOne(name, nv);
         }
     }
 
-    // Merges two post-branch states: a variable is moved if it was moved in either branch.
-    void MergeMovedStates(const std::map<std::string, bool>& thenState,
-                          const std::map<std::string, bool>& elseState)
+    // Merges two post-branch states: a variable (or field) is moved if it was moved in either branch.
+    void MergeMovedStates(const MovedStateSnapshot& thenState,
+                          const MovedStateSnapshot& elseState)
     {
+        auto mergeOne = [&](const std::string& name, NamedVariable& nv) {
+            auto t = thenState.moved.find(name);
+            auto e = elseState.moved.find(name);
+            if (t != thenState.moved.end() && e != elseState.moved.end())
+                nv.IsMoved = t->second || e->second;
+            auto tf = thenState.movedFields.find(name);
+            auto ef = elseState.movedFields.find(name);
+            if (tf != thenState.movedFields.end() && ef != elseState.movedFields.end())
+            {
+                std::set<std::string> merged = tf->second;
+                merged.insert(ef->second.begin(), ef->second.end());
+                nv.MovedFields = std::move(merged);
+            }
+        };
         for (auto& frame : stackNamedVariable)
         {
-            for (auto& [name, nv] : frame.functionArgument)
-            {
-                auto t = thenState.find(name);
-                auto e = elseState.find(name);
-                if (t != thenState.end() && e != elseState.end())
-                    nv.IsMoved = t->second || e->second;
-            }
-            for (auto& [name, nv] : frame.namedVariable)
-            {
-                auto t = thenState.find(name);
-                auto e = elseState.find(name);
-                if (t != thenState.end() && e != elseState.end())
-                    nv.IsMoved = t->second || e->second;
-            }
+            for (auto& [name, nv] : frame.functionArgument) mergeOne(name, nv);
+            for (auto& [name, nv] : frame.namedVariable) mergeOne(name, nv);
         }
     }
 
@@ -10259,7 +10327,7 @@ public:
     // returned (the return expression's NamedVariable.Storage). It lets the struct-return
     // move detection below work even when the by-value return is materialized field-wise
     // (insertvalue) rather than as a single `load %Struct`, which dyn_cast<LoadInst> misses.
-    void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr)
+    void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr, const std::string& interfaceReturnStructName = "")
     {
         // check if break has already been inserted.
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
@@ -10375,6 +10443,22 @@ public:
 
         if (autoVaListAlloca)
             CreateVaEnd(autoVaListAlloca);
+
+        // Interface return: a returned concrete-implementer POINTER reaches here as a bare
+        // pointer (the loaded owning local). Its scope-exit free was already suppressed by the
+        // owned-pointer block above (the load made the variable look returned), so ownership
+        // moves to the caller exactly as a plain `return ptr;` would. Box it into the interface
+        // fat pointer { vtable, data } now, after the destructor walk. The value-operand and
+        // already-boxed-interface cases are handled at the return site (MainListener).
+        if (!interfaceReturnStructName.empty() && value)
+        {
+            auto* fatTy = GetFatPtrType();
+            if (currentFunction->getReturnType() == fatTy && value->getType() != fatTy)
+            {
+                auto* vtable = GetOrCreateVTable(interfaceReturnStructName, currentFunctionReturnTypeName);
+                value = BuildInterfaceFatValue(vtable, value);
+            }
+        }
 
         if (value == nullptr)
             builder->CreateRetVoid();

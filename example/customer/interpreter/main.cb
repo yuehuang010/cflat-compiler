@@ -1,0 +1,529 @@
+// main.cb - a tiny expression/scripting interpreter.
+//
+// Pipeline:  source text -> Lexer (tokens) -> Parser (AST) -> Evaluator (tree walk).
+//
+// The AST is a recursive struct tree: expression nodes are `Node*`, statement nodes
+// are `Stmt*`, each tagged by a `kind` field and dispatched by a recursive evaluator.
+// The variable environment is a dictionary<string, double>.
+//
+// (An earlier design used interfaces with VTable dispatch - one IExpr per node kind -
+//  but returning an interface value from a parse function currently miscompiles, so
+//  this version uses tagged-union nodes instead. See the Friction Report.)
+//
+// The little language it runs:
+//   x = 2 + 3 * 4;          // assignment, correct precedence -> 14
+//   print x;                // print a value
+//   if (x > 10) { ... } else { ... }
+//   while (x > 0) { x = x - 1; }
+//   operators: + - * /  ( )  and  == != < <= > >=
+//
+// Build:
+//   x64/Debug/cflat.exe example/customer/interpreter/main.cb -o example/customer/interpreter/app.exe
+// Run:
+//   example\customer\interpreter\app.exe                 (runs the embedded demo)
+//   example\customer\interpreter\app.exe demo.script     (runs a script file)
+
+import "list.cb";
+import "dictionary.cb";
+import "string.cb";
+import "filesystem.cb";
+
+// ── Token kinds ───────────────────────────────────────────────────────────────
+
+enum Tok : int
+{
+    End = 0,
+    Number,
+    Ident,
+    Plus, Minus, Star, Slash,
+    LParen, RParen, LBrace, RBrace,
+    Assign, Semi,
+    Eq, Ne, Lt, Le, Gt, Ge
+};
+
+struct Token
+{
+    int kind = default;
+    string text = default;
+    double num = default;
+};
+
+Token makeToken(int kind, string text)
+{
+    Token t = default;
+    t.kind = kind;
+    t.text = text;
+    return t;
+}
+
+// ── Lexer ─────────────────────────────────────────────────────────────────────
+
+bool isDigit(i8 c) { return c >= '0' && c <= '9'; }
+bool isAlpha(i8 c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+bool isAlnum(i8 c) { return isAlpha(c) || isDigit(c); }
+
+class Lexer
+{
+    string src = default;
+    int pos = default;
+    int len = default;
+
+    void init(string s)
+    {
+        src = s;
+        pos = 0;
+        len = s.length();
+    }
+
+    // charAt() clamps at the ends, so guard against pos >= len ourselves.
+    i8 cur()  { if (pos >= len) return 0; return src.charAt(pos); }
+    i8 peek() { if (pos + 1 >= len) return 0; return src.charAt(pos + 1); }
+
+    list<Token> tokenize()
+    {
+        list<Token> tokens = default;
+        while (pos < len)
+        {
+            i8 c = cur();
+
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            {
+                pos = pos + 1;
+                continue;
+            }
+
+            // Line comments: //... to end of line.
+            if (c == '/' && peek() == '/')
+            {
+                while (pos < len && cur() != '\n')
+                    pos = pos + 1;
+                continue;
+            }
+
+            // Numbers: digits with an optional decimal point.
+            if (isDigit(c))
+            {
+                int start = pos;
+                while (pos < len && (isDigit(cur()) || cur() == '.'))
+                    pos = pos + 1;
+                string text = src.substring(start, pos - start);
+                Token t = makeToken(Tok.Number, text);
+                t.num = text.toDouble();
+                tokens.add(t);
+                continue;
+            }
+
+            // Identifiers / keywords.
+            if (isAlpha(c))
+            {
+                int start = pos;
+                while (pos < len && isAlnum(cur()))
+                    pos = pos + 1;
+                tokens.add(makeToken(Tok.Ident, src.substring(start, pos - start)));
+                continue;
+            }
+
+            // Two-character operators.
+            if (c == '=' && peek() == '=') { tokens.add(makeToken(Tok.Eq, "==")); pos = pos + 2; continue; }
+            if (c == '!' && peek() == '=') { tokens.add(makeToken(Tok.Ne, "!=")); pos = pos + 2; continue; }
+            if (c == '<' && peek() == '=') { tokens.add(makeToken(Tok.Le, "<=")); pos = pos + 2; continue; }
+            if (c == '>' && peek() == '=') { tokens.add(makeToken(Tok.Ge, ">=")); pos = pos + 2; continue; }
+
+            // Single-character tokens.
+            if (c == '+') { tokens.add(makeToken(Tok.Plus,   "+")); pos = pos + 1; continue; }
+            if (c == '-') { tokens.add(makeToken(Tok.Minus,  "-")); pos = pos + 1; continue; }
+            if (c == '*') { tokens.add(makeToken(Tok.Star,   "*")); pos = pos + 1; continue; }
+            if (c == '/') { tokens.add(makeToken(Tok.Slash,  "/")); pos = pos + 1; continue; }
+            if (c == '(') { tokens.add(makeToken(Tok.LParen, "(")); pos = pos + 1; continue; }
+            if (c == ')') { tokens.add(makeToken(Tok.RParen, ")")); pos = pos + 1; continue; }
+            if (c == '{') { tokens.add(makeToken(Tok.LBrace, "{")); pos = pos + 1; continue; }
+            if (c == '}') { tokens.add(makeToken(Tok.RBrace, "}")); pos = pos + 1; continue; }
+            if (c == '<') { tokens.add(makeToken(Tok.Lt,     "<")); pos = pos + 1; continue; }
+            if (c == '>') { tokens.add(makeToken(Tok.Gt,     ">")); pos = pos + 1; continue; }
+            if (c == '=') { tokens.add(makeToken(Tok.Assign, "=")); pos = pos + 1; continue; }
+            if (c == ';') { tokens.add(makeToken(Tok.Semi,   ";")); pos = pos + 1; continue; }
+
+            printf("lex error: unexpected character '%c'\n", c);
+            pos = pos + 1;
+        }
+        tokens.add(makeToken(Tok.End, ""));
+        return tokens;
+    }
+};
+
+// ── Environment ─────────────────────────────────────────────────────────────
+
+class Env
+{
+    dictionary<string, double> vars = default;
+
+    double get(string name)
+    {
+        if (!vars.contains(name))
+            printf("runtime warning: variable '%s' is undefined (using 0)\n", name.data());
+        return vars.get(name);
+    }
+
+    void set(string name, double value) { vars.set(name, value); }
+};
+
+// ── AST: expression nodes ─────────────────────────────────────────────────────
+
+enum NExpr : int { ENum = 0, EVar, ENeg, EBin };
+
+class Node
+{
+    int kind = default;
+    double num = default;     // ENum
+    string name = default;    // EVar
+    int op = default;         // EBin operator (a Tok.* value)
+    Node* left = default;     // ENeg operand / EBin left
+    Node* right = default;    // EBin right
+};
+
+double evalNode(Node* n, Env* env)
+{
+    if (n == nullptr) return 0.0;
+    if (n->kind == NExpr.ENum) return n->num;
+    if (n->kind == NExpr.EVar) return env->get(n->name);
+    if (n->kind == NExpr.ENeg) return -evalNode(n->left, env);
+
+    // EBin
+    double l = evalNode(n->left, env);
+    double r = evalNode(n->right, env);
+    if (n->op == Tok.Plus)  return l + r;
+    if (n->op == Tok.Minus) return l - r;
+    if (n->op == Tok.Star)  return l * r;
+    if (n->op == Tok.Slash) return l / r;
+    if (n->op == Tok.Eq)    return (l == r) ? 1.0 : 0.0;
+    if (n->op == Tok.Ne)    return (l != r) ? 1.0 : 0.0;
+    if (n->op == Tok.Lt)    return (l <  r) ? 1.0 : 0.0;
+    if (n->op == Tok.Le)    return (l <= r) ? 1.0 : 0.0;
+    if (n->op == Tok.Gt)    return (l >  r) ? 1.0 : 0.0;
+    if (n->op == Tok.Ge)    return (l >= r) ? 1.0 : 0.0;
+    return 0.0;
+}
+
+// ── AST: statement nodes ──────────────────────────────────────────────────────
+
+enum NStmt : int { SPrint = 0, SAssign, SIf, SWhile };
+
+class Stmt
+{
+    int kind = default;
+    string name = default;        // SAssign target
+    Node* expr = default;         // SPrint value / SAssign value / SIf,SWhile condition
+    list<Stmt*> thenBody = default;  // SIf then-branch / SWhile body
+    list<Stmt*> elseBody = default;  // SIf else-branch
+};
+
+void execStmt(Stmt* s, Env* env);
+
+void execAll(list<Stmt*>* stmts, Env* env)
+{
+    int i = 0;
+    while (i < stmts->count())
+    {
+        execStmt(stmts->get(i), env);
+        i = i + 1;
+    }
+}
+
+void execStmt(Stmt* s, Env* env)
+{
+    if (s == nullptr) return;
+    if (s->kind == NStmt.SPrint)
+    {
+        printf("%g\n", evalNode(s->expr, env));
+        return;
+    }
+    if (s->kind == NStmt.SAssign)
+    {
+        env->set(s->name, evalNode(s->expr, env));
+        return;
+    }
+    if (s->kind == NStmt.SIf)
+    {
+        if (evalNode(s->expr, env) != 0.0)
+            execAll(&s->thenBody, env);
+        else
+            execAll(&s->elseBody, env);
+        return;
+    }
+    if (s->kind == NStmt.SWhile)
+    {
+        while (evalNode(s->expr, env) != 0.0)
+            execAll(&s->thenBody, env);
+        return;
+    }
+}
+
+// ── Parser (recursive descent) ────────────────────────────────────────────────
+//
+// Precedence (low to high):
+//   comparison ( == != < <= > >= )  ->  additive ( + - )  ->
+//   multiplicative ( * / )  ->  unary ( - )  ->  primary
+
+class Parser
+{
+    // Borrow the token list by pointer - copying a list<T> into a field aliases its
+    // backing storage and double-frees at scope exit, so we never own it here.
+    list<Token>* toks = default;
+    int pos = default;
+
+    void init(list<Token>* t) { toks = t; pos = 0; }
+
+    Token cur()           { return toks->get(pos); }
+    int   curKind()       { return toks->get(pos).kind; }
+    void  advance()       { pos = pos + 1; }
+    bool  check(int kind) { return curKind() == kind; }
+
+    bool accept(int kind)
+    {
+        if (check(kind)) { advance(); return true; }
+        return false;
+    }
+
+    void expect(int kind, string what)
+    {
+        if (!accept(kind))
+            printf("parse error: expected %s but found '%s'\n", what.data(), cur().text.data());
+    }
+
+    Node* makeNum(double v)
+    {
+        Node* n = new Node();
+        n->kind = NExpr.ENum;
+        n->num = v;
+        return n;
+    }
+
+    Stmt* parseStatement()
+    {
+        if (check(Tok.Ident))
+        {
+            string word = cur().text;
+            if (word == "print")
+            {
+                advance();
+                Stmt* s = new Stmt();
+                s->kind = NStmt.SPrint;
+                s->expr = parseExpr();
+                expect(Tok.Semi, "';'");
+                return s;
+            }
+            if (word == "if")    return parseIf();
+            if (word == "while") return parseWhile();
+
+            // assignment:  ident '=' expr ';'
+            advance();
+            Stmt* s = new Stmt();
+            s->kind = NStmt.SAssign;
+            s->name = word;
+            expect(Tok.Assign, "'='");
+            s->expr = parseExpr();
+            expect(Tok.Semi, "';'");
+            return s;
+        }
+
+        printf("parse error: unexpected token '%s'\n", cur().text.data());
+        advance();
+        return nullptr;
+    }
+
+    list<Stmt*> parseBlock()
+    {
+        list<Stmt*> stmts = default;
+        expect(Tok.LBrace, "'{'");
+        while (!check(Tok.RBrace) && !check(Tok.End))
+            stmts.add(parseStatement());
+        expect(Tok.RBrace, "'}'");
+        return stmts;
+    }
+
+    Stmt* parseIf()
+    {
+        advance();   // 'if'
+        Stmt* s = new Stmt();
+        s->kind = NStmt.SIf;
+        expect(Tok.LParen, "'('");
+        s->expr = parseExpr();
+        expect(Tok.RParen, "')'");
+        s->thenBody = parseBlock();
+        if (check(Tok.Ident) && cur().text == "else")
+        {
+            advance();
+            s->elseBody = parseBlock();
+        }
+        return s;
+    }
+
+    Stmt* parseWhile()
+    {
+        advance();   // 'while'
+        Stmt* s = new Stmt();
+        s->kind = NStmt.SWhile;
+        expect(Tok.LParen, "'('");
+        s->expr = parseExpr();
+        expect(Tok.RParen, "')'");
+        s->thenBody = parseBlock();
+        return s;
+    }
+
+    bool isComparison(int k)
+    {
+        return k == Tok.Eq || k == Tok.Ne || k == Tok.Lt ||
+               k == Tok.Le || k == Tok.Gt || k == Tok.Ge;
+    }
+
+    Node* parseExpr() { return parseComparison(); }
+
+    Node* parseBinExpr(int op, Node* left, Node* right)
+    {
+        Node* b = new Node();
+        b->kind = NExpr.EBin;
+        b->op = op;
+        b->left = left;
+        b->right = right;
+        return b;
+    }
+
+    Node* parseComparison()
+    {
+        Node* left = parseAdditive();
+        while (isComparison(curKind()))
+        {
+            int op = curKind();
+            advance();
+            left = parseBinExpr(op, left, parseAdditive());
+        }
+        return left;
+    }
+
+    Node* parseAdditive()
+    {
+        Node* left = parseMultiplicative();
+        while (check(Tok.Plus) || check(Tok.Minus))
+        {
+            int op = curKind();
+            advance();
+            left = parseBinExpr(op, left, parseMultiplicative());
+        }
+        return left;
+    }
+
+    Node* parseMultiplicative()
+    {
+        Node* left = parseUnary();
+        while (check(Tok.Star) || check(Tok.Slash))
+        {
+            int op = curKind();
+            advance();
+            left = parseBinExpr(op, left, parseUnary());
+        }
+        return left;
+    }
+
+    Node* parseUnary()
+    {
+        if (accept(Tok.Minus))
+        {
+            Node* n = new Node();
+            n->kind = NExpr.ENeg;
+            n->left = parseUnary();
+            return n;
+        }
+        return parsePrimary();
+    }
+
+    Node* parsePrimary()
+    {
+        if (check(Tok.Number))
+        {
+            Node* n = makeNum(cur().num);
+            advance();
+            return n;
+        }
+        if (check(Tok.Ident))
+        {
+            Node* n = new Node();
+            n->kind = NExpr.EVar;
+            n->name = cur().text;
+            advance();
+            return n;
+        }
+        if (accept(Tok.LParen))
+        {
+            Node* inner = parseExpr();
+            expect(Tok.RParen, "')'");
+            return inner;
+        }
+
+        printf("parse error: unexpected token '%s' in expression\n", cur().text.data());
+        advance();
+        return makeNum(0.0);
+    }
+
+    list<Stmt*> parseProgram()
+    {
+        list<Stmt*> prog = default;
+        while (!check(Tok.End))
+            prog.add(parseStatement());
+        return prog;
+    }
+};
+
+// ── Driver ────────────────────────────────────────────────────────────────────
+
+void run(string source)
+{
+    Lexer lexer;
+    lexer.init(source);
+    list<Token> tokens = lexer.tokenize();
+
+    Parser parser;
+    parser.init(&tokens);
+    list<Stmt*> prog = parser.parseProgram();
+
+    Env env;
+    execAll(&prog, &env);
+}
+
+string demoProgram()
+{
+    string s = "";
+    s = s + "a = 2 + 3 * 4;\n";          // precedence: 14, not 20
+    s = s + "print a;\n";
+    s = s + "b = (2 + 3) * 4;\n";        // parentheses: 20
+    s = s + "print b;\n";
+    s = s + "print 10 - 2 - 3;\n";       // left assoc: 5
+    s = s + "print 100 / 4 / 5;\n";      // left assoc: 5
+    s = s + "x = 0;\n";
+    s = s + "sum = 0;\n";
+    // NOTE: '{' / '}' are escaped as '{{' / '}}' because every CFlat string literal
+    // containing braces is treated as an interpolated string.
+    s = s + "while (x < 5) {{ sum = sum + x; x = x + 1; }}\n";
+    s = s + "print sum;\n";              // 0+1+2+3+4 = 10
+    s = s + "if (sum >= 10) {{ print 1; }} else {{ print 0; }}\n";  // 1
+    return s;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1)
+    {
+        string path = (string)argv[1];
+        if (File.exists(path))
+        {
+            string source = File.readAllText(path);
+            printf("--- running %s ---\n", path.data());
+            run(source);
+            return 0;
+        }
+        printf("file not found: %s (running embedded demo instead)\n", path.data());
+    }
+
+    printf("--- running embedded demo ---\n");
+    run(demoProgram());
+    return 0;
+}

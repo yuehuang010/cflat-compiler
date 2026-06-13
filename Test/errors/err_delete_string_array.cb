@@ -1,0 +1,23 @@
+// A raw 'new string[n]' array does not own its elements: 'string' has no runtime
+// ownership flag, so its slots may hold borrowed text (a literal, a view, or an alias
+// of another buffer). A destructive 'delete[n]' (or 'delete[]' / 'delete') would run
+// the string destructor on those slots and free non-owned memory -> heap corruption.
+// The compiler rejects it and steers to 'delete[_]' or 'list<string>'.
+import "string.cb";
+
+expect_error("cannot destructively 'delete'") {
+    void bad() {
+        string* codes = new string[8];
+        string prefix = "abc";
+        codes[5] = prefix;
+        delete[8] codes;
+    }
+}
+
+// Safe escape: 'delete[_]' frees the backing buffer without destructing elements.
+void good() {
+    string* codes = new string[8];
+    delete[_] codes;
+}
+
+extern int main() { return 0; }

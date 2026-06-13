@@ -1,0 +1,137 @@
+// main.cb - A config-driven tool demonstrating a full JSON round-trip.
+//
+// Reads an application config from disk (config.json), deserializes it into a
+// struct with `JsonBuilder.fromJson<T>`, drives some work from the values
+// (prints a report, validates ranges, computes derived values), applies a small
+// modification, then serializes the result back out with `JsonBuilder.toJson<T>`
+// and writes it to config.out.json.
+//
+// Build & run:
+//   x64/Debug/cflat.exe example/customer/json-config/main.cb -o example/customer/json-config/app.exe
+//   cd example/customer/json-config && ..\..\..\x64\Debug\cflat.exe ... (see README at bottom)
+//
+// Exercises JSON serialization for:
+//   - scalar fields: string, int, float, bool
+//   - a nested struct (DatabaseConfig)
+//   - a collection (list<string> featureFlags)
+
+import "json.cb";
+import "list.cb";
+import "filesystem.cb";
+
+// ── Config model ────────────────────────────────────────────────────────────────
+
+struct DatabaseConfig {
+    string host     = default;
+    int    port     = 0;
+    int    poolSize = 0;
+    bool   useTls   = false;
+};
+
+struct AppConfig {
+    string         appName        = default;
+    string         environment    = default;
+    int            listenPort     = 0;
+    int            maxConnections = 0;
+    float          cpuThreshold   = 0;
+    bool           debugMode      = false;
+    DatabaseConfig database       = default;
+    list<string>   featureFlags   = default;
+};
+
+// ── Report / validation / derived values ────────────────────────────────────────
+
+void printReport(AppConfig* c)
+{
+    printf("==== Application Config ====\n");
+    printf("  app          : %s\n", c->appName.data());
+    printf("  environment  : %s\n", c->environment.data());
+    printf("  listen port  : %d\n", c->listenPort);
+    printf("  max conns    : %d\n", c->maxConnections);
+    printf("  cpu threshold: %g\n", c->cpuThreshold);
+    printf("  debug mode   : %s\n", c->debugMode ? "on" : "off");
+    printf("  database:\n");
+    printf("    host    : %s\n", c->database.host.data());
+    printf("    port    : %d\n", c->database.port);
+    printf("    poolSize: %d\n", c->database.poolSize);
+    printf("    useTls  : %s\n", c->database.useTls ? "true" : "false");
+    printf("  feature flags (%d):\n", c->featureFlags.count());
+    for (string f in c->featureFlags)
+        printf("    - %s\n", f.data());
+}
+
+// Returns the number of problems found (0 == valid).
+int validate(AppConfig* c)
+{
+    int problems = 0;
+    if (c->listenPort < 1 || c->listenPort > 65535) {
+        printf("  [WARN] listenPort %d out of range 1..65535\n", c->listenPort);
+        problems++;
+    }
+    if (c->maxConnections <= 0) {
+        printf("  [WARN] maxConnections must be positive (got %d)\n", c->maxConnections);
+        problems++;
+    }
+    if (c->cpuThreshold < 0.0 || c->cpuThreshold > 1.0) {
+        printf("  [WARN] cpuThreshold %g should be in 0.0..1.0\n", c->cpuThreshold);
+        problems++;
+    }
+    if (c->database.poolSize > c->maxConnections) {
+        printf("  [WARN] db.poolSize %d exceeds maxConnections %d\n",
+               c->database.poolSize, c->maxConnections);
+        problems++;
+    }
+    return problems;
+}
+
+extern int main()
+{
+    string inPath  = "example/customer/json-config/config.json";
+    string outPath = "example/customer/json-config/config.out.json";
+
+    if (!File.exists(inPath)) {
+        printf("ERROR: input config not found: %s\n", inPath.data());
+        printf("(run from the repository root)\n");
+        return 1;
+    }
+
+    // ── Read + deserialize ──────────────────────────────────────────────────────
+    string text = File.readAllText(inPath);
+    printf("Loaded %d bytes from %s\n\n", text.length(), inPath.data());
+
+    AppConfig cfg = JsonBuilder.fromJson<AppConfig>(text);
+
+    printReport(&cfg);
+
+    // ── Validate ────────────────────────────────────────────────────────────────
+    printf("\n==== Validation ====\n");
+    int problems = validate(&cfg);
+    if (problems == 0) printf("  config OK\n");
+    else               printf("  %d problem(s) found\n", problems);
+
+    // ── Derived value ───────────────────────────────────────────────────────────
+    int reserved = (int)((float)cfg.maxConnections * cfg.cpuThreshold);
+    printf("\n==== Derived ====\n");
+    printf("  reserved connections (maxConnections * cpuThreshold) = %d\n", reserved);
+
+    // ── Modify: harden the config for production, then add a flag ────────────────
+    printf("\n==== Applying modifications ====\n");
+    if (cfg.environment == "production" && cfg.debugMode) {
+        cfg.debugMode = false;
+        printf("  forced debugMode off for production\n");
+    }
+    string newFlag = "validated";
+    cfg.featureFlags.add(newFlag.copy());
+    printf("  appended feature flag 'validated'\n");
+
+    // ── Serialize + write ───────────────────────────────────────────────────────
+    string outJson = JsonBuilder.toJson<AppConfig>(cfg);
+    if (!File.writeAllText(outPath, outJson)) {
+        printf("ERROR: failed to write %s\n", outPath.data());
+        return 1;
+    }
+    printf("\nWrote %d bytes to %s\n", outJson.length(), outPath.data());
+    printf("\n==== Output JSON ====\n%s\n", outJson.data());
+
+    return 0;
+}

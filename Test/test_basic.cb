@@ -1010,6 +1010,17 @@ bool testStringLiteral()
     result &= Test("str_lit_multi_a_data", sa.data(), "alpha");
     result &= Test("str_lit_multi_b_data", sb.data(), "beta!");
 
+    // X6: a ternary whose branches are a `string` value and a char* literal must
+    // coerce the literal to `string` (instead of asserting in LLVM's select on
+    // mismatched operands). Verify both branch orders and the selected value.
+    string base = "abc";
+    string t1 = base.length() == 0 ? "lit" : base;       // selects the string branch
+    result &= Test("ternary_str_pick_value",   t1.data(), "abc");
+    string t2 = base.length() == 3 ? "lit" : base;       // selects the char* literal
+    result &= Test("ternary_str_pick_literal", t2.data(), "lit");
+    string t3 = base.length() == 0 ? base : "fallback";  // reversed: string then char*
+    result &= Test("ternary_str_reversed",     t3.data(), "fallback");
+
     return result;
 }
 

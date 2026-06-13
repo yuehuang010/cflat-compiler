@@ -210,6 +210,51 @@ int testListStringMove()
     return passed;
 }
 
+// ── recursive owning-pointer-tree free (X4 Part 2 regression) ─────────────────
+// Passing a FIELD (node->left / node->right) to a 'move' parameter must mark only
+// that field as moved, not the whole base 'node' - otherwise the second field
+// access is wrongly rejected as "use of moved variable 'node'". This is the
+// canonical Huffman/AST shape: a recursive free over an owning pointer tree.
+struct TreeNode
+{
+    TreeNode* left  = nullptr;
+    TreeNode* right = nullptr;
+    ~TreeNode()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+void freeTree(move TreeNode* node)
+{
+    if (node == nullptr) return;
+    freeTree(node->left);    // moving node->left must NOT poison node ...
+    freeTree(node->right);   // ... so this line still compiles.
+    delete node;
+}
+
+int testRecursiveTreeFree()
+{
+    int passed = 0;
+
+    // 3-level full binary tree: 1 root + 2 children + 4 grandchildren = 7 nodes.
+    dtorCount = 0;
+    {
+        TreeNode* root = new TreeNode();
+        root->left  = new TreeNode();
+        root->right = new TreeNode();
+        root->left->left   = new TreeNode();
+        root->left->right  = new TreeNode();
+        root->right->left  = new TreeNode();
+        root->right->right = new TreeNode();
+        freeTree(root);
+        // root is moved into freeTree; scope exit is a no-op. Every node freed once.
+    }
+    passed += Test("recursive_tree_free_all_freed_once", dtorCount, 7);
+
+    return passed;
+}
+
 int testFieldOwnership()
 {
     int passed = 0;
@@ -439,6 +484,9 @@ extern int main()
     }
     passed += Test("composite_dtor_chain_frees_all", dtorCount, 4);
     total++;
+
+    passed += testRecursiveTreeFree();
+    total += 1;
 
     passed += testFieldOwnership();
     total += 7;

@@ -1,0 +1,393 @@
+// main.cb - a small Huffman compression tool.
+//
+// Build:
+//   x64/Debug/cflat.exe example/customer/compress/main.cb -o example/customer/compress/huff.exe
+// Run:
+//   huff compress   <input> <output>
+//   huff decompress <input> <output>
+//
+// File format (all multi-byte integers little-endian):
+//   magic     : 4 bytes  "HUF1"
+//   origLen   : 8 bytes  (i64)  number of bytes in the original file
+//   distinct  : 4 bytes  (u32)  number of byte values with non-zero frequency
+//   table     : distinct * (sym:1 byte + freq:u32) entries
+//   payload   : the packed Huffman bit stream (MSB-first within each byte)
+//
+// Decompression rebuilds the identical tree from the frequency table, so the
+// tree itself is not stored.
+//
+// The Huffman tree is held in a flat node "arena" (a Node[] indexed by int),
+// not a graph of new'd pointers - this keeps the recursive structure simple to
+// own and free (one array), and sidesteps per-node lifetime bookkeeping.
+
+import "filesystem.cb";
+
+// A tree node. left/right are indices into the node arena, or -1 for "none".
+// A leaf has left == -1 and right == -1 and a symbol in 0..255.
+struct Node
+{
+    int symbol = -1;
+    i64 freq   = 0;
+    int left   = -1;
+    int right  = -1;
+};
+
+bool isLeaf(Node* pool, int idx) { return pool[idx].left < 0 && pool[idx].right < 0; }
+
+// ── tree construction ──────────────────────────────────────────────────────
+
+// Build a Huffman tree into `pool` (must hold at least 2*256 nodes) from a
+// 256-entry frequency table. Returns the root node index, or -1 if empty.
+// Repeatedly combines the two lowest-weight live nodes via a linear min-scan
+// (a real priority queue would be the next step).
+int buildTree(i64* freq, Node* pool)
+{
+    int poolCount = 0;
+
+    // live[] holds the indices of nodes not yet merged
+    int[256] live;
+    int liveCount = 0;
+
+    int s = 0;
+    while (s < 256)
+    {
+        if (freq[s] > 0)
+        {
+            pool[poolCount].symbol = s;
+            pool[poolCount].freq   = freq[s];
+            pool[poolCount].left   = -1;
+            pool[poolCount].right  = -1;
+            live[liveCount] = poolCount;
+            liveCount++;
+            poolCount++;
+        }
+        s++;
+    }
+
+    if (liveCount == 0) return -1;
+
+    while (liveCount > 1)
+    {
+        int pa = lowestLive(pool, live, liveCount, -1);
+        int na = live[pa];
+        int pb = lowestLive(pool, live, liveCount, pa);
+        int nb = live[pb];
+
+        pool[poolCount].symbol = -1;
+        pool[poolCount].freq   = pool[na].freq + pool[nb].freq;
+        pool[poolCount].left   = na;
+        pool[poolCount].right  = nb;
+        int parent = poolCount;
+        poolCount++;
+
+        // remove pa and pb from live, then append the parent
+        // (remove the larger position first so the swap doesn't move the other)
+        int hi = pa > pb ? pa : pb;
+        int lo = pa < pb ? pa : pb;
+        live[hi] = live[liveCount - 1]; liveCount--;
+        live[lo] = live[liveCount - 1]; liveCount--;
+        live[liveCount] = parent; liveCount++;
+    }
+
+    return live[0];
+}
+
+// Position within live[0..liveCount) of the lowest-weight node, skipping the
+// position `skip` (pass -1 to skip nothing).
+int lowestLive(Node* pool, int* live, int liveCount, int skip)
+{
+    int best = -1;
+    i64 bestFreq = 0;
+    int i = 0;
+    while (i < liveCount)
+    {
+        if (i != skip)
+        {
+            i64 fr = pool[live[i]].freq;
+            if (best < 0 || fr < bestFreq)
+            {
+                best = i;
+                bestFreq = fr;
+            }
+        }
+        i++;
+    }
+    return best;
+}
+
+// Walk the tree and record each leaf's code as (length, bit-pattern). Bits are
+// stored right-aligned in a u64, MSB-first along the root->leaf path. Assumes
+// no code exceeds 64 bits, which holds for any non-pathological input.
+void generateCodes(Node* pool, int idx, u64 bits, int depth, u64* codeBits, int* codeLen)
+{
+    if (idx < 0) return;
+    if (isLeaf(pool, idx))
+    {
+        int sym = pool[idx].symbol;
+        // a single-symbol file has depth 0; give it a one-bit code
+        if (depth == 0) { codeLen[sym] = 1; codeBits[sym] = 0; }
+        else            { codeLen[sym] = depth; codeBits[sym] = bits; }
+        return;
+    }
+    generateCodes(pool, pool[idx].left,  bits << 1,       depth + 1, codeBits, codeLen);
+    generateCodes(pool, pool[idx].right, (bits << 1) | 1, depth + 1, codeBits, codeLen);
+}
+
+// ── little-endian byte helpers ─────────────────────────────────────────────
+
+void putU32(i8* buf, int pos, u32 v)
+{
+    buf[pos + 0] = (i8)(v & 0xFF);
+    buf[pos + 1] = (i8)((v >> 8) & 0xFF);
+    buf[pos + 2] = (i8)((v >> 16) & 0xFF);
+    buf[pos + 3] = (i8)((v >> 24) & 0xFF);
+}
+
+u32 getU32(i8* buf, int pos)
+{
+    u32 b0 = (u32)(u8)buf[pos + 0];
+    u32 b1 = (u32)(u8)buf[pos + 1];
+    u32 b2 = (u32)(u8)buf[pos + 2];
+    u32 b3 = (u32)(u8)buf[pos + 3];
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+void putI64(i8* buf, int pos, i64 v)
+{
+    int i = 0;
+    while (i < 8) { buf[pos + i] = (i8)((v >> (i * 8)) & 0xFF); i++; }
+}
+
+i64 getI64(i8* buf, int pos)
+{
+    i64 v = 0;
+    int i = 0;
+    while (i < 8) { v = v | (((i64)(u8)buf[pos + i]) << (i * 8)); i++; }
+    return v;
+}
+
+// ── compression ────────────────────────────────────────────────────────────
+
+int compress(char* inPath, char* outPath)
+{
+    File* inf = new File;
+    if (!inf->openRead((string)inPath))
+    {
+        printf("compress: cannot open %s\n", inPath);
+        delete inf;
+        return 1;
+    }
+    int n = inf->size();
+    i8* data = new i8[n > 0 ? n : 1];
+    inf->readBytes(data, n);
+    inf->close();
+    delete inf;
+
+    // frequency table
+    i64[256] freq;
+    int k = 0;
+    while (k < 256) { freq[k] = 0; k++; }
+    int i = 0;
+    while (i < n) { int b = (int)(u8)data[i]; freq[b] = freq[b] + 1; i++; }
+
+    Node* pool = new Node[512];
+    int root = buildTree(freq, pool);
+
+    u64[256] codeBits;
+    int[256] codeLen;
+    int z = 0;
+    while (z < 256) { codeBits[z] = 0; codeLen[z] = 0; z++; }
+    generateCodes(pool, root, 0, 0, codeBits, codeLen);
+
+    // count distinct symbols so the header only stores those
+    int distinct = 0;
+    int d = 0;
+    while (d < 256) { if (freq[d] > 0) distinct++; d++; }
+
+    // header(16 + distinct*5) + payload(<= n in practice; +slack)
+    int maxHeader = 4 + 8 + 4 + 256 * 5;
+    i8* out = new i8[maxHeader + n + 16];
+
+    out[0] = 'H'; out[1] = 'U'; out[2] = 'F'; out[3] = '1';
+    putI64(out, 4, (i64)n);
+    putU32(out, 12, (u32)distinct);
+    int p = 16;
+    int f = 0;
+    while (f < 256)
+    {
+        if (freq[f] > 0)
+        {
+            out[p] = (i8)f; p++;
+            putU32(out, p, (u32)freq[f]); p = p + 4;
+        }
+        f++;
+    }
+
+    // payload - pack bits MSB-first
+    int bytePos = p;
+    int cur = 0;
+    int nbits = 0;
+    out[bytePos] = 0;
+    int j = 0;
+    while (j < n)
+    {
+        int sym  = (int)(u8)data[j];
+        u64 bits = codeBits[sym];
+        int clen = codeLen[sym];
+        int c = clen - 1;
+        while (c >= 0)
+        {
+            int bit = (int)((bits >> c) & 1);
+            cur = (cur << 1) | bit;
+            nbits++;
+            if (nbits == 8)
+            {
+                out[bytePos] = (i8)cur;
+                bytePos++;
+                out[bytePos] = 0;
+                cur = 0;
+                nbits = 0;
+            }
+            c--;
+        }
+        j++;
+    }
+    if (nbits > 0)
+    {
+        cur = cur << (8 - nbits);   // left-align the final partial byte
+        out[bytePos] = (i8)cur;
+        bytePos++;
+    }
+
+    int total = bytePos;
+
+    File* of = new File;
+    if (!of->openWrite((string)outPath))
+    {
+        printf("compress: cannot create %s\n", outPath);
+        delete of;
+        return 1;
+    }
+    of->writeBytes(out, total);
+    of->close();
+    delete of;
+
+    double ratio = n > 0 ? (double)total / (double)n : 0.0;
+    printf("compressed %d -> %d bytes (%.1f%% of original)\n", n, total, ratio * 100.0);
+
+    delete[_] pool;
+    delete[] data;
+    delete[] out;
+    return 0;
+}
+
+// ── decompression ──────────────────────────────────────────────────────────
+
+int decompress(char* inPath, char* outPath)
+{
+    File* inf = new File;
+    if (!inf->openRead((string)inPath))
+    {
+        printf("decompress: cannot open %s\n", inPath);
+        delete inf;
+        return 1;
+    }
+    int n = inf->size();
+    i8* data = new i8[n > 0 ? n : 1];
+    inf->readBytes(data, n);
+    inf->close();
+    delete inf;
+
+    if (n < 16 || data[0] != 'H' || data[1] != 'U' || data[2] != 'F' || data[3] != '1')
+    {
+        printf("decompress: %s is not a HUF1 file\n", inPath);
+        delete[] data;
+        return 1;
+    }
+
+    i64 origLen  = getI64(data, 4);
+    int distinct = (int)getU32(data, 12);
+
+    i64[256] freq;
+    int f = 0;
+    while (f < 256) { freq[f] = 0; f++; }
+    int p = 16;
+    int kk = 0;
+    while (kk < distinct)
+    {
+        int sym = (int)(u8)data[p]; p++;
+        u32 fr  = getU32(data, p); p = p + 4;
+        freq[sym] = (i64)fr;
+        kk++;
+    }
+
+    Node* pool = new Node[512];
+    int root = buildTree(freq, pool);
+
+    i8* out = new i8[origLen > 0 ? origLen : 1];
+    i64 produced = 0;
+
+    if (root >= 0 && isLeaf(pool, root))
+    {
+        // single distinct symbol: no bits to read, just repeat it
+        int sym = pool[root].symbol;
+        while (produced < origLen) { out[produced] = (i8)sym; produced++; }
+    }
+    else
+    {
+        int bytePos = p;
+        int bitInByte = 0;
+        int node = root;
+        while (produced < origLen && node >= 0)
+        {
+            int curByte = (int)(u8)data[bytePos];
+            int bit = (curByte >> (7 - bitInByte)) & 1;
+            bitInByte++;
+            if (bitInByte == 8) { bitInByte = 0; bytePos++; }
+
+            node = bit == 1 ? pool[node].right : pool[node].left;
+            if (node >= 0 && isLeaf(pool, node))
+            {
+                out[produced] = (i8)pool[node].symbol;
+                produced++;
+                node = root;
+            }
+        }
+    }
+
+    File* of = new File;
+    if (!of->openWrite((string)outPath))
+    {
+        printf("decompress: cannot create %s\n", outPath);
+        delete of;
+        return 1;
+    }
+    of->writeBytes(out, (int)produced);
+    of->close();
+    delete of;
+
+    printf("decompressed %d -> %d bytes\n", n, (int)produced);
+
+    delete[_] pool;
+    delete[] data;
+    delete[] out;
+    return 0;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 4)
+    {
+        printf("Usage:\n");
+        printf("  huff compress   <input> <output>\n");
+        printf("  huff decompress <input> <output>\n");
+        return 1;
+    }
+
+    string mode = (string)argv[1];
+    if (mode == "compress")   return compress(argv[2], argv[3]);
+    if (mode == "decompress") return decompress(argv[2], argv[3]);
+
+    printf("unknown mode: %s\n", argv[1]);
+    return 1;
+}

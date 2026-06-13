@@ -353,6 +353,47 @@ bool testMultipleInterfaces()
     return result;
 }
 
+// ── Test 9: returning an interface value ─────────────────────────────────────
+// A function whose declared return type is an interface must produce a correct fat
+// pointer (vtable + data), so a method call on the returned value dispatches to the
+// concrete implementation. Regression for the interface-return miscompile, where a
+// returned concrete pointer was emitted as a bare `ret ptr` (verifier failure) and
+// the boxing workaround lost the object/vtable (silent 0 result).
+
+IShape makeCircleShape(int r)
+{
+    Circle* c = new Circle();
+    c.r = r;
+    return c;            // concrete implementer POINTER -> interface fat pointer
+}
+
+IShape echoShape(IShape s)
+{
+    return s;            // already-boxed interface value -> passthrough
+}
+
+bool testReturnInterface()
+{
+    bool result = true;
+
+    // Return a concrete implementer pointer as an interface, then dispatch a method.
+    IShape c = makeCircleShape(5);
+    result &= Test("return_iface_from_ptr_area",      c.area(),    75);   // 5*5*3
+    result &= Test("return_iface_from_ptr_is_circle", c is Circle, true);
+    Circle* cp = c as Circle;          // reclaim ownership to free the heap object
+    if (cp != nullptr)
+        delete cp;
+
+    // Return an already-boxed interface value (passthrough of a parameter).
+    Square sq;
+    sq.s = 6;
+    IShape boxed  = sq;
+    IShape passed = echoShape(boxed);
+    result &= Test("return_iface_passthrough_area",   passed.area(), 36); // 6*6
+
+    return result;
+}
+
 // =============================================================
 // list<IInterface> tests
 // =============================================================
@@ -495,6 +536,7 @@ extern int main()
     total++; passed += testSwitchInterfaceCase() ? 1 : 0;
     total++; passed += testSwitchDefault()       ? 1 : 0;
     total++; passed += testMultipleInterfaces()  ? 1 : 0;
+    total++; passed += testReturnInterface()     ? 1 : 0;
     total++; passed += testListInterfaceBasic()  ? 1 : 0;
     total++; passed += testListInterfaceIsAs()   ? 1 : 0;
     total++; passed += testListInterfaceForeach() ? 1 : 0;

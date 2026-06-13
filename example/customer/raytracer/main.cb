@@ -1,0 +1,279 @@
+// main.cb - a small recursive CPU raytracer.
+//
+// Renders several spheres on a checkered ground plane to a BMP file using
+// operator-overloaded vec3 math, a diffuse+ambient shading model, and one
+// or more bounces of mirror reflection.
+//
+// Build:
+//   x64/Debug/cflat.exe example/customer/raytracer/main.cb -o example/customer/raytracer/app.exe
+// Run:
+//   example\customer\raytracer\app.exe          -> writes render.bmp (400x300)
+
+import "graphic/bitmap.cb";
+import "math.cb";
+
+// ─── vec3: the whole point of the exercise is to lean on operator overloading ───
+
+struct vec3
+{
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+
+    vec3 operator+(vec3 o) { vec3 r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; return r; }
+    vec3 operator-(vec3 o) { vec3 r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; return r; }
+
+    // scalar multiply
+    vec3 operator*(double s) { vec3 r; r.x = x * s; r.y = y * s; r.z = z * s; return r; }
+    // component-wise multiply (used for color modulation)
+    vec3 operator*(vec3 o)   { vec3 r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; return r; }
+
+    double dot(vec3 o)   { return x * o.x + y * o.y + z * o.z; }
+    vec3   cross(vec3 o) { vec3 r; r.x = y * o.z - z * o.y; r.y = z * o.x - x * o.z; r.z = x * o.y - y * o.x; return r; }
+
+    double length()      { return Math.sqrt(x * x + y * y + z * z); }
+
+    vec3 normalize()
+    {
+        double l = length();
+        vec3 r; r.x = x / l; r.y = y / l; r.z = z / l; return r;
+    }
+};
+
+vec3 makeVec(double x, double y, double z)
+{
+    vec3 v; v.x = x; v.y = y; v.z = z; return v;
+}
+
+// reflect direction d about surface normal n (both assumed normalized)
+vec3 reflectDir(vec3 d, vec3 n)
+{
+    return d - n * (2.0 * d.dot(n));
+}
+
+// ─── scene ──────────────────────────────────────────────────────────────────
+
+struct Sphere
+{
+    vec3   center       = default;
+    double radius       = 1.0;
+    vec3   color        = default;
+    double reflectivity = 0.0;
+};
+
+// A small fixed scene held in globals so the recursive tracer can reach it.
+Sphere[4] g_spheres = default;
+int       g_sphereCount = 4;
+
+vec3 g_lightDir = default;   // normalized, set in main
+
+const double EPS = 0.001;
+
+// ─── intersection ─────────────────────────────────────────────────────────────
+
+// Returns the nearest positive t where ray (o + t*d) meets the sphere, or -1.
+double hitSphere(Sphere s, vec3 o, vec3 d)
+{
+    vec3   oc = o - s.center;
+    double a  = d.dot(d);
+    double b  = 2.0 * oc.dot(d);
+    double c  = oc.dot(oc) - s.radius * s.radius;
+    double disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) return -1.0;
+
+    double sq = Math.sqrt(disc);
+    double t0 = (-b - sq) / (2.0 * a);
+    if (t0 > EPS) return t0;
+    double t1 = (-b + sq) / (2.0 * a);
+    if (t1 > EPS) return t1;
+    return -1.0;
+}
+
+// Ground plane at y = 0. Returns t or -1.
+double hitGround(vec3 o, vec3 d)
+{
+    if (Math.abs(d.y) < 1e-6) return -1.0;
+    double t = -o.y / d.y;
+    if (t > EPS) return t;
+    return -1.0;
+}
+
+// ─── shading ──────────────────────────────────────────────────────────────────
+
+// Is the point in shadow with respect to the light?
+bool inShadow(vec3 p)
+{
+    vec3 o = p + g_lightDir * EPS;
+    int i = 0;
+    while (i < g_sphereCount)
+    {
+        if (hitSphere(g_spheres[i], o, g_lightDir) > 0.0) return true;
+        i++;
+    }
+    return false;
+}
+
+vec3 skyColor(vec3 d)
+{
+    double t = 0.5 * (d.y + 1.0);
+    vec3 white = makeVec(1.0, 1.0, 1.0);
+    vec3 blue  = makeVec(0.5, 0.7, 1.0);
+    return white * (1.0 - t) + blue * t;
+}
+
+vec3 groundColor(vec3 p)
+{
+    // checkerboard
+    int cx = (int)Math.floor(p.x);
+    int cz = (int)Math.floor(p.z);
+    bool even = ((cx + cz) & 1) == 0;
+    if (even) return makeVec(0.9, 0.9, 0.9);
+    return makeVec(0.2, 0.2, 0.2);
+}
+
+// Recursive trace: returns the color seen along ray (o + t*d).
+vec3 trace(vec3 o, vec3 d, int depth)
+{
+    double bestT  = 1e30;
+    int    bestIx = -1;   // -1 = none, -2 = ground
+
+    int i = 0;
+    while (i < g_sphereCount)
+    {
+        double t = hitSphere(g_spheres[i], o, d);
+        if (t > 0.0 && t < bestT) { bestT = t; bestIx = i; }
+        i++;
+    }
+
+    double tg = hitGround(o, d);
+    if (tg > 0.0 && tg < bestT) { bestT = tg; bestIx = -2; }
+
+    if (bestIx == -1) return skyColor(d);
+
+    vec3 hitPt = o + d * bestT;
+
+    vec3   normal       = default;
+    vec3   baseColor    = default;
+    double reflectivity = 0.0;
+
+    if (bestIx == -2)
+    {
+        normal       = makeVec(0.0, 1.0, 0.0);
+        baseColor    = groundColor(hitPt);
+        reflectivity = 0.2;
+    }
+    else
+    {
+        Sphere s     = g_spheres[bestIx];
+        vec3 off     = hitPt - s.center;
+        normal       = off.normalize();
+        baseColor    = s.color;
+        reflectivity = s.reflectivity;
+    }
+
+    // diffuse + ambient
+    double ambient = 0.2;
+    double diffuse = Math.max(0.0, normal.dot(g_lightDir));
+    if (inShadow(hitPt)) diffuse = 0.0;
+
+    vec3 local = baseColor * (ambient + diffuse);
+
+    if (reflectivity > 0.0 && depth > 0)
+    {
+        vec3 rdir = reflectDir(d, normal).normalize();
+        vec3 rcol = trace(hitPt + normal * EPS, rdir, depth - 1);
+        local = local * (1.0 - reflectivity) + rcol * reflectivity;
+    }
+
+    return local;
+}
+
+u8 toByte(double c)
+{
+    double v = Math.clamp(c, 0.0, 1.0);
+    return (u8)(v * 255.0 + 0.5);
+}
+
+extern int main()
+{
+    int W = 400;
+    int H = 300;
+    int maxDepth = 4;
+
+    // Build the scene.
+    g_spheres[0].center = makeVec(0.0, 1.0, 0.0);
+    g_spheres[0].radius = 1.0;
+    g_spheres[0].color  = makeVec(0.8, 0.3, 0.3);
+    g_spheres[0].reflectivity = 0.3;
+
+    g_spheres[1].center = makeVec(-2.2, 0.8, -1.0);
+    g_spheres[1].radius = 0.8;
+    g_spheres[1].color  = makeVec(0.3, 0.8, 0.3);
+    g_spheres[1].reflectivity = 0.1;
+
+    g_spheres[2].center = makeVec(2.2, 0.7, -0.5);
+    g_spheres[2].radius = 0.7;
+    g_spheres[2].color  = makeVec(0.3, 0.4, 0.9);
+    g_spheres[2].reflectivity = 0.5;
+
+    g_spheres[3].center = makeVec(0.4, 0.4, 1.6);
+    g_spheres[3].radius = 0.4;
+    g_spheres[3].color  = makeVec(0.9, 0.9, 0.2);
+    g_spheres[3].reflectivity = 0.8;
+
+    g_lightDir = makeVec(-1.0, 1.5, 0.6).normalize();
+
+    // Camera: a look-at basis built with the cross product.
+    vec3 camPos = makeVec(0.0, 1.5, 5.0);
+    vec3 target = makeVec(0.0, 0.8, 0.0);
+    vec3 worldUp = makeVec(0.0, 1.0, 0.0);
+
+    vec3 fwdTmp  = target - camPos;
+    vec3 forward = fwdTmp.normalize();
+    vec3 rgtTmp  = forward.cross(worldUp);
+    vec3 right   = rgtTmp.normalize();
+    vec3 camUp   = right.cross(forward);   // already unit length
+
+    double aspect = (double)W / (double)H;
+    double scale  = 0.7;   // ~35 degree half-fov-ish
+
+    Bitmap* bmp = new Bitmap;
+    bmp->create(W, H);
+
+    int py = 0;
+    while (py < H)
+    {
+        int px = 0;
+        while (px < W)
+        {
+            double u = (2.0 * ((double)px + 0.5) / (double)W - 1.0) * aspect * scale;
+            double v = (1.0 - 2.0 * ((double)py + 0.5) / (double)H) * scale;
+
+            vec3 rayTmp = forward + right * u + camUp * v;
+            vec3 dir = rayTmp.normalize();
+            vec3 col = trace(camPos, dir, maxDepth);
+
+            BitmapPixel pix;
+            pix.r = toByte(col.x);
+            pix.g = toByte(col.y);
+            pix.b = toByte(col.z);
+            pix.a = (u8)255;
+            bmp->set(px, py, pix);
+
+            px++;
+        }
+        py++;
+    }
+
+    string outPath = "render.bmp";
+    if (!bmp->save(outPath))
+    {
+        printf("raytracer: failed to save %s\n", outPath.data());
+        delete bmp;
+        return 1;
+    }
+
+    printf("raytracer: wrote %s (%dx%d)\n", outPath.data(), W, H);
+    delete bmp;
+    return 0;
+}

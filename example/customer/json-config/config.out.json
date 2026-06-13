@@ -1,0 +1,1 @@
+{"appName":"checkout-service","environment":"production","listenPort":8443,"maxConnections":256,"cpuThreshold":0.75,"debugMode":false,"database":{"host":"db.internal.example.com","port":5432,"poolSize":32,"useTls":true},"featureFlags":["fast-path","metrics","beta-ui","validated"]}

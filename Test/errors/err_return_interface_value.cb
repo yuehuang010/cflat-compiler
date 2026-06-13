@@ -1,0 +1,10 @@
+// Returning a by-value local that implements an interface would make the interface
+// fat pointer dangle once the function returns (its data points into the dead frame).
+// The compiler rejects this and steers to a heap allocation.
+
+interface IShape { int area(); };
+class Square : IShape { int s = 0; int area() { return s * s; } };
+
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape makeVal(int s) { Square sq; sq.s = s; return sq; }
+}

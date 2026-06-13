@@ -1,0 +1,23 @@
+The Huffman coding algorithm assigns shorter binary codes to more frequent
+symbols and longer codes to rarer ones, producing a prefix-free code that is
+optimal for symbol-by-symbol encoding. It was invented by David A. Huffman in
+1952 while he was a student at MIT, as a term-paper alternative to a final exam.
+
+The procedure is delightfully simple. First, count how often each symbol occurs
+in the input. Then treat every symbol as a leaf node whose weight is its count.
+Repeatedly remove the two nodes of smallest weight, join them under a new parent
+whose weight is the sum of the two, and put the parent back into the pool. When a
+single node remains, it is the root of the Huffman tree. Walking the tree from
+the root, a left branch contributes a 0 bit and a right branch contributes a 1
+bit, so the path from the root to a leaf spells out that symbol's code.
+
+Because no code is a prefix of any other code, the encoded bit stream can be
+decoded unambiguously: start at the root, follow one branch per bit, and emit a
+symbol whenever a leaf is reached. The more skewed the symbol frequencies, the
+better the compression. Text with lots of repeated letters compresses well,
+while already-random data barely compresses at all.
+
+This sample file exists so that the compressor has something realistic to chew
+on. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over
+the lazy dog. Pack my box with five dozen liquor jugs. How razorback-jumping
+frogs can level six piqued gymnasts! Sphinx of black quartz, judge my vow.

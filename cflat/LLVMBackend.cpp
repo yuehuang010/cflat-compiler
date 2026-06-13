@@ -1902,8 +1902,44 @@ void LLVMBackend::ResetForReanalysis()
     module = std::make_unique<llvm::Module>("cflat", *context);
     builder = std::make_unique<llvm::IRBuilder<>>(*context);
 
+    // Debug-info state is bound to the (now-discarded) module: the DIBuilder, its DIFile/
+    // DICompileUnit nodes, and the DIType/DIFile caches all point into the old module's
+    // metadata. The LSP Analyze path never calls InitDebugInfo so these are empty here,
+    // but clearing them keeps the "nothing module-bound survives the reset" invariant intact
+    // (and would prevent the same dangling-pointer crash class if a reanalysis ever ran -g).
+    diBuilder.reset();
+    diFile = nullptr;
+    compileUnit = nullptr;
+    diTypeCache.clear();
+    diFileCache_.clear();
+    pendingGlobalDI_.clear();
+
+    // Array-view noalias metadata is module-bound: aliasDomain_ / aliasScopes_ hold llvm::MDNode*
+    // and viewScopeByOrigin_ indexes into that vector, all created against the now-discarded module.
+    // They are normally rebuilt per function in createFunctionBlock, but until the next function is
+    // emitted they would be dangling pointers into the freed module - a violation of the
+    // "nothing module-bound survives the reset" invariant (same crash class as the stale
+    // fullDestructorCache_ Function* below). Drop them here so nothing module-bound persists.
+    aliasDomain_ = nullptr;
+    aliasScopes_.clear();
+    viewScopeByOrigin_.clear();
+    // returnedStructDtorSkipAlloca points at a returned local's alloca in the discarded module; it
+    // is normally saved/restored around the return-path destructor walk, but a compile aborted by an
+    // exception between set and restore would leave a dangling alloca pointer that the next file's
+    // EmitDestructorsForScope compares against (and could wrongly skip a destructor).
+    returnedStructDtorSkipAlloca = nullptr;
+
     functionTable.clear();
     dataStructures.clear();
+    // Memoized full-destructor wrappers are synthesized llvm::Function* objects that live
+    // in `module`, so they MUST be discarded with it - a stale entry would hand the next
+    // file's analysis a Function* into the freed module/context, which crashes the moment a
+    // dtor call is emitted to it (this was the non-deterministic LSP bulk-sweep "Internal
+    // compiler error during analysis"). fullDestructorInProgress_ is the recursion guard;
+    // an analysis aborted mid-recursion could leave a name in it and make GetOrCreateFullDestructor
+    // wrongly short-circuit on the next file.
+    fullDestructorCache_.clear();
+    fullDestructorInProgress_.clear();
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
@@ -1938,8 +1974,15 @@ void LLVMBackend::ResetForReanalysis()
     lastCallReturnsOwned = false;
     lastOwningResult = false;
     currentFunctionReturnsOwned = false;
+    // Siblings of currentFunctionReturnsOwned, set together in createFunctionBlock; an aborted
+    // compile mid-function would leave them describing the prior file's last function.
+    currentFunctionReturnIsArrayView = false;
+    currentFunctionReturnTypeName.clear();
     pendingOwnedStringTemps.clear();
     lastCallIsBonded = false;
+    // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
+    // would mark the next file's first bonded value as by-address.
+    lastCallBondByAddress = false;
     lastCallBondedSources.clear();
     lastCallLambdaCaptureNames.clear();
     lastCallRequiredLocks.clear();

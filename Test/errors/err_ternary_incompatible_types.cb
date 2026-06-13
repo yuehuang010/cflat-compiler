@@ -1,0 +1,18 @@
+// A ternary (?:) whose two branches have genuinely incompatible types (here an
+// integer literal and a `string` value) cannot be unified into a single LLVM
+// select operand type. Before this was diagnosed, it reached CreateSelect and
+// tripped an LLVM assertion ("Invalid operands for select") -> abort(). The
+// compiler must instead report a clean type error at the ternary. Unifiable
+// branches (e.g. char* literal vs string, or int vs float) are coerced and
+// compile fine; only a true mismatch errors here.
+import "string.cb";
+
+expect_error("ternary branches have incompatible types") {
+    int bad() {
+        string prefix = "abc";
+        int x = prefix.length() == 0 ? 5 : prefix;   // int vs string - incompatible
+        return x;
+    }
+}
+
+extern int main() { return 0; }

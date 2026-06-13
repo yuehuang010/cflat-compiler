@@ -1,0 +1,23 @@
+// X4 Part 1: copying an owning container VALUE by value into a struct field shallow-
+// aliases its backing buffer, which is then freed twice at teardown (once by the source's
+// destructor, once by the field's) -> STATUS_HEAP_CORRUPTION. There is no runtime owns-flag
+// to make this safe, so it is rejected at compile time with a steer to '.copy()' or 'move'.
+import "list.cb";
+
+class Holder
+{
+    list<int> xs = default;
+
+    void init(list<int> v)
+    {
+        // 'xs' is a field of Holder; 'v' is a named by-value parameter whose buffer is
+        // still owned by the caller's source -> shallow copy aliases it.
+        expect_error("copying owning value 'list<int>' by value into a struct field");
+        xs = v;
+    }
+};
+
+extern int main()
+{
+    return 0;
+}

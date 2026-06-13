@@ -3306,7 +3306,57 @@ public:
                         llvm::Value* retStorage = returnNV.Storage;
                         if (retStorage == nullptr && !returnNV.CallerName.empty())
                             retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
-                        compiler->CreateReturnCall(right, retStorage);
+
+                        // Interface return upcast. When the function's declared return type is an
+                        // interface (LLVM { ptr vtable, ptr data } fat pointer) but the returned
+                        // expression is a concrete implementer (not already a fat pointer), build
+                        // the fat pointer here - mirroring the assignment/parameter upcast. Without
+                        // this the `ret` operand is a bare pointer and module verification fails.
+                        std::string interfaceReturnStructName;
+                        if (auto* fatTy = compiler->GetFatPtrType();
+                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+                            && compiler->currentFunction->getReturnType() == fatTy
+                            && right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
+                        {
+                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+                            std::string structName = returnNV.TypeAndValue.TypeName;
+                            if (structName.empty() && returnNV.BaseType)
+                                if (auto* st = llvm::dyn_cast<llvm::StructType>(returnNV.BaseType))
+                                    structName = st->getName().str();
+
+                            if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
+                            {
+                                LogErrorContext(jump, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
+                            }
+                            else if (!structName.empty())
+                            {
+                                if (returnNV.TypeAndValue.Pointer)
+                                {
+                                    // Concrete implementer pointer: defer the boxing to
+                                    // CreateReturnCall so the owning local's scope-exit free is
+                                    // suppressed (ownership moves to the caller).
+                                    interfaceReturnStructName = structName;
+                                }
+                                else
+                                {
+                                    // Concrete implementer VALUE: the interface fat pointer must
+                                    // carry a data pointer that outlives this call. A by-value
+                                    // local lives in this frame, so boxing it would return a
+                                    // dangling pointer. Reject with a clear diagnostic steering to
+                                    // a heap allocation (rather than emitting UB / a verifier dump).
+                                    LogErrorContext(jump, std::format("cannot return local value '{}' as interface '{}' - "
+                                        "the interface fat pointer would dangle once this function returns; "
+                                        "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
+                                }
+                            }
+                            else if (llvm::isa<llvm::Constant>(right) && right->getType()->isPointerTy())
+                            {
+                                // `return nullptr;` for an interface return -> null fat pointer.
+                                right = llvm::ConstantAggregateZero::get(fatTy);
+                            }
+                        }
+
+                        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
                     }
                     else
                     {
@@ -5821,6 +5871,67 @@ public:
                 }
             }
 
+            // X4 (Part 1): copying an owning container / dtor-bearing struct VALUE by name into a
+            // longer-lived destination (struct field or heap object) shallow-copies the struct, which
+            // aliases its backing buffer. That buffer is then freed twice at teardown - once by the
+            // source's destructor and once by the destination's - corrupting the heap (the customer
+            // hit STATUS_HEAP_CORRUPTION). There is no runtime owns-flag to disambiguate (the same
+            // reason bare `string` members are deliberately never auto-destructed, and `string` is
+            // therefore exempt here), so this cannot be made safe by auto-deep-copy or move at this
+            // single site: a move cannot un-own the source's origin (e.g. a by-value parameter still
+            // aliases its caller's buffer), and a blanket deep-copy is a broad semantic/perf change to
+            // every `field = containerValue` that risks the same container-internals trap. Matching the
+            // resolved raw-string-array sub-bug, reject the plain copy with a clear steer. A move-rvalue
+            // / temporary (e.g. `v.copy()`, a freshly returned list) has null Storage and owns an
+            // independent buffer, so it is allowed - that is the recommended fix.
+            // Fire ONLY for a real struct-FIELD destination. A field store lowers to a StructGEP
+            // (two indices `{0, fieldIdx}` into a struct type); an array/element store
+            // (`_data[j] = tmp`, `_ptr[index] = value`) lowers to a single-index GEP into the
+            // element buffer. Excluding the latter is essential - those are legitimate buffer
+            // moves into a container slot (the container-internals case that must NOT be flagged).
+            auto* destGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
+            bool destIsStructField = destGep && destGep->getNumIndices() == 2
+                && destGep->getSourceElementType()->isStructTy();
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField
+                && !rightNV.TypeAndValue.Pointer
+                && !rightNV.TypeAndValue.IsArrayView
+                && !rightNV.TypeAndValue.IsMove
+                && rightNV.TypeAndValue.TypeName != "string"  // string members are never auto-destructed (leak, not double-free)
+                // The RHS must be an addressable lvalue (variable / parameter / field) whose backing
+                // buffer is still owned by that source - that is what makes the shallow copy an alias.
+                // A function-call result, '.copy()', or any temporary has null Storage (ownership was
+                // transferred to us, nothing else frees it) and is therefore safe - this is the
+                // recommended fix, so it must NOT be flagged. (Call results carry the callee name in
+                // CallerName, so CallerName alone cannot distinguish them.)
+                && rightNV.Storage != nullptr
+                && !rightNV.CallerName.empty()
+                && compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName) != nullptr)
+            {
+                // Render the mangled generic name back to source spelling for the message
+                // (e.g. "list__int" -> "list<int>", "dictionary__string__int" -> "dictionary<string, int>").
+                std::string displayType = rightNV.TypeAndValue.TypeName;
+                if (size_t d = displayType.find("__"); d != std::string::npos)
+                {
+                    std::string base = displayType.substr(0, d);
+                    std::string args = displayType.substr(d + 2);
+                    std::string joined;
+                    for (size_t pos = 0; pos <= args.size(); )
+                    {
+                        size_t sep = args.find("__", pos);
+                        if (sep == std::string::npos) { joined += args.substr(pos); break; }
+                        joined += args.substr(pos, sep - pos) + ", ";
+                        pos = sep + 2;
+                    }
+                    displayType = base + "<" + joined + ">";
+                }
+                LogErrorContext(ctx, std::format(
+                    "copying owning value '{}' by value into a struct field aliases its backing buffer "
+                    "and will double-free at teardown; use '.copy()' for an independent copy or 'move' "
+                    "to transfer ownership", displayType));
+                return right;
+            }
+
             auto* assignResult = derefAssign(right, rhsUnsigned);
             // Array-view element store: tag the store with the view's alias scope (matches the load
             // side in TagViewElementAccess) so the vectorizer proves distinct views disjoint.
@@ -5883,7 +5994,11 @@ public:
                     {
                         compiler->builder->CreateStore(
                             llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                        compiler->MarkVariableMoved(rightNV.CallerName);
+                        // Moving a field (`x = node->left`) marks only that field, not the base.
+                        if (!rightNV.FieldName.empty())
+                            compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);
+                        else
+                            compiler->MarkVariableMoved(rightNV.CallerName);
                     }
                 }
             }
@@ -5899,9 +6014,14 @@ public:
                         llvm::ConstantPointerNull::get(compiler->builder->getPtrTy()), ptrField);
                 }
             }
-            // Reassignment to a moved variable makes it live again.
+            // Reassignment to a moved variable (or field) makes it live again.
             if (operatorText == "=" && !namedVar.CallerName.empty())
-                compiler->MarkVariableUnmoved(namedVar.CallerName);
+            {
+                if (!namedVar.FieldName.empty())
+                    compiler->MarkVariableFieldUnmoved(namedVar.CallerName, namedVar.FieldName);
+                else
+                    compiler->MarkVariableUnmoved(namedVar.CallerName);
+            }
             // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
             if (operatorText == "=" && !namedVar.CallerName.empty())
                 compiler->ClearVariableBond(namedVar.CallerName);
@@ -5969,11 +6089,15 @@ public:
                 auto trueValue  = ParseExpression(expressionTrueCtx);
                 llvm::Value* falseValue = ParseConditionalExpression(expressionFalseCtx);
 
-                // Align branch types so LLVM select has matching operand types.
+                // Align branch types so LLVM select has matching operand types. A select
+                // with mismatched operands asserts inside LLVM ("Invalid operands for
+                // select"), so every unifiable case is coerced here and any remaining
+                // genuine mismatch is reported as a clean diagnostic before CreateSelect.
                 if (falseValue && trueValue && falseValue->getType() != trueValue->getType())
                 {
                     auto* ft = falseValue->getType();
                     auto* tt = trueValue->getType();
+                    auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
                     if (ft->isIntegerTy() && tt->isIntegerTy())
                     {
                         unsigned fb = ft->getIntegerBitWidth();
@@ -5988,6 +6112,42 @@ public:
                         unsigned tb = tt->getScalarSizeInBits();
                         if (fb < tb) falseValue = compiler->Upconvert(falseValue, tt);
                         else         trueValue  = compiler->Upconvert(trueValue,  ft);
+                    }
+                    else if (ft->isFloatingPointTy() && tt->isIntegerTy())
+                    {
+                        // Mixed int/float (e.g. cond ? 1 : 2.5): promote the integer side.
+                        trueValue = compiler->Upconvert(trueValue, ft);
+                    }
+                    else if (ft->isIntegerTy() && tt->isFloatingPointTy())
+                    {
+                        falseValue = compiler->Upconvert(falseValue, tt);
+                    }
+                    else if (strTy && tt == strTy && ft->isPointerTy())
+                    {
+                        // string vs char* literal (e.g. cond ? prefix : "0"): wrap the raw
+                        // pointer into a non-owning string so both branches are `string`.
+                        falseValue = compiler->WrapStringLiteralAsString(falseValue);
+                    }
+                    else if (strTy && ft == strTy && tt->isPointerTy())
+                    {
+                        trueValue = compiler->WrapStringLiteralAsString(trueValue);
+                    }
+                    else
+                    {
+                        auto describe = [](llvm::Type* t) -> std::string {
+                            if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
+                                return (st->hasName() ? st->getName().str() : std::string("struct"));
+                            if (t->isPointerTy()) return "pointer";
+                            if (t->isIntegerTy()) return "i" + std::to_string(t->getIntegerBitWidth());
+                            if (t->isFloatTy())   return "float";
+                            if (t->isDoubleTy())  return "double";
+                            return "value";
+                        };
+                        // ctx->expression() is the true branch; ctx->conditionalExpression() the false.
+                        LogErrorContext(ctx, std::format(
+                            "ternary branches have incompatible types '{}' and '{}'",
+                            describe(tt), describe(ft)));
+                        return {};
                     }
                 }
 
@@ -7079,11 +7239,14 @@ public:
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar)
     {
         auto* compiler = Compiler();
-        if (namedVar.IsMoved && namedVar.IdentifierLine > 0)
+        if (namedVar.IdentifierLine > 0)
         {
-            compiler->currentLine = namedVar.IdentifierLine;
-            compiler->currentColumn = namedVar.IdentifierColumn;
-            compiler->LogError(std::format("use of moved variable '{}'", namedVar.CallerName));
+            if (auto moved = compiler->MovedUseSubject(namedVar); !moved.empty())
+            {
+                compiler->currentLine = namedVar.IdentifierLine;
+                compiler->currentColumn = namedVar.IdentifierColumn;
+                compiler->LogError(std::format("use of moved variable '{}'", moved));
+            }
         }
         if (namedVar.TypeAndValue.Pointer)
         {
@@ -7415,10 +7578,17 @@ public:
                 nv.Storage = nullptr;
             };
 
-            // If the destination is a struct type and an operator overload exists,
-            // call it (e.g. (string)charPtr calls operator string(char*)).
+            // If the destination is a struct VALUE type and an operator overload
+            // exists, call it (e.g. (string)charPtr calls operator string(char*)).
+            // A POINTER (or array-view) destination is a pure reinterpret, never a
+            // value conversion: '(string*)p' must not invoke 'operator string'. Doing
+            // so produced a 'string' VALUE where a 'string*' was expected, which then
+            // asserted the compiler downstream (e.g. an invalid bitcast in
+            // 'delete[_] (string*)expr', or a 'no overload' error when no value
+            // conversion matched the pointer operand).
             std::string opName = "operator " + destTypeName.TypeName;
-            if (compiler->GetFunction(opName) != nullptr)
+            if (!destTypeName.Pointer && !destTypeName.IsArrayView
+                && compiler->GetFunction(opName) != nullptr)
             {
                 auto argNV = namedVar;
                 argNV.TypeAndValue.VariableName = "";  // clear name so positional matching is used
@@ -8655,11 +8825,52 @@ public:
         llvm::Value* ptrVal = nullptr;
         llvm::Value* srcAlloca = nullptr;
         llvm::Type* srcAllocaElemType = nullptr;
-        if (auto* ue = tryGetUnaryExpression(ctx->expression()))
+        std::string targetName;         // name of the deleted local (empty for field/expr targets)
+
+        // Peel any leading cast(s) off the delete target so 'delete[_] (T*)p' behaves
+        // exactly like 'delete[_] p'. A cast only renames the element type, so we must
+        // still recover the underlying owning local (and its source alloca) to null it
+        // and avoid a double free at scope exit. Without this, a cast target fell through
+        // to the bare ParseExpression branch below, which dropped the storage/ownership
+        // info (the owning local was then freed here AND again at scope exit -> heap
+        // corruption). The cast's destination type is recorded as the element type for
+        // destructor selection in destructive deletes.
+        CFlatParser::UnaryExpressionContext* ue = tryGetUnaryExpression(ctx->expression());
+        std::string castTypeName;
+        bool castElemPtr = false;
+        bool sawCast     = false;
+        if (ue == nullptr)
+        {
+            auto* castCtx = tryGetCastExpression(ctx->expression());
+            while (castCtx != nullptr
+                   && castCtx->typeName() != nullptr
+                   && castCtx->castExpression() != nullptr)
+            {
+                if (!sawCast)
+                {
+                    auto destTV  = ParseTypeName(castCtx->typeName());
+                    castTypeName = destTV.TypeName;
+                    castElemPtr  = destTV.ElemPointer;
+                    sawCast      = true;
+                }
+                auto* inner = castCtx->castExpression();
+                ue = tryGetUnaryExpression(inner);
+                if (ue != nullptr) break;
+                castCtx = tryGetCastExpression(inner);
+            }
+        }
+
+        if (ue != nullptr)
         {
             auto namedVar = ParseUnaryExpression(ue);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
+            // A cast target renames the element type; honor it for destructor selection.
+            if (sawCast)
+            {
+                typeName  = castTypeName;
+                elemIsPtr = castElemPtr;
+            }
 
             // Error: deleting a borrowed (non-move) parameter directly. If the caller owns the
             // pointer, it will be freed again when the caller's scope exits - double-free.
@@ -8724,6 +8935,7 @@ public:
                 {
                     srcAlloca = namedVar.Storage;
                     srcAllocaElemType = namedVar.BaseType;
+                    targetName = namedVar.CallerName;
                 }
             }
             else
@@ -8736,6 +8948,41 @@ public:
             ptrVal = ParseExpression(ctx->expression());
         }
         if (!ptrVal) return {};
+
+        // Error: a destructive delete ('delete', 'delete[]', 'delete[n]') of a raw 'string'
+        // buffer held in a LOCAL variable. 'string' carries no runtime ownership flag, so a
+        // slot may hold BORROWED text (a string literal, a view, or an alias of another
+        // buffer); running the string destructor on such a slot frees non-owned memory and
+        // corrupts the heap. A raw 'new string[n]' does NOT deep-copy / take ownership of
+        // assigned strings the way list/dictionary do, so its slots cannot be safely
+        // auto-destructed - the same reason bare 'string' members are excluded from
+        // member-destructor recursion (see internal/plan/member-dtor-recursion.md).
+        //
+        // The check is gated on the target being an alloca-backed LOCAL (srcAlloca set).
+        // Container types destroy their string buffer through a FIELD (list '_data',
+        // array '_ptr', ...), which leaves srcAlloca null, so list<string>/array<string>/
+        // dictionary<string> internals - which DO guarantee owned elements - are unaffected.
+        // The raw-free form 'delete[_]' (isRawFree) and 'string*' arrays (elemIsPtr, dtors
+        // already suppressed) are also exempt. Escape hatches: 'delete[_]' to free the buffer
+        // without destructing, or 'list<string>' which owns and frees its strings.
+        if (typeName == "string" && !isRawFree && !elemIsPtr && srcAlloca != nullptr)
+        {
+            std::string named = targetName.empty()
+                ? std::string("this 'string' buffer")
+                : std::format("the 'string' buffer '{}'", targetName);
+            std::string freeHint = targetName.empty()
+                ? std::string("'delete[_] ptr'")
+                : std::format("'delete[_] {}'", targetName);
+            LogErrorContext(ctx, std::format(
+                "cannot destructively 'delete' {} - a raw 'new string[n]' does not take "
+                "ownership of assigned strings (unlike list/dictionary), so its slots may hold "
+                "borrowed text (a string literal, a view, or an alias of another buffer) and "
+                "running the string destructor on them would free non-owned memory and corrupt "
+                "the heap. Use {} to free the buffer without destructing elements, or use "
+                "'list<string>', which owns and frees its strings.",
+                named, freeHint));
+            return {};
+        }
 
         // Error: bare delete[] on a named struct array - the caller must supply the count.
         if (isArray && !hasSizeExpr && compiler->IsDataStructure(typeName) && !elemIsPtr)
@@ -10053,7 +10300,16 @@ public:
                         // Bracket [] operation
 
                         auto expressCtx = dynamic_cast<CFlatParser::ExpressionContext*>(ruleContext);
-                        auto rvalue = ParseExpression(expressCtx);
+                        // Acquire the index via the named variant so we keep its declared
+                        // integer signedness (u8/u16/u32 -> unsigned). ParseExpression drops
+                        // the unsigned flag, which matters when the index is widened to the
+                        // pointer width below: LLVM treats GEP indices as SIGNED, so a narrow
+                        // unsigned index (e.g. (u8)b with b >= 128) would sign-extend to a
+                        // negative offset. Single evaluation - do not also call ParseExpression.
+                        auto idxNamed = ParseAssignmentExpressionNamed(expressCtx->assignmentExpression());
+                        bool idxIsUnsigned = idxNamed.TypeAndValue.IsUnsignedInteger() != -1;
+                        auto rvalue = LoadNamedVariable(idxNamed);
+                        ProcessPlusPlus();
 
                         // span<T> noalias fast path: lower `y[i]` to the field subscript `y._ptr[i]`.
                         // span::operator[] reaches the buffer through `this`, so every span's element
@@ -10157,6 +10413,21 @@ public:
                         if (!(rvalue && rvalue->getType()->isIntegerTy()))
                         {
                             LogErrorContext(expressCtx, "Expecting be an integer type.");
+                        }
+
+                        // Widen the index to the pointer width (i64) with the extension that
+                        // matches its declared signedness. LLVM treats GEP indices as signed
+                        // and would implicitly sign-extend a narrow index; an unsigned narrow
+                        // index (u8/u16/u32) whose top bit is set must zero-extend instead, or
+                        // it becomes a negative/huge offset (e.g. (u8)200 -> -56). Reached only
+                        // by the built-in array/pointer/simd subscripts below; a user operator[]
+                        // overload breaks out above with the original-width index.
+                        if (rvalue && rvalue->getType()->isIntegerTy() && !rvalue->getType()->isIntegerTy(64))
+                        {
+                            auto* idxI64Ty = Compiler(ctx)->builder->getInt64Ty();
+                            rvalue = idxIsUnsigned
+                                ? Compiler(ctx)->builder->CreateZExt(rvalue, idxI64Ty, "idxzext")
+                                : Compiler(ctx)->builder->CreateSExt(rvalue, idxI64Ty, "idxsext");
                         }
 
                         if (namedVar.BaseType && namedVar.BaseType->isVectorTy())
@@ -11006,6 +11277,13 @@ public:
 
                                             LLVMBackend::NamedVariable elemNV;
                                             elemNV.Storage = elemAlloca;
+                                            // BaseType is required so add()'s move-clear can zero the
+                                            // element's source storage after the move. Without it the
+                                            // move path sees a null base type and reports a bogus
+                                            // "'move' argument has no resolved type" at a phantom
+                                            // location (see LLVMBackend move-clear). Mirrors the
+                                            // list<string> element branch above, which sets BaseType.
+                                            elemNV.BaseType = nestedData.StructType;
                                             elemNV.TypeAndValue.TypeName = elemTypeName;
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
                                         }
@@ -11289,12 +11567,13 @@ public:
                                         if (argValue) callArgs.push_back(argValue);
                                         argNVs.push_back(argNV);
 
-                                        // Compile-time use-after-move check: arg is a moved variable.
-                                        if (argNV.IsMoved && argNV.IdentifierLine > 0)
-                                        {
-                                            // (Same diagnostic shape as direct-call site; conservative - only fires when source variable was already moved.)
-                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", argNV.CallerName));
-                                        }
+                                        // Compile-time use-after-move check: arg is a moved variable (or field).
+                                        if (argNV.IdentifierLine > 0)
+                                            if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
+                                            {
+                                                // (Same diagnostic shape as direct-call site; conservative - only fires when source storage was already moved.)
+                                                Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                            }
                                     }
                                 }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
@@ -11316,7 +11595,13 @@ public:
                                             Compiler(ctx)->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
                                     }
                                     if (!argNV.CallerName.empty())
-                                        Compiler(ctx)->MarkVariableMoved(argNV.CallerName);
+                                    {
+                                        // Moving a field marks only that field, not the base.
+                                        if (!argNV.FieldName.empty())
+                                            Compiler(ctx)->MarkVariableFieldMoved(argNV.CallerName, argNV.FieldName);
+                                        else
+                                            Compiler(ctx)->MarkVariableMoved(argNV.CallerName);
+                                    }
                                 }
                                 namedVar.Primary = result;
                                 namedVar.Storage = nullptr;
@@ -11420,6 +11705,16 @@ public:
                                 for (const auto& namedArgument : namedArgCtx)
                                 {
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    // Use-after-move check: a field access carries a populated Primary, so the
+                                    // LoadNamedVariable check below is skipped for it - check explicitly here so
+                                    // re-moving a field (or any moved variable) is rejected uniformly.
+                                    if (argNV.IdentifierLine > 0)
+                                        if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
+                                        {
+                                            Compiler(ctx)->currentLine = argNV.IdentifierLine;
+                                            Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
+                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                        }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     if (!argValue) break;
                                     LLVMBackend::NamedVariable argVar;
@@ -11430,6 +11725,9 @@ public:
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.CallerName = argNV.CallerName;
+                                    // Per-field move tracking: moving `node->left` marks only that field.
+                                    argVar.FieldName = argNV.FieldName;
+                                    argVar.MovedFields = argNV.MovedFields;
                                     argVar.TypeAndValue.IsInterface = argNV.TypeAndValue.IsInterface;
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;
@@ -11617,13 +11915,14 @@ public:
                             if (structVar.BaseType)
                             {
                                 // Use-after-move check for the method receiver.
-                                // LoadNamedVariable is not called for receivers, so check IsMoved here.
-                                if (structVar.IsMoved && structVar.IdentifierLine > 0)
-                                {
-                                    Compiler(ctx)->currentLine = structVar.IdentifierLine;
-                                    Compiler(ctx)->currentColumn = structVar.IdentifierColumn;
-                                    Compiler(ctx)->LogError(std::format("use of moved variable '{}'", structVar.CallerName));
-                                }
+                                // LoadNamedVariable is not called for receivers, so check here.
+                                if (structVar.IdentifierLine > 0)
+                                    if (auto moved = Compiler(ctx)->MovedUseSubject(structVar); !moved.empty())
+                                    {
+                                        Compiler(ctx)->currentLine = structVar.IdentifierLine;
+                                        Compiler(ctx)->currentColumn = structVar.IdentifierColumn;
+                                        Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                    }
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 arguments.push_back(argumentNamedVar);
@@ -11735,6 +12034,16 @@ public:
                                     }
                                     auto argName = namedArgument->Identifier();
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    // Use-after-move check: a field access carries a populated Primary, so the
+                                    // LoadNamedVariable check below is skipped for it - check explicitly here so
+                                    // re-moving a field (or any moved variable) is rejected uniformly.
+                                    if (argNV.IdentifierLine > 0)
+                                        if (auto moved = Compiler(ctx)->MovedUseSubject(argNV); !moved.empty())
+                                        {
+                                            Compiler(ctx)->currentLine = argNV.IdentifierLine;
+                                            Compiler(ctx)->currentColumn = argNV.IdentifierColumn;
+                                            Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
+                                        }
                                     // Load from storage if Primary isn't populated (simple variable reference)
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     lambdaExpectedType = {};
@@ -11747,6 +12056,11 @@ public:
                                     argVar.BaseType = argValue->getType();
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
+                                    // Propagate the field name (and inherited per-field move set) so that
+                                    // moving a struct sub-path (`node->left`) marks only that field, not the
+                                    // whole base variable - letting recursive owning-pointer-tree code compile.
+                                    argVar.FieldName = argNV.FieldName;
+                                    argVar.MovedFields = argNV.MovedFields;
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
@@ -11978,6 +12292,32 @@ public:
             }
         }
         return singleRuleChild ? tryGetUnaryExpression(singleRuleChild) : nullptr;
+    }
+
+    // Drill down single-rule-child chains to find the first actual cast expression
+    // (one of the form '(' typeName ')' castExpression). Used by ParseDeleteExpression
+    // to peel casts off a delete target - 'delete[_] (T*)p' must behave like
+    // 'delete[_] p'. Returns nullptr if the chain branches before reaching such a cast.
+    CFlatParser::CastExpressionContext* tryGetCastExpression(antlr4::RuleContext* ctx)
+    {
+        if (ctx->getRuleIndex() == CFlatParser::RuleCastExpression)
+        {
+            auto* ce = dynamic_cast<CFlatParser::CastExpressionContext*>(ctx);
+            if (ce != nullptr && ce->typeName() != nullptr && ce->castExpression() != nullptr)
+                return ce;
+        }
+
+        antlr4::RuleContext* singleRuleChild = nullptr;
+        for (auto* child : ctx->children)
+        {
+            if (child->getTreeType() == antlr4::tree::ParseTreeType::RULE)
+            {
+                if (singleRuleChild != nullptr)
+                    return nullptr; // multiple rule children - complex expression
+                singleRuleChild = dynamic_cast<antlr4::RuleContext*>(child);
+            }
+        }
+        return singleRuleChild ? tryGetCastExpression(singleRuleChild) : nullptr;
     }
 
     // Returns true if rawText (the full StringLiteral token text including quotes)
@@ -12393,16 +12733,42 @@ public:
 
                 if (cap.ByReference)
                 {
-                    // Load pointer to outer struct; register as a pointer-type variable.
+                    // Load pointer to the outer struct (the address stored in the closure).
                     auto* structTy  = compiler->GetDataStructure(cap.TV.TypeName).StructType;
                     auto* outerPtr  = compiler->builder->CreateLoad(
                         structTy->getPointerTo(), fieldGEP, cap.Name + "_ref");
-                    LLVMBackend::TypeAndValue captureTV = cap.TV;
-                    captureTV.Pointer       = true;
-                    captureTV.ConstArraySize = 0;  // inside the lambda this is a T*, not a T[N]
-                    captureNV.Primary = outerPtr;
-                    captureNV.TypeAndValue = captureTV;
-                    captureNV.BaseType     = structTy->getPointerTo();
+
+                    if (cap.TV.ConstArraySize > 0)
+                    {
+                        // A fixed array 'T[N]' captured by reference decays to an element
+                        // pointer 'T*' inside the lambda (indexed with arr[i]); register
+                        // it as a pointer variable.
+                        LLVMBackend::TypeAndValue captureTV = cap.TV;
+                        captureTV.Pointer        = true;
+                        captureTV.ConstArraySize = 0;  // inside the lambda this is a T*, not a T[N]
+                        captureNV.Primary      = outerPtr;
+                        captureNV.TypeAndValue = captureTV;
+                        captureNV.BaseType     = structTy->getPointerTo();
+                    }
+                    else
+                    {
+                        // A single named struct local captured by reference. The loaded
+                        // pointer IS the variable's storage (its address), so register the
+                        // capture exactly like an ordinary named struct local: a non-pointer
+                        // struct whose Storage is that address. This makes every use site -
+                        // field access, method receiver, and (the I2 bug) operator-overload
+                        // dispatch - dereference the capture to the struct value identically
+                        // to a stack local. Registering it as a pointer-type variable instead
+                        // left LoadNamedVariable returning the raw pointer, so an overloaded
+                        // operator (e.g. vec3 * double) saw a `ptr` operand and emitted
+                        // `fmul ptr, double` -> invalid IR.
+                        LLVMBackend::TypeAndValue captureTV = cap.TV;
+                        captureTV.Pointer        = false;
+                        captureTV.ConstArraySize = 0;
+                        captureNV.Storage      = outerPtr;
+                        captureNV.TypeAndValue = captureTV;
+                        captureNV.BaseType     = structTy;
+                    }
                 }
                 else
                 {

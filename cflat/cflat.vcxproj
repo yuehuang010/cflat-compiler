@@ -111,6 +111,8 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <!-- See the Debug|x64 note: reserve 64 MB for the deep-frame codegen recursion. -->
+      <StackReserveSize>67108864</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -128,6 +130,8 @@
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <!-- See the Debug|x64 note: reserve 64 MB for the deep-frame codegen recursion. -->
+      <StackReserveSize>67108864</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -149,6 +153,14 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>ws2_32.lib;version.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <!-- The recursive-descent codegen walk (MainListener Parse*) has very large
+           per-frame footprints in Debug (ParsePostfixExpression alone is ~109 KB),
+           so even modestly nested-but-legitimate source (e.g. graphic/bitmap.cb's
+           else-if chain, or the whole-core symbol-query scan) overflows the default 1 MB
+           stack in Debug while Release fits. Reserve 64 MB so legitimate, bounded
+           recursion has headroom on both configs. Reserve is virtual address space,
+           committed lazily, so the cost is negligible. -->
+      <StackReserveSize>67108864</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -170,6 +182,10 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>ws2_32.lib;version.lib;LLVMCodeGen.lib;LLVMTarget.lib;LLVMX86CodeGen.lib;LLVMX86Info.lib;LLVMX86Desc.lib;LLVMX86AsmParser.lib;LLVMMCDisassembler.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
+      <!-- See the Debug|x64 note: the codegen walk recurses with large frames; reserve
+           64 MB so deeply-but-finitely nested source has headroom (Release frames are
+           smaller but the same bound applies to sufficiently deep code). -->
+      <StackReserveSize>67108864</StackReserveSize>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

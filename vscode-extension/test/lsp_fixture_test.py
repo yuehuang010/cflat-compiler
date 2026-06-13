@@ -382,6 +382,63 @@ def test_def_nested_struct(client: LspClient) -> str | None:
     return "\n        ".join(failures)
 
 
+def test_reanalysis_state_isolation(exe: str) -> str | None:
+    """Regression for L1: transient/module-bound backend state must not leak across a backend
+    reanalysis. With the pool forced to a single slot, file B is always analyzed on the same
+    LLVMBackend that just analyzed file A, so any state left set by A that survives
+    ResetForReanalysis corrupts B's analysis. The confirmed L1 root cause is a stale
+    fullDestructorCache_ entry: a full-destructor llvm::Function* synthesized while analyzing A
+    lives in A's module; if it survives the reset, B's analysis emits a call to that Function*
+    from A's now-freed module -> "Internal compiler error during analysis" on B.
+
+    file_a (Test/test_threadpool.cb) then file_b (Test/test_parallel.cb) is the minimal
+    deterministic repro: both pass standalone (they are part of test.bat), but with the cache
+    clear removed B reliably fails on this exact ordering. B-after-A must equal B-alone."""
+    # Pool size 1 => one backend slot => B is guaranteed to reanalyze the slot A just used.
+    saved = os.environ.get("CFLAT_LSP_POOL_SIZE")
+    os.environ["CFLAT_LSP_POOL_SIZE"] = "1"
+    try:
+        client = LspClient(exe)
+    finally:
+        if saved is None:
+            os.environ.pop("CFLAT_LSP_POOL_SIZE", None)
+        else:
+            os.environ["CFLAT_LSP_POOL_SIZE"] = saved
+
+    path_a = REPO_ROOT / "Test" / "test_threadpool.cb"
+    path_b = REPO_ROOT / "Test" / "test_parallel.cb"
+    if not path_a.exists() or not path_b.exists():
+        return f"reanalysis: repro files missing ({path_a}, {path_b})"
+    try:
+        initialize(client)
+        uri_a = path_a.resolve().as_uri()
+        uri_b = path_b.resolve().as_uri()
+
+        _open_doc(client, uri_a, path_a.read_text(encoding="utf-8"))
+        diags_a = wait_diagnostics_for(client, uri_a, timeout=60.0)
+        errors_a = [d for d in diags_a if d.get("severity", 1) == 1]
+        if errors_a:
+            msgs = [d.get("message", "") for d in errors_a]
+            return f"reanalysis: file A not clean standalone (test fixture stale): {msgs}"
+
+        _open_doc(client, uri_b, path_b.read_text(encoding="utf-8"))
+        diags_b = wait_diagnostics_for(client, uri_b, timeout=60.0)
+        errors_b = [d for d in diags_b if d.get("severity", 1) == 1]
+        if errors_b:
+            msgs = [d.get("message", "") for d in errors_b]
+            return f"reanalysis: file B (clean standalone) reported errors after A: {msgs}"
+        return None
+    except (TimeoutError, RuntimeError) as e:
+        return f"reanalysis: server failed during B-after-A: {e}"
+    finally:
+        try:
+            client.request("shutdown")
+            client.notify("exit")
+        except Exception:
+            pass
+        client.close()
+
+
 def test_negative_hover_before_initialize(exe: str) -> str | None:
     """Hover before initialize should return an error response, not crash."""
     client = LspClient(exe)
@@ -503,12 +560,18 @@ def run_all(exe: str) -> bool:
         print("\n--- server stderr ---")
         print(stderr.strip())
 
-    # --- out-of-process test (needs its own client) ---
+    # --- out-of-process tests (each needs its own client) ---
     try:
         err = test_negative_hover_before_initialize(exe)
         record("negative: hover before initialize", err)
     except Exception as e:
         record("negative: hover before initialize", f"EXCEPTION: {e}")
+
+    try:
+        err = test_reanalysis_state_isolation(exe)
+        record("reanalysis: B-after-A state isolation (L1)", err)
+    except Exception as e:
+        record("reanalysis: B-after-A state isolation (L1)", f"EXCEPTION: {e}")
 
     return failed == 0
 

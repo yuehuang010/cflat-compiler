@@ -25,6 +25,28 @@ expect_error("use of moved variable 'child2'") {
     }
 }
 
+// X4 Part 2: moving a struct FIELD marks only that field, not the whole base.
+// Moving the SAME field twice must still error (the field's buffer was transferred).
+struct Tree { Tree* left = nullptr; Tree* right = nullptr; };
+void consumeTree(move Tree* t) { if (t != nullptr) delete t; }
+
+expect_error("use of moved variable 'root.left'") {
+    void moveFieldTwice(Tree* root)
+    {
+        consumeTree(root->left);
+        consumeTree(root->left);   // same field moved twice -> error
+    }
+}
+
+// Reading a moved field must still error.
+expect_error("use of moved variable 'root.left'") {
+    void readMovedField(Tree* root)
+    {
+        consumeTree(root->left);
+        Tree* alias = root->left;  // read of moved field -> error
+    }
+}
+
 extern int main()
 {
     // use after move - pass to another call

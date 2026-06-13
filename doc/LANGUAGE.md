@@ -157,6 +157,20 @@ string joined = join("-", parts);         // "a-b-c"
 
 Use LSP hover or `cflat.exe --symbol <name>` to browse the full API surface.
 
+> **`charAt` clamps, does not signal EOF.** `s.charAt(i)` clamps `i` to
+> `[0, length-1]` and returns the last character when `i >= length`. It cannot
+> serve as an EOF sentinel. Always guard with an explicit bounds check:
+>
+> ```c
+> // WRONG - charAt(len) returns last char, not 0
+> while (s.charAt(pos) != '\n') pos++;
+>
+> // Correct
+> while (pos < s.length() && s.charAt(pos) != '\n') pos++;
+> ```
+>
+> For an empty string, `charAt` returns `0` regardless of the index.
+
 Stringify a primitive explicitly with `value.toString()` (and `value.toString(base)` for an integer radix). A bare `(string)value` cast on a primitive is rejected - this keeps the owning heap allocation visible and matches C#/Java/Rust/Go:
 
 ```c
@@ -227,7 +241,7 @@ string both = "{a} and {b}";        // "foo and bar"
 Any `IString` implementor works inside `{}`:
 
 ```c
-struct Point : IString
+class Point : IString
 {
     int x = 0; int y = 0;
     string ToString() { return "{x}, {y}"; }   // nested interpolation
@@ -242,6 +256,21 @@ string s = "Point is {p}.";   // "Point is 10, 20."
 ```c
 string s = "value is {{x}} = {x}";   // "value is {x} = 42"  (x == 42)
 ```
+
+> **Any `{` in a string literal triggers interpolation.** This is a common surprise
+> when embedding JSON, format strings, or code templates. When a `{` is encountered
+> but the content inside is not a valid expression, the compiler reports "Undefined
+> variable" at line 1 of the file - not at the brace in question.
+>
+> Escape all literal braces that are not meant as interpolation anchors:
+>
+> ```c
+> // BROKEN - compiler sees {value} as an interpolation, reports "Undefined variable 'value'"
+> string tpl = "{"key": "{value}"}";
+>
+> // Correct - all structural braces escaped
+> string tpl = "{{\"key\": \"{value}\"}}";   // {"key": "<content of variable 'value'>"}
+> ```
 
 ### Structs
 
@@ -783,14 +812,14 @@ interface IScalable
     int Scale(int factor);
 };
 
-struct Counter : IReadable
+class Counter : IReadable
 {
     int count = 10;
     int Read() { return count; }
 };
 
-// A struct can implement multiple interfaces
-struct ScaledValue : IReadable, IScalable
+// A class can implement multiple interfaces
+class ScaledValue : IReadable, IScalable
 {
     int value = 3;
     int Read()            { return value; }
@@ -798,9 +827,14 @@ struct ScaledValue : IReadable, IScalable
 };
 ```
 
+> **`class` is required for interface implementation.** Only `class` definitions
+> support the `: IFace` base list. A bare `struct` cannot carry an interface list and
+> the parser rejects it. Use `struct` for plain data aggregates with no interface
+> contracts; use `class` when you need VTable dispatch.
+
 ### Interface Parameters (VTable Dispatch)
 
-A function accepting an interface type works with any implementing struct:
+A function accepting an interface type works with any implementing class or struct:
 
 ```c
 int readValue(IReadable reader)
@@ -821,7 +855,7 @@ interface Container<T>
     void Set(T value);
 };
 
-struct Storage<T> : Container<T>
+class Storage<T> : Container<T>
 {
     T data = default;
     T Get()           { return data; }
@@ -880,6 +914,29 @@ switch (shape)
     default:       printf("unknown\n");  break;
 }
 ```
+
+### Interface Value Semantics - Current Limitations
+
+Two operations that look natural do not work correctly at this time:
+
+- **Returning an interface value from a function miscompiles.** The generated code
+  produces incorrect IR and the return value is wrong at runtime. Workaround: return
+  the concrete pointer and let the caller box it into an interface at the assignment site.
+
+  ```c
+  // BROKEN - do not return an interface value
+  IShape getShape() { Circle c; IShape s = c; return s; }  // wrong output
+
+  // Correct: return the concrete pointer, box at call site
+  Circle* getShape() { return new Circle(); }
+  IShape s = getShape();   // boxing at assignment works correctly
+  ```
+
+- **`interface*` (pointer-to-interface) is rejected.** Interfaces are fat-pointer
+  values (object ptr + vtable ptr). You cannot take the address of an interface
+  variable. Use a concrete pointer where an indirect reference is needed.
+
+Both of these are known compiler limitations, not intentional language design decisions.
 
 ---
 
@@ -998,6 +1055,55 @@ int* p = ForwardBorrow(&a);   // p is bonded to a
 ```
 
 `bond` and `move` are mutually exclusive on the same parameter. `bond` is a soft keyword (text-matched at parse time), so identifiers and methods named `bond` still work in other contexts.
+
+### Memory Deallocation (`delete`)
+
+Four delete forms cover the different deallocation scenarios:
+
+| Form | When to use |
+|------|-------------|
+| `delete ptr` | Free a single object allocated with `new T` or `new T(...)`. Calls the destructor if one is defined. |
+| `delete[] ptr` | Free a primitive array allocated with `new T[n]` where `T` has no destructor. Does NOT call destructors. |
+| `delete[n] ptr` | Free a struct/class array of `n` elements. Calls the destructor on each element in order, then frees the buffer. |
+| `delete[_] ptr` | Free a raw buffer without calling any destructors. Use this for arrays of primitives when `delete[]` would be ambiguous, or to free just the backing storage of a container. |
+
+```c
+// Single object
+MyStruct* s = new MyStruct;
+delete s;                     // calls ~MyStruct() if defined
+
+// Primitive arrays
+i8* buf = new i8[1024];
+delete[] buf;                 // or: delete[_] buf  (equivalent for primitives)
+
+// Struct arrays - must supply the count
+Widget* ws = new Widget[n];
+delete[n] ws;                 // calls ~Widget() n times, then frees
+
+// Raw buffer of a struct array - no destructors
+Widget* raw = new Widget[n];
+delete[_] raw;                // frees memory only, no destructor calls
+```
+
+`delete[]` is rejected for struct types - the compiler requires you to choose
+explicitly between `delete[n]` (with destructors) and `delete[_]` (without).
+`delete[0]` is also rejected; use `delete[_]` to free a zero-or-unknown-count buffer.
+
+> **Owning containers copy = double-free.** `list<T>`, `dictionary<K,V>`, and similar
+> containers own their backing buffers. Assigning one by value (e.g. field assignment)
+> shallow-copies the header but shares the buffer. Both copies then free the same
+> memory at scope exit - heap corruption. Pass containers by pointer or use `move` to
+> transfer ownership.
+>
+> ```c
+> list<int> a; a.add(1);
+> list<int> b = a;   // WRONG: b and a share the backing buffer -> double-free
+> ```
+>
+> `string` is different: `list<string>::add` and `dictionary::set` take `move string`
+> and deep-copy a borrowed (non-owning) argument, so strings stored in containers are
+> safe. A plain `string s2 = s1;` assignment also shares the buffer - own an
+> independent copy with `s1.copy()`.
 
 ---
 
@@ -1263,6 +1369,29 @@ full pointer width rather than relying on the narrow integer's extension.
 A struct **value** cast to a pointer is rejected (use `&value` or `getPtr()`); only
 integers and other pointers reinterpret to a pointer.
 
+### Unsigned narrow-integer casts: always widen to `int` before use
+
+A cast to an unsigned narrow type like `u8` produces a signed `i8` in LLVM IR.
+When you then use the result as an array index or in a comparison, the signed
+interpretation means values >= 128 appear negative and index or compare incorrectly.
+
+Always widen to `int` (or another signed integer) after an unsigned narrow cast
+before using the value as an index or operand:
+
+```c
+i8* data = ...;
+int[256] freq;
+
+// WRONG: (u8)data[i] is still i8 in IR; values >= 128 sign-extend to negative
+freq[(u8)data[i]]++;         // mis-indexes for bytes >= 128
+
+// CORRECT: widen to int first so the zero-extension is explicit
+freq[(int)(u8)data[i]]++;    // correct zero-extension to 0..255
+```
+
+The same applies to comparisons and any arithmetic that must treat the byte as
+unsigned: `if ((int)(u8)c >= 128)`, `int idx = (int)(u8)src[i];`.
+
 ---
 
 ## Null-Safety
@@ -1479,10 +1608,11 @@ for (int x in nums)
     printf("%d\n", x);
 ```
 
-C-style fixed arrays work directly - no helper methods needed:
+C-style fixed arrays work directly - no helper methods needed. Use the type-first
+`T[N]` syntax (the C-style `T name[N]` declarator is not accepted for fixed arrays):
 
 ```c
-int buf[4];
+int[4] buf;
 buf[0] = 10; buf[1] = 20; buf[2] = 30; buf[3] = 40;
 
 for (int x in buf)
@@ -1619,6 +1749,36 @@ bool eq = (a == a);      // true
 
 `operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](threading.md)).
 
+**Operator overloading binding rules:**
+
+- **Left-operand dispatch.** `a op b` always calls `a.operator_op(b)`. The struct
+  that owns the operator must be the *left* operand. Writing `3.0f * vec` fails if
+  only `vec.operator*(float)` is defined; write `vec * 3.0f` instead.
+
+- **Unary operators** are zero-parameter member functions named `operator-`,
+  `operator!`, or `operator~`. Apply them with the standard prefix notation:
+  `-v`, `!b`, `~bits`.
+
+- **Operator chains on named variables work** (`a + b + c` is fine - each
+  intermediate result is a temporary that carries the type and dispatches again).
+
+- **Method calls on unnamed expression results are not supported.** Calling a
+  method directly on a parenthesized expression or a string literal produces an
+  "unknown function" error. Store the intermediate result first:
+
+  ```c
+  // BROKEN
+  Vec2 n = (hitPt - center).normalize();  // "unknown function '(hitPt-center)'"
+  string u = "hello".toUpper();           // "unknown function '\"hello\"'"
+
+  // Correct: bind the intermediate to a name first
+  Vec2 diff = hitPt - center;
+  Vec2 n = diff.normalize();
+
+  string s = "hello";
+  string u = s.toUpper();
+  ```
+
 ### Bitwise and Shift Operators
 
 ```c
@@ -1670,6 +1830,40 @@ printf("function: %s\n", __FUNCTION__);
 printf("line: %d\n",     __LINE__);
 printf("platform: %d\n", __PLATFORM__);  // 64 or 32, set by -p flag
 ```
+
+### Reserved Keywords and Intrinsics
+
+The following identifiers are reserved by the compiler and cannot be used as
+variable, function, struct, or namespace names.
+
+**Hard keywords** (ANTLR lexer tokens - always reserved):
+
+`annotation`, `as`, `auto`, `bool`, `break`, `case`, `char`, `class`, `const`,
+`continue`, `default`, `delete`, `do`, `double`, `else`, `enum`, `extern`,
+`float`, `for`, `function`, `goto`, `if`, `in`, `inline`, `int`, `interface`,
+`is`, `long`, `move`, `namespace`, `nameof`, `new`, `operator`, `register`,
+`restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `string`, `struct`,
+`switch`, `typedef`, `typeof`, `union`, `unsigned`, `using`, `void`, `volatile`,
+`where`, `while`
+
+**Soft keywords** (text-matched by the listener - reserved in the positions where
+they have syntactic meaning, but legal as identifiers in other positions):
+
+`bond`, `cache`, `define`, `from`, `lib`, `lock`, `program`, `vectorize`
+
+Note: `program` as a top-level keyword defines the managed-entry-point construct
+(see [`program` Keyword](#program-keyword)) and cannot be used as a variable name
+in the enclosing scope. `in` is a hard keyword and cannot be used as a variable
+name at all.
+
+**Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
+
+`annotationof`, `expect_error`, `is_pointer`, `nameof`, `reflect`, `reflect_set`,
+`sizeof`, `typeof`
+
+If you accidentally use a reserved word as an identifier, the error message may
+point to a nearby token rather than the reserved word itself. Check your names
+against this list when the error location looks wrong.
 
 ### Compile-Time Conditionals (`if const`)
 
@@ -1760,7 +1954,7 @@ CFlat can compile your own `.c` source, import another file's `main` as a progra
 
 ## JSON (lib/json.cb)
 
-`json.cb` provides `JsonBuilder.toJson<T>` and `fromJson<T>`. It respects `[JsonName]` and `[Private]` annotations (requires `interfaces.cb`):
+`json.cb` provides `JsonBuilder.toJson<T>` and `JsonBuilder.fromJson<T>`. It respects `[JsonName]` and `[Private]` annotations (requires `interfaces.cb`):
 
 ```c
 import "json.cb";
@@ -1785,15 +1979,49 @@ p._token = "secret";
 string json = JsonBuilder.toJson(p);
 // {"full_name":"Alice","age":30}   - _token omitted
 
-Person p2 = fromJson<Person>(json);
+Person p2 = JsonBuilder.fromJson<Person>(json);
 // p2.name == "Alice", p2.age == 30
 ```
 
-Use `{{` and `}}` to embed literal braces in format strings (they are not interpolated):
+**Both functions must be called as `JsonBuilder.toJson` / `JsonBuilder.fromJson`.** The
+bare unqualified form `fromJson<T>(...)` does not compile.
+
+### Supported field types
+
+| Field type | `toJson` | `fromJson` |
+|------------|----------|------------|
+| `int`, `bool`, `float` | yes | yes |
+| `string` | yes | yes (heap-owned copy) |
+| nested struct (value) | yes | yes |
+| `list<int>`, `list<bool>`, `list<float>`, `list<string>` | yes | yes |
+| `list<struct>` | yes | CURRENT LIMITATION - compile error with misleading message |
+| pointer fields | yes (as null) | no |
+
+**String ownership in `fromJson`.** String fields in a deserialized struct are
+heap-allocated copies (independent of the JSON input string). They are freed when
+the struct goes out of scope. Strings inside a `list<string>` field are also
+heap-copied at `add()` time, so the list owns them and they are freed with the list.
+
+**`list<struct>` fields do not round-trip through `fromJson`.** Attempting to
+deserialize a struct that contains a `list<NestedStruct>` field produces a compiler
+error with a misleading message pointing to a non-existent line. Use `list<int>`,
+`list<string>`, or a manually parsed approach for arrays of nested objects.
+
+### Embedding literal braces in strings
+
+`{` and `}` in any string literal trigger interpolation. When you build a JSON
+template or embed JSON text inside a string literal, use `{{` and `}}` to produce
+literal brace characters:
 
 ```c
-string literal = "result: {{value}}";   // "result: {value}"
+string template = "{{\"key\": \"{value}\"}}";   // {"key": "<value of 'value'>"}
+string literal  = "result: {{value}}";           // "result: {value}"
 ```
+
+If you forget to escape and accidentally write `{"key": "val"}` as a string
+literal, the compiler reports an "Undefined variable 'key'" error at the start of
+the file rather than at the brace - the `{` triggers interpolation before the
+error location can be narrowed.
 
 ---
 
@@ -1854,7 +2082,7 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 | `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
 | `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |
-| `filesystem.cb` | `File.Exists()`, `File.ReadAllText()`, `File.WriteAllText()`, `File.move()` |
+| `filesystem.cb` | `File.exists()`, `File.readAllText()`, `File.writeAllText()`, `File.move()`, `File.isFile()`, `File.remove()`, `File.copy()`; `Path.combine()`, `Path.getFileName()`, `Path.getDirectory()`, `Path.changeExtension()`; `Directory.list()`, `Directory.listFiles()`, `Directory.createAll()` |
 | `thread.cb` | `Thread` - Win32 thread wrapper; `start(fn, ctx)`, `join()` |
 | `random.cb` | `Random` - splitmix64 PRNG; `seed(i64)`, `seedFromTime()`, `next()`, `nextInt(min, max)`, `nextDouble()`; independent substreams via `jump(i64)` / `split()` |
 | `time.cb` | `Duration`, `TimePoint`, `Stopwatch` - high-resolution timing |
@@ -1867,6 +2095,7 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 | `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring |
 | `stop_token.cb` | `StopSource` / `StopToken` - cooperative cancellation |
 | `arena.cb` | `Arena` - bump allocator |
-| `json.cb` | `JsonBuilder.toJson<T>`, `fromJson<T>` - JSON serialization/deserialization |
+| `json.cb` | `JsonBuilder.toJson<T>`, `JsonBuilder.fromJson<T>` - JSON serialization/deserialization |
+| `graphic/bitmap.cb` | `Bitmap` - load/create/save Windows BMP files (`load(path)`, `save(path)`, `create(w,h)`, `get(x,y)`, `set(x,y,px)`, `width()`, `height()`); `BitmapPixel` struct (u8 fields `r`, `g`, `b`, `a`). `save` writes a real 24 bpp BMP file to disk. Import as `import "graphic/bitmap.cb";` |
 
 ---

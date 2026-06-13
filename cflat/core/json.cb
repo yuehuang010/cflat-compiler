@@ -7,10 +7,15 @@ class JsonBuilder : IReflector
 
     void beginObject(string name)
     {
+        // Emit the element/field separator first, regardless of whether this
+        // object is keyed. Array-element objects are visited with an empty name
+        // (no key), and they still need a leading ',' between siblings - gating
+        // the comma on name.length() drops it and yields invalid JSON like
+        // [{...}{...}]. The key text is only emitted when a name is present.
+        if (!firstField) sb.appendChar(',');
+        firstField = false;
         if (name.length() > 0)
         {
-            if (!firstField) sb.appendChar(',');
-            firstField = false;
             sb.appendChar('"');
             sb.append(name);
             sb.append("\":");

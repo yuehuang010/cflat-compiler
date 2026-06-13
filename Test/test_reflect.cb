@@ -73,6 +73,16 @@ struct Level3 { int val = 0; };
 struct Level2 { Level3 deep = default; int mid = 0; };
 struct Level1 { Level2 inner = default; string top = default; };
 
+// list<struct> field. Regression for J1: fromJson<T> of a list-whose-element-is-a-
+// struct field used to fail to compile (the generated add() of the element struct
+// was built without a resolved element type). It also guards the toJson array-
+// element separator: each element object must be comma-separated ([{...},{...}]),
+// not concatenated ([{...}{...}]) which is invalid JSON and breaks the round-trip.
+struct PointBag {
+    string label = default;
+    list<Point> points = default;
+};
+
 // Deserialization target with OWNED string fields freed by an explicit destructor
 // (the now-standard dtor pattern) plus a list<string>. Regression for the json
 // arena-dangling bug: fromJson must copy parsed string values out of the parser's
@@ -505,6 +515,25 @@ extern int main()
     Point jp0rt = JsonBuilder.fromJson<Point>(JsonBuilder.toJson(jp0));
     total++; passed += Test("json_roundtrip_zero_x", jp0rt.x, 0);
     total++; passed += Test("json_roundtrip_zero_y", jp0rt.y, 0);
+
+    // list<struct> field (J1): toJson must comma-separate element objects; fromJson
+    // must construct each element struct and add it to the list. Round-trip must
+    // preserve element count and field values.
+    PointBag pb;
+    pb.label = "shapes";
+    Point pbp0; pbp0.x = 3; pbp0.y = 4; pb.points.add(pbp0);
+    Point pbp1; pbp1.x = 5; pbp1.y = 6; pb.points.add(pbp1);
+    string pbJson = JsonBuilder.toJson(pb);
+    total++; passed += Test("toJson_list_struct", pbJson,
+        "{\"label\":\"shapes\",\"points\":[{\"x\":3,\"y\":4},{\"x\":5,\"y\":6}]}");
+
+    PointBag pb2 = JsonBuilder.fromJson<PointBag>(pbJson);
+    total++; passed += Test("fromJson_list_struct_count", pb2.points.count(),  2);
+    total++; passed += Test("fromJson_list_struct_label", pb2.label,           "shapes");
+    total++; passed += Test("fromJson_list_struct_p0x",   pb2.points[0].x,     3);
+    total++; passed += Test("fromJson_list_struct_p0y",   pb2.points[0].y,     4);
+    total++; passed += Test("fromJson_list_struct_p1x",   pb2.points[1].x,     5);
+    total++; passed += Test("fromJson_list_struct_p1y",   pb2.points[1].y,     6);
 
     // =========================================================================
     // XML tests

@@ -1,0 +1,21 @@
+// demo.script - sample program for the tiny interpreter.
+a = 2 + 3 * 4;        // operator precedence -> 14
+print a;
+b = (2 + 3) * 4;      // parentheses -> 20
+print b;
+
+// Comparisons yield 1.0 / 0.0
+print 3 < 5;          // 1
+print 5 == 6;         // 0
+
+// while loop: sum 1..10
+i = 1;
+sum = 0;
+while (i <= 10) {
+    sum = sum + i;
+    i = i + 1;
+}
+print sum;            // 55
+
+// if / else
+if (sum > 50) { print 100; } else { print -100; }   // 100
