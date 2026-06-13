@@ -35,17 +35,20 @@ import "cruntime.cb";
 import "network/socket.cb";
 import "http_parser.cb";
 import "http_response.cb";
+import "http_io.cb";
 
 // Per-connection context handed to a pool worker.  Owns the OS socket handle
 // until the task wraps it in a stack Socket and lets the destructor close it.
 struct _HttpConnCtx {
     void* handle = nullptr;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
+    int   maxRequestBytes = 1048576;
 };
 
 // Pool task: handles one accepted connection end-to-end.  ctx is delivered
 // move-owned via cflat's move void* convention; the cast preserves the
-// owning flag and scope exit auto-deletes.
+// owning flag and scope exit auto-deletes.  Reading, parsing and partial-send-safe
+// writing are delegated to http_io.cb.
 int _httpConnTask(move void* raw, stop_token tok)
 {
     _HttpConnCtx* ctx = (_HttpConnCtx*)raw;
@@ -53,28 +56,32 @@ int _httpConnTask(move void* raw, stop_token tok)
     Socket conn;
     conn._handle = ctx->handle;
 
-    i8* buf = new i8[8192];
-    int n = conn.recv(buf, 8191);
-    HttpResponse* resp = nullptr;
+    i8* buf = nullptr;
+    int len = 0;
+    int rc  = _http_readRequest(&conn, ctx->maxRequestBytes, &buf, &len);
 
-    if (n > 0)
+    if (rc != HTTP_READ_CLOSED)
     {
-        buf[n] = 0;
-        HttpRequest* req = parseHttpRequest(buf, n);
-        if (req->valid)
-            resp = ctx->handler(req);
-        delete req;
+        HttpResponse* resp = nullptr;
+        if (rc == HTTP_READ_TOO_LARGE)
+        {
+            resp = HttpResponse.payloadTooLarge();
+        }
+        else
+        {
+            HttpRequest* req = parseHttpRequest(buf, len);
+            if (req->valid)
+                resp = ctx->handler(req);
+            delete req;
+        }
+        if (buf != nullptr) delete buf;
+
+        if (resp == nullptr)
+            resp = HttpResponse.serverError();
+
+        _http_sendResponse(&conn, resp);
+        delete resp;
     }
-    delete buf;
-
-    if (resp == nullptr)
-        resp = HttpResponse.serverError(nullptr);
-
-    int rlen = 0;
-    i8* rbuf = resp->build(&rlen);
-    conn.send(rbuf, rlen);
-    delete rbuf;
-    delete resp;
 
     return 0;
 }
@@ -84,6 +91,7 @@ program HttpServer {
     int         port        = 8080;
     int         backlog     = 16;
     int         workerCount = 4;
+    int         maxRequestBytes = 1048576;   // 1 MiB cap; exceeded -> 413
     stop_token  stopToken   = default;
     ThreadPool  pool        = default;
     function<HttpResponse*(HttpRequest*)> handler = nullptr;
@@ -114,6 +122,7 @@ program HttpServer {
             _HttpConnCtx* c = new _HttpConnCtx;
             c->handle  = conn->_handle;
             c->handler = handler;
+            c->maxRequestBytes = maxRequestBytes;
             conn->_handle = nullptr;  // transfer OS handle; Socket shell freed here
             delete conn;
 

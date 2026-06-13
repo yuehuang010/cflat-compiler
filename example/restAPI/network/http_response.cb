@@ -1,224 +1,235 @@
-// core/network/http_response.cb - Build HTTP/1.1 responses.
+// network/http_response.cb - Build HTTP/1.1 responses.
 //
 // Usage:
 //   import "network/http_response.cb";
 //   HttpResponse* r = HttpResponse.ok("hello");
-//   int len = 0;
-//   i8* buf = r->build(&len);
-//   socket->send(buf, len);
-//   delete buf;
+//   string out = r->build();        // owned; always emits Connection: close
+//   socket->send(out.data(), out.length());
 //   delete r;
+//
+// Ownership: `_body` is an owned `string` (setBody stores a .copy()); the explicit
+// destructor frees it and setBody frees the previous buffer before overwriting.
+// `_statusText` is ALWAYS literal-backed (borrowed) - set only from string literals
+// by setStatus()/the factories - so it is never freed. The two header lists own
+// their elements and self-clean.
 
 import "string.cb";
 import "list.cb";
 
-// Write null-terminated string s into buf at offset pos; return new pos.
-int _http_puts(i8* buf, int pos, const char* s)
-{
-    int i = 0;
-    while (s[i] != 0) { buf[pos] = s[i]; pos++; i++; }
-    return pos;
-}
-
-// Write decimal integer val into buf at offset pos; return new pos.
-int _http_puti(i8* buf, int pos, int val)
-{
-    i8* tmp = new i8[16];
-    int len = sprintf(tmp, "%d", val);
-    int i = 0;
-    while (i < len) { buf[pos] = tmp[i]; pos++; i++; }
-    delete tmp;
-    return pos;
-}
-
 class HttpResponse {
-    int       _status     = 200;
-    i8*       _statusText = nullptr;   // points to a string literal - not owned
-    list<i8*> _headerNames  = default; // owns the heap strings it stores
-    list<i8*> _headerValues = default;
-    i8*       _body       = nullptr;
-    int       _bodyLen    = 0;
+    int          _status       = 200;
+    string       _statusText   = default;   // literal-backed (borrowed) - never freed
+    list<string> _headerNames  = default;   // own their elements; self-clean
+    list<string> _headerValues = default;
+    string       _body         = default;   // owned - freed in destructor
 
-    void setStatus(int code, const char* text)
+    // Set status code and reason text. `text` must be a string literal (borrowed);
+    // callers in this codebase always pass literals.
+    void setStatus(int code, string text)
     {
-        _status = code;
-        _statusText = (i8*)text;
+        _status     = code;
+        _statusText = text;
     }
 
-    void addHeader(const char* name, const char* value)
+    // Append a response header. Both name and value are deep-copied so the lists
+    // own them (callers may pass borrowed request-header values).
+    void addHeader(string name, string value)
     {
-        int nlen = strlen(name);
-        i8* nheap = new i8[nlen + 1];
-        int i = 0;
-        while (i <= nlen) { nheap[i] = name[i]; i++; }
-
-        int vlen = strlen(value);
-        i8* vheap = new i8[vlen + 1];
-        i = 0;
-        while (i <= vlen) { vheap[i] = value[i]; i++; }
-
-        _headerNames.add(nheap);
-        _headerValues.add(vheap);
+        _headerNames.add(name.copy());
+        _headerValues.add(value.copy());
     }
 
-    void setBody(i8* data, int len)
+    // Replace the body with an owned copy of `value`. Frees the previous buffer
+    // first so repeated setBody() calls do not leak (string-field reassignment
+    // does not auto-free the old buffer).
+    void setBody(string value)
     {
-        if (_body != nullptr) { delete _body; _body = nullptr; }
-        _body = new i8[len + 1];
-        int i = 0;
-        while (i < len) { _body[i] = data[i]; i++; }
-        _body[len] = 0;
-        _bodyLen = len;
+        // Free the previous owned buffer first (string-field reassignment does not
+        // auto-free), then take ownership of a fresh copy. The copy is routed
+        // through a `move` local: a bare `_body = value.copy()` would not transfer
+        // ownership of the temporary, leaving _body aliasing a freed buffer.
+        if (_body._ptr != nullptr) { i8* p = move _body._ptr; delete p; }
+        string owned = value.copy();
+        _body = move owned;
     }
 
-    void setTextBody(const char* text)
+    // Build the complete HTTP response into a fresh owned string. No fixed buffer,
+    // so arbitrarily large bodies are safe. Always emits Connection: close;
+    // Content-Length only when the body is non-empty.
+    move string build()
     {
-        setBody((i8*)text, strlen(text));
-    }
+        stringbuilder sb;
 
-    // Build the complete HTTP response into a heap buffer.  Sets *outLen to the
-    // byte count.  The caller owns the returned buffer and must delete it.
-    i8* build(int* outLen)
-    {
-        i8* buf = new i8[65536];
-        int pos = 0;
+        sb.append("HTTP/1.1 ");
+        sb.append(_status);
+        sb.appendChar(' ');
+        if (!_statusText.isEmpty()) sb.append(_statusText);
+        else                        sb.append("OK");
+        sb.append("\r\n");
 
-        pos = _http_puts(buf, pos, "HTTP/1.1 ");
-        pos = _http_puti(buf, pos, _status);
-        pos = _http_puts(buf, pos, " ");
-        pos = _http_puts(buf, pos, _statusText != nullptr ? _statusText : (i8*)"OK");
-        pos = _http_puts(buf, pos, "\r\n");
+        sb.append("Connection: close\r\n");
 
-        if (_bodyLen > 0)
+        if (_body.length() > 0)
         {
-            pos = _http_puts(buf, pos, "Content-Length: ");
-            pos = _http_puti(buf, pos, _bodyLen);
-            pos = _http_puts(buf, pos, "\r\n");
+            sb.append("Content-Length: ");
+            sb.append(_body.length());
+            sb.append("\r\n");
         }
 
         int i = 0;
         while (i < _headerNames.count())
         {
-            pos = _http_puts(buf, pos, _headerNames.get(i));
-            pos = _http_puts(buf, pos, ": ");
-            pos = _http_puts(buf, pos, _headerValues.get(i));
-            pos = _http_puts(buf, pos, "\r\n");
+            sb.append(_headerNames.get(i));
+            sb.append(": ");
+            sb.append(_headerValues.get(i));
+            sb.append("\r\n");
             i++;
         }
 
-        pos = _http_puts(buf, pos, "\r\n");
+        sb.append("\r\n");
 
-        int j = 0;
-        while (j < _bodyLen) { buf[pos] = _body[j]; pos++; j++; }
+        if (_body.length() > 0) sb.append(_body);
 
-        buf[pos] = 0;
-        *outLen = pos;
-        return buf;
+        return sb.toString();
     }
 
     ~HttpResponse()
     {
-        if (_body != nullptr) { delete _body; _body = nullptr; }
-        // _headerNames and _headerValues own their i8* elements and free them on destruction.
+        if (_body._ptr != nullptr) { i8* p = move _body._ptr; delete p; }
+        // _statusText is literal-backed (never owned) - not freed.
+        // _headerNames / _headerValues own their elements and self-clean.
     }
 
     // ── Static factories ──────────────────────────────────────────────────────
 
-    static HttpResponse* ok(const char* body)
+    static HttpResponse* ok()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 200;
+        r->_status     = 200;
         r->_statusText = "OK";
         r->addHeader("Content-Type", "text/plain");
-        if (body != nullptr) r->setTextBody(body);
         return r;
     }
 
-    static HttpResponse* okJson(const char* json)
+    static HttpResponse* ok(string body)
+    {
+        HttpResponse* r = HttpResponse.ok();
+        r->setBody(body);
+        return r;
+    }
+
+    static HttpResponse* okJson()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 200;
+        r->_status     = 200;
         r->_statusText = "OK";
         r->addHeader("Content-Type", "application/json");
-        if (json != nullptr) r->setTextBody(json);
+        return r;
+    }
+
+    static HttpResponse* okJson(string json)
+    {
+        HttpResponse* r = HttpResponse.okJson();
+        r->setBody(json);
         return r;
     }
 
     static HttpResponse* notFound()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 404;
+        r->_status     = 404;
         r->_statusText = "Not Found";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody("Not Found");
+        r->setBody("Not Found");
         return r;
     }
 
-    static HttpResponse* serverError(const char* msg)
+    static HttpResponse* serverError()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 500;
+        r->_status     = 500;
         r->_statusText = "Internal Server Error";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody(msg != nullptr ? msg : "Internal Server Error");
+        r->setBody("Internal Server Error");
         return r;
     }
 
-    static HttpResponse* created(const char* body)
+    static HttpResponse* serverError(string msg)
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 201;
+        r->_status     = 500;
+        r->_statusText = "Internal Server Error";
+        r->addHeader("Content-Type", "text/plain");
+        r->setBody(msg);
+        return r;
+    }
+
+    // 413 Payload Too Large - returned when a request exceeds maxRequestBytes.
+    static HttpResponse* payloadTooLarge()
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status     = 413;
+        r->_statusText = "Payload Too Large";
+        r->addHeader("Content-Type", "text/plain");
+        r->setBody("Payload Too Large");
+        return r;
+    }
+
+    static HttpResponse* created(string body)
+    {
+        HttpResponse* r = new HttpResponse;
+        r->_status     = 201;
         r->_statusText = "Created";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody(body != nullptr ? body : "Created");
+        r->setBody(body);
         return r;
     }
 
     static HttpResponse* noContent()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 204;
+        r->_status     = 204;
         r->_statusText = "No Content";
         return r;
     }
 
-    static HttpResponse* badRequest(const char* msg)
+    static HttpResponse* badRequest(string msg)
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 400;
+        r->_status     = 400;
         r->_statusText = "Bad Request";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody(msg != nullptr ? msg : "Bad Request");
+        r->setBody(msg);
         return r;
     }
 
-    static HttpResponse* unauthorized(const char* msg)
+    static HttpResponse* unauthorized(string msg)
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 401;
+        r->_status     = 401;
         r->_statusText = "Unauthorized";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody(msg != nullptr ? msg : "Unauthorized");
+        r->setBody(msg);
         return r;
     }
 
-    static HttpResponse* forbidden(const char* msg)
+    static HttpResponse* forbidden(string msg)
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 403;
+        r->_status     = 403;
         r->_statusText = "Forbidden";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody(msg != nullptr ? msg : "Forbidden");
+        r->setBody(msg);
         return r;
     }
 
     static HttpResponse* methodNotAllowed()
     {
         HttpResponse* r = new HttpResponse;
-        r->_status = 405;
+        r->_status     = 405;
         r->_statusText = "Method Not Allowed";
         r->addHeader("Content-Type", "text/plain");
-        r->setTextBody("Method Not Allowed");
+        r->setBody("Method Not Allowed");
         return r;
     }
 };

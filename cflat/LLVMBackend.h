@@ -828,6 +828,14 @@ public:
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
 
+    // When returning a struct VALUE local whose full-destructor frees members (e.g. owned
+    // string fields), the by-value snapshot carries those member pointers to the caller, so
+    // the local's destructor must be skipped on the return path or the returned value would
+    // dangle (and double-free when the caller destroys it). CreateReturnCall sets this to the
+    // returned local's alloca around the scope-exit destructor walk; EmitDestructorsForScope
+    // skips the struct whose Storage matches. Null on every non-return scope exit.
+    llvm::Value* returnedStructDtorSkipAlloca = nullptr;
+
     // Owned-string SSA temporaries produced by a ReturnsOwned call (e.g. the unnamed
     // (a + b) intermediate of a chained concat a + b + c) that are consumed as a
     // sub-expression rather than bound to a named local. They have no NamedVariable
@@ -1286,6 +1294,12 @@ private:
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
+    // Memoized "full destructor" per type: user dtor + recursive member destruction.
+    // Presence in the map means "computed"; the mapped value may be nullptr (type needs
+    // no destruction), the plain user dtor (no dtor-bearing members), or a synthesized
+    // wrapper. See GetOrCreateFullDestructor.
+    std::unordered_map<std::string, llvm::Function*> fullDestructorCache_;
+    std::unordered_set<std::string> fullDestructorInProgress_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
@@ -1416,10 +1430,9 @@ private:
 
         builder->SetInsertPoint(cleanupBB);
 
-        // Call destructor if the type has one
-        auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
-        if (it != dataStructures.end() && it->second.Destructor != nullptr)
-            builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { ptrVal });
+        // Call the full destructor (user dtor + member fields) if the type needs one.
+        if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+            builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
 
         // Call operator delete (allocator-aware) to free the pointer.
         auto* opDel = GetFunction("operator delete");
@@ -1526,15 +1539,22 @@ private:
             auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
             if (it != dataStructures.end())
             {
-                // String destructor is only called when the local owns its buffer.
+                // String destructor is only called when the local owns its buffer; it has
+                // no dtor-bearing members so the registered string dtor is the full dtor.
                 if (namedVar.TypeAndValue.TypeName == "string")
                 {
                     if (!namedVar.IsOwningString) continue;
                     EnsureStringDtorRegistered();
+                    if (it->second.Destructor == nullptr) continue;
+                    auto* fn = it->second.Destructor;
+                    builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
+                    continue;
                 }
-                if (it->second.Destructor == nullptr) continue;
-                auto* fn = it->second.Destructor;
-                builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
+                // Non-string struct local: run the full destructor (user dtor + members).
+                // Skip the struct value being moved out via `return` - the caller now owns it.
+                if (namedVar.Storage == returnedStructDtorSkipAlloca) continue;
+                if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    builder->CreateCall(fn->getFunctionType(), fn, { namedVar.Storage });
             }
         }
 
@@ -1556,9 +1576,8 @@ private:
             // Clean up move struct parameters
             if (namedVar.IsOwningStruct && namedVar.Storage != nullptr)
             {
-                auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
-                if (it != dataStructures.end() && it->second.Destructor != nullptr)
-                    builder->CreateCall(it->second.Destructor->getFunctionType(), it->second.Destructor, { namedVar.Storage });
+                if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    builder->CreateCall(dtor->getFunctionType(), dtor, { namedVar.Storage });
             }
         }
 
@@ -2238,6 +2257,105 @@ private:
         b.CreateRetVoid();
 
         RegisterDestructor("string", dtorFn);
+    }
+
+    // Return the function that fully destroys an instance of `typeName`: the user
+    // destructor (if any) followed by destruction of every destructor-bearing member
+    // field, recursively. Returns nullptr when the type needs no destruction at all
+    // (no user dtor and no dtor-bearing members). Result is memoized.
+    //
+    // Member scope: a member is destructed only when it is a VALUE field (not a pointer,
+    // array-view, simd, bitfield, or fixed-array) whose type is a struct with its own
+    // full destructor (list<T>, dictionary<T>, array<T>, user structs with `~T()`, and
+    // nested aggregates of these). Bare `string` members are intentionally NOT destructed:
+    // `string` carries no runtime owned/borrowed flag, and real code stores borrowed
+    // strings in `string` members (see internal/plan/member-dtor-recursion.md), so
+    // auto-freeing them would corrupt the heap. Raw pointer fields are never auto-freed.
+    //
+    // When a type has a user dtor but no dtor-bearing members, the user dtor IS the full
+    // destructor (no wrapper is synthesized) - the common case stays byte-identical.
+    llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
+    {
+        // `string` has no dtor-bearing members, so its full dtor is just the lazily
+        // registered string dtor. Resolve it live (never cache) so a call before the
+        // lazy registration does not poison the cache with a null.
+        if (typeName == "string")
+        {
+            EnsureStringDtorRegistered();
+            auto it = dataStructures.find("string");
+            return it != dataStructures.end() ? it->second.Destructor : nullptr;
+        }
+
+        // Only synthesized wrappers are cached - they are stable once built. The
+        // no-member-work and unknown-type results are resolved LIVE on every call so a
+        // destructor that is still a forward declaration when first queried (e.g. a
+        // generic ~list instantiation whose body is emitted later) is not frozen as a
+        // stale null. This mirrors the pre-existing direct `Destructor` reads at each site.
+        if (auto it = fullDestructorCache_.find(typeName); it != fullDestructorCache_.end())
+            return it->second;
+
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end())
+            return nullptr;
+
+        // Value-type member cycles are impossible (infinite size), but guard defensively
+        // so a malformed registry cannot recurse forever - fall back to the user dtor.
+        if (!fullDestructorInProgress_.insert(typeName).second)
+            return dsIt->second.Destructor;
+
+        llvm::Function* userDtor = dsIt->second.Destructor;
+
+        // Collect member fields that need destruction.
+        struct MemberWork { unsigned Index; llvm::Function* Dtor; };
+        std::vector<MemberWork> work;
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
+                continue;
+            if (f.ConstArraySize > 0)   // fixed-array members: out of scope (rare), documented
+                continue;
+            if (f.TypeName == "string") // borrowed/owned ambiguity: never auto-free, documented
+                continue;
+            if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
+                work.push_back({ i, childDtor });
+        }
+
+        fullDestructorInProgress_.erase(typeName);
+
+        if (work.empty())
+        {
+            // No member work: full destruction is exactly the user dtor (possibly null).
+            // Resolved live (not cached) so a later-registered dtor is picked up.
+            return userDtor;
+        }
+
+        // Synthesize a wrapper: user dtor first (so hand-written free-and-null logic runs
+        // before member teardown), then each member's full destructor.
+        auto* structTy = dsIt->second.StructType;
+        auto* voidTy   = llvm::Type::getVoidTy(*context);
+        auto* selfPtrTy = structTy->getPointerTo();
+        auto* fnTy = llvm::FunctionType::get(voidTy, { selfPtrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          typeName + ".dtorfull", *module);
+        fn->arg_begin()->setName("self");
+        fullDestructorCache_[typeName] = fn;   // memoize before body emission
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+        llvm::IRBuilder<> b(entry);
+        auto* self = &*fn->arg_begin();
+
+        if (userDtor)
+            b.CreateCall(userDtor->getFunctionType(), userDtor, { self });
+
+        for (const auto& w : work)
+        {
+            auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
+            b.CreateCall(w.Dtor->getFunctionType(), w.Dtor, { fieldPtr });
+        }
+
+        b.CreateRetVoid();
+        return fn;
     }
 
     // Called lazily from ParseFormatString after string concat is first needed.
@@ -10113,7 +10231,11 @@ public:
         return false;
     }
 
-    void CreateReturnCall(llvm::Value* value)
+    // `returnedLocalStorage`, when provided, is the alloca of the named local being
+    // returned (the return expression's NamedVariable.Storage). It lets the struct-return
+    // move detection below work even when the by-value return is materialized field-wise
+    // (insertvalue) rather than as a single `load %Struct`, which dyn_cast<LoadInst> misses.
+    void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr)
     {
         // check if break has already been inserted.
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
@@ -10134,7 +10256,8 @@ public:
                     {
                         for (auto& [varName, nv] : frame.namedVariable)
                         {
-                            if (nv.Storage == srcAlloca && nv.IsOwningString)
+                            if (nv.Storage == srcAlloca && nv.IsOwningString
+                                && nv.TypeAndValue.TypeName == "string")
                             {
                                 ownedStringReturnVar = &nv;
                                 nv.IsOwningString = false;  // suppress destructor
@@ -10161,6 +10284,39 @@ public:
             }
         }
 
+        // Returning a struct VALUE local whose full-destructor frees members (owned string
+        // fields, value containers, ...): the by-value snapshot in `value` carries those member
+        // pointers to the caller, so the local's destructor must be skipped here or the returned
+        // value dangles (and double-frees when the caller destroys it). Suppress only for the
+        // return-path destructor walk. Mirrors the owned-string / owned-pointer cases above.
+        llvm::Value* prevStructSkip = returnedStructDtorSkipAlloca;
+        if (value && !ownedStringReturnVar && !ownedPtrReturnVar)
+        {
+            llvm::Value* srcAlloca = returnedLocalStorage;
+            if (srcAlloca == nullptr)
+                if (auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(value))
+                    srcAlloca = loadInst->getPointerOperand();
+            if (srcAlloca != nullptr)
+            {
+                bool found = false;
+                for (auto& frame : stackNamedVariable)
+                {
+                    for (auto& [varName, nv] : frame.namedVariable)
+                    {
+                        if (nv.Storage == srcAlloca && !nv.TypeAndValue.Pointer
+                            && nv.TypeAndValue.TypeName != "string"
+                            && GetOrCreateFullDestructor(nv.TypeAndValue.TypeName) != nullptr)
+                        {
+                            returnedStructDtorSkipAlloca = srcAlloca;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+            }
+        }
+
         // Emit destructors for all scopes from innermost out to the function boundary
         for (auto it = stackNamedVariable.rbegin(); it != stackNamedVariable.rend(); ++it)
         {
@@ -10171,6 +10327,7 @@ public:
         // Restore flags (clean state, though the scope is about to be popped anyway)
         if (ownedStringReturnVar) ownedStringReturnVar->IsOwningString = true;
         if (ownedPtrReturnVar)    ownedPtrReturnVar->IsOwning = true;
+        returnedStructDtorSkipAlloca = prevStructSkip;
 
         // Auto return-type inference: record the (BB, value) pair so the caller can
         // unify types after body emission. Terminate the BB with a placeholder

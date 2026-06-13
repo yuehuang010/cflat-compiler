@@ -73,6 +73,23 @@ struct Level3 { int val = 0; };
 struct Level2 { Level3 deep = default; int mid = 0; };
 struct Level1 { Level2 inner = default; string top = default; };
 
+// Deserialization target with OWNED string fields freed by an explicit destructor
+// (the now-standard dtor pattern) plus a list<string>. Regression for the json
+// arena-dangling bug: fromJson must copy parsed string values out of the parser's
+// internal arena (freed on return) into owned heap buffers, or reading them yields
+// garbage and the destructor double-frees an arena pointer (crash). See
+// internal/plan/string-ownership-fixes.md.
+struct JsonDoc {
+    string title  = default;
+    string author = default;
+    list<string> tags = default;
+    int    year   = 0;
+    ~JsonDoc() {
+        if (title._ptr  != nullptr) { i8* p = move title._ptr;  delete p; }
+        if (author._ptr != nullptr) { i8* p = move author._ptr; delete p; }
+    }
+};
+
 struct AnnotatedPerson {
     [JsonName("first_name")]
     string firstName = default;
@@ -455,6 +472,20 @@ extern int main()
     total++; passed += Test("fromJson_deep_top", jl2.top,            "root");
     total++; passed += Test("fromJson_deep_mid", jl2.inner.mid,      99);
     total++; passed += Test("fromJson_deep_val", jl2.inner.deep.val, 7);
+
+    // Deserialize into a dtor-bearing struct with owned string fields + a list<string>.
+    // Values must be correct AND the struct must destruct cleanly (no double-free of an
+    // arena pointer). Regression for the json arena-dangling / return-by-value fixes.
+    {
+        JsonDoc jd = JsonBuilder.fromJson<JsonDoc>(
+            "{\"title\":\"Dune\",\"author\":\"Herbert\",\"tags\":[\"sf\",\"epic\"],\"year\":1965}");
+        total++; passed += Test("fromJson_dtor_title",    jd.title,         "Dune");
+        total++; passed += Test("fromJson_dtor_author",   jd.author,        "Herbert");
+        total++; passed += Test("fromJson_dtor_year",     jd.year,          1965);
+        total++; passed += Test("fromJson_dtor_tagcount", jd.tags.count(),  2);
+        total++; passed += Test("fromJson_dtor_tag0",     jd.tags.get(0),   "sf");
+        total++; passed += Test("fromJson_dtor_tag1",     jd.tags.get(1),   "epic");
+    } // jd destructs here: owned title/author freed, tags self-clean - must not crash.
 
     Employee je3 = JsonBuilder.fromJson<Employee>(JsonBuilder.toJson(e));
     total++; passed += Test("json_roundtrip_name",   je3.name,        e.name);

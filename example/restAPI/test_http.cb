@@ -1,35 +1,6 @@
 import "network/http_parser.cb";
 import "network/http_response.cb";
 
-// Returns true if buf[0..blen) contains needle.
-bool _contains(i8* buf, int blen, const char* needle)
-{
-    int nlen = strlen(needle);
-    if (nlen > blen) return false;
-    int i = 0;
-    while (i <= blen - nlen)
-    {
-        bool match = true;
-        int j = 0;
-        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
-        if (match) return true;
-        i++;
-    }
-    return false;
-}
-
-// Returns true if buf starts with prefix (prefix is null-terminated).
-bool _starts_with(i8* buf, const char* prefix)
-{
-    int i = 0;
-    while (prefix[i] != 0)
-    {
-        if (buf[i] != prefix[i]) return false;
-        i++;
-    }
-    return true;
-}
-
 extern int main()
 {
     bool ok = true;
@@ -39,19 +10,16 @@ extern int main()
     i8* raw1 = "GET /api/users HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n";
     HttpRequest* req1 = parseHttpRequest(raw1, strlen(raw1));
 
-    if (!req1->valid)                                { printf("FAIL 1: GET not valid\n");   ok = false; }
-    if (strcmp(req1->method,  "GET") != 0)           { printf("FAIL 1: method\n");          ok = false; }
-    if (strcmp(req1->path,    "/api/users") != 0)    { printf("FAIL 1: path\n");            ok = false; }
-    if (strcmp(req1->version, "HTTP/1.1") != 0)      { printf("FAIL 1: version\n");         ok = false; }
-    if (req1->headerCount != 2)                      { printf("FAIL 1: headerCount\n");     ok = false; }
-    if (req1->bodyLen != 0)                          { printf("FAIL 1: body should be 0\n"); ok = false; }
+    if (!req1->valid)                       { printf("FAIL 1: GET not valid\n");    ok = false; }
+    if (req1->method  != "GET")             { printf("FAIL 1: method\n");           ok = false; }
+    if (req1->path    != "/api/users")      { printf("FAIL 1: path\n");             ok = false; }
+    if (req1->version != "HTTP/1.1")        { printf("FAIL 1: version\n");          ok = false; }
+    if (req1->headerCount() != 2)           { printf("FAIL 1: headerCount\n");      ok = false; }
+    if (req1->body.length() != 0)           { printf("FAIL 1: body should be 0\n"); ok = false; }
 
-    i8* host1 = req1->getHeader("Host");
-    if (host1 == nullptr || strcmp(host1, "localhost") != 0)
+    if (req1->getHeader("Host") != "localhost")
         { printf("FAIL 1: Host header\n"); ok = false; }
-
-    i8* accept1 = req1->getHeader("Accept");
-    if (accept1 == nullptr || strcmp(accept1, "application/json") != 0)
+    if (req1->getHeader("Accept") != "application/json")
         { printf("FAIL 1: Accept header\n"); ok = false; }
 
     delete req1;
@@ -61,12 +29,12 @@ extern int main()
     i8* raw2 = "POST /submit HTTP/1.1\r\nContent-Length: 6\r\nContent-Type: text/plain\r\n\r\nhello!";
     HttpRequest* req2 = parseHttpRequest(raw2, strlen(raw2));
 
-    if (!req2->valid)                        { printf("FAIL 2: POST not valid\n");  ok = false; }
-    if (strcmp(req2->method, "POST") != 0)   { printf("FAIL 2: method\n");         ok = false; }
-    if (strcmp(req2->path, "/submit") != 0)  { printf("FAIL 2: path\n");           ok = false; }
-    if (req2->contentLength() != 6)          { printf("FAIL 2: Content-Length\n"); ok = false; }
-    if (req2->bodyLen != 6)                  { printf("FAIL 2: body len\n");       ok = false; }
-    if (strcmp(req2->body, "hello!") != 0)   { printf("FAIL 2: body content\n");   ok = false; }
+    if (!req2->valid)                    { printf("FAIL 2: POST not valid\n");  ok = false; }
+    if (req2->method != "POST")          { printf("FAIL 2: method\n");          ok = false; }
+    if (req2->path != "/submit")         { printf("FAIL 2: path\n");            ok = false; }
+    if (req2->contentLength() != 6)      { printf("FAIL 2: Content-Length\n");  ok = false; }
+    if (req2->body.length() != 6)        { printf("FAIL 2: body len\n");        ok = false; }
+    if (req2->body != "hello!")          { printf("FAIL 2: body content\n");    ok = false; }
 
     delete req2;
 
@@ -89,12 +57,12 @@ extern int main()
     i8* raw5 = "GET / HTTP/1.0\r\n\r\n";
     HttpRequest* req5 = parseHttpRequest(raw5, strlen(raw5));
 
-    if (!req5->valid)                          { printf("FAIL 5: no-header not valid\n"); ok = false; }
-    if (strcmp(req5->method,  "GET") != 0)     { printf("FAIL 5: method\n");              ok = false; }
-    if (strcmp(req5->path,    "/") != 0)       { printf("FAIL 5: path\n");                ok = false; }
-    if (strcmp(req5->version, "HTTP/1.0") != 0){ printf("FAIL 5: version\n");             ok = false; }
-    if (req5->headerCount != 0)                { printf("FAIL 5: headerCount\n");         ok = false; }
-    if (req5->bodyLen != 0)                    { printf("FAIL 5: body\n");                ok = false; }
+    if (!req5->valid)                  { printf("FAIL 5: no-header not valid\n"); ok = false; }
+    if (req5->method  != "GET")        { printf("FAIL 5: method\n");              ok = false; }
+    if (req5->path    != "/")          { printf("FAIL 5: path\n");                ok = false; }
+    if (req5->version != "HTTP/1.0")   { printf("FAIL 5: version\n");             ok = false; }
+    if (req5->headerCount() != 0)      { printf("FAIL 5: headerCount\n");         ok = false; }
+    if (req5->body.length() != 0)      { printf("FAIL 5: body\n");                ok = false; }
 
     delete req5;
 
@@ -104,8 +72,7 @@ extern int main()
     HttpRequest* req6 = parseHttpRequest(raw6, strlen(raw6));
 
     if (!req6->valid) { printf("FAIL 6: not valid\n"); ok = false; }
-    i8* val6 = req6->getHeader("X-Pad");
-    if (val6 == nullptr || strcmp(val6, "hello") != 0)
+    if (req6->getHeader("X-Pad") != "hello")
         { printf("FAIL 6: whitespace not trimmed\n"); ok = false; }
 
     delete req6;
@@ -116,8 +83,7 @@ extern int main()
     HttpRequest* req7 = parseHttpRequest(raw7, strlen(raw7));
 
     if (!req7->valid) { printf("FAIL 7: not valid\n"); ok = false; }
-    i8* val7 = req7->getHeader("Authorization");
-    if (val7 == nullptr || strcmp(val7, "Bearer tok:en") != 0)
+    if (req7->getHeader("Authorization") != "Bearer tok:en")
         { printf("FAIL 7: colon in value\n"); ok = false; }
 
     delete req7;
@@ -127,21 +93,23 @@ extern int main()
     i8* raw8 = "DELETE /res/42?cascade=true HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
     HttpRequest* req8 = parseHttpRequest(raw8, strlen(raw8));
 
-    if (!req8->valid)                                  { printf("FAIL 8: not valid\n");  ok = false; }
-    if (strcmp(req8->method, "DELETE") != 0)           { printf("FAIL 8: method\n");     ok = false; }
-    if (strcmp(req8->path,   "/res/42") != 0)          { printf("FAIL 8: path\n");       ok = false; }
-    if (req8->_queryCount != 1)                         { printf("FAIL 8: queryCount\n"); ok = false; }
-    if (strcmp(req8->getQuery("cascade"), "true") != 0) { printf("FAIL 8: query\n");      ok = false; }
+    if (!req8->valid)                         { printf("FAIL 8: not valid\n");   ok = false; }
+    if (req8->method != "DELETE")             { printf("FAIL 8: method\n");      ok = false; }
+    if (req8->path   != "/res/42")            { printf("FAIL 8: path\n");        ok = false; }
+    if (req8->queryCount() != 1)              { printf("FAIL 8: queryCount\n");  ok = false; }
+    if (req8->getQuery("cascade") != "true")  { printf("FAIL 8: query\n");       ok = false; }
 
     delete req8;
 
-    // ── 9. getHeader miss -> nullptr; missing Content-Length -> 0 ─────────────
+    // ── 9. getHeader miss -> "" / not present; missing Content-Length -> 0 ────
 
     i8* raw9 = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     HttpRequest* req9 = parseHttpRequest(raw9, strlen(raw9));
 
-    if (req9->getHeader("X-Missing") != nullptr)
-        { printf("FAIL 9: missing header should return nullptr\n"); ok = false; }
+    if (req9->hasHeader("X-Missing"))
+        { printf("FAIL 9: missing header should not be present\n"); ok = false; }
+    if (!req9->getHeader("X-Missing").isEmpty())
+        { printf("FAIL 9: missing header should return empty\n"); ok = false; }
     if (req9->contentLength() != 0)
         { printf("FAIL 9: missing Content-Length should return 0\n"); ok = false; }
 
@@ -152,10 +120,10 @@ extern int main()
     i8* raw10 = "PUT /items/1 HTTP/1.1\r\nContent-Length: 4\r\n\r\ndata";
     HttpRequest* req10 = parseHttpRequest(raw10, strlen(raw10));
 
-    if (!req10->valid)                      { printf("FAIL 10: not valid\n");  ok = false; }
-    if (strcmp(req10->method, "PUT") != 0)  { printf("FAIL 10: method\n");    ok = false; }
-    if (req10->bodyLen != 4)                { printf("FAIL 10: bodyLen\n");   ok = false; }
-    if (strcmp(req10->body, "data") != 0)   { printf("FAIL 10: body\n");      ok = false; }
+    if (!req10->valid)               { printf("FAIL 10: not valid\n");  ok = false; }
+    if (req10->method != "PUT")      { printf("FAIL 10: method\n");     ok = false; }
+    if (req10->body.length() != 4)   { printf("FAIL 10: bodyLen\n");    ok = false; }
+    if (req10->body != "data")       { printf("FAIL 10: body\n");       ok = false; }
 
     delete req10;
 
@@ -164,12 +132,12 @@ extern int main()
     i8* raw11 = "GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n";
     HttpRequest* req11 = parseHttpRequest(raw11, strlen(raw11));
 
-    if (!req11->valid)       { printf("FAIL 11: not valid\n");   ok = false; }
-    if (req11->headerCount != 4) { printf("FAIL 11: headerCount\n"); ok = false; }
-    if (strcmp(req11->getHeader("A"), "1") != 0) { printf("FAIL 11: A\n"); ok = false; }
-    if (strcmp(req11->getHeader("B"), "2") != 0) { printf("FAIL 11: B\n"); ok = false; }
-    if (strcmp(req11->getHeader("C"), "3") != 0) { printf("FAIL 11: C\n"); ok = false; }
-    if (strcmp(req11->getHeader("D"), "4") != 0) { printf("FAIL 11: D\n"); ok = false; }
+    if (!req11->valid)              { printf("FAIL 11: not valid\n");   ok = false; }
+    if (req11->headerCount() != 4)  { printf("FAIL 11: headerCount\n"); ok = false; }
+    if (req11->getHeader("A") != "1") { printf("FAIL 11: A\n"); ok = false; }
+    if (req11->getHeader("B") != "2") { printf("FAIL 11: B\n"); ok = false; }
+    if (req11->getHeader("C") != "3") { printf("FAIL 11: C\n"); ok = false; }
+    if (req11->getHeader("D") != "4") { printf("FAIL 11: D\n"); ok = false; }
 
     delete req11;
 
@@ -179,9 +147,8 @@ extern int main()
     HttpRequest* req12 = parseHttpRequest(raw12, strlen(raw12));
 
     if (!req12->valid) { printf("FAIL 12: not valid\n"); ok = false; }
-    i8* val12 = req12->getHeader("X-Empty");
-    if (val12 == nullptr)     { printf("FAIL 12: X-Empty should not be nullptr\n"); ok = false; }
-    if (val12 != nullptr && strlen(val12) != 0) { printf("FAIL 12: X-Empty should be empty\n"); ok = false; }
+    if (!req12->hasHeader("X-Empty"))             { printf("FAIL 12: X-Empty should be present\n"); ok = false; }
+    if (!req12->getHeader("X-Empty").isEmpty())   { printf("FAIL 12: X-Empty should be empty\n");   ok = false; }
 
     delete req12;
 
@@ -189,158 +156,138 @@ extern int main()
 
     HttpResponse* r13 = new HttpResponse;
     r13->setStatus(204, "No Content");
-    int rlen13 = 0;
-    i8* rbuf13 = r13->build(&rlen13);
+    string out13 = r13->build();
 
-    if (!_starts_with(rbuf13, "HTTP/1.1 204 No Content\r\n"))
+    if (!out13.startsWith("HTTP/1.1 204 No Content\r\n"))
         { printf("FAIL 13: 204 status line\n"); ok = false; }
-    if (_contains(rbuf13, rlen13, "Content-Length"))
+    if (out13.contains("Content-Length"))
         { printf("FAIL 13: Content-Length should be absent\n"); ok = false; }
+    if (!out13.contains("Connection: close\r\n"))
+        { printf("FAIL 13: Connection: close missing\n"); ok = false; }
 
-    delete rbuf13;
     delete r13;
 
     // ── 14. setBody() called twice -> second replaces first ────────────────────
 
-    HttpResponse* r14 = HttpResponse.ok(nullptr);
-    r14->setTextBody("first");
-    r14->setTextBody("second");
-    int rlen14 = 0;
-    i8* rbuf14 = r14->build(&rlen14);
+    HttpResponse* r14 = HttpResponse.ok();
+    r14->setBody("first");
+    r14->setBody("second");
+    string out14 = r14->build();
 
-    if (!_contains(rbuf14, rlen14, "second"))
+    if (!out14.contains("second"))
         { printf("FAIL 14: second body missing\n"); ok = false; }
-    if (_contains(rbuf14, rlen14, "Content-Length: 5"))
+    if (out14.contains("first"))
+        { printf("FAIL 14: first body should be gone\n"); ok = false; }
+    if (out14.contains("Content-Length: 5"))
         { printf("FAIL 14: old Content-Length still present\n"); ok = false; }
+    if (!out14.contains("Content-Length: 6"))
+        { printf("FAIL 14: new Content-Length missing\n"); ok = false; }
 
-    delete rbuf14;
     delete r14;
 
     // ── 15. Multiple addHeader calls - all appear in output ───────────────────
 
-    HttpResponse* r15 = HttpResponse.ok(nullptr);
+    HttpResponse* r15 = HttpResponse.ok();
     r15->addHeader("X-A", "alpha");
     r15->addHeader("X-B", "beta");
-    int rlen15 = 0;
-    i8* rbuf15 = r15->build(&rlen15);
+    string out15 = r15->build();
 
-    if (!_contains(rbuf15, rlen15, "X-A: alpha\r\n"))
-        { printf("FAIL 15: X-A header missing\n"); ok = false; }
-    if (!_contains(rbuf15, rlen15, "X-B: beta\r\n"))
-        { printf("FAIL 15: X-B header missing\n"); ok = false; }
+    if (!out15.contains("X-A: alpha\r\n")) { printf("FAIL 15: X-A header missing\n"); ok = false; }
+    if (!out15.contains("X-B: beta\r\n"))  { printf("FAIL 15: X-B header missing\n"); ok = false; }
 
-    delete rbuf15;
     delete r15;
 
     // ── 16. Blank line separator before body ──────────────────────────────────
 
     HttpResponse* r16 = HttpResponse.ok("hi");
-    int rlen16 = 0;
-    i8* rbuf16 = r16->build(&rlen16);
+    string out16 = r16->build();
 
-    if (!_contains(rbuf16, rlen16, "\r\n\r\n"))
+    if (!out16.contains("\r\n\r\n"))
         { printf("FAIL 16: blank line separator missing\n"); ok = false; }
 
-    delete rbuf16;
     delete r16;
 
     // ── 17. setStatus() custom 201 Created ───────────────────────────────────
 
     HttpResponse* r17 = new HttpResponse;
     r17->setStatus(201, "Created");
-    r17->setTextBody("new");
-    int rlen17 = 0;
-    i8* rbuf17 = r17->build(&rlen17);
+    r17->setBody("new");
+    string out17 = r17->build();
 
-    if (!_starts_with(rbuf17, "HTTP/1.1 201 Created\r\n"))
+    if (!out17.startsWith("HTTP/1.1 201 Created\r\n"))
         { printf("FAIL 17: 201 Created status\n"); ok = false; }
 
-    delete rbuf17;
     delete r17;
 
     // ── 18. Content-Length matches body size ─────────────────────────────────
 
     HttpResponse* r18 = HttpResponse.ok("hello");
-    int rlen18 = 0;
-    i8* rbuf18 = r18->build(&rlen18);
+    string out18 = r18->build();
 
-    if (!_contains(rbuf18, rlen18, "Content-Length: 5\r\n"))
+    if (!out18.contains("Content-Length: 5\r\n"))
         { printf("FAIL 18: Content-Length should be 5\n"); ok = false; }
 
-    delete rbuf18;
     delete r18;
 
-    // ── 19. outLen matches strlen of output ───────────────────────────────────
+    // ── 19. build() length matches strlen of output ───────────────────────────
 
     HttpResponse* r19 = HttpResponse.ok("abc");
-    int rlen19 = 0;
-    i8* rbuf19 = r19->build(&rlen19);
+    string out19 = r19->build();
 
-    if (rlen19 != strlen(rbuf19))
-        { printf("FAIL 19: outLen mismatch\n"); ok = false; }
+    if (out19.length() != strlen(out19.data()))
+        { printf("FAIL 19: length mismatch\n"); ok = false; }
 
-    delete rbuf19;
     delete r19;
 
-    // ── 20. serverError with nullptr -> default body ───────────────────────────
+    // ── 20. serverError() -> default body ──────────────────────────────────────
 
-    HttpResponse* r20 = HttpResponse.serverError(nullptr);
-    int rlen20 = 0;
-    i8* rbuf20 = r20->build(&rlen20);
+    HttpResponse* r20 = HttpResponse.serverError();
+    string out20 = r20->build();
 
-    if (!_starts_with(rbuf20, "HTTP/1.1 500 Internal Server Error\r\n"))
+    if (!out20.startsWith("HTTP/1.1 500 Internal Server Error\r\n"))
         { printf("FAIL 20: 500 status line\n"); ok = false; }
-    if (!_contains(rbuf20, rlen20, "Internal Server Error"))
+    if (!out20.contains("Internal Server Error"))
         { printf("FAIL 20: default body missing\n"); ok = false; }
 
-    delete rbuf20;
     delete r20;
 
     // ── 21. okJson - Content-Type and body ───────────────────────────────────
 
-    HttpResponse* r21 = HttpResponse.okJson(nullptr);
-    r21->setTextBody("42");
-    int rlen21 = 0;
-    i8* rbuf21 = r21->build(&rlen21);
+    HttpResponse* r21 = HttpResponse.okJson();
+    r21->setBody("42");
+    string out21 = r21->build();
 
-    if (!_contains(rbuf21, rlen21, "Content-Type: application/json\r\n"))
+    if (!out21.contains("Content-Type: application/json\r\n"))
         { printf("FAIL 21: Content-Type\n"); ok = false; }
-    if (!_contains(rbuf21, rlen21, "42"))
+    if (!out21.contains("42"))
         { printf("FAIL 21: body\n"); ok = false; }
 
-    delete rbuf21;
     delete r21;
 
     // ── 22. 404 Not Found ─────────────────────────────────────────────────────
 
     HttpResponse* r22 = HttpResponse.notFound();
-    int rlen22 = 0;
-    i8* rbuf22 = r22->build(&rlen22);
+    string out22 = r22->build();
 
-    if (!_starts_with(rbuf22, "HTTP/1.1 404 Not Found\r\n"))
+    if (!out22.startsWith("HTTP/1.1 404 Not Found\r\n"))
         { printf("FAIL 22: 404 status line\n"); ok = false; }
 
-    delete rbuf22;
     delete r22;
 
     // ── 23. Header with colon in value survives round-trip ───────────────────
-    // Parse a request whose Authorization header value contains a colon;
-    // rebuild a response echoing it back; verify the colon survives.
 
     i8* raw23 = "GET / HTTP/1.1\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\r\n";
     HttpRequest* req23 = parseHttpRequest(raw23, strlen(raw23));
-    i8* auth23 = req23->getHeader("Authorization");
 
-    HttpResponse* r23 = HttpResponse.ok(nullptr);
-    if (auth23 != nullptr) r23->addHeader("X-Echo-Auth", auth23);
-    int rlen23 = 0;
-    i8* rbuf23 = r23->build(&rlen23);
+    HttpResponse* r23 = HttpResponse.ok();
+    if (req23->hasHeader("Authorization"))
+        r23->addHeader("X-Echo-Auth", req23->getHeader("Authorization"));
+    string out23 = r23->build();
 
-    if (!_contains(rbuf23, rlen23, "X-Echo-Auth: Basic dXNlcjpwYXNz\r\n"))
+    if (!out23.contains("X-Echo-Auth: Basic dXNlcjpwYXNz\r\n"))
         { printf("FAIL 23: auth echo\n"); ok = false; }
 
     delete req23;
-    delete rbuf23;
     delete r23;
 
     // ── 24. PATCH method ─────────────────────────────────────────────────────
@@ -348,12 +295,60 @@ extern int main()
     i8* raw24 = "PATCH /doc/7 HTTP/1.1\r\nContent-Length: 3\r\n\r\nfoo";
     HttpRequest* req24 = parseHttpRequest(raw24, strlen(raw24));
 
-    if (!req24->valid)                       { printf("FAIL 24: not valid\n");  ok = false; }
-    if (strcmp(req24->method, "PATCH") != 0) { printf("FAIL 24: method\n");    ok = false; }
-    if (req24->bodyLen != 3)                 { printf("FAIL 24: bodyLen\n");   ok = false; }
-    if (strcmp(req24->body, "foo") != 0)     { printf("FAIL 24: body\n");      ok = false; }
+    if (!req24->valid)              { printf("FAIL 24: not valid\n"); ok = false; }
+    if (req24->method != "PATCH")   { printf("FAIL 24: method\n");    ok = false; }
+    if (req24->body.length() != 3)  { printf("FAIL 24: bodyLen\n");   ok = false; }
+    if (req24->body != "foo")       { printf("FAIL 24: body\n");      ok = false; }
 
     delete req24;
+
+    // ── 25. Large response body (>100KB) through build() ──────────────────────
+    // The old fixed-buffer build() overflowed an i8[65536]; the stringbuilder
+    // version must handle bodies larger than that without truncation.
+
+    {
+        int bigLen = 200000;
+        i8* big = new i8[bigLen + 1];
+        int bi = 0;
+        while (bi < bigLen) { big[bi] = (i8)('A' + (bi % 26)); bi++; }
+        big[bigLen] = 0;
+        string bigBody = default;
+        bigBody._ptr = big;
+        bigBody._len = bigLen;
+
+        HttpResponse* r25 = HttpResponse.ok(bigBody);
+        string out25 = r25->build();
+
+        if (!out25.contains("Content-Length: 200000\r\n"))
+            { printf("FAIL 25: large Content-Length\n"); ok = false; }
+        // Header block + CRLFCRLF + body; the full output must be at least as long
+        // as the body (the old fixed i8[65536] build would have truncated/overflowed).
+        if (out25.length() < bigLen)
+            { printf("FAIL 25: large body truncated\n"); ok = false; }
+        // Verify the body bytes survived verbatim: the response ends with the
+        // original buffer, so its tail must equal the tail of bigBody.
+        if (!out25.endsWith(bigBody.substring(bigLen - 64)))
+            { printf("FAIL 25: large body tail corrupted\n"); ok = false; }
+
+        delete r25;
+        delete big;
+    }
+
+    // ── 26. Body containing an embedded \r\n\r\n (length-based copy) ───────────
+    // A naive scan would treat the inner blank line as the header terminator and
+    // mis-copy the body; the length-based copy must preserve all bytes.
+
+    {
+        i8* raw26 = "POST /p HTTP/1.1\r\nContent-Length: 10\r\n\r\nab\r\n\r\ncdef";
+        HttpRequest* req26 = parseHttpRequest(raw26, strlen(raw26));
+
+        if (!req26->valid)              { printf("FAIL 26: not valid\n");  ok = false; }
+        if (req26->body.length() != 10) { printf("FAIL 26: body length\n"); ok = false; }
+        if (req26->body != "ab\r\n\r\ncdef") { printf("FAIL 26: body content\n"); ok = false; }
+        if (req26->contentLength() != 10) { printf("FAIL 26: content-length\n"); ok = false; }
+
+        delete req26;
+    }
 
     if (ok) printf("PASS: http comprehensive tests\n");
     return ok ? 0 : 1;

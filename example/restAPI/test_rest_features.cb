@@ -18,28 +18,16 @@ HttpResponse* featHelloHandler(HttpRequest* req)
 
 HttpResponse* featUserHandler(HttpRequest* req)
 {
-    i8* id = req->getParam("id");
-    if (id == nullptr) return HttpResponse.badRequest("missing id");
-    return HttpResponse.ok(id);
+    if (!req->hasParam("id")) return HttpResponse.badRequest("missing id");
+    return HttpResponse.ok(req->getParam("id"));
 }
 
 HttpResponse* featOrgRepoHandler(HttpRequest* req)
 {
-    i8* org  = req->getParam("org");
-    i8* repo = req->getParam("repo");
-    if (org == nullptr || repo == nullptr) return HttpResponse.badRequest("missing param");
-    // combine org/repo into response body
-    i8* buf = new i8[256];
-    int pos = 0;
-    int i = 0;
-    while (org[i] != 0)  { buf[pos] = org[i];  pos++; i++; }
-    buf[pos] = '/'; pos++;
-    i = 0;
-    while (repo[i] != 0) { buf[pos] = repo[i]; pos++; i++; }
-    buf[pos] = 0;
-    HttpResponse* r = HttpResponse.ok(buf);
-    delete buf;
-    return r;
+    if (!req->hasParam("org") || !req->hasParam("repo"))
+        return HttpResponse.badRequest("missing param");
+    // String idioms: combine org/repo with operator+ into the response body.
+    return HttpResponse.ok(req->getParam("org") + "/" + req->getParam("repo"));
 }
 
 HttpResponse* featMeHandler(HttpRequest* req)
@@ -49,23 +37,10 @@ HttpResponse* featMeHandler(HttpRequest* req)
 
 HttpResponse* featSearchHandler(HttpRequest* req)
 {
-    i8* q    = req->getQuery("q");
-    i8* page = req->getQuery("page");
-    if (q == nullptr) return HttpResponse.badRequest("missing q");
-    i8* buf = new i8[512];
-    int pos = 0;
-    int i = 0;
-    while (q[i] != 0) { buf[pos] = q[i]; pos++; i++; }
-    if (page != nullptr)
-    {
-        buf[pos] = ':'; pos++;
-        i = 0;
-        while (page[i] != 0) { buf[pos] = page[i]; pos++; i++; }
-    }
-    buf[pos] = 0;
-    HttpResponse* r = HttpResponse.ok(buf);
-    delete buf;
-    return r;
+    if (!req->hasQuery("q")) return HttpResponse.badRequest("missing q");
+    if (req->hasQuery("page"))
+        return HttpResponse.ok(req->getQuery("q") + ":" + req->getQuery("page"));
+    return HttpResponse.ok(req->getQuery("q"));
 }
 
 // Status code handlers
@@ -76,6 +51,9 @@ HttpResponse* featUnauthorizedHandler(HttpRequest* req) { return HttpResponse.un
 HttpResponse* featForbiddenHandler(HttpRequest* req) { return HttpResponse.forbidden("forbidden"); }
 HttpResponse* featMethodHandler(HttpRequest* req) { return HttpResponse.methodNotAllowed(); }
 
+// Large-body echo through the router path.
+HttpResponse* featBigHandler(HttpRequest* req) { return HttpResponse.ok(req->body); }
+
 // JSON handler
 struct FeatureItem {
     int id = 0;
@@ -85,24 +63,6 @@ HttpResponse* featJsonEchoHandler(HttpRequest* req)
 {
     FeatureItem item = HttpJson.parse<FeatureItem>(req);
     return HttpJson.respond<FeatureItem>(item);
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-bool _feat_contains(i8* buf, int blen, const char* needle)
-{
-    int nlen = strlen(needle);
-    if (nlen > blen) return false;
-    int i = 0;
-    while (i <= blen - nlen)
-    {
-        bool match = true;
-        int j = 0;
-        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
-        if (match) return true;
-        i++;
-    }
-    return false;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -139,6 +99,9 @@ extern int main()
     // JSON body
     srv.post("/json/echo",         featJsonEchoHandler);
 
+    // Large body
+    srv.post("/big",               featBigHandler);
+
     list<string> srvArgs;
     srv.run(srvArgs);
     os.windows.Sleep(50);
@@ -155,8 +118,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("param /users/:id status", resp->statusCode, 200);
-            ok &= Test("param /users/:id body",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "42"), true);
+            ok &= Test("param /users/:id body", resp->body.contains("42"), true);
             delete resp;
         }
     }
@@ -167,8 +129,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("param two-param status", resp->statusCode, 200);
-            ok &= Test("param two-param body",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "acme/widget"), true);
+            ok &= Test("param two-param body", resp->body.contains("acme/widget"), true);
             delete resp;
         }
     }
@@ -180,8 +141,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("exact beats param status", resp->statusCode, 200);
-            ok &= Test("exact beats param body",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "me-exact"), true);
+            ok &= Test("exact beats param body", resp->body.contains("me-exact"), true);
             delete resp;
         }
     }
@@ -194,10 +154,8 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("query multi-param status", resp->statusCode, 200);
-            ok &= Test("query multi-param body q",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "hello"), true);
-            ok &= Test("query multi-param body page",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "2"), true);
+            ok &= Test("query multi-param body q",    resp->body.contains("hello"), true);
+            ok &= Test("query multi-param body page", resp->body.contains("2"), true);
             delete resp;
         }
     }
@@ -208,8 +166,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("query url-decode status", resp->statusCode, 200);
-            ok &= Test("query url-decode body",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "hello world"), true);
+            ok &= Test("query url-decode body", resp->body.contains("hello world"), true);
             delete resp;
         }
     }
@@ -220,8 +177,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("query plus-space status", resp->statusCode, 200);
-            ok &= Test("query plus-space body",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "a b"), true);
+            ok &= Test("query plus-space body", resp->body.contains("a b"), true);
             delete resp;
         }
     }
@@ -229,7 +185,7 @@ extern int main()
     // ── Status codes ─────────────────────────────────────────────────────────
 
     {
-        HttpClientResponse* resp = client.post(host, g_feat_port, "/status/created", nullptr, 0);
+        HttpClientResponse* resp = client.post(host, g_feat_port, "/status/created", "");
         ok &= Test("201 created not null", resp != nullptr, true);
         if (resp != nullptr) { ok &= Test("201 created status", resp->statusCode, 201); delete resp; }
     }
@@ -262,24 +218,39 @@ extern int main()
     // ── JSON body (HttpJson) ──────────────────────────────────────────────────
 
     {
-        const char* body = "\{\"id\":99\}";
-        HttpClientResponse* resp = client.post(host, g_feat_port, "/json/echo", body, strlen(body));
+        HttpClientResponse* resp = client.post(host, g_feat_port, "/json/echo", "\{\"id\":99\}");
         ok &= Test("json echo not null", resp != nullptr, true);
         if (resp != nullptr)
         {
             ok &= Test("json echo status", resp->statusCode, 200);
-            i8* ct = resp->getHeader("Content-Type");
             ok &= Test("json echo content-type",
-                       ct != nullptr && strcmp(ct, "application/json") == 0, true);
-            ok &= Test("json echo body has 99",
-                       resp->bodyLen > 0 && _feat_contains(resp->body, resp->bodyLen, "99"), true);
+                       resp->getHeader("Content-Type") == "application/json", true);
+            ok &= Test("json echo body has 99", resp->body.contains("99"), true);
+            delete resp;
+        }
+    }
+
+    // ── Large body POST through the router ─────────────────────────────────────
+
+    {
+        int n = 50000;
+        stringbuilder body;
+        int bi = 0;
+        while (bi < n) { body.appendChar((i8)('0' + (bi % 10))); bi++; }
+        string bodyStr = body.toString();
+
+        HttpClientResponse* resp = client.post(host, g_feat_port, "/big", bodyStr);
+        ok &= Test("big POST not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("big POST status", resp->statusCode, 200);
+            ok &= Test("big POST length", resp->body.length(), n);
+            ok &= Test("big POST roundtrip", resp->body == bodyStr, true);
             delete resp;
         }
     }
 
     // ── Concurrent connections ────────────────────────────────────────────────
-    // Send several sequential requests after the threading refactor to verify
-    // the server correctly handles multiple connections.
 
     {
         bool concOk = true;

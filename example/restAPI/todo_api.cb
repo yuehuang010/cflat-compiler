@@ -1,0 +1,259 @@
+// todo_api.cb - In-memory Todo REST service built on the restAPI library.
+//
+// A small but complete CRUD server demonstrating the modernized stack: the router,
+// string/list idioms, JSON serialization, a mutex-guarded shared store, and a
+// graceful /shutdown that flips the server's stop_source.
+//
+// Endpoints:
+//   GET    /todos              list all todos (optional ?done=true|false filter)
+//   POST   /todos              create a todo from {"title":"...","done":false} -> 201
+//   GET    /todos/:id          fetch one todo            -> 200 / 404
+//   PUT    /todos/:id          update title/done         -> 200 / 404
+//   DELETE /todos/:id          remove a todo             -> 204 / 404
+//   POST   /shutdown           stop the server           -> 200
+//
+// Build & run:
+//   x64/Release/cflat.exe example/restAPI/todo_api.cb -i example/restAPI \
+//       -i example/restAPI/network -o out/todo_api.exe
+//   out\todo_api.exe          # listens on :8080 until POST /shutdown
+//
+// Concurrency: requests are served on pool worker threads, so every access to the
+// shared g_todos / g_nextId state is wrapped in a small g_lock critical section
+// (SRW, non-recursive - lock bodies never call another locked helper).
+
+import "list.cb";
+import "thread.cb";
+import "stop_token.cb";
+import "mutex.cb";
+import "json.cb";
+import "network/rest_server.cb";
+import "network/http_json.cb";
+
+// ── Model ──────────────────────────────────────────────────────────────────────
+
+struct Todo {
+    int    id    = 0;
+    string title = default;   // owned heap copy
+    bool   done  = false;
+
+    // `title` is an owned string; bare string members are not auto-destructed, so
+    // free it here. `move` makes the ownership transfer out of the field explicit.
+    ~Todo()
+    {
+        if (title._ptr != nullptr) { i8* p = move title._ptr; delete p; }
+    }
+};
+
+// ── Shared state ────────────────────────────────────────────────────────────────
+
+list<Todo*> g_todos  = default;   // owns its elements (delete frees each Todo)
+mutex       g_lock   = default;   // guards g_todos + g_nextId
+int         g_nextId = 1;
+stop_source g_stop   = default;   // flipped by POST /shutdown
+
+// ── Helpers ─────────────────────────────────────────────────────────────────────
+
+// Construct an owned Todo. The title is deep-copied so the Todo owns it regardless of
+// the caller's string lifetime. Assigning the owned `.copy()` temporary straight to the
+// field transfers ownership to it (the containing Todo's destructor frees the buffer).
+Todo* _makeTodo(int id, string title, bool done)
+{
+    Todo* t = new Todo;
+    t->id = id;
+    t->title = title.copy();
+    t->done = done;
+    return t;
+}
+
+// Serialize one Todo to JSON via the reflection-based JsonBuilder. Returned as a
+// `move string` so the caller's local is freed at scope exit.
+move string _todoJson(Todo* t)
+{
+    return JsonBuilder.toJson<Todo>(*t);
+}
+
+// Index of the todo with the given id, or -1. Caller MUST hold g_lock.
+int _findIndex(int id)
+{
+    int i = 0;
+    while (i < g_todos.count())
+    {
+        if (g_todos.get(i)->id == id) return i;
+        i++;
+    }
+    return -1;
+}
+
+// Request bodies are parsed with HttpJson.parse<Todo> (reflection-based JSON
+// deserialization). fromJsonRaw now copies parsed string values out of the parser's
+// arena into owned heap buffers, so the returned Todo's `title` is safe to read and
+// owns its storage - no hand-rolled extractor needed.
+
+// ── Handlers ─────────────────────────────────────────────────────────────────────
+
+HttpResponse* listTodos(HttpRequest* req)
+{
+    bool filter = req->hasQuery("done");
+    bool want   = false;
+    if (filter) want = req->getQuery("done") == "true";
+
+    stringbuilder sb;
+    sb.appendChar('[');
+    bool first = true;
+    lock (g_lock)
+    {
+        int i = 0;
+        while (i < g_todos.count())
+        {
+            Todo* t = g_todos.get(i);
+            if (!filter || t->done == want)
+            {
+                if (!first) sb.appendChar(',');
+                first = false;
+                string j = _todoJson(t);
+                sb.append(j);
+            }
+            i++;
+        }
+    }
+    sb.appendChar(']');
+
+    string body = sb.toString();
+    HttpResponse* r = HttpResponse.okJson(body);
+    if (body._ptr != nullptr) { i8* p = move body._ptr; delete p; }
+    return r;
+}
+
+HttpResponse* createTodo(HttpRequest* req)
+{
+    Todo input = HttpJson.parse<Todo>(req);   // owned title (heap copy), done
+
+    // add() takes ownership of the pointer (it is a move parameter), so serialize by
+    // reading the element back from the list rather than touching the moved local.
+    string j = default;
+    lock (g_lock)
+    {
+        Todo* t = _makeTodo(g_nextId, input.title, input.done);
+        g_nextId++;
+        g_todos.add(t);
+        string jj = _todoJson(g_todos.get(g_todos.count() - 1));
+        j = move jj;
+    }
+
+    HttpResponse* r = HttpResponse.okJson(j);
+    r->setStatus(201, "Created");
+    if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+    return r;
+}
+
+HttpResponse* getTodo(HttpRequest* req)
+{
+    int id = req->getParam("id").toInt();
+
+    HttpResponse* r = nullptr;
+    lock (g_lock)
+    {
+        int i = _findIndex(id);
+        if (i >= 0)
+        {
+            string j = _todoJson(g_todos.get(i));
+            r = HttpResponse.okJson(j);
+            if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+        }
+    }
+    if (r == nullptr) r = HttpResponse.notFound();
+    return r;
+}
+
+HttpResponse* updateTodo(HttpRequest* req)
+{
+    int    id       = req->getParam("id").toInt();
+    Todo   input    = HttpJson.parse<Todo>(req);   // owned title (heap copy), done
+    bool   hasTitle = input.title.length() > 0;
+
+    HttpResponse* r = nullptr;
+    lock (g_lock)
+    {
+        int i = _findIndex(id);
+        if (i >= 0)
+        {
+            Todo* t = g_todos.get(i);
+            if (hasTitle)
+            {
+                if (t->title._ptr != nullptr) { i8* p = move t->title._ptr; delete p; }
+                t->title = input.title.copy();   // owned copy transfers to the field
+            }
+            t->done = input.done;
+
+            string j = _todoJson(t);
+            r = HttpResponse.okJson(j);
+            if (j._ptr != nullptr) { i8* p = move j._ptr; delete p; }
+        }
+    }
+    if (r == nullptr) r = HttpResponse.notFound();
+    return r;
+}
+
+HttpResponse* deleteTodo(HttpRequest* req)
+{
+    int id = req->getParam("id").toInt();
+
+    bool found = false;
+    lock (g_lock)
+    {
+        int i = _findIndex(id);
+        if (i >= 0)
+        {
+            g_todos.removeAt(i);   // frees the Todo* -> ~Todo frees its title
+            found = true;
+        }
+    }
+    if (found) return HttpResponse.noContent();
+    return HttpResponse.notFound();
+}
+
+HttpResponse* shutdownHandler(HttpRequest* req)
+{
+    g_stop.request_stop();
+    return HttpResponse.ok("shutting down");
+}
+
+// ── Entry point ──────────────────────────────────────────────────────────────────
+
+extern int main()
+{
+    if (!Socket.initNetwork()) { printf("FAIL: initNetwork\n"); return 1; }
+
+    g_stop.init();
+
+    RestServer srv;
+    srv.port        = 8080;
+    srv.workerCount = 4;
+    srv.stopToken   = g_stop.get_token();
+
+    srv.get("/todos",      listTodos);
+    srv.post("/todos",     createTodo);
+    srv.get("/todos/:id",  getTodo);
+    srv.put("/todos/:id",  updateTodo);
+    srv.del("/todos/:id",  deleteTodo);
+    srv.post("/shutdown",  shutdownHandler);
+
+    list<string> args;
+    srv.run(args);
+    printf("todo_api listening on :8080\n");
+    fflush(nullptr);
+
+    // Blocks until a POST /shutdown handler flips g_stop and the accept loop exits.
+    srv.WaitForExit();
+
+    // Drain the store (removeAt frees each Todo, which frees its title).
+    lock (g_lock)
+    {
+        while (g_todos.count() > 0) g_todos.removeAt(0);
+    }
+
+    g_stop.dispose();
+    Socket.shutdownNetwork();
+    printf("todo_api stopped\n");
+    return 0;
+}

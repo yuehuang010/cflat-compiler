@@ -1,4 +1,4 @@
-// core/network/http_parser.cb - Parse raw HTTP/1.x messages.
+// network/http_parser.cb - Parse raw HTTP/1.x messages.
 //
 // Request usage:
 //   import "network/http_parser.cb";
@@ -6,6 +6,7 @@
 //   if (req->valid) {
 //       // path params (set by router dispatch):  req->getParam("id")
 //       // query params (parsed from URL):        req->getQuery("q")
+//       // headers:                               req->getHeader("Host")
 //   }
 //   delete req;
 //
@@ -13,182 +14,195 @@
 //   HttpClientResponse* resp = parseHttpResponse(buf, len);
 //   if (resp->valid) { printf("%d\n", resp->statusCode); }
 //   delete resp;
+//
+// Modern string idioms: method/path/version/body are owned `string` values (heap
+// copies cut from the input buffer). Headers, query params and path params are
+// stored as parallel `list<string>` name/value pairs (dictionary is unsuitable -
+// its keys are non-owning and it is not iterable). Container members self-clean on
+// destruction; the owned scalar `string` fields are freed by the explicit
+// destructors below (bare `string` members are NOT auto-destructed by the compiler).
 
 import "string.cb";
-
-extern cdecl int atoi(const char* s);
-
-int HTTP_MAX_HEADERS = 64;
-int HTTP_MAX_QUERY   = 16;
-int HTTP_MAX_PARAMS  = 8;
-
-struct HttpHeader {
-    i8* name  = nullptr;
-    i8* value = nullptr;
-
-    // Each HttpHeader owns its own name/value buffers; freeing them belongs here
-    // so the parent containers ('headers' / '_queryParams' / '_routeParams') can
-    // call 'delete[n] arr' and let each slot clean up its own fields.
-    ~HttpHeader()
-    {
-        if (name  != nullptr) { delete name;  name  = nullptr; }
-        if (value != nullptr) { delete value; value = nullptr; }
-    }
-
-    // Free + null in place without releasing the slot's storage; lets reusable
-    // arrays (e.g. router._routeParams) reset previous matches before refilling.
-    void clear()
-    {
-        if (name  != nullptr) { delete name;  name  = nullptr; }
-        if (value != nullptr) { delete value; value = nullptr; }
-    }
-};
+import "list.cb";
 
 // Parsed HTTP request. The caller owns the returned pointer and must delete it.
 class HttpRequest {
-    i8*         method      = nullptr;
-    i8*         path        = nullptr;  // path only, no query string
-    i8*         version     = nullptr;
-    HttpHeader* headers     = nullptr;
-    int         headerCount = 0;
-    i8*         body        = nullptr;
-    int         bodyLen     = 0;
-    bool        valid       = false;
+    string method  = default;   // owned
+    string path    = default;   // owned (path only, no query string)
+    string version = default;   // owned
+    string body    = default;   // owned (length-based copy, binary-safe)
+    bool   valid   = false;
 
-    // Query string parameters parsed from the URL (e.g. /search?q=foo&page=2).
-    // Reuses HttpHeader{name, value} as a key-value pair struct.
-    HttpHeader* _queryParams = nullptr;
-    int         _queryCount  = 0;
+    // Parallel header name/value lists (own their elements; self-clean).
+    list<string> _headerNames  = default;
+    list<string> _headerValues = default;
 
-    // Path parameters populated by the router when a parameterized route matches
-    // (e.g. /users/:id). Not set by parseHttpRequest - set by the router.
-    HttpHeader* _routeParams = nullptr;
-    int         _paramCount  = 0;
+    // Query-string params parsed from the URL (e.g. /search?q=foo&page=2).
+    list<string> _queryNames  = default;
+    list<string> _queryValues = default;
 
-    // Case-sensitive header lookup. Returns nullptr if not found.
-    i8* getHeader(const char* name)
+    // Path params populated by the router when a parameterized route matches
+    // (e.g. /users/:id). Not set by parseHttpRequest - set via setParams().
+    list<string> _paramNames  = default;
+    list<string> _paramValues = default;
+
+    // ── Header lookup ──────────────────────────────────────────────────────────
+
+    // Case-sensitive header lookup. Returns "" (literal-backed, non-null data())
+    // if not found - safe to call .data()/.length() on the miss result.
+    string getHeader(string name)
     {
         int i = 0;
-        while (i < headerCount)
+        while (i < _headerNames.count())
         {
-            if (strcmp(headers[i].name, name) == 0) return headers[i].value;
+            if (_headerNames.get(i) == name) return _headerValues.get(i);
             i++;
         }
-        return nullptr;
+        return "";
     }
 
-    // Query parameter lookup (key from URL query string). Returns nullptr if absent.
-    i8* getQuery(const char* name)
+    bool hasHeader(string name)
     {
-        if (_queryParams == nullptr) return nullptr;
         int i = 0;
-        while (i < _queryCount)
+        while (i < _headerNames.count())
         {
-            if (strcmp(_queryParams[i].name, name) == 0) return _queryParams[i].value;
+            if (_headerNames.get(i) == name) return true;
             i++;
         }
-        return nullptr;
+        return false;
     }
 
-    // Path parameter lookup (set by the router for parameterized routes like /users/:id).
-    // Returns nullptr if not set or name not found.
-    i8* getParam(const char* name)
+    int headerCount() { return _headerNames.count(); }
+
+    // ── Query lookup ───────────────────────────────────────────────────────────
+
+    string getQuery(string name)
     {
-        if (_routeParams == nullptr) return nullptr;
         int i = 0;
-        while (i < _paramCount)
+        while (i < _queryNames.count())
         {
-            if (strcmp(_routeParams[i].name, name) == 0) return _routeParams[i].value;
+            if (_queryNames.get(i) == name) return _queryValues.get(i);
             i++;
         }
-        return nullptr;
+        return "";
     }
 
-    // Returns the value of Content-Length, or 0 if absent.
+    bool hasQuery(string name)
+    {
+        int i = 0;
+        while (i < _queryNames.count())
+        {
+            if (_queryNames.get(i) == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    int queryCount() { return _queryNames.count(); }
+
+    // ── Path param lookup ──────────────────────────────────────────────────────
+
+    string getParam(string name)
+    {
+        int i = 0;
+        while (i < _paramNames.count())
+        {
+            if (_paramNames.get(i) == name) return _paramValues.get(i);
+            i++;
+        }
+        return "";
+    }
+
+    bool hasParam(string name)
+    {
+        int i = 0;
+        while (i < _paramNames.count())
+        {
+            if (_paramNames.get(i) == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    // Replace the path-param lists. Called by the router only on a full match, so
+    // a failed match attempt never leaves stale params behind. Takes ownership of
+    // both lists (the router's locals are moved in).
+    void setParams(move list<string> names, move list<string> values)
+    {
+        _paramNames  = move names;
+        _paramValues = move values;
+    }
+
+    // Value of Content-Length, or 0 if absent / unparseable.
     int contentLength()
     {
-        i8* val = getHeader("Content-Length");
-        if (val == nullptr) return 0;
-        return atoi(val);
+        return getHeader("Content-Length").toInt();
     }
 
     ~HttpRequest()
     {
-        if (method  != nullptr) { delete method;  method  = nullptr; }
-        if (path    != nullptr) { delete path;    path    = nullptr; }
-        if (version != nullptr) { delete version; version = nullptr; }
-        if (body    != nullptr) { delete body;    body    = nullptr; }
-        // Each HttpHeader's own destructor frees its name/value; use delete[n]
-        // so ~HttpHeader runs on every slot, then the array buffer is freed.
-        if (headers      != nullptr) { delete[headerCount] headers;     headers      = nullptr; }
-        if (_queryParams != nullptr) { delete[_queryCount]  _queryParams; _queryParams = nullptr; }
-        if (_routeParams != nullptr) { delete[_paramCount]  _routeParams; _routeParams = nullptr; }
+        // Owned scalar string fields - free their buffers (bare `string` members
+        // are not auto-destructed). All four only ever hold owned parser copies.
+        // `move` makes the ownership transfer out of the field explicit.
+        if (method._ptr  != nullptr) { i8* p = move method._ptr;  delete p; }
+        if (path._ptr    != nullptr) { i8* p = move path._ptr;    delete p; }
+        if (version._ptr != nullptr) { i8* p = move version._ptr; delete p; }
+        if (body._ptr    != nullptr) { i8* p = move body._ptr;    delete p; }
+        // The six list<string> members own their elements and self-clean.
     }
 };
 
-// Parsed HTTP response.  Caller owns the returned pointer and must delete it.
+// Parsed HTTP response. Caller owns the returned pointer and must delete it.
 class HttpClientResponse {
-    i8*         version     = nullptr;
-    int         statusCode  = 0;
-    i8*         statusText  = nullptr;
-    HttpHeader* headers     = nullptr;
-    int         headerCount = 0;
-    i8*         body        = nullptr;
-    int         bodyLen     = 0;
-    bool        valid       = false;
+    string version    = default;   // owned
+    int    statusCode = 0;
+    string statusText = default;   // owned (remainder of status line; may contain spaces)
+    string body       = default;   // owned
+    bool   valid      = false;
 
-    // Case-sensitive header lookup. Returns nullptr if not found.
-    i8* getHeader(const char* name)
+    list<string> _headerNames  = default;
+    list<string> _headerValues = default;
+
+    string getHeader(string name)
     {
         int i = 0;
-        while (i < headerCount)
+        while (i < _headerNames.count())
         {
-            if (strcmp(headers[i].name, name) == 0) return headers[i].value;
+            if (_headerNames.get(i) == name) return _headerValues.get(i);
             i++;
         }
-        return nullptr;
+        return "";
     }
+
+    bool hasHeader(string name)
+    {
+        int i = 0;
+        while (i < _headerNames.count())
+        {
+            if (_headerNames.get(i) == name) return true;
+            i++;
+        }
+        return false;
+    }
+
+    int headerCount() { return _headerNames.count(); }
 
     int contentLength()
     {
-        i8* val = getHeader("Content-Length");
-        if (val == nullptr) return 0;
-        return atoi(val);
+        return getHeader("Content-Length").toInt();
     }
 
     ~HttpClientResponse()
     {
-        if (version    != nullptr) { delete version;    version    = nullptr; }
-        if (statusText != nullptr) { delete statusText; statusText = nullptr; }
-        if (body       != nullptr) { delete body;       body       = nullptr; }
-        // ~HttpHeader frees each slot's name/value; delete[n] then drops the buffer.
-        if (headers    != nullptr) { delete[headerCount] headers; headers = nullptr; }
+        if (version._ptr    != nullptr) { i8* p = move version._ptr;    delete p; }
+        if (statusText._ptr != nullptr) { i8* p = move statusText._ptr; delete p; }
+        if (body._ptr       != nullptr) { i8* p = move body._ptr;       delete p; }
     }
 };
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-// Copy buf[start .. start+len) into a new null-terminated heap string.
-i8* _http_substr(i8* buf, int start, int len)
-{
-    i8* result = new i8[len + 1];
-    int i = 0;
-    while (i < len) { result[i] = buf[start + i]; i++; }
-    result[len] = 0;
-    return result;
-}
-
-// Copy buf[start .. start+len), stripping leading/trailing ASCII whitespace and CR.
-i8* _http_trim(i8* buf, int start, int len)
-{
-    while (len > 0 && (buf[start] == ' ' || buf[start] == '\t'))
-        { start++; len--; }
-    while (len > 0 && (buf[start + len - 1] == ' ' || buf[start + len - 1] == '\t' || buf[start + len - 1] == '\r'))
-        { len--; }
-    return _http_substr(buf, start, len);
-}
-
-// Return the numeric value of a single hex digit (0-9, A-F, a-f).
+// Numeric value of a single hex digit (0-9, A-F, a-f); 0 for non-hex input.
 int _http_hexval(i8 c)
 {
     if (c >= '0' && c <= '9') return (int)(c - '0');
@@ -197,169 +211,149 @@ int _http_hexval(i8 c)
     return 0;
 }
 
-// URL-decode buf[start..start+len) into a new heap string.
-// Decodes %XX percent-encoding and + as space.
-i8* _http_urldecode(i8* buf, int start, int len)
+// URL-decode buf[start..start+len) into a fresh owned string.
+// Decodes %XX percent-encoding and '+' as space.
+move string _http_urldecode(i8* buf, int start, int len)
 {
-    i8* result = new i8[len + 1];
-    int ri = 0;
-    int i = start;
+    stringbuilder sb;
+    int i   = start;
     int end = start + len;
     while (i < end)
     {
-        if (buf[i] == '+')
+        i8 c = buf[i];
+        if (c == '+')
         {
-            result[ri] = ' ';
-            ri++;
+            sb.appendChar(' ');
             i++;
         }
-        else if (buf[i] == '%' && i + 2 < end)
+        else if (c == '%' && i + 2 < end)
         {
-            int val = _http_hexval(buf[i + 1]) * 16 + _http_hexval(buf[i + 2]);
-            result[ri] = (i8)val;
-            ri++;
+            int v = _http_hexval(buf[i + 1]) * 16 + _http_hexval(buf[i + 2]);
+            sb.appendChar((i8)v);
             i += 3;
         }
         else
         {
-            result[ri] = buf[i];
-            ri++;
+            sb.appendChar(c);
             i++;
         }
     }
-    result[ri] = 0;
-    return result;
+    return sb.toString();
 }
 
-// Parse a query string buf[start..start+len) into req->_queryParams.
-// Expects req->_queryParams to already be allocated.
+// Parse query string buf[start..start+len) into req->_queryNames/_queryValues.
 void _http_parseQuery(HttpRequest* req, i8* buf, int start, int len)
 {
-    int i = start;
+    int i   = start;
     int end = start + len;
 
-    while (i < end && req->_queryCount < HTTP_MAX_QUERY)
+    while (i < end)
     {
-        // Find '=' separator for this key
         int keyEnd = i;
         while (keyEnd < end && buf[keyEnd] != '=' && buf[keyEnd] != '&') keyEnd++;
 
         if (keyEnd >= end || buf[keyEnd] != '=')
         {
-            // No '=' - malformed pair, skip to next '&'
+            // No '=' - malformed pair, skip to next '&'.
             while (i < end && buf[i] != '&') i++;
             if (i < end) i++;
             continue;
         }
 
         int valStart = keyEnd + 1;
-        int valEnd = valStart;
+        int valEnd   = valStart;
         while (valEnd < end && buf[valEnd] != '&') valEnd++;
 
-        req->_queryParams[req->_queryCount].name  = _http_urldecode(buf, i,        keyEnd - i);
-        req->_queryParams[req->_queryCount].value = _http_urldecode(buf, valStart, valEnd - valStart);
-        req->_queryCount++;
+        req->_queryNames.add(_http_urldecode(buf, i, keyEnd - i));
+        req->_queryValues.add(_http_urldecode(buf, valStart, valEnd - valStart));
 
         i = valEnd;
         if (i < end) i++;  // skip '&'
     }
 }
 
+// Wrap a raw buffer slice in a borrowed string for length-based scanning.
+// The result must not outlive `buf`; never freed.
+string _http_view(i8* buf, int len)
+{
+    string s = default;
+    s._ptr = buf;
+    s._len = len;
+    return s;
+}
+
 // ── Request parser ────────────────────────────────────────────────────────────
 
-// Parse raw bytes into an HttpRequest.  Returns a request with valid=false on
-// malformed input.  The caller owns the returned pointer and must delete it.
+// Parse raw bytes into an HttpRequest. Returns a request with valid=false on
+// malformed input. The caller owns the returned pointer and must delete it.
 HttpRequest* parseHttpRequest(i8* buf, int len)
 {
     HttpRequest* req = new HttpRequest;
-    req->headers      = new HttpHeader[HTTP_MAX_HEADERS];
-    req->_queryParams = new HttpHeader[HTTP_MAX_QUERY];
-    int qi = 0;
-    while (qi < HTTP_MAX_QUERY)
-    {
-        req->_queryParams[qi].name  = nullptr;
-        req->_queryParams[qi].value = nullptr;
-        qi++;
-    }
+    if (len <= 0) return req;
 
-    // Find the end of the request line (\r\n).
-    int lineEnd = -1;
-    int i = 0;
-    while (i < len - 1)
-    {
-        if (buf[i] == '\r' && buf[i + 1] == '\n') { lineEnd = i; i = len; }
-        else i++;
-    }
+    string raw = _http_view(buf, len);
+
+    int lineEnd = raw.indexOf("\r\n");
     if (lineEnd < 0) return req;
 
     // Method - bytes before the first space.
-    int methodEnd = 0;
-    while (methodEnd < lineEnd && buf[methodEnd] != ' ') methodEnd++;
-    req->method = _http_substr(buf, 0, methodEnd);
+    int sp1 = raw.indexOf(' ');
+    if (sp1 < 0 || sp1 >= lineEnd) return req;
+    req->method = raw.substring(0, sp1);
 
-    // Raw path - between first and second space (may include ?query).
-    int pathStart = methodEnd + 1;
-    int rawPathEnd = pathStart;
-    while (rawPathEnd < lineEnd && buf[rawPathEnd] != ' ') rawPathEnd++;
+    // Raw target - between first and second space (may include ?query).
+    int sp2 = raw.indexOf(" ", sp1 + 1);
+    if (sp2 < 0 || sp2 >= lineEnd) return req;
 
-    // Split path at '?': store only the path part; parse query string separately.
-    int qpos = pathStart;
-    while (qpos < rawPathEnd && buf[qpos] != '?') qpos++;
+    int targetStart = sp1 + 1;
+    int targetEnd   = sp2;            // exclusive
 
-    req->path = _http_substr(buf, pathStart, qpos - pathStart);
+    // Split target at '?': path before, query after.
+    int qpos = targetStart;
+    while (qpos < targetEnd && buf[qpos] != '?') qpos++;
+    int pathEnd = qpos < targetEnd ? qpos : targetEnd;
 
-    if (qpos < rawPathEnd)
-        _http_parseQuery(req, buf, qpos + 1, rawPathEnd - qpos - 1);
+    req->path = raw.substring(targetStart, pathEnd - targetStart);
+
+    if (qpos < targetEnd)
+        _http_parseQuery(req, buf, qpos + 1, targetEnd - qpos - 1);
 
     // Version - remainder of the request line.
-    int verStart = rawPathEnd + 1;
-    req->version = _http_substr(buf, verStart, lineEnd - verStart);
+    req->version = raw.substring(sp2 + 1, lineEnd - (sp2 + 1));
 
     // Headers - one per line until the blank line (\r\n\r\n).
     int pos = lineEnd + 2;
     bool headersEnd = false;
-    while (pos < len - 1 && !headersEnd)
+    while (pos < len && !headersEnd)
     {
-        if (buf[pos] == '\r' && buf[pos + 1] == '\n')
+        if (pos + 1 < len && buf[pos] == '\r' && buf[pos + 1] == '\n')
         {
             pos += 2;
             headersEnd = true;
         }
         else
         {
-            // Find the end of this header line.
-            int hEnd = pos;
-            bool atCRLF = false;
-            while (hEnd < len - 1 && !atCRLF)
-            {
-                if (buf[hEnd] == '\r' && buf[hEnd + 1] == '\n') atCRLF = true;
-                else hEnd++;
-            }
+            // Find the end of this header line (next CRLF).
+            int hEnd = raw.indexOf("\r\n", pos);
+            if (hEnd < 0) hEnd = len;
 
             // Split on the first colon.
             int colon = pos;
             while (colon < hEnd && buf[colon] != ':') colon++;
 
-            if (colon < hEnd && req->headerCount < HTTP_MAX_HEADERS)
+            if (colon < hEnd)
             {
-                req->headers[req->headerCount].name  = _http_trim(buf, pos, colon - pos);
-                req->headers[req->headerCount].value = _http_trim(buf, colon + 1, hEnd - colon - 1);
-                req->headerCount++;
+                req->_headerNames.add(raw.substring(pos, colon - pos).trim());
+                req->_headerValues.add(raw.substring(colon + 1, hEnd - colon - 1).trim());
             }
             pos = hEnd + 2;
         }
     }
 
-    // Body - everything after the blank line.
-    if (pos < len)
-    {
-        int blen = len - pos;
-        req->body = new i8[blen + 1];
-        int j = 0;
-        while (j < blen) { req->body[j] = buf[pos + j]; j++; }
-        req->body[blen] = 0;
-        req->bodyLen = blen;
-    }
+    // Body - everything after the blank line. Length-based copy (binary-safe;
+    // survives an embedded \r\n\r\n in the body).
+    if (headersEnd && pos < len)
+        req->body = raw.substring(pos, len - pos);
 
     req->valid = true;
     return req;
@@ -367,83 +361,64 @@ HttpRequest* parseHttpRequest(i8* buf, int len)
 
 // ── Response parser ───────────────────────────────────────────────────────────
 
-// Parse raw HTTP response bytes.  Returns a response with valid=false on
-// malformed input.  The caller owns the returned pointer and must delete it.
+// Parse raw HTTP response bytes. Returns a response with valid=false on malformed
+// input. The caller owns the returned pointer and must delete it.
 HttpClientResponse* parseHttpResponse(i8* buf, int len)
 {
     HttpClientResponse* resp = new HttpClientResponse;
-    resp->headers = new HttpHeader[HTTP_MAX_HEADERS];
+    if (len <= 0) return resp;
 
-    // Find end of status line (\r\n).
-    int lineEnd = -1;
-    int i = 0;
-    while (i < len - 1)
-    {
-        if (buf[i] == '\r' && buf[i + 1] == '\n') { lineEnd = i; i = len; }
-        else i++;
-    }
+    string raw = _http_view(buf, len);
+
+    int lineEnd = raw.indexOf("\r\n");
     if (lineEnd < 0) return resp;
 
     // Version - up to first space.
-    int verEnd = 0;
-    while (verEnd < lineEnd && buf[verEnd] != ' ') verEnd++;
-    resp->version = _http_substr(buf, 0, verEnd);
+    int sp1 = raw.indexOf(' ');
+    if (sp1 < 0 || sp1 >= lineEnd) return resp;
+    resp->version = raw.substring(0, sp1);
 
     // Status code - between first and second space.
-    int codeStart = verEnd + 1;
-    int codeEnd   = codeStart;
-    while (codeEnd < lineEnd && buf[codeEnd] != ' ') codeEnd++;
-    i8* codeStr = _http_substr(buf, codeStart, codeEnd - codeStart);
-    resp->statusCode = atoi(codeStr);
-    delete codeStr;
+    int sp2 = raw.indexOf(" ", sp1 + 1);
+    if (sp2 < 0 || sp2 >= lineEnd) sp2 = lineEnd;
+    string codeStr = raw.substring(sp1 + 1, sp2 - (sp1 + 1));
+    resp->statusCode = codeStr.toInt();
 
-    // Status text - remainder of status line.
-    int textStart = codeEnd + 1;
-    resp->statusText = _http_substr(buf, textStart, lineEnd - textStart);
+    // Status text - remainder of the status line (may contain spaces). When the
+    // status line has no reason text, statusText stays at its empty default.
+    if (sp2 < lineEnd)
+        resp->statusText = raw.substring(sp2 + 1, lineEnd - (sp2 + 1));
 
     // Headers - same CRLF-delimited scan as parseHttpRequest.
     int pos = lineEnd + 2;
     bool headersEnd = false;
-    while (pos < len - 1 && !headersEnd)
+    while (pos < len && !headersEnd)
     {
-        if (buf[pos] == '\r' && buf[pos + 1] == '\n')
+        if (pos + 1 < len && buf[pos] == '\r' && buf[pos + 1] == '\n')
         {
             pos += 2;
             headersEnd = true;
         }
         else
         {
-            int hEnd = pos;
-            bool atCRLF = false;
-            while (hEnd < len - 1 && !atCRLF)
-            {
-                if (buf[hEnd] == '\r' && buf[hEnd + 1] == '\n') atCRLF = true;
-                else hEnd++;
-            }
+            int hEnd = raw.indexOf("\r\n", pos);
+            if (hEnd < 0) hEnd = len;
 
             int colon = pos;
             while (colon < hEnd && buf[colon] != ':') colon++;
 
-            if (colon < hEnd && resp->headerCount < HTTP_MAX_HEADERS)
+            if (colon < hEnd)
             {
-                resp->headers[resp->headerCount].name  = _http_trim(buf, pos, colon - pos);
-                resp->headers[resp->headerCount].value = _http_trim(buf, colon + 1, hEnd - colon - 1);
-                resp->headerCount++;
+                resp->_headerNames.add(raw.substring(pos, colon - pos).trim());
+                resp->_headerValues.add(raw.substring(colon + 1, hEnd - colon - 1).trim());
             }
             pos = hEnd + 2;
         }
     }
 
     // Body - everything after the blank line.
-    if (pos < len)
-    {
-        int blen = len - pos;
-        resp->body = new i8[blen + 1];
-        int j = 0;
-        while (j < blen) { resp->body[j] = buf[pos + j]; j++; }
-        resp->body[blen] = 0;
-        resp->bodyLen = blen;
-    }
+    if (headersEnd && pos < len)
+        resp->body = raw.substring(pos, len - pos);
 
     resp->valid = true;
     return resp;

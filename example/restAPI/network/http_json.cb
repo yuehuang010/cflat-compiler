@@ -16,20 +16,19 @@ import "http_response.cb";
 
 // Non-generic helper so generic methods avoid a string local variable.
 // (string locals in generic static methods can cause LLVM dominance errors.)
-HttpResponse* _httpJsonBuildOkResponse(const char* jsonCStr)
+HttpResponse* _httpJsonBuildOkResponse(string json)
 {
-    return HttpResponse.okJson(jsonCStr);
+    return HttpResponse.okJson(json);
 }
 
 class HttpJson {
     // Deserialize the request body as JSON into struct T.
-    // Returns a default-initialized T if body is null or empty.
-    // req->body (i8*) is implicitly converted to string at the call site.
+    // Returns a default-initialized T if the body is empty.
     static T parse<T>(HttpRequest* req)
     {
         T result;
-        if (req->body != nullptr && req->bodyLen > 0)
-            result = JsonBuilder.fromJsonRaw<T>(req->body, req->bodyLen);
+        if (req->body.length() > 0)
+            result = JsonBuilder.fromJsonRaw<T>(req->body.data(), req->body.length());
         return result;
     }
 
@@ -37,6 +36,6 @@ class HttpJson {
     static HttpResponse* respond<T>(T val)
     {
         string json = JsonBuilder.toJson<T>(val);
-        return _httpJsonBuildOkResponse(json.data());
+        return _httpJsonBuildOkResponse(json);
     }
 };

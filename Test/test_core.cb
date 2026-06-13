@@ -31,6 +31,100 @@ struct FixedBuf
     int length = 0;
 };
 
+// ── member-field destructor recursion ────────────────────────────────────────
+// A containing object must run destructors on its destructor-bearing member fields
+// in every destruction path (scope exit, delete, delete[n], nested members).
+
+int g_order_marker = -1;
+
+// No user destructor, but a destructor-bearing value member -> needs a synthesized
+// destruction path so the member still gets destructed.
+struct MemberHolder
+{
+    Tracked t = default;
+};
+
+// Member-of-member: neither outer level has a user dtor; the leaf Tracked must still fire.
+struct NestedHolder
+{
+    MemberHolder inner = default;
+};
+
+// Hand-written dtor must run FIRST, then the member is destructed (no double-free).
+struct DtorHolder
+{
+    Tracked t = default;
+    ~DtorHolder()
+    {
+        g_order_marker = g_dtor_count;  // 0 here proves the member has not been destructed yet
+        g_dtor_count += 100;
+    }
+};
+
+// A value-type container member (array<Tracked>) must have its elements destructed
+// when the holder is destroyed.
+struct ArrHolder
+{
+    array<Tracked> at = default;
+};
+
+int testMemberDtor()
+{
+    int passed = 0;
+
+    // 1. Stack object at scope exit, outer has no user dtor.
+    g_dtor_count = 0;
+    {
+        MemberHolder h;
+    }
+    passed += Test("member dtor on scope exit", g_dtor_count, 1);
+
+    // 2. delete of a heap object, outer has no user dtor.
+    g_dtor_count = 0;
+    MemberHolder* mp = new MemberHolder;
+    delete mp;
+    passed += Test("member dtor on delete", g_dtor_count, 1);
+
+    // 3. Nested struct member (member of member).
+    g_dtor_count = 0;
+    {
+        NestedHolder n;
+    }
+    passed += Test("nested member-of-member dtor", g_dtor_count, 1);
+
+    // 4. User dtor runs first, then member destruction - no double-free, both fire once.
+    g_dtor_count = 0;
+    g_order_marker = -1;
+    {
+        DtorHolder d;
+    }
+    passed += Test("user dtor runs before member dtor", g_order_marker, 0);
+    passed += Test("user dtor + member dtor each fire once", g_dtor_count, 101);
+
+    // 5. delete[n] - each element's members are destructed too.
+    g_dtor_count = 0;
+    MemberHolder* arr = new MemberHolder[3];
+    delete[3] arr;
+    passed += Test("delete[n] destructs each element's members", g_dtor_count, 3);
+
+    // 6. Value container member at scope exit.
+    g_dtor_count = 0;
+    {
+        ArrHolder h;
+        h.at.init(3);
+    }
+    passed += Test("array<Tracked> member dtor on scope exit", g_dtor_count, 3);
+
+    // 7. Value container member on delete.
+    g_dtor_count = 0;
+    ArrHolder* hp = new ArrHolder;
+    hp->at.init(4);
+    delete hp;
+    passed += Test("array<Tracked> member dtor on delete", g_dtor_count, 4);
+
+    return passed;
+}
+
 int testArray()
 {
     int passed = 0;
@@ -1133,6 +1227,33 @@ move string pickName(u32 i)
     else         { string b = "other"; return b.copy(); }
 }
 
+// Return-by-value of a struct whose destructor frees owned string fields. The local
+// `o`'s destructor must be SKIPPED on the return (ownership moves to the caller) or the
+// returned value dangles and the caller's destruction double-frees. g_owned_ret_dtor
+// proves the struct is destructed exactly once (the returned `r`, not the local `o`).
+// Regression for the return-by-value-of-dtor-bearing-struct fix + the string-field
+// assignment ownership-transfer fix (internal/plan/string-ownership-fixes.md).
+int g_owned_ret_dtor = 0;
+struct OwnedRet {
+    string a = default;
+    string b = default;
+    ~OwnedRet() {
+        g_owned_ret_dtor++;
+        if (a._ptr != nullptr) { i8* p = move a._ptr; delete p; }
+        if (b._ptr != nullptr) { i8* p = move b._ptr; delete p; }
+    }
+};
+
+OwnedRet makeOwnedRet()
+{
+    OwnedRet o;
+    string s1 = "first-field";
+    string s2 = "second-field";
+    o.a = s1.copy();      // owned temp -> string field: ownership transfers to the field
+    o.b = s2.copy();
+    return o;             // by-value move-out: `o`'s dtor must not run here
+}
+
 int testStringAPI()
 {
     int passed = 0;
@@ -1503,6 +1624,17 @@ int testStringAPI()
         passed += Test("method on parenthesized value", (pv).copy(), "wrapped");
     }
 
+    // Return-by-value of a struct whose dtor frees owned string fields.
+    {
+        g_owned_ret_dtor = 0;
+        {
+            OwnedRet r = makeOwnedRet();
+            passed += Test("ret-struct owned field a", r.a, "first-field");
+            passed += Test("ret-struct owned field b", r.b, "second-field");
+        } // r destructs here - exactly one destruction, no double-free
+        passed += Test("ret-struct single destruction", g_owned_ret_dtor, 1);
+    }
+
     return passed;
 }
 
@@ -1516,6 +1648,7 @@ extern int main()
     int r;
 
     r = testArray();            passed += r; total += 14;
+    r = testMemberDtor();       passed += r; total += 8;
     r = testList();             passed += r; total += 15;
     r = testListCopy();         passed += r; total += 16;
     r = testHashset();          passed += r; total += 19;
@@ -1541,7 +1674,7 @@ extern int main()
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
-    r = testStringAPI();        passed += r; total += 106;
+    r = testStringAPI();        passed += r; total += 109;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

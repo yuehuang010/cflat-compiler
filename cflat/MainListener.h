@@ -3297,7 +3297,16 @@ public:
                         // the ret terminates the block.
                         compiler->UnregisterOwnedStringTemp(right);
                         compiler->FlushOwnedStringTemps();
-                        compiler->CreateReturnCall(right);
+                        // Pass the returned local's storage so a by-value struct return whose
+                        // full-destructor frees members (e.g. owned string fields) moves
+                        // ownership to the caller instead of being destructed here. The struct
+                        // return value is materialized field-wise (and a struct read leaves
+                        // Storage null, keeping the value in Primary), so resolve the alloca by
+                        // name - CreateReturnCall's LoadInst-based detection cannot see it.
+                        llvm::Value* retStorage = returnNV.Storage;
+                        if (retStorage == nullptr && !returnNV.CallerName.empty())
+                            retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
+                        compiler->CreateReturnCall(right, retStorage);
                     }
                     else
                     {
@@ -5625,9 +5634,16 @@ public:
             // an adjacent scope (e.g. `string b = "literal";` in the else branch after
             // `name = a.copy();` in the if branch) would falsely inherit ownership and
             // its scope-exit destructor would free a string literal -> heap corruption.
+            // Only a plain string LOCAL is tracked for scope-exit destruction. For a string
+            // FIELD assignment (`obj.field = expr.copy()`), CallerName names the base struct,
+            // not the field - marking it IsOwningString would mis-tag the whole struct (and,
+            // for a returned value struct, block the by-value move-out in CreateReturnCall).
+            // The field's buffer is owned via the containing struct's destructor instead, so
+            // skip the mark for field accesses (FieldName non-empty) - just consume the flag.
             if (operatorText == "=" && compiler->lastCallReturnsOwned)
             {
-                if (NamedVarIsString(namedVar) && !namedVar.CallerName.empty())
+                if (NamedVarIsString(namedVar) && !namedVar.CallerName.empty()
+                    && namedVar.FieldName.empty())
                     compiler->MarkVariableOwningString(namedVar.CallerName);
                 compiler->lastCallReturnsOwned = false;
             }
@@ -8729,12 +8745,11 @@ public:
             return {};
         }
 
-        // 1. Call destructor if it exists (non-array only)
+        // 1. Call the full destructor (user dtor + member fields) if needed (non-array only)
         if (!isArray && !typeName.empty())
         {
-            auto structData = compiler->GetDataStructure(typeName);
-            if (structData.Destructor)
-                compiler->builder->CreateCall(structData.Destructor, { ptrVal });
+            if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+                compiler->builder->CreateCall(dtor, { ptrVal });
         }
 
         // 1b. For delete[n]: call ~T() on each element using the caller-supplied count.
@@ -8742,8 +8757,8 @@ public:
         llvm::Value* freeBase = ptrVal;
         if (hasSizeExpr && !isRawFree && compiler->IsDataStructure(typeName) && !elemIsPtr)
         {
-            auto structData = compiler->GetDataStructure(typeName);
-            if (structData.Destructor)
+            llvm::Function* elemDtor = compiler->GetOrCreateFullDestructor(typeName);
+            if (elemDtor)
             {
                 auto* i64Ty = compiler->builder->getInt64Ty();
                 llvm::Value* arrCount = ParseExpression(ctx->deleteArraySize()->expression());
@@ -8771,7 +8786,7 @@ public:
                 compiler->builder->SetInsertPoint(bodyBB);
                 auto* idx2    = compiler->builder->CreateLoad(i64Ty, indexAlloca);
                 auto* elemPtr = compiler->builder->CreateGEP(elemType, ptrVal, idx2, "del_elem");
-                compiler->builder->CreateCall(structData.Destructor, { elemPtr });
+                compiler->builder->CreateCall(elemDtor, { elemPtr });
                 compiler->builder->CreateStore(
                     compiler->builder->CreateSub(idx2, compiler->builder->getInt64(1)), indexAlloca);
                 compiler->builder->CreateBr(condBB);
@@ -9453,10 +9468,9 @@ public:
 
                             if (!typeName.empty() && thisPtr)
                             {
-                                auto structData = compiler->GetDataStructure(typeName);
                                 // No destructor = no-op (primitive or struct with no cleanup needed).
-                                if (structData.Destructor)
-                                    compiler->builder->CreateCall(structData.Destructor, { thisPtr });
+                                if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+                                    compiler->builder->CreateCall(dtor, { thisPtr });
                             }
                             else
                             {
@@ -10873,7 +10887,22 @@ public:
                                     else if (typeName == "string" && !field.Pointer)
                                     {
                                         auto* strVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getString", {nameNV});
-                                        compiler->builder->CreateStore(strVal, gep);
+                                        // getString() returns a string that ALIASES the parser's Arena,
+                                        // which is freed when the deserialize call returns. Copy it into
+                                        // an owned heap buffer so the field outlives the arena - otherwise
+                                        // the field dangles (and a string-freeing dtor on T double-frees
+                                        // an arena pointer). See core/json.cb fromJson/fromJsonRaw.
+                                        LLVMBackend::TypeAndValue strTV;
+                                        strTV.TypeName = "string";
+                                        auto* strLLTy = compiler->GetType(strTV);
+                                        auto* srcStr = compiler->builder->CreateAlloca(strLLTy, nullptr, "rset_str_src");
+                                        compiler->builder->CreateStore(strVal, srcStr);
+                                        LLVMBackend::NamedVariable srcStrNV;
+                                        srcStrNV.Storage = srcStr;
+                                        srcStrNV.BaseType = strLLTy;
+                                        srcStrNV.TypeAndValue.TypeName = "string";
+                                        auto* owned = compiler->CreateOverloadedFunctionCall("copy", {srcStrNV});
+                                        compiler->builder->CreateStore(owned, gep);
                                     }
                                     // ── list<T> (value type) ──────────────────────────────────
                                     else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
@@ -10945,8 +10974,21 @@ public:
                                             strTV.TypeName = "string";
                                             auto* strAlloca = compiler->builder->CreateAlloca(compiler->GetType(strTV), nullptr, "rset_arr_str");
                                             compiler->builder->CreateStore(v, strAlloca);
+                                            // add() is a move - it would take ownership of the arena-aliasing
+                                            // pointer, leaving the list pointing into the freed arena (dangle +
+                                            // double-free on the list dtor). Copy out of the arena first so the
+                                            // list owns its own heap buffer. See core/json.cb.
+                                            auto* strLLTy = compiler->GetType(strTV);
+                                            LLVMBackend::NamedVariable srcStrNV;
+                                            srcStrNV.Storage = strAlloca;
+                                            srcStrNV.BaseType = strLLTy;
+                                            srcStrNV.TypeAndValue.TypeName = "string";
+                                            auto* owned = compiler->CreateOverloadedFunctionCall("copy", {srcStrNV});
+                                            auto* ownedAlloca = compiler->builder->CreateAlloca(strLLTy, nullptr, "rset_arr_str_owned");
+                                            compiler->builder->CreateStore(owned, ownedAlloca);
                                             LLVMBackend::NamedVariable elemNV;
-                                            elemNV.Storage = strAlloca;
+                                            elemNV.Storage = ownedAlloca;
+                                            elemNV.BaseType = strLLTy;
                                             elemNV.TypeAndValue.TypeName = "string";
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
                                         }

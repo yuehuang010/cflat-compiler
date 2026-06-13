@@ -1,0 +1,145 @@
+// network/http_io.cb - shared connection I/O for the HTTP/REST servers.
+//
+// Centralizes the two protocol-robustness primitives both server flavors need:
+//   _http_readRequest - read a complete request (headers + Content-Length body)
+//                       with a doubling buffer and a hard size cap.
+//   _http_sendResponse - build a response and send every byte (partial-send safe).
+//
+// No keep-alive, no chunked transfer-encoding: one request, one response, then the
+// connection is closed (the server always emits Connection: close).
+
+import "string.cb";
+import "network/socket.cb";
+import "http_response.cb";
+
+// Result codes for _http_readRequest.
+int HTTP_READ_OK        = 0;   // a complete request is in *outBuf / *outLen
+int HTTP_READ_CLOSED    = 1;   // peer closed before sending anything
+int HTTP_READ_TOO_LARGE = 2;   // request exceeded maxBytes -> caller should 413
+
+// Parse the Content-Length value out of the header block buf[0..headerLen).
+// Case-insensitive on the field name. Returns 0 if absent or unparseable.
+int _http_parseContentLength(i8* buf, int headerLen)
+{
+    string head = default;
+    head._ptr = buf;
+    head._len = headerLen;
+
+    int idx = head.indexOf("Content-Length:");
+    if (idx < 0) idx = head.indexOf("content-length:");
+    if (idx < 0) return 0;
+
+    int valStart = idx + 15;   // length of "Content-Length:"
+    int lineEnd  = head.indexOf("\r\n", valStart);
+    if (lineEnd < 0) lineEnd = headerLen;
+
+    string val     = head.substring(valStart, lineEnd - valStart);
+    string trimmed = val.trim();
+    return trimmed.toInt();
+}
+
+// Read a complete HTTP request from a connected socket.
+//
+// The socket is forced into BLOCKING mode first: an accepted socket inherits the
+// listener's non-blocking flag on Windows, and a Content-Length read loop on a
+// non-blocking socket cannot distinguish would-block from a real error or wait for
+// the second packet of a split request. Blocking recv gives deterministic framing.
+//
+// Strategy: a doubling buffer (start 8KB, capped at maxBytes). Read until the
+// "\r\n\r\n" header terminator is seen, parse Content-Length, then keep reading
+// until headerEnd + contentLength bytes are present or the peer closes. Exceeding
+// maxBytes returns HTTP_READ_TOO_LARGE.
+//
+// On HTTP_READ_OK the caller owns *outBuf and must delete it. On any other result
+// *outBuf is left untouched (nothing to free).
+int _http_readRequest(Socket* conn, int maxBytes, i8** outBuf, int* outLen)
+{
+    conn->setNonBlocking(false);
+
+    int cap = 8192;
+    if (cap > maxBytes) cap = maxBytes;
+    i8* buf = new i8[cap + 1];
+
+    int  total         = 0;
+    bool haveHeaders   = false;
+    int  headerEnd     = 0;   // index just past "\r\n\r\n"
+    int  contentLength = 0;
+    bool done          = false;
+
+    while (!done)
+    {
+        if (total >= cap)
+        {
+            if (cap >= maxBytes)
+            {
+                // Buffer full at the hard cap and the message is still incomplete.
+                delete buf;
+                return HTTP_READ_TOO_LARGE;
+            }
+            int newCap = cap * 2;
+            if (newCap > maxBytes) newCap = maxBytes;
+            i8* grown = new i8[newCap + 1];
+            int k = 0;
+            while (k < total) { grown[k] = buf[k]; k++; }
+            delete buf;
+            buf = grown;
+            cap = newCap;
+        }
+
+        int n = conn->recv(&buf[total], cap - total);
+        if (n <= 0)
+        {
+            // Peer closed (0) or error (-1): treat whatever is buffered as the message.
+            done = true;
+        }
+        else
+        {
+            total += n;
+            buf[total] = 0;
+
+            if (!haveHeaders)
+            {
+                string view = default;
+                view._ptr = buf;
+                view._len = total;
+                int he = view.indexOf("\r\n\r\n");
+                if (he >= 0)
+                {
+                    haveHeaders   = true;
+                    headerEnd     = he + 4;
+                    contentLength = _http_parseContentLength(buf, he);
+                }
+            }
+
+            if (haveHeaders && total >= headerEnd + contentLength)
+                done = true;
+        }
+    }
+
+    if (total == 0)
+    {
+        delete buf;
+        return HTTP_READ_CLOSED;
+    }
+
+    buf[total] = 0;
+    *outBuf = buf;
+    *outLen = total;
+    return HTTP_READ_OK;
+}
+
+// Build resp into a buffer and send every byte, looping until the whole response
+// is written (a single send() may transmit only part of a large response).
+void _http_sendResponse(Socket* conn, HttpResponse* resp)
+{
+    string out = resp->build();   // owned; freed at scope exit
+    i8* p     = out.data();
+    int total = out.length();
+    int sent  = 0;
+    while (sent < total)
+    {
+        int n = conn->send(&p[sent], total - sent);
+        if (n <= 0) break;   // peer closed / error - nothing more we can do
+        sent += n;
+    }
+}

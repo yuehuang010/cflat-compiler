@@ -1,4 +1,4 @@
-// core/network/router.cb - HTTP request router.
+// network/router.cb - HTTP request router.
 //
 // Routes are matched first by exact (method, path) equality, then by
 // parameterized patterns like /users/:id. Exact routes always take priority.
@@ -13,157 +13,87 @@
 //   HttpResponse* resp = router.dispatch(req);  // caller owns resp
 //   // In userHandler: req->getParam("id") returns the captured value.
 //   // Returns HttpResponse.notFound() on miss.
+//
+// Concurrency contract: routes are registered before run() and are READ-ONLY during
+// dispatch. dispatch() never mutates the router; the only per-request state it writes
+// is on the request object (path params), so concurrent dispatch of distinct requests
+// is safe with no locking.
+//
+// Storage: PARALLEL lists (_methods/_paths/_handlers/_hasParams), NOT a
+// list<_RouteEntry>. A list of structs holding owned `string` fields is unsafe to
+// read - list.get(i) returns a shallow value copy whose destructor would free the
+// list's owned buffers (double-free). list<string>.get(i) returns a borrowed string
+// (no destructor) and is safe. The string lists own their elements and self-clean,
+// so HttpRouter needs no explicit destructor.
 
 import "http_parser.cb";
 import "http_response.cb";
 
-// One registered route.
-struct _RouteEntry {
-    i8* method   = nullptr;
-    i8* path     = nullptr;
-    function<HttpResponse*(HttpRequest*)> handler = nullptr;
-    bool hasParams = false;  // true if path contains a ':' segment
-
-    // Each route owns its method/path buffers; ~HttpRouter calls 'delete[n] _routes'
-    // which invokes this destructor on every slot.
-    ~_RouteEntry()
-    {
-        if (method != nullptr) { delete method; method = nullptr; }
-        if (path   != nullptr) { delete path;   path   = nullptr; }
-    }
+// Wrapper so handlers can live in a `list`. `list<function<...>>` is not a valid
+// instantiation, but a list of a plain struct holding a function field is. The
+// struct has no destructor, so list.get(i) returns a safe value copy.
+struct _RouteHandler {
+    function<HttpResponse*(HttpRequest*)> fn = nullptr;
 };
 
-int _ROUTER_MAX_ROUTES = 64;
-
-// Copy a null-terminated C string to a new heap allocation.
-i8* _router_strdup(const char* s)
+// Compare a parameterized pattern against req->path segment-by-segment.
+// Captures ':name' segments and, on a FULL match only, writes them into the request
+// (so a failed attempt never leaves stale params behind). Returns true on a full match.
+bool _router_matchParams(string pattern, HttpRequest* req)
 {
-    int len = strlen(s);
-    i8* copy = new i8[len + 1];
+    list<string> pparts = pattern.split('/');
+    list<string> rparts = req->path.split('/');
+
+    if (pparts.count() != rparts.count()) return false;
+
+    list<string> names  = default;
+    list<string> values = default;
+    bool matched = true;
+
     int i = 0;
-    while (i <= len) { copy[i] = s[i]; i++; }
-    return copy;
-}
-
-// Returns true if path contains a ':' character (indicating a param segment).
-bool _router_hasParams(const char* path)
-{
-    int i = 0;
-    while (path[i] != 0) { if (path[i] == ':') return true; i++; }
-    return false;
-}
-
-// Compare pattern against req->path segment-by-segment.
-// Captures ':name' segments into req->_paramNames/_paramValues.
-// Returns true on a full match; false otherwise.
-// Resets _paramCount to 0 on each call so failed matches don't leave stale params.
-bool _router_matchParams(const char* pattern, HttpRequest* req)
-{
-    const char* reqPath = req->path;
-
-    int plen = strlen(pattern);
-    int rlen = strlen(reqPath);
-    int pi = 0;
-    int ri = 0;
-
-    // Skip leading slashes
-    if (pi < plen && pattern[pi] == '/') pi++;
-    if (ri < rlen && reqPath[ri] == '/') ri++;
-
-    // Reset param slots from any previous failed match attempt. HttpHeader.clear()
-    // frees its own name/value in place so the slot can be refilled without freeing
-    // the surrounding _routeParams buffer.
-    if (req->_routeParams != nullptr)
+    while (i < pparts.count() && matched)
     {
-        int qi = 0;
-        while (qi < req->_paramCount)
+        string ps = pparts.get(i);   // borrowed view into pparts
+        string rs = rparts.get(i);   // borrowed view into rparts
+        if (ps.length() > 0 && ps.charAt(0) == ':')
         {
-            req->_routeParams[qi].clear();
-            qi++;
+            // Capture - ':name' -> name, value = the request segment.
+            names.add(ps.substring(1));
+            values.add(rs.copy());
         }
-    }
-    req->_paramCount = 0;
-
-    while (pi <= plen && ri <= rlen)
-    {
-        // find end of current pattern segment
-        int pseg = pi;
-        while (pseg < plen && pattern[pseg] != '/') pseg++;
-
-        // find end of current request segment
-        int rseg = ri;
-        while (rseg < rlen && reqPath[rseg] != '/') rseg++;
-
-        int plen_seg = pseg - pi;
-        int rlen_seg = rseg - ri;
-
-        if (plen_seg == 0 && rlen_seg == 0) return true;  // both exhausted
-        if (plen_seg == 0 || rlen_seg == 0) return false;  // count mismatch
-
-        if (pattern[pi] == ':')
+        else if (ps != rs)
         {
-            // Capture: allocate route param array on first match
-            if (req->_routeParams == nullptr)
-            {
-                req->_routeParams = new HttpHeader[HTTP_MAX_PARAMS];
-                int qi = 0;
-                while (qi < HTTP_MAX_PARAMS)
-                {
-                    req->_routeParams[qi].name  = nullptr;
-                    req->_routeParams[qi].value = nullptr;
-                    qi++;
-                }
-            }
-            if (req->_paramCount < HTTP_MAX_PARAMS)
-            {
-                req->_routeParams[req->_paramCount].name  = _http_substr((i8*)pattern, pi + 1, plen_seg - 1);
-                req->_routeParams[req->_paramCount].value = _http_substr((i8*)reqPath,  ri,     rlen_seg);
-                req->_paramCount++;
-            }
+            matched = false;
         }
-        else
-        {
-            // Literal segment - must match exactly
-            if (plen_seg != rlen_seg) return false;
-            int k = 0;
-            while (k < plen_seg)
-            {
-                if (pattern[pi + k] != reqPath[ri + k]) return false;
-                k++;
-            }
-        }
-
-        pi = pseg;
-        ri = rseg;
-        if (pi < plen && pattern[pi] == '/') pi++;
-        if (ri < rlen && reqPath[ri] == '/') ri++;
+        i++;
     }
 
-    return pi >= plen && ri >= rlen;
+    if (matched)
+    {
+        req->setParams(move names, move values);
+        return true;
+    }
+    return false;   // names / values are freed at scope exit
 }
 
 class HttpRouter {
-    _RouteEntry* _routes = nullptr;
-    int          _count  = 0;
+    list<string>        _methods   = default;   // own their elements; self-clean
+    list<string>        _paths     = default;
+    list<_RouteHandler> _handlers  = default;
+    list<bool>          _hasParams = default;
 
-    void _alloc()
-    {
-        if (_routes == nullptr)
-            _routes = new _RouteEntry[_ROUTER_MAX_ROUTES];
-    }
-
-    // Register an exact or parameterized (method, path) route.
-    // Routes with ':' segments are matched after all exact routes.
-    void add(const char* method, const char* path,
+    // Register an exact or parameterized (method, path) route. Routes with ':'
+    // segments are matched after all exact routes. method/path are deep-copied so
+    // the router owns them regardless of the caller's string lifetime.
+    void add(string method, string path,
              function<HttpResponse*(HttpRequest*)> handler)
     {
-        _alloc();
-        if (_count >= _ROUTER_MAX_ROUTES) return;
-        _routes[_count].method    = _router_strdup(method);
-        _routes[_count].path      = _router_strdup(path);
-        _routes[_count].handler   = handler;
-        _routes[_count].hasParams = _router_hasParams(path);
-        _count++;
+        _methods.add(method.copy());
+        _paths.add(path.copy());
+        _RouteHandler h = default;
+        h.fn = handler;
+        _handlers.add(h);
+        _hasParams.add(path.contains(":"));
     }
 
     // Dispatch req to the first matching route.
@@ -172,36 +102,30 @@ class HttpRouter {
     // Returns HttpResponse.notFound() on miss. Caller owns the result.
     HttpResponse* dispatch(HttpRequest* req)
     {
-        if (_routes == nullptr) return HttpResponse.notFound();
+        int n = _methods.count();
 
         // Pass 1: exact match
         int i = 0;
-        while (i < _count)
+        while (i < n)
         {
-            if (!_routes[i].hasParams &&
-                strcmp(_routes[i].method, req->method) == 0 &&
-                strcmp(_routes[i].path,   req->path)   == 0)
-                return _routes[i].handler(req);
+            if (!_hasParams.get(i) &&
+                _methods.get(i) == req->method &&
+                _paths.get(i)   == req->path)
+                return _handlers.get(i).fn(req);
             i++;
         }
 
         // Pass 2: parameterized match
         i = 0;
-        while (i < _count)
+        while (i < n)
         {
-            if (_routes[i].hasParams &&
-                strcmp(_routes[i].method, req->method) == 0 &&
-                _router_matchParams(_routes[i].path, req))
-                return _routes[i].handler(req);
+            if (_hasParams.get(i) &&
+                _methods.get(i) == req->method &&
+                _router_matchParams(_paths.get(i), req))
+                return _handlers.get(i).fn(req);
             i++;
         }
 
         return HttpResponse.notFound();
-    }
-
-    ~HttpRouter()
-    {
-        // delete[n] invokes ~_RouteEntry on each live slot, then frees the buffer.
-        if (_routes != nullptr) { delete[_count] _routes; _routes = nullptr; }
     }
 };

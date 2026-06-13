@@ -14,7 +14,7 @@ HttpResponse* restHelloHandler(HttpRequest* req)
 
 HttpResponse* restEchoHandler(HttpRequest* req)
 {
-    if (req->body != nullptr && req->bodyLen > 0)
+    if (req->body.length() > 0)
         return HttpResponse.ok(req->body);
     return HttpResponse.ok("(no body)");
 }
@@ -34,20 +34,11 @@ HttpResponse* restJsonHandler(HttpRequest* req)
     return HttpResponse.okJson("\{\"status\":\"ok\"\}");
 }
 
-bool _rst_contains(i8* buf, int blen, const char* needle)
+// Echo back a large body verbatim - exercises the multi-recv read loop and the
+// growable response build through the router path.
+HttpResponse* restBigHandler(HttpRequest* req)
 {
-    int nlen = strlen(needle);
-    if (nlen > blen) return false;
-    int i = 0;
-    while (i <= blen - nlen)
-    {
-        bool match = true;
-        int j = 0;
-        while (j < nlen) { if (buf[i + j] != needle[j]) { match = false; } j++; }
-        if (match) return true;
-        i++;
-    }
-    return false;
+    return HttpResponse.ok(req->body);
 }
 
 extern int main()
@@ -70,6 +61,7 @@ extern int main()
     srv.put("/update",  restUpdateHandler);
     srv.del("/item",    restDeleteHandler);
     srv.get("/json",    restJsonHandler);
+    srv.post("/big",    restBigHandler);
 
     list<string> srvArgs;
     srv.run(srvArgs);
@@ -86,34 +78,31 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("GET /hello status", resp->statusCode, 200);
-            ok &= Test("GET /hello body",   resp->bodyLen > 0 &&
-                       _rst_contains(resp->body, resp->bodyLen, "Hello from REST!"), true);
+            ok &= Test("GET /hello body",   resp->body.contains("Hello from REST!"), true);
             delete resp;
         }
     }
 
     // POST /echo
     {
-        HttpClientResponse* resp = client.post(host, g_rest_port, "/echo", "ping", 4);
+        HttpClientResponse* resp = client.post(host, g_rest_port, "/echo", "ping");
         ok &= Test("POST /echo not null",  resp != nullptr, true);
         if (resp != nullptr)
         {
             ok &= Test("POST /echo status", resp->statusCode, 200);
-            ok &= Test("POST /echo body",   resp->bodyLen > 0 &&
-                       _rst_contains(resp->body, resp->bodyLen, "ping"), true);
+            ok &= Test("POST /echo body",   resp->body.contains("ping"), true);
             delete resp;
         }
     }
 
     // PUT /update
     {
-        HttpClientResponse* resp = client.put(host, g_rest_port, "/update", "x", 1);
+        HttpClientResponse* resp = client.put(host, g_rest_port, "/update", "x");
         ok &= Test("PUT /update not null", resp != nullptr, true);
         if (resp != nullptr)
         {
             ok &= Test("PUT /update status", resp->statusCode, 200);
-            ok &= Test("PUT /update body",   resp->bodyLen > 0 &&
-                       _rst_contains(resp->body, resp->bodyLen, "updated"), true);
+            ok &= Test("PUT /update body",   resp->body.contains("updated"), true);
             delete resp;
         }
     }
@@ -125,8 +114,7 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("DELETE /item status", resp->statusCode, 200);
-            ok &= Test("DELETE /item body",   resp->bodyLen > 0 &&
-                       _rst_contains(resp->body, resp->bodyLen, "deleted"), true);
+            ok &= Test("DELETE /item body",   resp->body.contains("deleted"), true);
             delete resp;
         }
     }
@@ -138,9 +126,8 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("GET /json status", resp->statusCode, 200);
-            i8* ct = resp->getHeader("Content-Type");
-            ok &= Test("GET /json content-type", ct != nullptr &&
-                       strcmp(ct, "application/json") == 0, true);
+            ok &= Test("GET /json content-type",
+                       resp->getHeader("Content-Type") == "application/json", true);
             delete resp;
         }
     }
@@ -152,6 +139,26 @@ extern int main()
         if (resp != nullptr)
         {
             ok &= Test("GET /missing status", resp->statusCode, 404);
+            delete resp;
+        }
+    }
+
+    // POST /big -> large body round-trip through the router (multi-recv assembly +
+    // growable response build).
+    {
+        int n = 40000;
+        stringbuilder body;
+        int bi = 0;
+        while (bi < n) { body.appendChar((i8)('a' + (bi % 26))); bi++; }
+        string bodyStr = body.toString();
+
+        HttpClientResponse* resp = client.post(host, g_rest_port, "/big", bodyStr);
+        ok &= Test("POST /big not null", resp != nullptr, true);
+        if (resp != nullptr)
+        {
+            ok &= Test("POST /big status", resp->statusCode, 200);
+            ok &= Test("POST /big length", resp->body.length(), n);
+            ok &= Test("POST /big roundtrip", resp->body == bodyStr, true);
             delete resp;
         }
     }
