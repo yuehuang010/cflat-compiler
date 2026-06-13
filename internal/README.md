@@ -24,3 +24,4 @@ that cost real debugging time. Read before touching the relevant subsystem.
 | [language-features.md](language-features.md) | Full CFlat feature list (generics, interfaces, arrays, module system, brace-init) + ownership/move + compile-time features; moved from CLAUDE.md |
 | [stdlib-reference.md](stdlib-reference.md) | Full `core/*.cb` standard library table with exports and import requirements; moved from CLAUDE.md |
 | [performance-benchmarks.md](performance-benchmarks.md) | Benchmark files, reference throughput table, stream/channel design notes; moved from CLAUDE.md |
+| [worktree-vcpkg-sharing.md](worktree-vcpkg-sharing.md) | Worktrees share main's 26 GB `vcpkg_installed` via junction (`new-worktree.bat`/`rm-worktree.bat`); the fresh-mtime rebuild trap; junction deletion hazard |

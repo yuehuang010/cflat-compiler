@@ -50,6 +50,18 @@ Full msbuild path (if not on PATH):
 ./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
 ```
 
+### Git worktrees (share the 26 GB vcpkg_installed)
+
+`vcpkg_installed` is ~26 GB / ~50 min to build. Use these repo-root scripts so worktrees share the main checkout's copy via a junction instead of rebuilding:
+
+```bash
+new-worktree.bat C:\source\cflat-feature -b feature/foo   # add worktree + junction, no vcpkg rebuild
+rm-worktree.bat  C:\source\cflat-feature                  # safe remove (unlinks junction first)
+```
+
+- **Never `rm -rf` or Explorer-delete a worktree** - that can follow the junction and wipe the shared 26 GB. Always use `rm-worktree.bat`.
+- See [`internal/worktree-vcpkg-sharing.md`](internal/worktree-vcpkg-sharing.md) for the mechanism, the fresh-mtime rebuild trap, and the optional snapshot fallback.
+
 ## Running
 
 ```bash
