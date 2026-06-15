@@ -98,6 +98,42 @@ extern int main()
         total++; passed += Test("dict nested remove", d.count(), 0);
     }
 
+    // === Bug 4: owned-string temp operand of +, ==/!=/relational, and switch scrutinee ===
+    // A move-returning string operand (e.g. `i.toString()`) is an owned temp that operator+,
+    // the comparison operators, and a switch dispatch only borrow. Each must be freed at the end
+    // of the full expression. Operands are registered in ParseAdditive/Equality/Relational; a
+    // control-flow CONDITION flushes its temps in the condition block (the post-branch merge block
+    // would drop them via the dominance guard and leak); a switch scrutinee's temps are re-homed to
+    // resumeBlock (the dispatch reads the buffer, so they cannot be flushed before it).
+    {
+        int i = 0;
+        int hits = 0;
+        while (i < 8)
+        {
+            if (i.toString() == "3") hits++;            // equality operand temp
+            if (i.toString() != "5") hits++;            // inequality operand temp
+            if (i.toString() < "9") hits++;             // relational operand temp
+            string r = "v" + i.toString();              // additive operand temp (r owns the result)
+            if (r != i.toString()) hits++;              // both a named string and an operand temp
+            i++;
+        }
+        for (int k = 0; k.toString() != "4"; k++) hits++;  // for-condition operand temp
+        int m = 0;
+        do { hits++; m++; } while (m.toString() != "3");   // do-while-condition operand temp
+
+        // switch scrutinees: bare owned-call, concat (operand + result), and named (scope-freed).
+        i = 0;
+        while (i < 6)
+        {
+            switch (i.toString())            { case "2": hits = hits + 10;  break; default: hits++; break; }
+            switch ("v" + i.toString())      { case "v3": hits = hits + 100; break; default: hits++; break; }
+            string s = i.toString();
+            switch (s)                       { case "1": hits = hits + 5;   break; default: hits++; break; }
+            i++;
+        }
+        total++; passed += Test("owned-string temp expression hits", hits > 0, true);
+    }
+
     // === Leak oracle: everything above must have freed on scope exit ===
     u64 leaks = HeapAudit.reportLeaks();
     total++; passed += Test("HeapAudit live allocations", (i64)leaks, (i64)0);

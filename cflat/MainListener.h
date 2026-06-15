@@ -3423,6 +3423,10 @@ public:
 
                 compiler->InitializeBlock(blockCondition, false);
                 auto condition = ParseExpression(expression);
+                // Free owned-string temps produced inside the condition (e.g. `do {...} while
+                // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
+                // in the post-loop block, where the dominance guard would drop them and leak.
+                compiler->FlushOwnedStringTemps();
                 compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // resume
@@ -3445,6 +3449,9 @@ public:
 
                 compiler->InitializeBlock(blockCondition, true, blockCondition, blockResume, blockResume);
                 auto condition = ParseExpression(expression);
+                // Free owned-string temps from the condition in the condition block (see do-while).
+                // Runs each iteration after the guard is evaluated.
+                compiler->FlushOwnedStringTemps();
 
                 // A constant-true guard (`while (true)` / `while (1)`) can only be
                 // left via `break`. Branch unconditionally into the body so the
@@ -3516,6 +3523,8 @@ public:
                     // Condition
                     compiler->InitializeBlock(blockCondition, false);
                     auto condition = ParseAssignmentExpression(compareCtx);
+                    // Free owned-string temps from the condition in the condition block (see do-while).
+                    compiler->FlushOwnedStringTemps();
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                     // Inner statement
@@ -3735,6 +3744,10 @@ public:
 
                 compiler->InitializeBlock(blockCondition, true, nullptr, nullptr, blockFalse);
                 auto condition = ParseExpression(expression);
+                // Free owned-string temps produced inside the condition (e.g. `if (s.toString()
+                // == x)`) here, while still in the condition block. The block-item flush runs in
+                // the post-if merge block, where the dominance guard would drop them and leak.
+                compiler->FlushOwnedStringTemps();
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
                 auto preIfMovedState = compiler->SaveMovedState();
@@ -3784,8 +3797,32 @@ public:
 
                 auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
 
+                // Owned-string temporaries produced while evaluating the scrutinee (the scrutinee
+                // result of `switch (s.toString())`, plus any borrowed operands of a `switch (a + b)`
+                // concat) are temporaries nothing else frees. They cannot be flushed before the
+                // dispatch - the string-switch strcmp chain reads the scrutinee's buffer - and
+                // matched cases branch away before any common post-dispatch point. So collect every
+                // temp registered during scrutinee evaluation, pull them off the pending list (the
+                // merge-block flush would otherwise drop them via the dominance guard and leak), and
+                // re-register them at resumeBlock below, where every case/default path converges.
+                // (A `return` inside a case leaks on that path - the same documented across-branch
+                // temp limitation that applies elsewhere.)
+                size_t pendingBefore = compiler->pendingOwnedStringTemps.size();
                 auto condVal = ParseExpression(expression);
                 switchCtx.condValue = condVal;
+
+                std::vector<llvm::Value*> scrutineeTemps;
+                for (size_t t = pendingBefore; t < compiler->pendingOwnedStringTemps.size(); t++)
+                    scrutineeTemps.push_back(compiler->pendingOwnedStringTemps[t].first);
+                compiler->pendingOwnedStringTemps.resize(pendingBefore);
+                // A bare owned-call scrutinee (`switch (call())`) is not registered by any operator
+                // site, so add condVal explicitly when it is an owned string temp not already collected.
+                auto* condStrTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+                if (compiler->lastCallReturnsOwned && condVal && condStrTy != nullptr
+                    && condVal->getType() == condStrTy
+                    && std::find(scrutineeTemps.begin(), scrutineeTemps.end(), condVal) == scrutineeTemps.end())
+                    scrutineeTemps.push_back(condVal);
+                compiler->lastCallReturnsOwned = false;
 
                 if (switchCtx.isTypeSwitch)
                 {
@@ -3939,6 +3976,12 @@ public:
                 switchStack.pop_back();
 
                 compiler->InitializeBlock(switchCtx.resumeBlock, false);
+                // Free the scrutinee temporaries now that the dispatch is done and all paths have
+                // converged here. Registered against resumeBlock so the block-item flush (which runs
+                // next, still positioned in resumeBlock) emits the destructors; each temp is computed
+                // in the switch-entry block, which dominates resumeBlock.
+                for (auto* t : scrutineeTemps)
+                    compiler->RegisterOwnedStringTemp(t);
                 return;
             }
         }
@@ -6336,8 +6379,18 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
+            // A move-returning string operand (e.g. `i.toString()` in `i.toString() == "3"`)
+            // is an owned temp that operator==/!= only borrows; register each operand for
+            // end-of-expression cleanup. Clear lastCallReturnsOwned before each operand parse
+            // so the flag reflects only that operand's own evaluation - otherwise the prior
+            // operand leaves it set and the next (possibly a named variable) is mis-registered
+            // and double-freed. Mirrors the additive operand-leak fix in ParseAdditiveExpression.
+            Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0]);
+            TrackOwnedStringOperatorResult(Compiler(ctx), lv.value);
+            Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseTypeCheckExpression(nextCtxs[1]);
+            TrackOwnedStringOperatorResult(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -6556,8 +6609,16 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
+            // See ParseEqualityExpression: a move-returning string operand (e.g.
+            // `s < other.toString()`) is an owned temp the relational operator only borrows.
+            // Reset lastCallReturnsOwned before each operand and register each owned temp for
+            // end-of-expression cleanup.
+            Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseShiftExpression(nextCtxs[0]);
+            TrackOwnedStringOperatorResult(Compiler(ctx), lv.value);
+            Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseShiftExpression(nextCtxs[1]);
+            TrackOwnedStringOperatorResult(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -7042,16 +7103,27 @@ public:
         }
         else if (nextCtxs.size() > 1)
         {
+            // A move-returning string operand (e.g. `i.toString()` in `"x" + i.toString()`)
+            // is an owned temp that operator+ only borrows; register it for end-of-expression
+            // cleanup. Clear lastCallReturnsOwned before each operand so the flag reflects ONLY
+            // that operand's own evaluation - otherwise a preceding owned operator+ result leaves
+            // it set and a following plain named-variable operand would be mis-registered and
+            // double-freed. The running `lvalue` (a chained intermediate) is tracked as an operator
+            // result inside TryBinaryOperatorOverload, not here.
+            Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseMultiplicativeExpression(nextCtxs[0]);
             llvm::Value* lvalue = lv.value;
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
+            TrackOwnedStringOperatorResult(Compiler(ctx), lvalue);
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
+                Compiler(ctx)->lastCallReturnsOwned = false;
                 auto rv = ParseMultiplicativeExpression(nextCtxs[i]);
                 llvm::Value* rvalue = rv.value;
                 bool ru = rv.isUnsigned;
+                TrackOwnedStringOperatorResult(Compiler(ctx), rvalue);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
                 if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
