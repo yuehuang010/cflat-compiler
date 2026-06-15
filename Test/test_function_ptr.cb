@@ -1081,6 +1081,45 @@ bool testNonCapturingLambdaToCFuncPtr()
     return result;
 }
 
+// ── function-type aliases (using Cb = function<R(Args)>) ──────────────────────
+// A `using` alias whose RHS is a function type is usable everywhere a function<...>
+// type is: parameter, local variable, struct field, and return type. The alias
+// expands to the closure type, so ownership (capture/copy/free) flows through it.
+using IntUnaryOp = function<int(int)>;          // HANDLE/EVENT-style: function<void(void*)> etc.
+
+struct AliasHandlerBox { IntUnaryOp op = default; };   // alias as a struct field type
+
+int callAlias(IntUnaryOp f, int x) { return f(x); }    // alias as a parameter type
+
+IntUnaryOp makeAliasAdder(int base)                    // alias as a return type
+{
+    IntUnaryOp f = (int x) => x + base;
+    return f;                                          // escape via variable
+}
+
+bool testFunctionTypeAlias()
+{
+    bool result = true;
+    // alias as a local var type + non-capturing lambda
+    IntUnaryOp inc = (int x) => x + 1;
+    result &= Test("alias local non-capturing", inc(41), 42);
+
+    // alias as a parameter type, capturing lambda passed by value
+    int cap = 100;
+    result &= Test("alias param capturing arg", callAlias((int x) => x + cap, 5), 105);
+
+    // alias as a return type (capturing closure escapes the helper frame)
+    IntUnaryOp add1000 = makeAliasAdder(1000);
+    result &= Test("alias return capturing", add1000(1), 1001);
+
+    // alias as a struct field type, assigned a capturing lambda
+    AliasHandlerBox box = default;
+    int bias = 7;
+    box.op = (int x) => x + bias;
+    result &= Test("alias struct field", box.op(3), 10);
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1147,6 +1186,9 @@ extern int main()
     total++; passed += testListSortDescending()        ? 1 : 0;
     total++; passed += testListSortEdgeCases()         ? 1 : 0;
     total++; passed += testListSortNamedComparator()   ? 1 : 0;
+
+    // Function-type aliases (using Cb = function<R(Args)>)
+    total++; passed += testFunctionTypeAlias()          ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

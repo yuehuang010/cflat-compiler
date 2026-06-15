@@ -1943,6 +1943,7 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
+    functionTypeAliases.clear();
     interfaceTable.clear();
     interfaceParents.clear();
     globalNamedVariable.clear();
@@ -1956,6 +1957,7 @@ void LLVMBackend::ResetForReanalysis()
     stringLiteralLenByPtr.clear();
     strConcatRegistered = false;
     stringDtorRegistered = false;
+    pendingOwnedClosureTemps.clear();
     lambdaCounter = 0;
     expectedError.clear();
     expectedErrorScopeDepth = SIZE_MAX;
@@ -2007,6 +2009,11 @@ void LLVMBackend::ResetForReanalysis()
     // string.cb references 'string' as a return type before the struct is parsed,
     // so it must exist before any core file is compiled.
     RegisterBuiltinString();
+    // Same for the closure fat type (Option A): the dataStructures entry was wiped, and
+    // its lazily-registered dtor/copy live in the now-discarded module, so re-register the
+    // type and arm the lazy lifetime registration to re-run for this file.
+    RegisterBuiltinClosure();
+    closureLifetimeRegistered = false;
 }
 
 // ---- Cross-thread sharing diagnostic (--xthread-scan N) pre-pass ----
@@ -2878,6 +2885,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     module->setDataLayout(llvm::DataLayout(dl));
     module->setTargetTriple((platformValue == 32) ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
     RegisterBuiltinString();
+    RegisterBuiltinClosure();   // closure fat type as an owning value type (Option A)
 
     auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
     SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
@@ -2905,6 +2913,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     // when the cache is loaded without re-running EnsureStr*/EnsureString*.
     EnsureStrConcatRegistered();
     EnsureStringDtorRegistered();
+    EnsureClosureLifetimeRegistered();   // closure dtor + env-cloning copy (Option A)
     return true;
 }
 

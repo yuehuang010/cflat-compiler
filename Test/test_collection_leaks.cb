@@ -21,6 +21,27 @@ import "dictionary.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
+// Owning aggregates with managed fields and NO user copy() - exercise the synthesized
+// memberwise copy() and the field-reassignment destruct-old (Bugs 5 and 6 below).
+struct LeakRow { string name = default; };
+struct LeakBox { list<int> nums = default; };
+struct LeakPair { string name = default; list<int> nums = default; };
+// Owning function<> field (lambda Option A): a closure stored in a struct field owns its heap
+// env and is freed by the struct's destructor, like a string/list field.
+struct LeakHandler { function<int(int)> fn = default; };
+
+// Returns a CAPTURING closure - its env must be heap-owned so the value can escape the frame
+// (Bug 8). Built in a local and returned by variable (the escape pattern real code uses).
+function<int(int)> makeLeakAdder(int base)
+{
+    function<int(int)> f = (int x) => x + base;
+    return f;
+}
+
+// Borrow a closure by value and invoke it (exercises the by-value argument copy site - the
+// caller's temporary env is freed at end of the call statement by FlushOwnedClosureTemps).
+int applyLeak(function<int(int)> fn, int v) { return fn(v); }
+
 extern int main()
 {
     HeapAudit.enable();
@@ -132,6 +153,81 @@ extern int main()
             i++;
         }
         total++; passed += Test("owned-string temp expression hits", hits > 0, true);
+    }
+
+    // === Bug 5: reassigning an owning-value struct FIELD destructs the OLD value ===
+    // `obj.field = newValue` previously overwrote the field's owned buffer without freeing
+    // it (the field-store leak / copy-point #3). The destruct-old fix frees the prior value
+    // first; the destructor is owned-bit/state-gated so a default or borrowed prior value is
+    // a safe no-op (no double-free), and a self-assign must not free-then-dangle.
+    {
+        string base = "reassigned";
+        LeakRow r = default;
+        r.name = base.toUpper();          // owned "REASSIGNED"
+        r.name = base.toLower();          // reassign: old owned buffer must be freed
+        r.name = r.name;                  // self-assign: must NOT free-then-use
+        r.name = "borrowed-literal";      // owned -> borrowed: old owned buffer freed
+        total++; passed += Test("field reassign final value", r.name, "borrowed-literal");
+
+        // move into a list<int> field (bypasses the X4 guard via `move`): old field freed
+        LeakBox bx = default;
+        list<int> v1 = default; v1.add(1);
+        bx.nums = move v1;
+        list<int> v2 = default; v2.add(2); v2.add(3);
+        bx.nums = move v2;                // old bx.nums (v1's buffer) must be freed
+        total++; passed += Test("field move-reassign count", bx.nums.count(), 2);
+    }
+
+    // === Bug 6: synthesized memberwise copy() deep-copies managed fields ===
+    // A value type with managed fields and no explicit copy() gets an implicit memberwise
+    // one: each managed field (string, list<int>) is deep-copied so the copy is independent,
+    // and both the original and the copy free exactly once (no alias double-free, no leak).
+    {
+        string base = "src";
+        LeakPair a = default;
+        a.name = base.toUpper();          // "SRC"
+        a.nums.add(10); a.nums.add(20);
+
+        LeakPair b = a.copy();            // synthesized deep copy
+        b.nums.add(30);                   // mutate the copy only
+        total++; passed += Test("memberwise copy independent list (orig)", a.nums.count(), 2);
+        total++; passed += Test("memberwise copy independent list (copy)", b.nums.count(), 3);
+        total++; passed += Test("memberwise copy string value", b.name, "SRC");
+    }
+
+    // === Bug 7: closure (function<...>) ownership - lambda Option A ===
+    // A capturing closure owns a heap env. As an owning value type it must: be freed at scope
+    // exit / struct teardown, clone-on-copy (.copy() and clone-by-default `b = a`), be stored
+    // into a struct field cleanly, and have an unbound by-value-argument temporary freed at the
+    // end of the call statement. Every path here must leave HeapAudit at zero.
+    {
+        // (a) capturing closure stored in a struct field, invoked after the defining frame is gone
+        LeakHandler h = default;
+        h.fn = makeLeakAdder(100);
+        total++; passed += Test("closure field store invoke", h.fn(5), 105);
+
+        // (b) returned capturing closure held in a local (escape via return)
+        function<int(int)> r = makeLeakAdder(1000);
+        total++; passed += Test("closure return->var invoke", r(1), 1001);
+
+        // (c) explicit .copy() -> two independent envs, both valid
+        function<int(int)> a = makeLeakAdder(10);
+        function<int(int)> b = a.copy();
+        total++; passed += Test("closure copy independent (orig)", a(2), 12);
+        total++; passed += Test("closure copy independent (copy)", b(3), 13);
+
+        // (d) clone-by-default: `c = a` deep-copies the env, a stays valid (no use-after-move)
+        function<int(int)> c = a;
+        total++; passed += Test("closure clone-by-default (clone)", c(7), 17);
+        total++; passed += Test("closure clone-by-default (source live)", a(8), 18);
+
+        // (e) lambda literal passed by value (unbound temp freed at statement end)
+        int cap = 50;
+        total++; passed += Test("closure literal by-value arg", applyLeak((int x) => x + cap, 4), 54);
+
+        // (f) named closure passed by value (caller retains ownership; callee borrows)
+        function<int(int)> g = (int x) => x + 1;
+        total++; passed += Test("closure named by-value arg", applyLeak(g, 9), 10);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

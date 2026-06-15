@@ -1,0 +1,71 @@
+// core/function.cb - closure env memory primitives (lambda Option A).
+//
+// A capturing `function<R(Args)>` value stores its captured variables in a heap
+// "env" block laid out as an 8-byte size header followed by the captures. The fat
+// value's env field points at the captures region (base + 8) with the low bit SET
+// as an OWNED tag - heap blocks are at least 8-byte aligned, so bit 0 is free. A
+// borrowed or non-capturing closure has a null/untagged env and is never freed or
+// cloned (a non-capturing lambda, a bare-function wrap, a C-fnptr thunk, or a
+// program onStdout hook).
+//
+// These three primitives hold the only env arithmetic; the compiler kernel (lambda
+// lowering, the closure destructor, and copy()) calls into them. A closure's
+// ownership then rides the value-type machinery exactly like `string`:
+// move-by-default, clone-on-copy, and scope-exit / struct-field teardown.
+//
+// The block is allocated with `new i8[]` / freed with `delete[]` so the allocation
+// routes through operator new/delete - the active allocator AND the HeapAudit leak
+// oracle both see it. Addresses are manipulated as i64 (with `(i8*)`/`(i64*)` casts
+// via named locals) so the raw allocation is not aliased into a second OWNING pointer
+// (which the ownership tracker would treat as a move).
+
+import "memory.cb";
+
+// Allocate `n` raw bytes through operator new and transfer the buffer out. Kept as
+// its own function so the `new i8[]` owning local is released by an identity return;
+// the result is then an ordinary, untracked function value the caller can freely
+// reinterpret without a move.
+i8* __closure_env_alloc(i64 n)
+{
+    i8* base = new i8[n];
+    return base;
+}
+
+// Allocate an owned env block big enough for `size` capture bytes. Returns the
+// TAGGED pointer to the captures region (base + 8, low bit set). The capture byte
+// count is stored in the 8-byte header so clone/free can recover it.
+i8* __closure_env_new(i64 size)
+{
+    i8* base = __closure_env_alloc(size + (i64)8);       // untracked function result
+    i64* hdr = (i64*)base;
+    hdr[0] = size;                                       // size header at base[0..8)
+    return (i8*)(((i64)base + (i64)8) | (i64)1);         // captures = base+8, OWNED-tagged
+}
+
+// Deep-copy an env block. A null or untagged (borrowed) env is returned unchanged -
+// there is nothing to clone and it is not ours to duplicate. An owned env is copied
+// byte-for-byte into a fresh block and re-tagged.
+i8* __closure_env_clone(i8* env)
+{
+    if (env == nullptr) return env;
+    if (((i64)env & (i64)1) == (i64)0) return env;       // borrowed: share, do not clone
+    i64 capAddr = (i64)env & ~(i64)1;                    // strip the tag -> captures address
+    i64* hdr = (i64*)(capAddr - (i64)8);
+    i64 size = hdr[0];                                   // recover capture byte count
+    i8* fresh = __closure_env_new(size);                 // tagged captures ptr (untracked result)
+    i8* dst = (i8*)((i64)fresh & ~(i64)1);
+    i8* src = (i8*)capAddr;
+    i64 i = (i64)0;
+    while (i < size) { dst[i] = src[i]; i = i + (i64)1; }
+    return fresh;
+}
+
+// Free an owned env block. A null or untagged env is left alone (borrowed - the low
+// bit is clear, so it is not a heap block we allocated).
+void __closure_env_free(i8* env)
+{
+    if (env == nullptr) return;
+    if (((i64)env & (i64)1) == (i64)0) return;           // borrowed: not ours to free
+    i8* base = (i8*)(((i64)env & ~(i64)1) - (i64)8);      // captures -> allocation base
+    delete[] base;
+}

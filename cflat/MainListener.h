@@ -547,6 +547,7 @@ private:
                     {
                         auto* fpSpec = typeSpec->functionPointerSpecifier();
                         declType.IsFunctionPointer = true;
+                        declType.TypeName = "__closure_fat_ptr";   // owning value type (Option A)
                         if (fpSpec->typeSpecifier() != nullptr)
                         {
                             declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
@@ -600,6 +601,19 @@ private:
                     LLVMBackend::TypeAndValue returnType{ .TypeName = mangledName };
                     compiler->CreateFunctionDeclaration(mangledName, returnType, {});
                     declType.TypeName = mangledName;
+                }
+                else if (auto fit = compiler->functionTypeAliases.find(typeSpec->getText());
+                         fit != compiler->functionTypeAliases.end())
+                {
+                    // Function-type alias (using Cb = function<R(Args)>): expand into the closure
+                    // signature, mirroring the functionPointerSpecifier branch above.
+                    declType.IsFunctionPointer     = true;
+                    declType.TypeName              = "__closure_fat_ptr";
+                    declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
+                    declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrParams         = fit->second.FuncPtrParams;
+                    declType.Pointer               = declSpec->pointer() != nullptr;
+                    break;
                 }
                 else
                 {
@@ -1156,6 +1170,31 @@ public:
         }
     }
 
+    // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec - the resolved form
+    // a `using Cb = function<R(Args)>;` alias stores and that ParseDeclarationSpecifiers expands.
+    // The closure value rides IsFunctionPointer + the signature; TypeName is the backing fat type.
+    LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec)
+    {
+        LLVMBackend::TypeAndValue tv;
+        tv.IsFunctionPointer = true;
+        tv.TypeName = "__closure_fat_ptr";
+        if (fpSpec->typeSpecifier() != nullptr)
+        {
+            tv.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
+            tv.FuncPtrReturnPointer  = fpSpec->pointer() != nullptr;
+            if (fpSpec->functionPointerParamList() != nullptr)
+                for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+                {
+                    LLVMBackend::TypeAndValue::FuncPtrParam p;
+                    p.TypeName = param->typeSpecifier()->getText();
+                    p.Pointer  = param->pointer() != nullptr;
+                    p.IsMove   = param->Move() != nullptr;
+                    tv.FuncPtrParams.push_back(p);
+                }
+        }
+        return tv;
+    }
+
     void ScanUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -1167,6 +1206,15 @@ public:
             alias = ctx->Identifier()->getText();
 
         auto* typeSpec = ctx->typeSpecifier();
+
+        // Function-type alias (using Cb = function<R(Args)>): store the resolved signature so the
+        // alias name expands to a closure type wherever it is used (pre-registered here so a
+        // forward reference in a function signature resolves during the scan pass).
+        if (auto* fpSpec = typeSpec->functionPointerSpecifier())
+        {
+            compiler->functionTypeAliases[alias] = BuildFuncPtrAliasType(fpSpec);
+            return;
+        }
         std::string target = typeSpec->getText();
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // they are peeled back onto the pointer flags at the resolution site (GetType /
@@ -1799,6 +1847,7 @@ private:
                 {
                     auto* fpSpec = typeSpec->functionPointerSpecifier();
                     declType.IsFunctionPointer = true;
+                    declType.TypeName = "__closure_fat_ptr";   // owning value type (Option A)
                     if (fpSpec->typeSpecifier() != nullptr)
                     {
                         declType.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
@@ -1895,6 +1944,19 @@ private:
                             }
                         }
                     }
+                }
+                else if (auto fit = Compiler(declSpecs)->functionTypeAliases.find(typeSpec->getText());
+                         fit != Compiler(declSpecs)->functionTypeAliases.end())
+                {
+                    // Function-type alias (using Cb = function<R(Args)>): expand into the closure
+                    // signature, mirroring the functionPointerSpecifier branch above.
+                    declType.IsFunctionPointer     = true;
+                    declType.TypeName              = "__closure_fat_ptr";
+                    declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
+                    declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrParams         = fit->second.FuncPtrParams;
+                    declType.Pointer               = declSpec->pointer() != nullptr;
+                    break;
                 }
                 else
                 {
@@ -2419,6 +2481,31 @@ public:
         return InstantiateGenericFunction(funcName, typeArgs);
     }
 
+    // Build the function-pointer TypeAndValue for a `function<R(Args)>` spec (the resolved form a
+    // `using Cb = function<R(Args)>;` alias stores). Duplicated from the ForwardRefScanner copy -
+    // the two passes are separate classes, mirroring the duplicated ParseDeclarationSpecifiers.
+    LLVMBackend::TypeAndValue BuildFuncPtrAliasType(CFlatParser::FunctionPointerSpecifierContext* fpSpec)
+    {
+        LLVMBackend::TypeAndValue tv;
+        tv.IsFunctionPointer = true;
+        tv.TypeName = "__closure_fat_ptr";
+        if (fpSpec->typeSpecifier() != nullptr)
+        {
+            tv.FuncPtrReturnTypeName = fpSpec->typeSpecifier()->getText();
+            tv.FuncPtrReturnPointer  = fpSpec->pointer() != nullptr;
+            if (fpSpec->functionPointerParamList() != nullptr)
+                for (auto* param : fpSpec->functionPointerParamList()->functionPointerParam())
+                {
+                    LLVMBackend::TypeAndValue::FuncPtrParam p;
+                    p.TypeName = param->typeSpecifier()->getText();
+                    p.Pointer  = param->pointer() != nullptr;
+                    p.IsMove   = param->Move() != nullptr;
+                    tv.FuncPtrParams.push_back(p);
+                }
+        }
+        return tv;
+    }
+
     void ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -2431,6 +2518,22 @@ public:
             alias = ctx->Identifier()->getText();
 
         auto* typeSpec = ctx->typeSpecifier();
+
+        // Function-type alias (using Cb = function<R(Args)>): a closure type carries a call
+        // signature, not a plain type name, so it is stored structurally in functionTypeAliases
+        // and expanded at every use site (ParseDeclarationSpecifiers). Must be handled before the
+        // type/namespace dispatch below, which only recognizes named types.
+        if (auto* fpSpec = typeSpec->functionPointerSpecifier())
+        {
+            compiler->functionTypeAliases[alias] = BuildFuncPtrAliasType(fpSpec);
+            if (auto* s = compiler->GetSymbolSink())
+                s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
+                            (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                            "using " + alias + " = " + typeSpec->getText(), {},
+                            ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+            return;
+        }
+
         std::string target = typeSpec->getText();
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
@@ -2893,6 +2996,7 @@ public:
             // claimed by a named local or a move parameter. Mirrors C++ temporary
             // lifetime - destroyed at the statement's semicolon.
             compiler->FlushOwnedStringTemps();
+            compiler->FlushOwnedClosureTemps();
         }
     }
 
@@ -3297,6 +3401,7 @@ public:
                         // the ret terminates the block.
                         compiler->UnregisterOwnedStringTemp(right);
                         compiler->FlushOwnedStringTemps();
+                        compiler->FlushOwnedClosureTemps();
                         // Pass the returned local's storage so a by-value struct return whose
                         // full-destructor frees members (e.g. owned string fields) moves
                         // ownership to the caller instead of being destructed here. The struct
@@ -3427,6 +3532,7 @@ public:
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
                 // in the post-loop block, where the dominance guard would drop them and leak.
                 compiler->FlushOwnedStringTemps();
+                compiler->FlushOwnedClosureTemps();
                 compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // resume
@@ -3452,6 +3558,7 @@ public:
                 // Free owned-string temps from the condition in the condition block (see do-while).
                 // Runs each iteration after the guard is evaluated.
                 compiler->FlushOwnedStringTemps();
+                compiler->FlushOwnedClosureTemps();
 
                 // A constant-true guard (`while (true)` / `while (1)`) can only be
                 // left via `break`. Branch unconditionally into the body so the
@@ -3525,6 +3632,7 @@ public:
                     auto condition = ParseAssignmentExpression(compareCtx);
                     // Free owned-string temps from the condition in the condition block (see do-while).
                     compiler->FlushOwnedStringTemps();
+                    compiler->FlushOwnedClosureTemps();
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                     // Inner statement
@@ -3748,6 +3856,7 @@ public:
                 // == x)`) here, while still in the condition block. The block-item flush runs in
                 // the post-if merge block, where the dominance guard would drop them and leak.
                 compiler->FlushOwnedStringTemps();
+                compiler->FlushOwnedClosureTemps();
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
                 auto preIfMovedState = compiler->SaveMovedState();
@@ -4869,6 +4978,14 @@ public:
                 std::string srcInferredTypeName;
                 bool srcInferredPointer = false;
                 bool srcInferredElemPointer = false;
+                // Managed-value copy at decl-init (string-redesign Phase 1): captured from the
+                // RHS NamedVariable so the store site can route `ManagedType b = a;` through
+                // a.copy() instead of a shallow alias. srcStorage non-null + !srcIsMove + a
+                // CallerName marks a named lvalue source whose buffer is still owned elsewhere.
+                llvm::Value* srcStorage = nullptr;
+                llvm::Type* srcBaseType = nullptr;
+                bool srcIsMove = false;
+                std::string srcCallerName;
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -5082,6 +5199,10 @@ public:
                                 srcInferredTypeName = rightNV.TypeAndValue.TypeName;
                                 srcInferredPointer = rightNV.TypeAndValue.Pointer;
                                 srcInferredElemPointer = rightNV.TypeAndValue.ElemPointer;
+                                srcStorage = rightNV.Storage;
+                                srcBaseType = rightNV.BaseType;
+                                srcIsMove = rightNV.TypeAndValue.IsMove;
+                                srcCallerName = rightNV.CallerName;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
@@ -5312,7 +5433,67 @@ public:
                         if (typeAndValue.IsSimd && !right->getType()->isVectorTy())
                             right = compiler->SplatToSimd(right, typeAndValue);
 
+                        // Owning-value MOVE at decl-init (string-redesign FINAL MODEL): `OwningType
+                        // b = a;` where a is a plain named local/global of a value type that owns
+                        // resources (has a full destructor). A shallow struct store aliases a's
+                        // buffers into b, double-freeing at teardown; instead MOVE - the shallow
+                        // store below transfers a's bits, and we mark a moved so its scope-exit
+                        // destructor is suppressed and any later use of a is rejected. `b = a.copy()`
+                        // is the explicit way to duplicate. Excludes move/temporary sources (a move
+                        // already transfers; a call result / .copy() owns an independent buffer with
+                        // null srcStorage) and non-variable sources (field/element accesses, whose
+                        // Storage is a GEP not an alloca/global) - those are not whole-variable moves.
+                        if (right->getType()->isStructTy()
+                            && srcStorage != nullptr
+                            && (llvm::isa<llvm::AllocaInst>(srcStorage)
+                                || llvm::isa<llvm::GlobalVariable>(srcStorage))
+                            && !srcIsMove
+                            && !srcCallerName.empty()
+                            && srcInferredTypeName == typeAndValue.TypeName
+                            && compiler->IsOwningValueType(typeAndValue.TypeName))
+                        {
+                            if (typeAndValue.TypeName == "__closure_fat_ptr")
+                            {
+                                // Closures (Option A) are CLONE-by-default, not move: cloning a
+                                // borrowed/null env is a no-op and cloning an owned env yields an
+                                // independent block, so `b = a` deep-copies the env and leaves a
+                                // valid (no use-after-move). `right` is replaced with the clone so
+                                // the CreateAssignment below stores an independent env into b.
+                                LLVMBackend::NamedVariable srcNV;
+                                srcNV.Storage  = srcStorage;
+                                srcNV.BaseType = compiler->GetClosureFatPtrType();
+                                srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
+                                if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                                    right = cloned;
+                            }
+                            else
+                            {
+                                // `right` already holds a's loaded {fields} value (transferred into b
+                                // by the CreateAssignment below). ZERO a's storage so a's always-run
+                                // scope-exit destructor is a no-op on the moved-out value (cflat value-
+                                // type moves zero the source rather than skip the dtor - this stays
+                                // correct under conditional moves, no runtime drop flag needed). Mark a
+                                // moved for the compile-time use-after-move diagnostic.
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
+                                compiler->MarkVariableMoved(srcCallerName);
+                                // `string` frees its local via the separate IsOwningString gate
+                                // (not the unconditional value-type path), so mark the moved-into
+                                // local owning - it now holds whatever `a` owned (the owned bit
+                                // rode along in the shallow store below). The dtor is owned-bit-
+                                // gated, so moving a borrowed string stays a scope-exit no-op.
+                                if (typeAndValue.TypeName == "string")
+                                    compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                            }
+                        }
+
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+
+                        // A closure local now owns its env (its scope-exit dtor frees it), so drop
+                        // the value from the owned-closure temp-flush list to avoid a double-free
+                        // (covers a lambda literal RHS, a clone, or a call result uniformly).
+                        if (typeAndValue.TypeName == "__closure_fat_ptr")
+                            compiler->UnregisterOwnedClosureTemp(right);
 
                         // Apply field initializer overrides after the default value is stored.
                         // A brace list targeting a generic container (list/array/dictionary) is
@@ -5935,6 +6116,40 @@ public:
             auto* destGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
             bool destIsStructField = destGep && destGep->getNumIndices() == 2
                 && destGep->getSourceElementType()->isStructTy();
+
+            // Closure store (Option A): closures are owning value types but CLONE-SAFE (cloning a
+            // borrowed/null env is a no-op, cloning an owned env yields an independent block), so a
+            // closure assignment / field store auto-clones a NAMED source rather than being rejected
+            // like string/list. The destination then owns an independent env; a move / temporary
+            // RHS already owns its env and is stored as-is. This deliberately bypasses the X4 /
+            // field-to-field / destruct-old guards below (which force explicit intent for types
+            // where cloning a borrow is unsafe). The old destination env is NOT freed here - that
+            // would be unsafe on a possibly-uninitialized field (e.g. a raw-malloc'd thread packet);
+            // a closure-field reassignment therefore leaks the old env (a narrow, documented gap).
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && namedVar.TypeAndValue.TypeName == "__closure_fat_ptr")
+            {
+                bool namedSource = rightNV.Storage != nullptr
+                    && !rightNV.TypeAndValue.IsMove
+                    && rightNV.TypeAndValue.TypeName == "__closure_fat_ptr";
+                if (namedSource)
+                {
+                    // Fresh arg NV (Storage + closure type only) so the user-side CallerName /
+                    // named-argument metadata on rightNV does not confuse copy() overload resolution.
+                    LLVMBackend::NamedVariable cloneArg;
+                    cloneArg.Storage  = rightNV.Storage;
+                    cloneArg.BaseType = compiler->GetClosureFatPtrType();
+                    cloneArg.TypeAndValue.TypeName = "__closure_fat_ptr";
+                    if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
+                        right = cloned;
+                }
+                derefAssign(right, rhsUnsigned);
+                // The destination now owns this closure env, so drop the stored value from the
+                // owned-closure temp-flush list to avoid a double-free (no-op for a clone result).
+                compiler->UnregisterOwnedClosureTemp(right);
+                return right;
+            }
+
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField
                 && !rightNV.TypeAndValue.Pointer
@@ -5973,6 +6188,106 @@ public:
                     "and will double-free at teardown; use '.copy()' for an independent copy or 'move' "
                     "to transfer ownership", displayType));
                 return right;
+            }
+
+            // Field-to-field copy of an owning value (`obj.s = obj2.s`) - REJECTED. Both sides are
+            // struct fields of the same owning value type, so a shallow store aliases obj2's backing
+            // buffer into obj's field and double-frees at teardown. This also covers `string` (which
+            // the X4 guard above excludes, to allow the common, safe borrowed-LOCAL-into-field pattern
+            // like `b._rootTag = rt`). It cannot be auto-resolved: ownership is a RUNTIME property (the
+            // string owned bit), so the compiler can neither safely deep-copy (would make a borrowed
+            // source owned) nor move (would consume a source the caller may keep using). Require the
+            // intent: `.copy()` for an independent value, `move` to transfer ownership. Self-field-
+            // assign (`obj.s = obj.s`) is a harmless no-op alias and is allowed.
+            auto* srcFieldGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(rightNV.Storage);
+            bool srcIsStructField = srcFieldGep && srcFieldGep->getNumIndices() == 2
+                && srcFieldGep->getSourceElementType()->isStructTy();
+            bool selfFieldAssign = !namedVar.FieldName.empty()
+                && namedVar.FieldName == rightNV.FieldName
+                && namedVar.CallerName == rightNV.CallerName;
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField && srcIsStructField
+                && !selfFieldAssign
+                && !rightNV.TypeAndValue.IsMove
+                && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+            {
+                LogErrorContext(ctx, std::format(
+                    "field-to-field copy of owning value '{}' aliases its backing buffer and will "
+                    "double-free at teardown; use '.copy()' for an independent copy or 'move' to "
+                    "transfer ownership", namedVar.TypeAndValue.TypeName));
+                return right;
+            }
+
+            // Owning-value MOVE at reassignment (string-redesign FINAL MODEL): `b = a` where
+            // both are plain named locals/globals of a value type that owns resources (has a full
+            // destructor). A shallow store would alias a's owned buffers into b (double-free at
+            // teardown); instead destruct b's OLD value, transfer a's bits with a shallow store,
+            // and mark a moved (use-after-move enforced). `b = a.copy()` is the explicit duplicate.
+            // Only fires for a plain local/global destination AND source (the X4 guard above still
+            // handles the struct-FIELD form until field-store lands; a GEP source is a field/element
+            // access, not a whole-variable move); excludes move/temporary/pointer/interface/funcptr
+            // RHS (a move already transfers, a temporary owns an independent buffer). Self-assign
+            // (`a = a`) is skipped - destructing then moving would be a use-after-destruct.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                && rightNV.Storage != nullptr
+                && (llvm::isa<llvm::AllocaInst>(rightNV.Storage) || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
+                && !rightNV.CallerName.empty()
+                && !rightNV.TypeAndValue.IsMove
+                && !rightNV.TypeAndValue.Pointer
+                && !rightNV.TypeAndValue.IsArrayView
+                && !rightNV.TypeAndValue.IsInterfacePointer
+                && !rightNV.TypeAndValue.IsFunctionPointer
+                && destination != rightNV.Storage
+                && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(rightNV.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(right, destination);
+                // Zero the moved-out source so its always-run scope-exit destructor is a no-op
+                // (cflat value-type move = zero the source, see the decl-init move above).
+                compiler->builder->CreateStore(
+                    llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
+                compiler->MarkVariableMoved(rightNV.CallerName);
+                // The destination is now live again (it may have been moved-from earlier).
+                if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
+                    compiler->MarkVariableUnmoved(namedVar.CallerName);
+                return right;
+            }
+
+            // Destruct the OLD value of an owning-value-type struct FIELD before overwriting it
+            // (closes the field-reassignment leak - copy-point #3). `obj.s = newOwned` previously
+            // overwrote the field's owned buffer without freeing it. The full destructor is owned-
+            // bit / state-gated, so destructing a default or borrowed field value is a safe no-op;
+            // only a genuinely-owned old value is freed. Limited to struct FIELDS (the 2-index GEP
+            // into a struct that destIsStructField already identifies) - element stores like
+            // `_data[j] = v` are container-internal moves whose slots the container destructs
+            // itself (list.set/removeAt call `.~()`), so auto-destructing them would double-free.
+            // Self-assign is skipped: `obj.s = obj.s` has distinct GEP instructions for the two
+            // sides (so the Storage pointers differ), so also compare the field PATH - destructing
+            // then storing the just-loaded (now-freed) value would be a use-after-free.
+            bool sameField = !namedVar.FieldName.empty()
+                && namedVar.FieldName == rightNV.FieldName
+                && namedVar.CallerName == rightNV.CallerName;
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField
+                && destination != rightNV.Storage
+                && !sameField
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+            {
+                // NOTE: this closes the field-reassignment LEAK (free the old value) but does NOT
+                // try to fix shallow-aliasing of an owning-value lvalue RHS (`obj.s = obj2.s`). That
+                // cannot be auto-fixed safely for `string`: ownership is a RUNTIME property (the _len
+                // owned bit), so a static COPY would wrongly make a borrowed source owned (breaking
+                // deliberate borrows like xml.cb's `b._rootTag = rt`, then double-freeing), and a
+                // static MOVE would consume a source that callers legitimately keep using. The X4
+                // guard already steers non-string owning types to an explicit `.copy()` / `move`;
+                // for `string`, aliasing a borrowed value is the common, intended case, so the
+                // owned-string field-to-field copy stays the caller's explicit `.copy()`.
+                // Destruct the field's OLD value before the overwriting store.
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
             }
 
             auto* assignResult = derefAssign(right, rhsUnsigned);
@@ -12535,7 +12850,10 @@ public:
                     // Already a string struct - extract _ptr (field 0) and _len (field 1)
                     llvm::Value* strVal = nv.Primary ? nv.Primary : compiler->CreateLoad(nv.Storage);
                     ptr = compiler->builder->CreateExtractValue(strVal, { 0u });
-                    len = compiler->builder->CreateExtractValue(strVal, { 1u });
+                    // Mask off _len's high OWNED bit - this length feeds __strconcat's segment lens.
+                    len = compiler->builder->CreateAnd(
+                        compiler->builder->CreateExtractValue(strVal, { 1u }),
+                        compiler->builder->getInt32(0x7FFFFFFF));
                 }
                 else
                 {
@@ -12549,7 +12867,9 @@ public:
                         return nullptr;
                     }
                     ptr = compiler->builder->CreateExtractValue(strVal, { 0u });
-                    len = compiler->builder->CreateExtractValue(strVal, { 1u });
+                    len = compiler->builder->CreateAnd(
+                        compiler->builder->CreateExtractValue(strVal, { 1u }),
+                        compiler->builder->getInt32(0x7FFFFFFF));
                 }
 
                 segments.push_back({ ptr, len });
@@ -12747,6 +13067,7 @@ public:
         // Build closure struct alloca in the OUTER function before switching IR context.
         llvm::AllocaInst* closureAlloca = nullptr;
         llvm::StructType* closureStructTy = nullptr;
+        llvm::Value* envForFatTagged = nullptr;   // tagged i8* env stored in the fat struct (Option A)
         auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
 
         if (!captures.empty())
@@ -12761,11 +13082,36 @@ public:
                     closureFields.push_back(compiler->GetType(cap.TV));
             }
             closureStructTy = llvm::StructType::create(*compiler->context, closureFields, closureName);
-            closureAlloca   = compiler->AllocaAtEntry(closureStructTy, nullptr, closureName);
+
+            // Owning heap env (lambda Option A): allocate the captures block on the heap via the
+            // library primitive so the closure VALUE can outlive its defining frame (Bug 8) and
+            // is freed/cloned by the value-type machinery. __closure_env_new returns a TAGGED
+            // captures pointer (low bit set); we populate captures through the untagged base and
+            // store the tagged pointer in the fat struct. If function.cb is not yet available
+            // (a capturing lambda in an early core file imported before it), fall back to the
+            // legacy stack env - untagged, so it reads as borrowed and is never freed/cloned.
+            llvm::Value* envCaptureBase = nullptr;
+            if (llvm::Function* envNewFn = compiler->GetFunction("__closure_env_new"))
+            {
+                uint64_t sz = compiler->module->getDataLayout().getTypeAllocSize(closureStructTy);
+                auto* sizeC     = llvm::ConstantInt::get(compiler->builder->getInt64Ty(), sz);
+                auto* taggedEnv = compiler->builder->CreateCall(envNewFn, { sizeC }, "closure_env");
+                envForFatTagged = taggedEnv;
+                auto* envInt  = compiler->builder->CreatePtrToInt(taggedEnv, compiler->builder->getInt64Ty());
+                auto* baseInt = compiler->builder->CreateAnd(envInt, compiler->builder->getInt64(~(uint64_t)1));
+                auto* baseI8  = compiler->builder->CreateIntToPtr(baseInt, i8PtrTy);
+                envCaptureBase = compiler->builder->CreateBitCast(baseI8, closureStructTy->getPointerTo(), "closure");
+            }
+            else
+            {
+                closureAlloca   = compiler->AllocaAtEntry(closureStructTy, nullptr, closureName);
+                envForFatTagged = compiler->builder->CreateBitCast(closureAlloca, i8PtrTy, "closure_i8");
+                envCaptureBase  = closureAlloca;
+            }
 
             for (size_t i = 0; i < captures.size(); i++)
             {
-                auto* fieldGEP = compiler->builder->CreateStructGEP(closureStructTy, closureAlloca, (unsigned)i);
+                auto* fieldGEP = compiler->builder->CreateStructGEP(closureStructTy, envCaptureBase, (unsigned)i);
                 if (captures[i].ByReference)
                 {
                     // Store pointer to outer struct (alloca address) in closure field.
@@ -12912,6 +13258,11 @@ public:
         // Build user-visible function-pointer TypeAndValue (no __env param).
         LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
+        // Tag the value with the closure backing type so the value-type ownership machinery
+        // (move-by-default, scope-exit/struct teardown, copy-clone) recognizes it (Option A).
+        // The call signature still rides FuncPtrReturnTypeName/FuncPtrParams; GetType keys off
+        // IsFunctionPointer before TypeName, so the closure fat type is still emitted.
+        tv.TypeName = "__closure_fat_ptr";
         tv.FuncPtrReturnTypeName = returnType.TypeName;
         tv.FuncPtrReturnPointer  = returnType.Pointer;
         for (const auto& p : params)
@@ -12922,10 +13273,11 @@ public:
             tv.FuncPtrParams.push_back(fp);
         }
 
-        // Build closure fat struct {invoker_as_i8ptr, closure_as_i8ptr_or_null}.
+        // Build closure fat struct {invoker_as_i8ptr, env_as_i8ptr_or_null}. The env is the
+        // tagged heap-env pointer (Option A); null for a non-capturing lambda.
         auto* fnAsI8   = compiler->builder->CreateBitCast(fn, i8PtrTy, "lambda_fn_i8");
-        llvm::Value* envForFat = closureAlloca
-            ? compiler->builder->CreateBitCast(closureAlloca, i8PtrTy, "closure_i8")
+        llvm::Value* envForFat = envForFatTagged
+            ? envForFatTagged
             : static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(i8PtrTy));
 
         auto* closureFatTy = compiler->GetClosureFatPtrType();
@@ -12937,6 +13289,12 @@ public:
         LLVMBackend::NamedVariable result;
         result.Primary     = fat;
         result.TypeAndValue = tv;
+
+        // Register the lambda value as an owned-closure temporary (Option A): if it is not bound
+        // to a named owner (e.g. passed directly by value as an argument), its heap env is freed
+        // at end-of-full-expression by FlushOwnedClosureTemps. A decl-init / assignment / field
+        // store that claims it calls UnregisterOwnedClosureTemp so only the owner frees it.
+        compiler->RegisterOwnedClosureTemp(fat);
 
         // Record what this lambda captures (names are already de-duplicated by
         // CollectLambdaCaptures) so a later attempt to pass it to a C function-pointer

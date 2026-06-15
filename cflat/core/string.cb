@@ -7,12 +7,76 @@
 // String literals are automatically wrapped into a `string` by the compiler.
 // Use `operator string` overloads to convert other types to `string`.
 //
+// Ownership (string-redesign FINAL MODEL): _len's HIGH BIT is the OWNED flag.
+//   1 = this string owns _ptr (a freshly allocated, NUL-terminated buffer) and the
+//       compiler's ~string frees it at scope exit / on container teardown.
+//   0 = borrowed (string literal, char* wrap, string_view) - never freed.
+// The built-in length() masks the bit off, so the low 31 bits are the byte count (max
+// 2^31-1). Build an OWNING string through `_strOwned` below so the bit is set in exactly
+// one place; a borrowed string is built by assigning _ptr/_len directly with the bit clear.
+// `string` is move-by-default: `string b = a` transfers ownership (a is consumed); use
+// `b = a.copy()` for an independent deep copy.
+//
 // Note: all character operations are byte/ASCII-level.  UTF-8 is valid to
 // store but only the byte count is tracked; multi-byte codepoints are not
 // iterated, cased, or trimmed as units.
 
 import "memory.cb";
 import "list.cb";
+
+// Wrap a freshly allocated, NUL-terminated buffer of `len` bytes into an OWNING string
+// (owned bit set). `move` marks the return owned so the caller's local frees it on scope
+// exit. This is the single place the owned bit is set; every allocating transform routes
+// its result here.
+move string _strOwned(move i8* buf, i32 len)
+{
+    string result = default;
+    result._ptr = buf;            // transfer the owning buffer into the result
+    result._len = len | (i32)0x80000000;
+    return result;
+}
+
+// ── string core accessors (library type) ─────────────────────────────────────
+// data()/length()/hash() were compiler built-ins; they now live here as ordinary
+// cflat so `string` is a library type. The compiler keeps only the {i8*,i32} layout
+// + literal lowering and never calls these internally (it inlines field access).
+
+// Number of bytes in the string (the low 31 bits of _len; the high bit is the OWNED flag).
+i32 length(string self)
+{
+    return self._len & 0x7FFFFFFF;
+}
+
+// Pointer to the underlying NUL-terminated bytes. A default/empty string (_ptr == null)
+// returns a pointer to a static empty literal so it stays safe to hand to C as a C string.
+i8* data(string self)
+{
+    if (self._ptr == nullptr) return "";
+    return self._ptr;
+}
+
+// FNV-1a hash over the bytes. Matches the previous compiler builtin bit-for-bit (basis
+// 0x811C9DC5, prime 0x01000193, byte zero-extended) so hash-keyed containers are stable.
+i32 hash(string self)
+{
+    i8* p = self._ptr;
+    i32 len = self.length();
+    i32 h = (i32)2166136261;
+    i32 i = 0;
+    while (i < len)
+    {
+        h = (h ^ (((i32)p[i]) & 0xFF)) * (i32)16777619;
+        i = i + 1;
+    }
+    return h;
+}
+
+// NOTE: the `string` DESTRUCTOR intentionally stays compiler-side (EnsureStringDtorRegistered),
+// NOT here. The compiler creates OWNED strings on its own - via "{x}" interpolation (__strconcat)
+// and the move-param heap-copy - WITHOUT the program importing this file, and those still need a
+// destructor at scope exit. So the dtor must be available even under --no-runtime / no string.cb
+// import. data()/length()/hash() above are safe to live here: the compiler never calls them
+// internally (it inlines field access), so they are only needed when string.cb is imported anyway.
 
 // ── toString: primitive -> string (the public conversion API) ────────────────
 //
@@ -30,10 +94,7 @@ move string toString(i32 self)
 {
     i8* buf = new i8[32];
     i32 len = sprintf(buf, "%d", self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert a signed 64-bit integer to its decimal string. Allocates; caller owns it.
@@ -41,10 +102,7 @@ move string toString(i64 self)
 {
     i8* buf = new i8[24];
     i32 len = sprintf(buf, "%lld", self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert an unsigned 32-bit integer to its decimal string. Allocates; caller owns it.
@@ -52,10 +110,7 @@ move string toString(u32 self)
 {
     i8* buf = new i8[16];
     i32 len = sprintf(buf, "%u", self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert an unsigned 64-bit integer to its decimal string. Allocates; caller owns it.
@@ -63,10 +118,7 @@ move string toString(u64 self)
 {
     i8* buf = new i8[24];
     i32 len = sprintf(buf, "%llu", self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert an 8-bit integer to its decimal string. Allocates; caller owns it.
@@ -74,10 +126,7 @@ move string toString(i8 self)
 {
     i8* buf = new i8[8];
     i32 len = sprintf(buf, "%d", (i32)self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert a double to a string using %g (shortest representation). Allocates; caller owns it.
@@ -85,10 +134,7 @@ move string toString(double self)
 {
     i8* buf = new i8[32];
     i32 len = sprintf(buf, "%g", self);
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Convert a bool to "true"/"false". Non-owning reference to a static literal; no allocation.
@@ -149,10 +195,7 @@ move string toString(i64 self, i32 base)
     while (i < len) { buf[i] = tmp[pos + i]; i = i + 1; }
     buf[len] = (i8)0;
 
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Owned string copy of a NUL-terminated C string; the source buffer is not
@@ -183,9 +226,9 @@ string operator string(IString s)
 }
 
 // Wrap a raw C string pointer into a non-owning string value. The result borrows `s`
-// (no allocation); it must not outlive the buffer. Call `.copy()` to take ownership.
-// `const char*` matches the operator+ family - char* and const char* are the same type
-// to the compiler (TypeName "char"); the const is a documentation-only qualifier here.
+// (no allocation; owned bit clear); it must not outlive the buffer. Call `.copy()` to take
+// ownership. `const char*` matches the operator+ family - char* and const char* are the
+// same type to the compiler (TypeName "char"); the const is a documentation-only qualifier.
 string operator string(const char* s)
 {
     string result = default;
@@ -228,12 +271,13 @@ move string operator string(double d)
 
 bool operator==(string a, string b)
 {
-    if (a._len != b._len) return false;
+    i32 alen = a.length();
+    if (alen != b.length()) return false;
     // Compare over the tracked byte length (memcmp), not strcmp: strcmp stops at the
     // first embedded NUL, so "a\0b" and "a\0c" would wrongly compare equal. This matches
     // compare()/operator</operator>, which are also length-based, and honors the type's
     // binary/UTF-8 storage contract.
-    return memcmp(a._ptr, b._ptr, (i64)a._len) == 0;
+    return memcmp(a._ptr, b._ptr, (i64)alen) == 0;
 }
 
 bool operator!=(string a, string b)
@@ -270,10 +314,7 @@ string operator+(string a, string b)
     }
     buf[total] = 0;
 
-    string result = default;
-    result._ptr = buf;
-    result._len = total;
-    return result;
+    return _strOwned(move buf, total);
 }
 
 // Concatenate a string with a raw C string literal: s + "..."
@@ -300,10 +341,7 @@ string operator+(string a, const char* b)
     }
     buf[total] = 0;
 
-    string result = default;
-    result._ptr = buf;
-    result._len = total;
-    return result;
+    return _strOwned(move buf, total);
 }
 
 // Concatenate a raw C string literal on the left with a string on the right.
@@ -320,10 +358,7 @@ string operator+(const char* a, string b)
     i32 j = 0;
     while (j < blen) { buf[alen + j] = bptr[j]; j++; }
     buf[total] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = total;
-    return result;
+    return _strOwned(move buf, total);
 }
 
 // Concatenate two raw C strings: cstr + cstr. Pointer + pointer has no meaning in C, so
@@ -340,10 +375,7 @@ string operator+(const char* a, const char* b)
     i32 j = 0;
     while (j < blen) { buf[alen + j] = b[j]; j++; }
     buf[total] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = total;
-    return result;
+    return _strOwned(move buf, total);
 }
 
 // Concatenate a string with any IString: s + istring_value
@@ -370,10 +402,7 @@ move string copy(string self)
     }
     buf[len] = 0;
 
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Deep copy: allocate a fresh null-terminated buffer from `alloc` and copy the
@@ -393,10 +422,7 @@ move string copy(string self, IAllocator alloc)
     }
     buf[len] = 0;
 
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // ── string -> number parsing ──────────────────────────────────────────────────
@@ -442,16 +468,17 @@ i64 toIntBase(string self, int base)
 // Return true if the string has no characters.
 bool isEmpty(string self)
 {
-    return self._len == 0;
+    return self.length() == 0;
 }
 
 // Return the byte at position i, clamped to [0, _len-1].
 // Returns 0 if the string is empty.
 i8 charAt(string self, i32 i)
 {
-    if (self._len == 0) return 0;
+    i32 len = self.length();
+    if (len == 0) return 0;
     if (i < 0) i = 0;
-    if (i >= self._len) i = self._len - 1;
+    if (i >= len) i = len - 1;
     return self._ptr[i];
 }
 
@@ -459,8 +486,8 @@ i8 charAt(string self, i32 i)
 // Returns -1 if not found.  startPos is clamped to [0, _len].
 i32 indexOf(string self, string needle, i32 startPos)
 {
-    i32 slen = self._len;
-    i32 nlen = needle._len;
+    i32 slen = self.length();
+    i32 nlen = needle.length();
     if (nlen == 0) return startPos < 0 ? 0 : (startPos > slen ? slen : startPos);
     if (startPos < 0) startPos = 0;
     i8* sp = self._ptr;
@@ -484,7 +511,7 @@ i32 indexOf(string self, string needle)
 // Return the index of the first occurrence of byte c, or -1 if absent.
 i32 indexOf(string self, i8 c)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* p = self._ptr;
     i32 i = 0;
     while (i < len)
@@ -498,8 +525,8 @@ i32 indexOf(string self, i8 c)
 // Return the index of the last occurrence of needle, or -1 if absent.
 i32 lastIndexOf(string self, string needle)
 {
-    i32 slen = self._len;
-    i32 nlen = needle._len;
+    i32 slen = self.length();
+    i32 nlen = needle.length();
     if (nlen == 0) return slen;
     if (nlen > slen) return -1;
     i8* sp = self._ptr;
@@ -516,7 +543,7 @@ i32 lastIndexOf(string self, string needle)
 // Return the index of the last occurrence of byte c, or -1 if absent.
 i32 lastIndexOf(string self, i8 c)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* p = self._ptr;
     i32 i = len - 1;
     while (i >= 0)
@@ -536,19 +563,20 @@ bool contains(string self, string needle)
 // Return true if self starts with prefix (byte-level comparison).
 bool startsWith(string self, string prefix)
 {
-    i32 plen = prefix._len;
+    i32 plen = prefix.length();
     if (plen == 0) return true;
-    if (plen > self._len) return false;
+    if (plen > self.length()) return false;
     return memcmp(self._ptr, prefix._ptr, (i64)plen) == 0;
 }
 
 // Return true if self ends with suffix (byte-level comparison).
 bool endsWith(string self, string suffix)
 {
-    i32 slen = suffix._len;
+    i32 slen = suffix.length();
+    i32 selfLen = self.length();
     if (slen == 0) return true;
-    if (slen > self._len) return false;
-    return memcmp(self._ptr + (self._len - slen), suffix._ptr, (i64)slen) == 0;
+    if (slen > selfLen) return false;
+    return memcmp(self._ptr + (selfLen - slen), suffix._ptr, (i64)slen) == 0;
 }
 
 // Lexicographic comparison using byte values and length.
@@ -556,8 +584,8 @@ bool endsWith(string self, string suffix)
 // Uses memcmp over the shorter length, then breaks ties by length.
 i32 compare(string a, string b)
 {
-    i32 alen = a._len;
-    i32 blen = b._len;
+    i32 alen = a.length();
+    i32 blen = b.length();
     i32 minLen = alen < blen ? alen : blen;
     if (minLen > 0)
     {
@@ -596,14 +624,14 @@ string_view* view(bond string* this)
 {
     string_view* sv = new string_view;
     sv->_ptr = this->_ptr;
-    sv->_len = this->_len;
+    sv->_len = this->length();
     return sv;
 }
 
 // Return a view of bytes [start, end), bonded to the source.  Indices are clamped.
 string_view* span(bond string* this, i32 start, i32 end)
 {
-    i32 len = this->_len;
+    i32 len = this->length();
     if (start < 0) start = 0;
     if (end > len) end = len;
     if (start > end) start = end;
@@ -828,10 +856,7 @@ struct stringbuilder
         int i = 0;
         while (i < _length) { copy[i] = _data[i]; i++; }
         copy[_length] = 0;
-        string result = default;
-        result._ptr = copy;
-        result._len = _length;
-        return result;
+        return _strOwned(move copy, _length);
     }
 
     // ToString() mirrors the IString method name (capital-T) so a stringbuilder satisfies
@@ -854,7 +879,7 @@ struct stringbuilder
 // Return a copy of bytes [start, _len).  start is clamped to [0, _len].
 move string substring(string self, i32 start)
 {
-    i32 slen = self._len;
+    i32 slen = self.length();
     if (start < 0) start = 0;
     if (start > slen) start = slen;
     i32 len = slen - start;
@@ -863,16 +888,13 @@ move string substring(string self, i32 start)
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Return a copy of bytes [start, start+len).  Both indices are clamped.
 move string substring(string self, i32 start, i32 len)
 {
-    i32 slen = self._len;
+    i32 slen = self.length();
     if (start < 0) start = 0;
     if (start > slen) start = slen;
     if (len < 0) len = 0;
@@ -882,10 +904,7 @@ move string substring(string self, i32 start, i32 len)
     i32 i = 0;
     while (i < len) { buf[i] = src[i]; i++; }
     buf[len] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Return a copy with every non-overlapping occurrence of oldVal replaced by newVal.
@@ -893,13 +912,13 @@ move string substring(string self, i32 start, i32 len)
 // If oldVal is empty, returns a copy of self unchanged.
 move string replace(string self, string oldVal, string newVal)
 {
-    i32 olen = oldVal._len;
+    i32 olen = oldVal.length();
     if (olen == 0) return self.copy();
-    i32 slen = self._len;
+    i32 slen = self.length();
     i8* sp = self._ptr;
     i8* op = oldVal._ptr;
     i8* np = newVal._ptr;
-    i32 nlen = newVal._len;
+    i32 nlen = newVal.length();
     stringbuilder sb;
     i32 pos = 0;
     while (pos <= slen - olen)
@@ -923,16 +942,13 @@ move string replace(string self, string oldVal, string newVal)
     i32 i = 0;
     while (i < rlen) { buf[i] = sd[i]; i++; }
     buf[rlen] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = rlen;
-    return result;
+    return _strOwned(move buf, rlen);
 }
 
 // Return a copy with all ASCII lowercase letters converted to uppercase (a-z only).
 move string toUpper(string self)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* buf = new i8[len + 1];
     i8* src = self._ptr;
     i32 i = 0;
@@ -944,16 +960,13 @@ move string toUpper(string self)
         i++;
     }
     buf[len] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Return a copy with all ASCII uppercase letters converted to lowercase (A-Z only).
 move string toLower(string self)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* buf = new i8[len + 1];
     i8* src = self._ptr;
     i32 i = 0;
@@ -965,16 +978,13 @@ move string toLower(string self)
         i++;
     }
     buf[len] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = len;
-    return result;
+    return _strOwned(move buf, len);
 }
 
 // Return a copy with leading ASCII whitespace (space, tab, CR, LF) removed.
 move string trimStart(string self)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
@@ -988,16 +998,13 @@ move string trimStart(string self)
     i32 i = 0;
     while (i < newLen) { buf[i] = src[startIdx + i]; i++; }
     buf[newLen] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = newLen;
-    return result;
+    return _strOwned(move buf, newLen);
 }
 
 // Return a copy with trailing ASCII whitespace (space, tab, CR, LF) removed.
 move string trimEnd(string self)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* src = self._ptr;
     i32 endIdx = len;
     while (endIdx > 0)
@@ -1010,16 +1017,13 @@ move string trimEnd(string self)
     i32 i = 0;
     while (i < endIdx) { buf[i] = src[i]; i++; }
     buf[endIdx] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = endIdx;
-    return result;
+    return _strOwned(move buf, endIdx);
 }
 
 // Return a copy with leading and trailing ASCII whitespace removed.
 move string trim(string self)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     i8* src = self._ptr;
     i32 startIdx = 0;
     while (startIdx < len)
@@ -1040,17 +1044,14 @@ move string trim(string self)
     i32 i = 0;
     while (i < newLen) { buf[i] = src[startIdx + i]; i++; }
     buf[newLen] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = newLen;
-    return result;
+    return _strOwned(move buf, newLen);
 }
 
 // Return a copy left-padded with spaces to at least width characters.
 // No-op (returns a copy) if self is already >= width characters wide.
 move string padLeft(string self, i32 width)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     if (len >= width) return self.copy();
     i32 pad = width - len;
     i8* buf = new i8[width + 1];
@@ -1060,17 +1061,14 @@ move string padLeft(string self, i32 width)
     i32 j = 0;
     while (j < len) { buf[pad + j] = src[j]; j++; }
     buf[width] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = width;
-    return result;
+    return _strOwned(move buf, width);
 }
 
 // Return a copy right-padded with spaces to at least width characters.
 // No-op (returns a copy) if self is already >= width characters wide.
 move string padRight(string self, i32 width)
 {
-    i32 len = self._len;
+    i32 len = self.length();
     if (len >= width) return self.copy();
     i8* buf = new i8[width + 1];
     i8* src = self._ptr;
@@ -1078,31 +1076,21 @@ move string padRight(string self, i32 width)
     while (i < len) { buf[i] = src[i]; i++; }
     while (i < width) { buf[i] = ' '; i++; }
     buf[width] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = width;
-    return result;
+    return _strOwned(move buf, width);
 }
 
 // ── Phase 3: split / join ────────────────────────────────────────────────────
 
 // Build an OWNED string from the byte range [src, src+len). The `move` return
-// type is what flags the result owning, so when it is added to a list<string>
-// the list's destructor frees the buffer. Building a part inline as a plain
-// `string part = default; part._ptr = buf;` local does NOT mark it owning (the
-// static ownership tracker only flags `move`-returns / operator+ results), so a
-// part added that way would leak on the list's destruction - route every split
-// part through this helper instead.
+// type plus the owned bit (via _strOwned) is what flags the result owning, so when
+// it is added to a list<string> the list's destructor frees the buffer.
 move string _str_owned_range(i8* src, i32 len)
 {
     i8* buf = new i8[len + 1];
     i32 k = 0;
     while (k < len) { buf[k] = src[k]; k++; }
     buf[len] = 0;
-    string part = default;
-    part._ptr = buf;
-    part._len = len;
-    return part;
+    return _strOwned(move buf, len);
 }
 
 // Split self around every occurrence of sep (string separator).
@@ -1113,8 +1101,8 @@ move string _str_owned_range(i8* src, i32 len)
 move list<string> split(string self, string sep)
 {
     list<string> out = default;
-    i32 slen = self._len;
-    i32 dlen = sep._len;
+    i32 slen = self.length();
+    i32 dlen = sep.length();
     if (dlen == 0)
     {
         out.add(self.copy());
@@ -1152,7 +1140,7 @@ move list<string> split(string self, string sep)
 move list<string> split(string self, i8 sep)
 {
     list<string> out = default;
-    i32 slen = self._len;
+    i32 slen = self.length();
     i8* sp = self._ptr;
     i32 pos = 0;
     while (pos <= slen)
@@ -1186,12 +1174,9 @@ move string join(string sep, list<string> parts)
     {
         i8* buf = new i8[1];
         buf[0] = 0;
-        string result = default;
-        result._ptr = buf;
-        result._len = 0;
-        return result;
+        return _strOwned(move buf, 0);
     }
-    i32 sepLen = sep._len;
+    i32 sepLen = sep.length();
     i32 total = 0;
     i32 idx = 0;
     while (idx < count)
@@ -1219,8 +1204,5 @@ move string join(string sep, list<string> parts)
         idx++;
     }
     buf[total] = 0;
-    string result = default;
-    result._ptr = buf;
-    result._len = total;
-    return result;
+    return _strOwned(move buf, total);
 }

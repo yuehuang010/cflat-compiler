@@ -850,6 +850,15 @@ public:
     // FlushOwnedStringTemps. See internal/string-concat-intermediate-leak.md.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedStringTemps;
 
+    // Owned-closure temporaries (lambda Option A): a lambda literal owns a heap env. When it is
+    // not bound to a named owner (e.g. passed by value directly as an argument), nothing frees
+    // its env, so it is registered here and freed at end-of-full-expression - the closure analog
+    // of pendingOwnedStringTemps. Unregistered when a decl-init / assignment / field store claims
+    // it (that owner's destructor frees it). The flush is tag-gated (a non-capturing temp's null
+    // env makes the free a no-op), and every closure STORE clones the env, so a callee that
+    // retained a copy holds its OWN clone and never aliases the flushed temp.
+    std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
+
     // T[] array-view noalias metadata (per-function, reset in createFunctionBlock). aliasDomain_ is
     // the single anonymous alias domain for the current function; aliasScopes_ holds one anonymous
     // scope per distinct view ORIGIN (parameter / field) seen in the function body. A view's element
@@ -969,6 +978,11 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
+    // Function-type aliases (`using Cb = function<R(Args)>;`). A closure type carries a call
+    // signature, not a plain type name, so it cannot live in the string-shaped typeAliases; the
+    // resolved TypeAndValue (IsFunctionPointer + return + params, TypeName "__closure_fat_ptr") is
+    // stored here and expanded wherever the alias name is used as a type (ParseDeclarationSpecifiers).
+    std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
     // Typedef name -> type spelling from C/header extraction. Populated by AdoptRawTypedefs
     // so the function-signature mapper can chase HANDLE -> void*, SOCKET -> uintptr_t, etc.
     // (a fallback; canonical spellings from the extractor already resolve most chains).
@@ -1297,12 +1311,14 @@ private:
     std::unordered_map<llvm::Constant*, int32_t> stringLiteralLenByPtr;
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
+    bool closureLifetimeRegistered = false;   // closure dtor + copy registered (lazy; needs function.cb)
     // Memoized "full destructor" per type: user dtor + recursive member destruction.
     // Presence in the map means "computed"; the mapped value may be nullptr (type needs
     // no destruction), the plain user dtor (no dtor-bearing members), or a synthesized
     // wrapper. See GetOrCreateFullDestructor.
     std::unordered_map<std::string, llvm::Function*> fullDestructorCache_;
     std::unordered_set<std::string> fullDestructorInProgress_;
+    std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
@@ -1502,6 +1518,51 @@ private:
             }
         }
         pendingOwnedStringTemps.clear();
+    }
+
+    void RegisterOwnedClosureTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        pendingOwnedClosureTemps.emplace_back(value, builder->GetInsertBlock());
+    }
+
+    void UnregisterOwnedClosureTemp(llvm::Value* value)
+    {
+        if (value == nullptr) return;
+        std::erase_if(pendingOwnedClosureTemps,
+            [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
+    }
+
+    // Free every owned-closure temporary still pending at end-of-full-expression (mirrors
+    // FlushOwnedStringTemps): a lambda literal whose env was never claimed by a named owner.
+    // Only temporaries created in the CURRENT block are freed (dominance safety); the list is
+    // always cleared so nothing carries across statements. The closure dtor is tag-gated, so a
+    // non-capturing temp (null env) frees nothing.
+    void FlushOwnedClosureTemps()
+    {
+        if (pendingOwnedClosureTemps.empty()) return;
+
+        auto* curBlock = builder->GetInsertBlock();
+        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
+        if (!terminated)
+        {
+            auto* closureTy = GetClosureFatPtrType();
+            auto* dtor = GetOrCreateFullDestructor("__closure_fat_ptr");
+            if (dtor != nullptr)
+            {
+                for (auto& [value, bb] : pendingOwnedClosureTemps)
+                {
+                    if (value == nullptr || bb != curBlock) continue;     // dominance safety
+                    if (value->getType() != closureTy) continue;
+                    // The dtor takes a __closure_fat_ptr*; spill the SSA value to an entry-block
+                    // alloca (never a loop body - see AllocaAtEntry) and free through it.
+                    auto* tmp = AllocaAtEntry(closureTy, nullptr, "closure.tmp");
+                    builder->CreateStore(value, tmp);
+                    builder->CreateCall(dtor->getFunctionType(), dtor, { tmp });
+                }
+            }
+        }
+        pendingOwnedClosureTemps.clear();
     }
 
     void EmitDestructorsForScope(const StackState& frame)
@@ -1973,106 +2034,13 @@ private:
             functionTable["string"].push_back(sym);
         }
 
-        // Create string.data(string self) -> i8*  [by value, extract field 0]
-        // Returns _ptr if non-null; otherwise returns a pointer to a static empty string.
-        // This makes data() safe on default-initialized strings (ptr==null, len==0).
-        {
-            auto* emptyStrTy = llvm::ArrayType::get(builder->getInt8Ty(), 1);
-            auto* emptyStrGlobal = new llvm::GlobalVariable(
-                *module, emptyStrTy, /*isConstant=*/true,
-                llvm::GlobalValue::PrivateLinkage,
-                llvm::ConstantAggregateZero::get(emptyStrTy),
-                "__string_empty");
-
-            auto* fnTy = llvm::FunctionType::get(ptrTy, { strTy }, false);
-            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.data", *module);
-            fn->arg_begin()->setName("self");
-            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            auto* ptr = b.CreateExtractValue(&*fn->arg_begin(), { 0u });
-            auto* nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
-            auto* isNull = b.CreateICmpEQ(ptr, nullPtr);
-            b.CreateRet(b.CreateSelect(isNull, emptyStrGlobal, ptr));
-
-            TypeAndValue selfParam{ "string", "self", false };
-            FunctionSymbol sym;
-            sym.UniqueName = "string.data";
-            sym.Function = fn;
-            sym.ReturnType = TypeAndValue{ "i8", "", true };
-            sym.Parameters = { selfParam };
-            functionTable["data"].push_back(sym);
-        }
-
-        // Create string.length(string self) -> i32  [by value, extract field 1]
-        {
-            auto* fnTy = llvm::FunctionType::get(i32Ty, { strTy }, false);
-            auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.length", *module);
-            fn->arg_begin()->setName("self");
-            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
-            llvm::IRBuilder<> b(entry);
-            b.CreateRet(b.CreateExtractValue(&*fn->arg_begin(), { 1u }));
-
-            TypeAndValue selfParam{ "string", "self", false };
-            FunctionSymbol sym;
-            sym.UniqueName = "string.length";
-            sym.Function = fn;
-            sym.ReturnType = TypeAndValue{ "i32", "", false };
-            sym.Parameters = { selfParam };
-            functionTable["length"].push_back(sym);
-        }
-
-        // Create string.hash(string self) -> i32  [FNV-1a over the bytes]
-        {
-            auto* i8Ty  = builder->getInt8Ty();
-            auto* ptrTy = i8Ty->getPointerTo();
-            auto* fnTy  = llvm::FunctionType::get(i32Ty, { strTy }, false);
-            auto* fn    = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage, "string.hash", *module);
-            fn->arg_begin()->setName("self");
-
-            auto* entryBB  = llvm::BasicBlock::Create(*context, "entry",  fn);
-            auto* loopBB   = llvm::BasicBlock::Create(*context, "loop",   fn);
-            auto* bodyBB   = llvm::BasicBlock::Create(*context, "body",   fn);
-            auto* exitBB   = llvm::BasicBlock::Create(*context, "exit",   fn);
-            llvm::IRBuilder<> b(entryBB);
-
-            auto* ptr = b.CreateExtractValue(&*fn->arg_begin(), { 0u }, "ptr");
-            auto* len = b.CreateExtractValue(&*fn->arg_begin(), { 1u }, "len");
-            auto* fnv_basis = b.getInt32(2166136261u);
-            auto* fnv_prime = b.getInt32(16777619u);
-            b.CreateBr(loopBB);
-
-            // loop: phi nodes for index and hash
-            b.SetInsertPoint(loopBB);
-            auto* idxPhi  = b.CreatePHI(i32Ty, 2, "idx");
-            auto* hashPhi = b.CreatePHI(i32Ty, 2, "h");
-            idxPhi->addIncoming(b.getInt32(0), entryBB);
-            hashPhi->addIncoming(fnv_basis, entryBB);
-            auto* cond = b.CreateICmpSLT(idxPhi, len);
-            b.CreateCondBr(cond, bodyBB, exitBB);
-
-            // body: h = (h ^ byte) * prime; idx++
-            b.SetInsertPoint(bodyBB);
-            auto* gep    = b.CreateGEP(i8Ty, ptr, idxPhi);
-            auto* byteVal = b.CreateLoad(i8Ty, gep, "byte");
-            auto* byteExt = b.CreateZExt(byteVal, i32Ty);
-            auto* xored  = b.CreateXor(hashPhi, byteExt);
-            auto* mulled = b.CreateMul(xored, fnv_prime);
-            auto* idxNext = b.CreateAdd(idxPhi, b.getInt32(1));
-            idxPhi->addIncoming(idxNext, bodyBB);
-            hashPhi->addIncoming(mulled, bodyBB);
-            b.CreateBr(loopBB);
-
-            b.SetInsertPoint(exitBB);
-            b.CreateRet(hashPhi);
-
-            TypeAndValue selfParam{ "string", "self", false };
-            FunctionSymbol sym;
-            sym.UniqueName = "string.hash";
-            sym.Function = fn;
-            sym.ReturnType = TypeAndValue{ "i32", "", false };
-            sym.Parameters = { selfParam };
-            functionTable["hash"].push_back(sym);
-        }
+        // string.data() / string.length() / string.hash() are now LIBRARY functions defined
+        // in core/string.cb (string-redesign: `string` as a library type). The compiler keeps
+        // only the bare {i8*,i32} layout + default ctor here for bootstrap (literal typing /
+        // __FILE__) and lowers literals via WrapStringLiteralAsString; the observable methods
+        // live in cflat. The compiler never calls these three internally (it inlines field
+        // access in the interpolation/%s path), so they resolve fine for every consumer, all
+        // of which import string.cb.
 
         // String destructor is registered lazily via EnsureStringDtorRegistered()
         // so that the C `free` function is available in the function table first.
@@ -2191,7 +2159,10 @@ private:
             rb.CreateStore(rb.getInt8(0), rb.CreateLoad(ptrTy, dstA));
             llvm::Value* strVal = llvm::UndefValue::get(strTy);
             strVal = rb.CreateInsertValue(strVal, rb.CreateLoad(ptrTy,  bufA),   { 0u });
-            strVal = rb.CreateInsertValue(strVal, rb.CreateLoad(i32Ty, totalA),  { 1u });
+            // The concatenated buffer is freshly malloc'd: set _len's high OWNED bit so the
+            // result owns it (string-redesign FINAL MODEL). length() masks the bit back off.
+            auto* ownedLen = rb.CreateOr(rb.CreateLoad(i32Ty, totalA), rb.getInt32(0x80000000));
+            strVal = rb.CreateInsertValue(strVal, ownedLen, { 1u });
             rb.CreateRet(strVal);
         }
 
@@ -2215,6 +2186,99 @@ private:
 
         // Pre-register the built-in `string` value type { i8* _ptr, i32 _len }.
         RegisterBuiltinString();
+
+        // Pre-register the closure fat type { i8* code, i8* env } as an owning value type
+        // (lambda Option A). The dtor + copy are registered lazily once function.cb's env
+        // primitives are available (EnsureClosureLifetimeRegistered).
+        RegisterBuiltinClosure();
+    }
+
+    // Register the closure backing type `__closure_fat_ptr` { i8* code, i8* env } as a
+    // dataStructures entry so a `function<R(Args)>` value (which carries this TypeName)
+    // is recognized as an owning value type. The destructor (frees the heap env) and the
+    // env-cloning copy() are added lazily by EnsureClosureLifetimeRegistered() once the
+    // core/function.cb primitives have been compiled.
+    void RegisterBuiltinClosure()
+    {
+        auto* closureTy = GetClosureFatPtrType();
+
+        DeclTypeAndValue codeField;
+        codeField.TypeName = "i8";
+        codeField.VariableName = "code";
+        codeField.Pointer = true;
+
+        DeclTypeAndValue envField;
+        envField.TypeName = "i8";
+        envField.VariableName = "env";
+        envField.Pointer = true;
+
+        dataStructures["__closure_fat_ptr"].StructType = closureTy;
+        dataStructures["__closure_fat_ptr"].StructFields = { codeField, envField };
+    }
+
+    // Lazily register the closure destructor and the env-cloning copy() once the
+    // core/function.cb env primitives are in the module. Mirrors EnsureStringDtorRegistered:
+    // a capturing closure owns its heap env, and these two functions are what the value-type
+    // machinery calls to free it at scope exit / struct teardown (dtor) and to clone it on
+    // copy (copy). A borrowed/null env is a runtime no-op inside the primitives.
+    void EnsureClosureLifetimeRegistered()
+    {
+        if (closureLifetimeRegistered) return;
+
+        // Resolve the library primitives. If function.cb has not been compiled yet (e.g. a
+        // closure appears in a core file imported before it), defer - try again on next use.
+        auto* freeFn  = GetFunction("__closure_env_free");
+        auto* cloneFn = GetFunction("__closure_env_clone");
+        if (!freeFn || !cloneFn) return;
+        closureLifetimeRegistered = true;
+
+        auto* closureTy = GetClosureFatPtrType();
+        auto* i8PtrTy   = builder->getInt8Ty()->getPointerTo();
+        auto* voidTy    = llvm::Type::getVoidTy(*context);
+
+        // Destructor: free the heap env (no-op if borrowed/null) and null the field.
+        {
+            auto* dtorTy = llvm::FunctionType::get(voidTy, { closureTy->getPointerTo() }, false);
+            auto* dtorFn = llvm::Function::Create(dtorTy, llvm::Function::InternalLinkage,
+                                                  "__closure_fat_ptr.dtor", *module);
+            dtorFn->arg_begin()->setName("self");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", dtorFn));
+            auto* self   = &*dtorFn->arg_begin();
+            auto* envPtr = b.CreateStructGEP(closureTy, self, 1, "envfield");
+            auto* env    = b.CreateLoad(i8PtrTy, envPtr, "env");
+            b.CreateCall(freeFn->getFunctionType(), freeFn, { env });
+            b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy), envPtr);
+            b.CreateRetVoid();
+            RegisterDestructor("__closure_fat_ptr", dtorFn);
+        }
+
+        // copy(__closure_fat_ptr self): clone the heap env so the copy owns an independent
+        // block (code pointer unchanged). Registered in functionTable["copy"] so the value-
+        // type copy machinery resolves it (and HasCopyOverloadFor short-circuits the
+        // memberwise synth, which would shallow-copy the env pointer and double-free).
+        {
+            auto* copyTy = llvm::FunctionType::get(closureTy, { closureTy }, false);
+            auto* copyFn = llvm::Function::Create(copyTy, llvm::Function::InternalLinkage,
+                                                  "__closure_fat_ptr.copy", *module);
+            copyFn->arg_begin()->setName("self");
+            llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", copyFn));
+            auto* self   = &*copyFn->arg_begin();
+            auto* code   = b.CreateExtractValue(self, { 0u }, "code");
+            auto* env    = b.CreateExtractValue(self, { 1u }, "env");
+            auto* newEnv = b.CreateCall(cloneFn->getFunctionType(), cloneFn, { env }, "clonedenv");
+            llvm::Value* fat = llvm::UndefValue::get(closureTy);
+            fat = b.CreateInsertValue(fat, code,   { 0u });
+            fat = b.CreateInsertValue(fat, newEnv, { 1u });
+            b.CreateRet(fat);
+
+            FunctionSymbol sym;
+            sym.UniqueName = "__closure_fat_ptr.copy";
+            sym.Function   = copyFn;
+            sym.ReturnType = TypeAndValue{ "__closure_fat_ptr", "", false };
+            sym.ReturnType.IsMove = true;   // the fresh clone is owned by the caller
+            sym.Parameters = { TypeAndValue{ "__closure_fat_ptr", "self", false } };
+            functionTable["copy"].push_back(sym);
+        }
     }
 
     // Called lazily the first time a string local's destructor needs to fire.
@@ -2245,19 +2309,31 @@ private:
         auto* entry = llvm::BasicBlock::Create(*context, "entry", dtorFn);
         llvm::IRBuilder<> b(entry);
 
+        auto* i32Ty   = b.getInt32Ty();
         auto* self    = &*dtorFn->arg_begin();
         auto* ptrPtr  = b.CreateStructGEP(strTy, self, 0, "ptrfield");
+        auto* lenPtr  = b.CreateStructGEP(strTy, self, 1, "lenfield");
         auto* ptr     = b.CreateLoad(ptrTy, ptrPtr, "ptr");
+        auto* len     = b.CreateLoad(i32Ty, lenPtr, "len");
         auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
+        // Free iff this string OWNS its buffer (string-redesign FINAL MODEL): _len's high
+        // bit is the OWNED flag. Borrowed strings (literals, char* wraps, views; owned bit
+        // clear) are never freed. This makes the dtor safe to call on ANY string - including
+        // a struct/container `string` member, where the compiler has no static ownership info
+        // and must rely on the runtime bit.
+        auto* isOwned   = b.CreateICmpNE(
+            b.CreateAnd(len, b.getInt32(0x80000000)), b.getInt32(0), "is_owned");
         auto* isNotNull = b.CreateICmpNE(ptr, nullPtr, "is_not_null");
+        auto* shouldFree = b.CreateAnd(isOwned, isNotNull, "should_free");
         auto* freeBlock = llvm::BasicBlock::Create(*context, "free", dtorFn);
         auto* doneBlock = llvm::BasicBlock::Create(*context, "done", dtorFn);
-        b.CreateCondBr(isNotNull, freeBlock, doneBlock);
+        b.CreateCondBr(shouldFree, freeBlock, doneBlock);
         b.SetInsertPoint(freeBlock);
         b.CreateCall(freeFn->getFunctionType(), freeFn, { ptr });
         b.CreateBr(doneBlock);
         b.SetInsertPoint(doneBlock);
         b.CreateStore(nullPtr, ptrPtr);
+        b.CreateStore(b.getInt32(0), lenPtr);
         b.CreateRetVoid();
 
         RegisterDestructor("string", dtorFn);
@@ -2271,10 +2347,10 @@ private:
     // Member scope: a member is destructed only when it is a VALUE field (not a pointer,
     // array-view, simd, bitfield, or fixed-array) whose type is a struct with its own
     // full destructor (list<T>, dictionary<T>, array<T>, user structs with `~T()`, and
-    // nested aggregates of these). Bare `string` members are intentionally NOT destructed:
-    // `string` carries no runtime owned/borrowed flag, and real code stores borrowed
-    // strings in `string` members (see internal/plan/member-dtor-recursion.md), so
-    // auto-freeing them would corrupt the heap. Raw pointer fields are never auto-freed.
+    // nested aggregates of these), INCLUDING bare `string` members. `string` now carries a
+    // runtime owned flag (the high bit of _len, string-redesign FINAL MODEL), so the string
+    // dtor frees an owning member and leaves a borrowed one (literal/view) untouched - it is
+    // safe to auto-destruct. Raw pointer fields are never auto-freed.
     //
     // When a type has a user dtor but no dtor-bearing members, the user dtor IS the full
     // destructor (no wrapper is synthesized) - the common case stays byte-identical.
@@ -2287,6 +2363,15 @@ private:
         {
             EnsureStringDtorRegistered();
             auto it = dataStructures.find("string");
+            return it != dataStructures.end() ? it->second.Destructor : nullptr;
+        }
+
+        // The closure fat type's full dtor is the lazily-registered env-freeing dtor (lambda
+        // Option A). Resolve live (never cache a pre-registration null), like `string`.
+        if (typeName == "__closure_fat_ptr")
+        {
+            EnsureClosureLifetimeRegistered();
+            auto it = dataStructures.find("__closure_fat_ptr");
             return it != dataStructures.end() ? it->second.Destructor : nullptr;
         }
 
@@ -2319,8 +2404,10 @@ private:
                 continue;
             if (f.ConstArraySize > 0)   // fixed-array members: out of scope (rare), documented
                 continue;
-            if (f.TypeName == "string") // borrowed/owned ambiguity: never auto-free, documented
-                continue;
+            // `string` members ARE destructed now (string-redesign FINAL MODEL): the owned
+            // bit in _len tells the string dtor at runtime whether to free, so a borrowed
+            // string member (literal/view; bit clear) is safely left alone while an owning
+            // one is freed. This is exactly what the owned bit was added to enable.
             if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
                 work.push_back({ i, childDtor });
         }
@@ -2359,6 +2446,136 @@ private:
         }
 
         b.CreateRetVoid();
+        return fn;
+    }
+
+    // True if `typeName` defines a no-arg instance method `copy()` (self only). This is
+    // the universal `.copy()` copy-constructor hook (string-redesign Phase 1): when a
+    // managed value is copied by value at a copy point (decl-init / assignment /
+    // field-store), the compiler invokes copy() to produce an independent, ownership-
+    // correct clone instead of a shallow struct copy that would alias owned buffers and
+    // double-free at teardown. The method-receiver convention is Parameters[0] == self
+    // (see the existing `Parameters[0].TypeName == typeName` checks in MainListener).
+    bool HasUserCopyMethod(const std::string& typeName) const
+    {
+        auto it = functionTable.find("copy");
+        if (it == functionTable.end())
+            return false;
+        for (const auto& sym : it->second)
+            if (sym.IsMethod && sym.Parameters.size() == 1
+                && sym.Parameters[0].TypeName == typeName)
+                return true;
+        return false;
+    }
+
+    // Phase-1 classifier: should a by-value copy of this type at a copy point be routed
+    // through `.copy()` rather than a plain shallow store? True for a struct/class that
+    // owns resources (has a full destructor) AND exposes a no-arg copy() to clone them.
+    // `string` and function<> stay on their existing static-ownership path until later
+    // phases, so they are excluded here.
+    bool TypeNeedsManagedCopy(const std::string& typeName)
+    {
+        if (typeName.empty() || typeName == "string")
+            return false;
+        if (dataStructures.find(typeName) == dataStructures.end())
+            return false;
+        if (!HasUserCopyMethod(typeName))
+            return false;
+        return GetOrCreateFullDestructor(typeName) != nullptr;
+    }
+
+    // A struct/class VALUE type that owns resources: it has a full destructor that frees
+    // at scope exit (string, list<T>, dictionary<K,V>, user classes with a `~T()`...). Per
+    // the string-redesign FINAL MODEL, `b = a` of such a type MOVES by default (transfer
+    // the bits + mark the source moved, use-after-move enforced) rather than aliasing (which
+    // double-frees) or deep-copying; `.copy()` is the explicit way to duplicate. `string` is
+    // included (it owns its buffer via the _len owned bit).
+    bool IsOwningValueType(const std::string& typeName)
+    {
+        if (typeName.empty())
+            return false;
+        if (dataStructures.find(typeName) == dataStructures.end())
+            return false;
+        return GetOrCreateFullDestructor(typeName) != nullptr;
+    }
+
+    // True when functionTable already has a `copy` overload whose first parameter is `typeName`
+    // (a user/library free `copy(T self)`, a method, or an already-synthesized memberwise copy).
+    // This is the gate for implicit copy synthesis: an existing copy() always wins.
+    bool HasCopyOverloadFor(const std::string& typeName) const
+    {
+        auto it = functionTable.find("copy");
+        if (it == functionTable.end()) return false;
+        for (const auto& sym : it->second)
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
+                return true;
+        return false;
+    }
+
+    // Synthesize the implicit `copy()` for a value type that does not define one: a MEMBERWISE
+    // copy (the "every value type has an implicit copy() if undefined" rule). The result starts
+    // as a shallow copy of `self`, then every value field whose type has its own copy() (managed
+    // members - string, list<T>, dictionary, nested owning structs) is replaced with an
+    // independent deep copy via that field's copy(); primitives and raw pointers stay
+    // shallow-copied (the pointee is shared, matching list<T>.copy()). The result is owned
+    // (`move`). Registered in functionTable["copy"] so overload resolution finds it; memoized.
+    llvm::Function* GetOrCreateMemberwiseCopy(const std::string& typeName)
+    {
+        if (auto it = memberwiseCopyCache_.find(typeName); it != memberwiseCopyCache_.end())
+            return it->second;
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end()) return nullptr;
+        auto* structTy = dsIt->second.StructType;
+        if (structTy == nullptr) return nullptr;
+
+        // Signature: T copy(T self) - self by value (a borrow; not destructed), result by value.
+        auto* fnTy = llvm::FunctionType::get(structTy, { structTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          typeName + ".copy.synth", *module);
+        fn->arg_begin()->setName("self");
+        memberwiseCopyCache_[typeName] = fn;   // memoize before body (re-entrancy / recursion safe)
+
+        // Register so overload resolution (user `x.copy()` + internal copy calls) finds it.
+        {
+            FunctionSymbol sym;
+            sym.UniqueName = typeName + ".copy.synth";
+            sym.Function   = fn;
+            sym.ReturnType = TypeAndValue{ typeName, "", false };
+            sym.ReturnType.IsMove = true;       // the fresh copy is owned by the caller
+            sym.Parameters = { TypeAndValue{ typeName, "self", false } };
+            functionTable["copy"].push_back(sym);
+        }
+
+        auto savedIP = builder->saveIP();
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+        builder->SetInsertPoint(entry);
+
+        // result = self  (shallow copy of every field; managed fields are fixed up below)
+        auto* resultSlot = builder->CreateAlloca(structTy, nullptr, "result");
+        builder->CreateStore(&*fn->arg_begin(), resultSlot);
+
+        // Deep-copy each managed value field, overwriting the aliased shallow handle.
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
+                continue;                       // pointer/view/simd/bitfield: shallow (pointee shared)
+            if (f.ConstArraySize > 0)
+                continue;                       // fixed-array members: out of scope (matches the dtor)
+            if (!HasCopyOverloadFor(f.TypeName) && !IsOwningValueType(f.TypeName))
+                continue;                       // POD field: the shallow copy is already correct
+            auto* fieldPtr = builder->CreateStructGEP(structTy, resultSlot, i, "fld");
+            NamedVariable argNV;
+            argNV.Storage  = fieldPtr;
+            argNV.BaseType = structTy->getElementType(i);
+            argNV.TypeAndValue.TypeName = f.TypeName;
+            if (auto* copied = CreateOverloadedFunctionCall("copy", { argNV }))
+                builder->CreateStore(copied, fieldPtr);
+        }
+
+        auto* resultVal = builder->CreateLoad(structTy, resultSlot, "copyresult");
+        builder->CreateRet(resultVal);
+        builder->restoreIP(savedIP);
         return fn;
     }
 
@@ -7872,6 +8089,15 @@ public:
         auto* fnPtrI8 = builder->CreateExtractValue(funcPtr, {0u}, "fn_i8");
         auto* envPtr  = builder->CreateExtractValue(funcPtr, {1u}, "env_ptr");
 
+        // Strip the OWNED tag (low bit) off the env before the env-last call: an owning heap
+        // env carries the tag (lambda Option A), and the invoker expects a clean pointer to the
+        // captures block. Borrowed/null env (tag clear) is unchanged by the mask.
+        {
+            auto* envInt = builder->CreatePtrToInt(envPtr, builder->getInt64Ty());
+            auto* masked = builder->CreateAnd(envInt, builder->getInt64(~(uint64_t)1));
+            envPtr = builder->CreateIntToPtr(masked, i8PtrTy, "env_untagged");
+        }
+
         // Build invoker function type: (user_params..., i8* env) -> RetType (env-last ABI).
         std::vector<llvm::Type*> paramTypes;
         for (const auto& p : funcPtrType.FuncPtrParams)
@@ -9063,6 +9289,25 @@ public:
     llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<LLVMBackend::NamedVariable> arguments, bool forceRoot = false)
     {
         functionName = ResolveQualifiedName(functionName, forceRoot);
+
+        // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
+        // one generated on demand (the "every value type has an implicit copy() if undefined"
+        // rule). Fires for both user `x.copy()` and the compiler's internal copy calls; an
+        // existing copy() always wins (HasCopyOverloadFor). Pointers/primitives are skipped.
+        if (functionName == "copy" && arguments.size() == 1
+            && !arguments[0].TypeAndValue.Pointer
+            && !arguments[0].TypeAndValue.TypeName.empty()
+            && dataStructures.count(arguments[0].TypeAndValue.TypeName)
+            && !HasCopyOverloadFor(arguments[0].TypeAndValue.TypeName))
+        {
+            // The closure fat type gets an env-cloning copy (not a memberwise one - both its
+            // fields are pointers, which a memberwise copy would shallow-share and double-free).
+            if (arguments[0].TypeAndValue.TypeName == "__closure_fat_ptr")
+                EnsureClosureLifetimeRegistered();
+            else
+                GetOrCreateMemberwiseCopy(arguments[0].TypeAndValue.TypeName);
+        }
+
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
@@ -9431,7 +9676,12 @@ public:
                     if (strTy && GetFunction("operator new"))
                     {
                         auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "litptr");
-                        auto* srcLen = builder->CreateExtractValue(value, { 1u }, "litlen");
+                        // Mask off _len's high OWNED bit before using it as a byte count
+                        // (string-redesign FINAL MODEL) - the bit would inflate allocSize to
+                        // ~2GB and AV the memcpy when the source is an owned string.
+                        auto* srcLen = builder->CreateAnd(
+                            builder->CreateExtractValue(value, { 1u }, "litlenraw"),
+                            builder->getInt32(0x7FFFFFFF), "litlen");
                         auto* allocSize = builder->CreateAdd(
                             builder->CreateZExt(srcLen, builder->getInt64Ty()),
                             builder->getInt64(1), "litbufsz");
@@ -9441,9 +9691,11 @@ public:
                         auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
                         auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
                         builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
+                        // The callee receives a freshly allocated buffer it owns: set the OWNED bit.
+                        auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "ownedlen");
                         value = llvm::UndefValue::get(strTy);
                         value = builder->CreateInsertValue(value, heapPtr, { 0u });
-                        value = builder->CreateInsertValue(value, srcLen,  { 1u });
+                        value = builder->CreateInsertValue(value, ownedLen, { 1u });
                     }
                 }
 

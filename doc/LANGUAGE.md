@@ -1192,6 +1192,25 @@ using Handle  = void*;       // pointer alias - lowers to i8*
 using Vec3    = float[3];    // fixed-array alias - Vec3 v = default; v[0] = 1.0f;
 ```
 
+It may also name a **function (callback) type** - a `function<R(Args)>`. The alias is usable
+everywhere the spelled-out type is: a parameter, a local, a struct field, or a return type, and
+ownership of any captured state flows through it unchanged.
+
+```c
+using EventCallback = function<void(void*)>;        // HANDLE is void*; an event/handler callback
+using WaitCallback  = function<void(void*, bool)>;  // e.g. a WAITORTIMERCALLBACK shape
+using IntUnaryOp    = function<int(int)>;
+
+struct Button { EventCallback onClick = default; }  // alias as a field type
+
+int apply(IntUnaryOp f, int x) { return f(x); }     // alias as a parameter type
+IntUnaryOp makeAdder(int base)                      // alias as a return type
+{
+    IntUnaryOp f = (int x) => x + base;             // bind to a local, then return it
+    return f;
+}
+```
+
 The `*` / `[N]` suffix is part of the alias and is folded onto the use site: `using PP = int*;`
 then `PP* x;` yields `int**` (two pointer levels are the maximum; three is an error). A pointer
 to an aliased fixed array (`Vec3* p`) is rejected like a written `float[3]*`.
