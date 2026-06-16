@@ -5619,6 +5619,16 @@ public:
         bool exprOwned = compilerLLVM->lastCallReturnsOwned;
         if (exprOwned && NamedVarIsString(nv))
             nv.IsOwningString = true;
+        // A plain owned-string VARIABLE read (not a call result) must also carry its owning
+        // status, so passing it directly as a `move string` argument TRANSFERS the buffer rather
+        // than tripping the defensive heap-copy in CreateOverloadedFunctionCall - that copy would
+        // clone the buffer for the callee while the `move` still consumes the source, orphaning
+        // the source's original buffer (a leak hit by list/dictionary/hashset add(move s)).
+        // Gated on the source variable's record actually owning, and on a whole-variable read
+        // (no FieldName) so a struct field access is left to the field-store machinery.
+        else if (!nv.IsOwningString && nv.FieldName.empty() && !nv.CallerName.empty()
+                 && NamedVarIsString(nv) && compilerLLVM->IsVariableOwningString(nv.CallerName))
+            nv.IsOwningString = true;
         compilerLLVM->lastCallReturnsOwned = exprOwned ? true : savedOwned;
         return nv;
     }
@@ -9520,6 +9530,16 @@ public:
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
+                // The moved value now owns whatever buffer the source owned (the source storage
+                // was just zeroed, so nothing else will free it). For `string`, carry the owning
+                // flag so passing `move s` directly as a `move string` argument TRANSFERS the
+                // buffer instead of tripping CreateOverloadedFunctionCall's defensive heap-copy -
+                // that clone would hand the callee a copy while this already-emptied source frees
+                // nothing, orphaning the original buffer (the list/dictionary/hashset add(move s)
+                // leak). Harmless for non-string value types (IsOwningString is string-gated).
+                if (NamedVarIsString(argNV))
+                    result.IsOwningString = argNV.IsOwningString
+                        || (!argNV.CallerName.empty() && compiler->IsVariableOwningString(argNV.CallerName));
                 return result;
             }
             return argNV;

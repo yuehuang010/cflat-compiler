@@ -95,7 +95,13 @@ struct dictionary<K, V>
         }
         int insertSlot = slot;
         if (firstDeleted != -1) insertSlot = firstDeleted;
-        _keys[insertSlot]   = key;
+        // Store the key. A `string` key is deep-copied so the slot owns an independent buffer:
+        // a plain store would alias the caller's `key` argument (a soon-freed temp/local),
+        // leaving the stored key dangling once that buffer is freed. The destructor/remove()/
+        // clear() free this owned copy. All other key types are stored as-is - the dictionary
+        // BORROWS pointer keys (it never frees them), matching its original contract.
+        if const (is_string(K))  _keys[insertSlot] = key.copy();
+        if const (!is_string(K)) _keys[insertSlot] = key;
         // Move (not copy) the incoming value into the slot. `value` is a `move V`
         // parameter, so a plain copy-assign would leave `value` owning the same
         // buffers as the slot; `value`'s scope-exit destructor would then free a
@@ -143,7 +149,10 @@ struct dictionary<K, V>
         {
             updateSlot = slot;
             if (firstDeleted != -1) updateSlot = firstDeleted;
-            _keys[updateSlot]   = key;
+            // Deep-copy a string key into the slot; store all other key types as-is.
+            // See add() for the rationale (avoid aliasing the soon-freed caller argument).
+            if const (is_string(K))  _keys[updateSlot] = key.copy();
+            if const (!is_string(K)) _keys[updateSlot] = key;
             _status[updateSlot] = 1;
             _count++;
         }
@@ -195,6 +204,9 @@ struct dictionary<K, V>
                     if (_values[slot] != nullptr) delete _values[slot];
                 if const (!is_pointer(V))
                     _values[slot].~();
+                // Destruct the owned key too (string etc.); primitive/pointer keys: no-op/unmanaged.
+                if const (is_string(K))
+                    _keys[slot].~();
                 _status[slot] = 2;
                 _count--;
                 return true;
@@ -223,6 +235,8 @@ struct dictionary<K, V>
                     if (_values[i] != nullptr) delete _values[i];
                 if const (!is_pointer(V))
                     _values[i].~();
+                if const (is_string(K))
+                    _keys[i].~();
             }
             i++;
         }
@@ -248,6 +262,11 @@ struct dictionary<K, V>
                     if (_values[i] != nullptr) delete _values[i];
                 if const (!is_pointer(V))
                     _values[i].~();
+                // String keys are deep-copied into the slot by add()/set(), so the dictionary
+                // owns them and must free them here; other key types are stored as-is and
+                // stay caller-managed (pointer keys are never freed).
+                if const (is_string(K))
+                    _keys[i].~();
             }
             i++;
         }

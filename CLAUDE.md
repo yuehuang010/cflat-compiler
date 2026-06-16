@@ -26,6 +26,7 @@ Do not modify the root `./vcpkg.json` without explicit permission.
 
 - After finding the root cause of the issue, consider writing a regression test.
 - When encountering a LLVM assert, after identifying the root cause, then write an proper error message in the compiler to avoid that case.
+- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (gitignored, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed.
 
 ## Building
 

@@ -1422,6 +1422,24 @@ private:
         return {};
     }
 
+    // True when the named variable is a string local/param that currently OWNS its heap buffer
+    // (its scope-exit destructor will free it). Lets the call path tell a plain owned-string
+    // VARIABLE read apart from a borrowed one, so passing it as a `move string` argument
+    // transfers the buffer instead of triggering the defensive heap-copy in
+    // CreateOverloadedFunctionCall (which would clone the buffer and orphan the source's - a leak).
+    bool IsVariableOwningString(const std::string& name) const
+    {
+        if (name.empty()) return false;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return it->second.IsOwningString;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return it->second.IsOwningString;
+        }
+        return false;
+    }
+
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount)
     {
         auto* zeroCond = builder->CreateICmpEQ(refCount, builder->getInt32(0), "refiszero");

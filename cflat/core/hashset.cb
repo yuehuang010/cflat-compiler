@@ -46,10 +46,23 @@ struct hashset<T>
         _count = 0;
         _init(_capacity * 2);
 
+        // Direct insert (mirrors dictionary._rehash): relocate each live element with a raw
+        // slot-to-slot store, NOT add(). add() deep-copies a string element, which would clone
+        // every element on each grow and orphan the originals (delete[_] below skips element
+        // dtors) - a leak. The raw store transfers the {ptr,len} bits; delete[_] then frees only
+        // the old buffer array, leaving the elements owned by the new table.
         int i = 0;
         while (i < oldCap)
         {
-            if (oldStatus[i] == 1) add(oldKeys[i]);
+            if (oldStatus[i] == 1)
+            {
+                int slot = _slot(oldKeys[i]);
+                while (_status[slot] != 0)
+                    slot = (slot + 1) % _capacity;
+                _keys[slot]   = oldKeys[i];
+                _status[slot] = 1;
+                _count++;
+            }
             i++;
         }
 
@@ -73,7 +86,13 @@ struct hashset<T>
         }
         int insertSlot = slot;
         if (firstDeleted != -1) insertSlot = firstDeleted;
-        _keys[insertSlot] = value;
+        // Store the element. A `string` element is deep-copied so the slot owns an independent
+        // buffer: a plain store would alias the caller's `value` argument (a soon-freed temp/
+        // local) and dangle once it is freed. The destructor/remove()/clear() free this owned
+        // copy. All other element types are stored as-is - the set BORROWS pointer elements (it
+        // never frees them), matching its original contract.
+        if const (is_string(T))  _keys[insertSlot] = value.copy();
+        if const (!is_string(T)) _keys[insertSlot] = value;
         _status[insertSlot] = 1;
         _count++;
         return true;
@@ -101,6 +120,10 @@ struct hashset<T>
         {
             if (_status[slot] == 1 && _keys[slot] == value)
             {
+                // Free the owned string copy; other element types are stored as-is and stay
+                // caller-managed (pointer elements are never freed).
+                if const (is_string(T))
+                    _keys[slot].~();
                 _status[slot] = 2;
                 _count--;
                 return true;
@@ -120,12 +143,30 @@ struct hashset<T>
     void clear()
     {
         int i = 0;
+        while (i < _capacity)
+        {
+            if (_status[i] == 1)
+                if const (is_string(T))
+                    _keys[i].~();
+            i++;
+        }
+        i = 0;
         while (i < _capacity) { _status[i] = 0; i++; }
         _count = 0;
     }
 
     ~hashset()
     {
+        // Free owned string element copies before freeing the raw buffer; other element types
+        // are stored as-is and stay caller-managed (pointer elements are never freed).
+        int i = 0;
+        while (i < _capacity)
+        {
+            if (_status[i] == 1)
+                if const (is_string(T))
+                    _keys[i].~();
+            i++;
+        }
         if (_keys   != nullptr) delete[_] _keys;
         if (_status != nullptr) delete[] _status;
     }

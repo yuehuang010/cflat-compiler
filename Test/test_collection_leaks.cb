@@ -18,6 +18,7 @@
 import "string.cb";
 import "list.cb";
 import "dictionary.cb";
+import "hashset.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
@@ -117,6 +118,54 @@ extern int main()
 
         d.remove(1);                       // value-type V destructed on remove
         total++; passed += Test("dict nested remove", d.count(), 0);
+    }
+
+    // === Bug 9a: list<string>.add(move <owned-string-local>) TRANSFERS the buffer ===
+    // A named owned string passed via `move` to a `move string` parameter must transfer its
+    // buffer into the callee, not be defensively heap-copied - the copy would be handed to the
+    // slot while the (already-emptied) source frees nothing, orphaning the original buffer: a
+    // leak of one heap buffer per inserted element. Fix: ParseMoveExpression flags the moved
+    // string value owning, so CreateOverloadedFunctionCall skips the defensive clone.
+    {
+        list<string> ls = default;
+        int i = 0;
+        while (i < 6) { string item = "item_" + i.toString(); ls.add(move item); i++; }
+        total++; passed += Test("list<str> move-local add count", ls.count(), 6);
+        total++; passed += Test("list<str> move-local add elem",  ls.get(5), "item_5");
+    }
+
+    // === Bug 9b: dictionary<string,K> deep-copies owning string KEYS and frees them ===
+    // String keys built from owned temps ("k"+i) are deep-copied into the slot (a plain store
+    // would alias the soon-freed argument and dangle); the slot's owned copy is freed on
+    // remove() and on destruction. set()/remove() locate the key via that owned copy.
+    {
+        dictionary<string, int> d = default;
+        int i = 0;
+        while (i < 6) { d.add("k" + i.toString(), i); i++; }
+        total++; passed += Test("dict<str,int> concat-key count",  d.count(), 6);
+        total++; passed += Test("dict<str,int> concat-key lookup", d.get("k3"), 3);
+        d.set("k3", 99);                       // overwrite existing key (found via the owned copy)
+        total++; passed += Test("dict<str,int> set existing count", d.count(), 6);
+        total++; passed += Test("dict<str,int> set value",          d.get("k3"), 99);
+        d.remove("k2");                        // removed key's owned copy freed
+        total++; passed += Test("dict<str,int> remove count",       d.count(), 5);
+    }
+
+    // === Bug 9c: hashset<string> owns its string ELEMENTS (deep-copied), frees them ===
+    // Owned-temp elements are deep-copied into the slot; growth past initial capacity relocates
+    // them with a raw slot-to-slot store (no per-element clone); remove()/clear()/the destructor
+    // free the owned copies. (Pointer elements stay borrowed - see test_generics hashset<ptr>.)
+    {
+        hashset<string> hs = default;
+        int i = 0;
+        while (i < 10) { hs.add("e" + i.toString()); i++; }   // grows past initial capacity (rehash)
+        total++; passed += Test("hashset<str> count",        hs.count(), 10);
+        total++; passed += Test("hashset<str> contains",     hs.contains("e7"), true);
+        total++; passed += Test("hashset<str> dup add",      hs.add("e3"), false);
+        hs.remove("e7");                       // removed element's owned copy freed
+        total++; passed += Test("hashset<str> after remove", hs.contains("e7"), false);
+        hs.clear();                            // every owned element freed, buffer reusable
+        total++; passed += Test("hashset<str> after clear",  hs.count(), 0);
     }
 
     // === Bug 4: owned-string temp operand of +, ==/!=/relational, and switch scrutinee ===
