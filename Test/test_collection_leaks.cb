@@ -47,6 +47,34 @@ function<int(int)> makeLeakAdder(int base)
 // caller's temporary env is freed at end of the call statement by FlushOwnedClosureTemps).
 int applyLeak(function<int(int)> fn, int v) { return fn(v); }
 
+// === String-RETURN ownership (runtime-bit model) regression helpers ===
+// Before the fix, the string destructor was gated on a COMPILE-TIME `IsOwningString` flag
+// instead of the runtime OWNED bit (_len high bit), so a genuinely-owned string returned
+// from a PLAIN (non-`move`) `string` function was never freed by the caller's local -> LEAK.
+// The helpers below exercise the return shapes the fix made leak- and double-free-clean:
+//   - returnOwnedConcat: returns a fresh owned temp (operator+ result)
+//   - returnOwnedLocal:  returns a whole owned LOCAL (moved out - source zeroed on return)
+//   - Greeter.greet:     owned string returned from a MEMBER function
+// while a list element read confirms a BORROW return is handed back with the owned bit
+// cleared, so the caller does not double-free a buffer the container still owns.
+string returnOwnedConcat(string who)
+{
+    string g = "hello ";
+    return g + who;            // owned concat temp, plain `string` return type
+}
+
+string returnOwnedLocal()
+{
+    string s = "x" + "yz";     // owned local
+    return s;                  // moved to caller: source zeroed so it is not double-freed
+}
+
+struct Greeter
+{
+    string prefix = default;
+    string greet(string who) { return prefix + who; }   // owned result from a member fn
+};
+
 extern int main()
 {
     HeapAudit.enable();
@@ -316,6 +344,46 @@ extern int main()
         v2 = v1;                          // free v2's old env, clone v1's env into v2
         total++; passed += Test("alias EVENT clone (v2)", v2(1), 41);
         total++; passed += Test("alias EVENT source live (v1)", v1(2), 42);
+    }
+
+    // === String RETURNS: owned transfer + borrow (runtime-bit ownership model) ===
+    // A plain `string` return of an owned value transfers ownership to the caller's local
+    // (freed on scope exit); a borrow return (a container element) is handed back non-owning
+    // so it is not double-freed. The caller never sees the function's `move`-ness - the
+    // runtime owned bit alone decides whether the local frees - so this works for free
+    // functions, member functions, AND lambdas. All of it must be leak/double-free clean.
+    {
+        string greeting = returnOwnedConcat("world");      // owned temp: "hello world"
+        total++; passed += Test("owned concat return", greeting.length(), 11);
+
+        string moved = returnOwnedLocal();                  // owned local moved out: "xyz"
+        total++; passed += Test("owned local move-return", moved.length(), 3);
+
+        Greeter gr = default;
+        gr.prefix = "hi-";
+        string built = gr.greet("bob");                     // owned member-fn result: "hi-bob"
+        total++; passed += Test("owned member-fn return", built.length(), 6);
+
+        // Lambda returning a string: the lambda invoker shares the same return-ownership path,
+        // so an owned temp (concat) and an owned local moved out of the body both transfer to
+        // the caller's local and free on scope exit - no leak, no double-free.
+        function<string()> tempFn = () => { return "lam" + "bda"; };   // owned concat in a lambda
+        string fromLambdaTemp = tempFn();
+        total++; passed += Test("lambda owned temp return", fromLambdaTemp.length(), 6);
+
+        function<string()> localFn = () => { string t = "x" + "y"; return t; };  // owned local
+        string fromLambdaLocal = localFn();
+        total++; passed += Test("lambda owned local return", fromLambdaLocal.length(), 2);
+
+        // Borrow return: list.get hands the element back as a non-owning borrow (owned bit
+        // cleared). The list still owns and frees it on teardown; the local `picked` must NOT
+        // free it (a double-free would abort), and the element must survive for the list.
+        list<string> fruits = default;
+        fruits.add("a" + "pple");                           // owned element ("apple")
+        fruits.add("ber" + "ry");                           // owned element ("berry")
+        string picked = fruits.get(0);                      // borrow of an owned element
+        total++; passed += Test("list element borrow return", picked.length(), 5);
+        total++; passed += Test("list element still owned", fruits.get(1).length(), 5);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

@@ -3369,6 +3369,32 @@ public:
                         auto right = LoadNamedVariable(returnNV);
                         ProcessPlusPlus();
 
+                        // String ownership transfer (runtime-bit model). Classify the returned
+                        // value once, before the owned-return flags below are cleared.
+                        //  - A whole string LOCAL read (its NamedVariable.Storage is an alloca, not
+                        //    a field/element GEP) that does not itself borrow an owned field is
+                        //    MOVED to the caller by CreateReturnCall (which zeroes the source), so
+                        //    its OWNED bit must stay set.
+                        //  - A genuinely-owned temp / new / owned call result keeps its bit too.
+                        //  - Anything else returned by a plain (non-`move`) string function is a
+                        //    BORROW of a location someone else owns (a field/element read such as
+                        //    list.get's `return _data[i]`, or a local that borrows an owned field).
+                        //    Clear the OWNED bit so the caller's always-run string destructor does
+                        //    not free a buffer the real owner still holds.
+                        bool returnExprOwned = compiler->IsOwningValue(right)
+                            || compiler->lastCallReturnsOwned
+                            || compiler->lastOwningResult
+                            || returnNV.IsOwningString;
+                        bool returnIsWholeLocal = returnNV.FieldName.empty()
+                            && returnNV.Storage != nullptr
+                            && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+                            && !returnNV.BorrowsOwnedString;
+                        bool clearReturnedStringBorrowBit =
+                            NamedVarIsString(returnNV)
+                            && !compiler->currentFunctionReturnsOwned
+                            && !returnExprOwned
+                            && !returnIsWholeLocal;
+
                         if (compiler->currentFunctionReturnsOwned && right != nullptr
                             && !llvm::isa<llvm::Constant>(right)
                             && right->getType()->isPointerTy())
@@ -3413,6 +3439,11 @@ public:
                         // or we would free an env the caller now owns (double free on its teardown).
                         compiler->UnregisterOwnedClosureTemp(right);
                         compiler->FlushOwnedClosureTemps();
+                        // Borrow returns: hand the caller a non-owning copy (see the classification
+                        // above). Done after the temp-flush so the unregister logic above still sees
+                        // the original loaded value; a borrow is never a registered owned temp.
+                        if (clearReturnedStringBorrowBit)
+                            right = compiler->ClearStringOwnedBit(right);
                         // Pass the returned local's storage so a by-value struct return whose
                         // full-destructor frees members (e.g. owned string fields) moves
                         // ownership to the caller instead of being destructed here. The struct

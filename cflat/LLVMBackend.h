@@ -1653,11 +1653,19 @@ private:
             auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
             if (it != dataStructures.end())
             {
-                // String destructor is only called when the local owns its buffer; it has
-                // no dtor-bearing members so the registered string dtor is the full dtor.
+                // String is a library value type whose destructor frees iff the runtime
+                // OWNED bit (_len's high bit) is set, so emit it UNCONDITIONALLY - like every
+                // other value type - and let the runtime bit decide. The legacy compile-time
+                // IsOwningString gate skipped genuinely-owned values whose ownership the
+                // compiler could not prove (e.g. an owned string returned from a plain
+                // `string` function), leaking their buffer. The only local that carries a SET
+                // owned bit it does NOT own is a field-borrow alias (`string b = obj.name;`):
+                // the owning struct frees that buffer, so skip it here to avoid a double-free.
+                // (Moved-from sources are zeroed -> bit clear -> dtor no-op; borrows of
+                // literals / coercions have the bit clear too, so emitting is harmless.)
                 if (namedVar.TypeAndValue.TypeName == "string")
                 {
-                    if (!namedVar.IsOwningString) continue;
+                    if (namedVar.BorrowsOwnedString) continue;
                     EnsureStringDtorRegistered();
                     if (it->second.Destructor == nullptr) continue;
                     auto* fn = it->second.Destructor;
@@ -2387,6 +2395,22 @@ private:
         b.CreateRetVoid();
 
         RegisterDestructor("string", dtorFn);
+    }
+
+    // Return a copy of a `string` SSA struct value with its OWNED bit (the high bit of
+    // _len) cleared, turning an owned value into a BORROW. Used at borrow-materialization
+    // sites - e.g. a plain (non-`move`) string return of a value the function does not own,
+    // such as `list.get`'s `return _data[i]` - so the caller's always-run string destructor
+    // treats the returned value as a borrow and does not free a buffer another owner (the
+    // container element, here) still holds. No-op if `value` is not a `string` struct value.
+    llvm::Value* ClearStringOwnedBit(llvm::Value* value)
+    {
+        if (value == nullptr) return value;
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (strTy == nullptr || value->getType() != strTy) return value;
+        auto* len    = builder->CreateExtractValue(value, { 1 }, "borrow.len");
+        auto* masked = builder->CreateAnd(len, builder->getInt32(0x7FFFFFFF), "borrow.len.noown");
+        return builder->CreateInsertValue(value, masked, { 1 }, "borrow.str");
     }
 
     // Return the function that fully destroys an instance of `typeName`: the user
@@ -10653,11 +10677,20 @@ public:
                     {
                         for (auto& [varName, nv] : frame.namedVariable)
                         {
-                            if (nv.Storage == srcAlloca && nv.IsOwningString
-                                && nv.TypeAndValue.TypeName == "string")
+                            // Returning a whole string LOCAL is a MOVE to the caller: zero the
+                            // source so its always-run scope-exit destructor is a no-op on the
+                            // moved-out value (the runtime owned bit rides along in `value`, so
+                            // the caller frees iff the local owned its buffer) - the same
+                            // zero-the-source discipline every other value type uses. A local
+                            // that merely BORROWS an owned field (BorrowsOwnedString) is left
+                            // alone: the owning struct frees that buffer, and the borrow's bit
+                            // was already cleared at the return site.
+                            if (nv.Storage == srcAlloca && nv.TypeAndValue.TypeName == "string"
+                                && !nv.BorrowsOwnedString)
                             {
                                 ownedStringReturnVar = &nv;
-                                nv.IsOwningString = false;  // suppress destructor
+                                builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(loadInst->getType()), srcAlloca);
                                 return;
                             }
                             if (nv.Storage == srcAlloca && nv.IsOwning)
@@ -10721,8 +10754,10 @@ public:
             if (it->isFunction) break;
         }
 
-        // Restore flags (clean state, though the scope is about to be popped anyway)
-        if (ownedStringReturnVar) ownedStringReturnVar->IsOwningString = true;
+        // Restore flags (clean state, though the scope is about to be popped anyway).
+        // The returned string local was moved out by zeroing its storage (not by toggling
+        // IsOwningString), so nothing to restore for it - its always-run dtor now no-ops on
+        // the zeroed value.
         if (ownedPtrReturnVar)    ownedPtrReturnVar->IsOwning = true;
         returnedStructDtorSkipAlloca = prevStructSkip;
 
