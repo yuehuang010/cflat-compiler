@@ -1,15 +1,3 @@
-// Args packet allocated with malloc so thread infrastructure bypasses any
-// per-program tracked allocator.
-//
-// _allocator carries the allocator that the child thread should install in its
-// __active_allocator TLS slot before calling fn. start() obtains it by calling
-// __active_allocator.spawn_child() on the parent thread, which lets allocators
-// choose between sharing (MallocAllocator returns self) and per-thread
-// instancing (BucketAllocator returns a fresh child registered for parent
-// cleanup). Without this propagation, the child starts with a null allocator
-// and any new/delete falls through to CRT malloc/free, which corrupts the
-// heap for vmem-backed BucketAllocator pages.
-// ---------------------------------------------------------------------------
 // Per-thread floating-point environment (traps + flush-to-zero / denormals).
 //
 // The SSE control word (MXCSR) is per-thread hardware state. By default CFlat
@@ -76,9 +64,6 @@ struct __ThreadArgs {
     int _fpConfig = 0;
 };
 
-// Move-typed args packet: the fn signature carries 'move void*', so the call
-// inside the trampoline transfers ownership of ctx to fn (matching the
-// move-overload of Thread.start()).
 struct __ThreadArgsMove {
     function<int(move void*)> fn = nullptr;
     void* ctx = nullptr;

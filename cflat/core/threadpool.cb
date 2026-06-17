@@ -412,9 +412,8 @@ class ThreadPool {
     // full; in that case the pool deletes ctx, so the caller never frees ctx
     // after this call.
     move TaskHandle* submit(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        // Refuse BEFORE consuming ctx.  cflat's move tracker is path-
-        // insensitive, so all ctx consumption funnels through the single
-        // store into t.ctx below.
+        // Refuse BEFORE consuming ctx; all ctx consumption funnels through
+        // the single store into t.ctx below.
         if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
             delete (void*)ctx;
             return nullptr;
@@ -458,7 +457,7 @@ class ThreadPool {
     // task was accepted, false if the pool refused (queue full / shutdown),
     // in which case the pool deletes ctx.
     bool submitDetached(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        // Refuse BEFORE consuming ctx; cflat's move tracker is path-insensitive.
+        // Refuse BEFORE consuming ctx; all ctx consumption goes through t.ctx below.
         if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
             delete (void*)ctx;
             return false;
@@ -502,12 +501,6 @@ class ThreadPool {
     // Returns an owning TaskHandle* on success, nullptr on shutdown / queue
     // saturation / duplicate-then.  On nullptr the pool deletes ctx.
     move TaskHandle* then(TaskHandle* dep, function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
-        // _inlineMode is not currently auto-triggered (see init()), so then()
-        // does not need a synchronous fast-path.  If inline mode is ever
-        // re-enabled, dep will already be done and the cleanest re-introduction
-        // is to call submit(fn, ctx, priority) here - but it must be the only
-        // ctx-consuming early-return to satisfy cflat's move tracker (one
-        // return-after-consume + one main-flow consume is the supported shape).
         if (_workers == nullptr || _stop.stop_requested()) {
             delete (void*)ctx;
             return nullptr;

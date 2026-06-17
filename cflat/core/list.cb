@@ -30,11 +30,6 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     void add(move T value)
     {
         if (_size >= _capacity) _grow();
-        // Move the incoming value into the slot. `value` is a move parameter (the
-        // list takes ownership), so transferring instead of copying zeroes the
-        // source; otherwise the scope-exit destructor of `value` would free a buffer
-        // the list now references - a double free for owning element types such as a
-        // nested list<list<int>>.
         _data[_size] = move value;
         _size++;
     }
@@ -46,14 +41,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Overwrite the element at index.  Takes ownership when T is a pointer type.
+    // The old element is freed/destructed before the new one is stored.
     void set(int index, move T value)
     {
-        // Free/destruct the element being overwritten first, or an owning element
-        // leaks: a pointer element's pointee, or a value-type element with owned
-        // buffers (e.g. string, or a nested container). Mirrors dictionary<K,V>.set.
-        // Slot assignment below is a raw overwrite (no implicit LHS destructor - the
-        // same property removeAt()/_grow() rely on), so this does not double-free.
-        // For primitive T the value-type branch's `.~()` is a no-op.
         if const (is_pointer(T))
         {
             if (_data[index] != nullptr) delete _data[index];
@@ -62,9 +52,6 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         {
             _data[index].~();
         }
-        // Move the incoming value into the slot (see add() for the rationale): the
-        // move parameter must transfer ownership, not copy, so the scope-exit
-        // destructor of `value` does not free a buffer the list now references.
         _data[index] = move value;
     }
 
@@ -86,11 +73,8 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Remove the element at index, shifting subsequent elements left.
-    // When T is a pointer type, the removed element is freed (destructor called +
-    // memory released). For a value-type element with owned buffers (e.g. string or
-    // a nested container) the element is destructed in place so it does not leak;
-    // for a primitive T the `.~()` is a no-op. The shift below is a raw overwrite,
-    // so destructing index first does not double-free.
+    // When T is a pointer type, the removed element is freed. For value types with
+    // owned buffers (e.g. string or a nested container), the element is destructed.
     void removeAt(int index)
     {
         if const (is_pointer(T))
@@ -112,11 +96,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         return _size;
     }
 
-    // Remove all elements. Pointer elements are freed; value-type elements with
-    // owned buffers (e.g. string or a nested container) are destructed in place via
-    // `.~()` so they do not leak (primitive elements: no-op). This matches what the
-    // destructor's `delete[_size] _data` does per element, and mirrors
-    // dictionary<K,V>.clear. Backing buffer is kept - capacity is unchanged.
+    // Remove all elements. Pointer elements are freed; value types with owned
+    // buffers (e.g. string or nested containers) are destructed. Backing buffer
+    // is kept - capacity is unchanged.
     void clear()
     {
         if const (is_pointer(T))
@@ -141,10 +123,8 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // ── ICopyable ──────────────────────────────────────────────────────────
-    // Return an independent copy of this list using the active allocator.
-    // string elements are deep-copied (string owns a heap buffer, so a shallow
-    // element copy would alias the buffer and double-free); primitive and
-    // pointer elements are copied by value (a list of pointers shares pointees).
+    // Return an independent deep copy of this list. String elements are deep-copied;
+    // primitive and pointer elements are copied by value (a list of pointers shares pointees).
     move list<T> copy()
     {
         list<T> result;

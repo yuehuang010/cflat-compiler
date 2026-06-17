@@ -46,11 +46,6 @@ struct hashset<T>
         _count = 0;
         _init(_capacity * 2);
 
-        // Direct insert (mirrors dictionary._rehash): relocate each live element with a raw
-        // slot-to-slot store, NOT add(). add() deep-copies a string element, which would clone
-        // every element on each grow and orphan the originals (delete[_] below skips element
-        // dtors) - a leak. The raw store transfers the {ptr,len} bits; delete[_] then frees only
-        // the old buffer array, leaving the elements owned by the new table.
         int i = 0;
         while (i < oldCap)
         {

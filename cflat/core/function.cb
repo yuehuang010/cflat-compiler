@@ -1,30 +1,11 @@
-// core/function.cb - closure env memory primitives (lambda Option A).
+// core/function.cb - internal closure environment memory primitives.
 //
-// A capturing `function<R(Args)>` value stores its captured variables in a heap
-// "env" block laid out as an 8-byte size header followed by the captures. The fat
-// value's env field points at the captures region (base + 8) with the low bit SET
-// as an OWNED tag - heap blocks are at least 8-byte aligned, so bit 0 is free. A
-// borrowed or non-capturing closure has a null/untagged env and is never freed or
-// cloned (a non-capturing lambda, a bare-function wrap, a C-fnptr thunk, or a
-// program onStdout hook).
-//
-// These three primitives hold the only env arithmetic; the compiler kernel (lambda
-// lowering, the closure destructor, and copy()) calls into them. A closure's
-// ownership then rides the value-type machinery exactly like `string`:
-// move-by-default, clone-on-copy, and scope-exit / struct-field teardown.
-//
-// The block is allocated with `new i8[]` / freed with `delete[]` so the allocation
-// routes through operator new/delete - the active allocator AND the HeapAudit leak
-// oracle both see it. Addresses are manipulated as i64 (with `(i8*)`/`(i64*)` casts
-// via named locals) so the raw allocation is not aliased into a second OWNING pointer
-// (which the ownership tracker would treat as a move).
+// These functions manage the heap-allocated capture block for capturing lambdas.
+// They are called by the compiler; do not call them directly from user code.
 
 import "memory.cb";
 
-// Allocate `n` raw bytes through operator new and transfer the buffer out. Kept as
-// its own function so the `new i8[]` owning local is released by an identity return;
-// the result is then an ordinary, untracked function value the caller can freely
-// reinterpret without a move.
+// Allocate `n` raw bytes through operator new.
 i8* __closure_env_alloc(i64 n)
 {
     i8* base = new i8[n];

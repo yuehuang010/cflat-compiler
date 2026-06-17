@@ -9,8 +9,8 @@
 //   atomic<T>       - generic load/store/CAS (T = i32 or i64)
 //
 // The __atomic_* functions below are stubs: the compiler intercepts every
-// call whose name starts with __atomic_ and emits LLVM atomic IR instead of
-// a real call.  No object file for these functions is ever linked.
+// call whose name starts with __atomic_ and emits the appropriate atomic
+// instructions.  No object file for these functions is ever linked.
 
 // -------------------------------------------------------------------------
 // Stubs - intercepted by the compiler; never actually called.

@@ -1,7 +1,7 @@
-// channel<T> - bounded MPMC ring buffer, Vyukov sequence-based algorithm.
+// channel<T> - bounded MPMC lock-free ring buffer.
 //
-// Lock-free.  N producers and M consumers may call push/try_push and
-// pop/try_pop concurrently without data races.
+// N producers and M consumers may call send/try_push and receive/try_pop
+// concurrently without data races.
 //
 // Usage:
 //   channel<int> ch;
@@ -15,13 +15,16 @@
 //   bool ok = ch.try_pop(&out);
 //   ch.destroy();
 //
+// Capacity MUST be a power of two.  init() rounds up non-power-of-two values
+// automatically.
+//
 // Pairing with external wakeup signals
 // -------------------------------------
-// try_pop can transiently return false when a producer has CAS-claimed _head
-// but has not yet stored its seq value - this is intrinsic to the Vyukov
-// algorithm.  Callers that pair try_pop with a counting semaphore (one
-// release() per push, one acquire() per consumer wake-up) MUST handle this
-// case by re-releasing the wakeup token so another consumer can retry:
+// try_pop can transiently return false when a producer has claimed a slot
+// but has not yet stored its sequence value.  Callers that pair try_pop with
+// a counting semaphore (one release() per push, one acquire() per consumer
+// wake-up) MUST handle this case by re-releasing the wakeup token so another
+// consumer can retry:
 //
 //   sem.acquire();
 //   if (!ch.try_pop(&v)) {
@@ -31,23 +34,6 @@
 //
 // This is the standard pattern for "transient-empty tolerant" consumption.
 // Without it, slow publishes can leak wake-up tokens and stall consumers.
-//
-// Algorithm (Dmitry Vyukov, 2010):
-//   Each slot carries a sequence number alongside the stored value.
-//   _head and _tail are monotonically increasing i64 cursors advanced via CAS.
-//   A producer claims slot (pos & _mask) by CAS-ing _head from pos to pos+1.
-//   It writes the value then stores seq[slot] = pos+1 to signal the consumer.
-//   A consumer claims slot (pos & _mask) by CAS-ing _tail from pos to pos+1.
-//   It reads the value then stores seq[slot] = pos+_cap to recycle the slot.
-//
-// Capacity MUST be a power of two - the hot path uses bitmasking (pos & _mask)
-// instead of division.  init() enforces this; non-power-of-two values are
-// rounded up to the next power of two automatically.
-//
-// Cache line layout (64 bytes each):
-//   Line 0: _buf* + _seq* + _cap + _mask          - read-only after init
-//   Line 1: _head                                  - producer-local
-//   Line 2: _tail                                  - consumer-local
 
 import "interfaces.cb";
 import "atomic.cb";
@@ -56,30 +42,26 @@ import "intrinsic.cb";   // pause() - spin-loop hint for the blocking send/recei
 
 class channel<T>
 {
-    // ── cache line 0: shared read-only config ─────────────────────────────────
-    // buf*(8) + seq*(8) + cap(8) + mask(8) + 4xpad(32) = 64 bytes
+    // Ring buffer and sequence array (read-only after init, shared across threads).
     T*   _buf  = nullptr;
     i64* _seq  = nullptr;
     i64  _cap  = 0;
     i64  _mask = 0;
     i64  _c0 = 0; i64 _c1 = 0; i64 _c2 = 0; i64 _c3 = 0;
 
-    // ── cache line 1: producer cursor ─────────────────────────────────────────
-    // head(8) + 7xpad(56) = 64 bytes
+    // Producer write cursor (cache-line-padded to avoid false sharing).
     i64 _head = 0;
     i64 _h0 = 0; i64 _h1 = 0; i64 _h2 = 0; i64 _h3 = 0;
     i64 _h4 = 0; i64 _h5 = 0; i64 _h6 = 0;
 
-    // ── cache line 2: consumer cursor ─────────────────────────────────────────
-    // tail(8) + 7xpad(56) = 64 bytes
+    // Consumer read cursor (cache-line-padded to avoid false sharing).
     i64 _tail = 0;
     i64 _t0 = 0; i64 _t1 = 0; i64 _t2 = 0; i64 _t3 = 0;
     i64 _t4 = 0; i64 _t5 = 0; i64 _t6 = 0;
 
-    // ── cache line 3: producer refcount + close flag ──────────────────────────
-    // producers(8) + closed(8) + 6xpad(48) = 64 bytes
+    // Producer refcount and close flag.
     //
-    // Rust-mpsc-style termination: each live producer registers via
+    // Each live producer registers via
     // add_producer().  When the last one leaves (close_producer() brings the
     // count to 0) the channel is marked closed, and the blocking
     // receive(T* out) overload reports EOF once the buffer is drained.

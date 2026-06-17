@@ -31,11 +31,7 @@ struct array<T>
 
     // Overwrite the element at index. Takes ownership when T owns resources (a pointer
     // element, or a value-type with owned buffers such as string or a nested container).
-    // Mirrors list<T>.set / dictionary<K,V>.set: free/destruct the element being
-    // overwritten first, then MOVE the incoming value in. A plain `_ptr[index] = value`
-    // with a by-value `T value` parameter shallow-copies an owning element and then frees
-    // it twice - the slot's copy and the parameter's scope-exit destructor share one buffer
-    // (heap corruption / double free). For primitive T the value-type `.~()` is a no-op.
+    // The old element is freed/destructed before the new one is stored.
     void set(int index, move T value)
     {
         if const (is_pointer(T))

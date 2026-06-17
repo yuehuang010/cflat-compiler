@@ -11,24 +11,11 @@ import "channel.cb";
 import "arena_channel.cb";
 import "stream.cb";
 
-// ── program args re-home ───────────────────────────────────────────────────
-// A program's args list<string> is built by the caller (typically the main
-// thread, where the active allocator is null -> CRT malloc) and then moved into
-// the program. Because main(move list<string> args) owns the list, it would free
-// those CRT buffers under the program's allocator - a cross-allocator free.
-//
-// The trampoline (EmitProgramRunWrapper) calls __prog_adopt_args right after it
-// installs the program allocator: it deep-copies the args into the program
-// allocator and frees the originals under the CRT, so main owns - and frees - a
-// list that the program allocator actually allocated. Keeping the move API
-// (run() still takes ownership) but re-homing the contents.
+// Internal helpers: re-home the args list from the caller's allocator into the
+// program's own allocator so the program can safely free them on exit.
 
-// Free a list<string> under the currently-active allocator (the move-param
-// destructor releases the buffers + backing array at scope exit).
 void __prog_drop_args(move list<string> s) { }
 
-// Deep-copy src into the active (program) allocator, free the originals under
-// the CRT, and return the program-owned copy.
 move list<string> __prog_adopt_args(move list<string> src)
 {
     list<string> dst = src.copy();          // active == program allocator -> dst owned by it

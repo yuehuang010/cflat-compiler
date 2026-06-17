@@ -1,21 +1,17 @@
 // Core string types.
 //
-// `string` is a built-in value type { i8* _ptr, i32 _len } with:
+// `string` is a value type with a pointer to NUL-terminated bytes and a byte count:
 //   i8* data()   - pointer to the underlying bytes (null-terminated)
 //   i32 length() - number of bytes, not counting the terminator
 //
 // String literals are automatically wrapped into a `string` by the compiler.
 // Use `operator string` overloads to convert other types to `string`.
 //
-// Ownership (string-redesign FINAL MODEL): _len's HIGH BIT is the OWNED flag.
-//   1 = this string owns _ptr (a freshly allocated, NUL-terminated buffer) and the
-//       compiler's ~string frees it at scope exit / on container teardown.
-//   0 = borrowed (string literal, char* wrap, string_view) - never freed.
-// The built-in length() masks the bit off, so the low 31 bits are the byte count (max
-// 2^31-1). Build an OWNING string through `_strOwned` below so the bit is set in exactly
-// one place; a borrowed string is built by assigning _ptr/_len directly with the bit clear.
-// `string` is move-by-default: `string b = a` transfers ownership (a is consumed); use
-// `b = a.copy()` for an independent deep copy.
+// Ownership: a string is either OWNED (holds a heap-allocated buffer that is freed on
+// scope exit or container teardown) or BORROWED (a string literal or char* wrap that is
+// never freed).  `string` is move-by-default: `string b = a` transfers ownership (a is
+// consumed); use `b = a.copy()` for an independent deep copy.  Borrowed strings (e.g.
+// a literal assigned to a variable) carry no heap buffer and are safe to let go out of scope.
 //
 // Note: all character operations are byte/ASCII-level.  UTF-8 is valid to
 // store but only the byte count is tracked; multi-byte codepoints are not
@@ -24,10 +20,8 @@
 import "memory.cb";
 import "list.cb";
 
-// Wrap a freshly allocated, NUL-terminated buffer of `len` bytes into an OWNING string
-// (owned bit set). `move` marks the return owned so the caller's local frees it on scope
-// exit. This is the single place the owned bit is set; every allocating transform routes
-// its result here.
+// Wrap a freshly allocated, NUL-terminated buffer of `len` bytes into an OWNING string.
+// The returned string takes ownership of `buf`; it will be freed at scope exit.
 move string _strOwned(move i8* buf, i32 len)
 {
     string result = default;
@@ -36,12 +30,9 @@ move string _strOwned(move i8* buf, i32 len)
     return result;
 }
 
-// ── string core accessors (library type) ─────────────────────────────────────
-// data()/length()/hash() were compiler built-ins; they now live here as ordinary
-// cflat so `string` is a library type. The compiler keeps only the {i8*,i32} layout
-// + literal lowering and never calls these internally (it inlines field access).
+// ── string core accessors ────────────────────────────────────────────────────
 
-// Number of bytes in the string (the low 31 bits of _len; the high bit is the OWNED flag).
+// Number of bytes in the string.
 i32 length(string self)
 {
     return self._len & 0x7FFFFFFF;
@@ -55,8 +46,7 @@ i8* data(string self)
     return self._ptr;
 }
 
-// FNV-1a hash over the bytes. Matches the previous compiler builtin bit-for-bit (basis
-// 0x811C9DC5, prime 0x01000193, byte zero-extended) so hash-keyed containers are stable.
+// FNV-1a hash over the bytes (basis 0x811C9DC5, prime 0x01000193, byte zero-extended).
 i32 hash(string self)
 {
     i8* p = self._ptr;
@@ -70,13 +60,6 @@ i32 hash(string self)
     }
     return h;
 }
-
-// NOTE: the `string` DESTRUCTOR intentionally stays compiler-side (EnsureStringDtorRegistered),
-// NOT here. The compiler creates OWNED strings on its own - via "{x}" interpolation (__strconcat)
-// and the move-param heap-copy - WITHOUT the program importing this file, and those still need a
-// destructor at scope exit. So the dtor must be available even under --no-runtime / no string.cb
-// import. data()/length()/hash() above are safe to live here: the compiler never calls them
-// internally (it inlines field access), so they are only needed when string.cb is imported anyway.
 
 // ── toString: primitive -> string (the public conversion API) ────────────────
 //
@@ -211,13 +194,12 @@ move string toString(const char* self)
     return borrowed.copy();
 }
 
-// ── operator string conversions (internal interpolation/coercion hook) ───────
+// ── operator string conversions ──────────────────────────────────────────────
 //
 // These are used by the compiler for string interpolation "{x}" and for
 // char* / IString coercion into a string value. They are NOT reachable as a
-// public `(string)primitive` cast - the compiler rejects that and directs the
-// user to value.toString(). The numeric overloads delegate to toString above so
-// the conversion logic has a single source of truth.
+// public `(string)primitive` cast - use value.toString() instead. The numeric
+// overloads delegate to toString above.
 
 // Convert any IString value to a string by calling ToString().
 string operator string(IString s)
@@ -385,10 +367,7 @@ string operator+(string a, IString b)
 }
 
 // ── string.copy ───────────────────────────────────────────────────────────────
-// Deep copy using the active allocator (`new`). Returns an owning string that is
-// freed by whatever allocator is active at the call site. `move` marks the return
-// as owned so the caller's local gets a scope-exit destructor (without it the
-// fresh buffer leaks - only operator+/move-string returns were flagged owned).
+// Return an independent owning deep copy of self.
 move string copy(string self)
 {
     i32 len = self.length();
@@ -1081,9 +1060,7 @@ move string padRight(string self, i32 width)
 
 // ── Phase 3: split / join ────────────────────────────────────────────────────
 
-// Build an OWNED string from the byte range [src, src+len). The `move` return
-// type plus the owned bit (via _strOwned) is what flags the result owning, so when
-// it is added to a list<string> the list's destructor frees the buffer.
+// Build an owning string from the byte range [src, src+len).
 move string _str_owned_range(i8* src, i32 len)
 {
     i8* buf = new i8[len + 1];

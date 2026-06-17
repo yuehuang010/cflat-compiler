@@ -8,35 +8,20 @@ import "cruntime.cb";
 
 thread_local IAllocator __active_allocator;   // zero-initialized fat-ptr; null data = inactive
 
-// Page-header dispatch hook. Set by an owning allocator at init time
-// (currently BucketAllocator via __BA_try_owner_dealloc). When set, operator
-// delete consults this hook first so pointers whose owning allocator differs
-// from the caller's __active_allocator (e.g. an inbox message that flowed from
-// program A to program B) still route back to the correct owner.
-//
-// Contract: returns true if the hook claimed and freed ptr; false otherwise.
-// Hook must be safe to call on arbitrary non-null pointers - it inspects a
-// page-aligned header magic before touching anything else.
+// Allocator dispatch hook. When set, operator delete consults this hook first so
+// pointers whose owning allocator differs from the active one (e.g. a message that
+// flowed from one program to another) still route back to the correct allocator.
+// Returns true if the hook claimed and freed the pointer; false otherwise.
 function<bool(void*)> __try_owner_dealloc = nullptr;
 
-// Thread-fuzzing hook (diagnostic). Null in everyday builds; installed by
-// diagnostic/thread_fuzz.cb's ThreadFuzz.enable(). When non-null, each
-// synchronization sched-point (mutex/channel/semaphore/latch/thread) calls it so
-// a seeded scheduler can perturb thread interleavings and reproduce timing-
-// dependent bugs. The only everyday cost is one predictable null-pointer compare
-// per sync operation. Declared here (rather than runtime.cb) because memory.cb's
-// file-scope globals are visible to every core file via the auto-import pre-scan,
-// matching the sibling __try_owner_dealloc hook above.
+// Thread-fuzzing hook (diagnostic). Null in normal builds; installed by
+// diagnostic/thread_fuzz.cb's ThreadFuzz.enable(). Each synchronization point
+// calls it so a seeded scheduler can perturb thread interleavings.
 function<void(int)> __fuzz_hook = nullptr;
 
-// Heap-audit hooks (diagnostic). Null in everyday builds; installed by
-// diagnostic/heap_audit.cb's HeapAudit.enable(). When non-null, operator new records
-// each allocation (pointer + size) live and operator delete checks each free, flagging
-// a double free at the bad free itself. Declared here (rather than runtime.cb) so the
-// file-scope globals are visible to every core file via the auto-import pre-scan,
-// matching the sibling __fuzz_hook / __try_owner_dealloc hooks above. Only assign these
-// to a real function in enable(); never re-assign to nullptr at runtime (a runtime
-// nullptr store to a function-typed global aborts LLVM with "Invalid constantexpr cast").
+// Heap-audit hooks (diagnostic). Null in normal builds; installed by
+// diagnostic/heap_audit.cb's HeapAudit.enable(). When non-null, operator new
+// records each allocation and operator delete checks each free for double-frees.
 function<void(void*, u64)> __alloc_audit_hook = nullptr;
 function<void(void*)>      __free_audit_hook  = nullptr;
 
@@ -70,9 +55,8 @@ void operator delete(void* ptr)
 }
 
 // Over-aligned allocation. Routes to the active allocator's alloc_aligned, or
-// falls back to _aligned_malloc. The compiler emits a call to this overload
-// for `new T` when alignof(T) exceeds the default-new threshold (16 on x64).
-// Pointers from this overload MUST be freed via operator delete_aligned.
+// falls back to _aligned_malloc. Used when alignof(T) exceeds the default threshold.
+// Pointers from this overload MUST be freed via __delete_aligned.
 void* operator new(i64 size, i64 align)
 {
     if (__active_allocator != nullptr)
@@ -80,9 +64,7 @@ void* operator new(i64 size, i64 align)
     return _aligned_malloc((win_size)size, (win_size)align);
 }
 
-// Companion to `operator new(size, align)`. Not an operator (grammar reserves
-// `operator delete` for the size-less form); called explicitly from compiler-
-// generated delete sites when the static type's alignment exceeds the default.
+// Companion free for over-aligned allocations made via operator new(size, align).
 void __delete_aligned(void* ptr)
 {
     if (ptr == nullptr) return;

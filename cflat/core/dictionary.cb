@@ -54,8 +54,6 @@ struct dictionary<K, V>
         _count = 0;
         _init(_capacity * 2);
 
-        // Direct insert - avoids calling add() (which has move V value) so the
-        // compiler's move tracker does not flag oldValues as consumed.
         int i = 0;
         while (i < oldCap)
         {
@@ -102,13 +100,6 @@ struct dictionary<K, V>
         // BORROWS pointer keys (it never frees them), matching its original contract.
         if const (is_string(K))  _keys[insertSlot] = key.copy();
         if const (!is_string(K)) _keys[insertSlot] = key;
-        // Move (not copy) the incoming value into the slot. `value` is a `move V`
-        // parameter, so a plain copy-assign would leave `value` owning the same
-        // buffers as the slot; `value`'s scope-exit destructor would then free a
-        // buffer the dictionary now references - a double free for a value-type V
-        // with a real destructor (e.g. a nested list<string>). Moving transfers
-        // ownership and zeroes the source. (For pointer/primitive V this is a plain
-        // store.) Mirrors list<T>.add.
         _values[insertSlot] = move value;
         _status[insertSlot] = 1;
         _count++;
@@ -156,11 +147,6 @@ struct dictionary<K, V>
             _status[updateSlot] = 1;
             _count++;
         }
-        // Move (not copy) the incoming value - see add(). On the overwrite branch the
-        // old value was already freed/destructed above; slot assignment is a raw
-        // overwrite, so moving here does not double-free. Without `move`, `value`'s
-        // scope-exit destructor would free a buffer the slot aliases (double free for
-        // a value-type V with a destructor, e.g. nested list<string>).
         _values[updateSlot] = move value;
     }
 

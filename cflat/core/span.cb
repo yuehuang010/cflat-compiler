@@ -3,8 +3,8 @@ import "view.cb";
 // span<T> - non-owning, NOALIAS window over a whole, distinct buffer: a thin `T[]` array-view plus
 // a length. The noalias sibling of view<T>: distinct spans are guaranteed to address distinct
 // allocations, so an -O2 `vectorize` loop over them drops the runtime overlap check it would emit
-// for raw pointers. Pass a span BY VALUE (it is two machine words) so the contract reaches the
-// callee - the `T[]` field rides the compiler's array-view alias-scope metadata through the call.
+// for raw pointers. Pass a span BY VALUE (it is two machine words) so the noalias contract reaches
+// the callee.
 //
 // To get the guaranteed-noalias loop, bind each span's buffer into a LOCAL `T[]` and index that:
 //
@@ -16,13 +16,10 @@ import "view.cb";
 //         vectorize for (i64 i = 0; i < n; i = i + 1) { yv[i] = yv[i] + a * xv[i]; }
 //     }
 //
-// operator[] (`y[i]`), get(i) and set(i, v) ALL carry the contract: the compiler lowers a span
-// subscript or accessor to the `_ptr` field access `y._ptr[i]`, keying the alias scope to the
-// receiver, so two distinct spans vectorize without a runtime check - the same result as the
-// local-`T[]` form above. This lowering needs an addressable (lvalue) span receiver; on an rvalue
-// span (e.g. `makeSpan().get(i)`) the access falls back to the real method call, which routes
-// through `this` and cannot carry noalias - bind the span to a local first, or use the local-`T[]`
-// form, when that matters.
+// operator[], get(i), and set(i, v) all carry the noalias contract, so two distinct spans
+// vectorize without a runtime check when the receiver is an lvalue (a named local variable).
+// On a temporary span (e.g. `makeSpan().get(i)`) bind it to a local first, or use the
+// local-`T[]` form above.
 //
 // Non-owning: a span never frees _ptr. The buffer's owner (an array<T>, a `new T[n]`, ...) must
 // outlive every span over it. Obtaining a span from a raw `T*` is a compile error at `wrap` (the
