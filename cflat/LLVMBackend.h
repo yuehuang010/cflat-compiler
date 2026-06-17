@@ -598,6 +598,7 @@ public:
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
+        bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         std::set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
@@ -1438,6 +1439,36 @@ private:
                 return it->second.IsOwningString;
         }
         return false;
+    }
+
+    // True when a string local was tainted as borrowing an owning string FIELD (e.g.
+    // `string t = b.name`). Storing such an alias into another field launders a
+    // field-to-field copy and double-frees, so the field-store path rejects it.
+    bool IsVariableBorrowingOwnedString(const std::string& name) const
+    {
+        if (name.empty()) return false;
+        for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                return it->second.BorrowsOwnedString;
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                return it->second.BorrowsOwnedString;
+        }
+        return false;
+    }
+
+    // Set/clear the field-borrow taint on a string local (used at declaration-with-initializer
+    // and on reassignment, mirroring MarkVariableOwningString).
+    void SetVariableBorrowsOwnedString(const std::string& name, bool value)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.BorrowsOwnedString = value; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.BorrowsOwnedString = value; return; }
+        }
     }
 
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount)

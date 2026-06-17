@@ -302,7 +302,7 @@ class Parser
     {
         if (check(Tok.Ident))
         {
-            string word = cur().text;
+            string word = cur().text.copy();   // cur() returns a temp Token; copy so word owns its text
             if (word == "print")
             {
                 advance();
@@ -319,7 +319,7 @@ class Parser
             advance();
             Stmt* s = new Stmt();
             s->kind = NStmt.SAssign;
-            s->name = word;
+            s->name = move word;   // transfer ownership of the owned copy into the AST node
             expect(Tok.Assign, "'='");
             s->expr = parseExpr();
             expect(Tok.Semi, "';'");

@@ -1,0 +1,20 @@
+// A field-to-field string copy laundered through a local temp: `string tmp = b.name;`
+// borrows the owning string field b.name (tmp is a non-owning alias of a buffer b still
+// owns), and `a.name = tmp;` then stores that alias into another field -> double-free at
+// teardown. The local borrow is tracked so the field-store rejects it, the same way the
+// direct form `a.name = b.name;` is rejected. Steer is 'move' / '.copy()'.
+import "string.cb";
+
+struct Row { string name = default; };
+
+void copyField(Row a, Row b)
+{
+    string tmp = b.name;               // borrows the owning string field b.name
+    expect_error("aliases a heap buffer it does not solely own");
+    a.name = tmp;                      // laundered field-to-field copy -> double-free
+}
+
+extern int main()
+{
+    return 0;
+}

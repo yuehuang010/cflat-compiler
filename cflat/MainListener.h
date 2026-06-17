@@ -4986,6 +4986,11 @@ public:
                 llvm::Type* srcBaseType = nullptr;
                 bool srcIsMove = false;
                 std::string srcCallerName;
+                // True when the initializer is (or transitively aliases) an owning string FIELD,
+                // e.g. `string t = b.name;`. Such a local borrows a heap buffer some struct still
+                // owns, so storing it into another field would double-free - tracked so the
+                // field-store reject can catch the laundered field-to-field copy.
+                bool srcBorrowsOwnedString = false;
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -5203,6 +5208,14 @@ public:
                                 srcBaseType = rightNV.BaseType;
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
                                 srcCallerName = rightNV.CallerName;
+                                // Taint a string local initialized from an owning string FIELD
+                                // (`string t = b.name`) or from another already-tainted borrow
+                                // (`string t2 = t`). A `.copy()` / `operator+` result (IsMove)
+                                // owns an independent buffer and is NOT a borrow.
+                                srcBorrowsOwnedString = NamedVarIsString(rightNV)
+                                    && !rightNV.TypeAndValue.IsMove
+                                    && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
+                                        || rightNV.BorrowsOwnedString);
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
@@ -5504,6 +5517,11 @@ public:
                                 EmitFieldInitializer(alloc, typeAndValue.TypeName, initializer->initializerList());
                         }
 
+                        // Taint a string local that borrows an owning string field, so storing it
+                        // into another field is rejected as a laundered field-to-field copy.
+                        if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString)
+                            compiler->stackNamedVariable.back().namedVariable[name].BorrowsOwnedString = true;
+
                         // Propagate ownership: if the RHS was a heap-allocating string call,
                         // mark this local as owning so the destructor frees the buffer on scope exit.
                         if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwned)
@@ -5629,6 +5647,13 @@ public:
         else if (!nv.IsOwningString && nv.FieldName.empty() && !nv.CallerName.empty()
                  && NamedVarIsString(nv) && compilerLLVM->IsVariableOwningString(nv.CallerName))
             nv.IsOwningString = true;
+        // Carry the field-borrow taint on a whole-variable string read (`a.name = tmp` where
+        // `tmp` was `string tmp = b.name`) so the field-store reject can catch the laundered
+        // field-to-field copy. A struct-field access (FieldName set) is left to the direct
+        // field-to-field reject; a call result has no CallerName.
+        if (nv.FieldName.empty() && !nv.CallerName.empty() && NamedVarIsString(nv)
+            && compilerLLVM->IsVariableBorrowingOwnedString(nv.CallerName))
+            nv.BorrowsOwnedString = true;
         compilerLLVM->lastCallReturnsOwned = exprOwned ? true : savedOwned;
         return nv;
     }
@@ -6133,9 +6158,15 @@ public:
             // like string/list. The destination then owns an independent env; a move / temporary
             // RHS already owns its env and is stored as-is. This deliberately bypasses the X4 /
             // field-to-field / destruct-old guards below (which force explicit intent for types
-            // where cloning a borrow is unsafe). The old destination env is NOT freed here - that
-            // would be unsafe on a possibly-uninitialized field (e.g. a raw-malloc'd thread packet);
-            // a closure-field reassignment therefore leaks the old env (a narrow, documented gap).
+            // where cloning a borrow is unsafe). The old destination env IS freed first, but ONLY
+            // when the destination is a known-initialized local/global (alloca/global) - reassigning
+            // such a slot (`f = otherLambda`) would otherwise leak its prior heap env. The destruct
+            // is skipped for a struct-FIELD destination (a 2-index GEP into a struct), whose slot may
+            // be uninitialized garbage (e.g. a raw-malloc'd thread packet) where freeing is unsafe;
+            // a closure-field reassignment therefore still leaks the old env (a narrow, documented
+            // gap). The closure dtor is env-tag-gated, so freeing a default-zero / borrowed slot is a
+            // safe no-op. Note decl-init does NOT reach this branch (it stores via CreateAssignment),
+            // so an alloca destination here always holds a previously-initialized closure value.
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && namedVar.TypeAndValue.TypeName == "__closure_fat_ptr")
             {
@@ -6153,6 +6184,13 @@ public:
                     if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
                         right = cloned;
                 }
+                // Free the old env when overwriting a known-initialized local/global slot. The
+                // clone above reads the SOURCE env, so it is unaffected by destructing the
+                // destination; a self-assign (`f = f`) is still safe because the clone produced an
+                // independent env before the old one is freed.
+                if (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor("__closure_fat_ptr"))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 derefAssign(right, rhsUnsigned);
                 // The destination now owns this closure env, so drop the stored value from the
                 // owned-closure temp-flush list to avoid a double-free (no-op for a clone result).
@@ -6215,6 +6253,38 @@ public:
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
+
+            // Assigning an OWNED string LOCAL/global directly into a string FIELD - REJECTED.
+            // A string field always owns its buffer, so a plain store aliases the source local's
+            // owned buffer into the field; both the field's teardown destructor and the local's
+            // scope-exit destructor then free it (double-free), and routing a field-to-field copy
+            // `tmp = b.name; a.name = tmp;` through such a local launders past the field-to-field
+            // reject below and corrupts the heap the same way. This cannot be auto-resolved: a
+            // static deep-copy would make every borrow owned (breaking the deliberate char*/literal
+            // borrow-into-field pattern like xml.cb's `b._rootTag = rt`, where the source's owned
+            // bit is clear and IsOwningString is false), and a static move would consume a source
+            // the caller may keep using. Require explicit intent. A `.copy()` / `operator+` result
+            // (IsMove or null Storage - it owns an independent buffer) and a borrowed char*/literal
+            // local (IsOwningString false) are NOT flagged - the recommended fixes are `move` to
+            // transfer ownership or `.copy()` for an independent buffer.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField
+                && NamedVarIsString(namedVar)
+                && rightNV.TypeAndValue.TypeName == "string"
+                && (rightNV.IsOwningString || rightNV.BorrowsOwnedString)
+                && rightNV.Storage != nullptr
+                && !rightNV.TypeAndValue.IsMove
+                && !selfFieldAssign)
+            {
+                LogErrorContext(ctx, std::format(
+                    "assigning the string '{}' into a struct field aliases a heap buffer it does not "
+                    "solely own (it {}) and will double-free at teardown; use 'move' to transfer "
+                    "ownership or '.copy()' for an independent copy", rightNV.CallerName,
+                    rightNV.IsOwningString ? "owns the buffer, which the field would also free"
+                                           : "borrows an owning string field"));
+                return right;
+            }
+
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField && srcIsStructField
                 && !selfFieldAssign
@@ -6393,6 +6463,17 @@ public:
             // Reassignment to a bonded variable breaks the bond (per design: bond is to the instance).
             if (operatorText == "=" && !namedVar.CallerName.empty())
                 compiler->ClearVariableBond(namedVar.CallerName);
+            // Refresh the field-borrow taint on a reassigned whole-variable string local: it now
+            // borrows a field iff the new RHS does (so `t = "lit"` after `t = b.name` clears it).
+            if (operatorText == "=" && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
+                && NamedVarIsString(namedVar))
+            {
+                bool rhsBorrowsField = NamedVarIsString(rightNV)
+                    && !rightNV.TypeAndValue.IsMove
+                    && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
+                        || rightNV.BorrowsOwnedString);
+                compiler->SetVariableBorrowsOwnedString(namedVar.CallerName, rhsBorrowsField);
+            }
             return assignResult;
         }
         else if (unaryCtx)

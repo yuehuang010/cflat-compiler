@@ -31,6 +31,10 @@ struct LeakPair { string name = default; list<int> nums = default; };
 // env and is freed by the struct's destructor, like a string/list field.
 struct LeakHandler { function<int(int)> fn = default; };
 
+// Function-type alias: ownership/clone/free flow through the alias exactly as through the
+// underlying function<int(int)>, so clone-by-default reassignment must not leak.
+using EVENT = function<int(int)>;
+
 // Returns a CAPTURING closure - its env must be heap-owned so the value can escape the frame
 // (Bug 8). Built in a local and returned by variable (the escape pattern real code uses).
 function<int(int)> makeLeakAdder(int base)
@@ -277,6 +281,41 @@ extern int main()
         // (f) named closure passed by value (caller retains ownership; callee borrows)
         function<int(int)> g = (int x) => x + 1;
         total++; passed += Test("closure named by-value arg", applyLeak(g, 9), 10);
+
+        // (g) reassigning a closure LOCAL frees the previous heap env (no leak of the old env).
+        // Each store overwrites a known-initialized alloca slot, so the old env is destructed
+        // before the new value lands. Covers a lambda-literal RHS, a named-source clone, and a
+        // self-assign (which must not double-free the slot it just cloned from).
+        int rk = 3;
+        function<int(int)> rf = (int x) => x + rk;   // env #1
+        rf = (int x) => x * rk;                       // frees env #1, stores env #2
+        rf = rf;                                       // clone-then-free-old: no double-free
+        function<int(int)> rsrc = (int x) => x - rk;
+        rf = rsrc;                                     // named-source clone; frees prior env
+        total++; passed += Test("closure reassign result", rf(10), 7);
+        total++; passed += Test("closure reassign source live", rsrc(10), 7);
+
+        // (h) assigning a NAMED closure into a tmp, repeatedly: each `tmp = name` clones the
+        // source env (clone-by-default) AND frees the tmp's PREVIOUS clone first, so reassigning
+        // a tmp via a name does not leak the prior cloned env. The named sources stay live (a
+        // clone, never a move), so they remain callable after being assigned into the tmp.
+        function<int(int)> src1 = makeLeakAdder(20);
+        function<int(int)> src2 = makeLeakAdder(30);
+        function<int(int)> tmp = src1;   // clone src1 -> tmp env #1
+        tmp = src2;                       // free tmp env #1, clone src2 -> tmp env #2
+        tmp = src1;                       // free tmp env #2, clone src1 -> tmp env #3
+        total++; passed += Test("closure tmp via name (result)", tmp(1), 21);
+        total++; passed += Test("closure tmp via name (src1 live)", src1(2), 22);
+        total++; passed += Test("closure tmp via name (src2 live)", src2(3), 33);
+
+        // (i) function-type alias `using EVENT = function<int(int)>`: two alias-typed locals,
+        // then clone-by-default reassignment `v2 = v1` through the alias. The store frees v2's
+        // previous env and clones v1's into v2 (no leak), and v1 stays live (clone, not move).
+        EVENT v1 = makeLeakAdder(40);
+        EVENT v2 = makeLeakAdder(50);
+        v2 = v1;                          // free v2's old env, clone v1's env into v2
+        total++; passed += Test("alias EVENT clone (v2)", v2(1), 41);
+        total++; passed += Test("alias EVENT source live (v1)", v1(2), 42);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===
