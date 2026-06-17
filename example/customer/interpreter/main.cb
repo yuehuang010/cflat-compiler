@@ -448,7 +448,7 @@ class Parser
         {
             Node* n = new Node();
             n->kind = NExpr.EVar;
-            n->name = cur().text;
+            n->name = cur().text.copy();   // cur() returns a temp Token aliasing a list element; copy so the Node owns its name
             advance();
             return n;
         }

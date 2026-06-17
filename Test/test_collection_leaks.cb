@@ -75,6 +75,12 @@ struct Greeter
     string greet(string who) { return prefix + who; }   // owned result from a member fn
 };
 
+// By-value owning-struct temp field-extract: a `move` return OWNS its fields, so a temp whose
+// field is read transiently is fully destructed at end-of-statement (no leak). A plain accessor
+// (`list.get`) returns a shallow ALIAS, so its temp must NOT be destructed (a double-free aborts).
+struct TempTok { string text = default; string extra = default; };
+move TempTok makeTempTok(int n) { TempTok t = default; t.text = "tok" + n.toString(); t.extra = "ex" + n.toString(); return t; }
+
 extern int main()
 {
     HeapAudit.enable();
@@ -384,6 +390,19 @@ extern int main()
         string picked = fruits.get(0);                      // borrow of an owned element
         total++; passed += Test("list element borrow return", picked.length(), 5);
         total++; passed += Test("list element still owned", fruits.get(1).length(), 5);
+
+        // A `move`-return temp read transiently is fully destructed at end of statement: both
+        // text and extra are freed (no leak). The reject guards against persisting the field.
+        total++; passed += Test("move-temp field read", makeTempTok(7).text.length(), 4);   // "tok7"
+
+        // list.get(i) returns a shallow ALIAS of the element, so the temp is NOT destructed - the
+        // element survives (frees once with the list, no double-free). Read it, and copy it out.
+        list<TempTok> toks = default;
+        TempTok one = default; one.text = "li" + "st"; one.extra = "ex" + "tra";
+        toks.add(one);
+        total++; passed += Test("get() alias field read", toks.get(0).text.length(), 4);   // "list"
+        string ownedCopy = toks.get(0).text.copy();         // copy from an alias -> independent owner
+        total++; passed += Test("get() alias field copy", ownedCopy.length(), 4);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

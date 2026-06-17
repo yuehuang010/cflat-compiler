@@ -1,0 +1,14 @@
+// Storing an owning field extracted from a by-value temp into a longer-lived slot must be
+// rejected: the field's buffer is owned by the temp (or its source), so a shallow copy into a
+// second owner double-frees at teardown. The fix is '.copy()'. See internal/issue/misc-known-gaps.md.
+struct Tok { string text = default; };
+struct Box { string slot = default; };
+
+move Tok mkTok() { Tok t = default; t.text = "x" + "y"; return t; }
+
+extern int main()
+{
+    expect_error("taken from a temporary");
+    Box b = default;
+    b.slot = mkTok().text;          // REJECTED - use mkTok().text.copy()
+}

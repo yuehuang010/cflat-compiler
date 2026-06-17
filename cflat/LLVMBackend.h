@@ -553,6 +553,9 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
+        // Field extracted from a BY-VALUE owning-struct temp (`makeToken().text`): may be read, but
+        // persisting it (store/bind/return) double-frees so those sites reject it. See FlushOwnedStructTemps.
+        bool FromOwningTempField = false;
         // Bitfield access: non-null BitfieldStorage means this is a bitfield view onto a storage word.
         // Reads compute shift+mask; writes do a read-modify-write on BitfieldStorage.
         llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
@@ -763,6 +766,11 @@ public:
     // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
     // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
+
+    // Spilled allocas of unbound owning-struct `move`-return temps (`makeToken().text`), freed by
+    // FlushOwnedStructTemps. Struct analog of the string/closure temp lists. Block = dominance guard.
+    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; };
+    std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
 
     // Per-function noalias metadata for T[] views. Proves pairwise disjointness for span<T> fields
     // where the noalias parameter attribute cannot reach. Reset in createFunctionBlock.
@@ -1360,6 +1368,41 @@ private:
             }
         }
         pendingOwnedClosureTemps.clear();
+    }
+
+    // Register a by-value owning-struct temp (already spilled to `alloca`) for full destruction at
+    // the end of the current full expression. The dtor takes a T*, so no spill is needed at flush.
+    void RegisterOwnedStructTemp(llvm::Value* alloca, const std::string& typeName)
+    {
+        if (alloca == nullptr || typeName.empty()) return;
+        pendingOwnedStructTemps.push_back({ alloca, typeName, builder->GetInsertBlock() });
+    }
+
+    void FlushOwnedStructTemps()
+    {
+        if (pendingOwnedStructTemps.empty()) return;
+
+        auto* curBlock = builder->GetInsertBlock();
+        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
+        if (!terminated)
+        {
+            for (auto& t : pendingOwnedStructTemps)
+            {
+                if (t.Alloca == nullptr || t.Block != curBlock) continue;   // dominance safety
+                if (auto* dtor = GetOrCreateFullDestructor(t.TypeName))
+                    builder->CreateCall(dtor->getFunctionType(), dtor, { t.Alloca });
+            }
+        }
+        pendingOwnedStructTemps.clear();
+    }
+
+    // Free all unnamed owned temporaries (string, closure, struct) at an end-of-full-expression
+    // boundary. The return path keeps the three explicit (it interleaves Unregister between them).
+    void FlushOwnedTemps()
+    {
+        FlushOwnedStringTemps();
+        FlushOwnedClosureTemps();
+        FlushOwnedStructTemps();
     }
 
     void EmitDestructorsForScope(const StackState& frame)

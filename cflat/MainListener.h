@@ -2991,12 +2991,9 @@ public:
                 ParseDestructuringDeclaration(destructuring);
             }
 
-            // End of a full expression / statement: free any owned-string temporaries
-            // (e.g. the unnamed (a + b) intermediate of a chained concat) that were not
-            // claimed by a named local or a move parameter. Mirrors C++ temporary
-            // lifetime - destroyed at the statement's semicolon.
-            compiler->FlushOwnedStringTemps();
-            compiler->FlushOwnedClosureTemps();
+            // End of a full expression / statement: free owned temporaries not claimed by a named
+            // local or move parameter (e.g. the unnamed `a + b` of a chained concat). Like C++.
+            compiler->FlushOwnedTemps();
         }
     }
 
@@ -3421,6 +3418,17 @@ public:
                         if (compiler->lastCallIsBonded)
                             checkBondSources(compiler->lastCallBondedSources);
 
+                        // Returning an owning field of a by-value temp (`return makeToken().text;`) REJECTED:
+                        // its buffer is owned elsewhere and would be freed, dangling the return value.
+                        if (returnNV.FromOwningTempField
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
+                                "would be freed. Use '.copy()' for an independent copy.",
+                                returnNV.OwningStructName, returnNV.FieldName));
+                        }
+
                         // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
                         compiler->lastCallReturnsOwned = false;
@@ -3439,6 +3447,9 @@ public:
                         // or we would free an env the caller now owns (double free on its teardown).
                         compiler->UnregisterOwnedClosureTemp(right);
                         compiler->FlushOwnedClosureTemps();
+                        // Owning temp whose field was extracted in the return expr (returning an OWNING
+                        // field is rejected upstream, so this never frees a buffer the caller now owns).
+                        compiler->FlushOwnedStructTemps();
                         // Borrow returns: hand the caller a non-owning copy (see the classification
                         // above). Done after the temp-flush so the unregister logic above still sees
                         // the original loaded value; a borrow is never a registered owned temp.
@@ -3573,8 +3584,7 @@ public:
                 // Free owned-string temps produced inside the condition (e.g. `do {...} while
                 // (s.toString() != "x")`) here, in the condition block. The block-item flush runs
                 // in the post-loop block, where the dominance guard would drop them and leak.
-                compiler->FlushOwnedStringTemps();
-                compiler->FlushOwnedClosureTemps();
+                compiler->FlushOwnedTemps();
                 compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                 // resume
@@ -3599,8 +3609,7 @@ public:
                 auto condition = ParseExpression(expression);
                 // Free owned-string temps from the condition in the condition block (see do-while).
                 // Runs each iteration after the guard is evaluated.
-                compiler->FlushOwnedStringTemps();
-                compiler->FlushOwnedClosureTemps();
+                compiler->FlushOwnedTemps();
 
                 // A constant-true guard (`while (true)` / `while (1)`) can only be
                 // left via `break`. Branch unconditionally into the body so the
@@ -3673,8 +3682,7 @@ public:
                     compiler->InitializeBlock(blockCondition, false);
                     auto condition = ParseAssignmentExpression(compareCtx);
                     // Free owned-string temps from the condition in the condition block (see do-while).
-                    compiler->FlushOwnedStringTemps();
-                    compiler->FlushOwnedClosureTemps();
+                    compiler->FlushOwnedTemps();
                     compiler->CreateConditionJump(condition, blockInner, blockResume);
 
                     // Inner statement
@@ -3897,8 +3905,7 @@ public:
                 // Free owned-string temps produced inside the condition (e.g. `if (s.toString()
                 // == x)`) here, while still in the condition block. The block-item flush runs in
                 // the post-if merge block, where the dominance guard would drop them and leak.
-                compiler->FlushOwnedStringTemps();
-                compiler->FlushOwnedClosureTemps();
+                compiler->FlushOwnedTemps();
                 compiler->CreateConditionJump(condition, blockTrue, blockFalse);
 
                 auto preIfMovedState = compiler->SaveMovedState();
@@ -5216,6 +5223,17 @@ public:
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 right = LoadNamedVariable(rightNV);
+                                // Binding an owning field of a by-value temp to a local (`string s = makeToken().text`)
+                                // REJECTED: its buffer is owned elsewhere and would be freed out from under the local.
+                                if (rightNV.FromOwningTempField
+                                    && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
+                                {
+                                    LogErrorContext(assignmentExpression, std::format(
+                                        "cannot bind '{}.{}' taken from a temporary to a local; its buffer is owned "
+                                        "elsewhere and would be freed out from under the local. Bind the whole call "
+                                        "result first (e.g. `auto t = ...;`) or use '.copy()' for an independent copy.",
+                                        rightNV.OwningStructName, rightNV.FieldName));
+                                }
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
                                 srcIsBorrowed = rightNV.IsBorrowed;
@@ -6247,6 +6265,19 @@ public:
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
+
+            // Storing an owning field of a by-value temp (`x = makeToken().text`) into a longer-lived
+            // slot REJECTED: the buffer is owned elsewhere (alias or `move`-temp), so a 2nd owner double-frees.
+            if (operatorText == "=" && rightNV.FromOwningTempField
+                && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot store '{}.{}' taken from a temporary into a longer-lived location; its buffer "
+                    "is owned elsewhere and would double-free. Use '.copy()' for an independent copy, or "
+                    "bind the whole call result to a local first and assign from that.",
+                    rightNV.OwningStructName, rightNV.FieldName));
+                return right;
+            }
 
             // Assigning an owned string local into a string field - REJECTED. A static copy would
             // make borrowed strings owned (breaking deliberate borrows like xml.cb's `b._rootTag = rt`).
@@ -10400,6 +10431,25 @@ public:
                                         if (!dataStructure.IsUnion)
                                             namedVar.Primary = Compiler(ctx)->CreateExtractValue(structVar.Primary, fieldIndex);
                                         namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+
+                                        // Field of a by-value owning-struct temp (`makeToken().text`): tag it (persisting
+                                        // double-frees), and destruct the temp only for a `move` return, not a `get()` alias.
+                                        const std::string& parentType = structVar.TypeAndValue.TypeName;
+                                        bool parentIsOwningTemp = !dataStructure.IsUnion
+                                            && !parentType.empty()
+                                            && parentType != "string"
+                                            && parentType != "__closure_fat_ptr"
+                                            && Compiler(ctx)->IsOwningValueType(parentType);
+                                        bool parentIsMoveOwned = parentIsOwningTemp
+                                            && structVar.TypeAndValue.IsMove;
+                                        if (parentIsMoveOwned && !structVar.FromOwningTempField)
+                                        {
+                                            auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");
+                                            Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);
+                                            Compiler(ctx)->RegisterOwnedStructTemp(tempAlloca, parentType);
+                                        }
+                                        if (parentIsOwningTemp || structVar.FromOwningTempField)
+                                            namedVar.FromOwningTempField = true;
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
@@ -12009,6 +12059,9 @@ public:
                                 // lambda's capture-bond (the closure holds &source, but the
                                 // returned value is independent).
                                 namedVar.IsBonded = false;
+                                // Invoking a temp's function<> field (`get(i).fn(req)`) yields a fresh result,
+                                // not the borrowed field - clear the taint so storing/returning it isn't rejected.
+                                namedVar.FromOwningTempField = false;
                                 namedVar.BondByAddress = false;
                                 namedVar.BondedSources.clear();
                                 functionArgCounter++;

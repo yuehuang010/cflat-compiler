@@ -1982,6 +1982,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnTypeName.clear();
     currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
+    pendingOwnedStructTemps.clear();
     lastCallIsBonded = false;
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,
     // would mark the next file's first bonded value as by-address.
