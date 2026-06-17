@@ -9205,6 +9205,19 @@ public:
             }
         }
 
+        // Register a closure-returning call RESULT as an owned closure temp (lambda Option A),
+        // mirroring how a lambda LITERAL is tracked at creation. A binding site (decl-init /
+        // assignment / field store / return) calls UnregisterOwnedClosureTemp so only the owner
+        // frees it; a result used INLINE (invoked directly, or passed by value as an argument) and
+        // never bound is freed by FlushOwnedClosureTemps at end-of-full-expression. Exclude the
+        // `copy` clone - its result is always consumed by an owner or stored into a struct field by
+        // the synthesized memberwise copy, so flushing it would double-free a now-owned field.
+        if (result != nullptr
+            && candidate.ReturnType.IsFunctionPointer
+            && functionName != "copy"
+            && result->getType() == GetClosureFatPtrType())
+            RegisterOwnedClosureTemp(result);
+
         return result;
     }
 

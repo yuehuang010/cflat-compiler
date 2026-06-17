@@ -6266,11 +6266,23 @@ public:
                     if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
                         right = cloned;
                 }
-                // Free the old env when overwriting a known-initialized local/global slot. The
-                // clone above reads the SOURCE env, so it is unaffected by destructing the
-                // destination; a self-assign (`f = f`) is still safe because the clone produced an
-                // independent env before the old one is freed.
-                if (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                // Free the old env when overwriting a KNOWN-INITIALIZED destination slot, so the
+                // prior env is not orphaned. Safe slots: a whole-variable closure local/global
+                // (alloca/global), and a struct FIELD of a stack/global value-type instance - its
+                // fields are default/zero-initialized, so an unset field reads as null and the env
+                // dtor (null/tag-guarded) is a no-op. A field reached through a HEAP pointer (e.g. a
+                // raw-malloc'd thread/process packet) may be uninitialized garbage, so it is NOT
+                // freed here - freeing a garbage env would corrupt the heap.
+                // The clone above reads the SOURCE env first, so a self-assign (`f = f`) is safe:
+                // the independent clone exists before the old env is freed.
+                bool destSlotInitialized =
+                    llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination);
+                if (!destSlotInitialized && destIsStructField)
+                {
+                    auto* base = destGep->getPointerOperand()->stripPointerCasts();
+                    destSlotInitialized = llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
+                }
+                if (destSlotInitialized)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor("__closure_fat_ptr"))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 derefAssign(right, rhsUnsigned);

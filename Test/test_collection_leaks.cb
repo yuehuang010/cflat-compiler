@@ -43,6 +43,14 @@ function<int(int)> makeLeakAdder(int base)
     return f;
 }
 
+// Same, but returns the capturing lambda LITERAL directly (no intermediate variable). This is a
+// distinct codegen path from makeLeakAdder; the returned env must still transfer to the caller's
+// local and free exactly once (no leak, no double-free) when that local goes out of scope.
+function<int(int)> makeLeakAdderLiteral(int base)
+{
+    return (int x) => x + base;
+}
+
 // Borrow a closure by value and invoke it (exercises the by-value argument copy site - the
 // caller's temporary env is freed at end of the call statement by FlushOwnedClosureTemps).
 int applyLeak(function<int(int)> fn, int v) { return fn(v); }
@@ -359,6 +367,35 @@ extern int main()
         v2 = v1;                          // free v2's old env, clone v1's env into v2
         total++; passed += Test("alias EVENT clone (v2)", v2(1), 41);
         total++; passed += Test("alias EVENT source live (v1)", v1(2), 42);
+
+        // (j) reassigning a closure struct FIELD frees the previous env (no leak of the old env).
+        // The field's enclosing struct is a stack value type (default-initialized), so the field
+        // destruct-old fires; a field reached through a heap pointer (raw packet) is left alone.
+        // A self-assign clones the source env before freeing the old one, so it never double-frees.
+        LeakHandler rh = default;
+        rh.fn = makeLeakAdder(7);         // env #1 -> field
+        rh.fn = makeLeakAdder(8);         // reassign: old env #1 freed, env #2 in field
+        rh.fn = rh.fn;                    // self-assign: clone-then-free-old, no double-free
+        total++; passed += Test("closure field reassign frees old env", rh.fn(1), 9);
+
+        // (k) returning a capturing lambda LITERAL directly (no intermediate variable): the env
+        // transfers to the caller's local and frees on scope exit. Exercised once and in a loop
+        // (each iteration's local frees independently - the envs must not accumulate).
+        function<int(int)> lit = makeLeakAdderLiteral(60);
+        total++; passed += Test("returned lambda literal invoke", lit(5), 65);
+        int li = 0;
+        int lsum = 0;
+        while (li < 16) { function<int(int)> lg = makeLeakAdderLiteral(li); lsum = lsum + lg(1); li = li + 1; }
+        total++; passed += Test("returned lambda literal loop sum", lsum, 136);   // sum of (1 + li), li=0..15
+
+        // (l) UNBOUND closure call result used INLINE: a closure-returning call whose result is
+        // never bound to a variable (invoked directly, or passed by value as an argument) is freed
+        // at end-of-full-expression by FlushOwnedClosureTemps - the call result is registered as an
+        // owned closure temp exactly like a lambda literal. Both the literal- and variable-return
+        // forms are covered, and the inline-arg form must not double-free the borrowed callee copy.
+        total++; passed += Test("inline-invoke literal-return call result", makeLeakAdderLiteral(1000)(7), 1007);
+        total++; passed += Test("inline-invoke variable-return call result", makeLeakAdder(2000)(3), 2003);
+        total++; passed += Test("inline-arg call result (by-value borrow)", applyLeak(makeLeakAdder(10), 5), 15);
     }
 
     // === String RETURNS: owned transfer + borrow (runtime-bit ownership model) ===
