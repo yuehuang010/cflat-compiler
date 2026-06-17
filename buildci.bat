@@ -84,7 +84,7 @@ if !OVERALL_ERRORS! EQU 0 (
 )
 
 :Publish
-powershell.exe -ExecutionPolicy Bypass -File "%~dp0package_release.ps1"
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0package_release.ps1"
 exit /b %ERRORLEVEL%
 
 :ElapsedTime

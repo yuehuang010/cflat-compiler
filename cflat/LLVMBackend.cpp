@@ -1980,6 +1980,7 @@ void LLVMBackend::ResetForReanalysis()
     // compile mid-function would leave them describing the prior file's last function.
     currentFunctionReturnIsArrayView = false;
     currentFunctionReturnTypeName.clear();
+    currentFunctionReturnTV = TypeAndValue{};
     pendingOwnedStringTemps.clear();
     lastCallIsBonded = false;
     // Sibling of lastCallIsBonded: a per-call bond flag that, if left set by an aborted compile,

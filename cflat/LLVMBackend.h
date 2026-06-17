@@ -831,6 +831,7 @@ public:
     bool currentFunctionReturnsOwned = false; // true when current function is declared with move T* or move string return type
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
     std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
+    TypeAndValue currentFunctionReturnTV; // full declared return TypeAndValue of the current function; used to thread a function<> return type into a returned lambda literal's expected type
 
     // When returning a struct VALUE local whose full-destructor frees members (e.g. owned
     // string fields), the by-value snapshot carries those member pointers to the caller, so
@@ -8641,6 +8642,9 @@ public:
         }
 
         createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView, returnType.TypeName);
+        // Sibling of the currentFunctionReturn* fields set inside createFunctionBlock: retain the
+        // full return TypeAndValue so a returned lambda literal can adopt a function<> return type.
+        currentFunctionReturnTV = returnType;
 
         if (diBuilder && diFile && line > 0)
         {

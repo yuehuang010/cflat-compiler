@@ -388,6 +388,32 @@ bool testVoidLambda()
     return result;
 }
 
+// ── Returning a lambda LITERAL directly from a function ───────────────────────
+// Regression: `return () => {...};` once failed module verification ("ret i32 in
+// void function") because the return handler did not thread the function's
+// declared function<> return type into the lambda's expected type. It must also
+// move the closure env to the caller (not free it as a returning temp).
+
+function<int()> makeConst()           { return () => { return 7; }; }
+function<int(int)> makeAdder(int n)   { return (int x) => { return x + n; }; }
+function<int()> makeLen(string s)     { return () => { return s.length(); }; }
+
+bool testReturnLambdaLiteral()
+{
+    bool result = true;
+
+    function<int()> k = makeConst();
+    result &= Test("return lambda const", k(), 7);
+
+    function<int(int)> add5 = makeAdder(5);
+    result &= Test("return lambda capture int", add5(10), 15);
+
+    function<int()> len = makeLen("hello");
+    result &= Test("return lambda capture string", len(), 5);
+
+    return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LAMBDA CAPTURE TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1149,6 +1175,7 @@ extern int main()
     total++; passed += testLambdaInHigherOrder()       ? 1 : 0;
     total++; passed += testLambdaThreeParam()          ? 1 : 0;
     total++; passed += testVoidLambda()               ? 1 : 0;
+    total++; passed += testReturnLambdaLiteral()       ? 1 : 0;
 
     // Lambda capture tests
     total++; passed += testCapturePrimitives()         ? 1 : 0;

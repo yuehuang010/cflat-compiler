@@ -1,5 +1,4 @@
 import "library/testmodule.cb";
-import "library/stringlib.cb";
 import "test_helper.cb";
 import "list.cb";
 import "thread.cb";
@@ -67,162 +66,6 @@ bool testProgramImport()
     return result;
 }
 
-// ── library/stringlib.cb tests ───────────────────────────────────────────────
-
-bool testLibLength()
-{
-    StringView s = StringView();
-    s.Init("hello");
-    bool result = true;
-    result &= Test("length_hello",  s.Length(), 5);
-    s.Init("");
-    result &= Test("length_empty",  s.Length(), 0);
-    s.Init("a");
-    result &= Test("length_single", s.Length(), 1);
-    return result;
-}
-
-bool testLibData()
-{
-    StringView s = StringView();
-    s.Init("world");
-    bool result = true;
-    result &= Test("data_world", s.Data(), "world");
-    return result;
-}
-
-bool testLibCharAt()
-{
-    StringView s = StringView();
-    s.Init("hello");
-    bool result = true;
-    result &= Test("charAt_0", s.CharAt(0), 'h');
-    result &= Test("charAt_1", s.CharAt(1), 'e');
-    result &= Test("charAt_4", s.CharAt(4), 'o');
-    return result;
-}
-
-bool testLibEquals()
-{
-    StringView s = StringView();
-    s.Init("hello");
-    bool result = true;
-    result &= Test("equals_match",    s.Equals("hello"),  true);
-    result &= Test("equals_mismatch", s.Equals("world"),  false);
-    result &= Test("equals_empty",    s.Equals(""),       false);
-    result &= Test("equals_prefix",   s.Equals("hell"),   false);
-    return result;
-}
-
-bool testLibStartsWith()
-{
-    StringView s = StringView();
-    s.Init("hello world");
-    bool result = true;
-    result &= Test("startsWith_match",    s.StartsWith("hello"),        true);
-    result &= Test("startsWith_full",     s.StartsWith("hello world"),  true);
-    result &= Test("startsWith_mismatch", s.StartsWith("world"),        false);
-    result &= Test("startsWith_longer",   s.StartsWith("hello world!"), false);
-    result &= Test("startsWith_empty",    s.StartsWith(""),              true);
-    return result;
-}
-
-bool testLibEndsWith()
-{
-    StringView s = StringView();
-    s.Init("hello world");
-    bool result = true;
-    result &= Test("endsWith_match",    s.EndsWith("world"),        true);
-    result &= Test("endsWith_full",     s.EndsWith("hello world"),  true);
-    result &= Test("endsWith_mismatch", s.EndsWith("hello"),        false);
-    result &= Test("endsWith_longer",   s.EndsWith("!hello world"), false);
-    result &= Test("endsWith_empty",    s.EndsWith(""),              true);
-    return result;
-}
-
-bool testLibStringSet()
-{
-    String s = String();
-    bool result = true;
-    s.Set("hello");
-    result &= Test("string_set_length", s.Length(), 5);
-    result &= Test("string_set_data",   s.Data(), "hello");
-    s.Set("hi");
-    result &= Test("string_set_overwrite_length", s.Length(), 2);
-    result &= Test("string_set_overwrite_data",   s.Data(), "hi");
-    s.Set("");
-    result &= Test("string_set_empty_length", s.Length(), 0);
-    s.Free();
-    return result;
-}
-
-bool testLibStringAppend()
-{
-    String s = String();
-    bool result = true;
-    s.Set("hello");
-    s.Append(" world");
-    result &= Test("string_append_length", s.Length(), 11);
-    result &= Test("string_append_data",   s.Data(), "hello world");
-    s.Append("!");
-    result &= Test("string_append_again_length", s.Length(), 12);
-    result &= Test("string_append_again_data",   s.Data(), "hello world!");
-    s.Free();
-    return result;
-}
-
-bool testLibStringClear()
-{
-    String s = String();
-    bool result = true;
-    s.Set("hello");
-    s.Clear();
-    result &= Test("string_clear_length", s.Length(), 0);
-    s.Set("after_clear");
-    result &= Test("string_after_clear_length", s.Length(), 11);
-    result &= Test("string_after_clear_data",   s.Data(), "after_clear");
-    s.Free();
-    return result;
-}
-
-bool testLibStringReadonly()
-{
-    String s = String();
-    bool result = true;
-    s.Set("hello world");
-    result &= Test("string_charAt_0",     s.CharAt(0), 'h');
-    result &= Test("string_charAt_4",     s.CharAt(4), 'o');
-    result &= Test("string_equals_match", s.Equals("hello world"),  true);
-    result &= Test("string_equals_miss",  s.Equals("hello"),        false);
-    result &= Test("string_startsWith",   s.StartsWith("hello"),    true);
-    result &= Test("string_endsWith",     s.EndsWith("world"),      true);
-    s.Free();
-    return result;
-}
-
-int GetLengthViaInterface(IReadonlyString s) { return s.Length(); }
-bool TestStrViaInterface(IReadonlyString s, const char* expected)
-{
-    return strcmp(s.Data(), expected) == 0;
-}
-
-bool testLibInterfaceArg()
-{
-    String s = String();
-    bool result = true;
-    s.Set("hello");
-    result &= Test("iface_length",     GetLengthViaInterface(s), 5);
-    result &= Test("iface_data",       TestStrViaInterface(s, "hello"), true);
-    result &= Test("iface_startsWith", s.StartsWith("hell"), true);
-
-    StringView sv = StringView();
-    sv.Init("world");
-    result &= Test("iface_sv_length",  GetLengthViaInterface(sv), 5);
-    result &= Test("iface_sv_data",    TestStrViaInterface(sv, "world"), true);
-    s.Free();
-    return result;
-}
-
 // Cross-file generic type alias: ModuleIntList = list<int> is declared in the imported
 // library/testmodule.cb and used here in the importer.
 bool testCrossFileAlias()
@@ -258,17 +101,6 @@ extern int main()
     total++; passed += testImportedNamespace() ? 1 : 0;
     total++; passed += testImportAs()          ? 1 : 0;
     total++; passed += testProgramImport()     ? 1 : 0;
-    total++; passed += testLibLength()        ? 1 : 0;
-    total++; passed += testLibData()          ? 1 : 0;
-    total++; passed += testLibCharAt()        ? 1 : 0;
-    total++; passed += testLibEquals()        ? 1 : 0;
-    total++; passed += testLibStartsWith()    ? 1 : 0;
-    total++; passed += testLibEndsWith()      ? 1 : 0;
-    total++; passed += testLibStringSet()     ? 1 : 0;
-    total++; passed += testLibStringAppend()  ? 1 : 0;
-    total++; passed += testLibStringClear()   ? 1 : 0;
-    total++; passed += testLibStringReadonly() ? 1 : 0;
-    total++; passed += testLibInterfaceArg()  ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }

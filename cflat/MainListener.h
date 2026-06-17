@@ -3350,8 +3350,15 @@ public:
                         // Evaluate via NV path so we can inspect bond info alongside ownership.
                         auto assignExpr = express->assignmentExpression();
                         LLVMBackend::NamedVariable returnNV;
+                        // Thread a function<> return type into a returned lambda literal so the
+                        // lambda's invoker is typed from the function's declared return type
+                        // (`return () => {...};`) instead of defaulting to void. Mirrors the
+                        // declaration/argument lambda-context threading.
+                        if (compiler->currentFunctionReturnTV.IsFunctionPointer)
+                            lambdaExpectedType = compiler->currentFunctionReturnTV;
                         if (assignExpr != nullptr)
                             returnNV = ParseAssignmentExpressionNamed(assignExpr);
+                        lambdaExpectedType = {};
                         // Returning a raw `T*` as a `T[]` return type would forge the noalias
                         // contract (a view must span a whole allocation). Decay T[]->T* is fine.
                         if (compiler->currentFunctionReturnIsArrayView
@@ -3401,6 +3408,10 @@ public:
                         // the ret terminates the block.
                         compiler->UnregisterOwnedStringTemp(right);
                         compiler->FlushOwnedStringTemps();
+                        // Same for a returned closure literal (`return () => {...};`): the closure
+                        // env is moved to the caller, so drop it from the temp list before flushing
+                        // or we would free an env the caller now owns (double free on its teardown).
+                        compiler->UnregisterOwnedClosureTemp(right);
                         compiler->FlushOwnedClosureTemps();
                         // Pass the returned local's storage so a by-value struct return whose
                         // full-destructor frees members (e.g. owned string fields) moves
@@ -6277,11 +6288,8 @@ public:
                 && !selfFieldAssign)
             {
                 LogErrorContext(ctx, std::format(
-                    "assigning the string '{}' into a struct field aliases a heap buffer it does not "
-                    "solely own (it {}) and will double-free at teardown; use 'move' to transfer "
-                    "ownership or '.copy()' for an independent copy", rightNV.CallerName,
-                    rightNV.IsOwningString ? "owns the buffer, which the field would also free"
-                                           : "borrows an owning string field"));
+                    "assigning a non-owning string '{}' into a struct field; use 'move' to transfer "
+                    "ownership or '.copy()' for an independent copy", rightNV.CallerName));
                 return right;
             }
 

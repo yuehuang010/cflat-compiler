@@ -10,7 +10,7 @@ struct Row { string name = default; };
 void copyField(Row a, Row b)
 {
     string tmp = b.name;               // borrows the owning string field b.name
-    expect_error("aliases a heap buffer it does not solely own");
+    expect_error("assigning a non-owning string 'tmp' into a struct field");
     a.name = tmp;                      // laundered field-to-field copy -> double-free
 }
 
