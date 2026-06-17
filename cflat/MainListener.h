@@ -3418,15 +3418,33 @@ public:
                         if (compiler->lastCallIsBonded)
                             checkBondSources(compiler->lastCallBondedSources);
 
-                        // Returning an owning field of a by-value temp (`return makeToken().text;`) REJECTED:
-                        // its buffer is owned elsewhere and would be freed, dangling the return value.
+                        // Returning an owning field of a by-value temp (`return makeToken().text;`).
                         if (returnNV.FromOwningTempField
                             && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
                         {
-                            LogErrorContext(jump, std::format(
-                                "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
-                                "would be freed. Use '.copy()' for an independent copy.",
-                                returnNV.OwningStructName, returnNV.FieldName));
+                            // A `move`-temp OWNS the field: move it out as the return value (Phase B).
+                            // Keep the owned bit (ownership transfers to the caller) and zero the source
+                            // field so the temp's full-dtor (FlushOwnedStructTemps below) skips it. Works
+                            // for a string field (clears its owned bit) or an owning struct field (the
+                            // aggregate-zero recursively clears every owning subfield's owned bit). An
+                            // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
+                            if (returnNV.MovableTempField && right != nullptr
+                                && right->getType() == returnNV.BaseType)
+                            {
+                                clearReturnedStringBorrowBit = false;
+                                auto* srcGep = compiler->builder->CreateStructGEP(
+                                    returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
+                                    returnNV.MoveTempFieldIndex, "movedfld");
+                                compiler->builder->CreateStore(
+                                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                            }
+                            else
+                            {
+                                LogErrorContext(jump, std::format(
+                                    "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
+                                    "would be freed. Use '.copy()' for an independent copy.",
+                                    returnNV.OwningStructName, returnNV.FieldName));
+                            }
                         }
 
                         // Clear flags consumed by the return check.
@@ -5028,6 +5046,12 @@ public:
                 // owns, so storing it into another field would double-free - tracked so the
                 // field-store reject can catch the laundered field-to-field copy.
                 bool srcBorrowsOwnedString = false;
+                // Implied move of a `move`-temp's owning field (`string s = makeToken().text`): the temp
+                // owns the field, so the local adopts it and the source field in the temp is zeroed.
+                bool srcMovableTempField = false;
+                llvm::Value* srcMoveTempStructAlloca = nullptr;
+                llvm::Type* srcMoveTempStructType = nullptr;
+                unsigned srcMoveTempFieldIndex = 0;
                 auto initializer = initDecl->initializer();
 
                 // Bare-brace form: T[N] arr {} - LeftBrace/initializerList are on initDecl directly.
@@ -5223,9 +5247,16 @@ public:
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 right = LoadNamedVariable(rightNV);
-                                // Binding an owning field of a by-value temp to a local (`string s = makeToken().text`)
-                                // REJECTED: its buffer is owned elsewhere and would be freed out from under the local.
-                                if (rightNV.FromOwningTempField
+                                // A `move`-temp's owning field can be MOVED into the local (the temp owns it):
+                                // capture the source so the store site adopts it and zeros the temp's field.
+                                srcMovableTempField = rightNV.MovableTempField
+                                    && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName);
+                                srcMoveTempStructAlloca = rightNV.MoveTempStructAlloca;
+                                srcMoveTempStructType = rightNV.MoveTempStructType;
+                                srcMoveTempFieldIndex = rightNV.MoveTempFieldIndex;
+                                // Binding an owning field of a NON-move (alias) temp to a local REJECTED: its
+                                // buffer is owned elsewhere and would be freed out from under the local.
+                                if (rightNV.FromOwningTempField && !srcMovableTempField
                                     && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression, std::format(
@@ -5550,6 +5581,18 @@ public:
 
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
 
+                        // Implied move of a `move`-temp's owning field: the local now owns the buffer, so
+                        // zero the source in the temp and mark a string local owning (not a borrow).
+                        if (srcMovableTempField)
+                        {
+                            auto* srcGep = compiler->builder->CreateStructGEP(
+                                srcMoveTempStructType, srcMoveTempStructAlloca, srcMoveTempFieldIndex, "movedfld");
+                            compiler->builder->CreateStore(
+                                llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                            if (typeAndValue.TypeName == "string")
+                                compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                        }
+
                         // A closure local now owns its env (its scope-exit dtor frees it), so drop
                         // the value from the owned-closure temp-flush list to avoid a double-free
                         // (covers a lambda literal RHS, a clone, or a call result uniformly).
@@ -5566,8 +5609,9 @@ public:
                         }
 
                         // Taint a string local that borrows an owning string field, so storing it
-                        // into another field is rejected as a laundered field-to-field copy.
-                        if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString)
+                        // into another field is rejected as a laundered field-to-field copy. An implied
+                        // move (above) makes the local a true owner, not a borrow, so skip the taint.
+                        if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString && !srcMovableTempField)
                             compiler->stackNamedVariable.back().namedVariable[name].BorrowsOwnedString = true;
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
@@ -6266,8 +6310,24 @@ public:
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
 
-            // Storing an owning field of a by-value temp (`x = makeToken().text`) into a longer-lived
-            // slot REJECTED: the buffer is owned elsewhere (alias or `move`-temp), so a 2nd owner double-frees.
+            // Implied move of a `move`-temp's owning field (`dest = makeToken().text`): the temp OWNS it,
+            // so free dest's old value, store the field, and zero the source so the temp dtor skips it.
+            if (operatorText == "=" && right && rightNV.MovableTempField
+                && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(right, destination);
+                auto* srcGep = compiler->builder->CreateStructGEP(
+                    rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, "movedfld");
+                compiler->builder->CreateStore(
+                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+                return right;
+            }
+
+            // Storing an owning field of a NON-move (alias) temp (`x = aliasTok().text`) into a longer-
+            // lived slot REJECTED: the buffer is owned elsewhere, so a 2nd owner double-frees. (Move-temps
+            // took the implied-move branch above.)
             if (operatorText == "=" && rightNV.FromOwningTempField
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
@@ -10447,6 +10507,15 @@ public:
                                             auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");
                                             Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);
                                             Compiler(ctx)->RegisterOwnedStructTemp(tempAlloca, parentType);
+                                            // The temp owns this field: let a persist site move it out (store + zero
+                                            // the source) rather than reject. Only an owning field can be moved.
+                                            if (Compiler(ctx)->IsOwningValueType(fieldType.TypeName))
+                                            {
+                                                namedVar.MovableTempField = true;
+                                                namedVar.MoveTempStructAlloca = tempAlloca;
+                                                namedVar.MoveTempStructType = structVar.BaseType;
+                                                namedVar.MoveTempFieldIndex = fieldIndex;
+                                            }
                                         }
                                         if (parentIsOwningTemp || structVar.FromOwningTempField)
                                             namedVar.FromOwningTempField = true;

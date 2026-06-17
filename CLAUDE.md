@@ -16,6 +16,10 @@ Do not modify the root `./vcpkg.json` without explicit permission.
 
 - Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.
 
+## Comments
+
+- Keep inline comments to 2 lines or fewer. Multiline comments are allowed above a function or at the beginning entry into a new scope.
+
 ## Logging Conventions
 
 - Use `LogError` or `LogErrorContext` for all error reporting in the compiler. Do not introduce `LogWarning` or leave `std::cout`.

@@ -1,14 +1,15 @@
-// Storing an owning field extracted from a by-value temp into a longer-lived slot must be
-// rejected: the field's buffer is owned by the temp (or its source), so a shallow copy into a
-// second owner double-frees at teardown. The fix is '.copy()'. See internal/issue/misc-known-gaps.md.
+// Storing an owning field extracted from a NON-move (alias) by-value temp into a longer-lived slot
+// must be rejected: a plain accessor's temp does not own the field buffer, so a shallow copy into a
+// second owner double-frees at teardown. The fix is '.copy()'. A `move`-return temp instead does an
+// implied move (the temp owns the field) - see test_collection_leaks.cb. See internal/issue/misc-known-gaps.md.
 struct Tok { string text = default; };
 struct Box { string slot = default; };
 
-move Tok mkTok() { Tok t = default; t.text = "x" + "y"; return t; }
+Tok aliasTok() { Tok t = default; t.text = "x" + "y"; return t; }
 
 extern int main()
 {
     expect_error("taken from a temporary");
     Box b = default;
-    b.slot = mkTok().text;          // REJECTED - use mkTok().text.copy()
+    b.slot = aliasTok().text;       // REJECTED - non-move temp, use aliasTok().text.copy()
 }

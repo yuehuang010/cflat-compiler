@@ -80,6 +80,15 @@ struct Greeter
 // (`list.get`) returns a shallow ALIAS, so its temp must NOT be destructed (a double-free aborts).
 struct TempTok { string text = default; string extra = default; };
 move TempTok makeTempTok(int n) { TempTok t = default; t.text = "tok" + n.toString(); t.extra = "ex" + n.toString(); return t; }
+// Destination for the implied-move cases: a `move`-temp's owning field transfers into this slot.
+struct TokHolder { string slot = default; };
+// Phase B: returning a `move`-temp's owning field moves it out (ownership escapes to the caller).
+// String field and struct field both move; the temp's other field still frees at end-of-statement.
+string returnMovedText(int n) { return makeTempTok(n).text; }
+struct InnerTok { string s = default; };
+struct OuterTok { InnerTok inner = default; };
+move OuterTok makeOuterTok(int n) { OuterTok o = default; o.inner.s = "in" + n.toString(); return o; }
+InnerTok returnMovedInner(int n) { return makeOuterTok(n).inner; }
 
 extern int main()
 {
@@ -403,6 +412,22 @@ extern int main()
         total++; passed += Test("get() alias field read", toks.get(0).text.length(), 4);   // "list"
         string ownedCopy = toks.get(0).text.copy();         // copy from an alias -> independent owner
         total++; passed += Test("get() alias field copy", ownedCopy.length(), 4);
+
+        // Implied move: a `move`-temp OWNS its field, so persisting it transfers ownership (no .copy
+        // needed). The destination frees the buffer once; the temp's other field frees at end of
+        // statement; the moved-out field is zeroed so the temp's dtor does not double-free it.
+        TokHolder h = default;
+        h.slot = makeTempTok(11).text;                      // implied move into a struct field
+        total++; passed += Test("implied-move into field", h.slot.length(), 5);   // "tok11"
+        string movedTok = makeTempTok(123).text;            // implied move into a local
+        total++; passed += Test("implied-move into local", movedTok.length(), 6); // "tok123"
+
+        // Phase B: returning a `move`-temp's owning field moves it out to the caller (no leak,
+        // no double-free - the temp's sibling field frees, the moved field rides out owned).
+        string retText = returnMovedText(55);               // string field moved out via return
+        total++; passed += Test("implied-move via return (string)", retText.length(), 5); // "tok55"
+        InnerTok retInner = returnMovedInner(9);            // struct field moved out via return
+        total++; passed += Test("implied-move via return (struct)", retInner.s.length(), 3); // "in9"
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===

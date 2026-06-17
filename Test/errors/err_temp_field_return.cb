@@ -1,0 +1,13 @@
+// Returning an owning field extracted from a NON-move (alias) by-value temp must be rejected: a
+// plain accessor's temp does not own the field buffer, so returning a shallow copy dangles once the
+// temp is destructed. The fix is '.copy()'. A `move`-return temp instead does an implied move out
+// of the return (Phase B) - see test_collection_leaks.cb. See internal/issue/misc-known-gaps.md.
+struct Tok { string text = default; };
+
+Tok aliasTok() { Tok t = default; t.text = "x" + "y"; return t; }
+
+expect_error("taken from a temporary") {
+    string getName() { return aliasTok().text; }   // REJECTED - alias temp, use .copy()
+}
+
+extern int main() { return 0; }

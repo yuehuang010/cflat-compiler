@@ -556,6 +556,12 @@ public:
         // Field extracted from a BY-VALUE owning-struct temp (`makeToken().text`): may be read, but
         // persisting it (store/bind/return) double-frees so those sites reject it. See FlushOwnedStructTemps.
         bool FromOwningTempField = false;
+        // Parent was a `move`-return temp (the temp OWNS this field): a persist site may MOVE the field
+        // out (store + zero the source) instead of forcing `.copy()`. An alias temp leaves these unset.
+        bool MovableTempField = false;
+        llvm::Value* MoveTempStructAlloca = nullptr;  // the spilled `owntemp` holding the parent struct
+        llvm::Type*  MoveTempStructType = nullptr;    // the parent struct's LLVM type, for the field GEP
+        unsigned     MoveTempFieldIndex = 0;          // this field's index within the parent struct
         // Bitfield access: non-null BitfieldStorage means this is a bitfield view onto a storage word.
         // Reads compute shift+mask; writes do a read-modify-write on BitfieldStorage.
         llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
