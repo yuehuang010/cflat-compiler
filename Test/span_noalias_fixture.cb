@@ -83,17 +83,17 @@ extern int main()
     if (a[100]  != 126.0)  ok = 0;
     if (a[1023] != 1049.0) ok = 0;
 
-    // operator[] form on its own buffers: c[i] += 5 * 2 = +10.
-    double[] c = new double[n];
+    // operator[] form on its own buffers: ca[i] += 5 * 2 = +10.
+    double[] ca = new double[n];
     double[] d = new double[n];
     i64 j = 0;
-    while (j < n) { c[j] = (double)j; d[j] = 2.0; j = j + 1; }
-    span<double> yc2; yc2.wrap(c, n);
+    while (j < n) { ca[j] = (double)j; d[j] = 2.0; j = j + 1; }
+    span<double> yc2; yc2.wrap(ca, n);
     span<double> xd2; xd2.wrap(d, n);
     span_idx_axpy(5.0, yc2, xd2);
-    if (c[0]    != 10.0)   ok = 0;
-    if (c[100]  != 110.0)  ok = 0;
-    if (c[1023] != 1033.0) ok = 0;
+    if (ca[0]    != 10.0)   ok = 0;
+    if (ca[100]  != 110.0)  ok = 0;
+    if (ca[1023] != 1033.0) ok = 0;
 
     // get()/set() form on its own buffers: e[i] += 7 * 2 = +14.
     double[] e = new double[n];

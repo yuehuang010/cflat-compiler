@@ -1,0 +1,5 @@
+// Two fields with the same name in one struct are rejected (C semantics). A duplicate used to
+// overwrite the first field's entry in name->index lookups and silently shadow it.
+expect_error("redeclaration of field 'x' in 'S'") {
+    struct S { int x = default; int x = default; };
+}

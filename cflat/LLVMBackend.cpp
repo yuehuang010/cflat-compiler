@@ -1948,6 +1948,7 @@ void LLVMBackend::ResetForReanalysis()
     interfaceParents.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
+    globalDeclSite.clear();
     namespaceTable.clear();
     stringPool.clear();
     stackNamedVariable.clear();
@@ -3243,6 +3244,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     interfaceParents.clear();
     globalNamedVariable.clear();
     globalVariableTypes.clear();
+    globalDeclSite.clear();
     namespaceTable.clear();
     typeAliases.clear();
     enumBackingTypes.clear();

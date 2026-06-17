@@ -1,0 +1,7 @@
+// Declaring the same global twice at file scope is rejected (C semantics). The second decl used to
+// silently overwrite the first's globalNamedVariable entry. An `extern` decl preceding a definition
+// is still allowed (tested elsewhere / by normal compiles).
+expect_error("redeclaration of global 'g' in the same scope") {
+    int g = 1;
+    int g = 2;
+}

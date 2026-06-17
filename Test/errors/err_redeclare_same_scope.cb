@@ -1,0 +1,10 @@
+// Declaring the same name twice in one scope is rejected (C semantics). Silently overwriting the
+// scope-map entry used to drop the shadowed owning local's destructor and leak its buffer.
+import "string.cb";
+
+extern int main()
+{
+    expect_error("redeclaration of 'a' in the same scope");
+    string a = "x" + "yz";
+    string a = "fo" + "o";
+}

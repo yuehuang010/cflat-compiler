@@ -5494,6 +5494,29 @@ public:
 
                 if (global_scope)
                 {
+                    // Same-scope (file-scope) redeclaration of a global is rejected (C semantics),
+                    // mirroring the local check. An `extern` declaration may legitimately precede a
+                    // definition (or repeat), so only flag when a prior real DEFINITION already exists
+                    // and this declaration is not itself an extern declaration. A re-registration at
+                    // the SAME source line is benign (a core file analyzed as a root - via a temp-copy
+                    // path, as the LSP does - is also pulled in via the auto-import graph, so its
+                    // globals register twice from the same line); only the same name at a DIFFERENT
+                    // line is a true in-source redeclaration.
+                    if (!externDeclOnly)
+                    {
+                        int curLine = (int)direct->getStart()->getLine();
+                        auto prevSite = compiler->globalDeclSite.find(name);
+                        bool sameLine = prevSite != compiler->globalDeclSite.end()
+                            && prevSite->second == curLine;
+                        auto existingGlobal = compiler->globalNamedVariable.find(name);
+                        if (!sameLine
+                            && existingGlobal != compiler->globalNamedVariable.end()
+                            && existingGlobal->second != nullptr
+                            && !existingGlobal->second->isDeclaration())
+                            LogErrorContext(direct, std::format(
+                                "redeclaration of global '{}' in the same scope; use a different name or assign to the existing variable", name));
+                        compiler->globalDeclSite[name] = curLine;
+                    }
                     auto constant = llvm::dyn_cast_or_null<llvm::Constant>(right);
                     compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
                     // Record the variable's declaration site so LSP go-to-definition
@@ -5520,6 +5543,14 @@ public:
                 {
                     if (typeAndValue.threadLocal)
                         LogErrorContext(direct, "thread_local is only allowed on global variables.");
+                    // Same-scope redeclaration is rejected (C semantics). Silently overwriting the
+                    // scope-map entry would drop the shadowed local's scope-exit destructor and leak
+                    // an owning value (string/list/closure). Shadowing in a NESTED block is fine - that
+                    // is a separate scope frame; parameters live in a separate map (functionArgument),
+                    // so a local re-using a parameter name is not flagged here.
+                    if (compiler->stackNamedVariable.back().namedVariable.count(name))
+                        LogErrorContext(direct, std::format(
+                            "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, alloc));
 
@@ -14677,6 +14708,17 @@ public:
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     decl list has " << declList.size() << " fields\n";
+
+        // Reject two fields with the same name in one struct/union (C semantics). A duplicate would
+        // overwrite the first field's entry in name->index lookups and silently shadow it. Anonymous
+        // (C-interop) members carry an empty name and are skipped.
+        {
+            std::unordered_set<std::string> seenFields;
+            for (const auto& f : declList)
+                if (!f.VariableName.empty() && !seenFields.insert(f.VariableName).second)
+                    LogErrorContext(ctx, std::format(
+                        "redeclaration of field '{}' in '{}'", f.VariableName, structName));
+        }
 
         // Bitfield packing: collapse runs of same-type bitfields into shared
         // storage slots BEFORE the constructor loop runs - the default ctor

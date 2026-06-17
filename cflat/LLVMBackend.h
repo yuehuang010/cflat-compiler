@@ -866,6 +866,14 @@ private:
     std::vector<StackState> stackNamedVariable;
     std::unordered_map<std::string, llvm::GlobalVariable*> globalNamedVariable;
     std::unordered_map<std::string, TypeAndValue> globalVariableTypes;
+    // Declaration LINE of each global, for same-scope redeclaration detection. A true in-source
+    // duplicate is the same name at DIFFERENT lines (`int g=1; int g=2;`). The same name at the
+    // SAME line is benign re-registration of one declaration: a core file analyzed as a root (via a
+    // temp-copy path, as the LSP does) is also pulled in via the auto-import graph, so its globals
+    // register twice from the same source line - the temp copy preserves line numbers, but its path
+    // differs from the real file, so line (not path) is the stable identity. Cleared by
+    // ResetForReanalysis like the maps above.
+    std::unordered_map<std::string, int> globalDeclSite;
     std::unordered_map<std::string, StructData> dataStructures;
 
     // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).
