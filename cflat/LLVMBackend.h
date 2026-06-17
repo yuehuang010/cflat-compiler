@@ -119,6 +119,10 @@ struct GenericTemplateState
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
     std::vector<PendingInstantiation>                                           pendingInstantiations;
+    // Mangled tuple name -> its element type args. Recorded wherever a tuple shell is named
+    // (including the forward-ref pre-scan) so a destructure can lazily instantiate the fields
+    // when the tuple is reached only via a return type before its producer was code-generated.
+    std::unordered_map<std::string, std::vector<std::string>>                   tupleTypeArgs;
 
     void Clear()
     {
@@ -136,6 +140,7 @@ struct GenericTemplateState
         genericFunctionConstraints.clear();
         instantiatedGenericFunctions.clear();
         pendingInstantiations.clear();
+        tupleTypeArgs.clear();
     }
 };
 

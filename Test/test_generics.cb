@@ -1984,7 +1984,25 @@ bool testTupleReturnAndDestructure()
     result &= Test("destr_auto_wild_int",  am, 42);
     result &= Test("destr_auto_wild_bool", ac, true);
 
+    // Regression: a tuple shape (long, char) that is NEVER value-constructed anywhere and is
+    // reached ONLY as a return type + destructure target. makeFreshPair is also defined AFTER
+    // this function, so its fields are not yet emitted when this destructure runs - the
+    // destructure must lazily instantiate them (was "arity mismatch: 2 variables for 0 fields").
+    (long fa, char fb) = makeFreshPair();
+    result &= Test("destr_fresh_long", fa, 9L);
+    result &= Test("destr_fresh_char", (int)fb, 65);
+
     return result;
+}
+
+// Builds a (long, char) tuple via field assignment - no '(a, b)' construction expression of
+// this shape exists in the file. Deliberately defined after testTupleReturnAndDestructure.
+(long, char) makeFreshPair()
+{
+    tuple<long, char> t = default;
+    t.item_0 = 9L;
+    t.item_1 = (char)65;
+    return t;
 }
 
 // Returns two array-views as a tuple. A tuple element may be a `T[]` array-view; each

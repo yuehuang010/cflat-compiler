@@ -4,4 +4,5 @@ import "memory.cb";
 import "function.cb";
 import "program.cb";
 import "string.cb";
+import "tuple.cb";
 

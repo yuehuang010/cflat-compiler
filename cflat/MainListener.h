@@ -542,6 +542,7 @@ private:
                         compiler->CreateStructType(mangledName, {});
                         LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
+                        compiler->gts.tupleTypeArgs[mangledName] = typeArgs;
                         declType.TypeName = mangledName;
                         declType.Pointer = declSpec->pointer() != nullptr;
                         declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
@@ -1151,13 +1152,17 @@ public:
                         // Pack-only form (T...) resolved during instantiation - skip forward-declare here
                         if (tts->tupleTypePackEntry() == nullptr)
                         {
-                            std::string mangledName = "tuple";
+                            std::vector<std::string> typeArgs;
                             for (auto* entry : tts->tupleTypeEntry())
-                                mangledName += "__" + MangleTypeArg(TupleEntryArgName(entry));
+                                typeArgs.push_back(TupleEntryArgName(entry));
+                            std::string mangledName = "tuple";
+                            for (const auto& arg : typeArgs)
+                                mangledName += "__" + MangleTypeArg(arg);
                             auto* c = Compiler(tts);
                             c->CreateStructType(mangledName, {});
                             LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                             c->CreateFunctionDeclaration(mangledName, rt, {});
+                            c->gts.tupleTypeArgs[mangledName] = typeArgs;
                         }
                     }
                     break;
@@ -1643,6 +1648,9 @@ private:
     // Queue for pending generic instantiations (delayed until safe to emit code)
     std::vector<PendingInstantiation>& pendingInstantiations;
 
+    // Mangled tuple name -> element type args (see GenericTemplateState::tupleTypeArgs)
+    std::unordered_map<std::string, std::vector<std::string>>& tupleTypeArgs;
+
     struct SwitchCaseEntry
     {
         llvm::ConstantInt* value = nullptr;       // non-null for integer cases
@@ -1834,6 +1842,7 @@ private:
                     }
                     std::string mangledName = MangledGenericName("tuple", typeArgs);
                     declType.TypeName = mangledName;
+                    tupleTypeArgs[mangledName] = typeArgs;
                     // Queue instantiation if inside a generic context and not already done
                     if (!instantiatedGenerics.count(mangledName) &&
                         (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
@@ -2228,6 +2237,7 @@ public:
         , instantiatedGenericFunctions(compilerLLVM->gts.instantiatedGenericFunctions)
         , genericFunctionConstraints(compilerLLVM->gts.genericFunctionConstraints)
         , pendingInstantiations(compilerLLVM->gts.pendingInstantiations)
+        , tupleTypeArgs(compilerLLVM->gts.tupleTypeArgs)
     {
         this->parser = parser;
         this->compilerLLVM = compilerLLVM;
@@ -3007,6 +3017,26 @@ public:
         }
     }
 
+    // Force a tuple's field layout to be emitted now. Used when a tuple type is reached only
+    // through a return type whose producing function has not been code-generated yet, so its
+    // fields are still empty. Looks up the element type args recorded when the shell was named.
+    void EnsureTupleInstantiated(const std::string& mangledName)
+    {
+        if (!instantiatedGenerics.count(mangledName) && !genericStructTemplates.count("tuple"))
+            return;  // tuple.cb not imported - nothing to instantiate from
+        auto it = tupleTypeArgs.find(mangledName);
+        if (it == tupleTypeArgs.end())
+            return;
+        if (!instantiatedGenerics.count(mangledName))
+        {
+            pendingInstantiations.push_back({"tuple", it->second, mangledName});
+            instantiatedGenerics.insert(mangledName);
+        }
+        auto savedState = Compiler()->SaveBuilderState();
+        ProcessPendingInstantiations();
+        Compiler()->RestoreBuilderState(savedState);
+    }
+
     void ParseDestructuringDeclaration(CFlatParser::DestructuringDeclarationContext* ctx)
     {
         auto* compiler = Compiler(ctx);
@@ -3021,6 +3051,12 @@ public:
             LogErrorContext(ctx, std::format("Destructuring requires a tuple type, got '{}'", rhsType));
             return;
         }
+
+        // A tuple reached only via a return type (its producer not yet code-generated, e.g. defined
+        // below this destructure) has a registered shell but no fields yet. Instantiate them now
+        // from the type args recorded when the shell was named.
+        if (compiler->GetDataStructure(rhsType).StructFields.empty())
+            EnsureTupleInstantiated(rhsType);
 
         auto* structType = compiler->GetDataStructure(rhsType).StructType;
         if (!structType)
@@ -13891,6 +13927,7 @@ public:
         }
 
         std::string mangledName = MangledGenericName("tuple", typeArgs);
+        tupleTypeArgs[mangledName] = typeArgs;
 
         // Ensure the tuple instantiation is processed before we use its struct layout
         if (!instantiatedGenerics.count(mangledName) &&
@@ -14457,6 +14494,7 @@ public:
                 for (auto* entry : tts->tupleTypeEntry())
                     typeArgs.push_back(TupleEntryArgName(entry));
                 std::string mangledName = MangledGenericName("tuple", typeArgs);
+                tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
                 {
                     pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
