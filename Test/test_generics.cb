@@ -1958,6 +1958,32 @@ bool testTupleReturnAndDestructure()
     result &= Test("destr3_float", b, 2.7f);
     result &= Test("destr3_bool",  c, true);
 
+    // Inferred entry: omit the type and infer it from the tuple field. At least one entry must
+    // carry a type so the parse is unambiguous (a fully type-less '(a, b) = expr;' parses as an
+    // assignment expression, not a destructure - see ParseDestructuringDeclaration).
+    (int ix, iy) = makePoint();
+    result &= Test("destr_infer_int",   ix, 3);
+    result &= Test("destr_infer_float", iy, 1.5f);
+
+    // `_` wildcard: skip a slot. The value stays in the tuple (no extra binding), and the wildcard
+    // can sit anywhere - first, last, or middle - mixed with typed/inferred entries.
+    (_, float wy) = makePoint();
+    result &= Test("destr_wild_first", wy, 1.5f);
+    (int wx, _) = makePoint();
+    result &= Test("destr_wild_second", wx, 3);
+    (int wa, _, bool wc) = makeTriple();
+    result &= Test("destr_wild_mid_int",  wa, 42);
+    result &= Test("destr_wild_mid_bool", wc, true);
+
+    // Leading `auto` disambiguates from an assignment expression, so a FULLY type-less form is
+    // allowed - every entry is inferred or `_`, no type token required anywhere.
+    auto (aa, ab) = makePoint();
+    result &= Test("destr_auto_int",   aa, 3);
+    result &= Test("destr_auto_float", ab, 1.5f);
+    auto (am, _, ac) = makeTriple();
+    result &= Test("destr_auto_wild_int",  am, 42);
+    result &= Test("destr_auto_wild_bool", ac, true);
+
     return result;
 }
 

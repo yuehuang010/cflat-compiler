@@ -1,0 +1,6 @@
+// `_` is reserved as the discard target; it cannot name a variable.
+extern int main()
+{
+    expect_error("'_' is reserved as the discard target");
+    int _ = 5;
+}

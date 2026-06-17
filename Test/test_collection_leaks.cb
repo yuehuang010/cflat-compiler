@@ -455,6 +455,11 @@ extern int main()
         makeTempTok(80);
         makePlainTok(81);
 
+        // `_ = expr` is an explicit discard: same end-of-full-expression destruction as the bare
+        // form, but works for any result (scalar/string/struct). Covered by the oracle below.
+        _ = makeTempTok(82);
+        _ = makePlainTok(83);
+
         // list.get(i) returns a shallow ALIAS of the element, so the temp is NOT destructed - the
         // element survives (frees once with the list, no double-free). Read it, and copy it out.
         list<TempTok> toks = default;

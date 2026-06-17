@@ -1706,6 +1706,35 @@ int testStringAPI()
     return passed;
 }
 
+// ── discard target `_` ───────────────────────────────────────────────────────
+// A bare discarded call and `_ = expr` both evaluate the RHS for its side effects
+// and destruct an owning-struct rvalue exactly once at end of the full expression
+// (regression: the discarded temp used to leak - no field-access site hooked it).
+int g_discard_side = 0;
+int discardSide(int x) { g_discard_side++; return x; }
+
+int testDiscard()
+{
+    int passed = 0;
+
+    // Bare-statement owning-struct temp: destructed exactly once (no leak, no double-free).
+    g_owned_ret_dtor = 0;
+    { makeOwnedRet(); }
+    passed += Test("bare discard destructs once", g_owned_ret_dtor, 1);
+
+    // `_ = expr` owning-struct temp: same single destruction.
+    g_owned_ret_dtor = 0;
+    { _ = makeOwnedRet(); }
+    passed += Test("'_ =' discard destructs once", g_owned_ret_dtor, 1);
+
+    // `_ = expr` still evaluates the RHS for its side effects.
+    g_discard_side = 0;
+    _ = discardSide(7);
+    passed += Test("'_ =' runs RHS side effect", g_discard_side, 1);
+
+    return passed;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 extern int main()
@@ -1743,6 +1772,7 @@ extern int main()
     r = testStringBuilder();    passed += r; total += 20;
     r = testStringView();       passed += r; total += 12;
     r = testStringAPI();        passed += r; total += 109;
+    r = testDiscard();          passed += r; total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -750,7 +750,7 @@ Tuples can be returned from functions:
 
 ### Destructuring Declaration
 
-A tuple value can be unpacked into named local variables in a single declaration. The types must be written explicitly:
+A tuple value can be unpacked into named local variables in a single declaration:
 
 ```c
 (int x, float y) = makePoint();
@@ -760,6 +760,29 @@ A tuple value can be unpacked into named local variables in a single declaration
 ```
 
 The right-hand side can be any expression that evaluates to a matching tuple type - a variable, a function call, or a construction expression.
+
+#### Inferred entries and the `_` wildcard
+
+An entry may omit its type to have it inferred from the corresponding tuple field, and `_`
+discards a slot (no variable is bound; the value stays in the tuple and is freed with it):
+
+```c
+(int a, b)   = makePoint();   // b inferred as float
+(int a, _)   = makePoint();   // second slot discarded
+(_, float b) = makePoint();   // first slot discarded
+```
+
+At least one entry must carry an explicit type. A fully type-less `(a, b) = expr;` is
+indistinguishable from an ordinary assignment expression, so it is parsed as one (an assignment
+to existing variables), not a destructure.
+
+To destructure with no types at all, prefix the pattern with `auto` - it disambiguates from an
+assignment expression, so every entry may be inferred or `_`:
+
+```c
+auto (a, b)    = makePoint();   // both inferred
+auto (x, _, z) = makeTriple();  // middle slot discarded
+```
 
 ### `ITuple<T...>` Interface
 
@@ -1148,6 +1171,25 @@ explicitly between `delete[n]` (with destructors) and `delete[_]` (without).
 > and deep-copy a borrowed (non-owning) argument, so strings stored in containers are
 > safe. A plain `string s2 = s1;` assignment also shares the buffer - own an
 > independent copy with `s1.copy()`.
+
+### Discarding a Result (`_`)
+
+`_` is the discard target. `_ = expr;` evaluates the right-hand side for its side effects and
+throws the value away. It works for any result type, and if the value is an owning temporary
+(an owning struct, `string`, or closure) it is destructed at the end of the full expression -
+so discarding never leaks:
+
+```c
+_ = compute();        // ignore a return value
+_ = makeToken();      // owning struct: built, then freed at the end of this statement
+```
+
+A bare call statement behaves the same way - `makeToken();` on its own also frees its result -
+so `_ =` is mostly about signalling intent ("I am deliberately ignoring this").
+
+`_` is reserved: it cannot name a variable, and only the plain `=` form is allowed (`_ += x` is
+an error). It is also the wildcard in tuple destructuring (see
+[Destructuring Declaration](#destructuring-declaration)) and in `switch` arms (`case _ =>`).
 
 ---
 

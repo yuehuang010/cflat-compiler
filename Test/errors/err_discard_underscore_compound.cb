@@ -1,0 +1,6 @@
+// `_` only supports the plain `=` discard form, not compound assignment.
+extern int main()
+{
+    expect_error("'_' is a discard target");
+    _ += 5;
+}

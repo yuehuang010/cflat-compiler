@@ -555,11 +555,12 @@ blockItem
     ;
 
 destructuringDeclaration
-    : '(' destructuringEntry (',' destructuringEntry)+ ')' '=' assignmentExpression ';'
+    : Auto? '(' destructuringEntry (',' destructuringEntry)+ ')' '=' assignmentExpression ';'
     ;
 
 destructuringEntry
     : declarationSpecifiers Identifier
+    | Identifier
     ;
 
 expressionStatement

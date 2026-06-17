@@ -3052,7 +3052,6 @@ public:
         for (size_t i = 0; i < entries.size(); i++)
         {
             auto* entry = entries[i];
-            auto declType = ParseDeclarationSpecifiers(entry->declarationSpecifiers());
             std::string varName = entry->Identifier()->getText();
 
             std::string fieldName = "item_" + std::to_string(i);
@@ -3062,6 +3061,17 @@ public:
                 if (f.VariableName == fieldName) break;
                 fieldIdx++;
             }
+
+            // `_` is the discard wildcard: skip binding this slot entirely. The value stays in
+            // the tuple, so the tuple's own destructor frees it (no extra var -> no double-free).
+            if (entry->declarationSpecifiers() == nullptr && varName == "_")
+                continue;
+
+            // Two entry forms: `T name` (explicit type) or a bare `name` whose type is inferred
+            // from the corresponding tuple field. A bare identifier other than `_` always infers.
+            LLVMBackend::TypeAndValue declType = entry->declarationSpecifiers() != nullptr
+                ? static_cast<LLVMBackend::TypeAndValue>(ParseDeclarationSpecifiers(entry->declarationSpecifiers()))
+                : static_cast<LLVMBackend::TypeAndValue>(structData.StructFields[fieldIdx]);
 
             auto* gep = compiler->CreateStructGEP(structType, tupleAlloca, fieldIdx);
             auto* fieldLLVMType = compiler->GetType(structData.StructFields[fieldIdx]);
@@ -5025,6 +5035,11 @@ public:
             {
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
+                // `_` is the reserved discard target (`_ = expr`), never a binding. Rejecting the
+                // declaration keeps `_ = ...` unambiguously a discard, not a hidden assignment to
+                // a user variable that silently never updates.
+                if (name == "_")
+                    LogErrorContext(direct, "'_' is reserved as the discard target; it cannot name a variable.");
                 // A namespace-scope global registers under its qualified name (Cfg.W),
                 // mirroring namespace functions and enum members: qualified access
                 // (Cfg.W) resolves through the global table, and two namespaces can
@@ -5995,6 +6010,20 @@ public:
         {
             auto operatorText = ctx->assignmentOperator()->getText();
             auto assignCtx = ctx->assignmentExpression();
+
+            // `_ = expr` is an explicit discard: evaluate the RHS for its side effects, drop the
+            // result, and - like a bare-statement temp - destruct an owning-struct rvalue at the
+            // end of the full expression. `_` is never an lvalue, so only the plain `=` form is
+            // meaningful; a compound op (`_ += x`) would have to read `_` and is rejected.
+            if (unaryCtx != nullptr && unaryCtx->getText() == "_")
+            {
+                if (operatorText != "=")
+                    LogErrorContext(unaryCtx,
+                        "'_' is a discard target; only '_ = expr' is allowed, not compound assignment.");
+                auto rhsNV = ParseAssignmentExpressionNamed(assignCtx);
+                RegisterDiscardedOwningStructTemp(rhsNV);
+                return rhsNV.Primary;
+            }
 
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
