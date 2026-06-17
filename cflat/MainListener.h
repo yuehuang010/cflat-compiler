@@ -2,22 +2,22 @@
 // ============================================================
 // MainListener.h - CFlat front-end: ForwardRefScanner + MainListener
 // ============================================================
-// SECTION         LINE     DESCRIPTION
+// SECTION         LINE      DESCRIPTION               FUNCTION
 // ───────────────────────────────────────────────────────────
-// §1              15-67    File-level helpers
-// §2              72-195   ForwardRefScanner class (pre-pass)
-// §3              200-517  MainListener class (code generation)
-//   §3.1  591             ParseDeclarationSpecifiers (codegen)
-//   §3.2  847             Interface/generic instantiation
-//   §3.3 1020             Top-level declarations
-//   §3.4 1206             Statement parsing
-//   §3.5 1858             Function/parameter declarations
-//   §3.6 2017             Expression parsing
-//   §3.7 3476             ParsePostfixExpression (~797 lines)
-//   §3.8 4838             Generic instantiation queue
-//   §3.9 5011             Struct/Class definitions
-//   §3.10 5571            Constructor/Destructor
-//   §3.11 5686            Utilities
+// §1              39-491    File-level helpers               IsReturnBlockFunction, getOperatorName
+// §2              492-1557  ForwardRefScanner class (pre-pass)
+// §3              1558+     MainListener class (code generation)
+//   §3.1  1760             ParseDeclarationSpecifiers (codegen)  ParseDeclarationSpecifiers
+//   §3.2  2280             Interface/generic instantiation   InstantiateGenericInterface, InstantiateGenericFunction
+//   §3.3  2509             Top-level declarations            ParseUsingDeclaration, ParseExternalDeclaration
+//   §3.4  2939             Statement parsing                 ParseBlockItemList, ParseStatement
+//   §3.5  4430             Function/parameter declarations   ParseFunctionDefinition, ParseDeclaration
+//   §3.6  5706             Expression parsing                ParseAssignmentExpressionNamed, ParseConditionalExpression
+//   §3.7 10120             ParsePostfixExpression (~3000 lines)  ParsePostfixExpression, ParseLambdaExpression
+//   §3.8 14053             Generic instantiation queue       QueueInstantiateGenericType
+//   §3.9 14311             Struct/Class definitions          ParseStructDefinition, ParseClassDefinition
+//   §3.10 17072            Constructor/Destructor            ParseConstructorDefinition, ParseDestructorDefinition
+//   §3.11 17236            Utilities                         ParseParameterTypeList, ParseNumberConstant
 // ============================================================
 
 #include <iostream>
@@ -4349,11 +4349,6 @@ public:
         if (firstDefault < 0)
             return;
 
-        // For each number of omitted trailing defaults, generate a wrapper that
-        // fills them in and forwards to the full function.
-        // e.g. f(int a, int b = 10, int c = 20):
-        //   wrapper(int a, int b) -> f(a, b, 20)
-        //   wrapper(int a)        -> f(a, 10, 20)
         for (int cutoff = firstDefault; cutoff < (int)params.size(); cutoff++)
         {
             std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
@@ -4361,15 +4356,8 @@ public:
             auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
             compiler->InitializeBlock(&wrapperFn->front(), false);
 
-            // Build the full argument list for the forwarding call. The wrapper
-            // forwards its arguments to the full function in declared order, so the
-            // call is purely POSITIONAL. We must clear each arg's VariableName: the
-            // params carry their declared names (and a method's leading `this` is
-            // named "<Type>__"), and MatchFunction treats any arg with a non-empty
-            // VariableName as a NAMED argument - which, when this forwarding call is
-            // resolved against a same-named method on an unrelated type, hard-errors
-            // ("named argument '<Type>__' does not match any parameter") instead of
-            // just rejecting that candidate.
+            // Clear each arg's VariableName: MatchFunction treats a non-empty VariableName as a
+            // NAMED argument, which hard-errors on same-named methods of unrelated types instead of rejecting.
             std::vector<LLVMBackend::NamedVariable> callArgs;
 
             for (int i = 0; i < cutoff; i++)
@@ -6172,43 +6160,14 @@ public:
                 }
             }
 
-            // X4 (Part 1): copying an owning container / dtor-bearing struct VALUE by name into a
-            // longer-lived destination (struct field or heap object) shallow-copies the struct, which
-            // aliases its backing buffer. That buffer is then freed twice at teardown - once by the
-            // source's destructor and once by the destination's - corrupting the heap (the customer
-            // hit STATUS_HEAP_CORRUPTION). There is no runtime owns-flag to disambiguate (the same
-            // reason bare `string` members are deliberately never auto-destructed, and `string` is
-            // therefore exempt here), so this cannot be made safe by auto-deep-copy or move at this
-            // single site: a move cannot un-own the source's origin (e.g. a by-value parameter still
-            // aliases its caller's buffer), and a blanket deep-copy is a broad semantic/perf change to
-            // every `field = containerValue` that risks the same container-internals trap. Matching the
-            // resolved raw-string-array sub-bug, reject the plain copy with a clear steer. A move-rvalue
-            // / temporary (e.g. `v.copy()`, a freshly returned list) has null Storage and owns an
-            // independent buffer, so it is allowed - that is the recommended fix.
-            // Fire ONLY for a real struct-FIELD destination. A field store lowers to a StructGEP
-            // (two indices `{0, fieldIdx}` into a struct type); an array/element store
-            // (`_data[j] = tmp`, `_ptr[index] = value`) lowers to a single-index GEP into the
-            // element buffer. Excluding the latter is essential - those are legitimate buffer
-            // moves into a container slot (the container-internals case that must NOT be flagged).
+            // X4 guard: copying a named owning-value into a struct field aliases its buffer (double-free).
+            // Single-index GEP excluded - those are container-internal element stores that must not be flagged.
             auto* destGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
             bool destIsStructField = destGep && destGep->getNumIndices() == 2
                 && destGep->getSourceElementType()->isStructTy();
 
-            // Closure store (Option A): closures are owning value types but CLONE-SAFE (cloning a
-            // borrowed/null env is a no-op, cloning an owned env yields an independent block), so a
-            // closure assignment / field store auto-clones a NAMED source rather than being rejected
-            // like string/list. The destination then owns an independent env; a move / temporary
-            // RHS already owns its env and is stored as-is. This deliberately bypasses the X4 /
-            // field-to-field / destruct-old guards below (which force explicit intent for types
-            // where cloning a borrow is unsafe). The old destination env IS freed first, but ONLY
-            // when the destination is a known-initialized local/global (alloca/global) - reassigning
-            // such a slot (`f = otherLambda`) would otherwise leak its prior heap env. The destruct
-            // is skipped for a struct-FIELD destination (a 2-index GEP into a struct), whose slot may
-            // be uninitialized garbage (e.g. a raw-malloc'd thread packet) where freeing is unsafe;
-            // a closure-field reassignment therefore still leaks the old env (a narrow, documented
-            // gap). The closure dtor is env-tag-gated, so freeing a default-zero / borrowed slot is a
-            // safe no-op. Note decl-init does NOT reach this branch (it stores via CreateAssignment),
-            // so an alloca destination here always holds a previously-initialized closure value.
+            // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
+            // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && namedVar.TypeAndValue.TypeName == "__closure_fat_ptr")
             {
@@ -6280,15 +6239,8 @@ public:
                 return right;
             }
 
-            // Field-to-field copy of an owning value (`obj.s = obj2.s`) - REJECTED. Both sides are
-            // struct fields of the same owning value type, so a shallow store aliases obj2's backing
-            // buffer into obj's field and double-frees at teardown. This also covers `string` (which
-            // the X4 guard above excludes, to allow the common, safe borrowed-LOCAL-into-field pattern
-            // like `b._rootTag = rt`). It cannot be auto-resolved: ownership is a RUNTIME property (the
-            // string owned bit), so the compiler can neither safely deep-copy (would make a borrowed
-            // source owned) nor move (would consume a source the caller may keep using). Require the
-            // intent: `.copy()` for an independent value, `move` to transfer ownership. Self-field-
-            // assign (`obj.s = obj.s`) is a harmless no-op alias and is allowed.
+            // Field-to-field copy of an owning value - REJECTED. Ownership is a runtime property, so
+            // the compiler cannot safely deep-copy (would make a borrowed source owned) nor auto-move.
             auto* srcFieldGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(rightNV.Storage);
             bool srcIsStructField = srcFieldGep && srcFieldGep->getNumIndices() == 2
                 && srcFieldGep->getSourceElementType()->isStructTy();
@@ -6296,19 +6248,8 @@ public:
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
 
-            // Assigning an OWNED string LOCAL/global directly into a string FIELD - REJECTED.
-            // A string field always owns its buffer, so a plain store aliases the source local's
-            // owned buffer into the field; both the field's teardown destructor and the local's
-            // scope-exit destructor then free it (double-free), and routing a field-to-field copy
-            // `tmp = b.name; a.name = tmp;` through such a local launders past the field-to-field
-            // reject below and corrupts the heap the same way. This cannot be auto-resolved: a
-            // static deep-copy would make every borrow owned (breaking the deliberate char*/literal
-            // borrow-into-field pattern like xml.cb's `b._rootTag = rt`, where the source's owned
-            // bit is clear and IsOwningString is false), and a static move would consume a source
-            // the caller may keep using. Require explicit intent. A `.copy()` / `operator+` result
-            // (IsMove or null Storage - it owns an independent buffer) and a borrowed char*/literal
-            // local (IsOwningString false) are NOT flagged - the recommended fixes are `move` to
-            // transfer ownership or `.copy()` for an independent buffer.
+            // Assigning an owned string local into a string field - REJECTED. A static copy would
+            // make borrowed strings owned (breaking deliberate borrows like xml.cb's `b._rootTag = rt`).
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsStructField
                 && NamedVarIsString(namedVar)
@@ -6338,16 +6279,8 @@ public:
                 return right;
             }
 
-            // Owning-value MOVE at reassignment (string-redesign FINAL MODEL): `b = a` where
-            // both are plain named locals/globals of a value type that owns resources (has a full
-            // destructor). A shallow store would alias a's owned buffers into b (double-free at
-            // teardown); instead destruct b's OLD value, transfer a's bits with a shallow store,
-            // and mark a moved (use-after-move enforced). `b = a.copy()` is the explicit duplicate.
-            // Only fires for a plain local/global destination AND source (the X4 guard above still
-            // handles the struct-FIELD form until field-store lands; a GEP source is a field/element
-            // access, not a whole-variable move); excludes move/temporary/pointer/interface/funcptr
-            // RHS (a move already transfers, a temporary owns an independent buffer). Self-assign
-            // (`a = a`) is skipped - destructing then moving would be a use-after-destruct.
+            // Owning-value MOVE at reassignment: a shallow store aliases owned buffers (double-free).
+            // Destruct the old destination first, then move source bits into it and zero the source.
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
                 && rightNV.Storage != nullptr
@@ -6375,17 +6308,8 @@ public:
                 return right;
             }
 
-            // Destruct the OLD value of an owning-value-type struct FIELD before overwriting it
-            // (closes the field-reassignment leak - copy-point #3). `obj.s = newOwned` previously
-            // overwrote the field's owned buffer without freeing it. The full destructor is owned-
-            // bit / state-gated, so destructing a default or borrowed field value is a safe no-op;
-            // only a genuinely-owned old value is freed. Limited to struct FIELDS (the 2-index GEP
-            // into a struct that destIsStructField already identifies) - element stores like
-            // `_data[j] = v` are container-internal moves whose slots the container destructs
-            // itself (list.set/removeAt call `.~()`), so auto-destructing them would double-free.
-            // Self-assign is skipped: `obj.s = obj.s` has distinct GEP instructions for the two
-            // sides (so the Storage pointers differ), so also compare the field PATH - destructing
-            // then storing the just-loaded (now-freed) value would be a use-after-free.
+            // Destruct old value of an owning-value-type struct FIELD before overwriting (closes
+            // field-reassignment leak). Limited to struct fields; container element stores double-free if touched here.
             bool sameField = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
@@ -6395,16 +6319,8 @@ public:
                 && !sameField
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
-                // NOTE: this closes the field-reassignment LEAK (free the old value) but does NOT
-                // try to fix shallow-aliasing of an owning-value lvalue RHS (`obj.s = obj2.s`). That
-                // cannot be auto-fixed safely for `string`: ownership is a RUNTIME property (the _len
-                // owned bit), so a static COPY would wrongly make a borrowed source owned (breaking
-                // deliberate borrows like xml.cb's `b._rootTag = rt`, then double-freeing), and a
-                // static MOVE would consume a source that callers legitimately keep using. The X4
-                // guard already steers non-string owning types to an explicit `.copy()` / `move`;
-                // for `string`, aliasing a borrowed value is the common, intended case, so the
-                // owned-string field-to-field copy stays the caller's explicit `.copy()`.
-                // Destruct the field's OLD value before the overwriting store.
+                // NOTE: closes the field-reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
+                // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
             }
@@ -6824,12 +6740,8 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            // A move-returning string operand (e.g. `i.toString()` in `i.toString() == "3"`)
-            // is an owned temp that operator==/!= only borrows; register each operand for
-            // end-of-expression cleanup. Clear lastCallReturnsOwned before each operand parse
-            // so the flag reflects only that operand's own evaluation - otherwise the prior
-            // operand leaves it set and the next (possibly a named variable) is mis-registered
-            // and double-freed. Mirrors the additive operand-leak fix in ParseAdditiveExpression.
+            // Clear lastCallReturnsOwned before each operand: a prior operand would leave it set
+            // and the next (possibly a named variable) would be mis-registered and double-freed.
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0]);
             TrackOwnedStringOperatorResult(Compiler(ctx), lv.value);
@@ -7548,13 +7460,8 @@ public:
         }
         else if (nextCtxs.size() > 1)
         {
-            // A move-returning string operand (e.g. `i.toString()` in `"x" + i.toString()`)
-            // is an owned temp that operator+ only borrows; register it for end-of-expression
-            // cleanup. Clear lastCallReturnsOwned before each operand so the flag reflects ONLY
-            // that operand's own evaluation - otherwise a preceding owned operator+ result leaves
-            // it set and a following plain named-variable operand would be mis-registered and
-            // double-freed. The running `lvalue` (a chained intermediate) is tracked as an operator
-            // result inside TryBinaryOperatorOverload, not here.
+            // Clear lastCallReturnsOwned before each operand: a preceding owned operator+ result would
+            // otherwise leave the flag set and mis-register the next plain-variable operand (double-free).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseMultiplicativeExpression(nextCtxs[0]);
             llvm::Value* lvalue = lv.value;
@@ -7607,14 +7514,8 @@ public:
                 {
                     auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
 
-                    // char* + char* -> concatenate (operator+(const char*, const char*)).
-                    // TryBinaryOperatorOverload can't reach this case: it dispatches off a
-                    // struct lvalue, but both operands here are raw i8* pointers. Pointer +
-                    // pointer has no C meaning, so claiming `+` for concat is safe; `ptr +
-                    // int` arithmetic is handled by the branch above and never reaches here.
-                    // An operand is a c-string when its element type is i8, or when it is a
-                    // constant string-literal pointer (which carries no element type). Both
-                    // must qualify so int* + int* still falls through to the arithmetic error.
+                    // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
+                    // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
                     auto isCStr = [&](llvm::Value* v, llvm::Type* et) -> bool {
                         if (et && et->isIntegerTy(8)) return true;
                         if (auto* c = llvm::dyn_cast<llvm::Constant>(v))
@@ -9350,14 +9251,8 @@ public:
         llvm::Type* srcAllocaElemType = nullptr;
         std::string targetName;         // name of the deleted local (empty for field/expr targets)
 
-        // Peel any leading cast(s) off the delete target so 'delete[_] (T*)p' behaves
-        // exactly like 'delete[_] p'. A cast only renames the element type, so we must
-        // still recover the underlying owning local (and its source alloca) to null it
-        // and avoid a double free at scope exit. Without this, a cast target fell through
-        // to the bare ParseExpression branch below, which dropped the storage/ownership
-        // info (the owning local was then freed here AND again at scope exit -> heap
-        // corruption). The cast's destination type is recorded as the element type for
-        // destructor selection in destructive deletes.
+        // Peel leading casts so 'delete[_] (T*)p' recovers the underlying owning local and its alloca;
+        // without this, a cast target drops storage/ownership info and double-frees at scope exit.
         CFlatParser::UnaryExpressionContext* ue = tryGetUnaryExpression(ctx->expression());
         std::string castTypeName;
         bool castElemPtr = false;
@@ -9472,22 +9367,8 @@ public:
         }
         if (!ptrVal) return {};
 
-        // Error: a destructive delete ('delete', 'delete[]', 'delete[n]') of a raw 'string'
-        // buffer held in a LOCAL variable. 'string' carries no runtime ownership flag, so a
-        // slot may hold BORROWED text (a string literal, a view, or an alias of another
-        // buffer); running the string destructor on such a slot frees non-owned memory and
-        // corrupts the heap. A raw 'new string[n]' does NOT deep-copy / take ownership of
-        // assigned strings the way list/dictionary do, so its slots cannot be safely
-        // auto-destructed - the same reason bare 'string' members are excluded from
-        // member-destructor recursion (see internal/plan/member-dtor-recursion.md).
-        //
-        // The check is gated on the target being an alloca-backed LOCAL (srcAlloca set).
-        // Container types destroy their string buffer through a FIELD (list '_data',
-        // array '_ptr', ...), which leaves srcAlloca null, so list<string>/array<string>/
-        // dictionary<string> internals - which DO guarantee owned elements - are unaffected.
-        // The raw-free form 'delete[_]' (isRawFree) and 'string*' arrays (elemIsPtr, dtors
-        // already suppressed) are also exempt. Escape hatches: 'delete[_]' to free the buffer
-        // without destructing, or 'list<string>' which owns and frees its strings.
+        // Reject destructive delete of a raw 'string' local: string has no runtime ownership flag
+        // so slots may hold borrowed text. srcAlloca gate leaves container internals (list/array) unaffected.
         if (typeName == "string" && !isRawFree && !elemIsPtr && srcAlloca != nullptr)
         {
             std::string named = targetName.empty()
@@ -9650,13 +9531,8 @@ public:
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
-                // The moved value now owns whatever buffer the source owned (the source storage
-                // was just zeroed, so nothing else will free it). For `string`, carry the owning
-                // flag so passing `move s` directly as a `move string` argument TRANSFERS the
-                // buffer instead of tripping CreateOverloadedFunctionCall's defensive heap-copy -
-                // that clone would hand the callee a copy while this already-emptied source frees
-                // nothing, orphaning the original buffer (the list/dictionary/hashset add(move s)
-                // leak). Harmless for non-string value types (IsOwningString is string-gated).
+                // Carry the owning flag so 'move s' directly as a 'move string' arg TRANSFERS the buffer;
+                // without it, the defensive copy in CreateOverloadedFunctionCall orphans the original.
                 if (NamedVarIsString(argNV))
                     result.IsOwningString = argNV.IsOwningString
                         || (!argNV.CallerName.empty() && compiler->IsVariableOwningString(argNV.CallerName));
@@ -9852,12 +9728,8 @@ public:
         }
         else if (method == "select")
         {
-            // select(mask, a, b): per-lane `mask ? a : b`. `mask` is a simd<bool,N> (an <N x i1>,
-            // typically the result of a vector comparison like `u > zero`); `a` and `b` are
-            // simd<T,N> of this receiver's shape. Lowers to a single vector select (vblendvps/
-            // vpblendvb), the branchless primitive that lets a masked stencil (e.g. LBM bounce-back:
-            // `solid ? wall : value`) stay straight-line and vectorize. Works for any element type,
-            // not just FP - swapping values is type-agnostic.
+            // select(mask, a, b): per-lane branchless select. Lowers to a single vblendvps/vpblendvb;
+            // mask must be simd<bool,N> from a vector comparison. Works for any element type.
             if (argNVs.size() != 3)
                 LogErrorContext(ctx, "simd<T,N>.select expects (mask, a, b).");
             llvm::Value* mask = argValue(0);
@@ -9993,15 +9865,8 @@ public:
         auto* topStructTy = llvm::dyn_cast_or_null<llvm::StructType>(structVar.BaseType);
         if (!topStructTy) return false;
 
-        // Depth-first search through anonymous (__anonN) members for `fieldName`. `chain` holds the
-        // field indices from the top record down to (and including) the leaf field: every element
-        // but the last is an anonymous-member index in its parent record; the last is the leaf
-        // field's index in the deepest record.
-        // A bitfield declared inside an anonymous member lives in the inner record's Bitfield
-        // side-table (not StructFields, which only holds the synthetic `__bfN` storage slots).
-        // When the DFS resolves the leaf to a bitfield, `bitfieldHit` captures it (by value -
-        // GetDataStructure returns a copy, so a pointer into `inner` would dangle) and the leaf
-        // chain element is the storage slot's StructFields index.
+        // DFS through anonymous (__anonN) members for fieldName. `chain` holds field indices root-to-leaf.
+        // bitfieldHit captured by value: GetDataStructure returns a copy, so a pointer into `inner` would dangle.
         std::vector<int> chain;
         bool isBitfieldHit = false;
         LLVMBackend::BitfieldInfo bitfieldHit{};
@@ -14286,15 +14151,8 @@ public:
     // reference. Returns true if the type is available (template was imported).
     bool EnsureArenaChannelInstantiated(LLVMBackend* compiler)
     {
-        // The type must be fully laid out (sized), not merely registered: a program ctor
-        // heap-allocates a shell of arena_channel<IMessage>, which needs sizeof(). The
-        // ForwardRefScanner pre-pass may have already registered an *opaque* shell (and
-        // flagged it in instantiatedGenerics) for the template's first use later in the
-        // file - if that use is in main(), it is codegen'd after this program, so the body
-        // is still unsized here. Treat an opaque shell as "not yet instantiated" and force
-        // the field layout now by re-queuing the instantiation (bypassing the
-        // instantiatedGenerics dedup); ParseClassDefinition fills the existing shell's body,
-        // and its non-opaque re-emission guard then makes the later main-use a no-op.
+        // ForwardRefScanner may have registered an opaque shell (flagged in instantiatedGenerics) before
+        // the full body is available; force re-queuing here so sizeof() is valid when the ctor needs it.
         auto isSized = [&]() {
             auto it = compiler->dataStructures.find(kArenaChannelType);
             return it != compiler->dataStructures.end() && it->second.StructType
@@ -14345,13 +14203,8 @@ public:
             return;
         }
 
-        // Re-emission guard: when the user's main file is also reached via a
-        // transitive import under a different canonical path (e.g. the deployed
-        // copy of a cflat/core/ file), the runtime chain may have already fully
-        // emitted this struct. CreateFunctionDefinition's duplicate-skip leaves
-        // the IR builder without the right scope to safely emit the bodies a
-        // second time, so any field-or-method reference falls over. Detect
-        // "already fully defined" here and skip the entire walk.
+        // Re-emission guard: if this struct was already fully emitted via a transitive import,
+        // CreateFunctionDefinition's duplicate-skip leaves the builder out of scope - skip the walk.
         {
             auto sd = compiler->GetDataStructure(structName);
             if (sd.StructType != nullptr && !sd.StructType->isOpaque())
@@ -14913,13 +14766,8 @@ public:
                 stopSrcDisposeFn->getFunctionType(), stopSrcDisposeFn, {stopSrcGEP});
         }
 
-        // Free the program-owned inbox arena_channel shell (always allocated in the ctor; a
-        // consumer's was upgraded to a live ring by `a >> b`, a producer's/non-messaging one is
-        // still an inert shell - arena_channel::destroy() no-ops on an uninitialized shell, then
-        // free() releases the struct either way). The outbox is a BORROWED handle (a self-loopback
-        // alias of this inbox before wiring, or some consumer's inbox after `>>`) and is never
-        // freed here. Safe at scope exit because the WaitForExit contract joins producer threads
-        // before they can touch the channel.
+        // Free the owned inbox shell; outbox is a BORROWED handle (self-loopback alias or consumer's inbox)
+        // and is never freed. arena_channel::destroy() is safe on an uninitialized shell.
         if (inboxArenaIdx != (unsigned)-1)
         {
             auto* arenaTy = compiler->dataStructures.count(kArenaChannelType)
@@ -15036,15 +14884,8 @@ public:
             return;
         }
 
-        // Detect calling style from LLVM arg count.
-        // Regular program methods have 'self' as the first arg, so the counts are offset by 1:
-        //   1 arg  = NoArgs   (self - "int main()")
-        //   2 args = ListArgs (self + list<string> - "int main(move list<string> args)")
-        //   3 args = ArgcArgv (self + int + char** - "int main(int argc, char** argv)")
-        // Imported programs are free functions (no self), so counts are:
-        //   0 args = NoArgs   ("int main()")
-        //   1 arg  = ListArgs ("int main(move list<string> args)")  [not yet supported]
-        //   2 args = ArgcArgv ("int main(int argc, char** argv)")
+        // Detect calling style from LLVM arg count. Regular methods have a leading 'self' arg;
+        // imported programs are free functions (no self), so the arg counts differ by 1.
         auto mainArgCount = static_cast<unsigned>(mainFn->arg_size());
         bool isNoArgs   = isImported ? (mainArgCount == 0) : (mainArgCount == 1);
         bool isListArgs = isImported ? (mainArgCount == 1) : (mainArgCount == 2);
@@ -15288,14 +15129,8 @@ public:
             // Load list__string args by value from the packet
             llvm::Value* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
-            // Re-home the args into the program allocator (which is now the active
-            // allocator). The caller built the args under its own allocator (CRT on
-            // the main thread); main(move list<string>) would otherwise free those
-            // foreign buffers under the program allocator. __prog_adopt_args deep-
-            // copies them into the program allocator and frees the originals under
-            // the CRT, so main owns a list the program allocator actually allocated.
-            // Only the list<string> form owns the list; the argc/argv form reads the
-            // string pointers into a separate argv array, so it is left untouched.
+            // Re-home the args into the program allocator: the caller built them under the CRT
+            // allocator; without adoption, freeing them under the program allocator corrupts the heap.
             if (isListArgs)
             {
                 auto* adoptFn = compiler->GetFunction("__prog_adopt_args");
@@ -15448,13 +15283,8 @@ public:
             // cleanupBB: shared teardown - both normal and exception paths converge here.
             compiler->builder->SetInsertPoint(cleanupBB);
 
-            // Auto-close a directly-piped output stream. `producer >> consumer` synthesizes a
-            // hidden stream, marks it _autoClose, and stores it in _out; here - after main() has
-            // returned, on the producer's own thread - we flush its last buffer + send EOF so the
-            // consumer's read loop terminates (the synthesized analogue of the explicit form's
-            // manual s.close()). Gated on _autoClose so the explicit `p >> s; s >> q` form, which
-            // also sets _out but closes manually, is left untouched. Skipped for programs with no
-            // _out (consumers, or programs that never pipe to stdout).
+            // Auto-close a directly-piped output stream: `producer >> consumer` synthesizes a hidden stream
+            // with _autoClose set; explicit `p >> s; s >> q` also sets _out but closes manually - leave it alone.
             {
                 unsigned outIdx = compiler->programTable[name].OutFieldIndex;
                 auto* streamTy  = compiler->dataStructures.count("stream")
@@ -16116,11 +15946,8 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
 
-            // inbox / outbox = a non-null lightweight arena_channel shell (self-loopback default;
-            // only when arena_channel.cb is imported). The shell is uninitialized (_ring._cap==0)
-            // so send/recv are silent no-ops until `>>` (with both useChannel set) calls init();
-            // allocating it here guarantees a non-null `this` so an unwired recv()/send() cannot
-            // crash. `>>` rebinds the producer's outbox to the consumer's inbox.
+            // Allocate a non-null arena_channel shell: send/recv are no-ops on the uninitialized shell,
+            // but a non-null `this` prevents crashes if recv/send is called before `>>` wires the channel.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
@@ -16194,12 +16021,8 @@ public:
                     "program '{}': field name '{}' is reserved", name, field.VariableName));
         }
 
-        // Inject synthetic fields: exitCode (int), _thread (Thread), _allocator (IAllocator fat-ptr),
-        // onStdout (function<void(char*)>), onStdin (function<char*()>), _stop_source (stop_source),
-        // trackHandles (int - stored as i32 to avoid i1-in-ConstantStruct LLVM assertion),
-        // useChannel (int - opt-in: gates the arena channel wiring in `p1 >> p2`),
-        // _out / _in (stream* - only when stream.cb is imported; set by >> for direct write_bytes/read_buf access),
-        // inbox / outbox (arena_channel* - only when arena_channel.cb is imported; the messaging mailbox)
+        // Inject synthetic fields after user-declared ones. trackHandles is i32 to avoid i1-in-ConstantStruct
+        // LLVM assertion. stream and arena_channel fields only injected when their .cb is imported.
         unsigned exitCodeFieldIndex     = (unsigned)declList.size();
         unsigned threadFieldIndex       = exitCodeFieldIndex + 1;
         unsigned allocatorFieldIndex    = threadFieldIndex + 1;
@@ -16446,11 +16269,8 @@ public:
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
 
-            // Synthetic fields: inbox / outbox = a non-null lightweight arena_channel shell
-            // (self-loopback default; only present when arena_channel.cb is imported). The shell is
-            // uninitialized (_ring._cap==0) so send/recv are silent no-ops until `>>` (with both
-            // useChannel set) calls init(); allocating it here guarantees a non-null `this` so an
-            // unwired recv()/send() cannot crash. `>>` rebinds the producer's outbox to b.inbox.
+            // Allocate a non-null arena_channel shell: send/recv are no-ops on the uninitialized shell,
+            // but a non-null `this` prevents crashes if recv/send is called before `>>` wires the channel.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
@@ -16571,13 +16391,8 @@ public:
             return;
         }
 
-        // Re-emission guard: when the user's main file is also reached via a
-        // transitive import under a different canonical path (e.g. the deployed
-        // copy of a cflat/core/ file), the runtime chain may have already fully
-        // emitted this struct. CreateFunctionDefinition's duplicate-skip leaves
-        // the IR builder without the right scope to safely emit the bodies a
-        // second time, so any field-or-method reference falls over. Detect
-        // "already fully defined" here and skip the entire walk.
+        // Re-emission guard: if this struct was already fully emitted via a transitive import,
+        // CreateFunctionDefinition's duplicate-skip leaves the builder out of scope - skip the walk.
         {
             auto sd = compiler->GetDataStructure(structName);
             if (sd.StructType != nullptr && !sd.StructType->isOpaque())
@@ -16832,11 +16647,8 @@ public:
                 compiler->RegisterDestructor(structName, dtorFn);
         }
 
-        // Pre-register interfaces before compiling method bodies so that
-        // StructImplementsInterface() returns true for assignments inside methods
-        // of the class itself (e.g. `IJSON result = this;` inside a class : IJSON).
-        // Helper: resolve concrete type args from an implements clause generic param list,
-        // expanding pack params (T...) using activePackSubstitutions.
+        // Pre-register interfaces before method bodies so StructImplementsInterface() returns true
+        // for assignments inside the class itself (e.g. `IJSON result = this;` inside a class : IJSON).
         auto resolveImplsTypeArgs = [&](CFlatParser::GenericTypeParametersContext* gtp) -> std::vector<std::string>
         {
             std::vector<std::string> args;

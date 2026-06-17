@@ -2,20 +2,20 @@
 // ============================================================
 // LLVMBackend.h - LLVM IR backend, type system, symbol tables
 // ============================================================
-// SECTION      LINE     DESCRIPTION
+// SECTION      LINE       DESCRIPTION               FUNCTION
 // ───────────────────────────────────────────────────────────
-// §1           40-370   Public enums/structs (Operation, TypeAndValue, ...)
-// §2           372-414  Private member data
-// §3           416-1134 Private methods
-// §4           1136+    Public methods (~160+ methods)
-//   §4.1               Debug info
-//   §4.2               Block control
-//   §4.3               Interface system
-//   §4.4               Variable management
-//   §4.5               IR emission
-//   §4.6               Control flow
-//   §4.7               Function system
-//   §4.8               Lookup / name resolution
+// §1           235-845    Public enums/structs (Operation, TypeAndValue, ...)
+// §2           847-1161   Private member data
+// §3           1162-4806  Private methods
+// §4           4807+      Public methods (>230 methods)
+//   §4.1       4848       Debug info                InitDebugInfo, FinalizeDebugInfo
+//   §4.2       4894       Block control             AbortFunctionBlocks, SaveBuilderState
+//   §4.3       4932       Interface system          CreateInterfaceDefinition, IsInterfaceType, GetFatPtrType
+//   §4.4       5915       Variable management       CreateGlobalVariable, AllocaAtEntry, CreateLocalVariable
+//   §4.5       6128       IR emission               CreateInsertValue, CreateStructGEP, CreateAssignment
+//   §4.6       7308       Control flow              CreateBasicBlock, SwitchToBlock, CreateJump
+//   §4.7       7690       Function system           CreateFunctionDeclaration, CreateFunctionDefinition
+//   §4.8       7991       Lookup / name resolution  IsKnownTypeName, GetType
 // ============================================================
 
 #include <deque>
@@ -76,9 +76,8 @@
 
 struct ExpectedErrorReceived {};
 
-// Resolved paths for lld-link and the MSVC / Windows SDK lib directories.
-// Persisted to %USERPROFILE%\.cflat\linker_paths_<arch>.json by --init and
-// loaded from there by EmitExecutable before falling back to live discovery.
+// Resolved lld-link and MSVC/Windows SDK lib paths.
+// Persisted to %USERPROFILE%\.cflat\linker_paths_<arch>.json; loaded before falling back to live discovery.
 struct LinkerPaths {
     std::string lldLink;
     std::string msvcLib;
@@ -91,10 +90,8 @@ struct LinkerPaths {
     }
 };
 
-// Per-backend generic template state. Holds the ANTLR contexts and metadata for
-// all generic struct/class/interface/function templates seen during one analysis,
-// plus the queue of pending instantiations. Lives on LLVMBackend so multiple
-// backends can run in parallel without stomping on each other.
+// Per-backend generic template state. Lives on LLVMBackend so concurrent
+// LSP-pool backends don't stomp each other.
 struct GenericTemplateState
 {
     struct PendingInstantiation
@@ -149,15 +146,8 @@ struct CompilerAbortException {
     size_t column;
 };
 
-// --run (JIT) emulated-TLS support. On x86_64-pc-windows-msvc LLVM lowers thread-locals to
-// emulated TLS, which calls __emutls_get_address(control) to fetch this thread's copy of a
-// thread-local. That helper normally lives in compiler-rt (which we do not link), so for the
-// in-process JIT we provide our own, backed by a host C++ thread_local map. JitRun injects
-// &CflatEmutlsGetAddress as an absolute symbol for "__emutls_get_address".
-//
-// Limitation: per-thread blocks are freed only at process exit, not thread exit (no
-// destructor hook). Acceptable for the run-and-exit --run utility; revisit before relying on
-// --run for long-lived multi-threaded programs.
+// --run JIT: compiler-rt is not linked, so we provide __emutls_get_address backed by a host
+// thread_local map. Per-thread blocks are freed only at process exit (no thread-exit dtor hook).
 namespace cflat_jit
 {
     // Matches compiler-rt's __emutls_control: { size, align, object-union, value }. We only
@@ -180,17 +170,8 @@ namespace cflat_jit
         return mem;
     }
 
-    // JITLink plugin that registers Windows x64 unwind info for JIT'd code. JITLink fixes up
-    // the .pdata section (an array of 12-byte RUNTIME_FUNCTION records, each three ADDR32NB
-    // RVA fields: function begin, function end, unwind-info), but without ORC's COFFPlatform
-    // (which needs the orc_rt runtime we do not link) nothing calls RtlAddFunctionTable - so
-    // the OS cannot find unwind data for JIT'd frames and any SEH / C++ EH / FP-trap unwind on
-    // a worker thread faults. This registers it manually.
-    //
-    // The RVAs in .pdata are relative to the image base JITLink picked. Rather than guess that
-    // base, we recover it from a .pdata relocation: a stored RVA equals (target - imageBase),
-    // so imageBase = target - storedRVA. We then hand the in-memory .pdata array straight to
-    // RtlAddFunctionTable with that base.
+    // Without ORC's COFFPlatform (needs orc_rt, not linked), nothing calls RtlAddFunctionTable.
+    // Registers .pdata manually so the OS can unwind JIT'd SEH/C++EH frames.
     class SehRegistrationPlugin : public llvm::orc::ObjectLinkingLayer::Plugin
     {
     public:
@@ -198,18 +179,13 @@ namespace cflat_jit
                               llvm::jitlink::LinkGraph&,
                               llvm::jitlink::PassConfiguration& Config) override
         {
-            // PreFixup: memory is allocated and every node - including the resolved external
-            // __ImageBase - has its final address, but fixups have not been applied yet. The
-            // JITDylib defines __ImageBase as a placeholder (address 0, just to satisfy the
-            // symbol lookup); here we rewrite it to the real image base so the ADDR32NB fixups
-            // in .pdata/.xdata compute correct, in-range 32-bit RVAs.
+            // PreFixup: __ImageBase is a placeholder (address 0) in the JITDylib; rewrite it
+            // to the real base before fixups so ADDR32NB RVAs in .pdata compute correctly.
             Config.PreFixupPasses.push_back(
                 [](llvm::jitlink::LinkGraph& G) { return FixImageBase(G); });
 
-            // PostFixup: relocations are applied and addresses are final (the in-process
-            // memory manager links at the executor addresses), so .pdata holds real RVAs.
-            // Unwind cannot fire until the code runs, which is after finalization, so
-            // registering here is safe.
+            // PostFixup: addresses are final and .pdata holds real RVAs; registering here
+            // is safe because unwind cannot fire until after finalization.
             Config.PostFixupPasses.push_back(
                 [](llvm::jitlink::LinkGraph& G) { return RegisterUnwindInfo(G); });
         }
@@ -224,9 +200,6 @@ namespace cflat_jit
                                          llvm::orc::ResourceKey) override {}
 
     private:
-        // Lowest block address in the graph - the image base every ADDR32NB RVA is relative to.
-        // The whole graph is one contiguous-ish allocation well under 4GB, so this base keeps
-        // all RVAs non-negative and in 32-bit range.
         static llvm::orc::ExecutorAddr LowestBlockAddress(llvm::jitlink::LinkGraph& G)
         {
             llvm::orc::ExecutorAddr base;
@@ -237,9 +210,6 @@ namespace cflat_jit
             return base; // default-constructed (0) if the graph has no blocks
         }
 
-        // PreFixup: point the resolved __ImageBase symbol at the real image base (it is defined
-        // as a placeholder in the JITDylib only to satisfy the lookup). After this, fixups see
-        // the correct anchor. Matches the base LowestBlockAddress feeds RegisterUnwindInfo.
         static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
         {
             llvm::jitlink::Symbol* sym = nullptr;
@@ -253,9 +223,8 @@ namespace cflat_jit
             return llvm::Error::success();
         }
 
-        // Defined out-of-line in LLVMBackend.cpp so the RtlAddFunctionTable forward-declaration
-        // stays in a TU that does not include <winnt.h> (avoids an extern "C" overload clash
-        // with the real prototype in TUs like LspServer.cpp that do include windows.h).
+        // Out-of-line in LLVMBackend.cpp to avoid an extern "C" clash with <winnt.h> in TUs
+        // that include windows.h (e.g. LspServer.cpp).
         static llvm::Error RegisterUnwindInfo(llvm::jitlink::LinkGraph& G);
     };
 }
@@ -298,8 +267,6 @@ public:
 
     };
 
-    // Structured facts about one `vectorize` loop, gathered at codegen time and
-    // used to compose a precise failure diagnostic (see ComposeVectorizeFailure).
     struct VectorizeLoopInfo
     {
         int line = 0, col = 0;          // the `vectorize` keyword
@@ -310,9 +277,8 @@ public:
         bool hasCall = false;           // a call appears in the loop body
         std::string callName;           // its callee text
         int callLine = 0, callCol = 0;  // the call site
-        // A span<T> accessor (get/set/operator[]) used in the body that routes through the
-        // method's `this` and so cannot carry the noalias contract - the precise cause when a
-        // vectorized loop still keeps a runtime alias check (the Detection-B failure below).
+        // A span<T> accessor routes through `this` and cannot carry the noalias contract,
+        // causing a surviving runtime alias check even with vectorize.
         bool hasSpanAccessor = false;
         std::string spanAccessor;       // "get", "set", or "operator[]"
         std::string spanReceiver;       // receiver variable name (for the `.data()` hint), if known
@@ -320,10 +286,6 @@ public:
     };
     void AddVectorizeLoopInfo(const VectorizeLoopInfo& info) { vectorizeLoops_.push_back(info); }
 
-    // Field index of a noalias array-view buffer field named `_ptr` (the span<T> convention),
-    // or -1 if `typeName` is not such a wrapper. Used to (a) lower a span subscript to the field
-    // access that carries noalias and (b) recognize a span receiver for the vectorize hint. The
-    // may-alias sibling view<T> has a raw-T* `_ptr` (IsArrayView=false) and so returns -1.
     int ArrayViewBufferFieldIndex(const std::string& typeName)
     {
         if (typeName.empty()) return -1;
@@ -334,9 +296,6 @@ public:
         return -1;
     }
 
-    // Record (first-writer-wins) that a span accessor was used inside the vectorize loop whose
-    // keyword is on `loopLine`, so a surviving runtime alias check can name it. No-op if the loop
-    // is unknown or already has an accessor recorded.
     void NoteVectorizeSpanAccessor(int loopLine, const std::string& accessor,
                                    const std::string& receiver, int line, int col)
     {
@@ -376,35 +335,24 @@ public:
         uint64_t ConstArraySize = 0;                   // outer (first) dimension; non-zero for fixed arrays
         std::vector<uint64_t> ConstInnerDimensions;   // inner dimensions for multi-dim arrays (e.g. [M] in T[N][M])
 
-        // Fixed-array sizes contributed by a TYPE ALIAS (using Vec3 = float[3]). The alias string
-        // stores the folded sizes ("float[3]"); ParseDeclarationSpecifiers peels them here so the
-        // per-declarator finalization can adopt them when the declarator carries no brackets of its
-        // own (the size lives on the type, shared by every declarator). 0 / empty = no alias array.
+        // Alias-provided array sizes (using Vec3 = float[3]). Peeled by ParseDeclarationSpecifiers
+        // so the per-declarator step can adopt them when the declarator has no brackets. 0 = none.
         uint64_t AliasArraySize = 0;
         std::vector<uint64_t> AliasInnerDims;
 
-        // simd<T,N>: builtin special-form vector type. IsSimd => TypeName is the element scalar (e.g. "float"),
-        // SimdLanes is N (power of 2). Lowers to LLVM <N x T>. A primitive value (register-resident), NOT a
-        // struct/array aggregate and NOT a pointer - never combined with Pointer/ConstArraySize.
+        // simd<T,N>: lowers to LLVM <N x T>. Register-resident primitive - never combined with
+        // Pointer or ConstArraySize.
         bool IsSimd = false;
         uint64_t SimdLanes = 0;
 
-        // Thin `int[]` array-view: an `int*` representation (Pointer is also set) carrying a
-        // noalias contract. Distinct `int[]` values point at distinct WHOLE allocations
-        // (pointer arithmetic and the `int* -> int[]` cast are both forbidden, so an offset
-        // sub-view is unconstructible). Drives: LLVM noalias on params, the arithmetic ban,
-        // distinct mangling, and `int[] -> int*` implicit decay. See doc/LANGUAGE.md.
+        // Thin `int[]` array-view: like `int*` but carries a noalias contract. Pointer arithmetic
+        // and `int* -> int[]` casts are forbidden so sub-views are unconstructible. See doc/LANGUAGE.md.
         bool IsArrayView = false;
 
-        // Transient per-function noalias provenance: when >= 0, indexes into LLVMBackend::aliasScopes_
-        // the alias-scope this view's element loads/stores should be tagged with. Keyed by ORIGIN
-        // (parameter or struct field), not SSA value, so copies of the same view share a scope and are
-        // therefore NOT treated as disjoint. NEVER serialized (it is meaningless across functions); it
-        // is recomputed each function from the live aliasScopes_ registry. See MintAliasScope /
-        // AttachViewNoalias.
+        // Keyed by ORIGIN (not SSA value) so copies of the same view share a scope and are not
+        // treated as disjoint. Never serialized; recomputed per-function from aliasScopes_.
         int NoaliasScopeId = -1;
 
-        // Lock-set analysis: non-empty when this variable's field is inside a lock(...) { } group.
         std::string GuardedBy;
         // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
         // Used to reconstruct the qualified lock name (e.g. "d.ready") for lock(this) parameter seeding.
@@ -561,27 +509,18 @@ public:
         bool external = false;
         bool threadLocal = false;
 
-        // User-requested alignment from `alignas(N)`. 0 means unset; honored only
-        // when greater than the type's ABI alignment. Power of two, validated at
-        // parse time.
+        // User-requested alignment from `alignas(N)`. 0 means unset; honored only when
+        // greater than the type's ABI alignment. Power of two, validated at parse time.
         uint64_t UserAlignValue = 0;
 
         // Bitfield support (struct/union fields only; 0 = not a bitfield).
-        // Layout (set by the packing pass before CreateStructType):
-        //   BitWidth          - width in bits, as written (1..N where N = sizeof(underlying)*8)
-        //                       0 with no name is the C "width-0 boundary" marker
-        //   BitOffset         - LSB-first offset within the storage unit (MSVC ordering)
-        //   StorageFieldIndex - LLVM struct element index of the underlying storage unit;
-        //                       multiple packed bitfields share the same index.
-        //   IsBitfield        - true for both named bitfields and width-0 padding markers;
-        //                       width-0 entries are dropped from StructFields after packing.
+        // BitOffset is LSB-first within the storage unit (MSVC ordering); StorageFieldIndex is the LLVM struct element index.
         unsigned BitWidth = 0;
         unsigned BitOffset = 0;
         unsigned StorageFieldIndex = 0;
         bool IsBitfield = false;
-        // True on the synthesized storage slot produced by PackBitfields. The
-        // default constructor uses this to zero-initialize the slot even when
-        // the user wrote no per-bitfield initializer.
+        // True on the synthesized storage slot from PackBitfields. Used to zero-initialize
+        // the slot even when no per-bitfield initializer was written.
         bool IsBitfieldStorage = false;
 
         std::vector<AnnotationValue> Annotations;
@@ -605,10 +544,8 @@ public:
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
-        // For a lambda literal: the (already de-duplicated) names of enclosing locals/params it
-        // captures, in capture order. Empty for non-capturing lambdas and for stored function<>
-        // values. Used to produce a precise diagnostic when a capturing lambda is illegally passed
-        // to a C function-pointer parameter (the C ABI cannot carry captured state).
+        // Capture names for lambda literals, in capture order. Empty for non-capturing lambdas.
+        // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
@@ -616,9 +553,8 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
-        // Bitfield access metadata. Non-null BitfieldStorage means the variable
-        // is a bitfield view onto a storage word; reads compute shift+mask, and
-        // writes do a read-modify-write on this pointer.
+        // Bitfield access: non-null BitfieldStorage means this is a bitfield view onto a storage word.
+        // Reads compute shift+mask; writes do a read-modify-write on BitfieldStorage.
         llvm::Value* BitfieldStorage = nullptr;   // GEP'd pointer to the storage word
         llvm::Type*  BitfieldStorageType = nullptr; // the storage word's LLVM type (e.g. i32)
         unsigned BitfieldOffset = 0;
@@ -653,9 +589,8 @@ public:
         explicit operator bool()  const { return value != nullptr; }
     };
 
-    // One named bitfield. Multiple BitfieldInfo entries may share the same
-    // StorageFieldIndex when the packing pass groups adjacent bitfields of the
-    // same underlying type into a single storage unit (MSVC LSB-first layout).
+    // Named bitfield. Multiple entries may share StorageFieldIndex when the packing
+    // pass groups adjacent bitfields into one storage unit (MSVC LSB-first layout).
     struct BitfieldInfo
     {
         std::string Name;
@@ -676,14 +611,11 @@ public:
         std::unordered_map<std::string, llvm::GlobalVariable*> VTables; // Only used by classes
         llvm::GlobalVariable* typeDescriptor = nullptr; // unique per-struct global for type identity
         bool IsUnion = false;
-        // User-requested alignment from `alignas(N)` on the struct definition.
-        // 0 means unset. When set, the struct's effective alignment is max of
-        // this and the ABI alignment LLVM derived from the field types.
+        // User-requested alignment from `alignas(N)` on the struct definition. 0 = unset.
+        // Effective alignment is max of this and ABI alignment from LLVM field types.
         uint64_t UserRequestedAlignment = 0;
-        // Bitfield side-table. Field-name lookup checks this BEFORE StructFields
-        // so that a packed run of bitfields surfaces through their declared names.
-        // StructFields itself contains the (synthetic) storage slots produced by
-        // the packing pass; they have names like `__bf0` and are not user-visible.
+        // Bitfield side-table: field-name lookup checks this BEFORE StructFields.
+        // StructFields has synthetic storage slots (`__bf0` etc.) that are not user-visible.
         std::vector<BitfieldInfo> Bitfields;
     };
 
@@ -745,17 +677,8 @@ public:
         }
     };
 
-    // ABI lowering recipe for one parameter or return value when calling a C extern with
-    // struct-by-value in its signature. Each slot tells the call-site emitter how to bridge
-    // a CFlat struct value to the platform ABI:
-    //   - Direct       : no lowering (scalar / pointer); pass the value as-is
-    //   - CoerceToInt  : load the struct as an iN integer (size in {1,2,4,8} bytes) and pass
-    //                    that. For the return slot, the iN result is stored back to a temp
-    //                    alloca and reinterpreted as the struct.
-    //   - ByVal        : pass a pointer to a caller-allocated copy of the struct. The LLVM
-    //                    'byval' attribute carries the pointee struct type + alignment.
-    //   - SRetReturn   : (return only) the function returns void; the caller passes a hidden
-    //                    pointer as arg 0 with the 'sret' attribute, callee writes through it.
+    // ABI lowering for C extern struct-by-value params/returns; Kind selects the MSVC x64
+    // lowering strategy (Direct / CoerceToInt / ByVal / SRetReturn).
     struct AbiSlot
     {
         enum Kind { Direct, CoerceToInt, ByVal, SRetReturn };
@@ -807,12 +730,8 @@ public:
         llvm::BasicBlock* ContinuationBlock;
     };
 
-    // Capture mode for 'auto' return-type inference. While active, CreateReturnCall
-    // does NOT emit a 'ret' instruction; instead it terminates the current BB with
-    // an UnreachableInst placeholder and records (BB, value) onto AutoReturnSites.
-    // After body emission the caller unifies the value types, builds a new function
-    // with the inferred signature, splices the BBs over, replaces each placeholder
-    // terminator with the real ret, and RAUWs the old function.
+    // 'auto' return-type inference: CreateReturnCall emits UnreachableInst placeholders instead
+    // of ret; the caller splices BBs and replaces placeholders after unifying all return types.
     struct AutoReturnSite
     {
         llvm::BasicBlock* Block;
@@ -833,41 +752,20 @@ public:
     std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
     TypeAndValue currentFunctionReturnTV; // full declared return TypeAndValue of the current function; used to thread a function<> return type into a returned lambda literal's expected type
 
-    // When returning a struct VALUE local whose full-destructor frees members (e.g. owned
-    // string fields), the by-value snapshot carries those member pointers to the caller, so
-    // the local's destructor must be skipped on the return path or the returned value would
-    // dangle (and double-free when the caller destroys it). CreateReturnCall sets this to the
-    // returned local's alloca around the scope-exit destructor walk; EmitDestructorsForScope
-    // skips the struct whose Storage matches. Null on every non-return scope exit.
+    // Returning a struct by value hands its member pointers to the caller; running the local's
+    // dtor on the return path would dangle them. EmitDestructorsForScope skips this alloca.
     llvm::Value* returnedStructDtorSkipAlloca = nullptr;
 
-    // Owned-string SSA temporaries produced by a ReturnsOwned call (e.g. the unnamed
-    // (a + b) intermediate of a chained concat a + b + c) that are consumed as a
-    // sub-expression rather than bound to a named local. They have no NamedVariable
-    // and so are invisible to EmitDestructorsForScope; without explicit cleanup their
-    // heap buffer leaks. Each entry pairs the SSA string value with the basic block it
-    // was created in (for dominance safety at flush time). Registered by the additive /
-    // operator lowering, removed when a named local or a `move string` parameter claims
-    // ownership, and freed at end-of-full-expression (C++ temporary semantics) via
-    // FlushOwnedStringTemps. See internal/string-concat-intermediate-leak.md.
+    // Unnamed ReturnsOwned string intermediates (e.g. a+b in a+b+c). Invisible to
+    // EmitDestructorsForScope; freed at end-of-full-expression by FlushOwnedStringTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedStringTemps;
 
-    // Owned-closure temporaries (lambda Option A): a lambda literal owns a heap env. When it is
-    // not bound to a named owner (e.g. passed by value directly as an argument), nothing frees
-    // its env, so it is registered here and freed at end-of-full-expression - the closure analog
-    // of pendingOwnedStringTemps. Unregistered when a decl-init / assignment / field store claims
-    // it (that owner's destructor frees it). The flush is tag-gated (a non-capturing temp's null
-    // env makes the free a no-op), and every closure STORE clones the env, so a callee that
-    // retained a copy holds its OWN clone and never aliases the flushed temp.
+    // Lambda literals with unclaimed heap envs (no named owner). Closure analog of
+    // pendingOwnedStringTemps; freed at end-of-full-expression by FlushOwnedClosureTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedClosureTemps;
 
-    // T[] array-view noalias metadata (per-function, reset in createFunctionBlock). aliasDomain_ is
-    // the single anonymous alias domain for the current function; aliasScopes_ holds one anonymous
-    // scope per distinct view ORIGIN (parameter / field) seen in the function body. A view's element
-    // accesses are tagged !alias.scope {own scope} + !noalias {every other scope}, which proves
-    // pairwise disjointness to the loop vectorizer without a runtime overlap check - the same effect
-    // the `noalias` parameter attribute gives for a bare T[] arg, but reaching through a by-value
-    // struct field (span<T>) where the attribute cannot. See MintAliasScope / AttachViewNoalias.
+    // Per-function noalias metadata for T[] views. Proves pairwise disjointness for span<T> fields
+    // where the noalias parameter attribute cannot reach. Reset in createFunctionBlock.
     llvm::MDNode* aliasDomain_ = nullptr;
     std::vector<llvm::MDNode*> aliasScopes_;
     std::map<std::string, int> viewScopeByOrigin_; // origin name -> index into aliasScopes_
@@ -875,12 +773,8 @@ public:
     bool lastCallIsBonded = false;           // set when the last call returned a bonded (borrowed) value
     bool lastCallBondByAddress = false;      // set when the bond originates from a by-address lambda capture (kind A)
     std::vector<std::string> lastCallBondedSources; // bond parameter names the last call's return borrows from
-    // De-duplicated capture names of the most recently evaluated lambda literal. Set in
-    // ParseLambdaExpression and consumed when the lambda is bound as a call argument, so the
-    // C function-pointer diagnostic can name exactly what a capturing lambda captured. Uses the
-    // compiler-level channel (like lastCallBondedSources) because the lambda's NamedVariable is
-    // reduced to its value before reaching the argument list - the MainListener-level
-    // lastLambdaType side-channel is cleared too early by intervening postfix processing.
+    // Capture names of the last lambda literal, for the C function-pointer diagnostic. Uses the
+    // compiler-level channel because lastLambdaType is cleared too early by postfix processing.
     std::vector<std::string> lastCallLambdaCaptureNames;
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
     std::vector<std::string> lastCallParameterNames; // VariableName of each parameter of the last resolved overload
@@ -897,9 +791,8 @@ public:
     {
         if (diagnosticSink_)
         {
-            // LSP mode: the error is delivered to the editor over the sink (JSON-RPC).
-            // Don't also echo to cout - in LSP mode cout is redirected to stderr, so the
-            // echo is pure noise that duplicates the diagnostic already sent to the client.
+            // LSP mode: cout is redirected to stderr and would duplicate the diagnostic already
+            // sent to the client over the sink. Don't echo.
             diagnosticSink_(sourceFileName, currentLine, currentColumn, message, 1);
             throw CompilerAbortException{ message, sourceFileName, currentLine, currentColumn };
         }
@@ -917,9 +810,7 @@ public:
         FailCompilation(message);
     }
 
-    // Terminate the current compilation. In batch / --check mode this throws so
-    // the batch loop can record the failure and continue with the next file;
-    // otherwise it preserves the historical hard exit(1).
+    // In batch/--check mode throws so the loop continues; otherwise exits with code 1.
     [[noreturn]] void FailCompilation(const std::string& message) const
     {
         if (batchMode_)
@@ -931,9 +822,8 @@ public:
     {
         if (diagnosticSink_)
         {
-            // LSP mode: forward warnings to the editor as warning-severity diagnostics.
-            // Previously these went only to cout (-> stderr), so they were both noise on
-            // stderr and invisible in the editor. Routing through the sink fixes both.
+            // LSP mode: route through the sink so warnings appear in the editor,
+            // not just on stderr where they were invisible.
             diagnosticSink_(sourceFileName, currentLine, currentColumn, message, 2);
             return;
         }
@@ -945,11 +835,6 @@ public:
     friend class CrossThreadEscapeScanner;
 
 public:
-    // True if a field is thread-safe by construction so it should NOT be reported by the
-    // cross-thread scan: explicitly guarded by a lock (GuardedBy) or an atomic wrapper
-    // type (lowered struct name atomic__i32 / atomic_counter / atomic_flag / ...). At the
-    // most aggressive level (--xthread-scan 3) atomics no longer suppress, since
-    // default-ordering atomics are surveyed too.
     bool FieldSatisfiesThreadDiscipline(const TypeAndValue& field) const
     {
         if (!field.GuardedBy.empty())
@@ -980,37 +865,28 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
-    // Function-type aliases (`using Cb = function<R(Args)>;`). A closure type carries a call
-    // signature, not a plain type name, so it cannot live in the string-shaped typeAliases; the
-    // resolved TypeAndValue (IsFunctionPointer + return + params, TypeName "__closure_fat_ptr") is
-    // stored here and expanded wherever the alias name is used as a type (ParseDeclarationSpecifiers).
+    // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
+    // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
-    // Typedef name -> type spelling from C/header extraction. Populated by AdoptRawTypedefs
-    // so the function-signature mapper can chase HANDLE -> void*, SOCKET -> uintptr_t, etc.
-    // (a fallback; canonical spellings from the extractor already resolve most chains).
-    // Process-wide; first-writer-wins.
+    // Fallback typedef map (HANDLE->void*, etc.) for the type mapper when canonical spellings
+    // don't resolve. Process-wide, first-writer-wins.
     std::unordered_map<std::string, std::string> cTypedefMap_;
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
-    // Namespace whose body is currently being code-generated (e.g. "N" or "Outer.Inner").
-    // Empty at file scope. Set/restored around a namespace member's body so that an
-    // unqualified sibling reference (e.g. bare "helper" inside "N") resolves to the
-    // enclosing-namespace symbol "N.helper". See ResolveQualifiedName.
+    // Set/restored around a namespace member's body so unqualified sibling references
+    // (e.g. "helper" inside "N") resolve to the enclosing-namespace symbol "N.helper".
     std::string currentNamespace_;
-    // Maps import alias name -> set of unqualified symbol names the file contributed.
-    // Populated by CompileImportedFile when namespaceName is non-empty.
     std::unordered_map<std::string, std::unordered_set<std::string>> importAliasMembers;
     std::unordered_set<std::string> importedFiles;
     std::vector<std::string> importStack;  // DFS stack for circular import detection
     std::string importSearchDir;
     std::string runtimeDir;
     std::string sourceFileDir_;  // original source dir for LSP temp-file analysis
-    // Display name to use in diagnostics in place of the analyzed file's own name.
-    // The LSP analyzes a temp copy (cflat_lsp_*.cb); without this, every diagnostic and
-    // the __FILE__ macro would carry the temp name instead of the real source file.
+    // Override name for diagnostics: LSP analyzes a temp copy, so this carries the real
+    // source path so diagnostics and __FILE__ don't show the temp name.
     std::string sourceDisplayName_;
 
     // Per-backend generic-template state, shared with MainListener via references.
@@ -1019,80 +895,48 @@ private:
     // When true, disables auto-import of core/runtime.cb
     bool skipRuntimeImport = false;
     bool verbose = false;
-    // When true (--check / batch mode), a fatal compile error throws instead of
-    // calling exit(1), so the batch loop can record the failure and move on.
     bool batchMode_ = false;
     bool noCache_ = false;
     bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
-    // --cpu: target CPU passed to createTargetMachine (the -mcpu-style knob: sets default
-    // ISA features + scheduling model). Empty means the platform default (x86-64 / i686).
-    // --tune: tune-only CPU (the -mtune knob: scheduling model only, no change to the
-    // legal instruction set); applied as the per-function "tune-cpu" attribute.
-    // Both are resolved ("native" -> host CPU) and validated in Compile, so EmitExecutable
-    // and the C interop path can use them verbatim.
+    // --cpu/-mcpu (ISA + scheduling) and --tune/-mtune (scheduling only). Resolved and
+    // validated in Compile so EmitExecutable and C interop can use them verbatim.
     std::string targetCpu_;
     std::string tuneCpu_;
     int platformValue = 64;  // 64 for win64, 32 for win32
-    // C interop: temp .obj files produced by clang-cl from .c inputs, linked
-    // into the final image by EmitExecutable and then deleted.
     std::vector<std::string> cObjectFiles_;
     int cOptLevel_ = 0;        // optimization level applied to clang C compiles
     bool cDebugInfo_ = false;  // emit CodeView for clang C compiles
-    // --asan: instrument with AddressSanitizer and link the compiler-rt asan runtime.
-    // Intended to be paired with -g so the runtime report can name CFlat source lines.
-    // Off by default; when off, codegen/linking is byte-for-byte unchanged.
+    // Off by default; when off, codegen/linking is byte-for-byte identical (no overhead).
     bool asan_ = false;
 
-    // --run: JIT and execute in-process instead of emitting an exe. jitExitCode_ carries the
-    // program's exit status back to main() (Compile returns bool for compile success only).
-    // runArgs_ are the program arguments (everything after a `--` on the command line),
-    // forwarded to an 'int main(int argc, char** argv)' entry as argv[1..]; argv[0] is the
-    // source file name. Empty for an 'int main()' entry.
+    // --run: jitExitCode_ carries the program's exit status (Compile returns compile success only).
+    // runArgs_ are forwarded as argv[1..] to main(int argc, char** argv); empty for main().
     bool runMode_ = false;
     int  jitExitCode_ = 0;
     std::vector<std::string> runArgs_;
 
-    // Cross-thread sharing scan state. xthreadScanLevel_ is 0 unless --xthread-scan N
-    // (N in 1..3) was passed; threadSharedTypes_ holds the struct type names found
-    // escaping across a thread-spawn boundary (populated by ScanCrossThreadEscapes before
-    // the codegen walk; consumed at the two field-access check sites). Findings are printed
-    // to stdout with an [xthread] prefix (not the diagnostic sink). Cleared by ResetForReanalysis.
+    // --xthread-scan N state. Findings go to stdout (not the diagnostic sink) and never
+    // affect the exit code or LSP. Cleared by ResetForReanalysis.
     int xthreadScanLevel_ = 0;
     std::unordered_set<std::string> threadSharedTypes_;
 
-    // Structured facts about each `vectorize` loop, gathered at codegen time (when
-    // the AST is available) and consulted by the post-optimization enforcement scan
-    // to produce a precise, well-located failure message. Matched to a failed loop
-    // by source line (which also travels in the loop's `!llvm.loop` metadata).
-    // Non-empty gates enforcement at -O2. Cleared by ResetForReanalysis.
+    // Gathered at codegen time (AST available); matched to failed loops by source line in
+    // `!llvm.loop` metadata to produce precise diagnostics. Cleared by ResetForReanalysis.
     std::vector<VectorizeLoopInfo> vectorizeLoops_;
-    // Dedupe set for the [xthread] cross-thread sharing report (see xthreadScanLevel_
-    // / threadSharedTypes_ above): each distinct finding line prints at most once.
-    // Cleared by ResetForReanalysis.
+    // Dedupe set so each [xthread] finding prints at most once. Cleared by ResetForReanalysis.
     std::unordered_set<std::string> xthreadReported_;
-    // C interop (prebuilt libraries): header search dirs (--c-include) used when
-    // AST-dumping a bound header, and import libraries (--c-lib) added to the
-    // lld-link line by EmitExecutable. A sibling runtime DLL of each lib is copied
-    // next to the output exe after a successful link.
+    // --c-include dirs and --c-lib import libraries. A sibling runtime DLL of each lib
+    // is copied next to the output exe after a successful link.
     std::vector<std::string> cIncludeDirs_;
     std::vector<std::string> cLinkLibs_;
-    // Preprocessor defines (--c-define) passed as /D to every clang-cl invocation:
-    // the .c object compile, the .c auto-extern AST dump, and the header AST dump.
     std::vector<std::string> cDefines_;
-    // Runtime DLLs sourced from `import package-vcpkg`. Populated by the vcpkg resolver
-    // with the authoritative list from vcpkg_installed/<triplet>/bin and copied next to
-    // the exe by CopyCRuntimeDlls. Kept separate from cLinkLibs_-based DLL probing.
+    // Authoritative DLL list from vcpkg_installed/<triplet>/bin, copied next to the exe.
+    // Kept separate from cLinkLibs_-based DLL probing.
     std::vector<std::string> vcpkgRuntimeDlls_;
-    // Vcpkg integration state. Owns manifest discovery, port validation, and the one-shot
-    // `vcpkg install` invocation. See VcpkgResolver.h.
     VcpkgResolver vcpkg_;
 
-    // Cache of C function signatures extracted from a .c via clang's AST dump, so the
-    // (slow) clang spawn is skipped when the file is unchanged - important for LSP,
-    // which re-analyzes the importing .cb on every debounced edit. Process-global and
-    // mutex-guarded: the LSP runs analyses concurrently on a pool of backends, and a
-    // document is not pinned to a slot, so a per-instance cache would miss across slots.
-    // Entries hold only plain data (no LLVM/context-bound objects), so sharing is safe.
+    // Process-global mutex-guarded cache of C signatures from clang AST dumps. Global because
+    // LSP backends run concurrently and a document is not pinned to a slot.
     struct CSigEntry
     {
         std::string name;
@@ -1102,7 +946,6 @@ private:
         int line = 1;
         int col = 0;
     };
-    // A C enum constant extracted from a bound header (registered as a bare global int).
     struct CEnumEntry
     {
         std::string name;
@@ -1110,9 +953,6 @@ private:
         int line = 1;
         int col = 0;
     };
-    // An externally-linkable C global variable - a header `extern int x;` declaration or a
-    // .c-defined global. Bound as a declaration-only, mutable CFlat global (external reference
-    // resolved by the linker against the C library / object). ret carries the mapped CFlat type.
     struct CGlobalEntry
     {
         std::string name;
@@ -1120,10 +960,8 @@ private:
         int line = 1;
         int col = 0;
     };
-    // An object-like C macro extracted from a bound header. Function-like macros are skipped
-    // (cflat has no preprocessor to expand them). The value is resolved by feeding the macro
-    // through an enum stub - the original source location (file/line/col) is preserved from
-    // the -dD discovery pass so the LSP can go-to-definition into the real header.
+    // Object-like C macro. Function-like macros are skipped (no preprocessor). Source location
+    // preserved from the -dD pass so LSP can go-to-definition into the real header.
     struct CMacroEntry
     {
         std::string name;
@@ -1132,50 +970,31 @@ private:
         std::string file;
         int line = 1;
         int col = 0;
-        // True when the macro's natural type (recovered by Pass B's __typeof__ probe)
-        // is a void* (directly or via a typedef chain like HANDLE -> void *). Such
-        // macros are sentinel pointers (INVALID_HANDLE_VALUE, MAP_FAILED, ...) and
-        // RegisterCMacros emits them as void* globals so they can be compared against
-        // pointer-returning C APIs.
+        // Natural type resolves to void* (sentinel pointer like INVALID_HANDLE_VALUE).
+        // Emitted as a void* global so it can be compared against pointer-returning APIs.
         bool isPointer = false;
-        // True when the macro's natural type is float / double / long double. The
-        // double-fold probe (__cflat_f_NAME) supplies the value; RegisterCMacros
-        // emits the macro as a CFlat `double` global. Routing on type (not on a
-        // successful double-fold alone) is intentional: `(double)(0x100000000)`
-        // folds fine but the macro is an integer constant, not a float.
+        // Natural type is float/double. Routes on type, not fold success: `(double)(0x100000000)`
+        // folds fine but is an integer constant - type routing prevents misclassifying it.
         bool isFloat = false;
-        // True when the macro expands to a string literal (e.g. #define VERSION "1.2.3").
-        // stringValue holds the decoded characters; RegisterCMacros interns it via
-        // CreateGlobalString and emits a `char*` global. Routed via Pass B's
-        // __typeof__ probe so `(int)"x"` stays on the integer path.
+        // Natural type is a string literal. Routed via __typeof__ so `(int)"x"` stays integer.
         bool isString = false;
         std::string stringValue;
-        // CFlat integer type recovered from the macro's natural C type (e.g.
-        // ((DWORD)-10) -> "u32"). Empty when the natural type is unknown or not a
-        // plain integer; RegisterCMacros then falls back to width-guessing from the
-        // value. Carrying the real type lets a call site match the header's
-        // parameter type without an explicit cast (GetStdHandle(STD_INPUT_HANDLE)).
+        // CFlat integer type from the macro's natural C type (e.g. DWORD -> "u32"). Lets callers
+        // match the header's parameter type without an explicit cast (e.g. GetStdHandle).
         std::string intTypeName;
-        // True when the macro's natural type is a C function-pointer (e.g.
-        // #define SIG_IGN ((void(*)(int))1)). value carries the folded integer
-        // bit pattern; funcPtrTV carries the parsed signature. RegisterCMacros
-        // emits a function<R(P...)> global initialized to a constant fat struct
-        // {thunk, env=intToPtr(value)} - same wire as a C-returned fn ptr.
+        // Natural type is a C function-pointer. Emitted as function<R(P...)> initialized to a
+        // fat struct {thunk, env=intToPtr(value)}, same wire format as a C-returned fn ptr.
         bool isFuncPtr = false;
         TypeAndValue funcPtrTV;
     };
-    // A C struct/union decl extracted from a bound header or source. Field types are kept as
-    // raw C type spellings (qualType) so they can be re-resolved against dataStructures after
-    // all records in the same TU are registered (handles forward references between structs).
+    // Field types kept as raw C spellings so they can be re-resolved after all records in the
+    // TU are registered (handles forward references between structs).
     struct CRecordFieldEntry
     {
         std::string name;
         std::string ctype;
-        // Bitfield support. When isBitfield is true, the C field is a bitfield
-        // and bitWidth holds the user-written width (1..N). bitOffset is the
-        // LSB-first offset within the containing storage unit, as resolved by
-        // RegisterCRecords using MSVC ABI rules; we do NOT rely on clang's
-        // reported offset since CFlat replicates the layout itself.
+        // CFlat replicates MSVC ABI layout itself; bitOffset is NOT taken from clang's
+        // reported offset - RegisterCRecords computes it from MSVC ABI rules.
         bool isBitfield = false;
         unsigned bitWidth = 0;
     };
@@ -1187,10 +1006,8 @@ private:
         int line = 1;
         int col = 0;
     };
-    // A function-like C macro extracted from a bound header. Translated to a CFlat 'auto'
-    // generic function so that callers can use macro-defined helpers like MIN/MAX/KB without
-    // hand-writing them. Body is the raw replacement text; the translation pass tokenizes,
-    // filters against an allowlist of safe expression operators, and rejects anything else.
+    // Function-like C macro translated to a CFlat 'auto' generic. The translation pass filters
+    // the body against an allowlist of safe operators; anything else is rejected.
     struct CFunctionMacroEntry
     {
         std::string name;
@@ -1200,15 +1017,12 @@ private:
         int line = 1;
         int col = 0;
     };
-    // An object-like macro name discovered during the header parse, awaiting value resolution
-    // (the resolve pass folds each name's integer / float / string / pointer value).
     struct CMacroNameCand
     {
         std::string name;
         std::string file;
         int line = 1;
     };
-    // One transitively-included file recorded for deep (transitive) disk-cache validation.
     struct CHeaderDep
     {
         std::string path;
@@ -1225,11 +1039,8 @@ private:
         std::vector<CMacroEntry> macros;
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
-        // `typedef struct Tag {...} Name;` aliases (Name -> Tag) surfaced from a header bind so the
-        // user can write the typedef name (MSG) instead of the bare tag (tagMSG). Cached so a
-        // disk-cache hit replays them; empty for the .c path.
+        // typedef-name -> tag aliases (MSG -> tagMSG). Cached so disk-cache hits replay them.
         std::vector<std::pair<std::string, std::string>> recordAliases;
-        // Populated only for deep-mode disk-cache entries; empty otherwise (shallow validation).
         std::vector<CHeaderDep> deps;
     };
     static inline std::mutex cFileSigCacheMutex_;
@@ -1240,10 +1051,8 @@ private:
     int pipeStreamCounter = 0;   // uniquifies synthesized hidden `stream` locals for `producer >> consumer` piping
     std::string expectedError;
     size_t expectedErrorScopeDepth = SIZE_MAX;  // SIZE_MAX = scoped block form (checked manually after block); else stackNamedVariable depth for bare-semicolon form
-    // File-scope bare-semicolon expect_error("..."); armed before ProcessImports so it can
-    // catch import-time diagnostics (e.g. the orphan-header error). Non-empty while pending;
-    // a match throws ExpectedErrorReceived (caught in Compile), an unmatched one at end of
-    // compilation is the did-not-occur failure. See Compile() in LLVMBackend.cpp.
+    // Armed before ProcessImports so import-time errors can match. An unmatched expectation
+    // at end of compilation is a did-not-occur failure.
     std::string fileScopeExpectedError_;
 
     // Compile-time macros (constant throughout compilation, set early)
@@ -1254,16 +1063,8 @@ private:
         std::string type;  // "int", "string", etc.
     };
     std::unordered_map<std::string, CompileTimeMacro> compileTimeMacros;
-    // Parse-tree cache for imported files. The ANTLR ecosystem (input/lexer/tokens/
-    // parser) is kept alive so generic-template ctx pointers stay valid, AND the whole
-    // entry is reused across compiles when the file's content is unchanged - parsing the
-    // standard-library closure (runtime.cb + transitive core imports) is by far the most
-    // expensive part of a small compile, so amortizing it across batch --check files and
-    // LSP re-analyses is a large win. The cache deliberately survives ResetForReanalysis.
-    //
-    // Per-backend (not process-global): an LSP backend slot is only ever used by one
-    // worker thread at a time, so no locking is needed and walked trees are never shared
-    // across threads.
+    // ANTLR ecosystem kept alive so generic-template ctx pointers remain valid. Core-library
+    // entries reused across compiles; deliberately survives ResetForReanalysis.
     struct CachedParseTree
     {
         std::string canonicalPath;                 // absolute canonical path
@@ -1274,24 +1075,16 @@ private:
         std::unique_ptr<CFlatParser> parser;
         CFlatParser::CompilationUnitContext* unit = nullptr;  // owned by `parser`
     };
-    // Persistent cache, keyed by canonical path - populated ONLY for implicit core-library
-    // imports (files under runtimeDir/core), whose content is stable for the process. User
-    // imports are deliberately excluded: they change during editing, and bounding the cache
-    // to core keeps staleness handling trivial.
+    // Core-library imports only (stable for the process lifetime). User imports deliberately
+    // excluded: they change during editing, so bounding to core keeps staleness trivial.
     std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
     // Per-compile lifetime anchor for NON-core imported parse trees (generic-template ctx
     // pointers point into them). Cleared by ResetForReanalysis; parseTreeCache_ is not.
     std::vector<std::unique_ptr<CachedParseTree>> importedParseStates;
 
-    // Parse `canonicalPath` into a CFlat tree. When `isCore` is true the tree is reused
-    // from / stored in parseTreeCache_ (validated by last-write time); otherwise it is
-    // parsed fresh and owned by importedParseStates for this compile only. Returns nullptr
-    // (and reports diagnostics) on a parse error; a failed parse is never cached.
-    // `displayName` is used in TimeTraceScope/logs.
     CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName, bool isCore);
-    // Synthesized CFlat source (from C function-like macro translation) lives here.
-    // The parser ecosystem must outlive instantiation since genericFunctionTemplates
-    // stores raw FunctionDefinitionContext pointers into these trees.
+    // Parser ecosystem must outlive instantiation: genericFunctionTemplates holds raw
+    // FunctionDefinitionContext pointers into these trees.
     struct SyntheticParseState
     {
         std::string label;                                          // for diagnostics
@@ -1301,8 +1094,6 @@ private:
         std::unique_ptr<CFlatParser> parser;
     };
     std::vector<SyntheticParseState> syntheticParseStates_;
-    // Queued CFlat source generated from C function-like macros, drained after each
-    // C-header import by ProcessPendingMacroSources (defined in LLVMBackend.cpp).
     struct PendingMacroSource { std::string label; std::string source; };
     std::vector<PendingMacroSource> pendingMacroSources_;
     void ProcessPendingMacroSources();
@@ -1314,10 +1105,8 @@ private:
     bool strConcatRegistered = false;
     bool stringDtorRegistered = false;
     bool closureLifetimeRegistered = false;   // closure dtor + copy registered (lazy; needs function.cb)
-    // Memoized "full destructor" per type: user dtor + recursive member destruction.
-    // Presence in the map means "computed"; the mapped value may be nullptr (type needs
-    // no destruction), the plain user dtor (no dtor-bearing members), or a synthesized
-    // wrapper. See GetOrCreateFullDestructor.
+    // nullptr entry means "type needs no destruction"; non-null may be the plain user dtor
+    // or a synthesized wrapper that also runs dtor-bearing members.
     std::unordered_map<std::string, llvm::Function*> fullDestructorCache_;
     std::unordered_set<std::string> fullDestructorInProgress_;
     std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
@@ -1334,21 +1123,15 @@ private:
     llvm::DIFile* diFile = nullptr;
     llvm::DICompileUnit* compileUnit = nullptr;
     llvm::DISubprogram* currentSubprogram = nullptr;
-    // Cache: base type name -> DIType (no pointer/array wrapper). Pointer / array /
-    // function-pointer / interface fat-ptr wrappers are built on demand so the cache
-    // key stays simple.
+    // Base type name -> DIType (no pointer/array wrapper). Wrappers built on demand so
+    // the key stays simple.
     std::unordered_map<std::string, llvm::DIType*> diTypeCache;
-    // Cache: canonical source path -> DIFile. Without this, all functions / globals
-    // emitted from imported files would be attributed to the primary diFile, causing
-    // line-number collisions across files (breakpoint at one file's line N fires on
-    // any imported function whose actual line happens to be N).
+    // Without this, all imported-file functions are attributed to the primary diFile, causing
+    // line-number collisions (a breakpoint at line N fires on any imported function at line N).
     std::unordered_map<std::string, llvm::DIFile*> diFileCache_;
 
-    // Globals queued for deferred DI emission. We defer because a global's struct type
-    // may still be an opaque shell (typical for generic instantiations) at the moment
-    // the global is declared - emitting DI immediately would produce an unspecified
-    // type with no fields. By the time FinalizeDebugInfo runs, all struct layouts are
-    // finished and GetDIType returns the real composite.
+    // Deferred so a generic struct is not opaque when DI is emitted; FinalizeDebugInfo
+    // runs after all layouts are complete.
     struct PendingGlobalDI
     {
         llvm::GlobalVariable* gVar;
@@ -1377,14 +1160,12 @@ private:
 
 
 private:
-    // Create Function Proto or Signature
     llvm::Function* createFunctionProto(std::string name, llvm::FunctionType* returnType)
     {
         auto fn = llvm::Function::Create(returnType, llvm::Function::ExternalLinkage, name, *module);
 
         // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
-        // This attribute prevents instcombine from removing loads/stores through null pointers
-        // as UB, preserving the fault so the program construct's SEH handler can catch it.
+        // NullPointerIsValid prevents instcombine from removing null loads/stores as UB.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
 
         llvm::verifyFunction(*fn);
@@ -1405,11 +1186,6 @@ private:
         }
     }
 
-    // Returns the Storage alloca and BaseType for a named variable in any active
-    // scope (innermost first). Searches both functionArgument (for move params)
-    // and namedVariable. Used by the transfer-ownership path to find the source
-    // alloca when an expression (e.g. a cast) has cleared rightNV.Storage but
-    // CallerName still names the original variable.
     struct VarStorageRef { llvm::Value* Storage = nullptr; llvm::Type* BaseType = nullptr; };
     VarStorageRef FindVariableStorage(const std::string& name) const
     {
@@ -1424,11 +1200,6 @@ private:
         return {};
     }
 
-    // True when the named variable is a string local/param that currently OWNS its heap buffer
-    // (its scope-exit destructor will free it). Lets the call path tell a plain owned-string
-    // VARIABLE read apart from a borrowed one, so passing it as a `move string` argument
-    // transfers the buffer instead of triggering the defensive heap-copy in
-    // CreateOverloadedFunctionCall (which would clone the buffer and orphan the source's - a leak).
     bool IsVariableOwningString(const std::string& name) const
     {
         if (name.empty()) return false;
@@ -1442,9 +1213,6 @@ private:
         return false;
     }
 
-    // True when a string local was tainted as borrowing an owning string FIELD (e.g.
-    // `string t = b.name`). Storing such an alias into another field launders a
-    // field-to-field copy and double-frees, so the field-store path rejects it.
     bool IsVariableBorrowingOwnedString(const std::string& name) const
     {
         if (name.empty()) return false;
@@ -1458,8 +1226,6 @@ private:
         return false;
     }
 
-    // Set/clear the field-borrow taint on a string local (used at declaration-with-initializer
-    // and on reassignment, mirroring MarkVariableOwningString).
     void SetVariableBorrowsOwnedString(const std::string& name, bool value)
     {
         if (name.empty()) return;
@@ -1516,19 +1282,12 @@ private:
         builder->SetInsertPoint(afterBB);
     }
 
-    // Record an owned-string SSA temporary for end-of-full-expression cleanup. Called
-    // by the operator lowering when an operator+ (ReturnsOwned string) result is NOT
-    // bound to a named local. `value` must be the %string struct value the call returned.
     void RegisterOwnedStringTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
         pendingOwnedStringTemps.emplace_back(value, builder->GetInsertBlock());
     }
 
-    // Remove an owned-string temporary from the pending-cleanup list because some other
-    // construct has taken ownership of it: a named local (its destructor will free it on
-    // scope exit) or a `move string` parameter (the callee frees it). Prevents a double
-    // free of the same buffer.
     void UnregisterOwnedStringTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
@@ -1536,13 +1295,6 @@ private:
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
     }
 
-    // Free every owned-string temporary still pending at the end of a full expression,
-    // mirroring C++ temporary lifetime (destroyed at the semicolon). Only temporaries
-    // created in the CURRENT basic block are freed - one created across a branch (e.g. in
-    // a loop condition) would not dominate this insert point, so it is dropped rather than
-    // emitted as invalid IR (a rare leak, documented in the bug note). The list is always
-    // cleared so temporaries never carry across statements. No-op if the current block is
-    // already terminated (e.g. after a return emitted the frees itself).
     void FlushOwnedStringTemps()
     {
         if (pendingOwnedStringTemps.empty()) return;
@@ -1583,11 +1335,6 @@ private:
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
     }
 
-    // Free every owned-closure temporary still pending at end-of-full-expression (mirrors
-    // FlushOwnedStringTemps): a lambda literal whose env was never claimed by a named owner.
-    // Only temporaries created in the CURRENT block are freed (dominance safety); the list is
-    // always cleared so nothing carries across statements. The closure dtor is tag-gated, so a
-    // non-capturing temp (null env) frees nothing.
     void FlushOwnedClosureTemps()
     {
         if (pendingOwnedClosureTemps.empty()) return;
@@ -1620,12 +1367,8 @@ private:
         if (builder->GetInsertBlock()->getTerminator() != nullptr)
             return;
 
-        // Cleanup calls (destructors, operator delete, lock release) emitted here
-        // belong to "the end of the scope" rather than any user statement. If we
-        // have a subprogram but the builder lost its debug location (e.g. just
-        // after a branch / return / lambda body), the verifier rejects untagged
-        // inlinable calls in -g builds. Pin a synthetic location to the function
-        // line so every cleanup instruction is properly attributed.
+        // Cleanup destructors have no user location. Pin a synthetic location to the function
+        // line to avoid the -g verifier rejecting untagged inlinable calls after a branch/return.
         if (currentSubprogram && !builder->getCurrentDebugLocation())
         {
             builder->SetCurrentDebugLocation(llvm::DILocation::get(
@@ -1653,16 +1396,8 @@ private:
             auto it = dataStructures.find(namedVar.TypeAndValue.TypeName);
             if (it != dataStructures.end())
             {
-                // String is a library value type whose destructor frees iff the runtime
-                // OWNED bit (_len's high bit) is set, so emit it UNCONDITIONALLY - like every
-                // other value type - and let the runtime bit decide. The legacy compile-time
-                // IsOwningString gate skipped genuinely-owned values whose ownership the
-                // compiler could not prove (e.g. an owned string returned from a plain
-                // `string` function), leaking their buffer. The only local that carries a SET
-                // owned bit it does NOT own is a field-borrow alias (`string b = obj.name;`):
-                // the owning struct frees that buffer, so skip it here to avoid a double-free.
-                // (Moved-from sources are zeroed -> bit clear -> dtor no-op; borrows of
-                // literals / coercions have the bit clear too, so emitting is harmless.)
+                // String dtor is emitted unconditionally - the runtime OWNED bit (_len high bit) decides.
+                // Legacy IsOwningString skipped genuinely-owned strings the compiler couldn't prove owned, leaking their buffer.
                 if (namedVar.TypeAndValue.TypeName == "string")
                 {
                     if (namedVar.BorrowsOwnedString) continue;
@@ -1711,10 +1446,6 @@ private:
         }
     }
 
-    // Mint a fresh alias scope for one view origin in the current function and return its index into
-    // aliasScopes_. The anonymous alias domain is created lazily on first use. The returned index is
-    // stored on the view's TypeAndValue::NoaliasScopeId so every access derived from the same origin
-    // (and any copy that shares the id) tags the same scope.
     int MintAliasScope()
     {
         llvm::MDBuilder mdb(*context);
@@ -1725,17 +1456,6 @@ private:
         return (int)aliasScopes_.size() - 1;
     }
 
-    // Tag a load/store with the noalias provenance of a view: !alias.scope = { its own scope } and
-    // !noalias = { every OTHER live scope in this function }. With each origin in its own scope, the
-    // optimizer can prove any two distinct-origin views do not alias - dropping the runtime overlap
-    // check the loop vectorizer would otherwise insert.
-    //
-    // The alias.scope is set unconditionally (even when no sibling exists yet): scopes are minted
-    // lazily as origins are first indexed, so an access emitted before its sibling's scope exists
-    // would otherwise be invisible to that later sibling's !noalias list. Always stamping the
-    // alias.scope makes the disambiguation order-independent - a later access whose !noalias names
-    // this scope proves disjointness against this access regardless of which was emitted first. The
-    // !noalias list is only attached when at least one other scope currently exists.
     void AttachViewNoalias(llvm::Instruction* memInst, int scopeId)
     {
         if (memInst == nullptr || scopeId < 0 || scopeId >= (int)aliasScopes_.size())
@@ -1750,12 +1470,6 @@ private:
             memInst->setMetadata(llvm::LLVMContext::MD_noalias, llvm::MDNode::get(*context, others));
     }
 
-    // Return the alias-scope index for a view ORIGIN (a parameter name, local name, or
-    // struct-instance name for a field view), minting one on first sight. Keyed by the origin
-    // STRING - so every access derived from the same origin (and any copy that names the same
-    // origin) shares a scope and is therefore correctly treated as possibly-aliasing itself, while
-    // two distinct origins land in distinct scopes and are proven disjoint. An empty key returns -1
-    // (no stable provenance -> no metadata; a bare T[] parameter still relies on its noalias attr).
     int GetOrMintViewScope(const std::string& originKey)
     {
         if (originKey.empty())
@@ -1773,12 +1487,8 @@ private:
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
         builder->SetInsertPoint(entry);
-        // Drop any debug location lingering from the caller's emission context
-        // before emitting parameter allocas/stores: otherwise those instructions
-        // get tagged with the outer function's DISubprogram, which trips the
-        // LLVM verifier (`!dbg attachment points at wrong subprogram`).
-        // CreateFunctionDefinition will re-set the location once it attaches the
-        // new function's subprogram below.
+        // Drop any debug location before emitting parameter allocas/stores: instructions tagged
+        // with the outer DISubprogram trip the verifier (`!dbg attachment points at wrong subprogram`).
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
         auto& stackState = stackNamedVariable.emplace_back();
 
@@ -2013,9 +1723,8 @@ private:
             uint64_t alignBits = (uint64_t)DL.getABITypeAlign(st).value() * 8;
             const llvm::StructLayout* SL = DL.getStructLayout(st);
 
-            // Insert a forward declaration into the cache before recursing into
-            // fields - this lets a struct that contains a pointer to itself (or
-            // a mutually-recursive struct) resolve without infinite recursion.
+            // Forward-declare into cache before recursing into fields so that self-referential
+            // or mutually-recursive structs resolve without infinite recursion.
             auto fwd = diBuilder->createReplaceableCompositeType(
                 llvm::dwarf::DW_TAG_structure_type, tv.TypeName, compileUnit, diFile, 0);
             diTypeCache[tv.TypeName] = fwd;
@@ -2047,14 +1756,10 @@ private:
         }
 
         // Unknown / opaque - leave as unspecified so the debugger at least knows the name.
-        // Do NOT cache: a struct may be opaque now (e.g. generic instantiation processed
-        // before its body is laid out) and become a real composite later. Caching the
-        // unspecified version would poison every subsequent lookup with no struct fields.
+        // Do NOT cache: a struct may be opaque now and become real later (e.g. generic before body layout).
         return diBuilder->createUnspecifiedType(tv.TypeName);
     }
 
-    // Registers the built-in `string` value type: { i8* _ptr, i32 _len }.
-    // data() returns _ptr; length() returns _len.  No vtable - direct struct access.
     void RegisterBuiltinString()
     {
         auto* ptrTy = builder->getInt8Ty()->getPointerTo();
@@ -2092,13 +1797,8 @@ private:
             functionTable["string"].push_back(sym);
         }
 
-        // string.data() / string.length() / string.hash() are now LIBRARY functions defined
-        // in core/string.cb (string-redesign: `string` as a library type). The compiler keeps
-        // only the bare {i8*,i32} layout + default ctor here for bootstrap (literal typing /
-        // __FILE__) and lowers literals via WrapStringLiteralAsString; the observable methods
-        // live in cflat. The compiler never calls these three internally (it inlines field
-        // access in the interpolation/%s path), so they resolve fine for every consumer, all
-        // of which import string.cb.
+        // string.data/length/hash are library functions in core/string.cb. Only the bare
+        // {i8*,i32} layout + default ctor live here for bootstrap (literal typing, __FILE__).
 
         // String destructor is registered lazily via EnsureStringDtorRegistered()
         // so that the C `free` function is available in the function table first.
@@ -2245,17 +1945,11 @@ private:
         // Pre-register the built-in `string` value type { i8* _ptr, i32 _len }.
         RegisterBuiltinString();
 
-        // Pre-register the closure fat type { i8* code, i8* env } as an owning value type
-        // (lambda Option A). The dtor + copy are registered lazily once function.cb's env
-        // primitives are available (EnsureClosureLifetimeRegistered).
+        // Pre-register the closure fat type { i8* code, i8* env } (lambda Option A).
+        // Dtor + copy registered lazily when function.cb env primitives are available.
         RegisterBuiltinClosure();
     }
 
-    // Register the closure backing type `__closure_fat_ptr` { i8* code, i8* env } as a
-    // dataStructures entry so a `function<R(Args)>` value (which carries this TypeName)
-    // is recognized as an owning value type. The destructor (frees the heap env) and the
-    // env-cloning copy() are added lazily by EnsureClosureLifetimeRegistered() once the
-    // core/function.cb primitives have been compiled.
     void RegisterBuiltinClosure()
     {
         auto* closureTy = GetClosureFatPtrType();
@@ -2274,11 +1968,6 @@ private:
         dataStructures["__closure_fat_ptr"].StructFields = { codeField, envField };
     }
 
-    // Lazily register the closure destructor and the env-cloning copy() once the
-    // core/function.cb env primitives are in the module. Mirrors EnsureStringDtorRegistered:
-    // a capturing closure owns its heap env, and these two functions are what the value-type
-    // machinery calls to free it at scope exit / struct teardown (dtor) and to clone it on
-    // copy (copy). A borrowed/null env is a runtime no-op inside the primitives.
     void EnsureClosureLifetimeRegistered()
     {
         if (closureLifetimeRegistered) return;
@@ -2310,10 +1999,8 @@ private:
             RegisterDestructor("__closure_fat_ptr", dtorFn);
         }
 
-        // copy(__closure_fat_ptr self): clone the heap env so the copy owns an independent
-        // block (code pointer unchanged). Registered in functionTable["copy"] so the value-
-        // type copy machinery resolves it (and HasCopyOverloadFor short-circuits the
-        // memberwise synth, which would shallow-copy the env pointer and double-free).
+        // Registered so HasCopyOverloadFor short-circuits memberwise synth, which would
+        // shallow-copy the env pointer and double-free.
         {
             auto* copyTy = llvm::FunctionType::get(closureTy, { closureTy }, false);
             auto* copyFn = llvm::Function::Create(copyTy, llvm::Function::InternalLinkage,
@@ -2350,8 +2037,7 @@ private:
         if (!strTy) return;
 
         // Prefer operator delete (allocator-aware) over raw free.
-        // operator delete is defined in memory.cb which is imported before string.cb,
-        // so it should be available by the time the first string dtor is needed.
+        // operator delete is from memory.cb which is imported before string.cb.
         auto* freeFn  = GetFunction("operator delete");
         if (!freeFn) freeFn = module->getFunction("free");
         if (!freeFn) return;   // neither available yet; destructor cannot be created
@@ -2374,11 +2060,8 @@ private:
         auto* ptr     = b.CreateLoad(ptrTy, ptrPtr, "ptr");
         auto* len     = b.CreateLoad(i32Ty, lenPtr, "len");
         auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy);
-        // Free iff this string OWNS its buffer (string-redesign FINAL MODEL): _len's high
-        // bit is the OWNED flag. Borrowed strings (literals, char* wraps, views; owned bit
-        // clear) are never freed. This makes the dtor safe to call on ANY string - including
-        // a struct/container `string` member, where the compiler has no static ownership info
-        // and must rely on the runtime bit.
+        // Free iff this string OWNS its buffer (_len high bit = OWNED flag).
+        // Borrowed strings (literals, char* wraps) have bit clear - safe to call dtor on ANY string.
         auto* isOwned   = b.CreateICmpNE(
             b.CreateAnd(len, b.getInt32(0x80000000)), b.getInt32(0), "is_owned");
         auto* isNotNull = b.CreateICmpNE(ptr, nullPtr, "is_not_null");
@@ -2397,12 +2080,6 @@ private:
         RegisterDestructor("string", dtorFn);
     }
 
-    // Return a copy of a `string` SSA struct value with its OWNED bit (the high bit of
-    // _len) cleared, turning an owned value into a BORROW. Used at borrow-materialization
-    // sites - e.g. a plain (non-`move`) string return of a value the function does not own,
-    // such as `list.get`'s `return _data[i]` - so the caller's always-run string destructor
-    // treats the returned value as a borrow and does not free a buffer another owner (the
-    // container element, here) still holds. No-op if `value` is not a `string` struct value.
     llvm::Value* ClearStringOwnedBit(llvm::Value* value)
     {
         if (value == nullptr) return value;
@@ -2413,26 +2090,10 @@ private:
         return builder->CreateInsertValue(value, masked, { 1 }, "borrow.str");
     }
 
-    // Return the function that fully destroys an instance of `typeName`: the user
-    // destructor (if any) followed by destruction of every destructor-bearing member
-    // field, recursively. Returns nullptr when the type needs no destruction at all
-    // (no user dtor and no dtor-bearing members). Result is memoized.
-    //
-    // Member scope: a member is destructed only when it is a VALUE field (not a pointer,
-    // array-view, simd, bitfield, or fixed-array) whose type is a struct with its own
-    // full destructor (list<T>, dictionary<T>, array<T>, user structs with `~T()`, and
-    // nested aggregates of these), INCLUDING bare `string` members. `string` now carries a
-    // runtime owned flag (the high bit of _len, string-redesign FINAL MODEL), so the string
-    // dtor frees an owning member and leaves a borrowed one (literal/view) untouched - it is
-    // safe to auto-destruct. Raw pointer fields are never auto-freed.
-    //
-    // When a type has a user dtor but no dtor-bearing members, the user dtor IS the full
-    // destructor (no wrapper is synthesized) - the common case stays byte-identical.
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
     {
-        // `string` has no dtor-bearing members, so its full dtor is just the lazily
-        // registered string dtor. Resolve it live (never cache) so a call before the
-        // lazy registration does not poison the cache with a null.
+        // `string` full dtor is the lazily registered string dtor. Resolve live (never cache)
+        // so a call before lazy registration doesn't poison the cache with null.
         if (typeName == "string")
         {
             EnsureStringDtorRegistered();
@@ -2449,11 +2110,8 @@ private:
             return it != dataStructures.end() ? it->second.Destructor : nullptr;
         }
 
-        // Only synthesized wrappers are cached - they are stable once built. The
-        // no-member-work and unknown-type results are resolved LIVE on every call so a
-        // destructor that is still a forward declaration when first queried (e.g. a
-        // generic ~list instantiation whose body is emitted later) is not frozen as a
-        // stale null. This mirrors the pre-existing direct `Destructor` reads at each site.
+        // Only synthesized wrappers are cached - they are stable once built. Direct lookups
+        // are resolved live so forward-declared types (e.g. generic ~list) aren't frozen as null.
         if (auto it = fullDestructorCache_.find(typeName); it != fullDestructorCache_.end())
             return it->second;
 
@@ -2478,10 +2136,8 @@ private:
                 continue;
             if (f.ConstArraySize > 0)   // fixed-array members: out of scope (rare), documented
                 continue;
-            // `string` members ARE destructed now (string-redesign FINAL MODEL): the owned
-            // bit in _len tells the string dtor at runtime whether to free, so a borrowed
-            // string member (literal/view; bit clear) is safely left alone while an owning
-            // one is freed. This is exactly what the owned bit was added to enable.
+            // `string` members ARE destructed: the owned bit in _len tells the dtor whether to free.
+            // A borrowed string (literal/view; bit clear) is safely left alone by the dtor.
             if (llvm::Function* childDtor = GetOrCreateFullDestructor(f.TypeName))
                 work.push_back({ i, childDtor });
         }
@@ -2523,13 +2179,6 @@ private:
         return fn;
     }
 
-    // True if `typeName` defines a no-arg instance method `copy()` (self only). This is
-    // the universal `.copy()` copy-constructor hook (string-redesign Phase 1): when a
-    // managed value is copied by value at a copy point (decl-init / assignment /
-    // field-store), the compiler invokes copy() to produce an independent, ownership-
-    // correct clone instead of a shallow struct copy that would alias owned buffers and
-    // double-free at teardown. The method-receiver convention is Parameters[0] == self
-    // (see the existing `Parameters[0].TypeName == typeName` checks in MainListener).
     bool HasUserCopyMethod(const std::string& typeName) const
     {
         auto it = functionTable.find("copy");
@@ -2542,11 +2191,6 @@ private:
         return false;
     }
 
-    // Phase-1 classifier: should a by-value copy of this type at a copy point be routed
-    // through `.copy()` rather than a plain shallow store? True for a struct/class that
-    // owns resources (has a full destructor) AND exposes a no-arg copy() to clone them.
-    // `string` and function<> stay on their existing static-ownership path until later
-    // phases, so they are excluded here.
     bool TypeNeedsManagedCopy(const std::string& typeName)
     {
         if (typeName.empty() || typeName == "string")
@@ -2558,12 +2202,6 @@ private:
         return GetOrCreateFullDestructor(typeName) != nullptr;
     }
 
-    // A struct/class VALUE type that owns resources: it has a full destructor that frees
-    // at scope exit (string, list<T>, dictionary<K,V>, user classes with a `~T()`...). Per
-    // the string-redesign FINAL MODEL, `b = a` of such a type MOVES by default (transfer
-    // the bits + mark the source moved, use-after-move enforced) rather than aliasing (which
-    // double-frees) or deep-copying; `.copy()` is the explicit way to duplicate. `string` is
-    // included (it owns its buffer via the _len owned bit).
     bool IsOwningValueType(const std::string& typeName)
     {
         if (typeName.empty())
@@ -2573,9 +2211,6 @@ private:
         return GetOrCreateFullDestructor(typeName) != nullptr;
     }
 
-    // True when functionTable already has a `copy` overload whose first parameter is `typeName`
-    // (a user/library free `copy(T self)`, a method, or an already-synthesized memberwise copy).
-    // This is the gate for implicit copy synthesis: an existing copy() always wins.
     bool HasCopyOverloadFor(const std::string& typeName) const
     {
         auto it = functionTable.find("copy");
@@ -2586,13 +2221,6 @@ private:
         return false;
     }
 
-    // Synthesize the implicit `copy()` for a value type that does not define one: a MEMBERWISE
-    // copy (the "every value type has an implicit copy() if undefined" rule). The result starts
-    // as a shallow copy of `self`, then every value field whose type has its own copy() (managed
-    // members - string, list<T>, dictionary, nested owning structs) is replaced with an
-    // independent deep copy via that field's copy(); primitives and raw pointers stay
-    // shallow-copied (the pointee is shared, matching list<T>.copy()). The result is owned
-    // (`move`). Registered in functionTable["copy"] so overload resolution finds it; memoized.
     llvm::Function* GetOrCreateMemberwiseCopy(const std::string& typeName)
     {
         if (auto it = memberwiseCopyCache_.find(typeName); it != memberwiseCopyCache_.end())
@@ -2673,19 +2301,6 @@ private:
         builder->CreateCall(fn, {apAlloca});
     }
 
-    // Emit a single-argument LLVM float intrinsic.  Works for both float (f32)
-    // and double (f64) - type is inferred from floatVal.  Returns nullptr if
-    // methodName is not a recognized float method.
-    //
-    // Supported methods and their LLVM counterparts:
-    //   round      -> llvm.round       ceil       -> llvm.ceil
-    //   floor      -> llvm.floor       trunc      -> llvm.trunc
-    //   abs        -> llvm.fabs        rint       -> llvm.rint
-    //   sqrt       -> llvm.sqrt        nearbyint  -> llvm.nearbyint
-    //   sin        -> llvm.sin         exp        -> llvm.exp
-    //   cos        -> llvm.cos         exp2       -> llvm.exp2
-    //   log        -> llvm.log         log2       -> llvm.log2
-    //   log10      -> llvm.log10
     llvm::Value* CreateFloatIntrinsic(const std::string& methodName, llvm::Value* floatVal)
     {
         llvm::Intrinsic::ID id;
@@ -2710,10 +2325,6 @@ private:
         return builder->CreateCall(fn, {floatVal});
     }
 
-    // Emit the x86 RDTSCP instruction - a serializing read of the CPU timestamp
-    // counter.  Returns the 64-bit cycle count; the TSC_AUX processor id (the
-    // intrinsic's second result) is discarded.  x86/Intel target only - CFlat
-    // callers should guard with `if const (__X86__)`.
     llvm::Value* CreateRdtscp()
     {
         // llvm.x86.rdtscp returns { i64 cycles, i32 aux } and takes no arguments.
@@ -2722,11 +2333,6 @@ private:
         return builder->CreateExtractValue(call, { 0u }, "rdtscp");
     }
 
-    // Emit the x86 LFENCE instruction - a load fence that also serializes the
-    // instruction stream: it does not retire until all prior instructions have
-    // completed, and no later instruction starts before it.  Pairs with RDTSC so
-    // out-of-order execution cannot smear a measured region's start/end.  Returns
-    // nothing.  x86/Intel target only - guard callers with `if const (__X86__)`.
     void CreateLfence()
     {
         // llvm.x86.sse2.lfence returns void and takes no arguments.
@@ -2734,9 +2340,6 @@ private:
         builder->CreateCall(fn, {});
     }
 
-    // Emit the x86 PAUSE instruction - a spin-loop hint that yields the SMT
-    // sibling and lowers the power/throughput cost of a busy-wait.  Returns
-    // nothing.  x86/Intel target only - guard callers with `if const (__X86__)`.
     void CreatePause()
     {
         // llvm.x86.sse2.pause returns void and takes no arguments.
@@ -2744,36 +2347,24 @@ private:
         builder->CreateCall(fn, {});
     }
 
-    // Population count (llvm.ctpop) - number of set bits.  Target-independent:
-    // lowers to POPCNT on x86, CNT on ARM, etc.  Result has the same integer
-    // type as the input.
     llvm::Value* CreatePopcount(llvm::Value* intVal)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::ctpop, { intVal->getType() });
         return builder->CreateCall(fn, { intVal }, "popcount");
     }
 
-    // Count trailing zeros (llvm.cttz).  Target-independent.  The second argument
-    // is_zero_poison is false, so cttz(0) is the bit width (well-defined) rather
-    // than poison.  Result has the same integer type as the input.
     llvm::Value* CreateCtz(llvm::Value* intVal)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::cttz, { intVal->getType() });
         return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "ctz");
     }
 
-    // Count leading zeros (llvm.ctlz).  Target-independent.  is_zero_poison is
-    // false, so ctlz(0) is the bit width.  Result matches the input's type.
     llvm::Value* CreateClz(llvm::Value* intVal)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::ctlz, { intVal->getType() });
         return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "clz");
     }
 
-    // Software prefetch (llvm.prefetch).  Target-independent.  Hints the memory
-    // subsystem to pull `addr` toward the cache.  Hardcoded to a read prefetch
-    // (rw=0) with high temporal locality (3) into the data cache (cache type=1) -
-    // the common streaming/strided-loop case.  Returns nothing.
     void CreatePrefetch(llvm::Value* addr)
     {
         auto* i32ty = llvm::Type::getInt32Ty(*context);
@@ -2785,27 +2376,18 @@ private:
             llvm::ConstantInt::get(i32ty, 1) }); // cache type: 1 = data cache
     }
 
-    // Fused multiply-add (llvm.fma): a * b + c with a single rounding step.
-    // Target-independent; lowers to a hardware FMA when available.  All three
-    // operands and the result share the same floating-point type.
     llvm::Value* CreateFma(llvm::Value* a, llvm::Value* b, llvm::Value* c)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::fma, { a->getType() });
         return builder->CreateCall(fn, { a, b, c }, "fma");
     }
 
-    // Branch-probability hint (llvm.expect): tells the optimizer the i1 condition
-    // `cond` is expected to equal `expected`.  Target-independent; affects block
-    // layout only, not the computed value.  Result is the same i1 value.
     llvm::Value* CreateExpect(llvm::Value* cond, bool expected)
     {
         auto* fn = llvm::Intrinsic::getDeclaration(module.get(), llvm::Intrinsic::expect, { cond->getType() });
         return builder->CreateCall(fn, { cond, llvm::ConstantInt::get(cond->getType(), expected ? 1 : 0) }, "expect");
     }
 
-    // Emit an integer narrowing/widening conversion (to_i8, to_u8, to_i16, to_u16,
-    // to_i32, to_u32, to_i64, to_u64).  Returns nullptr for unrecognized names.
-    // Narrowing always truncates; widening sign-extends for signed targets, zero-extends for unsigned.
     llvm::Value* CreateIntegerConvert(const std::string& methodName, llvm::Value* intVal)
     {
         struct Target { unsigned bits; bool isSigned; };
@@ -2870,9 +2452,6 @@ private:
         return true;
     }
 
-    // Resolve clang-cl.exe, preferring the copy deployed next to cflat.exe (runtimeDir)
-    // over whatever may be on PATH - this keeps the toolchain self-contained and mirrors
-    // how lld-link is located. Returns "" if not found anywhere.
     std::string FindClangCl() const
     {
         if (!runtimeDir.empty())
@@ -2887,42 +2466,18 @@ private:
         return "";
     }
 
-    // --- Linker path helpers (cache-first; static so --init can call without a compile) ---
-
-    // Returns %USERPROFILE%\.cflat, or "" if USERPROFILE is unset.
     static std::string GetCflatCacheDir();
-
-    // Run vswhere + directory scan and return the resolved paths for the given arch ("x64"/"x86").
-    // runtimeDir is the directory of cflat.exe, used to locate the deployed lld-link/clang-cl.
     static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir);
-
-    // Try to load previously cached paths from ~/.cflat/linker_paths_<arch>.json.
-    // Returns nullopt if the file is missing, malformed, or any stored path no longer exists.
     static std::optional<LinkerPaths> LoadLinkerPathsFromCache(const std::string& arch);
-
-    // Persist paths to ~/.cflat/linker_paths_<arch>.json (creates the directory if needed).
     static bool SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths);
-
-    // Cache-first lookup: load from disk, fall back to DiscoverLinkerPaths, and write the
-    // cache on a miss so subsequent compiles skip discovery.
     static LinkerPaths FindLinkerPaths(const std::string& arch, const std::string& runtimeDir);
 
-    // Compile a real C source file with clang-cl into a temporary object, recorded
-    // in cObjectFiles_ for EmitExecutable to link. clang-cl auto-detects the Windows
-    // SDK / MSVC, so no explicit include-dir discovery is needed here. Headers come
-    // from the .cb's own 'extern' declarations; this object supplies the definitions.
     bool CompileCFile(const std::string& cSourcePath, const std::string& programAlias = "")
     {
-        // Auto-discover the C function signatures so the importing .cb does not need
-        // hand-written 'extern' declarations. Best-effort: a failure here just falls
-        // back to the old behaviour (caller must declare the functions manually).
-        // When programAlias is set ('import program "x.c" as Alias'), the C `main` is
-        // registered as `__imported_main_<Alias>` and wired into programTable here.
+        // Auto-discover C function signatures so the importing .cb needs no hand-written extern declarations.
+        // When programAlias is set, registers C `main` as `__imported_main_<Alias>` in programTable.
         ExtractCSignatures(cSourcePath, programAlias);
 
-        // In LSP / analysis mode we only need the signatures (already extracted above)
-        // for hover, completion and go-to-definition - not a linkable object file.
-        // symbolSink_ is set only by the LSP server, so it is a reliable mode flag.
         if (symbolSink_ != nullptr)
             return true;
 
@@ -2951,15 +2506,9 @@ private:
         if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
         else if (cOptLevel_ == 1) argStrs.push_back("/O1");
         if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
-        // Match the native object's tuning for C interop objects. --cpu sets both ISA and
-        // tune (clang -march); --tune overrides tune only (clang -mtune). clang-cl needs the
-        // /clang: prefix to forward these clang-driver options. Pre-resolved/validated in Compile.
         if (!targetCpu_.empty()) argStrs.push_back("/clang:-march=" + targetCpu_);
         if (!tuneCpu_.empty())   argStrs.push_back("/clang:-mtune=" + tuneCpu_);
         for (const auto& def : cDefines_) argStrs.push_back("/D" + def);
-        // For an imported program, rename the object's `main` symbol so it matches the
-        // `__imported_main_<Alias>` declaration (above) and does not collide with the
-        // CFlat program's own entry `main` at link time.
         if (!programAlias.empty())
             argStrs.push_back("/Dmain=__imported_main_" + programAlias);
 
@@ -2992,14 +2541,8 @@ private:
         return true;
     }
 
-    // Compile the in-process crash-handler (core/diagnostic/crashdump.c) into a temporary object
-    // recorded in cObjectFiles_ for EmitExecutable to link. Used only under -g, where a
-    // PDB is produced and DbgHelp can symbolize CFlat frames at runtime.
-    //
-    // Deliberately NOT routed through CompileCFile: that path runs ExtractCSignatures
-    // (libclang) and registers the C functions as CFlat externs, which we do not want for
-    // an internal handler. This is a minimal clang-cl spawn. arch is "x64" or "x86".
-    // Failures are reported via LogError and return false without aborting the compile.
+    // NOT routed through CompileCFile: that path runs ExtractCSignatures and registers the
+    // functions as CFlat externs, which we don't want for an internal handler.
     bool CompileCrashHandlerObject(const std::string& arch)
     {
         if (runtimeDir.empty())
@@ -3070,22 +2613,12 @@ private:
     // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
 
 
-    // Returns false for anything the extern ABI cannot faithfully pass - struct/union
-    // by value, > 2 pointer levels, or an unknown scalar - so the caller can skip the
-    // whole function rather than emit a wrong signature. This intentionally mirrors the
-    // scalar+pointer subset that GetCCompatibleType already supports for hand-written
-    // extern declarations.
     bool MapCTypeToTypeAndValue(std::string ctype, TypeAndValue& out)
     {
         std::unordered_set<std::string> visited;
         return MapCTypeToTypeAndValueImpl(std::move(ctype), out, visited);
     }
 
-    // Recognises clang's spelling for a bare function-pointer type:
-    //   "int (*)(const char *, int)"   ->   IsFunctionPointer with return=int, params=[char*, int]
-    // The leading return type is whatever appears before the literal "(*)" token; the
-    // parenthesised argument list follows. Nested function-pointer arguments are rejected
-    // (depth-counted top-level commas only) - matches the >2 pointer-levels limit.
     bool ParseCFunctionPointerSpelling(const std::string& s, TypeAndValue& out,
                                        std::unordered_set<std::string>& visited)
     {
@@ -3174,13 +2707,6 @@ private:
         return true;
     }
 
-    // Extract fixed-array dimensions ("[N]") from a C field type spelling, returning the
-    // element spelling with those groups removed and the dimensions in declaration order.
-    // Only positive integer extents are treated as fixed arrays; an incomplete "[]" or a
-    // non-numeric extent is left verbatim (the caller's mapper then applies the usual
-    // array->pointer decay). Used by RegisterCRecords so a struct field like
-    // `char szExeFile[260]` lays out as an inline 260-byte array (correct sizeof), NOT a
-    // decayed pointer - which would silently shrink the struct.
     static std::string StripFixedArrayDims(const std::string& ctype, std::vector<uint64_t>& dims)
     {
         std::string elem;
@@ -3216,9 +2742,8 @@ private:
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited)
     {
-        // Detect function-pointer spelling before the generic '*'-strip path mangles it.
-        // clang spells these as "R (*)(args)" - the "(*)" token disambiguates from a
-        // function declaration (which would have a name between the parens).
+        // Detect function-pointer spelling before the '*'-strip path mangles it.
+        // clang spells these as "R (*)(args)"; the "(*)" token disambiguates from a declaration.
         if (ctype.find("(*)") != std::string::npos)
         {
             if (ParseCFunctionPointerSpelling(ctype, out, visited))
@@ -3260,12 +2785,8 @@ private:
         }
         while (!base.empty() && base.back() == ' ') base.pop_back();
 
-        // Three-or-more levels of indirection (e.g. `char***`, `void****`) collapse to an
-        // opaque `void**`. CFlat's TypeAndValue exposes at most two pointer levels
-        // (Pointer + ElemPointer), and any pointer is the same ABI size on x64/x86, so
-        // the call still links correctly. Direct dereference of the third+ level is not
-        // available from CFlat - the user holds the handle and threads it back through C
-        // (e.g. allocate / free helpers on the C side that hide the inner indirection).
+        // 3+ levels of indirection collapse to void** - CFlat TypeAndValue has at most two pointer
+        // levels. Pointers are the same ABI size on x64/x86, so calls still link correctly.
         if (ptr > 2)
         {
             out.TypeName = "void";
@@ -3274,10 +2795,8 @@ private:
             return true;
         }
 
-        // enum decays to int; struct/union pointers become opaque void* (the call only
-        // needs a pointer-sized slot). For struct/union *by value* we look up the tag in
-        // dataStructures - the auto-registered C struct gets a CFlat TypeAndValue with that
-        // tag name and Pointer=false, so call-site ABI lowering can see the layout.
+        // enum decays to int. struct/union by-value: look up in dataStructures for ABI lowering.
+        // struct/union pointers become opaque void* (only a pointer-sized slot is needed).
         std::string mapped;
         if (base.rfind("enum ", 0) == 0)
         {
@@ -3329,11 +2848,8 @@ private:
             }
             else
             {
-                // Final fallback: chase a user typedef recorded by AdoptRawTypedefs. We
-                // append the original pointer-star count so HANDLE (ptr=0) recursing into
-                // "void *" lands at void with ptr=1. Visited-set prevents pathological
-                // self-referential typedefs from looping (clang would have errored, but
-                // be defensive).
+                // Chase a user typedef from AdoptRawTypedefs; append pointer stars so HANDLE (ptr=0)->void* works.
+                // visited-set prevents pathological self-referential typedefs from looping.
                 auto td = cTypedefMap_.find(base);
                 if (td != cTypedefMap_.end() && visited.insert(base).second)
                 {
@@ -3370,13 +2886,6 @@ private:
         return HashFileFnv1a(path, outHash);
     }
 
-    // Register a set of extracted C signatures into the function table (as unmangled,
-    // C-compatible externs) and into the LSP symbol sink. Shared by the cache-hit and
-    // cache-miss paths so both behave identically.
-    // programAlias non-empty: this .c is being brought in via `import program "x.c" as Alias`.
-    // The C `main` is registered under `__imported_main_<Alias>` (matching the renamed object
-    // symbol from CompileCFile's /Dmain define) and wired into programTable so the imported-
-    // program synthesis (struct + run wrapper) treats it exactly like a .cb imported program.
     void RegisterCSignatures(const std::vector<CSigEntry>& sigs, const std::string& fileForLsp,
                              const std::string& programAlias = "")
     {
@@ -3420,9 +2929,6 @@ private:
             std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
     }
 
-    // Build the clang driver args shared by the C-interop extraction paths. headerDir, when
-    // non-empty, is added as the first -I (the bound header's own directory). errorRecovery
-    // enables per-decl recovery so one bad probe / decl does not poison the rest.
     std::vector<std::string> BuildClangDriverArgs(const std::string& headerDir,
                                                const std::vector<std::string>& extraDefines,
                                                bool errorRecovery) const
@@ -3445,14 +2951,6 @@ private:
         return args;
     }
 
-    // ---- clang C++ API C-interop extraction (CClangExtract.cpp) -------------------------
-    // The extractor (clang C++ API, single full parse + cheap PP prepass) emits plain-data
-    // canonical-C-type spellings; these helpers map them to the C* structs the existing
-    // Register*/cache machinery consumes. Canonical spellings already resolve typedef chains
-    // (HANDLE -> void *), so the string-based MapCTypeToTypeAndValue stays unchanged.
-
-    // Map one extracted signature to a CSigEntry. Returns false (skips the function) when a
-    // return / parameter type is outside the extern ABI subset (skips the whole function).
     bool MapRawSig(const cflat_cinterop::RawSig& r, CSigEntry& e)
     {
         e = CSigEntry();
@@ -3481,11 +2979,6 @@ private:
         return true;
     }
 
-    // Map one extracted global variable to a CGlobalEntry. Returns false (skips the global) when
-    // its type is outside the extern ABI subset. Array-typed globals are skipped: the string
-    // mapper decays `T[N]` to a pointer, which would mistype the symbol's storage as holding a
-    // pointer rather than being the array data - a silent miscompile. The user threads such
-    // symbols through C-side accessors instead.
     bool MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEntry& e)
     {
         if (r.ctype.find('[') != std::string::npos)
@@ -3508,9 +3001,6 @@ private:
         return true;
     }
 
-    // Classify a folded object-like macro into a CMacroEntry. An int macro whose natural type
-    // chases (via the mapper) to a function pointer or void* becomes a funcptr / pointer
-    // sentinel; otherwise it is a plain int / float / string. Returns false for Skip macros.
     bool ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e)
     {
         using K = cflat_cinterop::RawMacro;
@@ -3535,8 +3025,6 @@ private:
         return true;
     }
 
-    // Adopt typedef aliases into cTypedefMap_ (first-writer-wins). Canonical spellings already
-    // resolve most chains; this only feeds the rare bare-alias fallback in the type mapper.
     void AdoptRawTypedefs(const cflat_cinterop::ExtractResult& raw)
     {
         for (const auto& t : raw.typedefs)
@@ -3544,11 +3032,6 @@ private:
                 cTypedefMap_.emplace(t.name, t.underlying);
     }
 
-    // Surface `typedef struct Tag {...} Name;` (a by-value record typedef) as a CFlat type alias
-    // Name -> Tag, so a user can write the familiar typedef name (MSG, RECT, WNDCLASSEXA) rather
-    // than the bare clang tag (tagMSG, ...). MUST run after RegisterCRecords so the target tag is
-    // already in dataStructures. Pointer / array / scalar typedefs are left to the C type mapper.
-    // Fills `out` with the (alias, target) pairs so the disk cache can replay them on a hit.
     void CollectRecordTypedefAliases(const cflat_cinterop::ExtractResult& raw,
                                      std::vector<std::pair<std::string, std::string>>& out)
     {
@@ -3586,12 +3069,8 @@ private:
         }
     }
 
-    // For a header bind, the extractor collects records both in and out of scope (see
-    // RawRecord::inScope). Registering every out-of-scope SDK struct would flood the type table,
-    // but an in-scope struct is useless if a struct it embeds BY VALUE was dropped (the in-scope
-    // struct then fails to size and is itself skipped - the cascade that made MSG/WNDCLASSEXA
-    // unavailable from windows.h). This keeps the transitive closure of in-scope records over
-    // their by-value field dependencies and drops the rest, in place.
+    // Keep the transitive closure of in-scope records over their by-value field deps.
+    // Dropping a by-value dependency causes the in-scope struct to fail to size (cascades, e.g. MSG/WNDCLASSEXA).
     void PruneRecordsToNeededClosure(std::vector<cflat_cinterop::RawRecord>& records)
     {
         // Last definition wins on a duplicate tag (forward decls are not definitions, so this is
@@ -3600,10 +3079,8 @@ private:
         for (size_t i = 0; i < records.size(); ++i)
             if (!records[i].name.empty()) byName[records[i].name] = i;
 
-        // Extract the referenced record tag from a field's canonical C type spelling, but ONLY
-        // when the field embeds the aggregate by value (a pointer field is pointer-sized whether
-        // or not the pointee is registered, so it creates no sizing dependency). Returns "" for
-        // pointer / scalar / enum fields.
+        // Extract the by-value dependency tag from a field type spelling.
+        // Pointer fields are pointer-sized regardless of pointee registration, so skip them.
         auto byValueDep = [](const std::string& ctype) -> std::string {
             if (ctype.find('*') != std::string::npos) return {};   // pointer: no sizing dependency
             std::string s = ctype;
@@ -3653,7 +3130,6 @@ private:
         records.swap(kept);
     }
 
-    // Translate extracted records to CRecordEntry (field type spellings carried through).
     void MapRawRecords(const cflat_cinterop::ExtractResult& raw, std::vector<CRecordEntry>& out)
     {
         for (const auto& r : raw.records)
@@ -3672,20 +3148,6 @@ private:
         }
     }
 
-    // Parse a C *header* via the clang C++ API and produce the bind data (functions, enums,
-    // records, object-like macro values, function-like macros). Records are registered up
-    // front so struct-by-value signatures resolve. (Formerly a libclang decl+name parse plus a
-    // separate value-fold parse; now a single full parse via the clang C++ API.) Returns false
-    // on a hard parse failure.
-    // Extract decls from one or more C headers that share a single translation unit. The stub
-    // `#include`s each header in `headerPaths` order, so an earlier entry can satisfy a later
-    // one's prerequisites - this is how a grouped import `import {"windows.h","tlhelp32.h"};`
-    // makes tlhelp32.h's HANDLE/DWORD resolve without the compiler knowing any header by name.
-    // A plain single-header import passes a one-element list. The in-scope registration set is
-    // the union, over every header, of its own directory plus the Windows SDK um/<->shared/
-    // sibling expansion (and the --c-include roots), so each header contributes only decls that
-    // live under those roots. If the parse hits a missing-prerequisite error inside a header,
-    // nothing is registered and *outPrereqFailure is set so the caller can fail loudly.
     bool ExtractCHeaderClang(const std::vector<std::string>& headerPaths,
                              std::vector<CSigEntry>& outSigs, std::vector<CEnumEntry>& outEnums,
                              std::vector<CRecordEntry>& outRecords,
@@ -3700,9 +3162,8 @@ private:
     {
         if (headerPaths.empty()) return false;
 
-        // The first header's directory anchors the clang driver's primary -I; every header's
-        // directory (plus its SDK sibling) is added to the in-scope set below. The primary header
-        // also labels the TimeTrace scopes and attributes registered decls for LSP go-to-def.
+        // The first header's directory anchors the primary -I; also labels TimeTrace scopes
+        // and attributes registered decls for LSP go-to-def.
         const std::string& headerPath = headerPaths.front();
         const std::string primaryDir = std::filesystem::path(headerPath).parent_path().string();
 
@@ -3723,11 +3184,8 @@ private:
         req.skipFunctionBodies = true;   // headers: declarations only - skip inline bodies
         req.wantIncludes   = (outIncludes != nullptr);
 
-        // In-scope set = union over the group of each header's dir + the Windows SDK um/<->shared/
-        // sibling expansion. The Windows SDK splits its API surface across um/ (functions, most
-        // structs) and shared/ (winerror.h ERROR_*, minwindef.h MAX_PATH, ntdef.h, ...); code
-        // copied from MSDN fails on the very first ERROR_SUCCESS without the sibling. This is a
-        // generic directory-layout rule, not knowledge of any specific header.
+        // Expand um/<->shared/ siblings: the Windows SDK splits its surface across both and
+        // code from MSDN fails without the sibling (ERROR_SUCCESS, MAX_PATH, etc.).
         auto addScopeDir = [&](const std::string& d) {
             for (const auto& e : req.inScopeDirs) if (e == d) return;
             req.inScopeDirs.push_back(d);
@@ -3762,9 +3220,8 @@ private:
             return false;
         }
 
-        // A missing-prerequisite error inside a header (unknown type 'HANDLE', ...) means clang
-        // dropped the dependent declarations; registering the error-recovered remnants would
-        // silently expose a partial, wrong-sized API. Refuse and let the caller suggest a group.
+        // clang drops dependent decls on prereq errors, so registering the remnants would expose
+        // a partial/wrong-sized API. Refuse and let the caller suggest a grouped import.
         if (raw.prereqErrors > 0)
         {
             if (outPrereqFailure) *outPrereqFailure = true;
@@ -3781,10 +3238,8 @@ private:
             AdoptRawTypedefs(raw);
         }
 
-        // Records first, then register, so struct-by-value param/return types resolve. Prune to
-        // the in-scope set plus the by-value dependency closure before mapping, so the cache and
-        // the type table carry the dependency structs (e.g. POINT for MSG) but not every
-        // unrelated out-of-scope SDK struct.
+        // Records first so struct-by-value param/return types resolve; pruned to the by-value
+        // closure so dependency structs (e.g. POINT for MSG) are included but unrelated ones aren't.
         {
             llvm::TimeTraceScope recordScope("RegisterCRecords", headerPath);
             PruneRecordsToNeededClosure(raw.records);
@@ -3903,11 +3358,6 @@ private:
         return true;
     }
 
-    // Auto-discover C function signatures so `import "foo.c";` needs no hand-written
-    // 'extern'. Results are cached per .c file: the (slow) clang AST dump is skipped
-    // when the file is unchanged - the timestamp is checked first, and the content hash
-    // is consulted only when the timestamp differs (e.g. touch / checkout with no real
-    // change). Feeds both the function table and the LSP symbol sink.
     bool ExtractCSignatures(const std::string& cSourcePath, const std::string& programAlias = "")
     {
         // Canonical path: stable cache key + the real .c for LSP go-to-definition.
@@ -3975,11 +3425,8 @@ private:
             return true;
         }
 
-        // Cache miss - parse and extract (outside the lock; concurrent first-time misses for
-        // the same file just redo the work harmlessly, last writer wins). Extraction is in-
-        // process via the clang C++ API and needs no clang-cl; the object compile (CompileCFile)
-        // is what requires clang-cl, and it reports its own error if the toolchain is missing.
-        // This also lets LSP .c indexing work when clang-cl is unavailable.
+        // Cache miss - parse outside the lock; concurrent misses redo work harmlessly.
+        // Extraction uses the clang C++ API in-process (no clang-cl needed), so LSP works too.
         std::vector<CSigEntry> sigs;
         std::vector<CRecordEntry> records;
         std::vector<CGlobalEntry> globals;
@@ -4005,11 +3452,6 @@ private:
         return true;
     }
 
-    // Render a "= value" suffix for a folded C integer constant's --symbol / hover
-    // signature, so the discoverable type carries its compile-time value too
-    // (GENERIC_READ is `u32 GENERIC_READ = 0x80000000`, not just `u32 GENERIC_READ`).
-    // Unsigned integer types render in hex masked to their width - the flag/mask idiom
-    // these constants almost always express; signed integer types render in decimal.
     static std::string ConstIntValueSuffix(const std::string& typeName, long long value)
     {
         bool isUnsigned = !typeName.empty() && typeName[0] == 'u';  // u8/u16/u32/u64
@@ -4022,9 +3464,6 @@ private:
         return std::format(" = {}", value);
     }
 
-    // Register C enum constants as bare global int constants - matching C's flat enum
-    // scope (the user writes CURLOPT_URL, not CURLoption.CURLOPT_URL). Built directly via
-    // builder->getIntN to sidestep CreateConstant's stoi limitation on wide values.
     void RegisterCEnums(const std::vector<CEnumEntry>& enums, const std::string& fileForLsp)
     {
         for (const CEnumEntry& e : enums)
@@ -4052,9 +3491,6 @@ private:
             std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
     }
 
-    // Register externally-linkable C globals as declaration-only, mutable CFlat globals (external
-    // references the linker resolves against the C library / object). First-writer-wins against an
-    // existing global, matching RegisterCEnums.
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp)
     {
         for (const CGlobalEntry& e : globals)
@@ -4075,37 +3511,25 @@ private:
             std::cout << "[verbose]   registered " << globals.size() << " C global(s) from " << fileForLsp << "\n";
     }
 
-    // Auto-register C struct/union decls extracted from a header or .c source as CFlat
-    // struct types. Two passes: first creates an opaque shell for every record so fields
-    // that reference siblings (or self-pointers) can resolve, then fills each body via
-    // MapCTypeToTypeAndValue (which now accepts "struct Name" once the shell exists).
-    // First-writer-wins on dataStructures: a hand-written CFlat struct with the same name,
-    // or an earlier header's contribution, takes precedence over later C-side definitions.
     void RegisterCRecords(const std::vector<CRecordEntry>& records, const std::string& fileForLsp)
     {
         if (records.empty()) return;
 
-        // Pass 1: opaque shells. Skip ones already in dataStructures so we never overwrite
-        // a CFlat-defined struct/union with C metadata. Anonymous records (no tag) are
-        // skipped - they have no name to bind to, and clang inlines their fields into the
-        // enclosing struct at the JSON layer anyway.
+        // Pass 1: opaque shells. CFlat-defined types win; anonymous records are skipped
+        // (clang inlines their fields at the JSON layer).
         std::vector<const CRecordEntry*> ours;
         ours.reserve(records.size());
         for (const auto& r : records)
         {
             if (r.name.empty()) continue;
             if (dataStructures.find(r.name) != dataStructures.end()) continue;
-            // Create the opaque shell now so a later field can refer to the record via
-            // `struct r.name *` / `union r.name *` or to another record being registered
-            // in the same batch. CreateUnionType handles the opaque-shell case identically
-            // to CreateStructType, so the union branch can also start from an opaque shell.
+            // Create the opaque shell so later fields/records in the same batch can refer to it.
             CreateStructType(r.name, /*typeAndValues*/{});
             ours.push_back(&r);
         }
 
-        // Pass 2: bodies. If any field type cannot be mapped, abandon this record and leave
-        // the opaque shell in place - a later reference will then surface a clear error
-        // rather than crash on a partially-typed struct.
+        // Pass 2: bodies. On unmappable fields leave the opaque shell in place so a later
+        // reference surfaces a clear error rather than crashing on a partial struct.
         for (const CRecordEntry* rp : ours)
         {
             const CRecordEntry& r = *rp;
@@ -4115,10 +3539,8 @@ private:
             for (const auto& f : r.fields)
             {
                 TypeAndValue tv;
-                // Fixed-size array field (e.g. `char szExeFile[260]`): strip the [N] extents
-                // and map the element type, then re-apply the dimensions as an inline array.
-                // The shared mapper decays any `[...]` to a pointer (correct for a function
-                // parameter, wrong for a struct field), so the extents are peeled here first.
+                // Strip fixed-array dims before mapping: the shared mapper decays `[N]` to a
+                // pointer (right for params, wrong for fields), so peel them here first.
                 std::vector<uint64_t> arrDims;
                 std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv))
@@ -4135,11 +3557,8 @@ private:
                     tv.ConstArraySize = arrDims[0];
                     tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                 }
-                // A C function-pointer field (e.g. WNDPROC lpfnWndProc in WNDCLASSEXA) occupies a
-                // single bare pointer in the C ABI. CFlat's function<T> is a 16-byte {code, env}
-                // fat closure, so keeping IsFunctionPointer here would oversize the struct and
-                // shift every following field's offset (sizeof(WNDCLASSEXA) -> 88 instead of 80).
-                // Collapse to an opaque void*; the user stores `(void*)namedFunction` into it.
+                // C fn-ptr fields are bare pointers (8 bytes); CFlat function<T> is 16 bytes.
+                // Collapse to void* to keep struct layout correct; user casts explicitly.
                 if (tv.IsFunctionPointer)
                 {
                     tv = TypeAndValue{};
@@ -4158,15 +3577,10 @@ private:
             }
             if (!ok || fields.empty())
             {
-                // Leave the shell in place for !ok with no body so we don't crash on later
-                // references; the user will get a clear error if they try to use it.
                 continue;
             }
-            // A by-value aggregate field whose LLVM type is still an opaque shell (an inner
-            // record we abandoned above, or a forward declaration never completed) has no
-            // size. Sizing it in CreateStructType/CreateUnionType would assert ("Cannot
-            // getTypeInfo() on a type that is unsized"). Abandon this record too, leaving the
-            // opaque shell - same graceful path as an unmapped field.
+            // An opaque-shell by-value aggregate field has no size; CreateStructType would
+            // assert "Cannot getTypeInfo() on unsized". Abandon and leave the shell.
             for (const auto& d : fields)
             {
                 if (d.Pointer) continue;            // pointers are always sized
@@ -4181,17 +3595,13 @@ private:
                 }
             }
             if (!ok) continue;
-            // Bitfield packing for C structs uses the same MSVC LSB-first layout
-            // as native CFlat bitfields. The packing pass produces synthetic
-            // storage slots; CreateStructType consumes them and stores the
-            // BitfieldInfo side-table on the StructData.
+            // Bitfield packing uses the same MSVC LSB-first layout as native CFlat bitfields;
+            // the packing pass produces synthetic slots and CreateStructType stores BitfieldInfo.
             std::vector<BitfieldInfo> packedBitfields;
             bool anyBitfields = false;
             for (const auto& tv : fields) { if (tv.IsBitfield) { anyBitfields = true; break; } }
-            // Save the semantic field list (original names + CFlat-mapped types) before
-            // PackBitfields replaces individual bitfield entries with __bfN storage slots.
-            // Used only for per-field symbol registration below; skipped when there are no
-            // bitfields because fields itself is unchanged in that case.
+            // Save semantic fields before PackBitfields replaces them with __bfN slots;
+            // used only for LSP symbol registration below.
             std::vector<DeclTypeAndValue> prePackFields;
             if (anyBitfields)
             {
@@ -4207,9 +3617,7 @@ private:
             {
                 s->Register(SymbolKind::Struct, r.name, fileForLsp, r.line, r.col < 0 ? 0 : r.col,
                             (r.isUnion ? "union " : "struct ") + r.name);
-                // Register per-field symbols so --symbol detail and LSP hover list members.
-                // For bitfield records use prePackFields (semantic names before packing);
-                // for plain records fields itself is unchanged.
+                // For bitfield records use prePackFields (semantic names before packing).
                 const auto& symFields = anyBitfields ? prePackFields : fields;
                 for (const auto& f : symFields)
                 {
@@ -4235,10 +3643,6 @@ private:
             std::cout << "[verbose]   registered " << ours.size() << " C record(s) from " << fileForLsp << "\n";
     }
 
-    // Register object-like C macros (as classified by ClassifyRawMacro) as bare global int
-    // constants - same flat-scope rule as RegisterCEnums so the user writes CURLOPT_URL, not
-    // qualified. First-writer-wins against an existing global. The LSP location points at the
-    // original #define in the real header, not the synthesized resolution stub.
     void RegisterCMacros(const std::vector<CMacroEntry>& macros)
     {
         size_t registered = 0;
@@ -4250,15 +3654,10 @@ private:
             TypeAndValue tv;
             tv.VariableName = m.name;
             llvm::Constant* c = nullptr;
-            // Compile-time value rendered into the --symbol / hover signature so the
-            // folded constant is discoverable at the use site (no defensive casts).
             std::string valSuffix;
             if (m.isString)
             {
-                // String-literal macro (e.g. #define VERSION "1.2.3"). Intern the literal
-                // in the string pool and register a `char*` global pointing at it. CFlat's
-                // `char*` matches C's `const char*` ABI; callers can pass directly to any C
-                // function taking const char* without an explicit cast.
+                // Intern the string literal and register a char* global (char* matches const char* ABI).
                 tv.TypeName = "char";
                 tv.Pointer  = true;
                 llvm::Value* strGv = CreateGlobalString(".cmacro." + m.name, m.stringValue);
@@ -4267,9 +3666,8 @@ private:
             }
             else if (m.isFloat)
             {
-                // Float/double macro (e.g. M_PI). Always register as `double` - CFlat
-                // narrows at use site if assigned to a `float`, and double matches C's
-                // default FP promotion in expressions.
+                // Float/double macro (e.g. M_PI). Always registered as `double` - CFlat narrows at
+                // use site; double matches C's default FP promotion in variadic/unprototyped calls.
                 tv.TypeName = "double";
                 tv.Pointer  = false;
                 c = llvm::ConstantFP::get(builder->getDoubleTy(), m.floatValue);
@@ -4277,10 +3675,8 @@ private:
             }
             else if (m.isFuncPtr)
             {
-                // Function-pointer constant macro (e.g. SIG_IGN). Register as a
-                // function<R(P...)> global initialized to a constant fat struct
-                // {thunk_const, env=intToPtr(value)} - same wire shape as a
-                // C-returned function pointer, just frozen at link time.
+                // Register as a function<R(P...)> fat struct {thunk_const, env=intToPtr(value)};
+                // same wire shape as a C-returned function pointer, frozen at link time.
                 tv = m.funcPtrTV;
                 tv.VariableName = m.name;
 
@@ -4306,25 +3702,19 @@ private:
             }
             else if (m.isPointer)
             {
-                // Sentinel pointer macro (e.g. INVALID_HANDLE_VALUE). Register as a
-                // void* global initialized by reinterpreting the folded bit pattern
-                // as a pointer - matches the C macro's natural type so direct compares
-                // against a HANDLE-returning API succeed without an explicit cast.
+                // Sentinel pointer: reinterpret the bit pattern as a void* so comparisons
+                // against HANDLE-returning APIs work without an explicit cast.
                 tv.TypeName = "void";
                 tv.Pointer  = true;
                 llvm::Type* i8Ptr = llvm::PointerType::get(*context, 0);
                 llvm::Constant* bits = builder->getInt64((uint64_t)m.value);
                 c = llvm::ConstantExpr::getIntToPtr(bits, i8Ptr);
-                // Sentinel pointers are bit patterns (INVALID_HANDLE_VALUE = -1); show
-                // the full 64-bit pattern in hex, matching how the C macro reads.
                 valSuffix = std::format(" = 0x{:x}", (uint64_t)m.value);
             }
             else if (!m.intTypeName.empty())
             {
-                // The macro's natural C type is a known integer: register with it, so
-                // ((DWORD)-10) is a u32 and a call site taking u32 matches without a
-                // cast (GetStdHandle(STD_INPUT_HANDLE)). Build the constant at the
-                // type's own width - truncation keeps the C bit pattern exact.
+                // Register with the macro's natural C type so call sites match without casts;
+                // build at the type's width so truncation keeps the bit pattern exact.
                 tv.TypeName = m.intTypeName;
                 tv.Pointer  = false;
                 unsigned bits = BitfieldStorageBits(m.intTypeName);
@@ -4355,16 +3745,6 @@ private:
                       << macros.size() << " object-like candidates)\n";
     }
 
-    // Tokenize a function-like macro body and verify every token is on a safe allowlist:
-    // integer + decimal-float literals (int suffix stripped, float suffix kept), char
-    // literals, parameter references, parens, the operators + - * / % & | ^ ~ ! << >> <
-    // <= > >= == != && || ? : , calls into already-known C functions, and bare references
-    // to known global / enum constants. The translated body is returned via 'out' on
-    // success. Unknown identifiers, strings, member access ('.', '->'), hex floats, casts,
-    // '#'/'##', '['/']', and the comma operator outside a call return false and the macro
-    // is dropped (silently, so binding a header never spews errors for macros cflat cannot
-    // express). Identifier resolution is validated against functionTable / globalNamedVariable
-    // here so the generated source only ever references symbols that already resolve.
     bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const
     {
         std::unordered_set<std::string> paramSet(m.params.begin(), m.params.end());
@@ -4374,9 +3754,8 @@ private:
         size_t i = 0;
         bool hasContent = false;
 
-        // Paren-context stack: 'c' = argument list of a validated call (',' allowed),
-        // 'g' = a grouping paren (',' would be the comma operator - rejected). A call
-        // identifier sets pendingCallParen so the next '(' becomes a 'c' context.
+        // 'c' = argument list of a validated call (',' allowed);
+        // 'g' = grouping paren (',' would be the comma operator, rejected).
         std::vector<char> parenCtx;
         bool pendingCallParen = false;
 
@@ -4422,10 +3801,7 @@ private:
                 continue;
             }
 
-            // Numeric literal. Decimal integers and decimal floats are supported; integer
-            // suffixes (u/U/l/L) are stripped (cflat's lexer rejects them) while float
-            // suffixes (f/F/l/L) are kept (cflat accepts them). Hex integers are supported;
-            // hex floats (a '.'/'p'/'P' after the hex digits) are dropped.
+            // Integer suffixes (u/U/l/L) are stripped; float suffixes kept; hex floats dropped.
             if (std::isdigit((unsigned char)c) ||
                 (c == '.' && i + 1 < s.size() && std::isdigit((unsigned char)s[i + 1])))
             {
@@ -4542,12 +3918,8 @@ private:
         while (!out.empty() && std::isspace((unsigned char)out.back())) out.pop_back();
         if (out.empty()) return false;
 
-        // Defensive parens like '(n)' in macro bodies become C-style casts in CFlat
-        // (`castExpression : '(' typeName ')' castExpression`), e.g. '(n) * 1024'
-        // parses as 'cast n of *1024'. Strip parens around bare identifiers - they
-        // are redundant in a real function and unblock the multiply/binary-op cases.
-        // A '(' immediately preceded by an identifier char is a CALL's argument paren
-        // (e.g. ml_add(x)); never strip those or the call would be mangled.
+        // Strip parens around bare identifiers: '(n)' is a C-style cast in CFlat grammar,
+        // but never strip call-argument parens (preceded by identifier char).
         size_t pos = 0;
         while ((pos = out.find('(', pos)) != std::string::npos)
         {
@@ -4576,10 +3948,6 @@ private:
         return true;
     }
 
-    // Translate function-like C macros into CFlat 'auto' generic functions and queue
-    // the synthesized source for parsing. Rejected macros are dropped silently (verbose
-    // log emits the reason). Generated source shape per macro:
-    //     auto NAME<T0,T1,...>(T0 p0, T1 p1, ...) { return (BODY); }
     void RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>& funcMacros,
                                  const std::string& fileForLsp)
     {
@@ -4590,9 +3958,6 @@ private:
 
         for (const auto& m : funcMacros)
         {
-            // Skip if a real symbol with this name already exists (extern function,
-            // existing generic template, or even a bound C macro constant). First writer
-            // wins, matching the existing object-like macro path.
             if (functionTable.count(m.name) ||
                 globalNamedVariable.count(m.name))
             {
@@ -4634,18 +3999,6 @@ private:
             pendingMacroSources_.push_back({ fileForLsp + "@cmacros", std::move(generated) });
     }
 
-    // Bind a prebuilt C library by extracting its header's declarations + enum constants.
-    // No object is produced (unlike CompileCFile) - the library is linked via --c-lib in
-    // EmitExecutable. Results are cached per header+include-dir set, mirroring
-    // ExtractCSignatures. Runs in LSP mode too (registration only), so headers contribute
-    // hover / completion / go-to-definition.
-    // Loud, actionable diagnostic for a header that does not compile on its own because it
-    // relies on a prerequisite header having been included first (the classic Windows SDK leaf
-    // case: tlhelp32.h uses HANDLE/DWORD without including the header that defines them). The
-    // compiler does not know which header is the prerequisite - that belongs in the user's
-    // source - so the message teaches the grouped-import fix generically. Only fires for a
-    // standalone single-header import; a header already in a group that still fails names the
-    // group so the user can fix the order or add the missing prerequisite.
     void ReportOrphanHeader(const std::vector<std::string>& headerPaths, const std::string& clangErr)
     {
         std::string name = std::filesystem::path(headerPaths.front()).filename().string();
@@ -4675,20 +4028,12 @@ private:
         return CompileCHeaderGroup(std::vector<std::string>{ headerPath }, extraDefines, diskCache);
     }
 
-    // Bind one or more C headers that share a single translation unit (a grouped import
-    // `import {"windows.h","tlhelp32.h"};`). The headers are extracted together so an earlier
-    // entry satisfies a later one's prerequisites; registration scope stays per the union of
-    // their directories (see ExtractCHeaderClang). The cache key folds the full ordered list,
-    // so a header extracted standalone never collides with the same header extracted after a
-    // prerequisite. Freshness folds every group member's mtime/hash.
     bool CompileCHeaderGroup(const std::vector<std::string>& headerPaths,
                              const std::vector<std::string>& extraDefines = {},
                              bool diskCache = false)
     {
         if (headerPaths.empty()) return true;
 
-        // Real path per header for cache identity + LSP attribution; the first is the primary
-        // (labels diagnostics / attributes registered decls, mirroring the single-header path).
         std::vector<std::string> realPaths;
         realPaths.reserve(headerPaths.size());
         for (const auto& h : headerPaths)
@@ -4698,18 +4043,14 @@ private:
         }
         const std::string& fileForLsp = realPaths.front();
 
-        // Fold the ordered header list, the include-dir set and the defines into the cache key:
-        // the same header under different --c-include roots / --c-define values, or extracted
-        // standalone vs. after a prerequisite header, can expose different decls and must not
-        // collide on a stale entry.
+        // Fold headers, include-dirs, and defines: same header under different roots/defines or
+        // standalone vs. grouped must not share a stale cache entry.
         std::string cacheKey;
         for (const auto& rp : realPaths)       cacheKey += "|H" + rp;
         for (const auto& inc : cIncludeDirs_)  cacheKey += "|I" + inc;
         for (const auto& def : cDefines_)      cacheKey += "|D" + def;
         for (const auto& def : extraDefines)   cacheKey += "|d" + def;
 
-        // Combined freshness across the group: max mtime + a fold of every member's content
-        // hash, so a change to any header in the group invalidates the entry.
         uint64_t currentHash = 0;
         bool haveHash = false;
         auto hashNow = [&]() -> uint64_t {
@@ -4781,9 +4122,8 @@ private:
             return true;
         }
 
-        // Persistent disk cache (opt-in via the `cache` import clause). On hit we preload the
-        // in-memory cache and register the decls, skipping the clang header parse entirely.
-        // The disk key folds the same path/include/define set as the in-memory key above.
+        // Persistent disk cache (opt-in via `cache` import clause). On hit, preloads the
+        // in-memory cache and registers decls, skipping the clang header parse entirely.
         std::filesystem::path cHeaderCacheDir = GetCHeaderCacheDir();
         uint64_t diskKey = 0;
         if (diskCache && !mtEc && !cHeaderCacheDir.empty())
@@ -4819,9 +4159,8 @@ private:
         bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
         std::vector<std::string> includes;
         {
-            // Functions / enums / records / object-like macro values / function-like macros are
-            // all produced by the clang C++ API extractor in one full parse (+ a cheap
-            // preprocess-only prepass for macro names). No clang-cl, no libclang.
+            // All C entities are extracted in one full parse (plus a cheap preprocess-only prepass
+            // for macro names). Uses clang C++ API, not clang-cl or libclang.
             llvm::TimeTraceScope extractScope("CHeaderExtract", fileForLsp);
             bool prereqFailure = false;
             std::string prereqMsg;
@@ -4847,9 +4186,8 @@ private:
             entry.funcMacros = funcMacros;
             entry.globals = globals;
             entry.recordAliases = aliases;
-            // Build the transitive dependency list (deep mode): keep only paths that resolve
-            // to a real file on disk - this drops the virtual stub and clang pseudo-files,
-            // and dedups. A non-existent dep would otherwise poison every later validation.
+            // Keep only real on-disk paths in the transitive dependency list (deep mode).
+            // Non-existent deps would otherwise poison every later cache validation.
             if (wantDeps)
             {
                 std::unordered_set<std::string> seen;
@@ -4866,9 +4204,8 @@ private:
                     entry.deps.push_back(std::move(dep));
                 }
             }
-            // --run is read-only: never persist the header cache to disk under run mode, even
-            // when the import opted in with a 'cache' clause (the in-memory entry below still
-            // serves this compile).
+            // --run is read-only: never persist header cache to disk even with 'cache' clause.
+            // The in-memory entry still serves this compile.
             if (diskCache && !runMode_ && !cHeaderCacheDir.empty())
                 WriteCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), entry);
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -4977,15 +4314,10 @@ private:
             dest.close();
         }
 
-        // ---- Find lld-link and MSVC / Windows SDK lib paths (cache-first) ----
         const std::string arch = (platform == "win32") ? "x86" : "x64";
 
-        // Under -g a PDB is produced beside the exe, so DbgHelp can symbolize CFlat
-        // frames at runtime. Compile the in-process crash handler and link it in (with
-        // dbghelp.lib below). Best-effort: if the handler compile fails (e.g. core/diagnostic/crashdump.c
-        // not deployed or clang-cl missing), CompileCrashHandlerObject logs via LogError and
-        // returns false; we then skip the handler-specific link args so the link still
-        // succeeds and still produces the PDB - just without the in-process backtrace.
+        // Under -g, compile and link the in-process crash handler (DbgHelp symbolizes CFlat frames).
+        // If CompileCrashHandlerObject fails, skip handler link args but still produce the PDB.
         bool crashHandlerLinked = debugInfo && CompileCrashHandlerObject(arch);
 
         LinkerPaths linkerPaths_;
@@ -5005,7 +4337,6 @@ private:
             return false;
         }
 
-        // ---- Invoke lld-link directly with explicit lib paths ----
         std::vector<std::string> linkArgStrs = {
             lldLinkPath,
             "/out:" + exePath,
@@ -5028,14 +4359,11 @@ private:
         }
         if (crashHandlerLinked)
         {
-            // DbgHelp (StackWalk64/SymFromAddr/SymGetLineFromAddr64) for the in-process
-            // crash handler. dbghelp.lib lives in the Windows SDK um lib dir (umLibPath,
-            // already on the libpath below). Gated on crashHandlerLinked so a failed
-            // handler compile does not /INCLUDE a symbol that was never emitted.
+            // DbgHelp for the in-process crash handler. Gated on crashHandlerLinked so a failed
+            // handler compile doesn't /INCLUDE a symbol that was never emitted.
             linkArgStrs.push_back("dbghelp.lib");
-            // Force-retain the crash handler's .CRT$XCU initializer: it has no external
-            // references, so lld-link's /OPT:REF (on by default, even with /DEBUG) would
-            // garbage-collect it. x86 decorates the data symbol with a leading underscore.
+            // Force-retain the crash handler's .CRT$XCU initializer - lld-link's /OPT:REF would
+            // garbage-collect it since it has no external references. x86 uses a leading underscore.
             linkArgStrs.push_back(arch == "x86"
                 ? "/INCLUDE:_cflat_crash_init_"
                 : "/INCLUDE:cflat_crash_init_");
@@ -5044,12 +4372,8 @@ private:
         if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
         if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
 
-        // AddressSanitizer runtime. The compiler-rt asan import libs ship in the same MSVC
-        // lib/<arch> dir as the CRT (already on the libpath above) and the runtime DLL lives
-        // in the sibling bin/Host*/<arch> dir. We link the dynamic asan runtime (matches the
-        // dynamic CRT, /MD-style msvcrt.lib used below) and force-include the thunk via
-        // /wholearchive so its CRT$XI* interceptor-init records are retained. The asan DLL is
-        // copied next to the exe after a successful link (see below). Gated on asan_.
+        // AddressSanitizer: link the dynamic asan runtime (matches /MD-style CRT), force-include
+        // the thunk via /wholearchive to retain CRT$XI* interceptors. DLL copied next to exe.
         std::string asanDllToCopy;
         if (asan_)
         {
@@ -5069,9 +4393,8 @@ private:
         linkArgStrs.push_back(objPath);
         // Merge any C objects compiled by clang-cl from .c inputs.
         for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
-        // Prebuilt C import libraries (--c-lib): add each lib's directory as a search
-        // path, then the lib itself. lld-link accepts an explicit path too, but the
-        // /libpath + name form keeps behaviour uniform with the system libs above.
+        // Prebuilt C import libraries (--c-lib): add each lib's dir as libpath, then name.
+        // Keeps behavior uniform with system libs above.
         for (const auto& lib : cLinkLibs_)
         {
             auto libDir = std::filesystem::path(lib).parent_path().string();
@@ -5098,10 +4421,8 @@ private:
             }
         }
 
-        // Self-contained run: copy each --c-lib's sibling runtime DLL next to the exe so
-        // the program launches without the user staging DLLs. Conan puts the DLL either
-        // beside the import lib or in a ../bin sibling; check both. Best-effort - a static
-        // lib has no DLL, which is fine.
+        // Copy each --c-lib's sibling runtime DLL next to the exe for self-contained launch.
+        // Conan puts the DLL beside the import lib or in ../bin - check both. Best-effort.
         {
             llvm::TimeTraceScope dllScope("CopyCRuntimeDlls", exePath);
             CopyCRuntimeDlls(exePath);
@@ -5125,12 +4446,8 @@ private:
         return true;
     }
 
-    // True if a thread-spawn call is reachable from 'main', following direct calls only (a
-    // worklist BFS over the static call graph). Used by --run to reject multi-threaded programs
-    // up front. Indirect/virtual calls are not followed, but the spawn primitive itself
-    // (CreateThread / _beginthreadex) is always invoked by a direct call from the thread
-    // wrapper, so the chain main -> ... -> wrapper -> CreateThread is fully direct and caught.
-    // Reachability (not mere presence) means importing thread.cb without spawning stays allowed.
+    // BFS over static call graph to detect thread-spawn reachability from main (--run guard).
+    // Indirect calls not followed; the spawn primitive is always reached via direct call from the wrapper.
     bool ReachesThreadSpawn()
     {
         auto isSpawnPrimitive = [](llvm::StringRef name) {
@@ -5165,16 +4482,6 @@ private:
         return false;
     }
 
-    // --run: JIT the in-memory module and execute its 'main' in-process, writing nothing to
-    // disk. The host process (cflat.exe) already links and initialized the dynamic CRT, so
-    // the JIT'd code resolves printf/malloc/kernel32 etc. from the DLLs already loaded into
-    // this process via a process-wide symbol generator - no CRT startup of our own is needed.
-    //
-    // Scope (prototype): single-module, host-target programs whose entry is 'int main()'.
-    // Not yet handled - C interop objects (cObjectFiles_), --c-lib import libs, and programs
-    // whose main takes argv (the 'program' construct / 'int main(move list<string>)'). Those
-    // need object/library injection and an argv marshaller respectively. 'runExitCode' returns
-    // the program's exit status; the function returns false only on a JIT setup failure.
     bool JitRun(int& runExitCode)
     {
         runExitCode = 0;
@@ -5190,10 +4497,8 @@ private:
             return false;
         }
 
-        // Determine the entry signature now, before the module is handed to the JIT (which
-        // consumes it). Two prototypes are supported: 'int main()' and
-        // 'int main(int argc, char** argv)'. The second form receives the program arguments
-        // passed after '--' on the command line.
+        // Determine entry signature before handing the module to the JIT (which consumes it).
+        // Two prototypes: int main() and int main(int argc, char** argv).
         llvm::FunctionType* mainTy = module->getFunction("main")->getFunctionType();
         unsigned mainParamCount = mainTy->getNumParams();
         bool mainTakesArgv = false;
@@ -5219,13 +4524,8 @@ private:
             return false;
         }
 
-        // Guard: in-process --run is single-threaded only. The 'program' construct and raw
-        // thread<T> both spawn worker threads via Win32 CreateThread, and on a JIT'd module
-        // those workers run an SEH-wrapped trampoline (__C_specific_handler) whose unwind
-        // tables are not registered by the JIT's memory manager - the worker corrupts/crashes
-        // the moment it unwinds. Rather than fault at runtime, detect a reachable spawn at the
-        // source and refuse with a helpful error. Reachability from 'main' means importing
-        // thread.cb without actually spawning stays allowed.
+        // Guard: --run is single-threaded only. JIT'd thread workers lack SEH unwind tables,
+        // causing a crash on any unwind. Refuse early if main reachably spawns a thread.
         if (ReachesThreadSpawn())
         {
             LogError(
@@ -5262,9 +4562,8 @@ private:
         module->setDataLayout(jit->getDataLayout());
         module->setTargetTriple(jit->getTargetTriple().str());
 
-        // Resolve external symbols (CRT, kernel32, ws2_32, ...) from the symbols already
-        // loaded into this process. GlobalPrefix from the data layout keeps name mangling
-        // consistent with the JIT (no prefix on win64, '_' on win32).
+        // Resolve external symbols (CRT, kernel32, ws2_32) from already-loaded process symbols.
+        // GlobalPrefix from the data layout keeps name mangling consistent (no prefix on win64).
         auto gen = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
             jit->getDataLayout().getGlobalPrefix());
         if (!gen)
@@ -5275,9 +4574,8 @@ private:
         }
         jit->getMainJITDylib().addGenerator(std::move(*gen));
 
-        // Supply __emutls_get_address (see cflat_jit::CflatEmutlsGetAddress). Emulated TLS is
-        // how the host target lowers thread-locals, and runtime.cb's allocator hooks are
-        // thread-local, so essentially every program needs this helper.
+        // Supply __emutls_get_address - emulated TLS is how the host target lowers thread-locals.
+        // runtime.cb allocator hooks are thread-local, so essentially every program needs this.
         {
             llvm::orc::SymbolMap syms;
             syms[jit->mangleAndIntern("__emutls_get_address")] = llvm::orc::ExecutorSymbolDef(
@@ -5322,10 +4620,8 @@ private:
         // Dispatch on the entry signature detected above.
         if (mainTakesArgv)
         {
-            // Build a C-style argv: argv[0] is the program (source file) name, argv[1..] are the
-            // user's program arguments, and argv[argc] is NULL per the C convention. The backing
-            // std::strings outlive the call; std::string::data() is NUL-terminated (C++11+), so
-            // each element is a valid C string.
+            // Build a C-style argv: argv[0] = source file name, argv[1..] = user args, argv[argc] = NULL.
+            // std::string::data() is NUL-terminated (C++11+), so each element is a valid C string.
             std::vector<std::string> argvStorage;
             argvStorage.reserve(runArgs_.size() + 1);
             argvStorage.push_back(sourceFileName.empty() ? std::string("program") : sourceFileName);
@@ -5354,14 +4650,6 @@ private:
         return true;
     }
 
-    // Resolve the compiler-rt AddressSanitizer runtime for --asan and add it to the link.
-    // The dynamic asan import libs (clang_rt.asan_dynamic-<suffix>.lib and the matching
-    // runtime-thunk) ship in the MSVC lib/<arch> dir (msvcLibDir, already on the libpath),
-    // and the runtime DLL lives in the sibling bin/Host{x64,x86}/<arch> dir. Appends the two
-    // libs plus a /wholearchive for the thunk to linkArgStrs and returns the absolute DLL
-    // path to deploy in dllSrcOut. On any missing piece, reports via LogError and returns
-    // false (the runtime ABI is version-pinned, so a missing/mismatched runtime is fatal -
-    // we never silently fall back). suffix: x86_64 for x64, i386 for x86.
     bool ResolveAsanRuntime(const std::string& arch, const std::string& msvcLibDir,
                             std::vector<std::string>& linkArgStrs, std::string& dllSrcOut)
     {
@@ -5419,16 +4707,12 @@ private:
         return false;
     }
 
-    // For each --c-lib, find a matching runtime DLL (lib dir, or a ../bin sibling) and copy
-    // it next to the output exe. Tries <stem>.dll and the common lib<stem> / <stem>_imp
-    // import-lib naming so the right DLL is found for either layout.
     void CopyCRuntimeDlls(const std::string& exePath)
     {
         namespace fs = std::filesystem;
         auto exeDir = fs::path(exePath).parent_path();
-        // The legacy probe path (below) and the vcpkg authoritative list often resolve to
-        // the same DLL when --c-lib is set by the vcpkg resolver. Track dest filenames so
-        // we don't copy + log the same file twice.
+        // Track dest filenames to avoid duplicate copies when the legacy probe and vcpkg
+        // authoritative list resolve to the same DLL for a given --c-lib.
         std::unordered_set<std::string> copiedDestNames;
         for (const auto& lib : cLinkLibs_)
         {
@@ -5472,9 +4756,8 @@ private:
                 std::cout << "[verbose]   no runtime DLL found for " << lib << " (static lib?)\n";
         }
 
-        // vcpkg-resolved DLLs: paths are authoritative (taken from the .list under
-        // vcpkg_installed/<triplet>/bin) - no probing needed, just copy. Skip ones the
-        // legacy probe above already copied.
+        // vcpkg-resolved DLL paths are authoritative (from vcpkg_installed/<triplet>/bin).
+        // Skip ones the legacy probe already copied.
         for (const auto& dll : vcpkgRuntimeDlls_)
         {
             fs::path src(dll);
@@ -5606,10 +4889,8 @@ public:
         builder->SetCurrentDebugLocation(llvm::DebugLoc());
     }
 
-    // Terminate all unterminated basic blocks in every function in the module, then pop stack
-    // frames back down to targetDepth (without running destructors - used in error-skip paths).
-    // Iterates the whole module because lambdas save/restore builder state: when an exception
-    // fires inside a lambda the outer function's blocks may also be unterminated.
+    // Terminate all unterminated blocks in the module (lambdas mean outer function blocks may
+    // also be unterminated), then pop stack frames to targetDepth without running destructors.
     void AbortFunctionBlocks(size_t targetDepth)
     {
         for (auto& fn : *module)
@@ -5723,8 +5004,7 @@ public:
     }
 
     // Creates __shim_<name>(original params..., i8* env) that ignores env and calls original.
-    // Env is the trailing param (the closure ABI is env-last) so a non-capturing lambda's
-    // invoker is bitcast-compatible with a bare C function pointer; this shim mirrors that layout.
+    // Env-last ABI makes this bitcast-compatible with a bare C function pointer.
     llvm::Function* GetOrCreateFunctionShim(llvm::Function* original)
     {
         std::string shimName = "__shim_" + original->getName().str();
@@ -5761,11 +5041,8 @@ public:
         return shim;
     }
 
-    // Thunk used to wrap a bare C function pointer (returned from an extern C call) as a
-    // closure {thunk, env=cfnptr}. The thunk's `env` slot carries the real C function
-    // pointer at runtime; CreateIndirectCall passes env as the trailing arg, so the thunk
-    // reads env back, bitcasts it to the C signature, and tail-calls through it.
-    // One thunk per signature - keyed by the C-compatible LLVM FunctionType.
+    // Wraps a bare C function pointer as a closure {thunk, env=cfnptr}. The env slot carries
+    // the real C fn ptr; the thunk reads env back, bitcasts to C signature, and tail-calls through it.
     llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
     {
         // Build a stable signature key (mangled function type) so we share thunks across
@@ -5806,9 +5083,6 @@ public:
         return thunk;
     }
 
-    // Wraps a C-returned bare function pointer in a {thunk, cfnptr-as-env} fat struct
-    // so CFlat's indirect-call machinery (which passes env as the trailing arg) routes through
-    // the thunk and reaches the real C function with the right argument layout.
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
     {
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
@@ -5991,8 +5265,7 @@ public:
             if (funcIt != functionTable.end())
             {
                 // method.Parameters excludes 'this'; sym.Parameters[0] is 'this'.
-                // Match by struct this-pointer AND by the remaining parameter types/count,
-                // so overloads like getInt(string) vs getInt(int) resolve correctly.
+                // Match by struct this-pointer and remaining params to distinguish overloads.
                 size_t expectedParamCount = 1 + method.Parameters.size();
                 for (const auto& sym : funcIt->second)
                 {
@@ -6281,10 +5554,8 @@ public:
 
     bool TypeImplementsInterface(const std::string& typeName, const std::string& ifaceName) const
     {
-        // An interface trivially satisfies a constraint to itself: `T : IMessage`
-        // is met by T == IMessage. This lets a generic constrained to a marker
-        // interface be instantiated with that interface as the default payload
-        // (e.g. arena_channel<IMessage>).
+        // An interface trivially satisfies a constraint to itself (e.g. arena_channel<IMessage>
+        // uses IMessage as its payload type when constrained to IMessage).
         if (typeName == ifaceName && interfaceTable.count(typeName)) return true;
 
         auto it = dataStructures.find(typeName);
@@ -6338,9 +5609,6 @@ public:
         }
     }
 
-    // Lazily synthesizes void __reflect_T(T* obj, IReflector visitor) for the given struct type.
-    // Returns the synthesized function, or nullptr if structName is not a known struct.
-    // Safe to call mid-emission: uses SaveBuilderState/RestoreBuilderState.
     llvm::Function* SynthesizeReflectFunction(const std::string& structName)
     {
         auto compiler = this;
@@ -6644,10 +5912,6 @@ public:
         return fn;
     }
 
-    // externalDecl=true emits a declaration-only global (null initializer + ExternalLinkage):
-    // an external reference the linker resolves to a definition elsewhere (a C library symbol,
-    // or a CFlat `extern` global defined in another translation unit). Mutable, C-style - the
-    // global is NOT zero-initialized here (that would emit a conflicting definition).
     llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0, bool externalDecl = false)
     {
         llvm::Type* destinationType = GetType(typeValue);
@@ -6662,9 +5926,8 @@ public:
             }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
             {
-                // Widen a narrower FP constant to the global's type. A bare float literal
-                // (1.0 is typed float) widens to a double global - float -> double is an
-                // implicit widening conversion. Narrowing is left alone so it still errors.
+                // Widen a narrower FP constant to the global's type (float -> double is implicit).
+                // Narrowing is left alone so it still errors at use.
                 if (destinationType->isFloatingPointTy() &&
                     fpValue->getType()->getScalarSizeInBits() < destinationType->getScalarSizeInBits())
                 {
@@ -6726,10 +5989,8 @@ public:
         return gVar;
     }
 
-    // Emit an alloca in the function entry block so that loop-body declarations
-    // don't grow the stack unboundedly across iterations.  VLAs (non-null arraySize)
-    // must stay at the current point because their size is computed dynamically.
-    // When `align` is nonzero, the alloca is annotated with that alignment.
+    // Emit alloca in the function entry block - loop-body allocas would grow the stack unboundedly.
+    // VLAs (non-null arraySize) must stay at the current point (dynamic size).
     llvm::AllocaInst* AllocaAtEntry(llvm::Type* type, llvm::Value* arraySize, const llvm::Twine& name = "", uint64_t align = 0)
     {
         llvm::AllocaInst* a;
@@ -6759,10 +6020,8 @@ public:
     llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0)
     {
         auto type = GetType(typeValue, autoType);
-        // An abandoned C-imported record (a field type the extractor could not map,
-        // e.g. INPUT_RECORD's inline anonymous union) is registered as an unsized
-        // opaque shell. It cannot live on the stack - diagnose instead of emitting
-        // IR that fails module verification.
+        // An abandoned C-imported record (field type the extractor couldn't map, e.g.
+        // INPUT_RECORD's anonymous union) is an unsized opaque shell - diagnose, don't emit invalid IR.
         if (!typeValue.Pointer && type != nullptr && type->isStructTy() && !type->isSized())
         {
             LogError(std::format(
@@ -6770,11 +6029,8 @@ public:
                 "it can only be used through a pointer", typeValue.TypeName));
             type = builder->getInt8Ty();  // sized placeholder; the error already aborts the compile
         }
-        // A fixed-size array's dimension is already encoded in `type` (GetType
-        // returns [N x T], or [N x [M x T]] for multi-dim). Passing that same N
-        // again as the alloca element-count would allocate N copies of [N x T] -
-        // an N x N over-allocation (e.g. int[1024] -> 4MB instead of 4KB, which
-        // both wastes stack and defeats the loop vectorizer's bounds analysis).
+        // GetType returns [N x T] for fixed-size arrays; passing N again as element-count
+        // would allocate N x [N x T] - an N x N over-allocation (int[1024] -> 4MB not 4KB).
         if (typeValue.ConstArraySize > 0)
             arraySize = nullptr;
         // Effective alignment: max(decl-level alignas, struct-level alignas, ABI).
@@ -6827,9 +6083,6 @@ public:
         return AllocaAtEntry(type, nullptr);
     }
 
-    // Register an alloca of struct type as the implicit 'this' pointer in the current scope.
-    // Used by parameterized constructors: the alloca IS the pointer (same layout as a method's
-    // incoming this* argument), so GetMemberVariable can GEP through it.
     void RegisterThisPointer(const TypeAndValue& tv, llvm::Value* storage, llvm::Type* baseType)
     {
         NamedVariable namedVar{
@@ -6840,9 +6093,8 @@ public:
         };
         stackNamedVariable.back().functionArgument[tv.VariableName] = namedVar;
 
-        // Also register under "this" so explicit `this->field` resolves correctly.
-        // Primary = storage (the alloca) so LoadNamedVariable returns it directly as a pointer
-        // rather than loading through it (which would yield the struct by value, not a pointer).
+        // Also register under "this" so `this->field` resolves correctly.
+        // Primary=storage makes LoadNamedVariable return the pointer, not load through it.
         TypeAndValue thisTv = tv;
         thisTv.VariableName = "this";
         NamedVariable thisVar{
@@ -6873,23 +6125,15 @@ public:
         return builder->CreateStore(newValue, destination);
     }
 
-    /// <summary>
-    /// Initialize a constant in the structInstance;
-    /// </summary>
     llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index)
     {
         return builder->CreateInsertValue(structInstance, newValue, index);
     }
 
-    /// <summary>
-    /// Get the Storage position in a struct.
-    /// </summary>
     llvm::Value* CreateStructGEP(llvm::Type* structType, llvm::Value* structAlloc, unsigned int index, std::string variableName = "")
     {
-        // When the base is a GlobalVariable (a Constant), IRBuilder's ConstantFolder
-        // tries to fold the GEP into a ConstantExpr. In LLVM 18 opaque pointer mode
-        // this internally calls ConstantExpr::getCast with an invalid type combination,
-        // triggering an assertion. Bypass the folder by inserting a real GEP instruction.
+        // LLVM 18 opaque pointer mode: ConstantFolder folds GlobalVariable GEPs into ConstantExpr,
+        // which calls ConstantExpr::getCast with an invalid type combination and asserts. Insert directly.
         if (llvm::isa<llvm::GlobalVariable>(structAlloc))
         {
             llvm::Value* idxs[] = { builder->getInt32(0), builder->getInt32(index) };
@@ -6976,9 +6220,8 @@ public:
             auto targetSize = destType->getScalarSizeInBits();
             auto srcSize = srcType->getScalarSizeInBits();
 
-            // Widening only (e.g. float -> double). Narrowing (double -> float) is
-            // not handled here - use a typed literal (0.0f) or an explicit cast at
-            // the source level so types match before reaching this path.
+            // Widening only (float -> double). Narrowing not handled here -
+            // use a typed literal (0.0f) or explicit cast so types match.
             if (srcSize < targetSize)
                 return builder->CreateFPExt(value, destType);
         }
@@ -7004,19 +6247,8 @@ public:
         return value;
     }
 
-    // C integer promotion for the compile-time constant-fold path: a sub-int
-    // operand is promoted to int (i32) before the two constants are folded.
-    // Without this, binary folding of small literals overflows in the literal's
-    // minimal storage width - the literal 1 is stored as i8, so (i8)1 << 20 folds
-    // to 0 and (i8)100 << 1 to -56. Callers gate this on both operands being
-    // constants, so runtime narrow arithmetic keeps its width (and still matches
-    // narrow return/storage types). The folded constant is truncated back by the
-    // receiving storage (CreateCast) when assigned to a narrower type.
-    //
-    // i32 is the smallest width that actually resolves the overflow: i16 still
-    // loses 1 << 20 and 4 * 1024 * 1024, and going wider than int (to i64) is
-    // unnecessary - so we cap at exactly i32 (C's int) and never promote i32/i64.
-    // i1 (bool) is left alone; promotion targets only the i8/i16 char/short widths.
+    // C integer promotion for compile-time constant folding: (i8)1 << 20 folds to 0 without this.
+    // Cap at i32 - i16 still overflows, i64 is unnecessary. Gated on both operands being constants.
     llvm::Value* PromoteToInt(llvm::Value* value, bool isUnsigned = false) const
     {
         auto* type = value->getType();
@@ -7030,17 +6262,10 @@ public:
     }
 
 
-    /// <summary>
-    /// Compare bit width.
-    /// </summary>
-    /// <returns>Returns -1 for in compatible type, 0 for same, positive number for possible Upconvert.</returns>
     int CompareUpconvert(llvm::Type* srcType, llvm::Type* destType) const
     {
-        // A typeless operand (e.g. a bare literal cast through an operator overload,
-        // whose NamedVariable carries only Primary - no BaseType, no TypeName) reaches
-        // here with a null srcType. Treat it as incompatible (-1) rather than
-        // dereferencing null: the caller then reports a clean "no overload matches"
-        // diagnostic instead of segfaulting. See internal/string-literal-cast-crash.md.
+        // Null srcType (e.g. bare literal cast through operator overload, no TypeName): return -1
+        // so caller reports "no overload matches" instead of segfaulting on null dereference.
         if (srcType == nullptr || destType == nullptr)
             return -1;
 
@@ -7962,9 +7187,8 @@ public:
             }
             case Operation::LogicalAnd:
             {
-                // Normalize both operands to i1 so bitwise AND behaves as logical AND.
-                // Without this, isdigit()-style functions (returning 4, 8, etc.) would
-                // AND to 0 with the i1-widened left side (1 & 4 == 0).
+                // Normalize to i1 so AND behaves logically. isdigit() returns 4/8, which
+                // would AND to 0 against an i1-widened left side (1 & 4 == 0).
                 if (!left->getType()->isIntegerTy(1))
                     left = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0), "tobool");
                 if (!right->getType()->isIntegerTy(1))
@@ -8021,9 +7245,8 @@ public:
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
             return CreateVectorOperation(op, left, right, leftIsUnsigned || rightIsUnsigned);
 
-        // C integer promotion (see PromoteToInt), scoped to the compile-time fold
-        // case (both operands constant) so runtime narrow arithmetic is unaffected.
-        // Signedness is preserved so unsigned narrow constants zero-extend.
+        // C integer promotion for compile-time constants only (see PromoteToInt).
+        // Signedness preserved so unsigned narrow constants zero-extend.
         if (llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right))
         {
             left  = PromoteToInt(left,  leftIsUnsigned);
@@ -8163,9 +7386,8 @@ public:
         auto* fnPtrI8 = builder->CreateExtractValue(funcPtr, {0u}, "fn_i8");
         auto* envPtr  = builder->CreateExtractValue(funcPtr, {1u}, "env_ptr");
 
-        // Strip the OWNED tag (low bit) off the env before the env-last call: an owning heap
-        // env carries the tag (lambda Option A), and the invoker expects a clean pointer to the
-        // captures block. Borrowed/null env (tag clear) is unchanged by the mask.
+        // Strip the OWNED tag (low bit) off the env - an owning heap env carries the tag (lambda
+        // Option A) but the invoker expects a clean pointer. Borrowed/null env is unchanged.
         {
             auto* envInt = builder->CreatePtrToInt(envPtr, builder->getInt64Ty());
             auto* masked = builder->CreateAnd(envInt, builder->getInt64(~(uint64_t)1));
@@ -11350,19 +10572,6 @@ public:
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v) { cHeaderCacheDeep_ = v; }
 
-    // ---- Cross-thread sharing diagnostic (--xthread-scan N) ----------------
-    // Opt-in, default OFF (level 0). A pre-pass (ScanCrossThreadEscapes, run before the
-    // codegen walk) collects the set of struct TYPES whose instances escape to a spawned
-    // thread into threadSharedTypes_; the two field-access reporting sites in MainListener
-    // then print a one-line [xthread] report to stdout for any access to a field of such a
-    // type that is neither atomic nor guarded by a lock. Higher levels widen which
-    // spawn/escape patterns the pre-pass recognizes:
-    //   1 - address-of a local struct passed to a thread spawn (&ctx; low noise)
-    //   2 - level 1 + a heap struct-pointer local handed to a spawn (ptr handoff)
-    //   3 - level 2 + any struct pointer passed to ANY call, and default-ordering
-    //       atomics no longer suppress (most aggressive / most false positives)
-    // This is a plain compiler stdout report, NOT a diagnostic-sink warning, so it
-    // is never routed to the LSP and never affects the exit code.
     void SetXthreadScanLevel(int n) { xthreadScanLevel_ = n; }
     int  GetXthreadScanLevel() const { return xthreadScanLevel_; }
     bool IsXthreadEscapedType(const std::string& typeName) const
@@ -11374,13 +10583,7 @@ public:
         if (!typeName.empty())
             threadSharedTypes_.insert(typeName);
     }
-    // Pre-pass: walk the main translation unit's parse tree (before the codegen walk) and
-    // populate threadSharedTypes_ with struct types that escape to a spawned thread.
-    // No-op when xthreadScanLevel_ == 0. Defined in LLVMBackend.cpp.
     void ScanCrossThreadEscapes(CFlatParser::CompilationUnitContext* cu);
-    // Emit one [xthread] line for a field access on an escaped struct type, unless the
-    // field is thread-safe by construction (atomic wrapper or lock-guarded). Deduped so
-    // each distinct finding prints once. Plain stdout - NOT a diagnostic-sink warning.
     void ReportXthreadFieldAccess(const std::string& varName, const std::string& fieldName,
                                   const std::string& structType, const TypeAndValue& field)
     {
@@ -11404,9 +10607,7 @@ public:
     void SetSymbolSink(LspSymbolIndex* sink) { symbolSink_ = sink; }
     LspSymbolIndex* GetSymbolSink() const { return symbolSink_; }
 
-    // LSP-only sink for "faded" hint regions (unused/unreachable code). Carries a full
-    // range (start..end, 1-based line / 0-based col) so the client can gray a whole span
-    // rather than a single caret. Set only in LSP mode; null during real compiles.
+    // LSP-only: grays unreachable/unused code spans. Null during real compiles.
     using HintRegionSink = std::function<void(int startLine, int startCol,
                                               int endLine, int endCol,
                                               const std::string& msg)>;
@@ -11421,41 +10622,21 @@ public:
     void ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
                            const std::vector<std::string>& sourceLines);
 
-    // inputOverride, when non-empty, replaces positional(0) as the file to compile.
-    // Used by batch / --check mode to compile each positional file independently.
     bool Compile(const ArgParser& args, const std::string& inputOverride = {});
 
-    // --grammar: parse a single source file in isolation to validate its syntax
-    // (no imports, no forward-ref scan, no codegen). Syntax errors are reported
-    // with the same humanized hints as a normal compile. When verbose is set, the
-    // full parse-tree rule stack is also printed. Returns true if the file parsed
-    // without syntax errors.
     bool CheckGrammar(const std::string& filename);
 
     bool CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName = {}, const std::string& programAlias = {}, const std::vector<std::string>& explicitLibs = {}, const std::vector<std::string>& extraDefines = {}, bool cacheHeader = false);
 
-    // Resolve an import filename against the same search order CompileImportedFile uses
-    // (importing dir, LSP source dir, -i dir, --c-include roots, runtime core, Windows SDK).
-    // Returns true with the canonical path in `outCanonical`; on failure logs the not-found
-    // error (unless `quiet`) and returns false.
     bool ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
                            std::string& outCanonical, bool quiet = false);
 
-    // Handle a grouped import `import { "a", "b" } lib {...} define ...;`. Non-header entries
-    // (.cb/.c) route individually in listed order; every header entry (.h/.hpp/.hh) is bound as
-    // ONE translation unit so an earlier header satisfies a later one's prerequisites. Group
-    // `lib`/`define` clauses apply to the whole group.
     bool CompileImportGroup(const std::string& importingFilePath,
                             const std::vector<std::string>& entries,
                             const std::vector<std::string>& groupLibs,
                             const std::vector<std::string>& groupDefines,
                             bool cacheGroup);
 
-    // Resolve an inline `lib "..."` clause to a link argument for cLinkLibs_. A library that
-    // ships beside the importing .cb (the Conan/vcpkg layout) is used by its full path; a
-    // bare system lib name like "user32.lib" that is not found there is passed through
-    // unqualified, so lld-link resolves it against the system lib search paths - the Windows
-    // SDK `um` dir that cflat already discovered to resolve <windows.h> is on that path.
     static std::string ResolveCLinkLib(const std::string& lib, const std::string& importingFilePath)
     {
         std::filesystem::path lp(lib);
@@ -11473,19 +10654,10 @@ public:
         return lib;
     }
 
-    // Vcpkg integration setters - wired from CLI flags in main.cpp.
     void SetVcpkgExe(const std::string& path)        { vcpkg_.SetExeOverride(path); }
     void SetVcpkgManifest(const std::string& path)   { vcpkg_.SetManifestOverride(path); }
     void SetVcpkgTriplet(const std::string& triplet) { vcpkg_.SetTripletOverride(triplet); }
 
-    // Manifest-walk origin for a `import package-vcpkg` on the ROOT file under compilation.
-    // In LSP mode the analyzed file is a temp copy in %TEMP% (see LspServer's
-    // RunAnalysisOnSlot), so walking up from it would never find the project's vcpkg.json;
-    // sourceFileDir_ carries the file's real on-disk directory and is used as the origin.
-    // In CLI mode sourceFileDir_ is empty and the real analyzed path is returned unchanged.
-    // Only for the root file - transitive .cb imports pass their own real path and must keep
-    // walking from there (nearest vcpkg.json wins). The returned path is synthetic (only its
-    // parent directory is consulted by the resolver), so the basename is irrelevant.
     std::string RootVcpkgImportPath(const std::string& analyzedPath) const
     {
         if (sourceFileDir_.empty())
@@ -11493,13 +10665,6 @@ public:
         return (std::filesystem::path(sourceFileDir_) /
                 std::filesystem::path(analyzedPath).filename()).string();
     }
-
-    // ---- Vcpkg header disk cache ----
-    // Cache lives in vcpkg_installed/.cflat-cache/<key>.json, co-located with the
-    // installed packages so it invalidates naturally when vcpkg rewrites them.
-    // Key: FNV-1a of the canonical header path + --c-define values.
-    // Concurrent-write safety: atomic temp-file + rename; treat any read failure
-    // as a cache miss (benign - just re-runs clang).
 
     static uint64_t VcpkgDiskCacheKey(const std::string& fileForLsp,
                                        const std::vector<std::string>& defines)
@@ -11510,8 +10675,6 @@ public:
         return h;
     }
 
-    // Disk-cache directory for plain `import "x.h" cache;` header binds. Sits beside the
-    // core-bitcode and linker-path caches under %USERPROFILE%\.cflat. Empty if unavailable.
     static std::string GetCHeaderCacheDir()
     {
         std::string base = GetCflatCacheDir();
@@ -11519,11 +10682,6 @@ public:
         return base + "\\cheaders";
     }
 
-    // FNV-1a key for the plain-header disk cache. Folds the same inputs as the in-memory
-    // cache key in CompileCHeader (canonical path, every --c-include dir, every --c-define,
-    // and every per-import inline define) so a header exposed differently under different
-    // roots/defines never collides on a stale entry. The version-stamped SDK include dirs
-    // here are what catch an SDK upgrade in shallow mode.
     static uint64_t CHeaderDiskCacheKey(const std::string& fileForLsp,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
@@ -11533,8 +10691,6 @@ public:
                                    includeDirs, defines, extraDefines);
     }
 
-    // Group form: folds the full ordered header list so a header bound standalone never shares
-    // a disk-cache slot with the same header bound after a prerequisite (different decl set).
     static uint64_t CHeaderDiskCacheKey(const std::vector<std::string>& headerPaths,
                                         const std::vector<std::string>& includeDirs,
                                         const std::vector<std::string>& defines,
@@ -11750,8 +10906,6 @@ public:
         return m;
     }
 
-    // Validate one transitively-included dependency: accept on mtime match (fast) or, on
-    // mtime drift, content-hash match. A vanished file or unreadable hash is a miss.
     static bool CHeaderDepFresh(const CHeaderDep& dep)
     {
         std::error_code ec;
