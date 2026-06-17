@@ -449,6 +449,12 @@ extern int main()
         // statement (regression: this unbound temp used to leak its text+extra buffers).
         total++; passed += Test("plain-temp field read", makePlainTok(8).text.length(), 4);   // "tok8"
 
+        // A bare discarded owning-struct call (no bind, no field read) is destructed at the end of
+        // the full expression (regression: this used to leak the whole temp - no field-access site
+        // hooked it). Covered by the HeapAudit oracle below; both move and plain returns apply.
+        makeTempTok(80);
+        makePlainTok(81);
+
         // list.get(i) returns a shallow ALIAS of the element, so the temp is NOT destructed - the
         // element survives (frees once with the list, no double-free). Read it, and copy it out.
         list<TempTok> toks = default;

@@ -3585,6 +3585,16 @@ public:
             auto express = expressStatement->expression();
             if (express != nullptr)
             {
+                // A discarded full expression (`makePlain(2);`). Evaluate via the Named path so we
+                // can see whether the result is an unclaimed owning-struct temp and register it for
+                // end-of-full-expression destruction (FlushOwnedTemps at the block-item boundary).
+                if (auto* assign = express->assignmentExpression())
+                {
+                    auto resultNV = ParseAssignmentExpressionNamed(assign);
+                    ProcessPlusPlus();
+                    RegisterDiscardedOwningStructTemp(resultNV);
+                    return;
+                }
                 ParseExpression(express);
                 return;
             }
@@ -14292,6 +14302,28 @@ public:
 
         LogErrorContext(ctx, "Expression has no assignment sub-expressions.");
         return nullptr;
+    }
+
+    // A discarded statement result (`makePlain(2);`) that is an unclaimed owning-struct rvalue
+    // temp is claimed by nothing, so without this it leaks. Spill it and register for destruction
+    // at the end of the full expression (FlushOwnedTemps at the block-item boundary). Mirrors the
+    // field-access registration gate (see the `makeToken().text` path). Storage==null is the
+    // rvalue-temp signal: a named local or a deref (`(*p)`) carries Storage and is freed by its own
+    // scope dtor, so we must not double-free it here. `alias` borrows and string/closure values
+    // (own runtime owned-bit + temp lists) are excluded.
+    void RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv)
+    {
+        const std::string& typeName = nv.TypeAndValue.TypeName;
+        if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return;
+        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
+        if (nv.TypeAndValue.IsAlias || nv.FromOwningTempField) return;
+
+        auto* compiler = Compiler();
+        if (!compiler->IsOwningValueType(typeName)) return;
+
+        auto* tempAlloca = compiler->AllocaAtEntry(nv.BaseType, nullptr, "discardtemp");
+        compiler->builder->CreateStore(nv.Primary, tempAlloca);
+        compiler->RegisterOwnedStructTemp(tempAlloca, typeName);
     }
 
     void ProcessPlusPlus()
