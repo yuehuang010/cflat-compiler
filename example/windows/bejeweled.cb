@@ -1,0 +1,417 @@
+// Bejeweled - a native Win32 GUI match-3 game written in CFlat.
+//
+// Rules:
+//   - Left-click two adjacent gems to swap them.
+//   - Form rows or columns of 3 or more identical gems to clear them.
+//   - Gems above fall down to fill gaps; new gems appear at the top.
+//   - Swaps are only allowed if they result in at least one match.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/bejeweled.cb -o out/bejeweled.exe
+//   out\bejeweled.exe
+
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "random.cb";
+import "array.cb";
+import "time.cb";
+
+// -- Constants --------------------------------------------------------------
+const int BOARD_W     = 8;
+const int BOARD_H     = 8;
+const int CELL        = 64;   // pixels per cell
+const int HEADER_H    = 60;   // score area height
+const int GEM_TYPES   = 7;
+
+// -- Globals ----------------------------------------------------------------
+array<int> g_board    = default;
+int g_score           = 0;
+int g_selX            = -1;
+int g_selY            = -1;
+Random g_rng          = default;
+
+// -- Helpers ----------------------------------------------------------------
+int idx(int x, int y) { return y * BOARD_W + x; }
+
+u32 rgb(int r, int g, int b)
+{
+    return (u32)(r | (g << 8) | (b << 16));
+}
+
+u32 getGemColor(int type)
+{
+    if (type == 1) return rgb(255, 50, 50);   // Red
+    if (type == 2) return rgb(50, 255, 50);   // Green
+    if (type == 3) return rgb(50, 50, 255);   // Blue
+    if (type == 4) return rgb(255, 255, 50);  // Yellow
+    if (type == 5) return rgb(255, 50, 255);  // Magenta
+    if (type == 6) return rgb(50, 255, 255);  // Cyan
+    if (type == 7) return rgb(255, 150, 50);  // Orange
+    return rgb(100, 100, 100);
+}
+
+// -- Game Logic -------------------------------------------------------------
+
+bool hasMatchAt(int x, int y)
+{
+    int type = g_board.get(idx(x, y));
+    if (type == 0) return false;
+
+    // Horizontal
+    int hCount = 1;
+    int i = x - 1;
+    while (i >= 0 && g_board.get(idx(i, y)) == type) { hCount++; i--; }
+    i = x + 1;
+    while (i < BOARD_W && g_board.get(idx(i, y)) == type) { hCount++; i++; }
+    if (hCount >= 3) return true;
+
+    // Vertical
+    int vCount = 1;
+    int j = y - 1;
+    while (j >= 0 && g_board.get(idx(x, j)) == type) { vCount++; j--; }
+    j = y + 1;
+    while (j < BOARD_H && g_board.get(idx(x, j)) == type) { vCount++; j++; }
+    if (vCount >= 3) return true;
+
+    return false;
+}
+
+bool findMatches(array<bool>* matched)
+{
+    bool found = false;
+    int i = 0;
+    while (i < BOARD_W * BOARD_H) { matched->set(i, false); i++; }
+
+    // Horizontal pass
+    int y = 0;
+    while (y < BOARD_H)
+    {
+        int x = 0;
+        while (x < BOARD_W - 2)
+        {
+            int type = g_board.get(idx(x, y));
+            if (type != 0 &&
+                type == g_board.get(idx(x + 1, y)) &&
+                type == g_board.get(idx(x + 2, y)))
+            {
+                matched->set(idx(x, y), true);
+                matched->set(idx(x + 1, y), true);
+                matched->set(idx(x + 2, y), true);
+                found = true;
+            }
+            x++;
+        }
+        y++;
+    }
+
+    // Vertical pass
+    int x = 0;
+    while (x < BOARD_W)
+    {
+        int y = 0;
+        while (y < BOARD_H - 2)
+        {
+            int type = g_board.get(idx(x, y));
+            if (type != 0 &&
+                type == g_board.get(idx(x, y + 1)) &&
+                type == g_board.get(idx(x, y + 2)))
+            {
+                matched->set(idx(x, y), true);
+                matched->set(idx(x, y + 1), true);
+                matched->set(idx(x, y + 2), true);
+                found = true;
+            }
+            y++;
+        }
+        x++;
+    }
+    return found;
+}
+
+void processBoard()
+{
+    array<bool> matched = default;
+    matched.init(BOARD_W * BOARD_H);
+
+    while (findMatches(&matched))
+    {
+        // Clear matched gems and count them
+        int cleared = 0;
+        int i = 0;
+        while (i < BOARD_W * BOARD_H)
+        {
+            if (matched.get(i))
+            {
+                g_board.set(i, 0);
+                cleared++;
+            }
+            i++;
+        }
+        g_score += cleared * 10;
+
+        // Make gems fall
+        int x = 0;
+        while (x < BOARD_W)
+        {
+            int writeY = BOARD_H - 1;
+            int readY = BOARD_H - 1;
+            while (readY >= 0)
+            {
+                int type = g_board.get(idx(x, readY));
+                if (type != 0)
+                {
+                    g_board.set(idx(x, writeY), type);
+                    writeY--;
+                }
+                readY--;
+            }
+            // Fill top with new gems
+            while (writeY >= 0)
+            {
+                g_board.set(idx(x, writeY), g_rng.nextInt(1, GEM_TYPES));
+                writeY--;
+            }
+            x++;
+        }
+    }
+}
+
+void initBoard()
+{
+    int i = 0;
+    while (i < BOARD_W * BOARD_H) { g_board.set(i, 0); i++; }
+
+    int y = 0;
+    while (y < BOARD_H)
+    {
+        int x = 0;
+        while (x < BOARD_W)
+        {
+            int type;
+            do {
+                type = g_rng.nextInt(1, GEM_TYPES);
+                g_board.set(idx(x, y), type);
+            } while (hasMatchAt(x, y));
+            x++;
+        }
+        y++;
+    }
+    g_score = 0;
+}
+
+void swap(int x1, int y1, int x2, int y2)
+{
+    int t1 = g_board.get(idx(x1, y1));
+    int t2 = g_board.get(idx(x2, y2));
+    g_board.set(idx(x1, y1), t2);
+    g_board.set(idx(x2, y2), t1);
+}
+
+// -- Rendering --------------------------------------------------------------
+
+void fill(void* hdc, RECT* rc, u32 color)
+{
+    void* br = CreateSolidBrush(color);
+    FillRect(hdc, rc, br);
+    DeleteObject(br);
+}
+
+void drawGem(void* hdc, int x, int y, int type, bool selected)
+{
+    int px = x * CELL;
+    int py = HEADER_H + y * CELL;
+
+    if (selected)
+    {
+        RECT rc = default;
+        rc.left   = px;
+        rc.top    = py;
+        rc.right  = px + CELL;
+        rc.bottom = py + CELL;
+        fill(hdc, &rc, rgb(80, 80, 90));
+    }
+
+    void* br = CreateSolidBrush(getGemColor(type));
+    void* oldBr = SelectObject(hdc, br);
+    void* pen = CreatePen(PS_SOLID, 2, rgb(30, 30, 30));
+    void* oldPen = SelectObject(hdc, pen);
+
+    Ellipse(hdc, px + 8, py + 8, px + CELL - 8, py + CELL - 8);
+
+    SelectObject(hdc, oldBr);
+    SelectObject(hdc, oldPen);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+void paint(void* hwnd)
+{
+    PAINTSTRUCT ps = default;
+    void* hdc = BeginPaint(hwnd, &ps);
+
+    // Header
+    RECT hr = default;
+    hr.left   = 0;
+    hr.top    = 0;
+    hr.right  = BOARD_W * CELL;
+    hr.bottom = HEADER_H;
+    fill(hdc, &hr, rgb(40, 40, 45));
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, rgb(255, 255, 255));
+    char[64] buf = default;
+    wsprintfA(&buf[0], "Score: %d", g_score);
+    DrawTextA(hdc, &buf[0], -1, &hr, (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE));
+
+    // Board background
+    RECT br = default;
+    br.left   = 0;
+    br.top    = HEADER_H;
+    br.right  = BOARD_W * CELL;
+    br.bottom = HEADER_H + BOARD_H * CELL;
+    fill(hdc, &br, rgb(20, 20, 25));
+
+    // Gems
+    int y = 0;
+    while (y < BOARD_H)
+    {
+        int x = 0;
+        while (x < BOARD_W)
+        {
+            drawGem(hdc, x, y, g_board.get(idx(x, y)), (x == g_selX && y == g_selY));
+            x++;
+        }
+        y++;
+    }
+
+    EndPaint(hwnd, &ps);
+}
+
+// -- Window Proc ------------------------------------------------------------
+
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_PAINT)
+    {
+        paint(hwnd);
+        return (i64)0;
+    }
+
+    if (msg == WM_LBUTTONDOWN)
+    {
+        int mx = (int)(i16)(lParam & (i64)0xFFFF);
+        int my = (int)(i16)((lParam >> 16) & (i64)0xFFFF);
+
+        int x = mx / CELL;
+        int y = (my - HEADER_H) / CELL;
+
+        if (my >= HEADER_H && x >= 0 && x < BOARD_W && y >= 0 && y < BOARD_H)
+        {
+            if (g_selX == -1)
+            {
+                g_selX = x;
+                g_selY = y;
+            }
+            else
+            {
+                int dx = x - g_selX;
+                if (dx < 0) dx = -dx;
+                int dy = y - g_selY;
+                if (dy < 0) dy = -dy;
+
+                if ((dx == 1 && dy == 0) || (dx == 0 && dy == 1))
+                {
+                    // Try swap
+                    swap(g_selX, g_selY, x, y);
+                    if (hasMatchAt(g_selX, g_selY) || hasMatchAt(x, y))
+                    {
+                        processBoard();
+                    }
+                    else
+                    {
+                        // Invalid swap, swap back
+                        swap(g_selX, g_selY, x, y);
+                    }
+                    g_selX = -1;
+                    g_selY = -1;
+                }
+                else
+                {
+                    // New selection
+                    g_selX = x;
+                    g_selY = y;
+                }
+            }
+            InvalidateRect(hwnd, nullptr, 1);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_KEYDOWN)
+    {
+        if ((int)wParam == VK_F2)
+        {
+            initBoard();
+            InvalidateRect(hwnd, nullptr, 1);
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    g_rng.seedFromTime();
+    g_board.init(BOARD_W * BOARD_H);
+    initBoard();
+
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = "CFlatBejeweled";
+
+    RegisterClassExA(&wc);
+
+    RECT want = default;
+    want.left   = 0;
+    want.top    = 0;
+    want.right  = BOARD_W * CELL;
+    want.bottom = HEADER_H + BOARD_H * CELL;
+    AdjustWindowRect(&want, (u32)WS_OVERLAPPEDWINDOW, 0);
+
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatBejeweled",
+        "CFlat Bejeweled",
+        (u32)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX),
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        want.right - want.left,
+        want.bottom - want.top,
+        nullptr, nullptr, hInst, nullptr);
+
+    if (hwnd == nullptr) return 1;
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    return (int)msg.wParam;
+}

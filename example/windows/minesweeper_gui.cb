@@ -11,7 +11,6 @@
 //   example\customer\minesweeper-win32\app.exe
 import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
 import "random.cb";
-import "array.cb";
 
 // -- Board constants --------------------------------------------------------
 const int BOARD_W    = 9;
@@ -25,12 +24,10 @@ const int HEADER_H   = 44;    // status bar height in pixels
 //   g_state  - 0 = hidden, 1 = revealed, 2 = flagged
 //   g_mines  - 0 = safe,   1 = mine
 //   g_counts - neighbouring mine count (0-8)
-// NOTE: these are heap-backed `array<int>` containers, initialised in main().
-// Global *fixed-size* arrays (`int[N] g = default;`) miscompile today - see the
-// friction report - so we use the standard-library container instead.
-array<int> g_state  = default;
-array<int> g_mines  = default;
-array<int> g_counts = default;
+// Flat global fixed-size arrays sized by the board dimensions; zero-initialised.
+int[BOARD_W * BOARD_H] g_state  = default;
+int[BOARD_W * BOARD_H] g_mines  = default;
+int[BOARD_W * BOARD_H] g_counts = default;
 
 int    g_flagsLeft  = 0;
 int    g_revealed   = 0;
@@ -64,8 +61,8 @@ void placeMines(int safeCol, int safeRow)
         // Keep a 3x3 safe zone around the first click.
         if (c >= safeCol - 1 && c <= safeCol + 1 &&
             r >= safeRow - 1 && r <= safeRow + 1) continue;
-        if (g_mines.get(idx(c, r)) != 0) continue;
-        g_mines.set(idx(c, r), 1);
+        if (g_mines[idx(c, r)] != 0) continue;
+        g_mines[idx(c, r)] = 1;
         placed++;
     }
 
@@ -84,13 +81,13 @@ void placeMines(int safeCol, int safeRow)
                 {
                     if ((dr != 0 || dc != 0) &&
                         inBounds(col + dc, row + dr) &&
-                        g_mines.get(idx(col + dc, row + dr)) != 0)
+                        g_mines[idx(col + dc, row + dr)] != 0)
                         count++;
                     dc++;
                 }
                 dr++;
             }
-            g_counts.set(idx(col, row), count);
+            g_counts[idx(col, row)] = count;
             col++;
         }
         row++;
@@ -101,10 +98,10 @@ void placeMines(int safeCol, int safeRow)
 void floodReveal(int col, int row)
 {
     if (!inBounds(col, row)) return;
-    if (g_state.get(idx(col, row)) != 0) return;   // revealed or flagged
-    g_state.set(idx(col, row), 1);
+    if (g_state[idx(col, row)] != 0) return;   // revealed or flagged
+    g_state[idx(col, row)] = 1;
     g_revealed++;
-    if (g_counts.get(idx(col, row)) != 0) return;  // stop at numbered cells
+    if (g_counts[idx(col, row)] != 0) return;  // stop at numbered cells
     int dr = -1;
     while (dr <= 1)
     {
@@ -122,7 +119,7 @@ void floodReveal(int col, int row)
 void reveal(int col, int row)
 {
     if (!inBounds(col, row)) return;
-    if (g_state.get(idx(col, row)) != 0) return;   // flagged or revealed
+    if (g_state[idx(col, row)] != 0) return;   // flagged or revealed
 
     if (g_firstClick)
     {
@@ -130,9 +127,9 @@ void reveal(int col, int row)
         placeMines(col, row);
     }
 
-    if (g_mines.get(idx(col, row)) != 0)
+    if (g_mines[idx(col, row)] != 0)
     {
-        g_state.set(idx(col, row), 1);
+        g_state[idx(col, row)] = 1;
         g_gameOver = true;
         return;
     }
@@ -149,16 +146,16 @@ void reveal(int col, int row)
 void toggleFlag(int col, int row)
 {
     if (!inBounds(col, row)) return;
-    int s = g_state.get(idx(col, row));
+    int s = g_state[idx(col, row)];
     if (s == 1) return;   // revealed - cannot flag
     if (s == 2)
     {
-        g_state.set(idx(col, row), 0);
+        g_state[idx(col, row)] = 0;
         g_flagsLeft++;
     }
     else
     {
-        g_state.set(idx(col, row), 2);
+        g_state[idx(col, row)] = 2;
         g_flagsLeft--;
     }
 }
@@ -169,9 +166,9 @@ void resetGame()
     int i = 0;
     while (i < total)
     {
-        g_state.set(i, 0);
-        g_mines.set(i, 0);
-        g_counts.set(i, 0);
+        g_state[i] = 0;
+        g_mines[i] = 0;
+        g_counts[i] = 0;
         i++;
     }
     g_flagsLeft  = MINE_COUNT;
@@ -230,9 +227,9 @@ void drawCell(void* hdc, int col, int row)
     rc.right  = x + CELL;
     rc.bottom = y + CELL;
 
-    int s     = g_state.get(idx(col, row));
-    int mine  = g_mines.get(idx(col, row));
-    int count = g_counts.get(idx(col, row));
+    int s     = g_state[idx(col, row)];
+    int mine  = g_mines[idx(col, row)];
+    int count = g_counts[idx(col, row)];
 
     if (s == 1)
     {
@@ -378,9 +375,6 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 extern int main()
 {
     g_rng.seedFromTime();
-    g_state.init(BOARD_W * BOARD_H);
-    g_mines.init(BOARD_W * BOARD_H);
-    g_counts.init(BOARD_W * BOARD_H);
     resetGame();
 
     void* hInst = GetModuleHandleA(nullptr);

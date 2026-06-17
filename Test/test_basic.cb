@@ -1887,6 +1887,18 @@ int sumFixedBuf(i8* buf, int len)
 // must index to the element exactly like locals do.
 int[81] gFixedArr = default;
 int*[3] gPtrArr = default;
+// Global brace/positional initializer: lowered to an LLVM constant array.
+int[4] gInitArr = {10, 20, 30, 40};
+// Partial positional init: trailing slots zero-fill (matches local semantics).
+int[4] gPartialArr = {7, 8};
+// Empty brace on a primitive element: zero-init, equivalent to = default.
+int[3] gEmptyArr = {};
+// Global array sized by a named const / const-expr: the size must be folded at
+// compile time (a non-literal size used to leave the global malformed and crash).
+const int kGRows = 9;
+const int kGCols = 9;
+int[kGRows * kGCols] gConstExprArr = default;
+int[kGRows] gConstNameArr = default;
 
 bool testFixedArrays()
 {
@@ -1949,6 +1961,19 @@ bool testFixedArrays()
     gFixedArr[80] = 22;
     result &= Test("fixed_global_elem0", gFixedArr[0], 11);
     result &= Test("fixed_global_elemN", gFixedArr[80], 22);
+
+    // Global brace/positional initializer: read back the constant elements.
+    result &= Test("fixed_global_init0", gInitArr[0], 10);
+    result &= Test("fixed_global_init3", gInitArr[3], 40);
+    result &= Test("fixed_global_partial_set", gPartialArr[1], 8);
+    result &= Test("fixed_global_partial_zerofill", gPartialArr[3], 0);
+    result &= Test("fixed_global_empty_zero", gEmptyArr[0], 0);
+
+    // Global array sized by a named const / const-expr: full extent is usable.
+    gConstExprArr[80] = 5;   // index 80 only valid if size folded to 9*9 = 81
+    gConstNameArr[8]  = 6;   // index 8 only valid if size folded to 9
+    result &= Test("fixed_global_constexpr_size", gConstExprArr[80], 5);
+    result &= Test("fixed_global_constname_size", gConstNameArr[8], 6);
 
     // Global fixed array: variable-index write and a loop sum.
     int gi = 0;

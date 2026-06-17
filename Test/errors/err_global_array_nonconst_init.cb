@@ -1,0 +1,8 @@
+// Global fixed-size array brace initializers must be compile-time constants.
+// A non-constant element (here, a value read from another global) is rejected.
+
+int g_seed = 5;
+
+expect_error("global array initializer elements must be compile-time constants") {
+    int[3] g_arr = {1, g_seed, 3};
+}

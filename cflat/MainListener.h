@@ -4879,15 +4879,23 @@ public:
         llvm::Value* arraySize = nullptr;
         if (typeAndValue.ArraySize)
         {
-            arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
+            // A global array dimension can reference a `const` int or be a const-expr
+            // (int[BOARD_W*BOARD_H]); evaluating it the local way would emit a load into
+            // the program-init block and leave the size unfolded. EvalGlobalArrayDim folds
+            // it without leaking IR. Locals keep the live value (supports VLA-style sizing).
+            if (global_scope)
+                arraySize = EvalGlobalArrayDim(typeAndValue.ArraySize);
+            else
+                arraySize = ParseAssignmentExpression(typeAndValue.ArraySize);
         }
 
         // Evaluate inner dimensions for multi-dim arrays: T[N][M] -> ConstInnerDimensions = {M}
         typeAndValue.ConstInnerDimensions.clear();
         for (auto* dimExpr : typeAndValue.ExtraArrayDims)
         {
-            auto* dimVal = ParseAssignmentExpression(dimExpr);
-            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(dimVal))
+            auto* dimVal = global_scope ? EvalGlobalArrayDim(dimExpr)
+                                        : ParseAssignmentExpression(dimExpr);
+            if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(dimVal))
                 typeAndValue.ConstInnerDimensions.push_back(ci->getZExtValue());
             else
                 LogErrorContext(dimExpr, "array dimension must be a compile-time constant");
@@ -5075,13 +5083,24 @@ public:
                             if (fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
                             { positionalArray = true; break; }
 
+                    bool emptyArrInit = (arrInitList == nullptr || arrInitList->fieldInit().empty());
+
                     if (global_scope)
                     {
-                        LogErrorContext(initDecl, "array value-initializer '= {}' is not allowed at global scope");
+                        EmitGlobalFixedArrayInit(name, typeAndValue, arrInitList, positionalArray, direct, initDecl);
                     }
                     else if (positionalArray)
                     {
                         EmitPositionalFixedArrayInit(name, typeAndValue, arrInitList, arraySize, line, allocList);
+                    }
+                    else if (emptyArrInit && compiler->GetDataStructure(typeAndValue.TypeName).StructType == nullptr)
+                    {
+                        // Empty `{}` on a primitive/pointer element type is zero-init,
+                        // equivalent to `= default`. (Struct empty-{} still seeds below.)
+                        auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
+                        allocList.push_back(std::pair(name, arrAlloc));
+                        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
+                        compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
                     }
                     else
                     {
@@ -8936,6 +8955,213 @@ public:
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             compiler->CreateAssignment(val, elemPtr, false, elemTy);
         }
+    }
+
+    // Coerce a folded element constant to the array's element type so ConstantArray::get
+    // does not assert. Mirrors CreateGlobalVariable's int/fp-widen/null coercion.
+    static llvm::Constant* CoerceConstantToArrayElement(
+        LLVMBackend* compiler, llvm::Constant* c, llvm::Type* elemTy)
+    {
+        if (c->getType() == elemTy) return c;
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(c))
+        {
+            if (elemTy->isIntegerTy())
+                return llvm::ConstantInt::get(elemTy, ci->getZExtValue());
+            if (elemTy->isFloatingPointTy())
+                return llvm::ConstantFP::get(elemTy, (double)ci->getSExtValue());
+        }
+        else if (auto* cf = llvm::dyn_cast<llvm::ConstantFP>(c))
+        {
+            if (elemTy->isFloatingPointTy())
+            {
+                llvm::APFloat v = cf->getValueAPF();
+                bool lost = false;
+                v.convert(elemTy->getFltSemantics(), llvm::APFloat::rmNearestTiesToEven, &lost);
+                return llvm::ConstantFP::get(elemTy->getContext(), v);
+            }
+        }
+        else if (c->isNullValue())
+        {
+            return llvm::Constant::getNullValue(elemTy);
+        }
+        return nullptr;
+    }
+
+    // Global fixed-size array brace/positional initializer: T[N] g = {v0,...} / {}.
+    // Lowers to an LLVM constant array on the GlobalVariable (no runtime stores, which
+    // cannot run at global-init time). Positional elements must be compile-time constants.
+    void EmitGlobalFixedArrayInit(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        bool positionalArray,
+        CFlatParser::DirectDeclaratorContext* direct,
+        antlr4::ParserRuleContext* errCtx)
+    {
+        auto* compiler = Compiler(errCtx);
+        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
+        auto* elemTy = arrTy->getElementType();
+        uint64_t n = tv.ConstArraySize;
+
+        bool emptyInit = (initList == nullptr || initList->fieldInit().empty());
+        llvm::Constant* arrConst = nullptr;
+
+        if (emptyInit)
+        {
+            // Empty `{}` -> zero-init, same as `= default`.
+            arrConst = llvm::Constant::getNullValue(arrTy);
+        }
+        else if (positionalArray)
+        {
+            auto elements = initList->fieldInit();
+            if (elements.size() > n)
+            {
+                LogErrorContext(initList, std::format(
+                    "too many initializers for '{}[{}]': got {} elements", tv.TypeName, n, elements.size()));
+                return;
+            }
+
+            // Evaluate element expressions inside a throwaway function so stray IR does
+            // not corrupt the current insert block; each must fold to a constant.
+            auto savedState = compiler->SaveBuilderState();
+            auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+            auto* tmpFn = llvm::Function::Create(
+                voidTy, llvm::Function::PrivateLinkage, "__global_arr_init_tmp", compiler->module.get());
+            auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
+            compiler->builder->SetInsertPoint(tmpBB);
+
+            std::vector<llvm::Constant*> elems;
+            elems.reserve(n);
+            bool ok = true;
+            for (size_t i = 0; i < elements.size(); i++)
+            {
+                auto* fi = elements[i];
+                auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+                llvm::Value* val = LoadNamedVariable(nv);
+                auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
+                if (c) c = CoerceConstantToArrayElement(compiler, c, elemTy);
+                if (!c)
+                {
+                    LogErrorContext(fi, "global array initializer elements must be compile-time constants");
+                    ok = false;
+                    break;
+                }
+                elems.push_back(c);
+            }
+            // Zero-fill unspecified trailing slots, matching local positional-init.
+            for (size_t i = elements.size(); i < n; i++)
+                elems.push_back(llvm::Constant::getNullValue(elemTy));
+
+            tmpFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+
+            if (!ok) return;
+            arrConst = llvm::ConstantArray::get(arrTy, elems);
+        }
+        else
+        {
+            LogErrorContext(errCtx, std::format(
+                "global array initializer for '{}' must be positional '{{v0, v1, ...}}' or empty '{{}}'; struct field-init '{{field=v}}' at global scope is not supported",
+                tv.TypeName));
+            return;
+        }
+
+        compiler->CreateGlobalVariable(tv, arrConst);
+
+        // Register the global for LSP/--symbol, matching the scalar global path.
+        if (auto* s = compiler->GetSymbolSink())
+        {
+            int dl = (int)direct->getStart()->getLine();
+            int dc = (int)direct->getStart()->getCharPositionInLine();
+            s->RegisterVariable(name, tv.TypeName, compiler->GetSourceFilePath(), dl, dc);
+            s->Register(SymbolKind::Variable, name, compiler->GetSourceFilePath(), dl, dc,
+                        std::format("{}[{}] {}", tv.TypeName, n, name));
+        }
+    }
+
+    // Fold an evaluated size expression to a compile-time unsigned integer. Handles literals,
+    // loads of a global int with a constant initializer (cflat `const int N = ...`), integer
+    // arithmetic (W*H etc.), and integer width casts. Returns false if it is not foldable.
+    static bool TryFoldConstInt(llvm::Value* v, uint64_t& out)
+    {
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v))
+        {
+            out = ci->getZExtValue();
+            return true;
+        }
+        if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(v))
+        {
+            if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(ld->getPointerOperand()))
+                if (gv->hasInitializer())
+                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(gv->getInitializer()))
+                    {
+                        out = ci->getZExtValue();
+                        return true;
+                    }
+            return false;
+        }
+        if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(v))
+        {
+            uint64_t l = 0, r = 0;
+            if (!TryFoldConstInt(bo->getOperand(0), l) || !TryFoldConstInt(bo->getOperand(1), r))
+                return false;
+            switch (bo->getOpcode())
+            {
+                case llvm::Instruction::Add:  out = l + r; return true;
+                case llvm::Instruction::Sub:  out = l - r; return true;
+                case llvm::Instruction::Mul:  out = l * r; return true;
+                case llvm::Instruction::SDiv:
+                case llvm::Instruction::UDiv: if (r == 0) return false; out = l / r; return true;
+                case llvm::Instruction::SRem:
+                case llvm::Instruction::URem: if (r == 0) return false; out = l % r; return true;
+                case llvm::Instruction::Shl:  out = l << r; return true;
+                case llvm::Instruction::LShr:
+                case llvm::Instruction::AShr: out = l >> r; return true;
+                case llvm::Instruction::And:  out = l & r; return true;
+                case llvm::Instruction::Or:   out = l | r; return true;
+                case llvm::Instruction::Xor:  out = l ^ r; return true;
+                default: return false;
+            }
+        }
+        if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v))
+        {
+            if (cast->getOpcode() == llvm::Instruction::Trunc ||
+                cast->getOpcode() == llvm::Instruction::ZExt ||
+                cast->getOpcode() == llvm::Instruction::SExt)
+                return TryFoldConstInt(cast->getOperand(0), out);
+            return false;
+        }
+        return false;
+    }
+
+    // Resolve a GLOBAL array dimension to a compile-time constant. The size IR is built inside
+    // a throwaway function so its loads/arithmetic never leak into the program-init block, then
+    // folded. On a non-constant size, logs an error and returns 1 as an error-recovery extent
+    // (LogError does not abort, so the dimension must stay well-formed to avoid a later crash).
+    llvm::ConstantInt* EvalGlobalArrayDim(CFlatParser::AssignmentExpressionContext* expr)
+    {
+        auto* compiler = Compiler(expr);
+        auto savedState = compiler->SaveBuilderState();
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* tmpFn = llvm::Function::Create(
+            voidTy, llvm::Function::PrivateLinkage, "__global_arr_dim_tmp", compiler->module.get());
+        auto* tmpBB = llvm::BasicBlock::Create(*compiler->context, "entry", tmpFn);
+        compiler->builder->SetInsertPoint(tmpBB);
+
+        llvm::Value* sizeVal = ParseAssignmentExpression(expr);
+        uint64_t folded = 0;
+        bool ok = sizeVal && TryFoldConstInt(sizeVal, folded);
+
+        tmpFn->eraseFromParent();
+        compiler->RestoreBuilderState(savedState);
+
+        auto* i64Ty = llvm::Type::getInt64Ty(*compiler->context);
+        if (!ok)
+        {
+            LogErrorContext(expr, "global array size must be a compile-time constant");
+            return llvm::ConstantInt::get(i64Ty, 1);
+        }
+        return llvm::ConstantInt::get(i64Ty, folded);
     }
 
     // Length-inferred array-view initializer: T[] x = {v0, v1, ...}.

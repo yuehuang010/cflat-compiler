@@ -6,9 +6,10 @@
 // are `Stmt*`, each tagged by a `kind` field and dispatched by a recursive evaluator.
 // The variable environment is a dictionary<string, double>.
 //
-// (An earlier design used interfaces with VTable dispatch - one IExpr per node kind -
-//  but returning an interface value from a parse function currently miscompiles, so
-//  this version uses tagged-union nodes instead. See the Friction Report.)
+// This version uses tagged-union nodes (a `kind` field + a recursive evaluator) rather
+// than one IExpr interface per node kind. An interface/VTable-dispatch design also works
+// now - the earlier interface-return miscompile was fixed 2026-06-13 - so the tagged-union
+// here is just a style choice, not a workaround.
 //
 // The little language it runs:
 //   x = 2 + 3 * 4;          // assignment, correct precedence -> 14
