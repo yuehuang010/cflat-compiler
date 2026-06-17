@@ -35,7 +35,9 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Read the element at index (borrow - caller does not receive ownership).
-    T get(int index)
+    // `alias`: the element stays owned by the list, so the returned value must not
+    // be freed by the caller. Use `.copy()` to take an independent owned copy.
+    alias T get(int index)
     {
         return _data[index];
     }
@@ -212,8 +214,8 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             _qsort(0, _size - 1, compare);
     }
 
-    // l[index] - same semantics as get(index).
-    T operator[](int index)
+    // l[index] - same semantics as get(index) (alias borrow, see get).
+    alias T operator[](int index)
     {
         return _data[index];
     }

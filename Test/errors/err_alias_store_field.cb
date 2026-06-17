@@ -1,0 +1,21 @@
+// Storing an `alias` (borrow) value into a struct field. list.get is declared
+// `alias`, so its result borrows the list's buffer. Storing it into a field whose
+// always-run destructor would later free that buffer is a double-free. The store
+// site rejects it with the precise 'alias' message (not the generic 'use move'
+// reject, since you cannot move out of a borrow). Steer is '.copy()'.
+import "string.cb";
+import "list.cb";
+
+struct Token  { string text = default; };
+struct Holder { Token tok = default; };
+
+void stash(list<Token> toks, Holder h)
+{
+    expect_error("cannot store an 'alias' value");
+    h.tok = toks.get(0);               // alias borrow stored into an owning field
+}
+
+extern int main()
+{
+    return 0;
+}

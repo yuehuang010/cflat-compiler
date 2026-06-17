@@ -39,6 +39,7 @@
   - [Switch on Interface Type](#switch-on-interface-type)
 - [Ownership / Lifetime (`move`)](#ownership--lifetime-move-keyword)
   - [`move` Return Type](#move-return-type)
+  - [`alias` Return Type (borrow)](#alias-return-type-borrow)
   - [`bond` Lifetime Keyword](#bond-lifetime-keyword)
 - [Namespaces & Modules](#namespaces--modules)
   - [Namespaces](#namespaces)
@@ -1013,6 +1014,49 @@ move Widget* leak(Widget* w)
 
 - **Local variable propagation**: assigning the result of a `move T*` call to a local variable transfers ownership - the local is freed at scope exit just like a `new`-allocated pointer.
 - **Forwarding**: a `move T*` function can return a `move` parameter directly; the cleanup that would normally run at scope exit is suppressed so the resource isn't freed prematurely.
+
+### `alias` Return Type (borrow)
+
+`alias` is the dual of `move`. For an **owning struct value type** (a struct with a destructor, e.g. one holding a `string` field), there are three return forms:
+
+| Return form | Meaning | Caller frees? |
+|---|---|---|
+| `move T` | by value, ownership transferred out | yes |
+| `T` | by value, **owning** (default) | yes |
+| `alias T` | by value, **borrow** - the source still owns the storage | **no** |
+
+A plain by-value return is owning by default - the caller receives a value it must (and does) free. Use `alias` when the returned value only *borrows* storage that something else keeps owning, such as a collection accessor that hands back an element the collection still holds:
+
+```c
+struct list<T>
+{
+    // The element stays owned by the list, so the returned value must not be
+    // freed by the caller. `alias` says so; the caller may read it, and uses
+    // `.copy()` to take an independent owned copy.
+    alias T get(int index) { return _data[index]; }
+}
+```
+
+`alias` returns a **value**, not a pointer, so it does not reintroduce a dangling reference by itself. It only says "this value does not own its interior buffers." This lets an accessor stay cheap (no per-read copy) while keeping ownership honest.
+
+**What the compiler does with an `alias` result:**
+
+- **Unbound temp read** (`toks.get(0).text.length()`) - the borrow is read and never freed; the collection frees its element once. (A plain owning return in the same position is instead destructed at end-of-statement, so neither leaks nor double-frees.)
+- **Bound to a local** (`Token t = toks.get(0);`) - `t` is marked a borrow; its scope-exit destructor is suppressed so it does not double-free the collection's buffer.
+- **Escapes are compile errors.** An `alias` value cannot outlive its source, so the following are rejected (the fix is `.copy()`, which takes an independent owned value, or declaring the function itself `alias` to pass the borrow through):
+
+```c
+struct Holder { Token tok = default; };
+
+Token first(list<Token> toks)   { return toks.get(0); }   // error: returning an 'alias' value
+void  stash(list<Token> toks, Holder h) { h.tok = toks.get(0); }   // error: storing an 'alias' value into a field
+```
+
+**Notes:**
+
+- `alias` is a soft keyword detected by text matching, not an ANTLR token - identifiers named `alias` still work.
+- `alias` applies to **owning struct value types**. `string` (and closures) are excluded: they carry a runtime owned bit that already clears on a borrow return, so `return someList.get(i)` for a `string` is safe without `alias`.
+- The discriminator for choosing `alias`: tag it when the source **still owns** the element after the call (a peek, like `list.get`). If the call **consumes/releases** the element (the source no longer owns it, like `channel.receive`/`pop` whose producer side is `push(move T)`), leave it owning.
 
 ### `bond` Lifetime Keyword
 

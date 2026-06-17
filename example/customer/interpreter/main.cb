@@ -274,7 +274,7 @@ class Parser
 
     void init(list<Token>* t) { toks = t; pos = 0; }
 
-    Token cur()           { return toks->get(pos); }
+    alias Token cur()     { return toks->get(pos); }   // borrow: peeks the current token, list still owns it
     int   curKind()       { return toks->get(pos).kind; }
     void  advance()       { pos = pos + 1; }
     bool  check(int kind) { return curKind() == kind; }

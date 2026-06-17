@@ -2805,6 +2805,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     o["ps"] = std::move(ps);
     if (s.Variadic)     o["va"] = true;
     if (s.ReturnsOwned) o["ro"] = true;
+    if (s.ReturnsAlias) o["ra"] = true;
     if (s.IsMethod)     o["m"]  = true;
     if (!s.RequiredLocks.empty())
     {
@@ -3302,6 +3303,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                     if (auto* po = pe.getAsObject()) sym.Parameters.push_back(DeserializeTav(*po));
             if (auto v = fo->getBoolean("va")) sym.Variadic = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
+            if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("m"))  sym.IsMethod = *v;
             if (auto* rl = fo->getArray("rl"))
                 for (auto& le : *rl)

@@ -88,6 +88,10 @@ struct Greeter
 // (`list.get`) returns a shallow ALIAS, so its temp must NOT be destructed (a double-free aborts).
 struct TempTok { string text = default; string extra = default; };
 move TempTok makeTempTok(int n) { TempTok t = default; t.text = "tok" + n.toString(); t.extra = "ex" + n.toString(); return t; }
+// PLAIN (non-move) owning return: builds a fresh owned local and transfers it out by value. An
+// unbound transient field read (`makePlainTok(3).text.length()`) used to LEAK - the temp owned
+// the buffer but, unbound, was never destructed. It is now dropped at end-of-statement (no leak).
+TempTok makePlainTok(int n) { TempTok t = default; t.text = "tok" + n.toString(); t.extra = "ex" + n.toString(); return t; }
 // Destination for the implied-move cases: a `move`-temp's owning field transfers into this slot.
 struct TokHolder { string slot = default; };
 // Phase B: returning a `move`-temp's owning field moves it out (ownership escapes to the caller).
@@ -440,6 +444,10 @@ extern int main()
         // A `move`-return temp read transiently is fully destructed at end of statement: both
         // text and extra are freed (no leak). The reject guards against persisting the field.
         total++; passed += Test("move-temp field read", makeTempTok(7).text.length(), 4);   // "tok7"
+
+        // A PLAIN (non-move) owning return read transiently is also fully destructed at end of
+        // statement (regression: this unbound temp used to leak its text+extra buffers).
+        total++; passed += Test("plain-temp field read", makePlainTok(8).text.length(), 4);   // "tok8"
 
         // list.get(i) returns a shallow ALIAS of the element, so the temp is NOT destructed - the
         // element survives (frees once with the list, no double-free). Read it, and copy it out.

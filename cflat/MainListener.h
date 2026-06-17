@@ -517,6 +517,11 @@ private:
                         declType.IsMove = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
+                    if (typeSpec->getText() == "alias")
+                    {
+                        declType.IsAlias = true;
+                        continue;  // not a type; look for the actual type in next specifier
+                    }
                     if (typeSpec->getText() == "bond")
                     {
                         declType.IsBond = true;
@@ -1776,6 +1781,11 @@ private:
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
+                    continue;  // not a type; look for the actual type in next specifier
+                }
+                if (typeSpec->getText() == "alias")
+                {
+                    declType.IsAlias = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
                 if (typeSpec->getText() == "bond")
@@ -3447,6 +3457,24 @@ public:
                             }
                         }
 
+                        // Returning a whole `alias` (borrow) value from a non-`alias` function hands
+                        // the caller a value whose always-run destructor frees a buffer the real owner
+                        // still holds. Allowed only when the function itself is declared `alias` (the
+                        // borrow passes through). `.copy()` makes an independent owned value. `string`
+                        // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
+                        // already clears on a borrow return (the string-redesign borrow path), so the
+                        // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
+                        if ((returnNV.TypeAndValue.IsAlias || returnNV.IsAliasBorrow)
+                            && returnNV.TypeAndValue.TypeName != "string"
+                            && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
+                            && !compiler->currentFunctionReturnTV.IsAlias)
+                        {
+                            LogErrorContext(jump, std::format(
+                                "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
+                                "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
+                                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
+                        }
+
                         // Clear flags consumed by the return check.
                         compiler->lastOwningResult = false;
                         compiler->lastCallReturnsOwned = false;
@@ -5054,6 +5082,10 @@ public:
                 // owns, so storing it into another field would double-free - tracked so the
                 // field-store reject can catch the laundered field-to-field copy.
                 bool srcBorrowsOwnedString = false;
+                // True when the initializer is an `alias` (borrow) return (`Token t = toks.get(0)`).
+                // The local shallow-aliases storage it does not own, so its scope-exit destructor
+                // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
+                bool srcIsAlias = false;
                 // Implied move of a `move`-temp's owning field (`string s = makeToken().text`): the temp
                 // owns the field, so the local adopts it and the source field in the temp is zeroed.
                 bool srcMovableTempField = false;
@@ -5305,6 +5337,9 @@ public:
                                 srcStorage = rightNV.Storage;
                                 srcBaseType = rightNV.BaseType;
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
+                                // Alias if the RHS is an `alias` call result OR a read of an
+                                // alias-borrow local (chained `Token t2 = t1;`) - both borrow.
+                                srcIsAlias = rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow;
                                 srcCallerName = rightNV.CallerName;
                                 // Taint a string local initialized from an owning string FIELD
                                 // (`string t = b.name`) or from another already-tainted borrow
@@ -5590,6 +5625,7 @@ public:
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
                                 || llvm::isa<llvm::GlobalVariable>(srcStorage))
                             && !srcIsMove
+                            && !srcIsAlias
                             && !srcCallerName.empty()
                             && srcInferredTypeName == typeAndValue.TypeName
                             && compiler->IsOwningValueType(typeAndValue.TypeName))
@@ -5648,6 +5684,22 @@ public:
                         // (covers a lambda literal RHS, a clone, or a call result uniformly).
                         if (typeAndValue.TypeName == "__closure_fat_ptr")
                             compiler->UnregisterOwnedClosureTemp(right);
+
+                        // `alias` (borrow) initializer: the local shallow-aliases storage the source
+                        // still owns. Suppress its scope-exit destructor so it does not double-free,
+                        // and leave it non-owning. A persist of this local is rejected at the store
+                        // sites (see the FromOwningTempField / IsAliasBorrow escape checks). Excludes
+                        // `string`/`__closure_fat_ptr` - their runtime owned bit already makes a borrow
+                        // local's destructor a no-op, so the `alias` machinery is for owning STRUCTS.
+                        if (srcIsAlias && compiler->IsOwningValueType(typeAndValue.TypeName)
+                            && typeAndValue.TypeName != "string"
+                            && typeAndValue.TypeName != "__closure_fat_ptr")
+                        {
+                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            nv.IsAliasBorrow = true;
+                            nv.IsOwningString = false;
+                            nv.IsOwning = false;
+                        }
 
                         // Apply field initializer overrides after the default value is stored.
                         // A brace list targeting a generic container (list/array/dictionary) is
@@ -6320,6 +6372,24 @@ public:
                 // The destination now owns this closure env, so drop the stored value from the
                 // owned-closure temp-flush list to avoid a double-free (no-op for a clone result).
                 compiler->UnregisterOwnedClosureTemp(right);
+                return right;
+            }
+
+            // Storing a whole `alias` (borrow) value into a struct field: the field's always-run
+            // destructor would free a buffer the real owner still holds (double-free). Caught here
+            // (with the precise message) ahead of the generic owning-value reject below, which would
+            // wrongly suggest 'move' - you cannot move out of a borrow. Use '.copy()'. Excludes
+            // `string`/`__closure_fat_ptr` - they carry a runtime owned bit (the string-redesign
+            // borrow path); the `alias` machinery is only for owning STRUCTS with no runtime bit.
+            if (operatorText == "=" && right && destIsStructField
+                && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
+                && rightNV.TypeAndValue.TypeName != "string"
+                && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr")
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
+                    "and would dangle. Use '.copy()' for an independent owned copy.",
+                    rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName));
                 return right;
             }
 
@@ -10762,16 +10832,18 @@ public:
                                         namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
 
                                         // Field of a by-value owning-struct temp (`makeToken().text`): tag it (persisting
-                                        // double-frees), and destruct the temp only for a `move` return, not a `get()` alias.
+                                        // double-frees), and destruct the temp when it OWNS the buffer (a `move` or plain
+                                        // owning return) but NOT for an `alias` borrow (`get()`), which would double-free.
                                         const std::string& parentType = structVar.TypeAndValue.TypeName;
                                         bool parentIsOwningTemp = !dataStructure.IsUnion
                                             && !parentType.empty()
                                             && parentType != "string"
                                             && parentType != "__closure_fat_ptr"
                                             && Compiler(ctx)->IsOwningValueType(parentType);
-                                        bool parentIsMoveOwned = parentIsOwningTemp
-                                            && structVar.TypeAndValue.IsMove;
-                                        if (parentIsMoveOwned && !structVar.FromOwningTempField)
+                                        // Owns the temp's buffer unless it is an `alias` (borrow) return.
+                                        bool parentOwnsTemp = parentIsOwningTemp
+                                            && !structVar.TypeAndValue.IsAlias;
+                                        if (parentOwnsTemp && !structVar.FromOwningTempField)
                                         {
                                             auto* tempAlloca = Compiler(ctx)->AllocaAtEntry(structVar.BaseType, nullptr, "owntemp");
                                             Compiler(ctx)->builder->CreateStore(structVar.Primary, tempAlloca);

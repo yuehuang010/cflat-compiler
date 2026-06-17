@@ -1,0 +1,20 @@
+// Returning an `alias` (borrow) value from a non-`alias` function. list.get is
+// declared `alias` - the element stays owned by the list, so the returned value
+// borrows the list's buffer. Handing it back from a plain (non-alias) function
+// would give the caller a value whose always-run destructor frees a buffer the
+// list still owns (double-free). Steer is 'alias' on the function, or '.copy()'.
+import "string.cb";
+import "list.cb";
+
+struct Token { string text = default; };
+
+Token firstToken(list<Token> toks)
+{
+    expect_error("cannot return an 'alias' value");
+    return toks.get(0);                // alias borrow escaping via a non-alias return
+}
+
+extern int main()
+{
+    return 0;
+}

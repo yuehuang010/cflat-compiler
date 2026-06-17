@@ -321,6 +321,7 @@ public:
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
+        bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
         bool IsStdcall = false;  // function declared with 'stdcall' - uses __stdcall calling convention on Win32
         bool IsCdecl = false;   // function declared with 'cdecl'   - explicit C calling convention (default; recognized for clarity)
@@ -548,6 +549,7 @@ public:
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
+        bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         llvm::Value* RefCountStorage = nullptr; // lazy i32 alloca at function entry; non-null only when pointer escaped to a field
         std::string CallerName;          // the variable's name at the call site, for move tracking
@@ -712,6 +714,7 @@ public:
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
+        bool ReturnsAlias = false; // true when the function returns an 'alias' by-value borrow - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
@@ -1457,7 +1460,7 @@ private:
                 // Legacy IsOwningString skipped genuinely-owned strings the compiler couldn't prove owned, leaking their buffer.
                 if (namedVar.TypeAndValue.TypeName == "string")
                 {
-                    if (namedVar.BorrowsOwnedString) continue;
+                    if (namedVar.BorrowsOwnedString || namedVar.IsAliasBorrow) continue;
                     EnsureStringDtorRegistered();
                     if (it->second.Destructor == nullptr) continue;
                     auto* fn = it->second.Destructor;
@@ -1465,6 +1468,8 @@ private:
                     continue;
                 }
                 // Non-string struct local: run the full destructor (user dtor + members).
+                // Skip an `alias`-bound local - it borrows storage it does not own (double-free).
+                if (namedVar.IsAliasBorrow) continue;
                 // Skip the struct value being moved out via `return` - the caller now owns it.
                 if (namedVar.Storage == returnedStructDtorSkipAlloca) continue;
                 if (auto* fn = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
@@ -7794,6 +7799,7 @@ public:
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
                 .ReturnsOwned = returnsOwned,
+                .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
                 .Recipe = recipe,
             };
@@ -8015,6 +8021,7 @@ public:
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
                 .ReturnsOwned = returnsOwned,
+                .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
             };
 
@@ -9104,6 +9111,7 @@ public:
 
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
+        lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
         lastCallReturnsOwned = candidate.ReturnsOwned;
 
         // Populate lock-check side-channels for call-site RequiredLocks verification.
@@ -10321,6 +10329,7 @@ public:
                     sym.UniqueName  = newMangledName;
                     sym.ReturnType  = newReturnType;
                     sym.ReturnsOwned = returnsOwned;
+                    sym.ReturnsAlias = newReturnType.IsAlias; // 'alias' return: caller must not free the interior
                     sym.IsMethod    = isMethod;
                     sym.Parameters  = arguments;
                     sym.Variadic    = varargs;
