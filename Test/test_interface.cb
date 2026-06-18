@@ -54,6 +54,25 @@ class FileStream : IReader, IWriter
     void write(string text) { }
 };
 
+// Destructor side-effect counter for delete-through-interface (Test 15).
+int gDelIfaceDtorCount = 0;
+
+interface ICounted { int value(); };
+
+class Counted : ICounted
+{
+    int v = 0;
+    int value() { return v; }
+    ~Counted() { gDelIfaceDtorCount = gDelIfaceDtorCount + 1; }
+};
+
+ICounted makeCounted()
+{
+    Counted* c = new Counted();
+    c->v = 7;
+    return c;
+}
+
 // ── Test 1: VTable dispatch ──────────────────────────────────────────────────
 // Interface method calls route to the correct concrete implementation.
 
@@ -530,6 +549,32 @@ bool testChannelInterface()
     return a0 == 75 && a1 == 16;
 }
 
+// ── Test 15: delete through an interface fat pointer ─────────────────────────
+// 'delete <interfaceValue>' must virtually destruct the concrete object EXACTLY
+// once and free it once - for both a same-scope boxed local (which must transfer
+// ownership away from the source so it does not also free) and a factory-returned
+// interface. The destructor counter proves single destruction per delete.
+bool testDeleteThroughInterface()
+{
+    gDelIfaceDtorCount = 0;
+
+    // Same-scope boxed local: 'ICounted e = c;' transfers ownership of 'c' into 'e'.
+    Counted* c = new Counted();
+    c->v = 3;
+    ICounted e = c;
+    int got1 = e.value();
+    delete e;                       // exactly one destruction, one free
+    bool boxedOk = (got1 == 3) && (gDelIfaceDtorCount == 1);
+
+    // Factory-returned interface value.
+    ICounted f = makeCounted();
+    int got2 = f.value();
+    delete f;                       // second destruction
+    bool factoryOk = (got2 == 7) && (gDelIfaceDtorCount == 2);
+
+    return boxedOk && factoryOk;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -549,6 +594,7 @@ extern int main()
     total++; passed += testListInterfaceForeach() ? 1 : 0;
     total++; passed += testListInterfaceSort()   ? 1 : 0;
     total++; passed += testChannelInterface()    ? 1 : 0;
+    total++; passed += testDeleteThroughInterface() ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

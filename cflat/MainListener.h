@@ -5316,6 +5316,21 @@ public:
                                         }
                                     }
                                     right = compiler->BuildInterfaceFatValue(vtable, dataPtr);
+                                    // Transfer ownership of an owning RHS pointer local into the
+                                    // interface box: null the source and mark it moved so its
+                                    // scope-exit cleanup won't double-free the object that
+                                    // 'delete <iface>' now owns. Mirrors the assignment path.
+                                    if (rightNV.IsOwning && rightNV.TypeAndValue.Pointer
+                                        && rightNV.Storage != nullptr)
+                                    {
+                                        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(rightNV.BaseType))
+                                        {
+                                            compiler->builder->CreateStore(
+                                                llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
+                                            if (!rightNV.CallerName.empty())
+                                                compiler->MarkVariableMoved(rightNV.CallerName);
+                                        }
+                                    }
                                 }
                                 else if (typeAndValue.TypeName == "string" &&
                                          right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -9751,6 +9766,7 @@ public:
         // AST-level type information from the unary expression instead.
         std::string typeName;
         bool elemIsPtr = false;         // true when deleting array of pointers (e.g. list<T*> buffer)
+        bool isInterfaceOperand = false; // true when the operand is an interface fat-ptr value
         llvm::Value* ptrVal = nullptr;
         llvm::Value* srcAlloca = nullptr;
         llvm::Type* srcAllocaElemType = nullptr;
@@ -9788,6 +9804,10 @@ public:
             auto namedVar = ParseUnaryExpression(ue);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
+            // An interface value is a {vtable, data} fat struct, not a raw pointer; flag it so
+            // the free path below extracts the data pointer and dispatches the dtor virtually.
+            isInterfaceOperand = namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsInterfacePointer && !sawCast;
             // A cast target renames the element type; honor it for destructor selection.
             if (sawCast)
             {
@@ -9871,6 +9891,16 @@ public:
             ptrVal = ParseExpression(ctx->expression());
         }
         if (!ptrVal) return {};
+
+        // Interface fat-pointer operand: ptrVal is a {vtable, data} struct value. Extract the
+        // data pointer, run the concrete destructor via the vtable, and free - a plain bitcast
+        // of the fat struct to a raw pointer is invalid. srcAlloca (the local's storage) gets its
+        // data field nulled so scope-exit / a second delete cannot double-free.
+        if (isInterfaceOperand && !isArray)
+        {
+            compiler->DeleteInterfaceValue(ptrVal, typeName, srcAlloca);
+            return {};
+        }
 
         // Reject destructive delete of a raw 'string' local: string has no runtime ownership flag
         // so slots may hold borrowed text. srcAlloca gate leaves container internals (list/array) unaffected.

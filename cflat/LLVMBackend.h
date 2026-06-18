@@ -5292,6 +5292,13 @@ public:
             }
         }
 
+        // Trailing slot: full concrete destructor (or null) for delete-through-interface.
+        // Layout is [typedesc, method0..N-1, fullDtor]; method indices stay unchanged.
+        if (auto* dtor = GetOrCreateFullDestructor(structName))
+            entries.push_back(llvm::ConstantExpr::getBitCast(dtor, ptrTy));
+        else
+            entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
+
         auto arrTy = llvm::ArrayType::get(ptrTy, entries.size());
         auto vtableConst = llvm::ConstantArray::get(arrTy, entries);
         auto vtableGlobal = new llvm::GlobalVariable(
@@ -5375,6 +5382,13 @@ public:
             }
         }
 
+        // Trailing slot: full concrete destructor (or null) for delete-through-interface.
+        // Layout is [typedesc, method0..N-1, fullDtor]; method indices stay unchanged.
+        if (auto* dtor = GetOrCreateFullDestructor(structName))
+            entries.push_back(llvm::ConstantExpr::getBitCast(dtor, ptrTy));
+        else
+            entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
+
         auto arrTy = llvm::ArrayType::get(ptrTy, entries.size());
         auto vtableConst = llvm::ConstantArray::get(arrTy, entries);
         auto vtableGlobal = new llvm::GlobalVariable(
@@ -5398,6 +5412,60 @@ public:
         v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
         v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
         return v;
+    }
+
+    // delete through an interface fat pointer: the operand is a {vtable, data} struct, not a
+    // raw pointer. Extract the data pointer, run the concrete destructor via the vtable's
+    // trailing dtor slot (index 1 + methodCount, runtime null-guarded), then free with
+    // operator delete. A null data pointer (already deleted) makes the whole thing a no-op.
+    // When fatStorage is non-null its data field is nulled so a second delete is also a no-op.
+    void DeleteInterfaceValue(llvm::Value* fatVal, const std::string& ifaceName, llvm::Value* fatStorage)
+    {
+        auto fatTy = GetFatPtrType();
+        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+
+        llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
+        llvm::Value* dataPtr   = builder->CreateExtractValue(fatVal, { 1u }, "iface_data");
+
+        size_t methodCount = 0;
+        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
+            methodCount = it->second.size();
+
+        auto* nullPtr   = llvm::ConstantPointerNull::get(ptrTy);
+        auto* dataIsNull = builder->CreateICmpEQ(dataPtr, nullPtr, "iface_data_isnull");
+        auto* liveBB  = CreateBasicBlock("iface_del_live");
+        auto* afterBB = CreateBasicBlock("iface_del_after");
+        builder->CreateCondBr(dataIsNull, afterBB, liveBB);
+
+        // Live: dispatch the destructor through the vtable, guarding a null slot.
+        builder->SetInsertPoint(liveBB);
+        auto* dtorSlot = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32((int)(1 + methodCount)), "iface_dtor_slot");
+        auto* dtorFn   = builder->CreateLoad(ptrTy, dtorSlot, "iface_dtor");
+        auto* dtorIsNull = builder->CreateICmpEQ(dtorFn, nullPtr, "iface_dtor_isnull");
+        auto* callBB = CreateBasicBlock("iface_del_dtor");
+        auto* freeBB = CreateBasicBlock("iface_del_free");
+        builder->CreateCondBr(dtorIsNull, freeBB, callBB);
+
+        builder->SetInsertPoint(callBB);
+        auto* dtorTy = llvm::FunctionType::get(builder->getVoidTy(), { ptrTy }, false);
+        builder->CreateCall(dtorTy, dtorFn, { dataPtr });
+        builder->CreateBr(freeBB);
+
+        builder->SetInsertPoint(freeBB);
+        NamedVariable ptrArg;
+        ptrArg.Primary  = dataPtr;
+        ptrArg.BaseType = ptrTy;
+        if (GetFunction("operator delete"))
+            CreateOverloadedFunctionCall("operator delete", { ptrArg });
+        builder->CreateBr(afterBB);
+
+        builder->SetInsertPoint(afterBB);
+        // Null the operand's data field so a second delete sees a null pointer and no-ops.
+        if (fatStorage != nullptr)
+        {
+            auto* dataField = builder->CreateStructGEP(fatTy, fatStorage, 1);
+            builder->CreateStore(nullPtr, dataField);
+        }
     }
 
     // Returns true if the given constant is a pooled string literal (length known at compile time).
