@@ -2157,6 +2157,47 @@ private:
         return builder->CreateInsertValue(value, masked, { 1 }, "borrow.str");
     }
 
+    // Recursively clear the runtime OWNED bit on every owning value-type field of a struct SSA
+    // value, turning the value into a BORROW. Used when an accessor returns a struct taken from a
+    // collection it still owns (e.g. list.get's `alias T get` returning `_data[i]`): the caller
+    // gets a shallow copy whose always-run full destructor would otherwise free buffers the
+    // container still holds. The `alias` compile-time machinery suppresses the destructor at the
+    // immediate binding site, but a copy that escapes that tracking (e.g. a for-in loop variable)
+    // is still destructed - clearing the runtime bit makes that destructor a safe no-op, mirroring
+    // what ClearStringOwnedBit already does for a scalar string borrow return. Pointer/view/simd/
+    // bitfield/fixed-array fields carry no value-level owned bit and are left untouched (matches the
+    // destructor and memberwise-copy field selection).
+    llvm::Value* ClearStructOwnedBits(llvm::Value* value, const std::string& typeName)
+    {
+        if (value == nullptr || typeName.empty()) return value;
+        auto dsIt = dataStructures.find(typeName);
+        if (dsIt == dataStructures.end()) return value;
+        auto* structTy = dsIt->second.StructType;
+        if (structTy == nullptr || value->getType() != structTy) return value;
+
+        for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
+        {
+            const auto& f = dsIt->second.StructFields[i];
+            if (f.Pointer || f.ElemPointer || f.IsArrayView || f.IsSimd || f.IsBitfield)
+                continue;
+            if (f.ConstArraySize > 0)
+                continue;
+            if (f.TypeName == "string")
+            {
+                auto* len    = builder->CreateExtractValue(value, { i, 1u }, "fborrow.len");
+                auto* masked = builder->CreateAnd(len, builder->getInt32(0x7FFFFFFF), "fborrow.noown");
+                value = builder->CreateInsertValue(value, masked, { i, 1u }, "fborrow.str");
+            }
+            else if (IsOwningValueType(f.TypeName))
+            {
+                auto* sub = builder->CreateExtractValue(value, { i }, "fborrow.sub");
+                sub = ClearStructOwnedBits(sub, f.TypeName);
+                value = builder->CreateInsertValue(value, sub, { i }, "fborrow.subset");
+            }
+        }
+        return value;
+    }
+
     llvm::Function* GetOrCreateFullDestructor(const std::string& typeName)
     {
         // `string` full dtor is the lazily registered string dtor. Resolve live (never cache)
@@ -5493,6 +5534,44 @@ public:
         strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });
         strVal = builder->CreateInsertValue(strVal, builder->getInt32(len), { 1u });
         return strVal;
+    }
+
+    // Deep-copy a string VALUE into a freshly heap-allocated, NUL-terminated owned buffer
+    // (OWNED high-bit set on _len). Used when a string whose ownership the compiler cannot
+    // transfer (e.g. a by-value parameter, which is a copy of an argument the CALLER still
+    // frees) must be stored into a longer-lived slot such as a struct field - a shallow store
+    // would alias the source buffer and dangle once the source is freed. Mirrors the inline
+    // copy used for a non-owning string passed to a `move` parameter. Copies _len content bytes
+    // then writes the terminator, so an empty/null-backed source never reads from a null pointer.
+    llvm::Value* EmitOwnedStringDeepCopy(llvm::Value* value)
+    {
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (strTy == nullptr || value == nullptr || value->getType() != strTy) return value;
+        if (!GetFunction("operator new")) return value;
+
+        auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "cpyptr");
+        // Mask off the OWNED high bit before using _len as a byte count.
+        auto* srcLen = builder->CreateAnd(
+            builder->CreateExtractValue(value, { 1u }, "cpylenraw"),
+            builder->getInt32(0x7FFFFFFF), "cpylen");
+        auto* len64 = builder->CreateZExt(srcLen, builder->getInt64Ty());
+        auto* allocSize = builder->CreateAdd(len64, builder->getInt64(1), "cpybufsz");
+
+        NamedVariable szArg;
+        szArg.Primary  = allocSize;
+        szArg.BaseType = builder->getInt64Ty();
+        auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
+        auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "cpybuf");
+        // Copy exactly _len bytes (0 is a safe no-op for an empty source), then NUL-terminate.
+        builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), len64);
+        auto* termPtr = builder->CreateInBoundsGEP(builder->getInt8Ty(), heapPtr, { len64 }, "cpyterm");
+        builder->CreateStore(builder->getInt8(0), termPtr);
+
+        auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "cpyownedlen");
+        llvm::Value* out = llvm::UndefValue::get(strTy);
+        out = builder->CreateInsertValue(out, heapPtr, { 0u });
+        out = builder->CreateInsertValue(out, ownedLen, { 1u });
+        return out;
     }
 
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,

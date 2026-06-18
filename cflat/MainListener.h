@@ -3447,6 +3447,21 @@ public:
                             && !compiler->currentFunctionReturnsOwned
                             && !returnExprOwned
                             && !returnIsWholeLocal;
+                        // Same borrow classification for a STRUCT taken from a collection the
+                        // function does not own (e.g. `alias T get` returning `_data[i]`). The
+                        // shallow copy handed back carries the OWNED bit of every owning string
+                        // (or nested-struct) field; a copy that escapes alias compile-time tracking
+                        // - notably a for-in loop variable - is destructed and would free buffers
+                        // the container still owns. Clear those field bits so any such destruct is
+                        // a no-op (the container keeps its single owner). A whole-local move-out or
+                        // a `move`-returning function keeps its bits so ownership transfers.
+                        bool clearReturnedStructBorrowBits =
+                            right != nullptr && right->getType()->isStructTy()
+                            && !NamedVarIsString(returnNV)
+                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+                            && !compiler->currentFunctionReturnsOwned
+                            && !returnExprOwned
+                            && !returnIsWholeLocal;
 
                         if (compiler->currentFunctionReturnsOwned && right != nullptr
                             && !llvm::isa<llvm::Constant>(right)
@@ -3488,6 +3503,11 @@ public:
                                 && right->getType() == returnNV.BaseType)
                             {
                                 clearReturnedStringBorrowBit = false;
+                                // Same exclusion for a moved-out owning STRUCT field (e.g.
+                                // `return makeOuterTok(n).inner;`): the buffer's ownership transfers
+                                // to the caller, so its owning-field bits must stay set, not be
+                                // cleared as a borrow - clearing would orphan the buffer (leak).
+                                clearReturnedStructBorrowBits = false;
                                 auto* srcGep = compiler->builder->CreateStructGEP(
                                     returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
                                     returnNV.MoveTempFieldIndex, "movedfld");
@@ -3547,6 +3567,8 @@ public:
                         // the original loaded value; a borrow is never a registered owned temp.
                         if (clearReturnedStringBorrowBit)
                             right = compiler->ClearStringOwnedBit(right);
+                        else if (clearReturnedStructBorrowBits)
+                            right = compiler->ClearStructOwnedBits(right, returnNV.TypeAndValue.TypeName);
                         // Pass the returned local's storage so a by-value struct return whose
                         // full-destructor frees members (e.g. owned string fields) moves
                         // ownership to the caller instead of being destructed here. The struct
@@ -6531,6 +6553,37 @@ public:
             bool selfFieldAssign = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
+
+            // A plain (non-move) by-value `string` PARAMETER stored into a struct field: deep-copy it.
+            // The parameter is a by-value copy of the caller's argument, but the CALLER still owns and
+            // frees the underlying buffer (e.g. an owning concat temp passed as the argument is freed
+            // at the caller's end-of-statement cleanup). A shallow store would alias that buffer into
+            // the field, leaving it dangling - and silently corrupted once the freed block is reused -
+            // after the caller frees the temp. A true move is impossible from here (the callee cannot
+            // reach the caller's temp cleanup), so an independent owned copy is the only safe transfer;
+            // it is exactly what the owning-string-into-field reject below recommends ('.copy()').
+            // `move` params (handled by the move-string transfer below) and owned temps / call results
+            // (null Storage, already transferred to us) keep their existing zero-copy paths.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsStructField
+                && NamedVarIsString(namedVar)
+                && rightNV.TypeAndValue.TypeName == "string"
+                && !rightNV.TypeAndValue.IsMove
+                && rightNV.FieldName.empty()
+                && rightNV.Storage != nullptr
+                && !rightNV.CallerName.empty()
+                && !selfFieldAssign)
+            {
+                auto argNV = compiler->GetFunctionArgument(rightNV.CallerName);
+                bool srcIsByValueStringParam =
+                    argNV.Storage != nullptr
+                    && argNV.Storage == rightNV.Storage
+                    && argNV.TypeAndValue.TypeName == "string"
+                    && !argNV.TypeAndValue.IsMove
+                    && !argNV.IsOwningString;
+                if (srcIsByValueStringParam)
+                    right = compiler->EmitOwnedStringDeepCopy(right);
+            }
 
             // Implied move of a `move`-temp's owning field (`dest = makeToken().text`): the temp OWNS it,
             // so free dest's old value, store the field, and zero the source so the temp dtor skips it.

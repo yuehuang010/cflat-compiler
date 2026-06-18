@@ -308,6 +308,97 @@ int testFieldOwnership()
     return passed;
 }
 
+// ── owning-string by-value param stored into a field (param -> field regression) ──────
+// A factory that stores a plain (non-move) by-value `string` parameter into a struct field
+// must give the field an INDEPENDENT owned buffer. The argument is typically an owning concat
+// temp that the CALLER frees at its end-of-statement cleanup; a shallow store would alias that
+// buffer into the field, leaving it dangling - and silently corrupted once a later allocation
+// reuses the freed block - after the factory returns. (A true move is impossible from the
+// callee, so the param -> field store deep-copies.)
+struct Labelled
+{
+    string label = default;
+};
+
+Labelled* makeLabelled(string s)
+{
+    Labelled* n = new Labelled();
+    n.label = s;            // plain by-value param -> field: must deep-copy, not alias
+    return n;
+}
+
+int testParamStringToField()
+{
+    int bad = 0;
+    for (int i = 0; i < 1000; i++)
+    {
+        // Owning concat temp as the argument; the caller frees it after makeLabelled returns.
+        Labelled* n = makeLabelled("item-" + i.toString());
+        // A subsequent string allocation reuses the block freed if ownership leaked.
+        string churn = "blah-" + i.toString() + "-padding-padding-padding";
+        string want = "item-" + i.toString();
+        if (n.label.indexOf(want) != 0) { bad = bad + 1; }
+        delete n;           // ~Labelled frees the owned field copy exactly once
+    }
+    int passed = 0;
+    passed += Test("param_string_to_field_survives", bad, 0);
+    return passed;
+}
+
+// ── value struct with an owning string field, moved into a list<T> via add() ──────────
+// `list<T>.add(move T value)` MOVES the struct into `_data[i]`, so the list becomes the
+// sole owner of each element's owning string field. Reading elements back - especially via
+// `for (Holder h in list)`, which binds a by-value copy of each element to the loop variable
+// and destructs it at loop exit - must NOT free the buffer the list still owns. `alias T get`
+// returns a borrow whose owning-field OWNED bits are cleared, so a destructed copy is a no-op.
+// Regression: before the fix the loop-variable copy freed the field, dangling the list element
+// and double-freeing on teardown (process exit 127). Verifies the stored data is intact across
+// later allocations and that teardown frees each buffer exactly once (reaching this point at
+// all proves no double-free; data integrity proves no premature free).
+struct Holder
+{
+    int id = 0;
+    string name = default;
+};
+
+int testStructWithStringFieldIntoList()
+{
+    int bad = 0;
+    int sumLen = 0;
+    {
+        list<Holder> holders;
+        for (int i = 0; i < 50; i++)
+        {
+            Holder h = default;
+            h.id = i;
+            h.name = "holder-" + i.toString();   // owning string field
+            holders.add(h);                       // MOVE struct into the list
+        }
+        // for-in binds a by-value copy per element and destructs it at loop exit; the
+        // borrowed owning-string field must survive (no double-free, no corruption).
+        for (Holder h in holders)
+            sumLen = sumLen + h.name.length();
+        // Churn allocations would reuse any buffer wrongly freed by the loop copies.
+        for (int i = 0; i < 50; i++)
+        {
+            string churn = "padding-padding-padding-" + i.toString();
+            if (churn.length() < 1) { bad = bad + 1; }
+        }
+        // Read back through indexing after the churn: every element must be intact.
+        for (int i = 0; i < holders.count(); i++)
+        {
+            string want = "holder-" + i.toString();
+            if (holders.get(i).name.indexOf(want) != 0) { bad = bad + 1; }
+            if (holders.get(i).id != i) { bad = bad + 1; }
+        }
+        // `holders` (and every owned element string) is destructed here - exactly once.
+    }
+    int passed = 0;
+    passed += Test("struct_string_field_into_list_intact", bad, 0);
+    passed += Test("struct_string_field_into_list_sumlen", sumLen, 440); // 10*len("holder-N") + 40*len("holder-NN")
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -490,6 +581,12 @@ extern int main()
 
     passed += testFieldOwnership();
     total += 7;
+
+    passed += testParamStringToField();
+    total += 1;
+
+    passed += testStructWithStringFieldIntoList();
+    total += 2;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
