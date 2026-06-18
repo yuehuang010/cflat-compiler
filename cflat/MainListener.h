@@ -7085,13 +7085,13 @@ public:
             // Clear lastCallReturnsOwned before each operand: a prior operand would leave it set
             // and the next (possibly a named variable) would be mis-registered and double-freed.
             // Each owned-string operand that is a call result is a temporary the comparison only
-            // borrows; register it for end-of-statement cleanup (see RegisterComparisonOperandTemp).
+            // borrows; register it for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0]);
-            RegisterComparisonOperandTemp(Compiler(ctx), lv.value);
+            RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseTypeCheckExpression(nextCtxs[1]);
-            RegisterComparisonOperandTemp(Compiler(ctx), rv.value);
+            RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -7313,13 +7313,13 @@ public:
             // See ParseEqualityExpression: a string operand returned from a call (e.g.
             // `s < other.toString()`) is an owned temp the relational operator only borrows.
             // Reset lastCallReturnsOwned before each operand and register each call-result
-            // operand for end-of-statement cleanup (see RegisterComparisonOperandTemp).
+            // operand for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseShiftExpression(nextCtxs[0]);
-            RegisterComparisonOperandTemp(Compiler(ctx), lv.value);
+            RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseShiftExpression(nextCtxs[1]);
-            RegisterComparisonOperandTemp(Compiler(ctx), rv.value);
+            RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -7814,6 +7814,10 @@ public:
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
             TrackOwnedStringOperatorResult(Compiler(ctx), lvalue);
+            // String concat (+) only borrows its operands: a plain (non-move) string-returning
+            // call leaves lastCallReturnsOwned false, so TrackOwnedStringOperatorResult skips it.
+            // Register call-result string operands directly so they are freed at end-of-statement.
+            RegisterBorrowedStringOperandTemp(Compiler(ctx), lvalue);
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
@@ -7822,6 +7826,7 @@ public:
                 llvm::Value* rvalue = rv.value;
                 bool ru = rv.isUnsigned;
                 TrackOwnedStringOperatorResult(Compiler(ctx), rvalue);
+                RegisterBorrowedStringOperandTemp(Compiler(ctx), rvalue);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
                 if (lvalue->getType()->isPointerTy() && rvalue->getType()->isPointerTy() && op == "-")
@@ -8145,20 +8150,22 @@ public:
             compiler->RegisterOwnedStringTemp(result);
     }
 
-    // A comparison (== != < > <= >=) only BORROWS its string operands: it reads their
-    // data/length and returns a bool, taking ownership of neither. When an operand is a
+    // A comparison (== != < > <= >=) or string concat (+) only BORROWS its string
+    // operands: it reads their data/length and never takes ownership. When an operand is a
     // string returned straight from a CALL (a function/method/operator result that was
     // never bound to a named local), nothing else owns that temporary, so it must be
     // freed at end-of-statement or it leaks. Register every call-result string operand
     // for FlushOwnedStringTemps.
     //   - A named local / field read lowers to a load / insertvalue chain (not a CallInst)
     //     and is skipped here, so the operand's real owner (its scope destructor) frees it
-    //     exactly once - `localA != localB` does not double free.
+    //     exactly once - `localA != localB` / `localA + localB` does not double free.
     //   - Registration is idempotent (RegisterOwnedStringTemp dedups), so an operator+
     //     result already tracked by TryBinaryOperatorOverload is freed once, not twice.
     //   - string.dtor checks the runtime owned bit, so registering a call that returns a
     //     borrow (e.g. an `alias string` accessor) is a safe no-op rather than a free.
-    void RegisterComparisonOperandTemp(LLVMBackend* compiler, llvm::Value* operand)
+    //   - Only string-struct operands are registered, so pointer arithmetic / ptr - ptr
+    //     operands in an additive expression are ignored.
+    void RegisterBorrowedStringOperandTemp(LLVMBackend* compiler, llvm::Value* operand)
     {
         if (operand == nullptr || !llvm::isa<llvm::CallInst>(operand)) return;
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");

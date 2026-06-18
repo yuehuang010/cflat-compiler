@@ -505,6 +505,27 @@ extern int main()
         string cmpB = returnOwnedConcat("q");
         bool cmpLocals = cmpA != cmpB;
         total++; passed += Test("named owned-string locals compared (no double-free)", cmpLocals, true);
+
+        // Additive-operand temps from PLAIN (non-`move`) string returns. Same gap as the
+        // comparison operands above but on the `+` (concat) path: a plain string-returning call
+        // used DIRECTLY as a `+` operand was never registered and leaked (the result `r` is freed,
+        // the two operand temps were not). operator+ only borrows its operands, so freeing each
+        // temp once is correct. Chained `+` mixes operand temps with an intermediate result temp.
+        {
+            string addCall = returnOwnedConcat("a") + returnOwnedConcat("b");   // two plain-fn temps
+            total++; passed += Test("plain-fn temp '+' operands", addCall.length(), 14); // "hello ahello b"
+            string addChain = returnOwnedConcat("a") + returnOwnedConcat("b") + returnOwnedConcat("c");
+            total++; passed += Test("plain-fn temp chained '+' operands", addChain.length() > 0, true);
+        }
+
+        // Named owned-string locals as `+` operands must NOT be double-freed: the locals own the
+        // buffers and free once on scope exit; operator+ borrows them and frees nothing.
+        {
+            string addA = returnOwnedConcat("p");
+            string addB = returnOwnedConcat("q");
+            string addLocals = addA + addB;
+            total++; passed += Test("named owned-string locals added (no double-free)", addLocals.length() > 0, true);
+        }
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===
