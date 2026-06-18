@@ -46,12 +46,15 @@ class Triangle : IDrawable
     void draw() { printf("Triangle b=%d\n", b); }
 };
 
+// Captures the last by-value string passed through IWriter.write (Bug 1 regression).
+int gLastWriteLen = 0;
+
 class FileStream : IReader, IWriter
 {
     int id = 0;
 
     string read()  { return "data"; }
-    void write(string text) { }
+    void write(string text) { gLastWriteLen = text.length(); }
 };
 
 // Destructor side-effect counter for delete-through-interface (Test 15).
@@ -353,6 +356,16 @@ bool testMultipleInterfaces()
     // stale method name and failed overload resolution.
     result &= Test("multi_iface_read_chain_len",        reader.read().length(), 4);
     result &= Test("multi_iface_read_chain_data",       reader.read().data(), "data");
+
+    // Bug 1 regression: a virtual interface method taking a by-value struct (string)
+    // arg used to push a bare ptr where the vtable signature expects %string by value,
+    // failing module verification. Both a literal and a named owned string must work.
+    writer.write("hello");
+    result &= Test("multi_iface_write_byval_literal",   gLastWriteLen, 5);
+    string greeting = "hi-" + "there";
+    writer.write(greeting);
+    result &= Test("multi_iface_write_byval_named",     gLastWriteLen, 8);
+    result &= Test("multi_iface_write_named_survives",  greeting.length(), 8);
 
     result &= Test("multi_iface_is_filestream_reader",  reader is FileStream, true);
     result &= Test("multi_iface_is_filestream_writer",  writer is FileStream, true);

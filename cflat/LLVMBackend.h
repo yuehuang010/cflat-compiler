@@ -5574,6 +5574,73 @@ public:
         return out;
     }
 
+    // Lower a by-value argument to match a declared (non-variadic) by-value parameter:
+    // implicit char*/literal -> string coercion, scalar/struct upconvert, and the
+    // non-owning-string -> move-param heap-copy. Shared by the normal call path
+    // (CreateOverloadedFunctionCall) and virtual dispatch (CallInterfaceMethod) so the
+    // two argument-lowering paths cannot drift. Returns the lowered call-arg value.
+    llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
+    {
+        if (param.TypeName == "string" && !param.Pointer
+            && value && value->getType() == builder->getInt8Ty()->getPointerTo())
+        {
+            // Implicit char* -> string coercion: string literal or char* passed to a string param.
+            auto* c = llvm::dyn_cast<llvm::Constant>(value);
+            if (c && IsStringLiteralConstant(c))
+                value = WrapStringLiteralAsString(value);
+            else if (GetFunction("operator string"))
+            {
+                NamedVariable argNV2;
+                argNV2.Primary = value;
+                argNV2.BaseType = value->getType();
+                argNV2.TypeAndValue.TypeName = "char";
+                argNV2.TypeAndValue.Pointer = true;
+                value = CreateOverloadedFunctionCall("operator string", { argNV2 });
+            }
+            else
+                value = WrapStringLiteralAsString(value);
+        }
+        else
+        {
+            // Upconvert to match the declared parameter type (e.g. i16 -> i32; struct identity).
+            bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
+            value = Upconvert(value, GetType(param), argIsUnsigned);
+        }
+
+        // Non-owning string (literal or view) passed to a move parameter - heap-copy it
+        // so the callee receives an owned buffer it can safely free.
+        if (param.IsMove && param.TypeName == "string" && !arg.IsOwningString)
+        {
+            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+            if (strTy && GetFunction("operator new"))
+            {
+                auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "litptr");
+                // Mask off _len's high OWNED bit before using it as a byte count
+                // (string-redesign FINAL MODEL) - the bit would inflate allocSize to
+                // ~2GB and AV the memcpy when the source is an owned string.
+                auto* srcLen = builder->CreateAnd(
+                    builder->CreateExtractValue(value, { 1u }, "litlenraw"),
+                    builder->getInt32(0x7FFFFFFF), "litlen");
+                auto* allocSize = builder->CreateAdd(
+                    builder->CreateZExt(srcLen, builder->getInt64Ty()),
+                    builder->getInt64(1), "litbufsz");
+                NamedVariable szArg;
+                szArg.Primary  = allocSize;
+                szArg.BaseType = builder->getInt64Ty();
+                auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
+                auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
+                builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
+                // The callee receives a freshly allocated buffer it owns: set the OWNED bit.
+                auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "ownedlen");
+                value = llvm::UndefValue::get(strTy);
+                value = builder->CreateInsertValue(value, heapPtr, { 0u });
+                value = builder->CreateInsertValue(value, ownedLen, { 1u });
+            }
+        }
+
+        return value;
+    }
+
     llvm::Value* CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& extraArgNVs)
     {
@@ -5673,8 +5740,11 @@ public:
             }
             else
             {
+                // Scalar or by-value struct (string / user value struct). Reuse the normal
+                // call path's lowering so a string literal becomes a %string by value rather
+                // than a bare ptr. See LowerByValueArg (canonical path: CreateOverloadedFunctionCall).
                 auto val = nv.Primary != nullptr ? nv.Primary : CreateLoad(nv.Storage);
-                val = Upconvert(val, GetType(param), nv.TypeAndValue.IsUnsignedInteger() != -1);
+                val = LowerByValueArg(val, param, nv);
                 callArgs.push_back(val);
             }
         }
@@ -9167,65 +9237,9 @@ public:
 
                 if (!inVariadicRange)
                 {
-                    if (candParamItr->TypeName == "string" && !candParamItr->Pointer
-                        && value && value->getType() == builder->getInt8Ty()->getPointerTo())
-                    {
-                        // Implicit char* -> string coercion: string literal or char* passed to a string param.
-                        auto* c = llvm::dyn_cast<llvm::Constant>(value);
-                        if (c && IsStringLiteralConstant(c))
-                            value = WrapStringLiteralAsString(value);
-                        else if (GetFunction("operator string"))
-                        {
-                            NamedVariable argNV2;
-                            argNV2.Primary = value;
-                            argNV2.BaseType = value->getType();
-                            argNV2.TypeAndValue.TypeName = "char";
-                            argNV2.TypeAndValue.Pointer = true;
-                            value = CreateOverloadedFunctionCall("operator string", { argNV2 });
-                        }
-                        else
-                            value = WrapStringLiteralAsString(value);
-                    }
-                    else
-                    {
-                        // Upconvert to match the declared parameter type (e.g. i16 -> i32).
-                        bool argIsUnsigned = arg.TypeAndValue.IsUnsignedInteger() != -1;
-                        value = Upconvert(value, GetType(*candParamItr), argIsUnsigned);
-                    }
-                }
-
-                // Non-owning string (literal or view) passed to a move parameter - heap-copy it
-                // so the callee receives an owned buffer it can safely free.
-                if (!inVariadicRange &&
-                    candParamItr->IsMove &&
-                    candParamItr->TypeName == "string" &&
-                    !arg.IsOwningString)
-                {
-                    auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-                    if (strTy && GetFunction("operator new"))
-                    {
-                        auto* srcPtr = builder->CreateExtractValue(value, { 0u }, "litptr");
-                        // Mask off _len's high OWNED bit before using it as a byte count
-                        // (string-redesign FINAL MODEL) - the bit would inflate allocSize to
-                        // ~2GB and AV the memcpy when the source is an owned string.
-                        auto* srcLen = builder->CreateAnd(
-                            builder->CreateExtractValue(value, { 1u }, "litlenraw"),
-                            builder->getInt32(0x7FFFFFFF), "litlen");
-                        auto* allocSize = builder->CreateAdd(
-                            builder->CreateZExt(srcLen, builder->getInt64Ty()),
-                            builder->getInt64(1), "litbufsz");
-                        NamedVariable szArg;
-                        szArg.Primary  = allocSize;
-                        szArg.BaseType = builder->getInt64Ty();
-                        auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
-                        auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
-                        builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
-                        // The callee receives a freshly allocated buffer it owns: set the OWNED bit.
-                        auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "ownedlen");
-                        value = llvm::UndefValue::get(strTy);
-                        value = builder->CreateInsertValue(value, heapPtr, { 0u });
-                        value = builder->CreateInsertValue(value, ownedLen, { 1u });
-                    }
+                    // Canonical by-value arg lowering (string coercion + move heap-copy);
+                    // shared with virtual dispatch via CallInterfaceMethod.
+                    value = LowerByValueArg(value, *candParamItr, arg);
                 }
 
                 argList.push_back(value);
