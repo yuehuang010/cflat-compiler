@@ -165,6 +165,67 @@ struct Surface
     }
 };
 
+// Draw a single-cell border around rect b: '+' corners, '-'/'|' edges. Silently
+// no-ops on a degenerate rect (a box needs at least 2x2 to have an interior).
+void drawBorder(Surface* s, Rect b)
+{
+    if (b.w < 2 || b.h < 2) return;
+    int right  = b.x + b.w - 1;
+    int bottom = b.y + b.h - 1;
+    s.put(b.x, b.y, '+');
+    s.put(right, b.y, '+');
+    s.put(b.x, bottom, '+');
+    s.put(right, bottom, '+');
+    int x = b.x + 1;
+    while (x < right) { s.put(x, b.y, '-'); s.put(x, bottom, '-'); x++; }
+    int y = b.y + 1;
+    while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
+}
+
+// ── Canvas: the surface-agnostic draw target nodes paint into ─────────────────
+// Nodes paint via Canvas primitives (in CELL coordinates) instead of poking a
+// Surface's cells directly, so the SAME tree can render to a char grid (TUI) or a
+// GDI window (Win32). A Canvas implementation owns the cell->pixel mapping.
+interface Canvas
+{
+    void clear();
+    void drawText(int col, int row, const char* s);
+    void drawRect(Rect r, bool filled);   // filled=false draws a border, true fills
+};
+
+// TUI Canvas: a thin adapter over a Surface. (Surface is a struct and cannot
+// implement an interface directly, so the adapter carries the contract.) Holds a
+// borrowed Surface*; it never owns the grid, so it has no destructor.
+class SurfaceCanvas : Canvas
+{
+    Surface* target = nullptr;
+
+    void clear() { this.target.fill(' '); }
+
+    void drawText(int col, int row, const char* s) { this.target.text(col, row, s); }
+
+    void drawRect(Rect r, bool filled)
+    {
+        if (!filled) { drawBorder(this.target, r); return; }
+        int yy = r.y;
+        while (yy < r.y + r.h)
+        {
+            int xx = r.x;
+            while (xx < r.x + r.w) { this.target.put(xx, yy, ' '); xx++; }
+            yy++;
+        }
+    }
+};
+
+// A SurfaceCanvas value bound to `s`, ready to pass as a Canvas. No heap, no owner:
+// it just wraps the borrowed pointer for the duration of a paint call.
+SurfaceCanvas canvasFor(Surface* s)
+{
+    SurfaceCanvas c = default;
+    c.target = s;
+    return c;
+}
+
 // Node-kind tags - returned by Element.kind() so the reconciler can compare node
 // types WITHOUT an `as` downcast (which would hit the open Bug 9 UAF path).
 int ELEM_VIEW      = 1;
@@ -189,7 +250,7 @@ interface Element
     string toJson();
     void destroyTree();
     int  layout(int x, int y, int availW);
-    void paint(Surface* s);
+    void paint(Canvas c);
     bool handleClick(int x, int y);
     int  kind();
     string propsSig();
@@ -226,10 +287,10 @@ class View : Element
         return h;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv)
     {
         for (Element c in this.children)
-            c.paint(s);
+            c.paint(cv);
     }
 
     bool handleClick(int x, int y)
@@ -300,9 +361,9 @@ class Text : Element
         return 1;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv)
     {
-        s.text(this.bounds.x, this.bounds.y, this.text.data());
+        cv.drawText(this.bounds.x, this.bounds.y, this.text.data());
     }
 
     bool handleClick(int x, int y) { return false; }
@@ -345,10 +406,10 @@ class Button : Element
         return 1;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv)
     {
         string rendered = "[ " + this.label + " ]";
-        s.text(this.bounds.x, this.bounds.y, rendered.data());
+        cv.drawText(this.bounds.x, this.bounds.y, rendered.data());
     }
 
     bool handleClick(int x, int y)
@@ -369,23 +430,6 @@ class Button : Element
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
 };
-
-// Draw a single-cell border around rect b: '+' corners, '-'/'|' edges. Silently
-// no-ops on a degenerate rect (a box needs at least 2x2 to have an interior).
-void drawBorder(Surface* s, Rect b)
-{
-    if (b.w < 2 || b.h < 2) return;
-    int right  = b.x + b.w - 1;
-    int bottom = b.y + b.h - 1;
-    s.put(b.x, b.y, '+');
-    s.put(right, b.y, '+');
-    s.put(b.x, bottom, '+');
-    s.put(right, bottom, '+');
-    int x = b.x + 1;
-    while (x < right) { s.put(x, b.y, '-'); s.put(x, bottom, '-'); x++; }
-    int y = b.y + 1;
-    while (y < bottom) { s.put(b.x, y, '|'); s.put(right, y, '|'); y++; }
-}
 
 // ── Box: a bordered container that fills a width x height region ───────────────
 // Unlike View (a flow-stacked, borderless container), a Box is sized: it draws a
@@ -424,11 +468,11 @@ class Box : Element
         return h;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv)
     {
-        drawBorder(s, this.bounds);
+        cv.drawRect(this.bounds, false);
         for (Element c in this.children)
-            c.paint(s);
+            c.paint(cv);
     }
 
     bool handleClick(int x, int y)
@@ -694,10 +738,10 @@ class ComponentElement : Element
         return h;
     }
 
-    void paint(Surface* s)
+    void paint(Canvas cv)
     {
         for (Element c in this.inner)
-            c.paint(s);
+            c.paint(cv);
     }
 
     bool handleClick(int x, int y)

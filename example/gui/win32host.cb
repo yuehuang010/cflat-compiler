@@ -1,0 +1,225 @@
+// win32host.cb - a native Win32 GUI host for the ui.cb framework.
+//
+// This is the Win32 instance of the host loop shape that host.cb implements for
+// the terminal: input -> dispatch (handleClick) -> drain dirty -> render ->
+// reconcile -> repaint only what changed. The framework (Element tree, reconciler,
+// model layer) is reused UNCHANGED; the only thing that differs from the TUI host
+// is the draw target (GdiCanvas instead of SurfaceCanvas) and the message pump.
+//
+// A size-aware component reads hostWidth()/hostHeight() in its render() - the
+// model-layer equivalent of a "useWindowSize()" hook - so the same tree rescales
+// when the window is resized. See gui_boxes.cb for a demo.
+//
+// This file has no main(); it is imported by an app file that calls runAppGui().
+import "windows.h" lib { "user32.lib", "gdi32.lib" } cache;
+import "ui.cb";
+
+// Layout is in CHARACTER CELLS; GdiCanvas maps a cell to this many pixels. Hit
+// testing divides mouse pixels by the same constants, so clicks land on the cell
+// the layout drew.
+const int CELL_W = 9;
+const int CELL_H = 18;
+
+// Current window size in CELLS. Size-aware components read these in render().
+int _gTermW = 80;
+int _gTermH = 25;
+
+int hostWidth()  { return _gTermW; }
+int hostHeight() { return _gTermH; }
+
+// The running app and its committed tree, reached from the free-function WndProc
+// (a stdcall callback cannot capture `this`). Single window / single thread, so
+// globals are the right tool here - same justification as the model layer's
+// _uiDirty. _gReady guards the tree before the first build (WM_SIZE) and after
+// teardown (WM_DESTROY).
+Component _gApp  = default;
+Element   _gTree = default;
+bool      _gReady = false;
+
+// ── GdiCanvas: the GDI implementation of the Canvas draw interface ─────────────
+// Holds the device context for the current WM_PAINT plus the cell size. drawText
+// uses DrawTextA (left-aligned, single line); drawRect frames or fills a cell
+// rectangle with a stock black brush. Borrows the HDC - owns no GDI objects.
+class GdiCanvas : Canvas
+{
+    void* hdc = nullptr;
+    int cellW = CELL_W;
+    int cellH = CELL_H;
+
+    void clear() { }   // the window background is erased by the default WM_ERASEBKGND
+
+    void drawText(int col, int row, const char* s)
+    {
+        RECT rc = default;
+        rc.left   = col * this.cellW;
+        rc.top    = row * this.cellH;
+        rc.right  = rc.left + 4096;        // wide; single line is left-clipped to it
+        rc.bottom = rc.top + this.cellH;
+        SetBkMode(this.hdc, TRANSPARENT);
+        SetTextColor(this.hdc, 0u);        // black
+        DrawTextA(this.hdc, (char*)s, -1, &rc,
+                  (u32)(DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX));
+    }
+
+    void drawRect(Rect r, bool filled)
+    {
+        RECT rc = default;
+        rc.left   = r.x * this.cellW;
+        rc.top    = r.y * this.cellH;
+        rc.right  = (r.x + r.w) * this.cellW;
+        rc.bottom = (r.y + r.h) * this.cellH;
+        void* br = GetStockObject(BLACK_BRUSH);
+        if (filled) { FillRect(this.hdc, &rc, br); return; }
+        FrameRect(this.hdc, &rc, br);
+    }
+};
+
+// Free the old tree (if any) and render a fresh one at the current cell size.
+// A resize produces no reconcile patches (the size flows in through render()), so
+// like boxes.cb we rebuild + full-repaint rather than diff.
+void rebuildTree()
+{
+    if (_gReady) { deleteTree(_gTree); _gReady = false; }
+    _gTree = _gApp.render();
+    _gTree.layout(0, 0, _gTermW);
+    _gReady = true;
+}
+
+// LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM). stdcall keeps the ABI
+// correct on 32-bit (no-op on x64).
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_SIZE)
+    {
+        // LOWORD/HIWORD of lParam are the new client width/height in pixels.
+        int pw = (int)(lParam & (i64)0xFFFF);
+        int ph = (int)((lParam >> 16) & (i64)0xFFFF);
+        int nw = pw / CELL_W;
+        int nh = ph / CELL_H;
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        _gTermW = nw;
+        _gTermH = nh;
+        rebuildTree();
+        InvalidateRect(hwnd, nullptr, 1);
+        return (i64)0;
+    }
+
+    // Suppress the default background erase; WM_PAINT repaints the whole client
+    // through a back buffer, so erasing first would only cause flicker.
+    if (msg == WM_ERASEBKGND)
+        return (i64)1;
+
+    if (msg == WM_PAINT)
+    {
+        PAINTSTRUCT ps = default;
+        void* hdc = BeginPaint(hwnd, &ps);
+
+        RECT rc = default;
+        GetClientRect(hwnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        // Double buffer: draw into an offscreen bitmap, then blit it in one shot.
+        void* memDC  = CreateCompatibleDC(hdc);
+        void* bmp    = CreateCompatibleBitmap(hdc, w, h);
+        void* oldBmp = SelectObject(memDC, bmp);
+
+        FillRect(memDC, &rc, GetStockObject(WHITE_BRUSH));
+        if (_gReady)
+        {
+            GdiCanvas cv = default;
+            cv.hdc = memDC;
+            _gTree.layout(0, 0, _gTermW);
+            _gTree.paint(cv);
+        }
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, (u32)SRCCOPY);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        EndPaint(hwnd, &ps);
+        return (i64)0;
+    }
+
+    if (msg == WM_LBUTTONDOWN)
+    {
+        int px = (int)(lParam & (i64)0xFFFF);
+        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        if (_gReady)
+        {
+            // Dispatch the click; the handler mutates state and calls invalidate().
+            // Then drain the dirty flag and reconcile, repainting only on a change.
+            _gTree.handleClick(px / CELL_W, py / CELL_H);
+            if (consumeDirty())
+            {
+                Element wip = _gApp.render();
+                list<Patch> patches = default;
+                _gTree = reconcile(_gTree, wip, &patches);
+                if (patches.count() > 0)
+                {
+                    _gTree.layout(0, 0, _gTermW);
+                    InvalidateRect(hwnd, nullptr, 1);
+                }
+            }
+        }
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        if (_gReady) { deleteTree(_gTree); _gReady = false; }
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+// Register the window class, create the window, and run the message loop until
+// WM_QUIT. The component is borrowed (the caller owns it and must outlive this
+// call); we stash it in _gApp for the WndProc to render from.
+int runAppGui(Component app, const char* title)
+{
+    _gApp = app;
+
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.hbrBackground = GetStockObject(WHITE_BRUSH);
+    wc.lpszClassName = "CFlatUiWindow";
+
+    RegisterClassExA(&wc);
+
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatUiWindow",
+        title,
+        (u32)WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        640, 480,
+        nullptr, nullptr, hInst, nullptr);
+
+    if (hwnd == nullptr)
+    {
+        printf("CreateWindowExA failed\n");
+        return 1;
+    }
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    return (int)msg.wParam;
+}

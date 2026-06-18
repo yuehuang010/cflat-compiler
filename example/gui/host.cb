@@ -1,0 +1,254 @@
+// host.cb - a terminal (TUI) host for the ui.cb framework.
+//
+// Closes the UI v1 loop: it paints an Element tree to the console, dispatches
+// mouse clicks to the node that was hit (virtually, through the Element
+// interface - never a downcast), and repaints when a click mutates state.
+//
+// Two run modes:
+//   - Real console: interactive. Click the "[ +1 ]" button to increment the
+//     counter; ESC quits and the cursor/console mode are restored.
+//   - Redirected I/O (CI, --run): Terminal.init() returns false, so it falls
+//     back to a deterministic headless self-test that drives layout + paint +
+//     hit-test + dispatch against an in-memory Surface and prints PASS/FAIL.
+//
+// Run the self-test:   x64/Release/cflat.exe example/ui/host.cb --run
+// Run interactively:   x64/Release/cflat.exe example/ui/host.cb -o out/host.exe && out\host.exe
+
+import "ui.cb";
+import "terminal.cb";
+
+class Counter : Component
+{
+    int count = 0;
+
+    Element render()
+    {
+        View* root = view(makeStyle(1, 0, 0));
+        root.add(text("Count: " + this.count.toString()));
+        root.add(button("+1", () => { this.count = this.count + 1; invalidate(); }));
+        return root;
+    }
+};
+
+// ── Headless self-test suite ──────────────────────────────────────────────────
+// Deterministic, no-console checks of the whole pipeline (render -> layout ->
+// paint -> hit-test -> invalidate -> reconcile -> minimal repaint). Run when
+// Terminal.init() fails (redirected I/O / --run). Each sub-test returns true on
+// success; selfTest aggregates and returns 0 iff all pass.
+
+int countOp(list<Patch>* p, int op)
+{
+    int n = 0; int i = 0;
+    while (i < p.count()) { if (p.get(i).op == op) n++; i++; }
+    return n;
+}
+
+int diffRows(Surface* a, Surface* b, int h)
+{
+    int n = 0; int r = 0;
+    while (r < h) { if (a.rowDiffers(b, r)) n++; r++; }
+    return n;
+}
+
+Text* ktext(string k, string s) { Text* t = text(s); t.setKey(k); return t; }
+
+// Counter click -> invalidate -> reconcile yields exactly one Update(Text), and
+// minimal repaint sees exactly one changed row (the count text).
+bool testCounterReconcile()
+{
+    Counter c; c.count = 0;
+    Surface front; front.init(40, 6);
+    Surface back;  back.init(40, 6);
+
+    Element tree = c.render();
+    tree.layout(0, 0, 40);
+    front.fill(' '); tree.paint(canvasFor(&front));
+    if (!front.contains("Count: 0")) { deleteTree(tree); return false; }
+
+    bool clicked = false; int y = 0;
+    while (y < front.height && !clicked)
+    {
+        int x = 0;
+        while (x < front.width) { if (tree.handleClick(x, y)) { clicked = true; break; } x++; }
+        y++;
+    }
+    if (!clicked || c.count != 1 || !consumeDirty()) { deleteTree(tree); return false; }
+
+    Element wip = c.render();
+    list<Patch> p = default;
+    tree = reconcile(tree, wip, &p);
+    bool patchOk = p.count() == 1 && p.get(0).op == PATCH_UPDATE && p.get(0).nodeKind == ELEM_TEXT;
+
+    tree.layout(0, 0, 40);
+    back.fill(' '); tree.paint(canvasFor(&back));
+    bool rendered = back.contains("Count: 1");
+    int changed = diffRows(&front, &back, 6);   // minimal repaint: one row changed
+    bool noSpurious = !consumeDirty();
+
+    deleteTree(tree);
+    return patchOk && rendered && changed == 1 && noSpurious;
+}
+
+// Keyed children matched across a reorder: no structural patches, new order shown.
+bool testKeyedReorder()
+{
+    View* x = view(makeStyle(0,0,0));
+    x.add(ktext("a","A")); x.add(ktext("b","B")); x.add(ktext("c","C"));
+    View* y = view(makeStyle(0,0,0));
+    y.add(ktext("c","C")); y.add(ktext("a","A")); y.add(ktext("b","B"));
+
+    Element t = x;
+    list<Patch> p = default;
+    t = reconcile(t, y, &p);
+    bool structural = countOp(&p, PATCH_INSERT) == 0 && countOp(&p, PATCH_REMOVE) == 0;
+
+    Surface s; s.init(8, 4); t.layout(0,0,8); s.fill(' '); t.paint(canvasFor(&s));
+    char* r0 = s.row(0); char* r1 = s.row(1); char* r2 = s.row(2);
+    bool order = strcmp(r0, "C") == 0 && strcmp(r1, "A") == 0 && strcmp(r2, "B") == 0;
+    free((void*)r0); free((void*)r1); free((void*)r2);
+
+    deleteTree(t);
+    return structural && order;
+}
+
+// Components mounted as keyed nodes: reorder + a state change reconcile with no
+// structural churn (matched by key) and at least one Update (the changed child).
+bool testComponentReconcile()
+{
+    Counter* a = new Counter(); a.count = 0;
+    Counter* b = new Counter(); b.count = 0;
+
+    View* r1 = view(makeStyle(0,0,0));
+    r1.add(mount(a, "a")); r1.add(mount(b, "b"));
+    Element committed = r1;
+
+    a.count = 1;   // state behind component 'a' changes
+    View* r2 = view(makeStyle(0,0,0));
+    r2.add(mount(b, "b")); r2.add(mount(a, "a"));   // reorder
+    Element wip = r2;
+
+    list<Patch> p = default;
+    committed = reconcile(committed, wip, &p);
+    bool ok = countOp(&p, PATCH_INSERT) == 0
+           && countOp(&p, PATCH_REMOVE) == 0
+           && countOp(&p, PATCH_UPDATE) >= 1;
+
+    deleteTree(committed);
+    delete a; delete b;   // counters are held by reference, not by the tree
+    return ok;
+}
+
+int selfTest()
+{
+    int pass = 0; int total = 0;
+    total++; if (testCounterReconcile())   pass++; else printf("  FAIL: counter reconcile + minimal repaint\n");
+    total++; if (testKeyedReorder())       pass++; else printf("  FAIL: keyed reorder\n");
+    total++; if (testComponentReconcile()) pass++; else printf("  FAIL: component reconcile\n");
+
+    if (pass == total)
+    {
+        printf("PASS: ui self-tests %d/%d (reconcile, minimal repaint, keyed reorder, components)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: ui self-tests %d/%d\n", pass, total);
+    return 1;
+}
+
+// Minimal repaint: blit only the rows of `back` that differ from `front`, then
+// sync front <- back. Pass full=true to force a complete repaint (first frame).
+void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool full)
+{
+    int r = 0;
+    while (r < height)
+    {
+        if (full || back.rowDiffers(front, r))
+        {
+            char* line = back.row(r);
+            term.moveTo(r + 1, 1);
+            printf("%s", line);
+            free((void*)line);
+        }
+        r++;
+    }
+    front.copyFrom(back);
+    term.flush();
+}
+
+int runApp(Component app)
+{
+    Terminal term;
+    if (!term.init())
+        return selfTest();   // redirected I/O: run the deterministic self-test
+
+    term.hideCursor();
+
+    int w = 0;
+    int h = 0;
+    if (!term.getSize(&w, &h)) { w = 80; h = 25; }
+
+    // Double buffer: paint into `back`, diff against `front`, blit only changed rows.
+    Surface front; front.init(w, h);
+    Surface back;  back.init(w, h);
+
+    Element tree = app.render();
+    tree.layout(0, 0, w);
+    back.fill(' ');
+    tree.paint(canvasFor(&back));
+    back.text(0, h - 1, "(click [ +1 ], ESC to quit)");
+    flushFrame(&term, &front, &back, h, true);   // first frame: full paint
+
+    bool running = true;
+    while (running)
+    {
+        i32 evt = 0;
+        KeyEvent key;
+        MouseEvent mouse;
+        if (term.pollEvent(&evt, &key, &mouse))
+        {
+            if (evt == 1)
+            {
+                if (key.vkCode == VK_ESCAPE) running = false;
+            }
+            else if (evt == 2)
+            {
+                // Just dispatch the click; the handler mutates state and calls
+                // invalidate(). Rendering is driven by the dirty flag below.
+                if (mouse.isPress() && mouse.leftButton())
+                    tree.handleClick((int)mouse.x, (int)mouse.y);
+            }
+        }
+        else
+        {
+            os.windows.Sleep(16);
+        }
+
+        // Drain the dirty flag: re-render + reconcile only when state changed,
+        // then repaint only the rows that actually differ.
+        if (consumeDirty())
+        {
+            Element wip = app.render();
+            list<Patch> patches = default;
+            tree = reconcile(tree, wip, &patches);
+            if (patches.count() > 0)
+            {
+                tree.layout(0, 0, w);
+                back.fill(' ');
+                tree.paint(canvasFor(&back));
+                back.text(0, h - 1, "(click [ +1 ], ESC to quit)");
+                flushFrame(&term, &front, &back, h, false);   // minimal repaint
+            }
+        }
+    }
+
+    deleteTree(tree);
+    term.showCursor();
+    term.restore();
+    return 0;
+}
+
+extern int main()
+{
+    Counter app;
+    app.count = 0;
+    return runApp(app);
+}

@@ -1,0 +1,284 @@
+// boxes.cb - an interactive, resizable bordered-box demo for the ui.cb framework.
+//
+// Run modes (same split as host.cb):
+//   - Real console: interactive. The outer Box fills the terminal and rescales
+//     LIVE when you resize the window; clicking "[ add box ]" nests one more small
+//     box inside. ESC quits and the cursor/console mode are restored.
+//   - Redirected I/O (CI, --run): Terminal.init() returns false, so it falls back
+//     to a deterministic headless self-test (resize scaling + click -> nested box).
+//
+// Run the self-test:   x64/Release/cflat.exe example/ui/boxes.cb --run
+// Run interactively:   x64/Release/cflat.exe example/ui/boxes.cb -o out/boxes.exe && out\boxes.exe
+//
+// BoxApp keeps termW/termH (the host pokes these in on resize) and a click count.
+
+import "ui.cb";
+import "terminal.cb";
+
+class BoxApp : Component
+{
+    int termW = 20;
+    int termH = 8;
+    int clicks = 0;
+
+    Element render()
+    {
+        Box* root = box(makeStyle(0, this.termW, this.termH));
+        root.setKey("root");
+
+        Button* add = button("add box", () => { this.clicks = this.clicks + 1; invalidate(); });
+        add.setKey("btn");
+        root.add(add);
+
+        Text* status = text("Boxes: " + this.clicks.toString() + "   (ESC to quit)");
+        status.setKey("status");
+        root.add(status);
+
+        int i = 0;
+        while (i < this.clicks)
+        {
+            Box* small = box(makeStyle(0, 6, 3));
+            small.setKey("b" + i.toString());
+            root.add(small);
+            i++;
+        }
+        return root;
+    }
+};
+
+// ── Headless self-test (run under redirected I/O / --run) ─────────────────────
+
+// '+' marks every box corner; counting them counts boxes (4 corners each). The
+// demo keeps button labels free of '+' so this stays a clean box count.
+int countChar(Surface* s, char target)
+{
+    int n = 0; int r = 0;
+    while (r < s.height)
+    {
+        char* line = s.row(r);
+        int i = 0;
+        while (line[i] != '\0') { if (line[i] == target) n++; i++; }
+        free((void*)line);
+        r++;
+    }
+    return n;
+}
+
+// True if the four corners of a w x h grid hold the box border char '+'.
+bool cornersFramed(Surface* s, int w, int h)
+{
+    char* top = s.row(0);
+    char* bot = s.row(h - 1);
+    bool ok = (int)strlen(top) >= w && (int)strlen(bot) >= w
+           && top[0] == '+' && top[w - 1] == '+'
+           && bot[0] == '+' && bot[w - 1] == '+';
+    free((void*)top); free((void*)bot);
+    return ok;
+}
+
+int countOp(list<Patch>* p, int op)
+{
+    int n = 0; int i = 0;
+    while (i < p.count()) { if (p.get(i).op == op) n++; i++; }
+    return n;
+}
+
+// Render the app at (w,h), paint into a fresh w x h surface, assert the border
+// lands flush on all four corners. Done at two sizes proves the box scales.
+bool renderFramedAt(BoxApp* app, int w, int h)
+{
+    app.termW = w; app.termH = h;
+    Element tree = app.render();
+    tree.layout(0, 0, w);
+    Surface s; s.init(w, h);
+    s.fill(' ');
+    tree.paint(&s);
+    bool ok = cornersFramed(&s, w, h);
+    deleteTree(tree);
+    return ok;
+}
+
+bool testResizeScaling()
+{
+    BoxApp app; app.clicks = 0;
+    bool small = renderFramedAt(&app, 20, 8);
+    bool big   = renderFramedAt(&app, 40, 12);
+    return small && big;
+}
+
+// Click the [add box] button, then reconcile the next render: exactly one box is
+// inserted, and the painted grid gains one box worth of corners (4).
+bool testClickAddsBox()
+{
+    BoxApp app; app.clicks = 0;
+    app.termW = 24; app.termH = 10;
+
+    Element tree = app.render();
+    tree.layout(0, 0, 24);
+
+    // Dispatch a click by scanning the grid for the cell the button occupies.
+    Surface probe; probe.init(24, 10); probe.fill(' '); tree.paint(&probe);
+    int beforeCorners = countChar(&probe, '+');   // outer box only: 4
+
+    bool clicked = false; int y = 0;
+    while (y < 10 && !clicked)
+    {
+        int x = 0;
+        while (x < 24) { if (tree.handleClick(x, y)) { clicked = true; break; } x++; }
+        y++;
+    }
+    if (!clicked || app.clicks != 1 || !consumeDirty()) { deleteTree(tree); return false; }
+
+    Element wip = app.render();
+    list<Patch> p = default;
+    tree = reconcile(tree, wip, &p);
+    bool oneInsert = countOp(&p, PATCH_INSERT) == 1;
+
+    tree.layout(0, 0, 24);
+    Surface after; after.init(24, 10); after.fill(' '); tree.paint(&after);
+    int afterCorners = countChar(&after, '+');     // outer + one nested box: 8
+
+    deleteTree(tree);
+    return oneInsert && beforeCorners == 4 && afterCorners == 8;
+}
+
+int selfTest()
+{
+    int pass = 0; int total = 0;
+    total++; if (testResizeScaling()) pass++; else printf("  FAIL: resize scaling\n");
+    total++; if (testClickAddsBox())  pass++; else printf("  FAIL: click adds nested box\n");
+
+    if (pass == total)
+    {
+        printf("PASS: box self-tests %d/%d (resize scaling, click -> nested box)\n", pass, total);
+        return 0;
+    }
+    printf("FAIL: box self-tests %d/%d\n", pass, total);
+    return 1;
+}
+
+// ── Interactive host loop ─────────────────────────────────────────────────────
+
+// Minimal repaint: blit only the rows of `back` that differ from `front`, then
+// sync front <- back. Pass full=true to force a complete repaint.
+void flushFrame(Terminal* term, Surface* front, Surface* back, int height, bool full)
+{
+    int r = 0;
+    while (r < height)
+    {
+        if (full || back.rowDiffers(front, r))
+        {
+            char* line = back.row(r);
+            term.moveTo(r + 1, 1);
+            printf("%s", line);
+            free((void*)line);
+        }
+        r++;
+    }
+    front.copyFrom(back);
+    term.flush();
+}
+
+// Render the whole tree fresh into `back` and full-paint. Used for the first
+// frame and after a resize (a size change does not produce reconcile patches, so
+// it cannot ride the incremental path - we rebuild and repaint everything).
+move Element repaintAll(BoxApp* app, Terminal* term, Surface* front, Surface* back,
+                       move Element tree, int w, int h)
+{
+    deleteTree(tree);
+    Element fresh = app.render();
+    fresh.layout(0, 0, w);
+    back.fill(' ');
+    fresh.paint(back);
+    term.clear();
+    flushFrame(term, front, back, h, true);
+    return fresh;
+}
+
+int runApp(BoxApp* app)
+{
+    Terminal term;
+    if (!term.init())
+        return selfTest();   // redirected I/O: run the deterministic self-test
+
+    term.hideCursor();
+
+    int w = 0;
+    int h = 0;
+    if (!term.getSize(&w, &h)) { w = 80; h = 25; }
+    app.termW = w; app.termH = h;
+
+    // Double buffer: paint into `back`, diff against `front`, blit only changed rows.
+    Surface front; front.init(w, h);
+    Surface back;  back.init(w, h);
+
+    Element tree = app.render();
+    tree.layout(0, 0, w);
+    back.fill(' ');
+    tree.paint(&back);
+    flushFrame(&term, &front, &back, h, true);   // first frame: full paint
+
+    bool running = true;
+    while (running)
+    {
+        i32 evt = 0;
+        KeyEvent key;
+        MouseEvent mouse;
+        if (term.pollEvent(&evt, &key, &mouse))
+        {
+            if (evt == 1)
+            {
+                if (key.vkCode == VK_ESCAPE) running = false;
+            }
+            else if (evt == 2)
+            {
+                if (mouse.isPress() && mouse.leftButton())
+                    tree.handleClick((int)mouse.x, (int)mouse.y);
+            }
+        }
+        else
+        {
+            os.windows.Sleep(16);
+        }
+
+        // Live resize: pollEvent does not surface size events, so poll getSize and
+        // rebuild + full-repaint when the window dimensions change.
+        int nw = 0; int nh = 0;
+        if (term.getSize(&nw, &nh) && nw > 0 && nh > 0 && (nw != w || nh != h))
+        {
+            w = nw; h = nh;
+            app.termW = w; app.termH = h;
+            front.init(w, h);
+            back.init(w, h);
+            tree = repaintAll(app, &term, &front, &back, tree, w, h);
+        }
+
+        // Drain the dirty flag: re-render + reconcile only when a click changed
+        // state, then repaint only the rows that actually differ.
+        if (consumeDirty())
+        {
+            Element wip = app.render();
+            list<Patch> patches = default;
+            tree = reconcile(tree, wip, &patches);
+            if (patches.count() > 0)
+            {
+                tree.layout(0, 0, w);
+                back.fill(' ');
+                tree.paint(&back);
+                flushFrame(&term, &front, &back, h, false);   // minimal repaint
+            }
+        }
+    }
+
+    deleteTree(tree);
+    term.showCursor();
+    term.restore();
+    return 0;
+}
+
+extern int main()
+{
+    BoxApp app;
+    app.clicks = 0;
+    return runApp(&app);
+}

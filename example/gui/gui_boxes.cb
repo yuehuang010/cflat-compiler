@@ -1,0 +1,59 @@
+// gui_boxes.cb - the resizable-box demo rendered through the native Win32 GDI
+// host instead of the terminal.
+//
+// This is the SAME app shape as example/ui/boxes.cb (a resizable outer Box; each
+// click of "add box" nests one more small box inside) but it renders to a real
+// window with GDI. Nothing in the framework changed between the two - only the
+// host (win32host.cb's GdiCanvas + message loop) differs from the TUI host. That
+// is the whole point of the Canvas seam: swap the draw target, reuse the tree,
+// the reconciler, and the model layer unchanged.
+//
+// The outer box is sized from hostWidth()/hostHeight() (the host's window-size
+// hook, in character cells), so it rescales live when you resize the window.
+//
+// Build & run:
+//   x64/Release/cflat.exe example/gui/gui_boxes.cb -o out/gui_boxes.exe
+//   out\gui_boxes.exe
+//
+// Click "[ add box ]" to nest a box; resize the window to watch the outer box
+// rescale; close the window to quit.
+import "win32host.cb";
+
+class BoxApp : Component
+{
+    int clicks = 0;
+
+    Element render()
+    {
+        // Outer box fills the window (in cells); it rescales on resize because
+        // render() re-reads the host size every time the host rebuilds the tree.
+        Box* root = box(makeStyle(0, hostWidth(), hostHeight()));
+        root.setKey("root");
+
+        Button* add = button("add box", () => { this.clicks = this.clicks + 1; invalidate(); });
+        add.setKey("btn");
+        root.add(add);
+
+        Text* status = text("Boxes: " + this.clicks.toString());
+        status.setKey("status");
+        root.add(status);
+
+        // One small bordered box per click, stacked inside the outer box.
+        int i = 0;
+        while (i < this.clicks)
+        {
+            Box* small = box(makeStyle(0, 8, 3));
+            small.setKey("b" + i.toString());
+            root.add(small);
+            i++;
+        }
+        return root;
+    }
+};
+
+extern int main()
+{
+    BoxApp app;
+    app.clicks = 0;
+    return runAppGui(app, "CFlat UI - Boxes (GDI)");
+}
