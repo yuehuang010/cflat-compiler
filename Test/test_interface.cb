@@ -328,6 +328,13 @@ bool testMultipleInterfaces()
     string s = reader.read();
     result &= Test("multi_iface_read",                  s, "data");
 
+    // Regression: chaining a method directly on the result of an interface method that
+    // returns a by-value type (string) must resolve. The interface call's result needs a
+    // populated return type + struct receiver, else the chained call re-dispatched the
+    // stale method name and failed overload resolution.
+    result &= Test("multi_iface_read_chain_len",        reader.read().length(), 4);
+    result &= Test("multi_iface_read_chain_data",       reader.read().data(), "data");
+
     result &= Test("multi_iface_is_filestream_reader",  reader is FileStream, true);
     result &= Test("multi_iface_is_filestream_writer",  writer is FileStream, true);
 

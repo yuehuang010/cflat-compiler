@@ -5467,6 +5467,10 @@ public:
         auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx + 1));
         auto fnPtr = builder->CreateLoad(ptrTy, fnPtrField);
 
+        // Record the return type so the call site can populate the result's TypeAndValue
+        // (needed for chaining a method on the result, e.g. `e.toJson().data()`).
+        lastCallReturnType = methodInfo->ReturnType;
+
         llvm::Type* retTy = GetType(methodInfo->ReturnType);
         std::vector<llvm::Type*> paramTypes = { ptrTy };
         for (const auto& p : methodInfo->Parameters)

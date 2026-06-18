@@ -977,6 +977,37 @@ bool testStringType()
     return result;
 }
 
+// Regression: a chained access `structValue.field.method()` where `field` is a primitive
+// must bind the FIELD VALUE as the method receiver, not the parent struct. Covers a struct
+// local base and a `this` base inside a member method.
+struct ChainPoint
+{
+    int x = 0;
+    int y = 0;
+    string xStr() { return this.x.toString(); }
+};
+
+bool testChainedFieldUFCS()
+{
+    bool result = true;
+
+    ChainPoint p = default;
+    p.x = 5;
+    p.y = 42;
+
+    // Local struct base: p.x.toString() must operate on x (int), not p (ChainPoint).
+    string sx = p.x.toString();
+    result &= Test("chain_field_local_x", sx.data(), "5");
+    string sy = p.y.toString();
+    result &= Test("chain_field_local_y", sy.data(), "42");
+
+    // `this` base inside a method: this.x.toString().
+    string sthis = p.xStr();
+    result &= Test("chain_field_this", sthis.data(), "5");
+
+    return result;
+}
+
 // Tests the built-in string literal syntax: string s = "...";
 // A string literal is automatically wrapped in a string struct { _ptr, _len }.
 bool testStringLiteral()
@@ -2301,6 +2332,7 @@ extern int main()
     total++; passed += testNewArrayConstructor()            ? 1 : 0;
     total++; passed += testNewAssignNoOwnershipLeak()       ? 1 : 0;
     total++; passed += testStringType()                  ? 1 : 0;
+    total++; passed += testChainedFieldUFCS()            ? 1 : 0;
     total++; passed += testStringLiteral()               ? 1 : 0;
     total++; passed += testFormatString()                ? 1 : 0;
     total++; passed += testIfConst()                     ? 1 : 0;

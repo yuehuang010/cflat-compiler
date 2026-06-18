@@ -10487,6 +10487,33 @@ public:
         return true;
     }
 
+    // Classify a postfix call result into the struct/interface receiver slots so the next
+    // chained '.member'/'.method()' resolves against it. Mirrors the inline classifier used
+    // after the normal (non-interface) call path; the caller clears both slots first.
+    void ClassifyPostfixCallResult(
+        antlr4::ParserRuleContext* ctx,
+        const LLVMBackend::NamedVariable& result,
+        LLVMBackend::NamedVariable& structVar,
+        LLVMBackend::NamedVariable& interfaceVar)
+    {
+        if (result.TypeAndValue.IsInterface)
+        {
+            interfaceVar = result;
+            structVar = {};
+        }
+        else if (result.BaseType && result.BaseType->isStructTy())
+        {
+            structVar = result;
+            interfaceVar = {};
+        }
+        else if (!result.TypeAndValue.TypeName.empty() && result.TypeAndValue.Pointer
+                 && Compiler(ctx)->GetDataStructure(result.TypeAndValue.TypeName).StructType != nullptr)
+        {
+            structVar = result;
+            interfaceVar = {};
+        }
+    }
+
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
@@ -11020,6 +11047,15 @@ public:
                             // Fixed-array field: clear structVar so the subscript handler does not
                             // mistake the parent struct as the operator[] target.
                             structVar = {};
+                        }
+                        else if (namedVar.BaseType != nullptr || namedVar.Primary != nullptr)
+                        {
+                            // Member resolved to a concrete non-struct value (e.g. a primitive
+                            // field `s.x`). Clear structVar/interfaceVar so a following UFCS or
+                            // method call binds the field VALUE as the receiver rather than the
+                            // parent struct left over from the previous chain link.
+                            structVar = {};
+                            interfaceVar = {};
                         }
 
                         break;
@@ -12710,8 +12746,15 @@ public:
                                 );
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                // Populate TypeAndValue from the interface method's return type and
+                                // re-classify the result so a chained member/method call on it works
+                                // (e.g. `e.toJson().data()` or `e.mk().get()`). Without this the result
+                                // has no struct receiver and the chained call re-dispatches the stale name.
+                                if (namedVar.Primary)
+                                    namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 interfaceVar = {};
                                 structVar = {};
+                                ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
                             }
                             else
                             {
@@ -12733,8 +12776,13 @@ public:
                                 namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(extFuncName, allArgs);
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                // Mirror the interface-method path: carry the return type and
+                                // re-classify so a chained call on the result resolves.
+                                if (namedVar.Primary)
+                                    namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 interfaceVar = {};
                                 structVar = {};
+                                ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
                             }
                         }
                         else
