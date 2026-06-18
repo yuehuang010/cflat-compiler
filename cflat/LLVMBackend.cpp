@@ -87,16 +87,18 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
 // source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
 // form. Empty when the import carries no lib clause. Each is resolved to a link argument
 // by ResolveCLinkLib at the header-bind site.
+static std::string DequoteStringLiteral(const std::string& raw)
+{
+    return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
+}
+
 static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> libs;
     auto* lc = imp->libClause();
     if (!lc) return libs;
     for (auto* lit : lc->StringLiteral())
-    {
-        std::string raw = lit->getText();
-        if (raw.size() >= 2) libs.push_back(raw.substr(1, raw.size() - 2));
-    }
+        libs.push_back(DequoteStringLiteral(lit->getText()));
     return libs;
 }
 
@@ -110,7 +112,7 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
         if (!dc->StringLiteral()) continue;
         std::string raw = dc->StringLiteral()->getText();
         if (raw.size() < 2) continue;
-        defines.push_back(raw.substr(1, raw.size() - 2));
+        defines.push_back(DequoteStringLiteral(raw));
     }
     return defines;
 }
@@ -131,10 +133,7 @@ static std::vector<std::string> DequoteImportGroup(CFlatParser::ImportDeclaratio
     auto* grp = imp->importGroup();
     if (!grp) return out;
     for (auto* lit : grp->StringLiteral())
-    {
-        std::string raw = lit->getText();
-        if (raw.size() >= 2) out.push_back(raw.substr(1, raw.size() - 2));
-    }
+        out.push_back(DequoteStringLiteral(lit->getText()));
     return out;
 }
 
@@ -150,9 +149,7 @@ static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
 {
     auto* fc = imp->fromClause();
     if (!fc || !fc->StringLiteral()) return "";
-    std::string raw = fc->StringLiteral()->getText();
-    if (raw.size() < 2) return "";
-    return raw.substr(1, raw.size() - 2);
+    return DequoteStringLiteral(fc->StringLiteral()->getText());
 }
 
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
@@ -312,9 +309,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     xthreadScanLevel_ = args.getXthreadScanLevel();
     // C library bindings: header search dirs, prebuilt import libraries, and defines.
     cIncludeDirs_ = args.getMultiOption("c-include");
-    for (const auto& lib : args.getMultiOption("c-lib"))
-        cLinkLibs_.push_back(lib);
-    cDefines_ = args.getMultiOption("c-define");
+    cLinkLibs_    = args.getMultiOption("c-lib");
+    cDefines_     = args.getMultiOption("c-define");
     // Vcpkg integration options: forward to the resolver. Each is optional - the
     // resolver auto-discovers vcpkg.exe and the manifest when not overridden.
     if (auto p = args.getOption("vcpkg-exe"))      vcpkg_.SetExeOverride(*p);
@@ -339,25 +335,18 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                   << (tuneCpu_.empty() ? effectiveCpu + " (same as target cpu)" : tuneCpu_) << "\n";
     }
 
-    if (exePath)
-    {
-        auto exeDir = std::filesystem::path(*exePath).parent_path();
-        if (!exeDir.empty() && !std::filesystem::exists(exeDir))
+    auto checkOutputDir = [](const std::optional<std::string>& path, const char* flag) -> bool {
+        if (!path) return true;
+        auto dir = std::filesystem::path(*path).parent_path();
+        if (!dir.empty() && !std::filesystem::exists(dir))
         {
-            std::cerr << "Error: output directory '" << exeDir.string() << "' does not exist (-o " << *exePath << ").\n";
+            std::cerr << "Error: output directory '" << dir.string() << "' does not exist (" << flag << " " << *path << ").\n";
             return false;
         }
-    }
-
-    if (lliPath)
-    {
-        auto lliDir = std::filesystem::path(*lliPath).parent_path();
-        if (!lliDir.empty() && !std::filesystem::exists(lliDir))
-        {
-            std::cerr << "Error: output directory '" << lliDir.string() << "' does not exist (--out-lli " << *lliPath << ").\n";
-            return false;
-        }
-    }
+        return true;
+    };
+    if (!checkOutputDir(exePath, "-o") || !checkOutputDir(lliPath, "--out-lli"))
+        return false;
 
     if (!std::filesystem::exists(filename))
     {
@@ -421,20 +410,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             SetCompileTimeMacro("__FILE__", gv, "string");
         }
 
-        // __PLATFORM__: target platform (64 or 32)
-        auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
-        SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
-
-        auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
-        SetCompileTimeMacro("__WIN64__", win64Const, "int");
-        auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
-        SetCompileTimeMacro("__WIN32__", win32Const, "int");
-        auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-        SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
-        // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
-        // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
-        auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-        SetCompileTimeMacro("__X86__", x86Const, "int");
+        SetPlatformMacros();
 
         if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
     }
@@ -1748,18 +1724,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
             gv->setConstant(true);
             SetCompileTimeMacro("__FILE__", gv, "string");
         }
-        auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
-        SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
-        auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
-        SetCompileTimeMacro("__WIN64__", win64Const, "int");
-        auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
-        SetCompileTimeMacro("__WIN32__", win32Const, "int");
-        auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-        SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
-        // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
-        // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
-        auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-        SetCompileTimeMacro("__X86__", x86Const, "int");
+        SetPlatformMacros();
     }
 
     if (!runtimeDir.empty())
@@ -2891,18 +2856,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     RegisterBuiltinString();
     RegisterBuiltinClosure();   // closure fat type as an owning value type (Option A)
 
-    auto platformConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue);
-    SetCompileTimeMacro("__PLATFORM__", platformConst, "int");
-    auto win64Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 64 ? 1 : 0);
-    SetCompileTimeMacro("__WIN64__", win64Const, "int");
-    auto win32Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), platformValue == 32 ? 1 : 0);
-    SetCompileTimeMacro("__WIN32__", win32Const, "int");
-    auto windowsConst = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-    SetCompileTimeMacro("__WINDOWS__", windowsConst, "int");
-    // Target architecture is always x86/Intel today (win64 -> x86_64, win32 -> i686).
-    // Exposed so callers can guard architecture-specific intrinsics like __rdtscp().
-    auto x86Const = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*context), 1);
-    SetCompileTimeMacro("__X86__", x86Const, "int");
+    SetPlatformMacros();
 
     if (runtimeDir.empty()) return false;
     auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";

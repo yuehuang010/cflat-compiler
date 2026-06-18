@@ -264,12 +264,11 @@ int main(int argc, char* argv[])
 
     CompilerManager::Instance().InstallAssertHook();
 
-    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
-    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
-    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
+    for (int crtMode : {_CRT_ASSERT, _CRT_ERROR, _CRT_WARN})
+    {
+        _CrtSetReportMode(crtMode, _CRTDBG_MODE_FILE);
+        _CrtSetReportFile(crtMode, _CRTDBG_FILE_STDERR);
+    }
 
     ArgParser args;
     args.addPositional("filename", "Source file to compile");

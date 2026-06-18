@@ -12,12 +12,16 @@ public:
 	void addFlag(const std::string& name, char shortName, const std::string& description)
 	{
 		m_flags.push_back({ name, shortName, description });
+		m_nameKind[name] = ArgKind::Flag;
+		if (shortName) m_shortToName[shortName] = name;
 	}
 
 	// Register an option that takes a value (e.g. --output foo.ll)
 	void addOption(const std::string& name, char shortName, const std::string& description, const std::string& defaultValue = "")
 	{
 		m_options.push_back({ name, shortName, description, defaultValue });
+		m_nameKind[name] = ArgKind::Option;
+		if (shortName) m_shortToName[shortName] = name;
 		if (!defaultValue.empty())
 			m_optionValues[name] = defaultValue;
 	}
@@ -27,6 +31,8 @@ public:
 	void addMultiOption(const std::string& name, char shortName, const std::string& description)
 	{
 		m_multiOptions.push_back({ name, shortName, description, "" });
+		m_nameKind[name] = ArgKind::MultiOption;
+		if (shortName) m_shortToName[shortName] = name;
 	}
 
 	// Register a named positional argument (for usage display only)
@@ -260,6 +266,7 @@ public:
 	}
 
 private:
+	enum class ArgKind { Flag, Option, MultiOption };
 	struct FlagDef   { std::string name; char shortName; std::string description; };
 	struct OptionDef { std::string name; char shortName; std::string description; std::string defaultValue; };
 	struct PositionalDef { std::string name; std::string description; };
@@ -268,6 +275,9 @@ private:
 	std::vector<OptionDef>      m_options;
 	std::vector<OptionDef>      m_multiOptions;
 	std::vector<PositionalDef>  m_positionals;
+
+	std::unordered_map<std::string, ArgKind> m_nameKind;
+	std::unordered_map<char, std::string>    m_shortToName;
 
 	std::unordered_map<std::string, bool>                     m_flagValues;
 	std::unordered_map<std::string, std::string>              m_optionValues;
@@ -279,33 +289,25 @@ private:
 
 	bool isFlag(const std::string& name) const
 	{
-		for (const auto& f : m_flags)
-			if (f.name == name) return true;
-		return false;
+		auto it = m_nameKind.find(name);
+		return it != m_nameKind.end() && it->second == ArgKind::Flag;
 	}
 
 	bool isOption(const std::string& name) const
 	{
-		for (const auto& o : m_options)
-			if (o.name == name) return true;
-		return false;
+		auto it = m_nameKind.find(name);
+		return it != m_nameKind.end() && it->second == ArgKind::Option;
 	}
 
 	bool isMultiOption(const std::string& name) const
 	{
-		for (const auto& o : m_multiOptions)
-			if (o.name == name) return true;
-		return false;
+		auto it = m_nameKind.find(name);
+		return it != m_nameKind.end() && it->second == ArgKind::MultiOption;
 	}
 
 	std::string resolveShort(char s) const
 	{
-		for (const auto& f : m_flags)
-			if (f.shortName == s) return f.name;
-		for (const auto& o : m_options)
-			if (o.shortName == s) return o.name;
-		for (const auto& o : m_multiOptions)
-			if (o.shortName == s) return o.name;
-		return "";
+		auto it = m_shortToName.find(s);
+		return it != m_shortToName.end() ? it->second : std::string{};
 	}
 };

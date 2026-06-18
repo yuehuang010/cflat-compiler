@@ -250,19 +250,24 @@ private:
         return (platform_ == "win32") ? "x86-windows" : "x64-windows";
     }
 
+    static std::optional<std::string> GetEnv(const char* name)
+    {
+        char buf[1024] = {};
+        size_t len = 0;
+        if (getenv_s(&len, buf, sizeof(buf), name) == 0 && len > 0)
+            return std::string(buf);
+        return std::nullopt;
+    }
+
     // Locate vcpkg.exe. Order: --vcpkg-exe, VCPKG_ROOT, vswhere (VS-bundled), PATH.
     std::string LocateVcpkgExe()
     {
         if (!exeOverride_.empty() && std::filesystem::exists(exeOverride_))
             return exeOverride_;
+        if (auto root = GetEnv("VCPKG_ROOT"))
         {
-            size_t len = 0;
-            char buf[1024] = {};
-            if (getenv_s(&len, buf, sizeof(buf), "VCPKG_ROOT") == 0 && len > 0)
-            {
-                std::filesystem::path p = std::filesystem::path(buf) / "vcpkg.exe";
-                if (std::filesystem::exists(p)) return p.string();
-            }
+            std::filesystem::path p = std::filesystem::path(*root) / "vcpkg.exe";
+            if (std::filesystem::exists(p)) return p.string();
         }
         // VS-bundled: vswhere -> <VSInstall>\VC\vcpkg\vcpkg.exe
         {
@@ -339,14 +344,10 @@ private:
 
         // Machine-wide binary cache so prebuilt packages are shared across cflat projects.
         std::filesystem::path binaryCache;
-        {
-            size_t len = 0;
-            char buf[1024] = {};
-            if (getenv_s(&len, buf, sizeof(buf), "LOCALAPPDATA") == 0 && len > 0)
-                binaryCache = std::filesystem::path(buf) / "cflat" / "vcpkg-cache";
-            else
-                binaryCache = std::filesystem::temp_directory_path(ec) / "cflat-vcpkg-cache";
-        }
+        if (auto appdata = GetEnv("LOCALAPPDATA"))
+            binaryCache = std::filesystem::path(*appdata) / "cflat" / "vcpkg-cache";
+        else
+            binaryCache = std::filesystem::temp_directory_path(ec) / "cflat-vcpkg-cache";
         std::filesystem::create_directories(binaryCache, ec);
         _putenv_s("VCPKG_DEFAULT_BINARY_CACHE", binaryCache.string().c_str());
         _putenv_s("VCPKG_FEATURE_FLAGS", "manifests,binarycaching");

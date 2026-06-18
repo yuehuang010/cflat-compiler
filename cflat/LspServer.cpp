@@ -28,7 +28,7 @@ namespace {
 // URI <-> file path conversion
 std::string uriToFilePath(const std::string& uri)
 {
-    if (uri.size() < 8 || uri.substr(0, 8) != "file:///")
+    if (uri.size() < 8 || uri.compare(0, 8, "file:///") != 0)
         return uri;
     std::string path = uri.substr(8);  // strip "file:///"
     std::string result;
@@ -59,6 +59,8 @@ std::string filePathToUri(const std::string& path)
     }
     return uri;
 }
+
+static bool isWordChar(char c) { return std::isalnum((unsigned char)c) || c == '_'; }
 
 // Return the text of a single line (0-based) from document text.
 static std::string getLineText(const std::string& text, int line)
@@ -133,7 +135,6 @@ std::unordered_map<std::string, int> scanIdentifierOccurrences(const std::string
 {
     std::unordered_map<std::string, int> counts;
     auto isWordStart = [](char c) { return std::isalpha((unsigned char)c) || c == '_'; };
-    auto isWord      = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
 
     size_t i = 0, n = text.size();
     while (i < n)
@@ -170,7 +171,7 @@ std::unordered_map<std::string, int> scanIdentifierOccurrences(const std::string
         if (isWordStart(c))
         {
             size_t start = i;
-            while (i < n && isWord(text[i])) i++;
+            while (i < n && isWordChar(text[i])) i++;
             counts[text.substr(start, i - start)]++;
             continue;
         }
@@ -182,30 +183,13 @@ std::unordered_map<std::string, int> scanIdentifierOccurrences(const std::string
 // Extract the word (identifier) at a given 0-based line/character position in text.
 std::string extractWordAt(const std::string& text, int line, int character)
 {
-    int currentLine = 0;
-    size_t lineStart = 0;
-    for (size_t i = 0; i < text.size(); ++i)
-    {
-        if (text[i] == '\n')
-        {
-            if (currentLine == line)
-                break;
-            currentLine++;
-            lineStart = i + 1;
-        }
-    }
+    std::string lineText = getLineText(text, line);
     size_t col = static_cast<size_t>(character);
-    size_t lineEnd = text.find('\n', lineStart);
-    if (lineEnd == std::string::npos) lineEnd = text.size();
-    std::string lineText = text.substr(lineStart, lineEnd - lineStart);
-
     if (col >= lineText.size()) return {};
-
-    auto isWord = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
     size_t start = col;
-    while (start > 0 && isWord(lineText[start - 1])) start--;
+    while (start > 0 && isWordChar(lineText[start - 1])) start--;
     size_t end = col;
-    while (end < lineText.size() && isWord(lineText[end])) end++;
+    while (end < lineText.size() && isWordChar(lineText[end])) end++;
     return lineText.substr(start, end - start);
 }
 
@@ -213,27 +197,12 @@ std::string extractWordAt(const std::string& text, int line, int character)
 // Returns {"", ""} if the character before the cursor (or before any partial word) is not '.'.
 std::pair<std::string, std::string> extractReceiverAt(const std::string& text, int line, int character)
 {
-    int currentLine = 0;
-    size_t lineStart = 0;
-    for (size_t i = 0; i < text.size(); ++i)
-    {
-        if (text[i] == '\n')
-        {
-            if (currentLine == line) break;
-            currentLine++;
-            lineStart = i + 1;
-        }
-    }
-    size_t lineEnd = text.find('\n', lineStart);
-    if (lineEnd == std::string::npos) lineEnd = text.size();
-    std::string lineText = text.substr(lineStart, lineEnd - lineStart);
-
+    std::string lineText = getLineText(text, line);
     size_t col = static_cast<size_t>(character) < lineText.size() ? static_cast<size_t>(character) : lineText.size();
-    auto isWord = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
 
     // Scan backward over any partial identifier typed after the dot
     size_t partialStart = col;
-    while (partialStart > 0 && isWord(lineText[partialStart - 1]))
+    while (partialStart > 0 && isWordChar(lineText[partialStart - 1]))
         partialStart--;
     std::string partial = lineText.substr(partialStart, col - partialStart);
 
@@ -245,7 +214,7 @@ std::pair<std::string, std::string> extractReceiverAt(const std::string& text, i
     size_t dotPos = partialStart - 1;
     size_t recvEnd = dotPos;
     size_t recvStart = dotPos;
-    while (recvStart > 0 && isWord(lineText[recvStart - 1]))
+    while (recvStart > 0 && isWordChar(lineText[recvStart - 1]))
         recvStart--;
     if (recvStart == recvEnd) return {"", ""};
 
@@ -436,17 +405,14 @@ private:
                     text = change.value("text", "");
         }
 
-        {
-            std::lock_guard<std::mutex> lock(docsMutex_);
-            if (auto it = docs_.find(uri); it != docs_.end())
-                it->second.text = text;
-        }
-
         std::string filePath;
         {
             std::lock_guard<std::mutex> lock(docsMutex_);
             if (auto it = docs_.find(uri); it != docs_.end())
+            {
+                it->second.text = text;
                 filePath = it->second.filePath;
+            }
         }
         ScheduleAnalysis(uri, filePath, text, /*immediate=*/false);
     }
@@ -486,6 +452,17 @@ private:
         PublishDiagnostics(uri, {});
     }
 
+    static void ExtractTextDocPosition(const nlohmann::json& params, std::string& uri, int& line, int& character)
+    {
+        if (params.contains("textDocument") && params["textDocument"].is_object())
+            uri = params["textDocument"].value("uri", "");
+        if (params.contains("position") && params["position"].is_object())
+        {
+            line      = params["position"].value("line",      0);
+            character = params["position"].value("character", 0);
+        }
+    }
+
     void HandleHover(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
         if (!msg.contains("params") || !msg["params"].is_object())
@@ -494,13 +471,7 @@ private:
 
         std::string uri;
         int line = 0, character = 0;
-        if (params.contains("textDocument") && params["textDocument"].is_object())
-            uri = params["textDocument"].value("uri", "");
-        if (params.contains("position") && params["position"].is_object())
-        {
-            line      = params["position"].value("line",      0);
-            character = params["position"].value("character", 0);
-        }
+        ExtractTextDocPosition(params, uri, line, character);
 
         std::string text;
         {
@@ -537,13 +508,7 @@ private:
 
         std::string uri;
         int line = 0, character = 0;
-        if (params.contains("textDocument") && params["textDocument"].is_object())
-            uri = params["textDocument"].value("uri", "");
-        if (params.contains("position") && params["position"].is_object())
-        {
-            line      = params["position"].value("line",      0);
-            character = params["position"].value("character", 0);
-        }
+        ExtractTextDocPosition(params, uri, line, character);
 
         std::string text;
         std::string filePath;

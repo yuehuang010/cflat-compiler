@@ -124,24 +124,7 @@ struct GenericTemplateState
     // when the tuple is reached only via a return type before its producer was code-generated.
     std::unordered_map<std::string, std::vector<std::string>>                   tupleTypeArgs;
 
-    void Clear()
-    {
-        genericStructTemplates.clear();
-        genericClassTemplates.clear();
-        genericStructTypeParams.clear();
-        instantiatedGenerics.clear();
-        genericStructConstraints.clear();
-        genericClassConstraints.clear();
-        genericInterfaceTemplates.clear();
-        genericInterfaceTypeParams.clear();
-        instantiatedInterfaces.clear();
-        genericFunctionTemplates.clear();
-        genericFunctionTypeParams.clear();
-        genericFunctionConstraints.clear();
-        instantiatedGenericFunctions.clear();
-        pendingInstantiations.clear();
-        tupleTypeArgs.clear();
-    }
+    void Clear() { *this = GenericTemplateState{}; }
 };
 
 struct CompilerAbortException {
@@ -452,14 +435,8 @@ public:
 
         int IsFloatingPoint() const
         {
-            if (TypeName == "float")
-                return 32;
-
-            if (TypeName == "double")
-            {
-                return 64;
-            }
-
+            if (TypeName == "float")  return 32;
+            if (TypeName == "double") return 64;
             return -1;
         }
 
@@ -1190,7 +1167,7 @@ private:
 
 
 private:
-    llvm::Function* createFunctionProto(std::string name, llvm::FunctionType* returnType)
+    llvm::Function* createFunctionProto(const std::string& name, llvm::FunctionType* returnType)
     {
         auto fn = llvm::Function::Create(returnType, llvm::Function::ExternalLinkage, name, *module);
 
@@ -2550,7 +2527,7 @@ private:
     void RunBaselinePasses();
     void OptimizeModule(int optimizationLevel);
 
-    bool SaveToFile(std::string filename)
+    bool SaveToFile(const std::string& filename)
     {
         std::error_code errorCode;
         llvm::raw_fd_ostream outLL(filename, errorCode);
@@ -2563,7 +2540,7 @@ private:
         return true;
     }
 
-    bool WriteBitcode(std::string filename)
+    bool WriteBitcode(const std::string& filename)
     {
         std::error_code errorCode;
         llvm::raw_fd_ostream outBC(filename, errorCode, llvm::sys::fs::OF_None);
@@ -4078,6 +4055,7 @@ private:
         if (funcMacros.empty()) return;
 
         std::string generated;
+        generated.reserve(funcMacros.size() * 60);
         size_t accepted = 0, rejected = 0, skipped = 0;
 
         for (const auto& m : funcMacros)
@@ -4895,7 +4873,7 @@ private:
         }
     }
 
-    Operation ParseOperation(std::string operationText)
+    Operation ParseOperation(const std::string& operationText)
     {
         if (operationText == "+") { return Operation::Add; }
         else if (operationText == "*") { return Operation::Multiply; }
@@ -8103,7 +8081,7 @@ public:
         return GetType(tv);
     }
 
-    llvm::FunctionType* GetFunctionType(LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false, bool externC = false)
+    llvm::FunctionType* GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false, bool externC = false)
     {
         std::vector<llvm::Type*> types;
         types.reserve(arguments.size());
@@ -8117,7 +8095,7 @@ public:
         return llvm::FunctionType::get(retTy, types, varargs);
     }
 
-    std::string ComputeMangledName(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool varargs = false)
+    std::string ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false)
     {
         std::string argumentString = {};
 
@@ -8133,7 +8111,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, size_t scopeLine = 0)
+    llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, size_t scopeLine = 0)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -8375,6 +8353,10 @@ public:
                 resolvedTypeName = nsResolved;
         }
 
+        // resolvedTypeName is final; hoist the struct/interface map lookups once.
+        auto dsIt = dataStructures.find(resolvedTypeName);
+        bool isInterface = interfaceTable.count(resolvedTypeName) > 0;
+
         if (resolvedTypeName == "void") { type = builder->getVoidTy(); }
         else if (resolvedTypeName == "char" || resolvedTypeName == "i8" || resolvedTypeName == "u8") { type = builder->getInt8Ty(); }
         else if (resolvedTypeName == "short" || resolvedTypeName == "i16" || resolvedTypeName == "u16") { type = builder->getInt16Ty(); }
@@ -8388,7 +8370,7 @@ public:
         else
         {
             // Check if it is an interface type first
-            if (interfaceTable.count(resolvedTypeName) > 0)
+            if (isInterface)
             {
                 auto* fatTy = GetFatPtrType();
                 if (typeAndValue.ElemPointer)
@@ -8399,10 +8381,9 @@ public:
             }
             else
             {
-                auto result = dataStructures.find(resolvedTypeName);
-                if (result != dataStructures.end())
+                if (dsIt != dataStructures.end())
                 {
-                    type = result->second.StructType;
+                    type = dsIt->second.StructType;
                 }
                 else
                 {
@@ -8901,9 +8882,9 @@ public:
         return nullptr; // not an atomic builtin
     }
 
-    llvm::Value* CreateOverloadedFunctionCall(std::string functionName, std::vector<LLVMBackend::NamedVariable> arguments, bool forceRoot = false)
+    llvm::Value* CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot = false)
     {
-        functionName = ResolveQualifiedName(functionName, forceRoot);
+        std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
 
         // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
         // one generated on demand (the "every value type has an implicit copy() if undefined"
@@ -9433,7 +9414,7 @@ public:
         return result;
     }
 
-    llvm::Function* GetFunction(std::string functionName)
+    llvm::Function* GetFunction(const std::string& functionName)
     {
         auto functionSym = functionTable.find(functionName);
 
@@ -9516,7 +9497,7 @@ public:
         return overloads.front().Function;
     }
 
-    NamedVariable GetLocalVariable(std::string name)
+    NamedVariable GetLocalVariable(const std::string& name)
     {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -9546,7 +9527,7 @@ public:
     /// <summary>
     /// Get the member variable from a member function.
     /// </summary>
-    NamedVariable GetMemberVariable(std::string name)
+    NamedVariable GetMemberVariable(const std::string& name)
     {
         for (const auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -9561,7 +9542,7 @@ public:
                 for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
                 {
                     const auto& key = it->first;
-                    if (key.size() >= 2 && key.substr(key.size() - 2) == "__")
+                    if (key.size() >= 2 && key[key.size() - 2] == '_' && key.back() == '_')
                     {
                         thisIt = it;
                         break;
@@ -9916,7 +9897,7 @@ public:
         }
     }
 
-    llvm::GlobalVariable* GetGlobalVariable(std::string name)
+    llvm::GlobalVariable* GetGlobalVariable(const std::string& name)
     {
         auto result = globalNamedVariable.find(name);
         if (result != globalNamedVariable.end())
@@ -9954,6 +9935,16 @@ public:
         compileTimeMacros[name] = {name, value, type};
     }
 
+    void SetPlatformMacros()
+    {
+        auto i32 = llvm::Type::getInt32Ty(*context);
+        SetCompileTimeMacro("__PLATFORM__", llvm::ConstantInt::get(i32, platformValue),            "int");
+        SetCompileTimeMacro("__WIN64__",    llvm::ConstantInt::get(i32, platformValue == 64 ? 1 : 0), "int");
+        SetCompileTimeMacro("__WIN32__",    llvm::ConstantInt::get(i32, platformValue == 32 ? 1 : 0), "int");
+        SetCompileTimeMacro("__WINDOWS__",  llvm::ConstantInt::get(i32, 1),                        "int");
+        SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, 1),                        "int");
+    }
+
     CompileTimeMacro GetCompileTimeMacro(const std::string& name)
     {
         auto it = compileTimeMacros.find(name);
@@ -9962,7 +9953,7 @@ public:
         return {"", nullptr, ""};
     }
 
-    StructData GetDataStructure(std::string structName)
+    StructData GetDataStructure(const std::string& structName)
     {
         auto result = dataStructures.find(structName);
         if (result != dataStructures.end())
@@ -10073,60 +10064,39 @@ public:
         return ci; // Direct return
     }
 
-    llvm::Value* CreateFunctionCall(llvm::Function* func, std::vector<llvm::Value*> arg)
+    llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg)
     {
         // Perform Default Argument Promotions for Variadic arguments
+        std::vector<llvm::Value*> callArgs;
         if (func->isVarArg())
         {
-            std::vector<llvm::Value*> newArg;
             size_t varArgStart = func->arg_size();
             for (auto value : arg)
             {
                 if (varArgStart > 0)
                 {
                     auto destArgument = func->getArg(static_cast<unsigned int>(func->arg_size() - varArgStart));
-                    auto srcArg = Upconvert(value, destArgument);
-                    newArg.push_back(srcArg);
+                    callArgs.push_back(Upconvert(value, destArgument));
                     varArgStart--;
                     continue;
                 }
-
                 auto valueType = value->getType();
-
-                // Convert 16bit 32bit float to double and non-32bit int to 64bit.
+                // Convert 8/16-bit int to 32-bit and 16-bit/float to double (default argument promotions).
                 if (valueType->isIntegerTy(8) || valueType->isIntegerTy(16))
-                {
-                    auto newValue = builder->CreateSExt(value, builder->getInt32Ty(), "conv");
-                    newArg.push_back(newValue);
-                }
+                    callArgs.push_back(builder->CreateSExt(value, builder->getInt32Ty(), "conv"));
                 else if (valueType->is16bitFPTy() || valueType->isFloatTy())
-                {
-                    auto newValue = builder->CreateFPExt(value, builder->getDoubleTy(), "conv");
-                    newArg.push_back(newValue);
-                }
+                    callArgs.push_back(builder->CreateFPExt(value, builder->getDoubleTy(), "conv"));
                 else
-                {
-                    newArg.push_back(value);
-                }
+                    callArgs.push_back(value);
             }
-
-            arg = newArg;
         }
         else
         {
-            std::vector<llvm::Value*> newArg;
-
-            for (int i = 0; i < arg.size(); i++)
-            {
-                auto srcArgument = arg[i];
-                auto destArgument = func->getArg(i);
-                newArg.push_back(Upconvert(srcArgument, destArgument));
-            }
-
-            arg = newArg;
+            for (int i = 0; i < (int)arg.size(); i++)
+                callArgs.push_back(Upconvert(arg[i], func->getArg(i)));
         }
 
-        auto* ci = builder->CreateCall(func, arg);
+        auto* ci = builder->CreateCall(func, callArgs);
         ci->setCallingConv(func->getCallingConv());
         return ci;
     }

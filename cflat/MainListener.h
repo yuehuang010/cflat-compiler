@@ -662,18 +662,18 @@ private:
                 if (ArrayPtrOf(declSpec))
                 {
                     if (declType.IsArrayView)
-                        std::cerr << std::format("error: pointer to array-view '{}[]*' is not a valid type. "
+                        compiler->LogError(std::format("pointer to array-view '{}[]*' is not a valid type. "
                             "To return several results, return one 'T[]' and pass the rest as out-parameters: "
-                            "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.\n",
-                            declType.TypeName);
+                            "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.",
+                            declType.TypeName));
                     else
-                        std::cerr << std::format("error: pointer to fixed array '{}[N]*' is not a valid type; "
-                            "pass '{}*' (a fixed array decays to a pointer to its first element).\n",
-                            declType.TypeName, declType.TypeName);
+                        compiler->LogError(std::format("pointer to fixed array '{}[N]*' is not a valid type; "
+                            "pass '{}*' (a fixed array decays to a pointer to its first element).",
+                            declType.TypeName, declType.TypeName));
                 }
                 declType.IsInterface = compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
-                    std::cerr << std::format("error: pointer '*' is not allowed on interface type '{}'\n", declType.TypeName);
+                    compiler->LogError(std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
                 if (declType.IsInterface)
                 {
                     declType.IsInterfacePointer = declSpec->pointer() != nullptr;
@@ -683,7 +683,7 @@ private:
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
-                        std::cerr << std::format("error: nullable '?' is not allowed on primitive type '{}'\n", declType.TypeName);
+                        compiler->LogError(std::format("nullable '?' is not allowed on primitive type '{}'", declType.TypeName));
                     else
                     {
                         declType.IsNullable = true;
@@ -4138,10 +4138,10 @@ public:
 
                         auto* nextCheck = compiler->CreateBasicBlock("typeswitch_next");
 
-                        if (compiler->dataStructures.count(entry.typeCaseName))
+                        if (auto dsIt = compiler->dataStructures.find(entry.typeCaseName); dsIt != compiler->dataStructures.end())
                         {
                             // Concrete struct case: single type descriptor comparison
-                            auto& sd = compiler->dataStructures[entry.typeCaseName];
+                            auto& sd = dsIt->second;
                             if (!sd.typeDescriptor)
                             {
                                 LogErrorContext(expression, std::format("struct '{}' has no type descriptor", entry.typeCaseName));
@@ -4546,7 +4546,7 @@ public:
         }
     }
 
-    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, std::string structName = {}, std::string namespaceName = {}, const std::string& nameOverride = {})
+    void ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::string& nameOverride = {})
     {
         auto* compiler = Compiler(func);
         // Create Function Definition
@@ -7628,9 +7628,11 @@ public:
         antlr4::ParserRuleContext* ctx)
     {
         auto* compiler = Compiler(ctx);
-        if (!compiler->dataStructures.count("stream")) return;  // stream.cb not imported - arena-only
+        auto streamDsIt = compiler->dataStructures.find("stream");
+        if (streamDsIt == compiler->dataStructures.end()) return;  // stream.cb not imported - arena-only
+        auto& streamDs = streamDsIt->second;
 
-        auto* streamTy = compiler->dataStructures["stream"].StructType;
+        auto* streamTy = streamDs.StructType;
         auto* ctorFn   = compiler->GetFunction("stream");
         auto* initFn   = FindStreamMethodFn(compiler, "init");
         if (!ctorFn || !initFn)
@@ -7647,7 +7649,7 @@ public:
 
         // Mark _autoClose = true so the producer trampoline closes it after main() returns.
         unsigned autoCloseIdx = (unsigned)-1;
-        const auto& fields = compiler->dataStructures["stream"].StructFields;
+        const auto& fields = streamDs.StructFields;
         for (unsigned i = 0; i < fields.size(); ++i)
             if (fields[i].VariableName == "_autoClose") { autoCloseIdx = i; break; }
         if (autoCloseIdx != (unsigned)-1)
@@ -9583,7 +9585,7 @@ public:
             // into exactly two parts (covers primitives and string); otherwise skip coercion.
             std::string keyType, valType;
             {
-                std::string args = typeName.substr(std::string("dictionary__").size());
+                std::string args = typeName.substr(12);  // strlen("dictionary__")
                 size_t sep = args.find("__");
                 if (sep != std::string::npos && args.find("__", sep + 2) == std::string::npos)
                 {
@@ -9609,8 +9611,8 @@ public:
 
         // list<T> / array<T>: every element must be positional.
         const std::string elemType = isList
-            ? typeName.substr(std::string("list__").size())
-            : typeName.substr(std::string("array__").size());
+            ? typeName.substr(6)   // strlen("list__")
+            : typeName.substr(7);  // strlen("array__")
 
         for (auto* fi : elements)
         {
@@ -13690,45 +13692,32 @@ public:
                         for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                         {
                             auto localIt = frame.namedVariable.find(name);
+                            auto addCapture = [&](const LLVMBackend::NamedVariable& nv)
+                            {
+                                if (!nv.Storage) return;
+                                seenNames.insert(name);
+                                CaptureInfo ci;
+                                ci.Name = name;
+                                ci.TV   = nv.TypeAndValue;
+                                ci.OuterStorage = nv.Storage;
+                                // string is a value type ({i8*,i32}): its methods take string by value,
+                                // so it must be value-captured like primitives to avoid pointer mismatch.
+                                ci.ByReference = !ci.TV.Pointer
+                                    && !ci.TV.IsFunctionPointer
+                                    && !ci.TV.IsPrimitive()
+                                    && ci.TV.TypeName != "string"
+                                    && compiler->dataStructures.count(ci.TV.TypeName);
+                                captures.push_back(ci);
+                            };
                             if (localIt != frame.namedVariable.end())
                             {
-                                const auto& nv = localIt->second;
-                                if (nv.Storage)
-                                {
-                                    seenNames.insert(name);
-                                    CaptureInfo ci;
-                                    ci.Name = name;
-                                    ci.TV   = nv.TypeAndValue;
-                                    ci.OuterStorage = nv.Storage;
-                                    // string is a value type ({i8*,i32}): its methods take string by value,
-                                    // so it must be value-captured like primitives to avoid pointer mismatch.
-                                    ci.ByReference  = !ci.TV.Pointer
-                                        && !ci.TV.IsFunctionPointer
-                                        && !ci.TV.IsPrimitive()
-                                        && ci.TV.TypeName != "string"
-                                        && compiler->dataStructures.count(ci.TV.TypeName);
-                                    captures.push_back(ci);
-                                }
+                                addCapture(localIt->second);
                                 break;
                             }
                             auto argIt = frame.functionArgument.find(name);
                             if (argIt != frame.functionArgument.end())
                             {
-                                const auto& nv = argIt->second;
-                                if (nv.Storage)
-                                {
-                                    seenNames.insert(name);
-                                    CaptureInfo ci;
-                                    ci.Name = name;
-                                    ci.TV   = nv.TypeAndValue;
-                                    ci.OuterStorage = nv.Storage;
-                                    ci.ByReference  = !ci.TV.Pointer
-                                        && !ci.TV.IsFunctionPointer
-                                        && !ci.TV.IsPrimitive()
-                                        && ci.TV.TypeName != "string"
-                                        && compiler->dataStructures.count(ci.TV.TypeName);
-                                    captures.push_back(ci);
-                                }
+                                addCapture(argIt->second);
                                 break;
                             }
                         }
@@ -15360,13 +15349,7 @@ public:
     // The mode suffix is handled by the caller via GetLockArgMode().
     std::string GetLockArgCanonical(CFlatParser::ExpressionContext* expr)
     {
-        std::string text = expr->getText();
-        // Strip trailing .read or .write (soft keywords for rwlock mode)
-        if (text.size() > 5 && text.substr(text.size() - 5) == ".read")
-            return text.substr(0, text.size() - 5);
-        if (text.size() > 6 && text.substr(text.size() - 6) == ".write")
-            return text.substr(0, text.size() - 6);
-        return text;
+        return StripLockModeSuffix(expr->getText());
     }
 
     // Returns "read", "write", or "" (mutex / default exclusive) for the lock arg expression.
@@ -15491,8 +15474,8 @@ public:
         unsigned inboxArenaIdx = compiler->programTable[name].InboxArenaFieldIndex;
 
         auto* stopSrcDisposeFn = FindMethodOf("dispose", "stop_source");
-        auto* stopSrcType      = compiler->dataStructures.count("stop_source")
-                                 ? compiler->dataStructures["stop_source"].StructType : nullptr;
+        auto stopSrcIt = compiler->dataStructures.find("stop_source");
+        auto* stopSrcType = stopSrcIt != compiler->dataStructures.end() ? stopSrcIt->second.StructType : nullptr;
 
         // Load self->_allocator (IAllocator fat-ptr)
         auto* dtor_allocFieldGEP = compiler->builder->CreateStructGEP(
@@ -15568,14 +15551,14 @@ public:
 
         // Resolve types - all must be concrete by this point (ProcessPendingInstantiations ran)
         auto* progType        = compiler->dataStructures[name].StructType;
-        auto* defAllocType    = compiler->dataStructures.count("MallocAllocator")
-                                ? compiler->dataStructures["MallocAllocator"].StructType : nullptr;
-        auto* listStringType  = compiler->dataStructures.count("list__string")
-                                ? compiler->dataStructures["list__string"].StructType : nullptr;
-        auto* stringStructType= compiler->dataStructures.count("string")
-                                ? compiler->dataStructures["string"].StructType : nullptr;
-        auto* threadType      = compiler->dataStructures.count("Thread")
-                                ? compiler->dataStructures["Thread"].StructType : nullptr;
+        auto findStructType = [&](const std::string& name) -> llvm::StructType* {
+            auto it = compiler->dataStructures.find(name);
+            return it != compiler->dataStructures.end() ? it->second.StructType : nullptr;
+        };
+        auto* defAllocType    = findStructType("MallocAllocator");
+        auto* listStringType  = findStructType("list__string");
+        auto* stringStructType= findStructType("string");
+        auto* threadType      = findStructType("Thread");
         auto* fatTy           = compiler->GetFatPtrType();   // {i8*, i8*}
 
         if (!progType || !defAllocType || !listStringType || !threadType)
