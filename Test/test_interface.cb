@@ -665,6 +665,247 @@ bool testMoveReturnClosureInterface()
     return gNodeDtorCount == 2;
 }
 
+// =============================================================
+// String + interface coverage
+// Exercises owned strings flowing through: inherited interface chains,
+// interface values held in containers, owned string FIELDS dispatched via
+// an interface, and an interface-typed FIELD inside a class.
+// =============================================================
+
+// A base interface declares a string-returning method; the child interface
+// inherits it and adds its own. A concrete class backs both with OWNED string
+// fields. The inherited name() must dispatch correctly through BOTH the child
+// and the parent fat pointer, and every returned owned string must be correct
+// and freed exactly once.
+
+interface INamed
+{
+    string name();
+};
+
+interface IDescribed : INamed
+{
+    string describe();
+};
+
+int gAnimalDtorCount = 0;
+
+class Animal : IDescribed
+{
+    string nm = default;
+    string species = default;
+    string name()     { return nm; }                          // owned copy of field
+    string describe() { return name() + " the " + species; }  // chains inherited method
+    ~Animal() { gAnimalDtorCount = gAnimalDtorCount + 1; }
+};
+
+// ── Test 18: owned strings through an inherited interface chain ──────────────
+bool testStringInheritedInterfaceChain()
+{
+    bool result = true;
+    gAnimalDtorCount = 0;
+
+    Animal a;
+    a.nm = "Rex";
+    a.species = "dog";
+
+    // Dispatch through the CHILD interface view.
+    IDescribed d = a;
+    result &= Test("inh_child_name",      d.name(),     "Rex");
+    result &= Test("inh_child_describe",  d.describe(), "Rex the dog");
+
+    // Dispatch the inherited name() through the PARENT interface view.
+    INamed n = a;
+    result &= Test("inh_parent_name",     n.name(),     "Rex");
+
+    // Cast a child interface value UP to the parent interface, then dispatch
+    // the inherited string method through the parent fat pointer.
+    IDescribed d2 = a;
+    INamed n2 = d2 as INamed;
+    result &= Test("inh_cast_up_nonnull", n2 is Animal, true);
+    result &= Test("inh_cast_up_name",    n2.name(),    "Rex");
+
+    // Heap object boxed into the interface; delete frees the concrete (and its
+    // owned string fields) exactly once.
+    Animal* ha = new Animal();
+    ha.nm = "Mimi";
+    ha.species = "cat";
+    IDescribed hd = ha;
+    result &= Test("inh_heap_describe",   hd.describe(), "Mimi the cat");
+    delete hd;
+    result &= Test("inh_heap_dtor_once",  gAnimalDtorCount, 1);
+
+    return result;
+}
+
+// ── Test 19: list<Interface> of string-returning interface values ────────────
+bool testStringInterfaceList()
+{
+    bool result = true;
+
+    list<INamed> names;
+
+    Animal a1; a1.nm = "Ann";  a1.species = "x"; names.add(a1);
+    Animal a2; a2.nm = "Bob";  a2.species = "y"; names.add(a2);
+    Animal a3; a3.nm = "Cara"; a3.species = "z"; names.add(a3);
+
+    result &= Test("list_iface_str_count", names.count(),   3);
+    result &= Test("list_iface_str_get0",  names[0].name(), "Ann");
+    result &= Test("list_iface_str_get2",  names[2].name(), "Cara");
+
+    // Accumulate every interface-dispatched owned string in a foreach. Each
+    // reassignment of 'joined' must free the previous owned buffer (no leak).
+    string joined = "";
+    for (INamed nm in names)
+        joined = joined + nm.name() + ",";
+    result &= Test("list_iface_str_joined", joined, "Ann,Bob,Cara,");
+
+    return result;
+}
+
+// ── Test 20: channel<Interface> carrying string-returning interface values ───
+bool testStringInterfaceChannel()
+{
+    bool result = true;
+
+    channel<INamed> ch;
+    ch.init(4);
+
+    Animal a1; a1.nm = "Sky"; a1.species = "q"; ch.send(a1);
+    Animal a2; a2.nm = "Sea"; a2.species = "w"; ch.send(a2);
+
+    INamed r0 = ch.receive();
+    INamed r1 = ch.receive();
+
+    result &= Test("chan_iface_str_recv0", r0.name(), "Sky");
+    result &= Test("chan_iface_str_recv1", r1.name(), "Sea");
+
+    ch.destroy();
+    return result;
+}
+
+// An owned string field mutated through an interface: setLabel reassigns the
+// owned field (old buffer must be freed), label() returns an owned copy.
+interface IBox
+{
+    string label();
+    void setLabel(string s);
+};
+
+int gLabelBoxDtorCount = 0;
+
+class LabelBox : IBox
+{
+    string lbl = default;
+    string label()          { return lbl; }
+    void setLabel(string s) { lbl = s; }
+    ~LabelBox() { gLabelBoxDtorCount = gLabelBoxDtorCount + 1; }
+};
+
+// ── Test 21: owned string field read/mutated through an interface ────────────
+bool testStringFieldThroughInterface()
+{
+    bool result = true;
+    gLabelBoxDtorCount = 0;
+
+    LabelBox* b = new LabelBox();
+    b.lbl = "initial";
+    IBox box = b;
+
+    result &= Test("field_iface_initial",    box.label(), "initial");
+
+    // Store an owned interpolated string through the interface; old field freed.
+    int count = 7;
+    box.setLabel("count={count}");
+    result &= Test("field_iface_after_set",  box.label(), "count=7");
+
+    // Reassign again - exercises the owned-field reassignment path via vtable.
+    box.setLabel("final");
+    result &= Test("field_iface_reassigned", box.label(), "final");
+
+    // label() returns a BORROW of the field, so an independent snapshot needs
+    // an explicit `.copy()`. The copy must survive a LATER store to the field
+    // (without .copy() the snapshot would alias the field buffer, which is then
+    // freed by the next setLabel - the original borrow-into-local dangle).
+    string snapshot = box.label().copy();
+    box.setLabel("changed");
+    result &= Test("field_iface_snapshot_survives", snapshot,    "final");
+    result &= Test("field_iface_current",           box.label(), "changed");
+
+    delete box;
+    result &= Test("field_iface_dtor_once", gLabelBoxDtorCount, 1);
+
+    return result;
+}
+
+int gMovedLabelLen = 0;
+
+// Consumes a moved interface owning a string field: the field is readable in
+// the callee, and delete frees the concrete (and its string) exactly once.
+void consumeBox(move IBox b)
+{
+    gMovedLabelLen = b.label().length();
+    delete b;
+}
+
+// ── Test 22: move an interface owning a string field into a callee ───────────
+bool testStringFieldMoveInterface()
+{
+    bool result = true;
+    gLabelBoxDtorCount = 0;
+
+    LabelBox* b = new LabelBox();
+    b.lbl = "greetings";
+    IBox box = b;
+    consumeBox(box);                       // ownership moves in
+    result &= Test("field_move_label_len",  gMovedLabelLen, 9);
+    result &= Test("field_move_dtor_once",  gLabelBoxDtorCount, 1);
+
+    return result;
+}
+
+// An interface-typed FIELD inside a class. The field is a borrow (assigning a
+// concrete into it does NOT transfer ownership); the outer class dispatches a
+// string method through the stored interface value.
+class Container : INamed
+{
+    IDescribed inner = default;
+    string tag = default;
+    string name() { return tag + ":" + inner.name(); }
+};
+
+// ── Test 23: interface-typed field dispatching owned strings ─────────────────
+bool testInterfaceFieldString()
+{
+    bool result = true;
+    gAnimalDtorCount = 0;
+
+    Animal* a = new Animal();
+    a.nm = "Leo";
+    a.species = "lion";
+
+    Container* c = new Container();
+    c.tag = "zoo";
+    c.inner = a;                           // borrow: 'a' still owns the Animal
+
+    // Dispatch the inherited / child string methods through the interface field.
+    result &= Test("iface_field_inner_name",     c.inner.name(),     "Leo");
+    result &= Test("iface_field_inner_describe", c.inner.describe(), "Leo the lion");
+    // The outer method combines an owned field string with a field-dispatched one.
+    result &= Test("iface_field_outer_name",     c.name(),           "zoo:Leo");
+
+    // Box the outer object into an interface too - dispatch through two layers.
+    // Boxing a heap pointer into a local interface transfers ownership of 'c'.
+    INamed outer = c;
+    result &= Test("iface_field_outer_via_iface", outer.name(),      "zoo:Leo");
+
+    delete outer;                          // frees the Container (and its tag) once
+    delete a;                              // frees the borrowed Animal once
+    result &= Test("iface_field_inner_dtor_once", gAnimalDtorCount, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -687,6 +928,12 @@ extern int main()
     total++; passed += testDeleteThroughInterface() ? 1 : 0;
     total++; passed += testMoveInterfaceParam()     ? 1 : 0;
     total++; passed += testMoveReturnClosureInterface() ? 1 : 0;
+    total++; passed += testStringInheritedInterfaceChain() ? 1 : 0;
+    total++; passed += testStringInterfaceList()         ? 1 : 0;
+    total++; passed += testStringInterfaceChannel()      ? 1 : 0;
+    total++; passed += testStringFieldThroughInterface() ? 1 : 0;
+    total++; passed += testStringFieldMoveInterface()    ? 1 : 0;
+    total++; passed += testInterfaceFieldString()        ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

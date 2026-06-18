@@ -345,6 +345,71 @@ int testParamStringToField()
     return passed;
 }
 
+// ── borrowed owning-string field read into a local (field -> local regression) ────────
+// `string snap = obj.method()` (a plain method returning a field) and `string snap = obj.field`
+// (a direct field read) both bind a non-owning BORROW of the field's buffer. A later store to
+// the same field frees that buffer, so the local must hold an INDEPENDENT owned copy to survive
+// (and so a heap object can be deleted while a snapshot is still live). Regression: before the
+// fix the local aliased the field buffer and read garbage after a reassignment, and corrupted
+// the heap on delete (a non-heap/pool pointer got freed).
+class LabelHolder
+{
+    string lbl = default;
+    string label() { return lbl; }
+    void setLabel(string s) { lbl = s; }
+};
+
+interface ILabel
+{
+    string label();
+    void setLabel(string s);
+};
+
+class HeapLabel : ILabel
+{
+    string lbl = default;
+    string label() { return lbl; }
+    void setLabel(string s) { lbl = s; }
+    ~HeapLabel() { }
+};
+
+int testBorrowStringFieldIntoLocal()
+{
+    int passed = 0;
+
+    // A method return is a BORROW of the field, so an independent snapshot needs `.copy()`;
+    // it then survives a later setter store to the same field.
+    {
+        LabelHolder p;
+        p.setLabel("final");
+        string snap = p.label().copy();
+        p.setLabel("changed");
+        passed += Test("borrow_field_method_read_survives", snap, "final");
+    }
+
+    // Snapshot taken via a direct field read survives a later setter store.
+    {
+        LabelHolder q;
+        q.setLabel("final");
+        string snapQ = q.lbl;
+        q.setLabel("changed");
+        passed += Test("borrow_field_direct_read_survives", snapQ, "final");
+    }
+
+    // Heap object via an interface: a `.copy()` snapshot survives delete (no crash, no corruption);
+    // the field's owned buffer is freed exactly once by the destructor on delete.
+    {
+        ILabel b = new HeapLabel();
+        b.setLabel("final");
+        string snap = b.label().copy();
+        b.setLabel("changed");
+        delete b;
+        passed += Test("borrow_field_heap_snapshot_after_delete", snap, "final");
+    }
+
+    return passed;
+}
+
 // ── value struct with an owning string field, moved into a list<T> via add() ──────────
 // `list<T>.add(move T value)` MOVES the struct into `_data[i]`, so the list becomes the
 // sole owner of each element's owning string field. Reading elements back - especially via
@@ -587,6 +652,9 @@ extern int main()
 
     passed += testStructWithStringFieldIntoList();
     total += 2;
+
+    passed += testBorrowStringFieldIntoLocal();
+    total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

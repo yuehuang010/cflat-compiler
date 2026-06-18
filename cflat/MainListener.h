@@ -5694,6 +5694,7 @@ public:
                         // already transfers; a call result / .copy() owns an independent buffer with
                         // null srcStorage) and non-variable sources (field/element accesses, whose
                         // Storage is a GEP not an alloca/global) - those are not whole-variable moves.
+                        bool didDeepCopyBorrowString = false;
                         if (right->getType()->isStructTy()
                             && srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
@@ -5737,6 +5738,34 @@ public:
                                 if (typeAndValue.TypeName == "string")
                                     compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                             }
+                        }
+                        // String BORROW bound to an owning local via a DIRECT read of an owning string
+                        // FIELD the local does not own: `string x = obj.name`. srcBorrowsOwnedString
+                        // flags this statically (FieldName + OwningStructName known). The struct keeps
+                        // sole ownership, so ALWAYS deep-copy - x must hold an independent owned buffer
+                        // or it dangles once obj frees/reassigns the field (setter store, `delete obj`).
+                        // x is flagged owning so the borrow taint below is suppressed and x is treated
+                        // as a true owner (its unconditional owned-bit-gated dtor frees the copy).
+                        //
+                        // A plain function/method RESULT (`string x = obj.label()`) is deliberately NOT
+                        // handled here: the runtime OWNED bit means only "a heap buffer exists", not
+                        // "ownership transfers to you", so it cannot distinguish a returned field borrow
+                        // from a returned owned temp. Binding a borrowed return to a plain owning local
+                        // is an inherent ambiguity - the caller must use `.copy()` for an independent
+                        // string (exactly what the owning-string-into-field diagnostics recommend).
+                        else if (typeAndValue.TypeName == "string"
+                            && !typeAndValue.Pointer
+                            && right->getType()->isStructTy()
+                            && initializer != nullptr
+                            && initializer->assignmentExpression() != nullptr
+                            && !srcIsMove
+                            && !srcIsAlias
+                            && !srcMovableTempField
+                            && srcBorrowsOwnedString)
+                        {
+                            right = compiler->EmitOwnedStringDeepCopy(right);
+                            compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                            didDeepCopyBorrowString = true;
                         }
 
                         compiler->CreateAssignment(right, alloc, srcIsUnsigned);
@@ -5787,7 +5816,8 @@ public:
                         // Taint a string local that borrows an owning string field, so storing it
                         // into another field is rejected as a laundered field-to-field copy. An implied
                         // move (above) makes the local a true owner, not a borrow, so skip the taint.
-                        if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString && !srcMovableTempField)
+                        if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString
+                            && !srcMovableTempField && !didDeepCopyBorrowString)
                             compiler->stackNamedVariable.back().namedVariable[name].BorrowsOwnedString = true;
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
