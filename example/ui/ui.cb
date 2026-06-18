@@ -1,0 +1,635 @@
+// ui.cb - a small React-Native-style declarative UI library for CFlat.
+//
+// Design (see internal/plan/ui-framework-v1.md for the long-form rationale):
+//   - Element is an interface; every host node (View/Text/Button) implements it.
+//   - Nodes are heap-allocated and owned by their parent through the Element
+//     interface; teardown walks the tree via destroyTree().
+//   - Children are list<Element> (avoids the T[] length-inference gap).
+//   - Events are function<void()> closures with automatic capture.
+//   - v1 does not render; it serializes the tree to a renderer-friendly JSON
+//     shape: { "type": ..., "props": {...}, "children": [...] }.
+
+import "list.cb";
+import "string.cb";
+
+// Shared layout/style props. Plain value struct carried by host elements.
+struct Style
+{
+    int padding = 0;
+    int width = 0;
+    int height = 0;
+};
+
+Style makeStyle(int padding, int width, int height)
+{
+    Style s = default;
+    s.padding = padding;
+    s.width = width;
+    s.height = height;
+    return s;
+}
+
+bool styleIsEmpty(Style s)
+{
+    return s.padding == 0 && s.width == 0 && s.height == 0;
+}
+
+string styleToJson(Style s)
+{
+    return "{\"padding\":" + s.padding.toString()
+         + ",\"width\":" + s.width.toString()
+         + ",\"height\":" + s.height.toString() + "}";
+}
+
+// ── Rect: an absolute cell rectangle assigned during layout ──────────────────
+// Each node stores its own bounds so paint and hit-testing agree on geometry.
+struct Rect
+{
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+
+    bool contains(int px, int py)
+    {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+};
+
+// ── Surface: a headless width x height character grid ─────────────────────────
+// Nodes paint into a Surface; the host then blits it to the terminal. Keeping
+// paint off the real console makes layout/paint/hit-test deterministically
+// testable with no console attached. Mirrors TerminalSnapshot in core/terminal.cb.
+struct Surface
+{
+    char* _buf  = nullptr;
+    int   width  = 0;
+    int   height = 0;
+
+    void init(int w, int h)
+    {
+        if (_buf != nullptr) free((void*)_buf);
+        width  = w;
+        height = h;
+        _buf = (char*)malloc((i64)(w * h));
+        this.fill(' ');
+    }
+
+    void fill(char c)
+    {
+        int n = width * height;
+        int i = 0;
+        while (i < n) { _buf[i] = c; i++; }
+    }
+
+    // Write one cell, clipping silently when out of bounds.
+    void put(int x, int y, char c)
+    {
+        if (x < 0 || x >= width || y < 0 || y >= height) return;
+        _buf[y * width + x] = c;
+    }
+
+    // Write s starting at (x, y), clipping at the grid edges.
+    void text(int x, int y, const char* s)
+    {
+        int i = 0;
+        while (s[i] != '\0')
+        {
+            this.put(x + i, y, s[i]);
+            i++;
+        }
+    }
+
+    // Heap-allocated null-terminated copy of row r with trailing spaces trimmed.
+    // Caller frees. Same idiom as TerminalSnapshot.getRow.
+    char* row(int r)
+    {
+        char* out = (char*)malloc((i64)(width + 1));
+        int i = 0;
+        while (i < width) { out[i] = _buf[r * width + i]; i++; }
+        int end = width;
+        while (end > 0 && out[end - 1] == ' ') end--;
+        out[end] = '\0';
+        return out;
+    }
+
+    // True if text appears on any single row (does not match across row breaks).
+    bool contains(const char* text)
+    {
+        int tlen = strlen(text);
+        if (tlen == 0) return true;
+        int row = 0;
+        while (row < height)
+        {
+            int col = 0;
+            while (col <= width - tlen)
+            {
+                int j = 0;
+                bool match = true;
+                while (j < tlen)
+                {
+                    if (_buf[row * width + col + j] != text[j]) { match = false; break; }
+                    j++;
+                }
+                if (match) return true;
+                col++;
+            }
+            row++;
+        }
+        return false;
+    }
+
+    // True if row r differs from the same row of `o`. Drives minimal repaint:
+    // the host paints into a back buffer, then blits only the rows that changed.
+    bool rowDiffers(Surface* o, int r)
+    {
+        if (o.width != width || o.height != height) return true;
+        int base = r * width;
+        int i = 0;
+        while (i < width) { if (_buf[base + i] != o._buf[base + i]) return true; i++; }
+        return false;
+    }
+
+    // Copy another same-sized surface's cells into this one (front <- back).
+    void copyFrom(Surface* src)
+    {
+        if (src.width != width || src.height != height) return;
+        int n = width * height;
+        int i = 0;
+        while (i < n) { _buf[i] = src._buf[i]; i++; }
+    }
+
+    ~Surface()
+    {
+        if (_buf != nullptr) { free((void*)_buf); _buf = nullptr; }
+    }
+};
+
+// Node-kind tags - returned by Element.kind() so the reconciler can compare node
+// types WITHOUT an `as` downcast (which would hit the open Bug 9 UAF path).
+int ELEM_VIEW      = 1;
+int ELEM_TEXT      = 2;
+int ELEM_BUTTON    = 3;
+int ELEM_COMPONENT = 4;
+
+// The node interface. Typed host structs implement these so the tree can be
+// walked uniformly (serialize, layout, paint, hit-test, reconcile, teardown)
+// while keeping props compile-checked.
+//   - layout assigns this node's bounds and returns the rows it consumed.
+//   - paint draws self (and children) into the grid using bounds.
+//   - handleClick returns true if the point hit an interactive node, after
+//     firing its action. Dispatch is virtual on purpose: the host never
+//     downcasts a child, it lets each node decide if the hit is its own.
+//   - kind / propsSig / childList drive the reconciler: kind() compares node
+//     type, propsSig() is a string signature of a node's own props for change
+//     detection, childList() exposes a View's children (nullptr for leaves).
+interface Element
+{
+    string toJson();
+    void destroyTree();
+    int  layout(int x, int y, int availW);
+    void paint(Surface* s);
+    bool handleClick(int x, int y);
+    int  kind();
+    string propsSig();
+    list<Element>* childList();
+    string keyOf();          // "" if unkeyed; drives keyed child reconciliation
+    void setKey(string k);
+};
+
+// ── View: a container with a style and children ──────────────────────────────
+class View : Element
+{
+    Style style = default;
+    list<Element> children = default;
+    Rect bounds = default;
+    string key = default;
+
+    void add(Element child)
+    {
+        this.children.add(child);
+    }
+
+    // Stack children top-to-bottom, inset by the style padding on all sides.
+    int layout(int x, int y, int availW)
+    {
+        int pad = this.style.padding;
+        int cy = y + pad;
+        for (Element c in this.children)
+            cy = cy + c.layout(x + pad, cy, availW - 2 * pad);
+
+        int h = (cy - y) + pad;
+        Rect b = default;
+        b.x = x; b.y = y; b.w = availW; b.h = h;
+        this.bounds = b;
+        return h;
+    }
+
+    void paint(Surface* s)
+    {
+        for (Element c in this.children)
+            c.paint(s);
+    }
+
+    bool handleClick(int x, int y)
+    {
+        for (Element c in this.children)
+        {
+            if (c.handleClick(x, y))
+                return true;
+        }
+        return false;
+    }
+
+    string toJson()
+    {
+        string out = "{\"type\":\"View\"";
+        if (!styleIsEmpty(this.style))
+            out = out + ",\"style\":" + styleToJson(this.style);
+
+        out = out + ",\"children\":[";
+        int i = 0;
+        for (Element c in this.children)
+        {
+            if (i > 0)
+                out = out + ",";
+            out = out + c.toJson();
+            i++;
+        }
+        out = out + "]}";
+        return out;
+    }
+
+    // Recursively free the owning child subtree (descendants first, then each
+    // child node), then drop the now-dangling list entries.
+    void destroyTree()
+    {
+        for (Element c in this.children)
+        {
+            c.destroyTree();
+            delete c;
+        }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_VIEW; }
+    string propsSig() { return styleToJson(this.style); }
+    list<Element>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── Text: a leaf displaying a string ─────────────────────────────────────────
+class Text : Element
+{
+    string text = default;
+    Rect bounds = default;
+    string key = default;
+
+    string toJson()
+    {
+        return "{\"type\":\"Text\",\"text\":\"" + this.text + "\"}";
+    }
+
+    int layout(int x, int y, int availW)
+    {
+        Rect b = default;
+        b.x = x; b.y = y; b.w = (int)this.text.length(); b.h = 1;
+        this.bounds = b;
+        return 1;
+    }
+
+    void paint(Surface* s)
+    {
+        s.text(this.bounds.x, this.bounds.y, this.text.data());
+    }
+
+    bool handleClick(int x, int y) { return false; }
+
+    void destroyTree() { }
+
+    int kind() { return ELEM_TEXT; }
+    // "T:" prefix keeps Text and Button signatures distinct even for equal content.
+    string propsSig() { return "T:" + this.text; }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// ── Button: a leaf with a label and a click handler ──────────────────────────
+class Button : Element
+{
+    string label = default;
+    function<void()> onClick = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireClick()
+    {
+        this.onClick();
+    }
+
+    string toJson()
+    {
+        return "{\"type\":\"Button\",\"label\":\"" + this.label
+             + "\",\"clickable\":true}";
+    }
+
+    // Rendered as "[ label ]", so the width is the label plus the 4 framing chars.
+    int layout(int x, int y, int availW)
+    {
+        Rect b = default;
+        b.x = x; b.y = y; b.w = (int)this.label.length() + 4; b.h = 1;
+        this.bounds = b;
+        return 1;
+    }
+
+    void paint(Surface* s)
+    {
+        string rendered = "[ " + this.label + " ]";
+        s.text(this.bounds.x, this.bounds.y, rendered.data());
+    }
+
+    bool handleClick(int x, int y)
+    {
+        if (this.bounds.contains(x, y))
+        {
+            this.fireClick();
+            return true;
+        }
+        return false;
+    }
+
+    void destroyTree() { }
+
+    int kind() { return ELEM_BUTTON; }
+    string propsSig() { return "B:" + this.label; }
+    list<Element>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// Convenience constructors returning the concrete heap pointer (so callers can
+// set typed props), assignable to an Element slot at the use site.
+View* view(Style style)
+{
+    View* v = new View();
+    v.style = style;
+    return v;
+}
+
+// Plain string params: assigning an alias/param to an owning-string field
+// deep-copies, so the field keeps its own buffer after the arg is freed.
+Text* text(string s)
+{
+    Text* t = new Text();
+    t.text = s;
+    return t;
+}
+
+Button* button(string label, function<void()> onClick)
+{
+    Button* b = new Button();
+    b.label = label;
+    b.onClick = onClick;
+    return b;
+}
+
+// Tear down and free an entire owning tree: descendants first (via the node's
+// own destroyTree), then the root node itself. `move` transfers ownership of the
+// root in, so the delete is authorized; delete dispatches virtually.
+void deleteTree(move Element root)
+{
+    root.destroyTree();
+    delete root;
+}
+
+// ── Reconciler / patch stream ─────────────────────────────────────────────────
+//
+// reconcile() diffs a freshly-rendered WIP tree against the committed (live)
+// tree, mutating the committed tree in place and recording what changed as a
+// list<Patch>. It keeps a single owning tree across renders: unchanged nodes keep
+// their identity; changed nodes are swapped in from the WIP tree; the rest of the
+// WIP tree is freed. The patch log is in-memory only (not a serialized wire
+// format - that, and OTA, are deliberately out of scope here).
+
+int PATCH_UPDATE  = 0;   // a leaf's props changed (committed leaf swapped for the new one)
+int PATCH_REPLACE = 1;   // node type changed at a slot
+int PATCH_INSERT  = 2;   // a new child was added
+int PATCH_REMOVE  = 3;   // a child was dropped (and freed)
+
+struct Patch
+{
+    int    op       = 0;          // PATCH_*
+    int    nodeKind = 0;          // ELEM_* of the affected node
+    string detail   = default;    // human-readable, for tests/debug
+};
+
+Patch makePatch(int op, int nodeKind, string detail)
+{
+    Patch p = default;
+    p.op = op;
+    p.nodeKind = nodeKind;
+    p.detail = detail;
+    return p;
+}
+
+// Index of the first element in `pool` whose key equals `key`, or -1. Used to
+// match keyed children by identity instead of position (so middle insert/remove
+// and reorder preserve the right nodes).
+int indexByKey(list<Element>* pool, string key)
+{
+    int i = 0;
+    while (i < pool.count())
+    {
+        string ek = pool.get(i).keyOf();
+        bool match = ek == key;
+        if (match) return i;
+        i++;
+    }
+    return -1;
+}
+
+// Diff `wip` into `committed`, appending patches. Returns the node to keep in the
+// committed tree (usually `committed`; the WIP node on a replace/leaf-update).
+// Frees whichever subtree it discards. Ownership of both args transfers in.
+move Element reconcile(move Element committed, move Element wip, list<Patch>* patches)
+{
+    // Different node type at this slot: replace the whole subtree.
+    if (committed.kind() != wip.kind())
+    {
+        patches.add(makePatch(PATCH_REPLACE, wip.kind(), "replace"));
+        deleteTree(committed);
+        return wip;
+    }
+
+    // Same type. Leaves: compare prop signatures. Bind the signatures to locals so
+    // the owned temporary strings are reclaimed (a bare `a() != b()` leaks them).
+    list<Element>* kids = committed.childList();
+    if (kids == nullptr)
+    {
+        string oldSig = committed.propsSig();
+        string newSig = wip.propsSig();
+        bool changed = oldSig != newSig;
+        if (changed)
+        {
+            // Adopt the new leaf (new props, and a fresh onClick for Button).
+            patches.add(makePatch(PATCH_UPDATE, wip.kind(), "update"));
+            deleteTree(committed);
+            return wip;
+        }
+        // Unchanged: keep the committed node's identity, drop the WIP node.
+        deleteTree(wip);
+        return committed;
+    }
+
+    // Same type, container (View): reconcile children by index.
+    list<Element>* newKids = wip.childList();
+    int newN = newKids.count();
+
+    // Drain committed's children into a staging list so we can rebuild in order.
+    list<Element> staged = default;
+    while (kids.count() > 0)
+        staged.add(kids.take(0));
+
+    int i = 0;
+    while (i < newN)
+    {
+        Element newC = newKids.take(0);
+
+        // Match a committed child to reuse: by key if this child is keyed (so it
+        // can move position), else positionally from the front of the staged list.
+        string k = newC.keyOf();
+        int idx = -1;
+        if (k.length() > 0) idx = indexByKey(&staged, k);
+        else if (staged.count() > 0) idx = 0;
+
+        if (idx >= 0)
+        {
+            Element oldC = staged.take(idx);
+            kids.add(reconcile(oldC, newC, patches));
+        }
+        else
+        {
+            patches.add(makePatch(PATCH_INSERT, newC.kind(), "insert"));
+            kids.add(newC);
+        }
+        i++;
+    }
+
+    // Any committed children left over were removed.
+    while (staged.count() > 0)
+    {
+        Element rem = staged.take(0);
+        patches.add(makePatch(PATCH_REMOVE, rem.kind(), "remove"));
+        deleteTree(rem);
+    }
+
+    // WIP children all drained; free just the WIP container shell.
+    // (View style itself is treated as stable in this phase - see v3 plan.)
+    deleteTree(wip);
+    return committed;
+}
+
+// ── Update scheduling (model layer) ───────────────────────────────────────────
+//
+// A component mutates its state in an event handler, then calls invalidate() to
+// mark the UI dirty. The host drains the flag once per loop (consumeDirty) and,
+// only when set, re-renders + reconciles. This decouples input from rendering: a
+// click that changes nothing (no invalidate) triggers no re-render. Single-app,
+// single-threaded scheduler - a global flag is sufficient and keeps the model
+// layer minimal.
+bool _uiDirty = false;
+
+void invalidate() { _uiDirty = true; }
+
+// Return whether a render is pending, clearing the flag.
+bool consumeDirty()
+{
+    bool d = _uiDirty;
+    _uiDirty = false;
+    return d;
+}
+
+// A component renders itself to a host Element tree.
+interface Component
+{
+    Element render();
+};
+
+// ── ComponentElement: a reconciler node wrapping a component's rendered subtree ─
+//
+// Lets a parent render child components as nodes in its own tree. A parent owns
+// its child components (e.g. list<Counter*>) and, each render, re-mounts them by
+// key; the reconciler matches ComponentElements by key (kind ELEM_COMPONENT) and
+// descends into the single inner child, so each child's subtree - and the state
+// behind it - keeps its identity across add/remove/reorder. The wrapper has no
+// style of its own; layout/paint/hit-test delegate to the inner subtree.
+class ComponentElement : Element
+{
+    list<Element> inner = default;   // exactly one child: the component's render()
+    Rect bounds = default;
+    string key = default;
+
+    int layout(int x, int y, int availW)
+    {
+        int h = 0;
+        for (Element c in this.inner)
+            h = h + c.layout(x, y + h, availW);
+        Rect b = default;
+        b.x = x; b.y = y; b.w = availW; b.h = h;
+        this.bounds = b;
+        return h;
+    }
+
+    void paint(Surface* s)
+    {
+        for (Element c in this.inner)
+            c.paint(s);
+    }
+
+    bool handleClick(int x, int y)
+    {
+        for (Element c in this.inner)
+        {
+            if (c.handleClick(x, y))
+                return true;
+        }
+        return false;
+    }
+
+    string toJson()
+    {
+        string out = "{\"type\":\"Component\",\"child\":";
+        for (Element c in this.inner)
+            out = out + c.toJson();
+        return out + "}";
+    }
+
+    void destroyTree()
+    {
+        for (Element c in this.inner)
+        {
+            c.destroyTree();
+            delete c;
+        }
+        this.inner.clear();
+    }
+
+    int kind() { return ELEM_COMPONENT; }
+    string propsSig() { return ""; }
+    list<Element>* childList() { return &this.inner; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+};
+
+// Render a component now and wrap its subtree as a keyed reconciler node. The
+// component itself is owned by the caller (typically a parent component holding
+// its children by pointer); mount only renders it, it does not take ownership.
+ComponentElement* mount(Component c, string key)
+{
+    ComponentElement* ce = new ComponentElement();
+    ce.setKey(key);
+    ce.inner.add(c.render());
+    return ce;
+}

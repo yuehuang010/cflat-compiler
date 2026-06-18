@@ -1,0 +1,60 @@
+// counter.cb - exercises the ui.cb library.
+//
+// Builds a Counter component, renders it to a host tree, serializes to JSON,
+// then reaches into the tree, downcasts the Button via `as`, and fires its
+// click handler twice. The handler captures `this` and mutates component
+// state, so re-rendering reflects the new count. Finally the tree is torn down.
+
+import "ui.cb";
+
+class Counter : Component
+{
+    int count = 0;
+
+    Element render()
+    {
+        View* root = view(makeStyle(16, 0, 0));
+        root.add(text("Count: " + this.count.toString()));
+        root.add(button("+1", () => { this.count = this.count + 1; }));
+        return root;
+    }
+};
+
+extern int main()
+{
+    Counter c;
+    c.count = 0;
+
+    // First render: Count: 0
+    Element tree = c.render();
+    printf("render 1: %s\n", tree.toJson().data());
+
+    // Reach the Button (children[1]) and fire its onClick twice.
+    View* rootView = tree as View;
+    if (rootView == nullptr)
+    {
+        printf("ERROR: root is not a View\n");
+        return 1;
+    }
+
+    Button* inc = rootView.children[1] as Button;
+    if (inc == nullptr)
+    {
+        printf("ERROR: child[1] is not a Button\n");
+        return 1;
+    }
+
+    inc.fireClick();
+    inc.fireClick();
+
+    printf("count after 2 clicks: %d\n", c.count);
+
+    // Re-render reflects the mutated state: Count: 2.
+    // NOTE: tree teardown is intentionally omitted (v1 leak posture). Both
+    // `delete <interface>` AND recursive destroyTree() over list<Element> children
+    // are currently broken - see internal/issue/delete-through-interface-invalid-bitcast.md.
+    Element tree2 = c.render();
+    printf("render 2: %s\n", tree2.toJson().data());
+
+    return 0;
+}

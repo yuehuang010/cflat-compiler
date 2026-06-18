@@ -1315,6 +1315,12 @@ private:
     void RegisterOwnedStringTemp(llvm::Value* value)
     {
         if (value == nullptr) return;
+        // Idempotent: an SSA value owns exactly one buffer, so it must be freed once.
+        // A comparison operand that is an operator+ result is registered here both by
+        // TryBinaryOperatorOverload and by the comparison operand pass - dedup avoids a
+        // double free at flush.
+        for (const auto& e : pendingOwnedStringTemps)
+            if (e.first == value) return;
         pendingOwnedStringTemps.emplace_back(value, builder->GetInsertBlock());
     }
 
@@ -1485,6 +1491,13 @@ private:
         // Clean up owning function parameters (move params)
         for (const auto& [varName, namedVar] : frame.functionArgument)
         {
+            // A `move` interface fat-ptr param is owning, but its Storage is a {i8*,i8*} slot,
+            // not a single pointer - so EmitOwningPtrCleanup must not run on it. Interface
+            // ownership is released by an explicit `delete` (interface locals are likewise not
+            // auto-destructed at scope exit); the move flag only authorizes that delete.
+            if (namedVar.IsOwning && namedVar.Storage != nullptr
+                && namedVar.TypeAndValue.IsInterface && !namedVar.TypeAndValue.IsInterfacePointer)
+                continue;
             if (namedVar.IsOwning && namedVar.Storage != nullptr)
                 EmitOwningPtrCleanup(namedVar);
 
@@ -1589,6 +1602,9 @@ private:
                     .BaseType = fatTy,
                     .Primary = nullptr,
                     .Storage = tmp,
+                    // A `move` interface param takes ownership: mark it owning so 'delete x' is
+                    // permitted (not a borrow) and scope exit destructs it if not deleted.
+                    .IsOwning = itr_nameArg->IsMove,
                 };
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }

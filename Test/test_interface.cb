@@ -588,6 +588,83 @@ bool testDeleteThroughInterface()
     return boxedOk && factoryOk;
 }
 
+// Frees a `move` interface param: ownership must transfer into the function so
+// 'delete x' is permitted (not rejected as a borrow) and frees exactly once.
+void freeMovedInterface(move ICounted x)
+{
+    delete x;
+}
+
+// ── Test 16: move interface parameter takes ownership ────────────────────────
+// 'move <Interface> x' must transfer ownership into the callee so 'delete x' in
+// the body is allowed and frees the concrete object EXACTLY once - mirroring the
+// behaviour of a 'move T*' pointer parameter.
+bool testMoveInterfaceParam()
+{
+    gDelIfaceDtorCount = 0;
+
+    Counted* c = new Counted();
+    c->v = 9;
+    ICounted a = c;
+    freeMovedInterface(a);          // ownership moves in; exactly one destruction, one free
+
+    return gDelIfaceDtorCount == 1;
+}
+
+// Closure-owning node for the move-return regression: its destructor counts
+// destructions so we can prove the concrete object (and the function<> env it
+// owns) is destructed exactly once - no double-free, no leak.
+int gNodeDtorCount = 0;
+
+interface INode { int kind(); };
+
+class ClosureNode : INode
+{
+    function<void()> cb = default;
+    int k = 0;
+    int kind() { return k; }
+    ~ClosureNode() { gNodeDtorCount = gNodeDtorCount + 1; }
+};
+
+INode makeNode(int k)
+{
+    ClosureNode* n = new ClosureNode();
+    n->k = k;
+    n->cb = () => { };
+    return n;
+}
+
+void dropNode(move INode n) { delete n; }
+
+struct NodePatch { int v = 0; };
+NodePatch makeNodePatch(int v) { NodePatch p = default; p.v = v; return p; }
+
+// Move-return of a closure-owning interface AFTER an intervening call (list.add).
+// Ownership of the concrete node (and its function<> env) must transfer to the
+// caller through the move-return; it must not be cloned or freed here.
+move INode reconcileReplace(move INode drop, move INode keep, list<NodePatch>* patches)
+{
+    patches.add(makeNodePatch(keep.kind()));
+    dropNode(drop);
+    return keep;
+}
+
+// ── Test 17: move-return of a closure-owning interface after an intervening call ──
+// Regression for the UI reconciler's replace shape: an intervening call before a
+// move-return must not perturb ownership of a closure-bearing interface value.
+// 'drop' is deleted inside, 'keep' is move-returned and deleted by the caller -
+// each concrete node (with its function<> env) destructed exactly once.
+bool testMoveReturnClosureInterface()
+{
+    gNodeDtorCount = 0;
+    INode a = makeNode(1);
+    INode b = makeNode(2);
+    list<NodePatch> patches;
+    a = reconcileReplace(a, b, &patches);   // deletes original 'a', returns 'b'
+    dropNode(a);                            // caller frees the returned node once
+    return gNodeDtorCount == 2;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -608,6 +685,8 @@ extern int main()
     total++; passed += testListInterfaceSort()   ? 1 : 0;
     total++; passed += testChannelInterface()    ? 1 : 0;
     total++; passed += testDeleteThroughInterface() ? 1 : 0;
+    total++; passed += testMoveInterfaceParam()     ? 1 : 0;
+    total++; passed += testMoveReturnClosureInterface() ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

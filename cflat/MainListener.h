@@ -7108,12 +7108,14 @@ public:
         {
             // Clear lastCallReturnsOwned before each operand: a prior operand would leave it set
             // and the next (possibly a named variable) would be mis-registered and double-freed.
+            // Each owned-string operand that is a call result is a temporary the comparison only
+            // borrows; register it for end-of-statement cleanup (see RegisterComparisonOperandTemp).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseTypeCheckExpression(nextCtxs[0]);
-            TrackOwnedStringOperatorResult(Compiler(ctx), lv.value);
+            RegisterComparisonOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseTypeCheckExpression(nextCtxs[1]);
-            TrackOwnedStringOperatorResult(Compiler(ctx), rv.value);
+            RegisterComparisonOperandTemp(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -7332,16 +7334,16 @@ public:
         }
         else if (nextCtxs.size() == 2)
         {
-            // See ParseEqualityExpression: a move-returning string operand (e.g.
+            // See ParseEqualityExpression: a string operand returned from a call (e.g.
             // `s < other.toString()`) is an owned temp the relational operator only borrows.
-            // Reset lastCallReturnsOwned before each operand and register each owned temp for
-            // end-of-expression cleanup.
+            // Reset lastCallReturnsOwned before each operand and register each call-result
+            // operand for end-of-statement cleanup (see RegisterComparisonOperandTemp).
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto lv = ParseShiftExpression(nextCtxs[0]);
-            TrackOwnedStringOperatorResult(Compiler(ctx), lv.value);
+            RegisterComparisonOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
             auto rv = ParseShiftExpression(nextCtxs[1]);
-            TrackOwnedStringOperatorResult(Compiler(ctx), rv.value);
+            RegisterComparisonOperandTemp(Compiler(ctx), rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx);
@@ -8163,6 +8165,27 @@ public:
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
         if (strTy != nullptr && result->getType() == strTy)
             compiler->RegisterOwnedStringTemp(result);
+    }
+
+    // A comparison (== != < > <= >=) only BORROWS its string operands: it reads their
+    // data/length and returns a bool, taking ownership of neither. When an operand is a
+    // string returned straight from a CALL (a function/method/operator result that was
+    // never bound to a named local), nothing else owns that temporary, so it must be
+    // freed at end-of-statement or it leaks. Register every call-result string operand
+    // for FlushOwnedStringTemps.
+    //   - A named local / field read lowers to a load / insertvalue chain (not a CallInst)
+    //     and is skipped here, so the operand's real owner (its scope destructor) frees it
+    //     exactly once - `localA != localB` does not double free.
+    //   - Registration is idempotent (RegisterOwnedStringTemp dedups), so an operator+
+    //     result already tracked by TryBinaryOperatorOverload is freed once, not twice.
+    //   - string.dtor checks the runtime owned bit, so registering a call that returns a
+    //     borrow (e.g. an `alias string` accessor) is a safe no-op rather than a free.
+    void RegisterComparisonOperandTemp(LLVMBackend* compiler, llvm::Value* operand)
+    {
+        if (operand == nullptr || !llvm::isa<llvm::CallInst>(operand)) return;
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        if (strTy != nullptr && operand->getType() == strTy)
+            compiler->RegisterOwnedStringTemp(operand);
     }
 
     llvm::Value* TryBinaryOperatorOverload(

@@ -484,6 +484,27 @@ extern int main()
         total++; passed += Test("implied-move via return (string)", retText.length(), 5); // "tok55"
         InnerTok retInner = returnMovedInner(9);            // struct field moved out via return
         total++; passed += Test("implied-move via return (struct)", retInner.s.length(), 3); // "in9"
+
+        // Comparison-operand temps from PLAIN (non-`move`) string returns. The compiler does not
+        // flag a plain `string`-returning function as owned, so a result used DIRECTLY as a
+        // comparison operand was never registered for cleanup and leaked (regression: the temp is
+        // now freed at end-of-statement). The comparison only borrows the operands, so freeing the
+        // (single) temp each is correct. Covered for free functions AND member functions, for
+        // ==, !=, and relational <.
+        bool cmpNe = returnOwnedConcat("a") != returnOwnedConcat("b");   // two plain-fn temps
+        total++; passed += Test("plain-fn temp '!=' operands", cmpNe, true);
+        bool cmpEq = returnOwnedConcat("x") == returnOwnedConcat("x");   // == operands
+        total++; passed += Test("plain-fn temp '==' operands", cmpEq, true);
+        bool cmpLt = gr.greet("a") < gr.greet("b");                      // plain member-fn temps
+        total++; passed += Test("plain member-fn temp '<' operands", cmpLt, true);
+
+        // Named owned-string locals as comparison operands must NOT be double-freed: the locals
+        // own the buffers and free once on scope exit; the comparison borrows them and frees
+        // nothing. A double-free here would abort the HeapAudit oracle.
+        string cmpA = returnOwnedConcat("p");
+        string cmpB = returnOwnedConcat("q");
+        bool cmpLocals = cmpA != cmpB;
+        total++; passed += Test("named owned-string locals compared (no double-free)", cmpLocals, true);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===
