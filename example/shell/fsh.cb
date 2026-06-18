@@ -14,6 +14,8 @@
 // Built-in commands (run "help" inside the shell for the full list):
 //   cd dir set echo type copy move del mkdir rmdir ren cls pwd ver wc
 //   alias unalias history where jobs fg kill help exit
+//   Games/demos (in-process, full-screen, ESC to quit):
+//     bitmap minesweeper missile stars tetris
 //
 // Builtins run in-process and cannot be piped, redirected, or backgrounded
 // (prefix with "cmd /c" if you need that). External commands inherit the
@@ -48,6 +50,16 @@ import program "mkdir.cb" as MkdirApp;
 import program "rmdir.cb" as RmdirApp;
 import program "dir.cb"   as DirApp;
 import program "where.cb" as WhereApp;
+
+// Games and graphics demos live one directory up. They are interactive,
+// full-screen terminal programs; like the utility builtins they run in-process
+// on a managed thread that owns the shared console until the player quits
+// (ESC), then restore the terminal and hand control back to the prompt.
+import program "bitmap.cb"           as BitmapApp;
+import program "minesweeper.cb"      as MinesweeperApp;
+import program "missile_defender.cb" as MissileApp;
+import program "stars.cb"            as StarsApp;
+import program "tetris.cb"           as TetrisApp;
 
 // ── Win32 externs not already in os.windows.cb ────────────────────────────────
 
@@ -260,7 +272,7 @@ bool atCommandPosition(i8* buf, int tokenStart)
 // Add builtin command names that case-insensitively start with stub[0..stubLen).
 void addBuiltinMatches(list<string>* matches, i8* stub, int stubLen)
 {
-    const char* names = "cd dir set echo type copy move del erase mkdir md rmdir rd ren rename cls clear wc pwd ver alias unalias history where jobs fg kill help exit";
+    const char* names = "cd dir set echo type copy move del erase mkdir md rmdir rd ren rename cls clear wc pwd ver alias unalias history where jobs fg kill help exit bitmap minesweeper mines missile stars tetris";
     int i = 0;
     while (names[i] != 0)
     {
@@ -1207,6 +1219,14 @@ int cmdVer()
 
 int cmdWc(list<string>* argv)    { Wc w;       IProcess p = w; return runApp(p, argv); }
 
+// Games / graphics demos. Each takes over the console until the player quits,
+// then restores the terminal before returning the prompt.
+int cmdBitmap(list<string>* argv)      { BitmapApp a;      IProcess p = a; return runApp(p, argv); }
+int cmdMinesweeper(list<string>* argv) { MinesweeperApp a; IProcess p = a; return runApp(p, argv); }
+int cmdMissile(list<string>* argv)     { MissileApp a;     IProcess p = a; return runApp(p, argv); }
+int cmdStars(list<string>* argv)       { StarsApp a;       IProcess p = a; return runApp(p, argv); }
+int cmdTetris(list<string>* argv)      { TetrisApp a;      IProcess p = a; return runApp(p, argv); }
+
 int cmdAlias(list<string>* argv)
 {
     if (argv->count() < 2)
@@ -1418,6 +1438,12 @@ int cmdHelp()
     printf("  ver                 Show the shell version\n");
     printf("  help                Show this list\n");
     printf("  exit [code]         Quit the shell\n");
+    printf("\nGames and demos (ESC to quit, back to the prompt):\n");
+    printf("  bitmap [file]       Render a bitmap as ANSI color blocks\n");
+    printf("  minesweeper         Play Minesweeper\n");
+    printf("  missile             Play Missile Defender\n");
+    printf("  stars               Animated starfield demo\n");
+    printf("  tetris              Play Tetris\n");
     printf("\nSyntax:\n");
     printf("  a | b | c           Pipe stdout of one command into the next\n");
     printf("  cmd < in > out      Redirect stdin / stdout (>> appends)\n");
@@ -1441,7 +1467,9 @@ bool isBuiltinName(string cmd)
         || eqCI(cmd, "wc")    || eqCI(cmd, "pwd")     || eqCI(cmd, "ver")
         || eqCI(cmd, "alias") || eqCI(cmd, "unalias") || eqCI(cmd, "history")
         || eqCI(cmd, "where") || eqCI(cmd, "jobs")    || eqCI(cmd, "fg")
-        || eqCI(cmd, "kill")  || eqCI(cmd, "help")    || eqCI(cmd, "/?");
+        || eqCI(cmd, "kill")  || eqCI(cmd, "help")    || eqCI(cmd, "/?")
+        || eqCI(cmd, "bitmap")|| eqCI(cmd, "minesweeper") || eqCI(cmd, "mines")
+        || eqCI(cmd, "missile") || eqCI(cmd, "stars")  || eqCI(cmd, "tetris");
 }
 
 int runBuiltinCmd(string cmd, list<string>* argv)
@@ -1479,6 +1507,11 @@ int runBuiltinCmd(string cmd, list<string>* argv)
     if (eqCI(cmd, "fg"))                            return cmdFg(argv);
     if (eqCI(cmd, "kill"))                          return cmdKill(argv);
     if (eqCI(cmd, "help")  || eqCI(cmd, "/?"))      return cmdHelp();
+    if (eqCI(cmd, "bitmap"))                        return cmdBitmap(argv);
+    if (eqCI(cmd, "minesweeper") || eqCI(cmd, "mines")) return cmdMinesweeper(argv);
+    if (eqCI(cmd, "missile"))                       return cmdMissile(argv);
+    if (eqCI(cmd, "stars"))                         return cmdStars(argv);
+    if (eqCI(cmd, "tetris"))                        return cmdTetris(argv);
     return 1;
 }
 

@@ -45,17 +45,7 @@ for /r example %%F in (*.cb) do (
         set IMPORTED_DIRS=
 
         REM Determine import directories based on location
-        if "!FILE!"=="example\bitmap.cb" (
-            set IMPORTED_DIRS=
-        ) else if "!FILE!"=="example\stars.cb" (
-            set IMPORTED_DIRS=
-        ) else if "!FILE!"=="example\tetris.cb" (
-            set IMPORTED_DIRS=
-        ) else if "!FILE!"=="example\minesweeper.cb" (
-            set IMPORTED_DIRS=
-        ) else if "!FILE!"=="example\missile_defender.cb" (
-            set IMPORTED_DIRS=
-        ) else if "!FILE:~0,22!"=="example\restAPI\" (
+        if "!FILE:~0,22!"=="example\restAPI\" (
             set IMPORTED_DIRS=-i example/restAPI -i example/restAPI/network
         ) else if "!FILE:~0,15!"=="example\shell\" (
             set IMPORTED_DIRS=

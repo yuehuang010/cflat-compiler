@@ -1,0 +1,480 @@
+// missile_defender.cb - Mouse-driven missile defense game.
+//
+// Build:
+//   x64/Debug/cflat.exe example/missile_defender.cb -i cflat/core -o out/missile_defender.exe
+// Run:
+//   out\missile_defender.exe
+//
+// Left-click to fire an interceptor at the clicked position.
+// Interceptors explode on arrival and destroy missiles within blast radius.
+// Game ends when a missile reaches the ground.  ESC quits.
+
+import "terminal.cb";
+import "random.cb";
+import "time.cb";
+import "array.cb";
+
+// Held at global scope (not inside the namespace): generic instantiations like
+// array<Missile> are resolved against global type names.
+
+// Missiles fall from a random column at the top toward the ground.
+struct Missile {
+    bool alive = false;
+    int  col   = 0;
+    int  row   = 0;
+};
+
+// Interceptors travel from the launcher to the click target (fixed-point *16).
+struct Interceptor {
+    bool alive  = false;
+    int  col    = 0;   // current col *16
+    int  row    = 0;   // current row *16
+    int  dstCol = 0;
+    int  dstRow = 0;
+    int  dcol   = 0;   // delta per frame *16
+    int  drow   = 0;
+};
+
+// Explosions expand outward, killing missiles they touch.
+struct Explosion {
+    bool alive     = false;
+    int  col       = 0;
+    int  row       = 0;
+    int  radius    = 0;
+    int  maxRadius = 0;
+    int  timer     = 0;
+};
+
+namespace MissileDefender
+{
+
+    // ── Layout ────────────────────────────────────────────────────────────────────
+
+    int BOARD_W = 60;
+    int BOARD_H = 24;
+
+    int g_originRow = 1;
+    int g_originCol = 1;
+    int g_termW     = 0;
+    int g_termH     = 0;
+
+    void computeLayout(Terminal* term)
+    {
+        int w = 0; int h = 0;
+        if (!term->getSize(&w, &h)) { w = 80; h = 30; }
+        g_termW = w; g_termH = h;
+        g_originCol = (w - BOARD_W) / 2 + 1;
+        if (g_originCol < 1) g_originCol = 1;
+        g_originRow = (h - BOARD_H - 3) / 2 + 1;
+        if (g_originRow < 1) g_originRow = 1;
+    }
+
+    int toScreenCol(int bc) { return g_originCol + bc; }
+    int toScreenRow(int br) { return g_originRow + br; }
+
+    int toBoardCol(int sc) {
+        int bc = sc - g_originCol;
+        if (bc < 0 || bc >= BOARD_W) return -1;
+        return bc;
+    }
+    int toBoardRow(int sr) {
+        int br = sr - g_originRow;
+        if (br < 0 || br >= BOARD_H) return -1;
+        return br;
+    }
+
+    // ── Entity structs ────────────────────────────────────────────────────────────
+
+    int MAX_MISSILES     = 32;
+    int MAX_INTERCEPTORS = 16;
+    int MAX_EXPLOSIONS   = 16;
+
+    array<Missile>     g_missiles     = default;
+    array<Interceptor> g_interceptors = default;
+    array<Explosion>   g_explosions   = default;
+
+    // ── Game state ────────────────────────────────────────────────────────────────
+
+    int  g_launcherCol  = 0;
+    int  g_launcherRow  = 0;
+    int  g_score        = 0;
+    int  g_wave         = 1;
+    int  g_missilesLeft = 0;
+    bool g_running      = false;
+
+    int INTERC_SPEED = 24;   // fixed-point units/frame (1.5 cells)
+
+    int absVal(int x) { if (x < 0) return -x; return x; }
+
+    // ── Spawning ──────────────────────────────────────────────────────────────────
+
+    void spawnMissile(Random* rng)
+    {
+        int i = 0;
+        while (i < MAX_MISSILES) {
+            Missile* m = g_missiles.getPtr(i);
+            if (!m->alive) {
+                m->alive = true;
+                m->col   = rng->nextInt(1, BOARD_W - 2);
+                m->row   = 0;
+                g_missilesLeft--;
+                return;
+            }
+            i++;
+        }
+    }
+
+    void fireInterceptor(int dstCol, int dstRow)
+    {
+        int i = 0;
+        while (i < MAX_INTERCEPTORS) {
+            Interceptor* p = g_interceptors.getPtr(i);
+            if (!p->alive) {
+                p->alive  = true;
+                p->col    = g_launcherCol * 16;
+                p->row    = g_launcherRow * 16;
+                p->dstCol = dstCol;
+                p->dstRow = dstRow;
+                int dx = dstCol - g_launcherCol;
+                int dy = dstRow - g_launcherRow;
+                int len = absVal(dx) > absVal(dy) ? absVal(dx) : absVal(dy);
+                if (len == 0) len = 1;
+                p->dcol = dx * INTERC_SPEED / len;
+                p->drow = dy * INTERC_SPEED / len;
+                return;
+            }
+            i++;
+        }
+    }
+
+    void triggerExplosion(int col, int row)
+    {
+        int i = 0;
+        while (i < MAX_EXPLOSIONS) {
+            Explosion* e = g_explosions.getPtr(i);
+            if (!e->alive) {
+                e->alive     = true;
+                e->col       = col;
+                e->row       = row;
+                e->radius    = 0;
+                e->maxRadius = 3 + g_wave / 3;
+                e->timer     = 2;
+                return;
+            }
+            i++;
+        }
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────────────
+
+    bool inExplosion(int mc, int mr)
+    {
+        int i = 0;
+        while (i < MAX_EXPLOSIONS) {
+            Explosion* e = g_explosions.getPtr(i);
+            if (e->alive) {
+                if (absVal(e->row - mr) <= e->radius && absVal(e->col - mc) <= e->radius * 2)
+                    return true;
+            }
+            i++;
+        }
+        return false;
+    }
+
+    bool updateMissiles()
+    {
+        int i = 0;
+        while (i < MAX_MISSILES) {
+            Missile* m = g_missiles.getPtr(i);
+            if (m->alive) {
+                if (inExplosion(m->col, m->row)) {
+                    m->alive = false;
+                    g_score += 10 * g_wave;
+                } else if (m->row >= BOARD_H - 2) {
+                    return false;
+                }
+            }
+            i++;
+        }
+        return true;
+    }
+
+    void advanceMissiles()
+    {
+        int i = 0;
+        while (i < MAX_MISSILES) {
+            Missile* m = g_missiles.getPtr(i);
+            if (m->alive) m->row++;
+            i++;
+        }
+    }
+
+    void updateInterceptors()
+    {
+        int i = 0;
+        while (i < MAX_INTERCEPTORS) {
+            Interceptor* p = g_interceptors.getPtr(i);
+            if (p->alive) {
+                p->col = p->col + p->dcol;
+                p->row = p->row + p->drow;
+                int bc = p->col / 16;
+                int br = p->row / 16;
+                if (absVal(p->dstCol - bc) <= 1 && absVal(p->dstRow - br) <= 1) {
+                    triggerExplosion(p->dstCol, p->dstRow);
+                    p->alive = false;
+                }
+            }
+            i++;
+        }
+    }
+
+    void updateExplosions()
+    {
+        int i = 0;
+        while (i < MAX_EXPLOSIONS) {
+            Explosion* e = g_explosions.getPtr(i);
+            if (e->alive) {
+                e->timer--;
+                if (e->timer <= 0) {
+                    e->radius++;
+                    e->timer = 2;
+                    if (e->radius > e->maxRadius) e->alive = false;
+                }
+            }
+            i++;
+        }
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────────────────────
+
+    void drawBorder(Terminal* term)
+    {
+        term->moveTo(toScreenRow(-1), toScreenCol(-1));
+        printf("+");
+        int c = 0; while (c < BOARD_W) { printf("-"); c++; }
+        printf("+");
+
+        term->moveTo(toScreenRow(BOARD_H), toScreenCol(-1));
+        printf("+");
+        c = 0; while (c < BOARD_W) { printf("-"); c++; }
+        printf("+");
+
+        int r = 0;
+        while (r < BOARD_H) {
+            term->moveTo(toScreenRow(r), toScreenCol(-1));     printf("|");
+            term->moveTo(toScreenRow(r), toScreenCol(BOARD_W)); printf("|");
+            r++;
+        }
+    }
+
+    void clearBoard(Terminal* term)
+    {
+        int r = 0;
+        while (r < BOARD_H) {
+            term->moveTo(toScreenRow(r), toScreenCol(0));
+            int c = 0; while (c < BOARD_W) { printf(" "); c++; }
+            r++;
+        }
+    }
+
+    void drawGround(Terminal* term)
+    {
+        term->moveTo(toScreenRow(BOARD_H - 1), toScreenCol(0));
+        termFg(32);
+        int c = 0; while (c < BOARD_W) { printf("="); c++; }
+        termReset();
+    }
+
+    void drawLauncher(Terminal* term)
+    {
+        term->moveTo(toScreenRow(g_launcherRow), toScreenCol(g_launcherCol));
+        termFg(226); printf("A"); termReset();
+    }
+
+    void drawMissiles(Terminal* term)
+    {
+        int i = 0;
+        while (i < MAX_MISSILES) {
+            Missile* m = g_missiles.getPtr(i);
+            if (m->alive) {
+                term->moveTo(toScreenRow(m->row), toScreenCol(m->col));
+                termFg(196); printf("v"); termReset();
+            }
+            i++;
+        }
+    }
+
+    void drawInterceptors(Terminal* term)
+    {
+        int i = 0;
+        while (i < MAX_INTERCEPTORS) {
+            Interceptor* p = g_interceptors.getPtr(i);
+            if (p->alive) {
+                int bc = p->col / 16;
+                int br = p->row / 16;
+                if (bc >= 0 && bc < BOARD_W && br >= 0 && br < BOARD_H) {
+                    term->moveTo(toScreenRow(br), toScreenCol(bc));
+                    termFg(51); printf("*"); termReset();
+                }
+            }
+            i++;
+        }
+    }
+
+    void drawExplosions(Terminal* term)
+    {
+        int i = 0;
+        while (i < MAX_EXPLOSIONS) {
+            Explosion* e = g_explosions.getPtr(i);
+            if (e->alive) {
+                int ec = e->col; int er = e->row; int rad = e->radius;
+                termFg(226);
+                int dr = -rad;
+                while (dr <= rad) {
+                    int dc = -rad * 2;
+                    while (dc <= rad * 2) {
+                        if (absVal(dr) + absVal(dc / 2) == rad || rad == 0) {
+                            int br = er + dr; int bc = ec + dc;
+                            if (br >= 0 && br < BOARD_H - 1 && bc >= 0 && bc < BOARD_W) {
+                                term->moveTo(toScreenRow(br), toScreenCol(bc));
+                                printf("o");
+                            }
+                        }
+                        dc++;
+                    }
+                    dr++;
+                }
+                termReset();
+            }
+            i++;
+        }
+    }
+
+    void drawHUD(Terminal* term)
+    {
+        term->moveTo(toScreenRow(BOARD_H) + 1, toScreenCol(0));
+        printf("Score:%-6d  Wave:%-3d  Left-click to fire interceptor   ESC=quit",
+               g_score, g_wave);
+    }
+
+    // ── Wave management ───────────────────────────────────────────────────────────
+
+    bool waveComplete()
+    {
+        if (g_missilesLeft > 0) return false;
+        int i = 0;
+        while (i < MAX_MISSILES) { if (g_missiles.getPtr(i)->alive) return false; i++; }
+        return true;
+    }
+
+    void startWave()
+    {
+        g_wave++;
+        g_missilesLeft = 5 + g_wave * 2;
+    }
+
+    // ── Entry point ───────────────────────────────────────────────────────────────
+
+    int run()
+    {
+        Terminal term;
+        if (!term.init()) {
+            printf("terminal not available -- run from a real console\n");
+            return 1;
+        }
+
+        Random rng;
+        rng.seedFromTime();
+
+        g_missiles.init(MAX_MISSILES);
+        g_interceptors.init(MAX_INTERCEPTORS);
+        g_explosions.init(MAX_EXPLOSIONS);
+
+        computeLayout(&term);
+        g_launcherCol  = BOARD_W / 2;
+        g_launcherRow  = BOARD_H - 2;
+        g_missilesLeft = 8;
+        g_running      = true;
+
+        Timer missileTimer;
+        missileTimer.start(1500);
+
+        Timer gravityTimer;
+        gravityTimer.start(700);
+
+        term.hideCursor();
+        term.clear();
+        drawBorder(&term);
+
+        while (g_running) {
+            int curW = 0; int curH = 0;
+            term.getSize(&curW, &curH);
+            if (curW != g_termW || curH != g_termH) {
+                computeLayout(&term);
+                term.clear();
+                drawBorder(&term);
+            }
+
+            if (missileTimer.isExpired() && g_missilesLeft > 0) {
+                spawnMissile(&rng);
+                int interval = 1800 - g_wave * 60;
+                if (interval < 400) interval = 400;
+                missileTimer.start(interval);
+            }
+
+            i32 evType = 0;
+            KeyEvent   key   = default;
+            MouseEvent mouse = default;
+            while (term.pollEvent(&evType, &key, &mouse)) {
+                if (evType == 1) {
+                    if (key.vkCode == (i16)VK_ESCAPE) g_running = false;
+                } else if (evType == 2) {
+                    if (mouse.isPress() && mouse.leftButton()) {
+                        int bc = toBoardCol(mouse.x + 1);
+                        int br = toBoardRow(mouse.y + 1);
+                        if (bc >= 0 && br >= 0 && br < BOARD_H - 1)
+                            fireInterceptor(bc, br);
+                    }
+                }
+            }
+
+            if (gravityTimer.isExpired()) {
+                int interval = 600 - g_wave * 20;
+                if (interval < 200) interval = 200;
+                gravityTimer.start(interval);
+                advanceMissiles();
+            }
+
+            updateInterceptors();
+            updateExplosions();
+            if (!updateMissiles()) { g_running = false; break; }
+
+            if (waveComplete()) startWave();
+
+            clearBoard(&term);
+            drawGround(&term);
+            drawMissiles(&term);
+            drawExplosions(&term);
+            drawInterceptors(&term);
+            drawLauncher(&term);
+            drawHUD(&term);
+            term.flush();
+            sleep(16);
+        }
+
+        term.showCursor();
+        term.moveTo(toScreenRow(BOARD_H) + 2, 1);
+        term.restore();
+        printf("GAME OVER  score=%d  wave=%d\n", g_score, g_wave);
+        return 0;
+    }
+
+}
+
+// Bare entry point: delegate to the namespaced game body. Keeping main at
+// file scope preserves its bare linkage symbol, so the program builds
+// standalone AND is found by fsh's 'import program' (which renames main).
+extern int main()
+{
+    return MissileDefender.run();
+}
