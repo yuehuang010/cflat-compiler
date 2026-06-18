@@ -8,7 +8,13 @@ companion to `cflat --help`; both derive from the flag registrations in
 cflat <input> [options]
 cflat --init | --version | --help | --print-supported-cpus | --print-host-cpu
 cflat lsp                       # run the Language Server (see the VS Code extension)
+cflat lsp --lsp-pool-size N      # cap concurrent analyses to N backends/workers
 ```
+
+The `lsp` subcommand accepts `--verbose`/`-v`, `--import-dir`/`-i <dir>`, and
+`--lsp-pool-size <N>`. The pool size bounds how many analyses run in parallel (one
+backend and worker thread per slot); it defaults to the logical CPU count. The switch
+takes precedence over the `CFLAT_LSP_POOL_SIZE` environment variable.
 
 `<input>` is the source file to compile. A `.cb` file is CFlat; a `.c` file is real C
 (compiled by clang-cl and linked in); a `.h`/`.hpp`/`.hh` file is a C header binding. Extra

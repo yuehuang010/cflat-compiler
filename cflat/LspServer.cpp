@@ -233,7 +233,8 @@ struct OpenDocument
 class LspServer
 {
 public:
-    LspServer(int protocolFd, const std::string& runtimeDir, const std::string& importDir, bool verbose)
+    LspServer(int protocolFd, const std::string& runtimeDir, const std::string& importDir, bool verbose,
+              unsigned int poolSizeOverride = 0)
         : loop_(protocolFd, verbose)
         , runtimeDir_(runtimeDir)
         , importSearchDir_(importDir)
@@ -253,6 +254,9 @@ public:
             int v = std::atoi(envBuf);
             if (v > 0) poolSize_ = (unsigned int)v;
         }
+        // The --lsp-pool-size switch takes precedence over the env var.
+        if (poolSizeOverride > 0)
+            poolSize_ = poolSizeOverride;
         backendPool_.reserve(poolSize_);
         backendAnalyzed_.resize(poolSize_, false);
         for (unsigned int i = 0; i < poolSize_; ++i)
@@ -270,7 +274,7 @@ public:
             workers_.emplace_back([this] { WorkerLoop(); });
 
         if (verbose_)
-            std::cout << std::format("[lsp] backend pool size: {}\n", poolSize_);
+            std::cerr << std::format("[lsp] backend pool size: {}\n", poolSize_);
     }
 
     ~LspServer()
@@ -847,11 +851,11 @@ private:
             }
             catch (const std::exception& e)
             {
-                if (verbose_) std::cout << std::format("[lsp] analysis threw on slot {}: {}\n", slot, e.what());
+                if (verbose_) std::cerr << std::format("[lsp] analysis threw on slot {}: {}\n", slot, e.what());
             }
             catch (...)
             {
-                if (verbose_) std::cout << std::format("[lsp] analysis threw on slot {} (unknown)\n", slot);
+                if (verbose_) std::cerr << std::format("[lsp] analysis threw on slot {} (unknown)\n", slot);
             }
 
             {
@@ -935,7 +939,7 @@ private:
 
         if (!recovered)
         {
-            if (verbose_) std::cout << std::format("[lsp] compiler crash on slot {}, replacing backend\n", slot);
+            if (verbose_) std::cerr << std::format("[lsp] compiler crash on slot {}, replacing backend\n", slot);
             auto fresh = std::make_unique<LLVMBackend>();
             fresh->SetRuntimeDir(runtimeDir_);
             fresh->SetVerbose(verbose_);
@@ -982,7 +986,7 @@ private:
             if (!keepCached)
                 currentIndex_ = newIndex;
             else if (verbose_)
-                std::cout << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
+                std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
         }
 
         // Occurrence-based unused-code hints (functions / locals / params / imports).
@@ -1230,7 +1234,10 @@ int RunLspServer(int argc, char* argv[])
     int protocolFd = _dup(_fileno(stdout));
     _setmode(protocolFd, _O_BINARY);
     _setmode(_fileno(stdin), _O_BINARY);
-    std::cout.rdbuf(std::cout.rdbuf());
+    // stdout is reserved for the JSON-RPC channel (written via _write(protocolFd_)).
+    // Redirect anything that writes to std::cout - LSP verbose logs and backend
+    // diagnostics under -v - to stderr so it cannot corrupt the protocol stream.
+    std::cout.rdbuf(std::cerr.rdbuf());
 
     // Prevent child processes (e.g. clang-cl spawned for C-interop signature extraction)
     // from inheriting the JSON-RPC pipe handles. _dup and the CRT std fds are inheritable
@@ -1251,6 +1258,7 @@ int RunLspServer(int argc, char* argv[])
 
     bool verbose = false;
     std::string importDir;
+    unsigned int poolSizeOverride = 0;
     for (int i = 0; i < argc; ++i)
     {
         std::string_view arg(argv[i]);
@@ -1258,12 +1266,17 @@ int RunLspServer(int argc, char* argv[])
             verbose = true;
         else if ((arg == "--import-dir" || arg == "-i") && i + 1 < argc)
             importDir = argv[++i];
+        else if (arg == "--lsp-pool-size" && i + 1 < argc)
+        {
+            int v = std::atoi(argv[++i]);
+            if (v > 0) poolSizeOverride = (unsigned int)v;
+        }
     }
 
-    if (verbose) std::cout << "[lsp] server starting\n";
-    LspServer server(protocolFd, runtimeDir, importDir, verbose);
-    if (verbose) std::cout << "[lsp] entering Run()\n";
+    if (verbose) std::cerr << "[lsp] server starting\n";
+    LspServer server(protocolFd, runtimeDir, importDir, verbose, poolSizeOverride);
+    if (verbose) std::cerr << "[lsp] entering Run()\n";
     server.Run();
-    if (verbose) std::cout << "[lsp] Run() returned\n";
+    if (verbose) std::cerr << "[lsp] Run() returned\n";
     return 0;
 }

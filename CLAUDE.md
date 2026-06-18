@@ -8,6 +8,7 @@ cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) -
 
 ## Git
 Do not commit to git.  Stash is allowed.  
+Keep `master` linear: every commit on `master` must have a single parent.  Do not create merge commits (no merge commits on `master`); integrate work by rebasing so history stays linear.
 
 ## Dependencies
 Do not modify the root `./vcpkg.json` without explicit permission.

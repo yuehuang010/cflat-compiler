@@ -490,7 +490,7 @@ def test_server_resilience(client: LspClient) -> str | None:
 # Test runner
 # ---------------------------------------------------------------------------
 
-def run_all(exe: str) -> bool:
+def run_all(exe: str, extra_args: list) -> bool:
     if not FIXTURE_DIR.exists():
         print(f"error: fixture directory not found: {FIXTURE_DIR}", file=sys.stderr)
         return False
@@ -499,7 +499,7 @@ def run_all(exe: str) -> bool:
     print(f"Server:   {exe}")
     print(f"Fixtures: {FIXTURE_DIR} ({len(fixtures)} files)\n")
 
-    client = LspClient(exe)
+    client = LspClient(exe, extra_args)
     initialize(client)
 
     passed = 0
@@ -577,11 +577,13 @@ def run_all(exe: str) -> bool:
 
 
 def main():
+    extra_args: list = []
     if len(sys.argv) >= 2:
         exe = sys.argv[1]
         if not Path(exe).exists():
             print(f"error: not found: {exe}", file=sys.stderr)
             sys.exit(1)
+        extra_args = sys.argv[2:]
     else:
         exe = find_exe()
         if exe is None:
@@ -591,7 +593,7 @@ def main():
             )
             sys.exit(1)
 
-    ok = run_all(exe)
+    ok = run_all(exe, extra_args)
     sys.exit(0 if ok else 1)
 
 

@@ -136,10 +136,10 @@ TESTS = [
 ]
 
 
-def run_tests(exe: str) -> bool:
+def run_tests(exe: str, extra_args: list) -> bool:
     print(f"Server: {exe}\n")
 
-    client = LspClient(exe)
+    client = LspClient(exe, extra_args)
     passed = 0
     failed = 0
 
@@ -168,11 +168,13 @@ def run_tests(exe: str) -> bool:
 
 
 def main():
+    extra_args: list = []
     if len(sys.argv) >= 2:
         exe = sys.argv[1]
         if not Path(exe).exists():
             print(f"error: not found: {exe}", file=sys.stderr)
             sys.exit(1)
+        extra_args = sys.argv[2:]
     else:
         exe = find_exe()
         if exe is None:
@@ -182,7 +184,7 @@ def main():
             )
             sys.exit(1)
 
-    ok = run_tests(exe)
+    ok = run_tests(exe, extra_args)
     sys.exit(0 if ok else 1)
 
 
