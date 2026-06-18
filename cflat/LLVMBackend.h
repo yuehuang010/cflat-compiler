@@ -4981,11 +4981,18 @@ public:
         llvm::Function* function = nullptr;
         llvm::DISubprogram* subprogram = nullptr;
         llvm::DebugLoc debugLoc;
+        // Return-shape of the function being emitted. Emitting a nested function (e.g. a lambda
+        // invoker) mid-body calls createFunctionBlock, which overwrites this trio with the nested
+        // function's shape; snapshot it here so the enclosing function's return checks are restored.
+        bool returnsOwned = false;
+        bool returnIsArrayView = false;
+        std::string returnTypeName;
     };
 
     BuilderState SaveBuilderState() const
     {
-        return { builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation() };
+        return { builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
+                 currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName };
     }
 
     void RestoreBuilderState(const BuilderState& state)
@@ -4994,6 +5001,9 @@ public:
         currentFunction = state.function;
         currentSubprogram = state.subprogram;
         builder->SetCurrentDebugLocation(state.debugLoc);
+        currentFunctionReturnsOwned = state.returnsOwned;
+        currentFunctionReturnIsArrayView = state.returnIsArrayView;
+        currentFunctionReturnTypeName = state.returnTypeName;
     }
 
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)

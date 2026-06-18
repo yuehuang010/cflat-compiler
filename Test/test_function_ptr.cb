@@ -647,6 +647,66 @@ bool testCaptureMultiple()
     return result;
 }
 
+// A lambda inside a method auto-captures the implicit 'this' pointer.
+class ThisBox
+{
+    int v = 0;
+    function<void()> makeInc() { return () => { this.v = this.v + 1; }; }
+    function<int()>  makeGet() { return () => { return this.v; }; }
+    // Capture 'this' AND a value-captured parameter together.
+    function<int(int)> makeAddBoth(int base) { return (int n) => { return this.v + base + n; }; }
+};
+
+bool testCaptureThis()
+{
+    bool result = true;
+
+    // void lambda mutating a field through captured 'this'
+    ThisBox b;
+    b.v = 0;
+    function<void()> inc = b.makeInc();
+    inc(); inc();
+    result &= Test("capture this void", b.v, 2);
+
+    // value-returning lambda reading a field through captured 'this'
+    function<int()> get = b.makeGet();
+    result &= Test("capture this value-return", get(), 2);
+
+    // mixed: captured 'this' plus a captured parameter
+    ThisBox c;
+    c.v = 10;
+    function<int(int)> addBoth = c.makeAddBoth(5);
+    result &= Test("capture this + param", addBoth(3), 18);  // 10 + 5 + 3
+
+    return result;
+}
+
+// A nested lambda must not clobber the enclosing function's recorded return type:
+// an interface-returning function with a lambda before 'return <implementer>'.
+interface IValueFP { int getValue(); };
+class ValueHolderFP : IValueFP
+{
+    int n = 0;
+    int getValue() { return this.n; }
+};
+
+IValueFP makeValueHolderWithLambda(int x)
+{
+    ValueHolderFP* vh = new ValueHolderFP();
+    vh.n = x;
+    function<void()> noop = () => { };
+    noop();
+    return vh;   // must box into IValueFP, not the lambda's 'void'
+}
+
+bool testInterfaceReturnWithLambda()
+{
+    bool result = true;
+    IValueFP v = makeValueHolderWithLambda(42);
+    result &= Test("iface return after lambda", v.getValue(), 42);
+    return result;
+}
+
 bool testCaptureRegression()
 {
     bool result = true;
@@ -1187,6 +1247,8 @@ extern int main()
     total++; passed += testCaptureLocalArray()         ? 1 : 0;
     total++; passed += testLambdaAllocaInLoop()        ? 1 : 0;
     total++; passed += testCaptureBondReassign()       ? 1 : 0;
+    total++; passed += testCaptureThis()               ? 1 : 0;
+    total++; passed += testInterfaceReturnWithLambda()  ? 1 : 0;
 
     // Generic function pointer tests
     total++; passed += testGenericFuncPtrBasic()       ? 1 : 0;

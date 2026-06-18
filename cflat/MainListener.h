@@ -13472,6 +13472,7 @@ public:
         LLVMBackend::TypeAndValue TV;
         bool ByReference;       // true for non-pointer struct types (capture by reference)
         llvm::Value* OuterStorage;
+        bool IsThis = false;    // the implicit method self pointer; capture by value, re-register as 'this'
     };
 
     // Walk the lambda body AST and collect variables captured from the enclosing function scope.
@@ -13498,6 +13499,27 @@ public:
                 if (auto* gi = primary->genericIdentifier())
                 {
                     std::string name = gi->Identifier()->getText();
+                    // 'this' inside a method body is the implicit self pointer (Storage==nullptr,
+                    // Primary-backed), so the storage-keyed frame search below skips it. Capture it
+                    // explicitly: store the self pointer by value into the env and re-register it as
+                    // 'this' in the invoker so member access / bare method calls resolve normally.
+                    if (name == "this" && !seenNames.count("this") && !lambdaParamNames.count("this"))
+                    {
+                        auto thisPtr = compiler->GetThisPointer();
+                        if (thisPtr.Storage != nullptr)
+                        {
+                            seenNames.insert("this");
+                            CaptureInfo ci;
+                            ci.Name         = "this";
+                            ci.TV           = thisPtr.TypeAndValue;  // {TypeName=struct, Pointer=true}
+                            ci.TV.Pointer   = true;
+                            ci.OuterStorage = thisPtr.Storage;
+                            ci.ByReference  = false;
+                            ci.IsThis       = true;
+                            captures.push_back(ci);
+                        }
+                        return;
+                    }
                     // NOTE: functionTable / dataStructures are deliberately NOT excluded
                     // here. A local variable or parameter shadows a same-named function,
                     // method, or struct, so the enclosing-scope frame search below is the
@@ -13696,6 +13718,21 @@ public:
                 auto* fieldGEP = compiler->builder->CreateStructGEP(
                     closureStructTy, closurePtr, (unsigned)i);
                 const auto& cap = captures[i];
+
+                if (cap.IsThis)
+                {
+                    // Load the captured self pointer, park it in an alloca-of-pointer (the shape
+                    // GetThisPointer expects), and register it as the invoker's 'this'.
+                    auto* capTy     = compiler->GetType(cap.TV);
+                    auto* capVal    = compiler->builder->CreateLoad(capTy, fieldGEP, "this_val");
+                    auto* capAlloca = compiler->builder->CreateAlloca(capTy, nullptr, "this");
+                    compiler->builder->CreateStore(capVal, capAlloca);
+                    LLVMBackend::TypeAndValue thisTv = cap.TV;
+                    thisTv.VariableName = cap.TV.TypeName + "__";
+                    compiler->RegisterThisPointer(thisTv, capAlloca, capTy);
+                    continue;
+                }
+
                 auto& captureNV = compiler->stackNamedVariable.back().namedVariable[cap.Name];
 
                 if (cap.ByReference)
