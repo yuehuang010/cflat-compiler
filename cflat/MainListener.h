@@ -215,56 +215,29 @@ static bool PeelAliasArrayDims(std::string& name, std::vector<uint64_t>& dims)
 // per-kind children (declarations, methods, ...) are nested one level under aggregateMember
 // rather than being direct children of the struct/class context. These helpers flatten an
 // aggregate's members back into the per-kind vectors the listener expects, preserving source
-// order. Templated on the context type so they serve both StructDefinitionContext and
+// Collect all aggregate members for which the getter returns non-null.
+// Templated on the context type so it works for both StructDefinitionContext and
 // ClassDefinitionContext (both expose aggregateMember()).
-template <typename TCtx>
-static std::vector<CFlatParser::DeclarationContext*> MemberDeclarations(TCtx* ctx)
+template <typename Result, typename TCtx, typename Getter>
+static std::vector<Result*> MemberFilter(TCtx* ctx, Getter g)
 {
-    std::vector<CFlatParser::DeclarationContext*> out;
+    std::vector<Result*> out;
     for (auto* m : ctx->aggregateMember())
-        if (auto* d = m->declaration()) out.push_back(d);
+        if (auto* x = g(m)) out.push_back(x);
     return out;
 }
 template <typename TCtx>
-static std::vector<CFlatParser::FunctionDefinitionContext*> MemberFunctionDefinitions(TCtx* ctx)
-{
-    std::vector<CFlatParser::FunctionDefinitionContext*> out;
-    for (auto* m : ctx->aggregateMember())
-        if (auto* f = m->functionDefinition()) out.push_back(f);
-    return out;
-}
+static auto MemberDeclarations(TCtx* ctx)       { return MemberFilter<CFlatParser::DeclarationContext>      (ctx, [](auto* m){ return m->declaration();        }); }
 template <typename TCtx>
-static std::vector<CFlatParser::DestructorDefinitionContext*> MemberDestructorDefinitions(TCtx* ctx)
-{
-    std::vector<CFlatParser::DestructorDefinitionContext*> out;
-    for (auto* m : ctx->aggregateMember())
-        if (auto* d = m->destructorDefinition()) out.push_back(d);
-    return out;
-}
+static auto MemberFunctionDefinitions(TCtx* ctx) { return MemberFilter<CFlatParser::FunctionDefinitionContext>(ctx, [](auto* m){ return m->functionDefinition();  }); }
 template <typename TCtx>
-static std::vector<CFlatParser::StructDefinitionContext*> MemberStructDefinitions(TCtx* ctx)
-{
-    std::vector<CFlatParser::StructDefinitionContext*> out;
-    for (auto* m : ctx->aggregateMember())
-        if (auto* s = m->structDefinition()) out.push_back(s);
-    return out;
-}
+static auto MemberDestructorDefinitions(TCtx* ctx){ return MemberFilter<CFlatParser::DestructorDefinitionContext>(ctx, [](auto* m){ return m->destructorDefinition(); }); }
 template <typename TCtx>
-static std::vector<CFlatParser::ClassDefinitionContext*> MemberClassDefinitions(TCtx* ctx)
-{
-    std::vector<CFlatParser::ClassDefinitionContext*> out;
-    for (auto* m : ctx->aggregateMember())
-        if (auto* c = m->classDefinition()) out.push_back(c);
-    return out;
-}
+static auto MemberStructDefinitions(TCtx* ctx)  { return MemberFilter<CFlatParser::StructDefinitionContext>  (ctx, [](auto* m){ return m->structDefinition();    }); }
 template <typename TCtx>
-static std::vector<CFlatParser::LockFieldGroupContext*> MemberLockFieldGroups(TCtx* ctx)
-{
-    std::vector<CFlatParser::LockFieldGroupContext*> out;
-    for (auto* m : ctx->aggregateMember())
-        if (auto* l = m->lockFieldGroup()) out.push_back(l);
-    return out;
-}
+static auto MemberClassDefinitions(TCtx* ctx)   { return MemberFilter<CFlatParser::ClassDefinitionContext>   (ctx, [](auto* m){ return m->classDefinition();     }); }
+template <typename TCtx>
+static auto MemberLockFieldGroups(TCtx* ctx)    { return MemberFilter<CFlatParser::LockFieldGroupContext>    (ctx, [](auto* m){ return m->lockFieldGroup();      }); }
 
 // simd<T,N>: validate the lane count N. It must be a plain power-of-2 integer literal in [2,64]
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
@@ -361,14 +334,14 @@ static std::string ExtractLeadingDoc(antlr4::BufferedTokenStream* tokens, antlr4
         it.tok = t;
         it.startLine = (int)t->getLine();
         it.endLine = it.startLine + countNewlines(text);
-        if (text.compare(0, 2, "//") == 0)
+        if (text.starts_with("//"))
         {
             it.isLine = true;
             // /// is a doc comment; //// or longer slash run is not.
             it.isDoc = text.size() >= 3 && text[2] == '/' && (text.size() < 4 || text[3] != '/');
             return it;
         }
-        if (text.compare(0, 2, "/*") == 0)
+        if (text.starts_with("/*"))
         {
             it.isLine = false;
             // /** ... */ is a doc comment; bare /**/ is not.
@@ -700,9 +673,9 @@ private:
             else if (auto funcSpec = declSpec->functionSpecifier())
             {
                 if (funcSpec->getText() == "stdcall")
-                    declType.IsStdcall = true;
+                    declType.CallConv = LLVMBackend::CallingConv::Stdcall;
                 else if (funcSpec->getText() == "cdecl")
-                    declType.IsCdecl = true;
+                    declType.CallConv = LLVMBackend::CallingConv::Cdecl;
             }
             else if (declSpec->alignmentSpecifier() != nullptr)
             {
@@ -753,9 +726,8 @@ private:
         if (func->genericTypeParameters() != nullptr)
             return;
 
-        std::string name = getFunctionName(func);
-        if (!namespaceName.empty())
-            name = namespaceName + "." + name;
+        const std::string rawFuncName = getFunctionName(func);
+        std::string name = namespaceName.empty() ? rawFuncName : namespaceName + "." + rawFuncName;
 
         auto returnType = ParseDeclarationSpecifiers(func->declarationSpecifiers());
         // 'auto' return type is only supported on generic function templates (already
@@ -773,13 +745,13 @@ private:
         bool varargs = paramTypeList && paramTypeList->Ellipsis() != nullptr;
 
         // Operator new/delete/string and static methods are scoped to struct but have no 'this' param
-        bool isOperatorFunc = (getFunctionName(func) == "operator new"
-                            || getFunctionName(func) == "operator delete"
-                            || getFunctionName(func) == "operator string");
+        bool isOperatorFunc = (rawFuncName == "operator new"
+                            || rawFuncName == "operator delete"
+                            || rawFuncName == "operator string");
         bool isStaticFunc = isFunctionStatic(func);
         if (!structName.empty() && (isOperatorFunc || isStaticFunc))
         {
-            name = structName + "." + getFunctionName(func);
+            name = structName + "." + rawFuncName;
         }
         else if (!structName.empty())
         {
@@ -810,7 +782,7 @@ private:
             returnsOwned = true;
         }
 
-        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.IsStdcall, returnType.IsCdecl);
+        compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
 
         // Populate RequiredLocks from the function's lock clause and any extra locks
         // inherited from a positional lock group (extraRequiredLocks).
@@ -834,7 +806,7 @@ private:
             for (const auto& p : params)
             {
                 // Skip implicit 'this' pointer (name convention: TypeName__)
-                if (p.VariableName.size() >= 2 && p.VariableName.compare(p.VariableName.size() - 2, 2, "__") == 0)
+                if (p.VariableName.ends_with("__"))
                     continue;
                 if (!first) sig += ", ";
                 first = false;
@@ -869,7 +841,7 @@ private:
             // Operators and statics already have the qualified name; only instance methods need this.
             if (!structName.empty() && !isOperatorFunc && !isStaticFunc)
             {
-                std::string qualName = structName + "." + getFunctionName(func);
+                std::string qualName = structName + "." + rawFuncName;
                 s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
                             (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
                             sig, {}, doc);
@@ -1042,10 +1014,10 @@ private:
             if (groupArgs.empty()) continue;
             std::string guardianName = groupArgs[0]->getText();
             // Strip .read/.write rwlock suffix (same logic as GetLockArgCanonical in MainListener).
-            if (guardianName.size() > 5 && guardianName.substr(guardianName.size()-5) == ".read")
-                guardianName = guardianName.substr(0, guardianName.size()-5);
-            else if (guardianName.size() > 6 && guardianName.substr(guardianName.size()-6) == ".write")
-                guardianName = guardianName.substr(0, guardianName.size()-6);
+            if (guardianName.ends_with(".read"))
+                guardianName.resize(guardianName.size() - 5);
+            else if (guardianName.ends_with(".write"))
+                guardianName.resize(guardianName.size() - 6);
             // Qualify bare names to "this.<name>" so call-site substitution works.
             std::string qualifiedLock = (guardianName.find('.') == std::string::npos)
                                         ? ("this." + guardianName) : guardianName;
@@ -1272,7 +1244,7 @@ public:
             ctxParam.TypeName = "void";
             ctxParam.VariableName = "ctx";
             ctxParam.Pointer = true;
-            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false, false);
+            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false);
         }
 
         // Pre-declare run(Name* this, list__string args) -> bool
@@ -1392,7 +1364,7 @@ public:
             ctxParam.TypeName = "void";
             ctxParam.VariableName = "ctx";
             ctxParam.Pointer = true;
-            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false, false);
+            compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false);
         }
 
         // Pre-declare run(Name* this, list__string args) -> bool
@@ -1529,8 +1501,7 @@ public:
                 return;
             // Set expectedError so errors during the scan are caught rather than aborting.
             std::string rawText = expectErrDecl->StringLiteral()->getText();
-            rawText = rawText.substr(1, rawText.size() - 2); // strip surrounding quotes
-            compilerLLVM->expectedError = rawText;
+            compilerLLVM->expectedError = DequoteStringLiteral(rawText);
             try
             {
                 for (auto* extDecl : expectErrDecl->externalDeclaration())
@@ -1583,6 +1554,17 @@ private:
 
     std::unordered_map<llvm::Value*, std::pair<int, llvm::Type*>> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
+
+    // RAII guard: sets global_scope to false on entry and restores the saved value on exit.
+    struct GlobalScopeGuard
+    {
+        bool& scope;
+        bool  saved;
+        explicit GlobalScopeGuard(bool& s) : scope(s), saved(s) { scope = false; }
+        ~GlobalScopeGuard() { scope = saved; }
+        GlobalScopeGuard(const GlobalScopeGuard&)            = delete;
+        GlobalScopeGuard& operator=(const GlobalScopeGuard&) = delete;
+    };
 
     // Lambda state: expected type (set by ParseDeclaration before evaluating RHS)
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
@@ -2113,9 +2095,9 @@ private:
             else if (auto funcSpec = declSpec->functionSpecifier())
             {
                 if (funcSpec->getText() == "stdcall")
-                    declType.IsStdcall = true;
+                    declType.CallConv = LLVMBackend::CallingConv::Stdcall;
                 else if (funcSpec->getText() == "cdecl")
-                    declType.IsCdecl = true;
+                    declType.CallConv = LLVMBackend::CallingConv::Cdecl;
             }
             else if (auto alignSpec = declSpec->alignmentSpecifier())
             {
@@ -2826,21 +2808,21 @@ public:
                         for (auto* lit : lits)
                         {
                             std::string gr = lit->getText();
-                            if (gr.size() >= 2) entries.push_back(gr.substr(1, gr.size() - 2));
+                            if (gr.size() >= 2) entries.push_back(DequoteStringLiteral(gr));
                         }
                         std::vector<std::string> grpLibs;
                         if (auto* lc = imp->libClause())
                             for (auto* lit : lc->StringLiteral())
                             {
                                 std::string lr = lit->getText();
-                                if (lr.size() >= 2) grpLibs.push_back(lr.substr(1, lr.size() - 2));
+                                if (lr.size() >= 2) grpLibs.push_back(DequoteStringLiteral(lr));
                             }
                         std::vector<std::string> grpDefines;
                         for (auto* dc : imp->defineClause())
                             if (dc->StringLiteral())
                             {
                                 std::string dr = dc->StringLiteral()->getText();
-                                if (dr.size() >= 2) grpDefines.push_back(dr.substr(1, dr.size() - 2));
+                                if (dr.size() >= 2) grpDefines.push_back(DequoteStringLiteral(dr));
                             }
                         Compiler()->CompileImportGroup(Compiler()->currentSourceFilePath_, entries,
                                                        grpLibs, grpDefines, imp->cacheClause() != nullptr);
@@ -2849,15 +2831,9 @@ public:
                 }
                 std::string importFilename;
                 if (auto* grp = imp->importGroup())
-                {
-                    std::string gr = grp->StringLiteral(0)->getText();
-                    importFilename = gr.substr(1, gr.size() - 2);
-                }
+                    importFilename = DequoteStringLiteral(grp->StringLiteral(0)->getText());
                 else
-                {
-                    std::string raw = imp->StringLiteral()->getText();
-                    importFilename = raw.substr(1, raw.size() - 2);
-                }
+                    importFilename = DequoteStringLiteral(imp->StringLiteral()->getText());
                 // `import package-vcpkg "header" from "port";` inside an if-const branch.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "package-vcpkg")
                 {
@@ -2866,7 +2842,7 @@ public:
                         if (fc->StringLiteral())
                         {
                             std::string fr = fc->StringLiteral()->getText();
-                            if (fr.size() >= 2) portSpec = fr.substr(1, fr.size() - 2);
+                            if (fr.size() >= 2) portSpec = DequoteStringLiteral(fr);
                         }
                     Compiler()->CompileVcpkgImport(Compiler()->RootVcpkgImportPath(Compiler()->currentSourceFilePath_), importFilename, portSpec);
                     continue;
@@ -2877,14 +2853,14 @@ public:
                     for (auto* lit : lc->StringLiteral())
                     {
                         std::string lr = lit->getText();
-                        if (lr.size() >= 2) explicitLibs.push_back(lr.substr(1, lr.size() - 2));
+                        if (lr.size() >= 2) explicitLibs.push_back(DequoteStringLiteral(lr));
                     }
                 std::vector<std::string> extraDefines;
                 for (auto* dc : imp->defineClause())
                     if (dc->StringLiteral())
                     {
                         std::string dr = dc->StringLiteral()->getText();
-                        if (dr.size() >= 2) extraDefines.push_back(dr.substr(1, dr.size() - 2));
+                        if (dr.size() >= 2) extraDefines.push_back(DequoteStringLiteral(dr));
                     }
                 Compiler()->CompileImportedFile(Compiler()->currentSourceFilePath_, importFilename, ns, "", explicitLibs, extraDefines);
             }
@@ -4653,7 +4629,7 @@ public:
         size_t bodyLine = 0;
         if (auto* body = func->compoundStatement())
             bodyLine = body->getStart()->getLine();
-        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.IsStdcall, returnType.IsCdecl, bodyLine);
+        auto fn = compiler->CreateFunctionDefinition(name, returnType, allParams, returnType.external, varargs, line, returnsOwned, !structName.empty(), returnType.CallConv, bodyLine);
 
         // CreateFunctionDefinition returns the existing function (without setting up
         // a fresh entry block) when a matching definition was already emitted by a
@@ -4693,7 +4669,7 @@ public:
             {
                 std::string canonical = StripLockModeSuffix(rawLock);
                 currentLockSet.insert(canonical);
-                if (canonical.size() > 5 && canonical.substr(0, 5) == "this.")
+                if (canonical.starts_with("this."))
                     currentLockSet.insert(canonical.substr(5));
             }
         }
@@ -5049,7 +5025,7 @@ public:
                         linkName = declName;
                     declName = namespaceName + "." + declName;
                 }
-                compiler->CreateFunctionDeclaration(declName, typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl, linkName);
+                compiler->CreateFunctionDeclaration(declName, typeAndValue, allParams, typeAndValue.external, ellipsis, false, false, typeAndValue.CallConv, linkName);
 
                 // Register the declaration in the symbol index so extern-bound C
                 // runtime functions (atoi, strcmp, memcpy, ...) are discoverable
@@ -5086,7 +5062,7 @@ public:
                 for (int cutoff = firstDefault; firstDefault >= 0 && cutoff < (int)declParams.size(); cutoff++)
                 {
                     std::vector<LLVMBackend::TypeAndValue> wrapperParams(declParams.begin(), declParams.begin() + cutoff);
-                    compiler->CreateFunctionDeclaration(declName, typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.IsStdcall, typeAndValue.IsCdecl, linkName);
+                    compiler->CreateFunctionDeclaration(declName, typeAndValue, wrapperParams, typeAndValue.external, false, false, false, typeAndValue.CallConv, linkName);
                 }
             }
             else if (direct != nullptr)
@@ -12706,8 +12682,7 @@ public:
 
                             // Determine if the first param is an implicit 'this'
                             size_t paramOffset = (!rb->Params.empty() &&
-                                rb->Params[0].VariableName.size() >= 2 &&
-                                rb->Params[0].VariableName.substr(rb->Params[0].VariableName.size() - 2) == "__") ? 1 : 0;
+                                rb->Params[0].VariableName.ends_with("__")) ? 1 : 0;
 
                             // Bind 'this' if present
                             if (paramOffset > 0)
@@ -13254,7 +13229,7 @@ public:
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
                                     {
                                         const auto& fp = compilerLLVM->lastCallParameterNames[0];
-                                        if (fp.size() >= 2 && fp.substr(fp.size() - 2) == "__")
+                                        if (fp.ends_with("__"))
                                             rcvr = "this";
                                     }
                                     CheckCallSiteLocks(ctx, rcvr, arguments);
@@ -13319,7 +13294,7 @@ public:
                                     if (rcvr.empty() && !compilerLLVM->lastCallParameterNames.empty())
                                     {
                                         const auto& fp = compilerLLVM->lastCallParameterNames[0];
-                                        if (fp.size() >= 2 && fp.substr(fp.size() - 2) == "__")
+                                        if (fp.ends_with("__"))
                                             rcvr = "this";
                                     }
                                     CheckCallSiteLocks(primaryCtx, rcvr, arguments);
@@ -15279,7 +15254,7 @@ public:
         }
 
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto func : functionList)
             {
                 global_scope = false;
@@ -15310,12 +15285,11 @@ public:
                 else
                     ParseFunctionDefinition(func, structName);
             }
-            global_scope = savedScope;
         }
 
         // Parse functions declared inside positional lock groups.
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto* lfg : MemberLockFieldGroups(ctx))
             {
                 for (auto* func : lfg->functionDefinition())
@@ -15324,18 +15298,16 @@ public:
                     ParseFunctionDefinition(func, structName);
                 }
             }
-            global_scope = savedScope;
         }
 
         // Parse destructor
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
                 ParseDestructorDefinition(dtor, structName);
             }
-            global_scope = savedScope;
         }
 
         // Process any generic instantiations that were queued during this struct definition
@@ -15356,9 +15328,9 @@ public:
     std::string GetLockArgMode(CFlatParser::ExpressionContext* expr)
     {
         std::string text = expr->getText();
-        if (text.size() > 5 && text.substr(text.size() - 5) == ".read")
+        if (text.ends_with(".read"))
             return "read";
-        if (text.size() > 6 && text.substr(text.size() - 6) == ".write")
+        if (text.ends_with(".write"))
             return "write";
         return "";
     }
@@ -15366,9 +15338,9 @@ public:
     // Strip ".read" / ".write" rwlock mode suffix from a raw lock string.
     static std::string StripLockModeSuffix(const std::string& text)
     {
-        if (text.size() > 5 && text.substr(text.size() - 5) == ".read")
+        if (text.ends_with(".read"))
             return text.substr(0, text.size() - 5);
-        if (text.size() > 6 && text.substr(text.size() - 6) == ".write")
+        if (text.ends_with(".write"))
             return text.substr(0, text.size() - 6);
         return text;
     }
@@ -15722,7 +15694,7 @@ public:
             LLVMBackend::DeclTypeAndValue ctxParam;
             ctxParam.TypeName = "void";  ctxParam.VariableName = "ctx";  ctxParam.Pointer = true;
             auto* trampolineFn = compiler->CreateFunctionDefinition(
-                "__program_run_" + name, intReturn, {ctxParam}, false, false, 0, false, false, false);
+                "__program_run_" + name, intReturn, {ctxParam}, false, false, 0, false, false);
             compiler->programTable[name].TrampolineFunction = trampolineFn;
 
             // Install Windows SEH personality so hardware faults in main() are caught.
@@ -17058,13 +17030,12 @@ public:
 
         // Parse member functions (includes user's main)
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto func : ctx->functionDefinition())
             {
                 global_scope = false;
                 ParseFunctionDefinition(func, name);
             }
-            global_scope = savedScope;
         }
 
         // Set programTable field indices BEFORE parsing the destructor: a user ~Name()
@@ -17091,13 +17062,12 @@ public:
         // Parse the user destructor if present (at most one). Emitted as a single
         // compiler-owned ~Name() whose user body runs first, then the builtin teardown.
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto dtor : ctx->destructorDefinition())
             {
                 global_scope = false;
                 ParseProgramDestructorDefinition(dtor, name);
             }
-            global_scope = savedScope;
         }
 
         // Flush instantiations (e.g. list__string from main's params) before emitting run()
@@ -17444,7 +17414,7 @@ public:
         }
 
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto func : functionList)
             {
                 global_scope = false;
@@ -17475,12 +17445,11 @@ public:
                 else
                     ParseFunctionDefinition(func, structName);
             }
-            global_scope = savedScope;
         }
 
         // Parse functions declared inside positional lock groups.
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto* lfg : MemberLockFieldGroups(ctx))
             {
                 for (auto* func : lfg->functionDefinition())
@@ -17489,18 +17458,16 @@ public:
                     ParseFunctionDefinition(func, structName);
                 }
             }
-            global_scope = savedScope;
         }
 
         // Parse destructor
         {
-            bool savedScope = global_scope;
+            GlobalScopeGuard scopeGuard(global_scope);
             for (auto dtor : MemberDestructorDefinitions(ctx))
             {
                 global_scope = false;
                 ParseDestructorDefinition(dtor, structName);
             }
-            global_scope = savedScope;
         }
 
         // Record interfaces and verify implementations

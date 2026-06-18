@@ -217,6 +217,13 @@ namespace cflat_jit
     };
 }
 
+// Strip surrounding quotes from an ANTLR StringLiteral token text (e.g. `"foo"` -> `foo`).
+// Returns the raw text unchanged if it is shorter than 2 characters.
+inline std::string DequoteStringLiteral(const std::string& raw)
+{
+    return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
+}
+
 class LLVMBackend
 {
 public:
@@ -299,6 +306,8 @@ public:
             }
     }
 
+    enum class CallingConv { Default, Stdcall, Cdecl };
+
     struct TypeAndValue
     {
         std::string TypeName;
@@ -311,8 +320,7 @@ public:
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
         bool IsBond = false;     // parameter declared with 'bond' - return value borrows from this parameter; return must not outlive it
-        bool IsStdcall = false;  // function declared with 'stdcall' - uses __stdcall calling convention on Win32
-        bool IsCdecl = false;   // function declared with 'cdecl'   - explicit C calling convention (default; recognized for clarity)
+        CallingConv CallConv = CallingConv::Default; // calling convention for extern declarations (Stdcall/Cdecl; Default = compiler-chosen)
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
@@ -1308,13 +1316,20 @@ private:
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
     }
 
+    // True when the insert block is active (non-null, no terminator yet).
+    // Guards the Flush* functions: emitting into a terminated block is illegal IR.
+    bool IsInsertBlockLive() const
+    {
+        auto* b = builder->GetInsertBlock();
+        return b != nullptr && b->getTerminator() == nullptr;
+    }
+
     void FlushOwnedStringTemps()
     {
         if (pendingOwnedStringTemps.empty()) return;
 
         auto* curBlock = builder->GetInsertBlock();
-        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
-        if (!terminated)
+        if (IsInsertBlockLive())
         {
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");
             for (auto& [value, bb] : pendingOwnedStringTemps)
@@ -1353,8 +1368,7 @@ private:
         if (pendingOwnedClosureTemps.empty()) return;
 
         auto* curBlock = builder->GetInsertBlock();
-        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
-        if (!terminated)
+        if (IsInsertBlockLive())
         {
             auto* closureTy = GetClosureFatPtrType();
             auto* dtor = GetOrCreateFullDestructor("__closure_fat_ptr");
@@ -1388,8 +1402,7 @@ private:
         if (pendingOwnedStructTemps.empty()) return;
 
         auto* curBlock = builder->GetInsertBlock();
-        bool terminated = curBlock != nullptr && curBlock->getTerminator() != nullptr;
-        if (!terminated)
+        if (IsInsertBlockLive())
         {
             for (auto& t : pendingOwnedStructTemps)
             {
@@ -1412,7 +1425,7 @@ private:
 
     void EmitDestructorsForScope(const StackState& frame)
     {
-        if (builder->GetInsertBlock()->getTerminator() != nullptr)
+        if (!IsInsertBlockLive())
             return;
 
         // Cleanup destructors have no user location. Pin a synthetic location to the function
@@ -2518,7 +2531,7 @@ private:
         llvm::raw_string_ostream errorStream(errors);
         if (llvm::verifyModule(*module, &errorStream))
         {
-            std::cerr << "Module verification failed:\n" << errorStream.str() << "\n";
+            std::cout << std::format("Module verification failed:\n{}\n", errorStream.str());
             return false;
         }
         return true;
@@ -2533,7 +2546,7 @@ private:
         llvm::raw_fd_ostream outLL(filename, errorCode);
         if (errorCode)
         {
-            std::cerr << "Error: could not write IR to '" << filename << "': " << errorCode.message() << "\n";
+            std::cout << std::format("Error: could not write IR to '{}': {}\n", filename, errorCode.message());
             return false;
         }
         module->print(outLL, nullptr);
@@ -2546,7 +2559,7 @@ private:
         llvm::raw_fd_ostream outBC(filename, errorCode, llvm::sys::fs::OF_None);
         if (errorCode)
         {
-            std::cerr << "Error: could not write bitcode to '" << filename << "': " << errorCode.message() << "\n";
+            std::cout << std::format("Error: could not write bitcode to '{}': {}\n", filename, errorCode.message());
             return false;
         }
         llvm::WriteBitcodeToFile(*module, outBC);
@@ -2618,7 +2631,7 @@ private:
 
         if (verbose)
         {
-            std::cout << "[verbose] compiling C source: " << cSourcePath << " -> " << objPath << "\n";
+            std::cout << std::format("[verbose] compiling C source: {} -> {}\n", cSourcePath, objPath);
             std::cout << "[verbose]   clang-cl";
             for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
             std::cout << "\n";
@@ -2690,8 +2703,7 @@ private:
 
         if (verbose)
         {
-            std::cout << "[verbose] compiling crash handler: " << srcPath.str().str()
-                      << " -> " << objPath << "\n";
+            std::cout << std::format("[verbose] compiling crash handler: {} -> {}\n", srcPath.str().str(), objPath);
             std::cout << "[verbose]   clang-cl";
             for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
             std::cout << "\n";
@@ -3000,7 +3012,7 @@ private:
             // external=true: unmangled name + C-compatible types; cdecl on the call.
             CreateFunctionDeclaration(regName, e.ret, e.params, /*external=*/true, e.variadic,
                                       /*returnsOwned=*/false, /*isMethod=*/false,
-                                      /*isStdcall=*/false, /*isCdecl=*/true);
+                                      CallingConv::Cdecl);
 
             if (isProgMain)
             {
@@ -3027,7 +3039,7 @@ private:
         }
 
         if (verbose)
-            std::cout << "[verbose]   registered " << sigs.size() << " C function(s) from " << fileForLsp << "\n";
+            std::cout << std::format("[verbose]   registered {} C function(s) from {}\n", sigs.size(), fileForLsp);
     }
 
     std::vector<std::string> BuildClangDriverArgs(const std::string& headerDir,
@@ -3061,8 +3073,7 @@ private:
         e.col      = r.col < 0 ? 0 : r.col;
         if (!MapCTypeToTypeAndValue(r.retType, e.ret))
         {
-            if (verbose) std::cout << "[verbose]   skipping '" << r.name
-                                   << "': unsupported return type '" << r.retType << "'\n";
+            if (verbose) std::cout << std::format("[verbose]   skipping '{}': unsupported return type '{}'\n", r.name, r.retType);
             return false;
         }
         for (size_t i = 0; i < r.paramTypes.size(); ++i)
@@ -3070,8 +3081,7 @@ private:
             TypeAndValue ptv;
             if (!MapCTypeToTypeAndValue(r.paramTypes[i], ptv))
             {
-                if (verbose) std::cout << "[verbose]   skipping '" << r.name
-                                       << "': unsupported parameter type '" << r.paramTypes[i] << "'\n";
+                if (verbose) std::cout << std::format("[verbose]   skipping '{}': unsupported parameter type '{}'\n", r.name, r.paramTypes[i]);
                 return false;
             }
             if (i < r.paramNames.size()) ptv.VariableName = r.paramNames[i];
@@ -3084,8 +3094,7 @@ private:
     {
         if (r.ctype.find('[') != std::string::npos)
         {
-            if (verbose) std::cout << "[verbose]   skipping global '" << r.name
-                                   << "': array type '" << r.ctype << "' is not bindable\n";
+            if (verbose) std::cout << std::format("[verbose]   skipping global '{}': array type '{}' is not bindable\n", r.name, r.ctype);
             return false;
         }
         e = CGlobalEntry();
@@ -3094,8 +3103,7 @@ private:
         e.col  = r.col < 0 ? 0 : r.col;
         if (!MapCTypeToTypeAndValue(r.ctype, e.type))
         {
-            if (verbose) std::cout << "[verbose]   skipping global '" << r.name
-                                   << "': unsupported type '" << r.ctype << "'\n";
+            if (verbose) std::cout << std::format("[verbose]   skipping global '{}': unsupported type '{}'\n", r.name, r.ctype);
             return false;
         }
         e.type.VariableName = r.name;
@@ -3307,8 +3315,7 @@ private:
 
         if (verbose)
         {
-            std::cout << "[verbose] extracting C header"
-                      << (headerPaths.size() > 1 ? " group" : "") << ":";
+            std::cout << std::format("[verbose] extracting C header{}:", headerPaths.size() > 1 ? " group" : "");
             for (const auto& h : headerPaths) std::cout << " " << h;
             std::cout << " (clang C++ API)\n";
         }
@@ -3317,7 +3324,7 @@ private:
         std::string err;
         if (!cflat_cinterop::ExtractCInterop(req, raw, err))
         {
-            if (verbose) std::cout << "[verbose]   C header extraction failed: " << err << "\n";
+            if (verbose) std::cout << std::format("[verbose]   C header extraction failed: {}\n", err);
             return false;
         }
 
@@ -3328,7 +3335,7 @@ private:
             if (outPrereqFailure) *outPrereqFailure = true;
             if (outPrereqMsg) *outPrereqMsg = raw.firstPrereqError;
             if (verbose)
-                std::cout << "[verbose]   header is not self-contained: " << raw.firstPrereqError << "\n";
+                std::cout << std::format("[verbose]   header is not self-contained: {}\n", raw.firstPrereqError);
             return false;
         }
 
@@ -3398,10 +3405,8 @@ private:
         }
 
         if (verbose)
-            std::cout << "[verbose]   header bind: " << outSigs.size() << " sig(s), "
-                      << outEnums.size() << " enum(s), " << outRecords.size() << " record(s), "
-                      << outMacros.size() << " macro(s), " << outFuncMacros.size() << " func-macro(s), "
-                      << outGlobals.size() << " global(s)\n";
+            std::cout << std::format("[verbose]   header bind: {} sig(s), {} enum(s), {} record(s), {} macro(s), {} func-macro(s), {} global(s)\n",
+                outSigs.size(), outEnums.size(), outRecords.size(), outMacros.size(), outFuncMacros.size(), outGlobals.size());
         return true;
     }
 
@@ -3421,13 +3426,13 @@ private:
         req.definitionsOnly = true;
 
         if (verbose)
-            std::cout << "[verbose] extracting C signatures: " << cSourcePath << " (clang C++ API)\n";
+            std::cout << std::format("[verbose] extracting C signatures: {} (clang C++ API)\n", cSourcePath);
 
         cflat_cinterop::ExtractResult raw;
         std::string err;
         if (!cflat_cinterop::ExtractCInterop(req, raw, err))
         {
-            if (verbose) std::cout << "[verbose]   C extraction failed: " << err << "\n";
+            if (verbose) std::cout << std::format("[verbose]   C extraction failed: {}\n", err);
             return false;
         }
 
@@ -3498,7 +3503,7 @@ private:
                 CFileSigCacheEntry& entry = cacheIt->second;
                 if (entry.mtime == currentMtime)
                 {
-                    if (verbose) std::cout << "[verbose] C signatures cache hit (mtime) for " << fileForLsp << "\n";
+                    if (verbose) std::cout << std::format("[verbose] C signatures cache hit (mtime) for {}\n", fileForLsp);
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
                     hitGlobals = entry.globals;
@@ -3507,7 +3512,7 @@ private:
                 // Timestamp moved but content may be identical - only now pay for a hash.
                 else if (hashNow() == entry.hash)
                 {
-                    if (verbose) std::cout << "[verbose] C signatures cache hit (hash) for " << fileForLsp << "\n";
+                    if (verbose) std::cout << std::format("[verbose] C signatures cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime; // refresh so the next check short-circuits on mtime
                     hitSigs = entry.sigs;
                     hitRecords = entry.records;
@@ -3589,7 +3594,7 @@ private:
                             tv.TypeName + " " + e.name + ConstIntValueSuffix(tv.TypeName, e.value));
         }
         if (verbose)
-            std::cout << "[verbose]   registered " << enums.size() << " C enum constant(s) from " << fileForLsp << "\n";
+            std::cout << std::format("[verbose]   registered {} C enum constant(s) from {}\n", enums.size(), fileForLsp);
     }
 
     void RegisterCGlobals(const std::vector<CGlobalEntry>& globals, const std::string& fileForLsp)
@@ -3609,7 +3614,7 @@ private:
                             tv.TypeName + (tv.Pointer ? "*" : "") + " " + e.name);
         }
         if (verbose)
-            std::cout << "[verbose]   registered " << globals.size() << " C global(s) from " << fileForLsp << "\n";
+            std::cout << std::format("[verbose]   registered {} C global(s) from {}\n", globals.size(), fileForLsp);
     }
 
     void RegisterCRecords(const std::vector<CRecordEntry>& records, const std::string& fileForLsp)
@@ -3646,10 +3651,8 @@ private:
                 std::string elemSpelling = StripFixedArrayDims(f.ctype, arrDims);
                 if (!MapCTypeToTypeAndValue(elemSpelling, tv))
                 {
-                    if (verbose) std::cout << "[verbose]   skipping C " << (r.isUnion ? "union" : "struct")
-                                           << " '" << r.name
-                                           << "': unsupported field '" << f.name
-                                           << "' of type '" << f.ctype << "'\n";
+                    if (verbose) std::cout << std::format("[verbose]   skipping C {} '{}': unsupported field '{}' of type '{}'\n",
+                        r.isUnion ? "union" : "struct", r.name, f.name, f.ctype);
                     ok = false;
                     break;
                 }
@@ -3688,9 +3691,8 @@ private:
                 auto* ft = GetType(d);
                 if (ft && !ft->isSized())
                 {
-                    if (verbose) std::cout << "[verbose]   skipping C " << (r.isUnion ? "union" : "struct")
-                                           << " '" << r.name << "': field '" << d.VariableName
-                                           << "' has incomplete (unsized) type '" << d.TypeName << "'\n";
+                    if (verbose) std::cout << std::format("[verbose]   skipping C {} '{}': field '{}' has incomplete (unsized) type '{}'\n",
+                        r.isUnion ? "union" : "struct", r.name, d.VariableName, d.TypeName);
                     ok = false;
                     break;
                 }
@@ -3741,7 +3743,7 @@ private:
         }
 
         if (verbose)
-            std::cout << "[verbose]   registered " << ours.size() << " C record(s) from " << fileForLsp << "\n";
+            std::cout << std::format("[verbose]   registered {} C record(s) from {}\n", ours.size(), fileForLsp);
     }
 
     void RegisterCMacros(const std::vector<CMacroEntry>& macros)
@@ -3842,8 +3844,8 @@ private:
                             tv.TypeName + (tv.Pointer ? "* " : " ") + m.name + valSuffix);
         }
         if (verbose && !macros.empty())
-            std::cout << "[verbose]   registered " << registered << " C macro constant(s) (of "
-                      << macros.size() << " object-like candidates)\n";
+            std::cout << std::format("[verbose]   registered {} C macro constant(s) (of {} object-like candidates)\n",
+                registered, macros.size());
     }
 
     bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const
@@ -4064,7 +4066,7 @@ private:
                 globalNamedVariable.count(m.name))
             {
                 ++skipped;
-                if (verbose) std::cout << "[verbose]   skip macro " << m.name << ": name already defined\n";
+                if (verbose) std::cout << std::format("[verbose]   skip macro {}: name already defined\n", m.name);
                 continue;
             }
 
@@ -4072,7 +4074,7 @@ private:
             if (!TranslateMacroBody(m, translatedBody))
             {
                 ++rejected;
-                if (verbose) std::cout << "[verbose]   reject macro " << m.name << ": body uses unsupported tokens\n";
+                if (verbose) std::cout << std::format("[verbose]   reject macro {}: body uses unsupported tokens\n", m.name);
                 continue;
             }
 
@@ -4093,9 +4095,8 @@ private:
         }
 
         if (verbose)
-            std::cout << "[verbose]   function-like C macros: " << accepted << " translated, "
-                      << rejected << " rejected, " << skipped << " skipped (already defined) from "
-                      << fileForLsp << "\n";
+            std::cout << std::format("[verbose]   function-like C macros: {} translated, {} rejected, {} skipped (already defined) from {}\n",
+                accepted, rejected, skipped, fileForLsp);
 
         if (!generated.empty())
             pendingMacroSources_.push_back({ fileForLsp + "@cmacros", std::move(generated) });
@@ -4196,14 +4197,14 @@ private:
                 CFileSigCacheEntry& entry = cacheIt->second;
                 if (entry.mtime == currentMtime)
                 {
-                    if (verbose) std::cout << "[verbose] C header cache hit (mtime) for " << fileForLsp << "\n";
+                    if (verbose) std::cout << std::format("[verbose] C header cache hit (mtime) for {}\n", fileForLsp);
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
                 }
                 else if (hashNow() == entry.hash)
                 {
-                    if (verbose) std::cout << "[verbose] C header cache hit (hash) for " << fileForLsp << "\n";
+                    if (verbose) std::cout << std::format("[verbose] C header cache hit (hash) for {}\n", fileForLsp);
                     entry.mtime = currentMtime;
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
@@ -4234,7 +4235,7 @@ private:
             CFileSigCacheEntry diskEntry;
             if (TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry))
             {
-                if (verbose) std::cout << "[verbose] C header disk cache hit for " << fileForLsp << "\n";
+                if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
                     cFileSigCache_[cacheKey] = diskEntry;
@@ -4380,7 +4381,7 @@ private:
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
         if (!target)
         {
-            std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+            std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
             return false;
         }
 
@@ -4399,7 +4400,7 @@ private:
         llvm::raw_fd_ostream dest(objPath, EC, llvm::sys::fs::OF_None);
         if (EC)
         {
-            std::cerr << "Error: could not write object file '" << objPath << "': " << EC.message() << "\n";
+            std::cout << std::format("Error: could not write object file '{}': {}\n", objPath, EC.message());
             return false;
         }
 
@@ -4408,7 +4409,7 @@ private:
             llvm::legacy::PassManager pass;
             if (TM->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
             {
-                std::cerr << "Error: target does not support object file emission\n";
+                std::cout << "Error: target does not support object file emission\n";
                 return false;
             }
             pass.run(*module);
@@ -4435,7 +4436,7 @@ private:
         if (lldLinkPath.empty())
         {
             llvm::sys::fs::remove(objPath);
-            std::cerr << "Error: lld-link.exe not found\n";
+            std::cout << "Error: lld-link.exe not found\n";
             return false;
         }
 
@@ -4507,7 +4508,7 @@ private:
         std::vector<llvm::StringRef> linkArgs;
         for (auto& s : linkArgStrs) linkArgs.push_back(s);
 
-        std::cout << "Linking (" << arch << "): " << exePath << "\n";
+        std::cout << std::format("Linking ({}): {}\n", arch, exePath);
 
         {
             llvm::TimeTraceScope linkScope("Link", exePath);
@@ -4518,7 +4519,7 @@ private:
 
             if (rc != 0)
             {
-                std::cerr << "Error: linking failed (exit " << rc << "): " << linkErr << "\n";
+                std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
                 return false;
             }
         }
@@ -4542,8 +4543,7 @@ private:
                 LogError(std::format("--asan: failed to copy asan runtime DLL '{}' next to '{}': {}",
                                      asanDllToCopy, exePath, ec.message()));
             else if (verbose)
-                std::cout << "[verbose]   copied asan runtime DLL: " << asanDllToCopy
-                          << " -> " << dest.string() << "\n";
+                std::cout << std::format("[verbose]   copied asan runtime DLL: {} -> {}\n", asanDllToCopy, dest.string());
         }
         return true;
     }
@@ -4845,8 +4845,7 @@ private:
                         if (!ec)
                         {
                             copiedDestNames.insert(dest.filename().string());
-                            if (verbose) std::cout << "[verbose]   copied runtime DLL: " << dll.string()
-                                                   << " -> " << dest.string() << "\n";
+                            if (verbose) std::cout << std::format("[verbose]   copied runtime DLL: {} -> {}\n", dll.string(), dest.string());
                             copied = true;
                         }
                         break;
@@ -4855,7 +4854,7 @@ private:
                 if (copied) break;
             }
             if (!copied && verbose)
-                std::cout << "[verbose]   no runtime DLL found for " << lib << " (static lib?)\n";
+                std::cout << std::format("[verbose]   no runtime DLL found for {} (static lib?)\n", lib);
         }
 
         // vcpkg-resolved DLL paths are authoritative (from vcpkg_installed/<triplet>/bin).
@@ -4869,7 +4868,7 @@ private:
             if (copiedDestNames.count(dest.filename().string())) continue;
             fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
             if (!ec && verbose)
-                std::cout << "[verbose]   copied vcpkg DLL: " << src.string() << " -> " << dest.string() << "\n";
+                std::cout << std::format("[verbose]   copied vcpkg DLL: {} -> {}\n", src.string(), dest.string());
         }
     }
 
@@ -4925,26 +4924,26 @@ public:
 
     void DumpState() const
     {
-        std::cerr << "  File: " << (sourceFileName.empty() ? "<unknown>" : sourceFileName) << "\n";
-        std::cerr << "  Location: " << currentLine << ":" << currentColumn << "\n";
+        std::cout << std::format("  File: {}\n", sourceFileName.empty() ? "<unknown>" : sourceFileName);
+        std::cout << std::format("  Location: {}:{}\n", currentLine, currentColumn);
 
         if (currentFunction)
-            std::cerr << "  Function: " << currentFunction->getName().str() << "\n";
+            std::cout << std::format("  Function: {}\n", currentFunction->getName().str());
         else
-            std::cerr << "  Function: <none>\n";
+            std::cout << "  Function: <none>\n";
 
-        std::cerr << "  Scope depth: " << stackNamedVariable.size() << "\n";
+        std::cout << std::format("  Scope depth: {}\n", stackNamedVariable.size());
         if (!stackNamedVariable.empty())
         {
             const auto& top = stackNamedVariable.back();
-            std::cerr << "  Top scope locals:";
+            std::cout << "  Top scope locals:";
             for (const auto& [name, _] : top.namedVariable)
-                std::cerr << " " << name;
-            std::cerr << "\n";
+                std::cout << " " << name;
+            std::cout << "\n";
         }
 
-        std::cerr << "  Structs registered: " << dataStructures.size() << "\n";
-        std::cerr << "  Functions registered: " << functionTable.size() << "\n";
+        std::cout << std::format("  Structs registered: {}\n", dataStructures.size());
+        std::cout << std::format("  Functions registered: {}\n", functionTable.size());
     }
 
     void InitDebugInfo(const std::string& filename, const std::string& directory)
@@ -7612,7 +7611,7 @@ public:
 
     llvm::BranchInst* CreateJump(llvm::BasicBlock* block)
     {
-        if (block && builder->GetInsertBlock()->getTerminator() == nullptr)
+        if (block && IsInsertBlockLive())
             return builder->CreateBr(block);
         return nullptr;
     }
@@ -7794,8 +7793,7 @@ public:
 
         if (resumeBlock)
         {
-            // check if break has already been inserted.
-            if (builder->GetInsertBlock()->getTerminator() == nullptr)
+            if (IsInsertBlockLive())
                 return builder->CreateBr(resumeBlock);
         }
 
@@ -7979,7 +7977,7 @@ public:
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
     // table under the qualified lookup name but must link against the bare C symbol.
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, const std::string& linkageName = {})
+    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {})
     {
         // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
         // are lowered (coerce-to-int / byval / sret) per the Win64 or Win32 MSVC ABI. If the
@@ -8014,9 +8012,9 @@ public:
 
         if (llvm::Function* fn = llvm::dyn_cast<llvm::Function>(calleeValue))
         {
-            if (isStdcall && platformValue == 32)
+            if (callConv == CallingConv::Stdcall && platformValue == 32)
                 fn->setCallingConv(llvm::CallingConv::X86_StdCall);
-            else if (isCdecl)
+            else if (callConv == CallingConv::Cdecl)
                 fn->setCallingConv(llvm::CallingConv::C);
 
             if (useRecipe)
@@ -8111,7 +8109,7 @@ public:
         return uniqueName;
     }
 
-    llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, bool isStdcall = false, bool isCdecl = false, size_t scopeLine = 0)
+    llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0)
     {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
@@ -8129,7 +8127,7 @@ public:
         {
             if (!fn->empty())
             {
-                if (verbose) std::cerr << "[verbose] skipping duplicate definition of '" << functionName << "'\n";
+                if (verbose) std::cout << std::format("[verbose] skipping duplicate definition of '{}'\n", functionName);
                 return fn;
             }
             // Pre-declared by ForwardRefScanner - reuse the declaration and attach a body.
@@ -8160,9 +8158,9 @@ public:
         if (!external && functionName != "main")
             fn->setLinkage(llvm::Function::InternalLinkage);
 
-        if (isStdcall && platformValue == 32)
+        if (callConv == CallingConv::Stdcall && platformValue == 32)
             fn->setCallingConv(llvm::CallingConv::X86_StdCall);
-        else if (isCdecl)
+        else if (callConv == CallingConv::Cdecl)
             fn->setCallingConv(llvm::CallingConv::C);
 
         // Thin `int[]` array-view params carry a noalias contract (distinct views point at
@@ -9524,6 +9522,18 @@ public:
         return false;
     }
 
+    // Find the implicit 'this' argument in a function-argument map.
+    // The this parameter is named "<StructName>__" (trailing double-underscore).
+    // Returns end() when not in a member function context.
+    static auto FindThisArgIt(const std::map<std::string, NamedVariable>& args)
+        -> std::map<std::string, NamedVariable>::const_iterator
+    {
+        for (auto it = args.begin(); it != args.end(); ++it)
+            if (it->first.ends_with("__"))
+                return it;
+        return args.end();
+    }
+
     /// <summary>
     /// Get the member variable from a member function.
     /// </summary>
@@ -9535,19 +9545,7 @@ public:
 
             if (functionArguments.size() > 0)
             {
-                // The implicit `this` parameter is named "<StructName>__" (trailing
-                // double-underscore). functionArgument is a std::map sorted by key,
-                // so `begin()` is not guaranteed to be `this` - find it explicitly.
-                auto thisIt = functionArguments.end();
-                for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
-                {
-                    const auto& key = it->first;
-                    if (key.size() >= 2 && key[key.size() - 2] == '_' && key.back() == '_')
-                    {
-                        thisIt = it;
-                        break;
-                    }
-                }
+                auto thisIt = FindThisArgIt(functionArguments);
                 if (thisIt == functionArguments.end())
                     return {};
 
@@ -9609,19 +9607,7 @@ public:
             if (functionArguments.empty())
                 continue;
 
-            // Find the implicit 'this' arg - its name ends with "__" (the struct
-            // name followed by "__"). functionArgument is a std::map (sorted
-            // alphabetically), so we can't rely on begin() here.
-            auto thisIt = functionArguments.end();
-            for (auto it = functionArguments.begin(); it != functionArguments.end(); ++it)
-            {
-                const auto& argName = it->first;
-                if (argName.size() >= 2 && argName.substr(argName.size() - 2) == "__")
-                {
-                    thisIt = it;
-                    break;
-                }
-            }
+            auto thisIt = FindThisArgIt(functionArguments);
             if (thisIt == functionArguments.end())
                 break;
 
@@ -9659,29 +9645,25 @@ public:
             if (functionArguments.empty())
                 continue;
 
-            // The implicit 'this' arg is named "<StructName>__" (trailing "__").
-            for (const auto& [key, nv] : functionArguments)
-            {
-                if (key.size() < 2 || key.substr(key.size() - 2) != "__")
-                    continue;
-                std::string structName = key.substr(0, key.size() - 2);
-                if (!IsDataStructure(structName))
-                    continue;
-                // Only a *method* self qualifies here: its storage is an alloca-of-pointer
-                // (the incoming this* param), so loading it yields the struct pointer.
-                // A constructor's self is an alloca-of-struct (value under construction);
-                // leave that to the existing `this`-handling path.
-                auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(nv.Storage);
-                if (!alloca || !alloca->getAllocatedType()->isPointerTy())
-                    break;
-                NamedVariable thisVar = nv;
-                thisVar.CallerName = "this";
-                thisVar.TypeAndValue.TypeName = structName;
-                thisVar.TypeAndValue.Pointer = true;
-                return thisVar;
-            }
-            // First frame with arguments but no 'this' -> not a member body.
-            break;
+            auto thisIt = FindThisArgIt(functionArguments);
+            if (thisIt == functionArguments.end())
+                break;  // first frame with arguments but no 'this' -> not a member body
+            const auto& [key, nv] = *thisIt;
+            std::string structName = key.substr(0, key.size() - 2);
+            if (!IsDataStructure(structName))
+                break;
+            // Only a *method* self qualifies here: its storage is an alloca-of-pointer
+            // (the incoming this* param), so loading it yields the struct pointer.
+            // A constructor's self is an alloca-of-struct (value under construction);
+            // leave that to the existing `this`-handling path.
+            auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(nv.Storage);
+            if (!alloca || !alloca->getAllocatedType()->isPointerTy())
+                break;
+            NamedVariable thisVar = nv;
+            thisVar.CallerName = "this";
+            thisVar.TypeAndValue.TypeName = structName;
+            thisVar.TypeAndValue.Pointer = true;
+            return thisVar;
         }
         return {};
     }
@@ -10124,8 +10106,7 @@ public:
     // (insertvalue) rather than as a single `load %Struct`, which dyn_cast<LoadInst> misses.
     void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr, const std::string& interfaceReturnStructName = "")
     {
-        // check if break has already been inserted.
-        if (builder->GetInsertBlock()->getTerminator() != nullptr)
+        if (!IsInsertBlockLive())
             return;
 
         // If returning an owned variable loaded from a local alloca, suppress its cleanup
@@ -10547,7 +10528,7 @@ public:
 
     bool IsBlockTerminated()
     {
-        return builder->GetInsertBlock()->getTerminator() != nullptr;
+        return !IsInsertBlockLive();
     }
 
     // True when v is a compile-time-constant non-zero integer - the guard of an
@@ -10576,7 +10557,7 @@ public:
 
     void CreateBreakCall()
     {
-        if (builder->GetInsertBlock()->getTerminator() != nullptr)
+        if (!IsInsertBlockLive())
             return;
 
         for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
@@ -10592,7 +10573,7 @@ public:
 
     void CreateContinueCall()
     {
-        if (builder->GetInsertBlock()->getTerminator() != nullptr)
+        if (!IsInsertBlockLive())
             return;
 
         for (auto& stackFrame : std::ranges::reverse_view(stackNamedVariable))
@@ -10959,8 +10940,7 @@ public:
         if (tv.Pointer)        j["p"]   = true;
         if (tv.ElemPointer)    j["ep"]  = true;
         if (tv.IsMove)         j["mv"]  = true;
-        if (tv.IsStdcall)      j["sc"]  = true;
-        if (tv.IsCdecl)        j["cd"]  = true;
+        if (tv.CallConv != CallingConv::Default) j["cc"] = static_cast<int>(tv.CallConv);
         if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
         if (!tv.ConstInnerDimensions.empty()) j["idims"] = tv.ConstInnerDimensions;
         if (tv.IsSimd) { j["sd"] = true; j["sdl"] = tv.SimdLanes; }
@@ -10990,8 +10970,7 @@ public:
         tv.Pointer        = j.value("p",   false);
         tv.ElemPointer    = j.value("ep",  false);
         tv.IsMove         = j.value("mv",  false);
-        tv.IsStdcall      = j.value("sc",  false);
-        tv.IsCdecl        = j.value("cd",  false);
+        tv.CallConv = static_cast<CallingConv>(j.value("cc", 0));
         tv.ConstArraySize = j.value("arr", uint64_t{0});
         if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].get<std::vector<uint64_t>>();
         tv.IsSimd   = j.value("sd",  false);
@@ -11365,8 +11344,8 @@ public:
             if (lspMode && !includeDirPresent)
             {
                 if (verbose)
-                    std::cout << "[verbose] vcpkg: package not installed (no '" << res.includeDir
-                              << "'); skipping header '" << header << "' for LSP analysis\n";
+                    std::cout << std::format("[verbose] vcpkg: package not installed (no '{}'); skipping header '{}' for LSP analysis\n",
+                        res.includeDir, header);
                 return true;
             }
             // CLI: a missing header is a hard error. If `vcpkg install` was suppressed
@@ -11419,7 +11398,7 @@ public:
                 cFileSigCache_[inMemKey] = std::move(diskEntry);
                 diskHit = true;
                 if (verbose)
-                    std::cout << "[verbose] vcpkg header disk cache hit: " << fileForLsp << "\n";
+                    std::cout << std::format("[verbose] vcpkg header disk cache hit: {}\n", fileForLsp);
             }
         }
 
@@ -11488,12 +11467,12 @@ inline void CompilerManager::DumpAllState() const
     std::lock_guard<std::mutex> lock(mutex_);
     if (compilers_.empty())
     {
-        std::cerr << "  (no compiler instances registered)\n";
+        std::cout << "  (no compiler instances registered)\n";
         return;
     }
     for (size_t i = 0; i < compilers_.size(); ++i)
     {
-        std::cerr << "  [Compiler " << i << "]\n";
+        std::cout << std::format("  [Compiler {}]\n", i);
         compilers_[i]->DumpState();
     }
 }

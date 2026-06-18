@@ -76,20 +76,20 @@ static int EditDistance(const std::string& a, const std::string& b)
 // fields are registered under "<Type>.<member>", so we scan the index for that prefix.
 static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
 {
-    std::cout << def.name << "  (" << SymbolKindName(def.kind) << ")\n";
+    std::cout << std::format("{}  ({})\n", def.name, SymbolKindName(def.kind));
     if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
-        std::cout << "  " << def.signatureMarkdown << "\n";
+        std::cout << std::format("  {}\n", def.signatureMarkdown);
     for (const auto& sig : def.overloadSignatures)
-        std::cout << "  " << sig << "\n";
+        std::cout << std::format("  {}\n", sig);
     if (def.line > 0 && !def.file.empty())
-        std::cout << "  defined: " << def.file << ":" << def.line << "\n";
+        std::cout << std::format("  defined: {}:{}\n", def.file, def.line);
     if (!def.docComment.empty())
-        std::cout << "  doc: " << def.docComment << "\n";
+        std::cout << std::format("  doc: {}\n", def.docComment);
 
     const std::string prefix = def.name + ".";
     std::vector<const SymbolDef*> members;
     for (const auto& [name, m] : index.Symbols())
-        if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0)
+        if (name.starts_with(prefix) && name.size() > prefix.size())
             members.push_back(&m);
     std::sort(members.begin(), members.end(),
               [](const SymbolDef* a, const SymbolDef* b) { return a->name < b->name; });
@@ -104,7 +104,7 @@ static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
                 std::cout << "  :  " << m->signatureMarkdown;
             std::cout << "\n";
             for (const auto& sig : m->overloadSignatures)
-                std::cout << "    " << m->name << "  :  " << sig << "\n";
+                std::cout << std::format("    {}  :  {}\n", m->name, sig);
         }
     }
 }
@@ -150,9 +150,9 @@ static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::strin
     for (size_t i = 0; i < hits.size() && i < maxShow; ++i)
     {
         const SymbolDef* d = hits[i].def;
-        std::cout << "    " << d->name << "  (" << SymbolKindName(d->kind) << ")";
+        std::cout << std::format("    {}  ({})", d->name, SymbolKindName(d->kind));
         if (d->line > 0 && !d->file.empty())
-            std::cout << "  " << d->file << ":" << d->line;
+            std::cout << std::format("  {}:{}", d->file, d->line);
         std::cout << "\n";
     }
 }
@@ -221,9 +221,9 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
 
     if (index.SymbolCount() == 0)
     {
-        std::cerr << "Error: no symbols indexed";
-        if (!ok) std::cerr << " (analysis of '" << sourcePath << "' failed)";
-        std::cerr << ".\n";
+        std::cout << "Error: no symbols indexed";
+        if (!ok) std::cout << std::format(" (analysis of '{}' failed)", sourcePath);
+        std::cout << ".\n";
         return 1;
     }
     if (!ok && showLogo)
@@ -247,7 +247,7 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
             PrintSymbolDetail(index, *exact);
         else
         {
-            std::cout << "'" << term << "': no exact match.\n";
+            std::cout << std::format("'{}': no exact match.\n", term);
             if (!tempPath.empty())
                 std::cout << "  (no source file given, only showing symbols from core libraries; "
                              "pass a .cb that imports your headers to search them)\n";
@@ -308,7 +308,11 @@ int main(int argc, char* argv[])
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
 
     if (!args.parse(argc, argv))
+    {
+        if (!args.getError().empty())
+            std::cout << args.getError() << "\n";
         return 1;
+    }
 
     if (args.showVersion())
     {
@@ -317,9 +321,7 @@ int main(int argc, char* argv[])
     }
 
     // Locate runtime.cb next to this executable (needed for lld-link discovery too).
-    char* pgmptr = nullptr;
-    _get_pgmptr(&pgmptr);
-    std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+    std::string runtimeDir = GetExeDir();
 
     if (args.hasFlag("init"))
     {
@@ -341,7 +343,7 @@ int main(int argc, char* argv[])
     auto filename = args.getPositional(0);
     if (!filename)
     {
-        std::cerr << "Error: no input file specified.\n\n";
+        std::cout << "Error: no input file specified.\n\n";
         args.printUsage();
         return 1;
     }
@@ -362,7 +364,7 @@ int main(int argc, char* argv[])
         if (auto err = llvm::timeTraceProfilerWrite(tracePath, ""))
             llvm::consumeError(std::move(err));
         else if (showLogo)
-            std::cout << "Time trace written to " << tracePath << "\n";
+            std::cout << std::format("Time trace written to {}\n", tracePath);
         llvm::timeTraceProfilerCleanup();
     };
 
@@ -423,7 +425,7 @@ int main(int argc, char* argv[])
             }
             else
             {
-                std::cerr << std::format("FAIL: {}\n", file);
+                std::cout << std::format("FAIL: {}\n", file);
                 ++failures;
             }
         }
@@ -445,7 +447,7 @@ int main(int argc, char* argv[])
     bool runMode = args.hasFlag("run");
     if (runMode && (args.getOption("output") || args.getOption("out-lli") || args.getOption("bitcode")))
     {
-        std::cerr << "Error: --run is read-only and writes nothing to disk; it cannot be combined "
+        std::cout << "Error: --run is read-only and writes nothing to disk; it cannot be combined "
                      "with -o, -l/--out-lli, or -b/--bitcode.\n";
         return 1;
     }
@@ -453,7 +455,7 @@ int main(int argc, char* argv[])
     // in any other mode they would silently go nowhere, so reject them up front.
     if (!args.passthrough().empty() && !runMode)
     {
-        std::cerr << "Error: program arguments after '--' are only valid with --run.\n";
+        std::cout << "Error: program arguments after '--' are only valid with --run.\n";
         return 1;
     }
     compiler.SetRunMode(runMode);
@@ -465,7 +467,7 @@ int main(int argc, char* argv[])
 
     if (!ok)
     {
-        std::cerr << "Compilation failed.\n";
+        std::cout << "Compilation failed.\n";
         return 1;
     }
 

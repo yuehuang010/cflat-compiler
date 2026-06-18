@@ -1,6 +1,5 @@
 #include "JsonRpcLoop.h"
 #include <io.h>
-#include <fcntl.h>
 #include <format>
 #include <iostream>
 
@@ -23,11 +22,7 @@ static int ReadByte(bool verbose)
     if (n != 1)
     {
         if (verbose)
-        {
-            char msg[64];
-            int len = sprintf_s(msg, sizeof(msg), "[lsp] _read returned %d, errno=%d\n", n, errno);
-            _write(2, msg, len);
-        }
+            std::cerr << std::format("[lsp] _read returned {}, errno={}\n", n, errno);
         return -1;
     }
     return static_cast<int>(b);
@@ -46,13 +41,13 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
             int c = ReadByte(verbose_);
             if (c < 0)
             {
-                if (verbose_) { char msg[64]; int len = sprintf_s(msg, sizeof(msg), "[lsp] ReadByte returned -1 in header loop, lineCount=%d\n", lineCount); _write(2, msg, len); }
+                if (verbose_) std::cerr << std::format("[lsp] ReadByte returned -1 in header loop, lineCount={}\n", lineCount);
                 return false;
             }
             if (c == '\r')
             {
                 int next = ReadByte(verbose_);
-                if (next < 0) { if (verbose_) _write(2, "[lsp] ReadByte after CR returned -1\n", 36); return false; }
+                if (next < 0) { if (verbose_) std::cerr << "[lsp] ReadByte after CR returned -1\n"; return false; }
                 if (next == '\n') break;
                 line += static_cast<char>(next);
                 break;
@@ -60,7 +55,7 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
             line += static_cast<char>(c);
         }
 
-        if (verbose_) { char msg[128]; int len = sprintf_s(msg, sizeof(msg), "[lsp] header line[%d]: '%s'\n", lineCount, line.c_str()); _write(2, msg, len); }
+        if (verbose_) std::cerr << std::format("[lsp] header line[{}]: '{}'\n", lineCount, line);
         lineCount++;
 
         if (line.empty())
@@ -71,7 +66,7 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
             contentLength = std::stoul(line.substr(prefix.size()));
     }
 
-    if (verbose_) { char msg[64]; int len = sprintf_s(msg, sizeof(msg), "[lsp] contentLength=%zu\n", contentLength); _write(2, msg, len); }
+    if (verbose_) std::cerr << std::format("[lsp] contentLength={}\n", contentLength);
 
     if (contentLength == 0)
         return false;
@@ -90,11 +85,11 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
 
 void JsonRpcLoop::Run(MessageHandler handler)
 {
-    if (verbose_) _write(2, "[lsp] ReadMessage loop starting\n", 32);
+    if (verbose_) std::cerr << "[lsp] ReadMessage loop starting\n";
     std::string body;
     while (ReadMessage(body))
     {
-        if (verbose_) { std::string dbg = "[lsp] got message: " + body.substr(0, 60) + "\n"; _write(2, dbg.c_str(), (unsigned int)dbg.size()); }
+        if (verbose_) std::cerr << "[lsp] got message: " << body.substr(0, 60) << "\n";
 
         nlohmann::json parsed;
         try

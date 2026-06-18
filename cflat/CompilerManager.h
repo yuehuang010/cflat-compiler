@@ -61,9 +61,9 @@ private:
 
     static void AbortHandler(int)
     {
-        std::cerr << "\n=== abort() called - compiler state dump ===\n";
+        std::cout << "\n=== abort() called - compiler state dump ===\n";
         Instance().DumpAllState();
-        std::cerr << "============================================\n\n";
+        std::cout << "============================================\n\n";
         // Restore default and re-raise so the process exits with the correct signal.
         signal(SIGABRT, SIG_DFL);
         raise(SIGABRT);
@@ -71,18 +71,18 @@ private:
 
     static void LLVMFatalHandler(void*, const char* reason, bool)
     {
-        std::cerr << "\n=== LLVM fatal error: " << reason << " ===\n";
+        std::cout << std::format("\n=== LLVM fatal error: {} ===\n", reason);
         Instance().DumpAllState();
-        std::cerr << "===============================================\n\n";
+        std::cout << "===============================================\n\n";
     }
 
     static int __cdecl AssertHook(int reportType, char* message, int* returnValue)
     {
         if (reportType == _CRT_ASSERT)
         {
-            std::cerr << "\n=== LLVM Assert fired - compiler state dump ===\n";
+            std::cout << "\n=== LLVM Assert fired - compiler state dump ===\n";
             Instance().DumpAllState();
-            std::cerr << "===============================================\n\n";
+            std::cout << "===============================================\n\n";
         }
         return 0; // let CRT proceed to abort
     }

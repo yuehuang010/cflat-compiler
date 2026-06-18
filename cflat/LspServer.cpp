@@ -25,12 +25,14 @@
 
 namespace {
 
+constexpr std::string_view kFileUriPrefix = "file:///";
+
 // URI <-> file path conversion
 std::string uriToFilePath(const std::string& uri)
 {
-    if (uri.size() < 8 || uri.compare(0, 8, "file:///") != 0)
+    if (!uri.starts_with(kFileUriPrefix))
         return uri;
-    std::string path = uri.substr(8);  // strip "file:///"
+    std::string path = uri.substr(kFileUriPrefix.size());
     std::string result;
     for (size_t i = 0; i < path.size(); ++i)
     {
@@ -50,7 +52,7 @@ std::string uriToFilePath(const std::string& uri)
 
 std::string filePathToUri(const std::string& path)
 {
-    std::string uri = "file:///";
+    std::string uri(kFileUriPrefix);
     for (char c : path)
     {
         if (c == '\\') uri += '/';
@@ -86,7 +88,7 @@ static std::string extractImportFilename(const std::string& text, int line)
     std::string ln = getLineText(text, line);
     size_t i = 0;
     while (i < ln.size() && std::isspace((unsigned char)ln[i])) i++;
-    if (ln.substr(i, 6) != "import") return {};
+    if (ln.compare(i, 6, "import") != 0) return {};
     i += 6;
     while (i < ln.size() && std::isspace((unsigned char)ln[i])) i++;
     if (i >= ln.size() || ln[i] != '"') return {};
@@ -252,7 +254,6 @@ public:
             if (v > 0) poolSize_ = (unsigned int)v;
         }
         backendPool_.reserve(poolSize_);
-        backendInUse_.resize(poolSize_, false);
         backendAnalyzed_.resize(poolSize_, false);
         for (unsigned int i = 0; i < poolSize_; ++i)
         {
@@ -269,7 +270,7 @@ public:
             workers_.emplace_back([this] { WorkerLoop(); });
 
         if (verbose_)
-            std::cerr << "[lsp] backend pool size: " << poolSize_ << "\n";
+            std::cout << std::format("[lsp] backend pool size: {}\n", poolSize_);
     }
 
     ~LspServer()
@@ -373,10 +374,10 @@ private:
 
     void HandleDidOpen(const nlohmann::json& msg)
     {
-        if (!msg.contains("params") || !msg["params"].is_object()) return;
-        const auto& params = msg["params"];
-        if (!params.contains("textDocument") || !params["textDocument"].is_object()) return;
-        const auto& textDoc = params["textDocument"];
+        const auto* params = GetParams(msg);
+        if (!params) return;
+        if (!params->contains("textDocument") || !(*params)["textDocument"].is_object()) return;
+        const auto& textDoc = (*params)["textDocument"];
 
         OpenDocument doc;
         doc.uri      = textDoc.value("uri",  "");
@@ -391,16 +392,16 @@ private:
 
     void HandleDidChange(const nlohmann::json& msg)
     {
-        if (!msg.contains("params") || !msg["params"].is_object()) return;
-        const auto& params = msg["params"];
-        if (!params.contains("textDocument") || !params["textDocument"].is_object()) return;
+        const auto* params = GetParams(msg);
+        if (!params) return;
+        if (!params->contains("textDocument") || !(*params)["textDocument"].is_object()) return;
 
-        std::string uri = params["textDocument"].value("uri", "");
+        std::string uri = (*params)["textDocument"].value("uri", "");
         std::string text;
-        if (params.contains("contentChanges") && params["contentChanges"].is_array())
+        if (params->contains("contentChanges") && (*params)["contentChanges"].is_array())
         {
             // Full sync: use last change
-            for (const auto& change : params["contentChanges"])
+            for (const auto& change : (*params)["contentChanges"])
                 if (change.is_object())
                     text = change.value("text", "");
         }
@@ -419,11 +420,11 @@ private:
 
     void HandleDidSave(const nlohmann::json& msg)
     {
-        if (!msg.contains("params") || !msg["params"].is_object()) return;
-        const auto& params = msg["params"];
-        if (!params.contains("textDocument") || !params["textDocument"].is_object()) return;
+        const auto* params = GetParams(msg);
+        if (!params) return;
+        if (!params->contains("textDocument") || !(*params)["textDocument"].is_object()) return;
 
-        std::string uri = params["textDocument"].value("uri", "");
+        std::string uri = (*params)["textDocument"].value("uri", "");
         std::string text;
         std::string filePath;
         {
@@ -440,16 +441,23 @@ private:
 
     void HandleDidClose(const nlohmann::json& msg)
     {
-        if (!msg.contains("params") || !msg["params"].is_object()) return;
-        const auto& params = msg["params"];
-        if (!params.contains("textDocument") || !params["textDocument"].is_object()) return;
+        const auto* params = GetParams(msg);
+        if (!params) return;
+        if (!params->contains("textDocument") || !(*params)["textDocument"].is_object()) return;
 
-        std::string uri = params["textDocument"].value("uri", "");
+        std::string uri = (*params)["textDocument"].value("uri", "");
         {
             std::lock_guard<std::mutex> lock(docsMutex_);
             docs_.erase(uri);
         }
         PublishDiagnostics(uri, {});
+    }
+
+    // Returns a pointer to msg["params"] if it exists and is an object, else nullptr.
+    static const nlohmann::json* GetParams(const nlohmann::json& msg)
+    {
+        if (!msg.contains("params") || !msg["params"].is_object()) return nullptr;
+        return &msg["params"];
     }
 
     static void ExtractTextDocPosition(const nlohmann::json& params, std::string& uri, int& line, int& character)
@@ -465,13 +473,12 @@ private:
 
     void HandleHover(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
-        if (!msg.contains("params") || !msg["params"].is_object())
-            { SendResponse(id, nullptr); return; }
-        const auto& params = msg["params"];
+        const auto* params = GetParams(msg);
+        if (!params) { SendResponse(id, nullptr); return; }
 
         std::string uri;
         int line = 0, character = 0;
-        ExtractTextDocPosition(params, uri, line, character);
+        ExtractTextDocPosition(*params, uri, line, character);
 
         std::string text;
         {
@@ -500,15 +507,22 @@ private:
         });
     }
 
+    // For a generic instantiation mangled as "array__Explosion", returns "array".
+    // Returns the name unchanged if no "__" separator is present.
+    static std::string StripGenericSuffix(const std::string& name)
+    {
+        size_t dunder = name.find("__");
+        return dunder != std::string::npos ? name.substr(0, dunder) : name;
+    }
+
     void HandleDefinition(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
-        if (!msg.contains("params") || !msg["params"].is_object())
-            { SendResponse(id, nullptr); return; }
-        const auto& params = msg["params"];
+        const auto* params = GetParams(msg);
+        if (!params) { SendResponse(id, nullptr); return; }
 
         std::string uri;
         int line = 0, character = 0;
-        ExtractTextDocPosition(params, uri, line, character);
+        ExtractTextDocPosition(*params, uri, line, character);
 
         std::string text;
         std::string filePath;
@@ -565,11 +579,7 @@ private:
                 // Fall back to the template name ("array") so the method on the
                 // generic template definition is discoverable.
                 if (!def)
-                {
-                    size_t dunder = typeName->find("__");
-                    if (dunder != std::string::npos)
-                        def = index->Lookup(typeName->substr(0, dunder) + "." + word);
-                }
+                    def = index->Lookup(StripGenericSuffix(*typeName) + "." + word);
             }
             else
             {
@@ -626,17 +636,8 @@ private:
     {
         int line = 0, character = 0;
         std::string uri, text;
-        if (msg.contains("params") && msg["params"].is_object())
-        {
-            const auto& params = msg["params"];
-            if (params.contains("position") && params["position"].is_object())
-            {
-                line      = params["position"].value("line",      0);
-                character = params["position"].value("character", 0);
-            }
-            if (params.contains("textDocument") && params["textDocument"].is_object())
-                uri = params["textDocument"].value("uri", "");
-        }
+        if (const auto* params = GetParams(msg))
+            ExtractTextDocPosition(*params, uri, line, character);
         {
             std::lock_guard<std::mutex> lock(docsMutex_);
             if (auto it = docs_.find(uri); it != docs_.end())
@@ -659,11 +660,7 @@ private:
             // Generic instantiation: also try the template name (e.g. "array" from
             // "array__Explosion") so methods defined on the template show up.
             if (members.empty())
-            {
-                size_t dunder = typeName.find("__");
-                if (dunder != std::string::npos)
-                    members = index->LookupPrefix(typeName.substr(0, dunder) + "." + partial);
-            }
+                members = index->LookupPrefix(StripGenericSuffix(typeName) + "." + partial);
             for (const SymbolDef* def : members)
             {
                 // Strip the qualifying type prefix ("X.method" -> "method") regardless
@@ -675,8 +672,8 @@ private:
                 nlohmann::json item = {{"label", label}, {"detail", def->signatureMarkdown}};
                 switch (def->kind)
                 {
-                    case SymbolKind::Function: item["kind"] = 3; break;  // Function
-                    case SymbolKind::Field:    item["kind"] = 5; break;  // Field
+                    case SymbolKind::Function: item["kind"] = lsp::CompletionItemKindFunction; break;
+                    case SymbolKind::Field:    item["kind"] = lsp::CompletionItemKindField;    break;
                     default: break;
                 }
                 items.push_back(std::move(item));
@@ -695,12 +692,12 @@ private:
                 };
                 switch (def->kind)
                 {
-                    case SymbolKind::Function:  item["kind"] = 3;  break;  // Function
-                    case SymbolKind::Struct:    item["kind"] = 22; break;  // Struct
-                    case SymbolKind::Interface: item["kind"] = 8;  break;  // Interface
-                    case SymbolKind::Namespace: item["kind"] = 9;  break;  // Module
-                    case SymbolKind::TypeAlias: item["kind"] = 25; break;  // TypeParameter
-                    case SymbolKind::Field:     item["kind"] = 5;  break;  // Field
+                    case SymbolKind::Function:  item["kind"] = lsp::CompletionItemKindFunction;  break;
+                    case SymbolKind::Struct:    item["kind"] = lsp::CompletionItemKindStruct;    break;
+                    case SymbolKind::Interface: item["kind"] = lsp::CompletionItemKindInterface; break;
+                    case SymbolKind::Namespace: item["kind"] = lsp::CompletionItemKindModule;    break;
+                    case SymbolKind::TypeAlias: item["kind"] = lsp::CompletionItemKindTypeParam; break;
+                    case SymbolKind::Field:     item["kind"] = lsp::CompletionItemKindField;     break;
                 }
                 items.push_back(std::move(item));
             }
@@ -710,10 +707,10 @@ private:
 
     void HandleRunDiagnostics(const nlohmann::json& msg)
     {
-        if (!msg.contains("params") || !msg["params"].is_object()) return;
-        const auto& params = msg["params"];
+        const auto* params = GetParams(msg);
+        if (!params) return;
 
-        std::string uri      = params.value("uri", "");
+        std::string uri      = params->value("uri", "");
         std::string filePath = uriToFilePath(uri);
         std::string text;
         {
@@ -739,10 +736,7 @@ private:
 
     void EnqueueAnalysis(const std::string& uri, const std::string& filePath, const std::string& text)
     {
-        AnalysisJob job;
-        job.uri      = uri;
-        job.filePath = filePath;
-        job.text     = text;
+        AnalysisJob job{uri, filePath, text};
         {
             std::lock_guard<std::mutex> lock(uriGenMutex_);
             job.generation = ++uriGeneration_[uri];
@@ -842,7 +836,6 @@ private:
                 backendCV_.wait(lock, [&] { return !freeBackends_.empty(); });
                 slot = freeBackends_.back();
                 freeBackends_.pop_back();
-                backendInUse_[slot] = true;
             }
 
             // A single analysis must never take down the whole server: any C++ exception
@@ -854,16 +847,15 @@ private:
             }
             catch (const std::exception& e)
             {
-                if (verbose_) std::cerr << "[lsp] analysis threw on slot " << slot << ": " << e.what() << "\n";
+                if (verbose_) std::cout << std::format("[lsp] analysis threw on slot {}: {}\n", slot, e.what());
             }
             catch (...)
             {
-                if (verbose_) std::cerr << "[lsp] analysis threw on slot " << slot << " (unknown)\n";
+                if (verbose_) std::cout << std::format("[lsp] analysis threw on slot {} (unknown)\n", slot);
             }
 
             {
                 std::lock_guard<std::mutex> lock(backendMutex_);
-                backendInUse_[slot] = false;
                 freeBackends_.push_back(slot);
             }
             backendCV_.notify_one();
@@ -904,9 +896,9 @@ private:
 
         if (!filePath.empty())
         {
-            backend->SetSourceFileDir(std::filesystem::path(filePath).parent_path().string());
-            // Make diagnostics point at the real document instead of the temp copy.
-            backend->SetSourceDisplayName(std::filesystem::path(filePath).filename().string());
+            std::filesystem::path fp(filePath);
+            backend->SetSourceFileDir(fp.parent_path().string());
+            backend->SetSourceDisplayName(fp.filename().string());  // make diagnostics point at the real document
         }
         else
         {
@@ -928,7 +920,7 @@ private:
             lsp::Diagnostic diag;
             diag.range    = { { sl - 1, sc }, { el - 1, ec } };
             diag.message  = msg;
-            diag.severity = 4;  // Hint
+            diag.severity = lsp::DiagnosticSeverityHint;
             diag.tags     = { lsp::DiagnosticTagUnnecessary };
             diagnostics.push_back(diag);
         });
@@ -943,7 +935,7 @@ private:
 
         if (!recovered)
         {
-            if (verbose_) std::cerr << "[lsp] compiler crash on slot " << slot << ", replacing backend\n";
+            if (verbose_) std::cout << std::format("[lsp] compiler crash on slot {}, replacing backend\n", slot);
             auto fresh = std::make_unique<LLVMBackend>();
             fresh->SetRuntimeDir(runtimeDir_);
             fresh->SetVerbose(verbose_);
@@ -990,8 +982,7 @@ private:
             if (!keepCached)
                 currentIndex_ = newIndex;
             else if (verbose_)
-                std::cerr << "[lsp] keeping cached index (" << cachedCount
-                          << " symbols) over partial parse (" << newCount << ")\n";
+                std::cout << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
         }
 
         // Occurrence-based unused-code hints (functions / locals / params / imports).
@@ -1003,7 +994,7 @@ private:
         {
             bool hasError = false;
             for (const auto& d : diagnostics)
-                if (d.severity == 1) { hasError = true; break; }
+                if (d.severity == lsp::DiagnosticSeverityError) { hasError = true; break; }
             if (!hasError)
                 AppendUnusedDiagnostics(text, filePath, *newIndex, diagnostics);
         }
@@ -1026,7 +1017,7 @@ private:
             lsp::Diagnostic d;
             d.range    = { { line1 - 1, col0 }, { line1 - 1, col0 + len } };
             d.message  = msg;
-            d.severity = 4;  // Hint
+            d.severity = lsp::DiagnosticSeverityHint;
             d.tags     = { lsp::DiagnosticTagUnnecessary };
             out.push_back(std::move(d));
         };
@@ -1072,28 +1063,55 @@ private:
                              std::vector<lsp::Diagnostic>& out)
     {
         // Map each canonical defining-file to the set of names it defines.
-        std::unordered_map<std::string, std::vector<std::string>> namesByFile;
-        auto canon = [](const std::string& p) -> std::string {
-            std::error_code ec;
-            auto c = std::filesystem::canonical(std::filesystem::path(p).lexically_normal(), ec);
-            return ec ? std::string{} : c.string();
+        // canonCache avoids repeated canonical() syscalls for symbols that share a file.
+        std::unordered_map<std::string, std::string> canonCache;
+        auto canon = [&canonCache](const std::string& p) -> const std::string& {
+            auto [it, inserted] = canonCache.emplace(p, std::string{});
+            if (inserted)
+            {
+                std::error_code ec;
+                auto c = std::filesystem::canonical(std::filesystem::path(p).lexically_normal(), ec);
+                it->second = ec ? std::string{} : c.string();
+            }
+            return it->second;
         };
+
+        std::unordered_map<std::string, std::vector<std::string>> namesByFile;
         for (const auto& [name, def] : index.Symbols())
         {
             if (def.file.empty() || def.file == filePath) continue;
-            std::string key = canon(def.file);
+            const std::string& key = canon(def.file);
             if (!key.empty()) namesByFile[key].push_back(name);
         }
 
-        int lineCount = 1;
-        for (char c : text) if (c == '\n') lineCount++;
-
-        for (int line = 0; line < lineCount; ++line)
+        // Pre-split text into lines to avoid O(N^2) repeated scans in extractImportFilename.
+        std::vector<std::string_view> lines;
         {
-            std::string fname = extractImportFilename(text, line);
-            if (fname.size() < 4) continue;
-            std::string ext = fname.substr(fname.size() - 3);
-            if (ext != ".cb") continue;  // only plain CFlat imports
+            const char* p = text.data(), *end = p + text.size(), *lstart = p;
+            while (p != end)
+            {
+                if (*p == '\n') { lines.emplace_back(lstart, p - lstart); lstart = p + 1; }
+                ++p;
+            }
+            lines.emplace_back(lstart, end - lstart);
+        }
+
+        for (int line = 0; line < (int)lines.size(); ++line)
+        {
+            // Parse the import filename directly from the pre-split line (O(1) per line).
+            const std::string_view ln = lines[line];
+            size_t i = 0;
+            while (i < ln.size() && std::isspace((unsigned char)ln[i])) i++;
+            if (ln.compare(i, 6, "import") != 0) continue;
+            i += 6;
+            while (i < ln.size() && std::isspace((unsigned char)ln[i])) i++;
+            if (i >= ln.size() || ln[i] != '"') continue;
+            i++;
+            size_t fnStart = i;
+            while (i < ln.size() && ln[i] != '"') i++;
+            if (i >= ln.size()) continue;
+            std::string fname(ln.substr(fnStart, i - fnStart));
+            if (!fname.ends_with(".cb")) continue;
 
             std::string resolved = resolveImportPath(filePath, fname, importSearchDir_, runtimeDir_);
             if (resolved.empty()) continue;
@@ -1108,14 +1126,13 @@ private:
             }
             if (anyUsed) continue;
 
-            std::string lineText = getLineText(text, line);
-            int endCol = (int)lineText.size();
-            int startCol = 0;
-            while (startCol < endCol && std::isspace((unsigned char)lineText[startCol])) startCol++;
+            // Compute column range from the pre-split line (no extra scan).
+            int startCol = 0, endCol = (int)ln.size();
+            while (startCol < endCol && std::isspace((unsigned char)ln[startCol])) startCol++;
             lsp::Diagnostic d;
             d.range    = { { line, startCol }, { line, endCol } };
             d.message  = "unused import '" + fname + "'";
-            d.severity = 4;  // Hint
+            d.severity = lsp::DiagnosticSeverityHint;
             d.tags     = { lsp::DiagnosticTagUnnecessary };
             out.push_back(std::move(d));
         }
@@ -1171,7 +1188,6 @@ private:
     // ResetForReanalysis is needed before the next run on that slot.
     unsigned int poolSize_ = 1;
     std::vector<std::unique_ptr<LLVMBackend>> backendPool_;
-    std::vector<bool> backendInUse_;
     std::vector<bool> backendAnalyzed_;  // sized on first use in WorkerLoop via lazy resize
     std::vector<size_t> freeBackends_;
     std::mutex backendMutex_;
@@ -1214,7 +1230,7 @@ int RunLspServer(int argc, char* argv[])
     int protocolFd = _dup(_fileno(stdout));
     _setmode(protocolFd, _O_BINARY);
     _setmode(_fileno(stdin), _O_BINARY);
-    std::cout.rdbuf(std::cerr.rdbuf());
+    std::cout.rdbuf(std::cout.rdbuf());
 
     // Prevent child processes (e.g. clang-cl spawned for C-interop signature extraction)
     // from inheriting the JSON-RPC pipe handles. _dup and the CRT std fds are inheritable
@@ -1231,9 +1247,7 @@ int RunLspServer(int argc, char* argv[])
 
     llvm::CrashRecoveryContext::Enable();
 
-    char* pgmptr = nullptr;
-    _get_pgmptr(&pgmptr);
-    std::string runtimeDir = std::filesystem::path(pgmptr ? pgmptr : "").parent_path().string();
+    std::string runtimeDir = GetExeDir();
 
     bool verbose = false;
     std::string importDir;
@@ -1246,10 +1260,10 @@ int RunLspServer(int argc, char* argv[])
             importDir = argv[++i];
     }
 
-    if (verbose) _write(2, "[lsp] server starting\n", 22);
+    if (verbose) std::cout << "[lsp] server starting\n";
     LspServer server(protocolFd, runtimeDir, importDir, verbose);
-    if (verbose) _write(2, "[lsp] entering Run()\n", 21);
+    if (verbose) std::cout << "[lsp] entering Run()\n";
     server.Run();
-    if (verbose) _write(2, "[lsp] Run() returned\n", 21);
+    if (verbose) std::cout << "[lsp] Run() returned\n";
     return 0;
 }

@@ -68,16 +68,15 @@ namespace cflat_cinterop
             return out;
         }
 
-        bool PathInScope(const std::string& path, const std::vector<std::string>& dirs)
+        // dirs must already be normalized (via NormPath) and have trailing '/' stripped.
+        bool PathInScope(const std::string& path, const std::vector<std::string>& normDirs)
         {
-            if (dirs.empty()) return true;
+            if (normDirs.empty()) return true;
             std::string np = NormPath(path);
-            for (const auto& d : dirs)
+            for (const auto& nd : normDirs)
             {
-                std::string nd = NormPath(d);
-                while (!nd.empty() && nd.back() == '/') nd.pop_back();
                 if (nd.empty() || np.size() < nd.size()) continue;
-                if (np.compare(0, nd.size(), nd) != 0) continue;
+                if (!np.starts_with(nd)) continue;
                 // Require a separator boundary so ".../um" does not match ".../umbra/...".
                 if (np.size() == nd.size() || np[nd.size()] == '/') return true;
             }
@@ -100,7 +99,16 @@ namespace cflat_cinterop
             ExtractResult& out;
             std::vector<MacroProbe> probes;   // index == probe slot
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
-            ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o) {}
+            std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
+            ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
+            {
+                for (const auto& d : r.inScopeDirs)
+                {
+                    std::string nd = NormPath(d);
+                    while (!nd.empty() && nd.back() == '/') nd.pop_back();
+                    normDirs.push_back(std::move(nd));
+                }
+            }
         };
 
         // Prepass PPCallbacks: collect object-like macro names (-> probe list) and reconstruct
@@ -119,15 +127,15 @@ namespace cflat_cinterop
                 const IdentifierInfo* ii = nameTok.getIdentifierInfo();
                 if (!ii) return;
                 std::string name = ii->getName().str();
-                if (name.size() >= 2 && name[0] == '_' && name[1] == '_') return;
-                if (name.compare(0, sizeof(kProbePrefix) - 1, kProbePrefix) == 0) return;
+                if (name.starts_with("__")) return;
+                if (name.starts_with(kProbePrefix)) return;
 
                 SourceManager& sm = pp.getSourceManager();
                 PresumedLoc pl = sm.getPresumedLoc(mi->getDefinitionLoc());
                 std::string file = (pl.isValid() && pl.getFilename()) ? pl.getFilename() : "";
                 int line = pl.isValid() ? (int)pl.getLine() : 1;
                 int col = pl.isValid() ? (int)pl.getColumn() : 0;
-                if (st.req.requireInScope && !PathInScope(file, st.req.inScopeDirs)) return;
+                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return;
 
                 if (mi->isFunctionLike())
                 {
@@ -212,7 +220,7 @@ namespace cflat_cinterop
             bool LocOf(const Decl* d, std::string& file, int& line, int& col) const
             {
                 if (!LocOfRaw(d, file, line, col)) return false;
-                if (st.req.requireInScope && !PathInScope(file, st.req.inScopeDirs)) return false;
+                if (st.req.requireInScope && !PathInScope(file, st.normDirs)) return false;
                 return true;
             }
 
@@ -383,7 +391,7 @@ namespace cflat_cinterop
                 rec.name = rd->getNameAsString();
                 rec.isUnion = rd->isUnion();
                 rec.file = file; rec.line = line; rec.col = col;
-                rec.inScope = !st.req.requireInScope || PathInScope(file, st.req.inScopeDirs);
+                rec.inScope = !st.req.requireInScope || PathInScope(file, st.normDirs);
                 CollectFields(rd, rec.name, rec);
                 st.out.records.push_back(std::move(rec));
                 return true;

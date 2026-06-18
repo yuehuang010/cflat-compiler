@@ -50,7 +50,7 @@ std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& pr
     std::vector<const SymbolDef*> results;
     for (const auto& [name, def] : symbols_)
     {
-        if (name.size() >= prefix.size() && name.compare(0, prefix.size(), prefix) == 0)
+        if (name.starts_with(prefix))
             results.push_back(&def);
     }
     return results;

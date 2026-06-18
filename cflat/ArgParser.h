@@ -41,8 +41,13 @@ public:
 		m_positionals.push_back({ name, description });
 	}
 
+	// Returns the error message from the most recent failed parse() or
+	// getXthreadScanLevel() call. Empty if no error has occurred.
+	const std::string& getError() const { return m_errorMsg; }
+
 	bool parse(int argc, char* argv[])
 	{
+		m_errorMsg.clear();
 		m_program = argv[0];
 		for (int i = 1; i < argc; ++i)
 		{
@@ -78,36 +83,36 @@ public:
 				return true;
 			}
 
-			if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-')
-			{
-				std::string name = arg.substr(2);
+			// Dispatch a resolved long name: set flag, consume next token for option/multi-option,
+			// or set m_errorMsg and return false. display is the token as it appeared on the
+			// command line (e.g. "--verbose" or "-v") used only in error messages.
+			auto applyArg = [&](const std::string& name, const std::string& display) -> bool {
 				if (isFlag(name))
 				{
 					m_flagValues[name] = true;
 				}
 				else if (isOption(name))
 				{
-					if (i + 1 >= argc)
-					{
-						std::cerr << "Error: --" << name << " requires a value.\n";
-						return false;
-					}
+					if (i + 1 >= argc) { m_errorMsg = "Error: " + display + " requires a value."; return false; }
 					m_optionValues[name] = argv[++i];
 				}
 				else if (isMultiOption(name))
 				{
-					if (i + 1 >= argc)
-					{
-						std::cerr << "Error: --" << name << " requires a value.\n";
-						return false;
-					}
+					if (i + 1 >= argc) { m_errorMsg = "Error: " + display + " requires a value."; return false; }
 					m_multiOptionValues[name].push_back(argv[++i]);
 				}
 				else
 				{
-					std::cerr << "Error: unknown argument '--" << name << "'.\n";
+					m_errorMsg = "Error: unknown argument '" + display + "'.";
 					return false;
 				}
+				return true;
+			};
+
+			if (arg.size() > 2 && arg[0] == '-' && arg[1] == '-')
+			{
+				std::string name = arg.substr(2);
+				if (!applyArg(name, "--" + name)) return false;
 			}
 			else if (arg.size() >= 2 && arg[0] == '-')
 			{
@@ -117,43 +122,20 @@ public:
 					std::string name = resolveShort(s);
 					if (name.empty())
 					{
-						std::cerr << "Error: unknown argument '-" << s << "'.\n";
+						m_errorMsg = std::string("Error: unknown argument '-") + s + "'.";
 						return false;
 					}
-					if (isFlag(name))
-					{
-						m_flagValues[name] = true;
-					}
-					else if (isOption(name))
-					{
-						if (i + 1 >= argc)
-						{
-							std::cerr << "Error: -" << s << " requires a value.\n";
-							return false;
-						}
-						m_optionValues[name] = argv[++i];
-					}
-					else if (isMultiOption(name))
-					{
-						if (i + 1 >= argc)
-						{
-							std::cerr << "Error: -" << s << " requires a value.\n";
-							return false;
-						}
-						m_multiOptionValues[name].push_back(argv[++i]);
-					}
+					if (!applyArg(name, std::string("-") + s)) return false;
 				}
 				else
 				{
 					// Allow single-dash long flags like -O2, -O1
 					std::string name = arg.substr(1);
 					if (isFlag(name))
-					{
 						m_flagValues[name] = true;
-					}
 					else
 					{
-						std::cerr << "Error: unknown argument '" << arg << "'.\n";
+						m_errorMsg = "Error: unknown argument '" + arg + "'.";
 						return false;
 					}
 				}
@@ -225,7 +207,7 @@ public:
 		catch (...) { level = -1; }
 		if (level < 1 || level > 3)
 		{
-			std::cerr << "Error: --xthread-scan requires a level of 1, 2, or 3 (got '" << *val << "').\n";
+			m_errorMsg = "Error: --xthread-scan requires a level of 1, 2, or 3 (got '" + *val + "').";
 			return 0;
 		}
 		return level;
@@ -235,7 +217,7 @@ public:
 	{
 		std::cout << "Usage: " << m_program;
 		for (const auto& p : m_positionals)
-			std::cout << " <" << p.name << ">";
+			std::cout << std::format(" <{}>", p.name);
 		if (!m_flags.empty() || !m_options.empty() || !m_multiOptions.empty())
 			std::cout << " [options]";
 		std::cout << "\n";
@@ -244,7 +226,7 @@ public:
 		{
 			std::cout << "\nArguments:\n";
 			for (const auto& p : m_positionals)
-				std::cout << "  " << p.name << "\t\t" << p.description << "\n";
+				std::cout << std::format("  {}\t\t{}\n", p.name, p.description);
 		}
 
 		if (!m_flags.empty() || !m_options.empty() || !m_multiOptions.empty())
@@ -252,16 +234,16 @@ public:
 			std::cout << "\nOptions:\n";
 			std::cout << "  -h, --help\t\tShow this help message\n";
 			for (const auto& f : m_flags)
-				std::cout << "  -" << f.shortName << ", --" << f.name << "\t\t" << f.description << "\n";
+				std::cout << std::format("  -{}, --{}\t\t{}\n", f.shortName, f.name, f.description);
 			for (const auto& o : m_options)
 			{
-				std::cout << "  -" << o.shortName << ", --" << o.name << " <value>\t" << o.description;
+				std::cout << std::format("  -{}, --{} <value>\t{}", o.shortName, o.name, o.description);
 				if (!o.defaultValue.empty())
-					std::cout << " (default: " << o.defaultValue << ")";
+					std::cout << std::format(" (default: {})", o.defaultValue);
 				std::cout << "\n";
 			}
 			for (const auto& o : m_multiOptions)
-				std::cout << "  -" << o.shortName << ", --" << o.name << " <value>\t" << o.description << " (repeatable)\n";
+				std::cout << std::format("  -{}, --{} <value>\t{} (repeatable)\n", o.shortName, o.name, o.description);
 		}
 	}
 
@@ -285,6 +267,7 @@ private:
 	std::vector<std::string>                                  m_positionalValues;
 	std::vector<std::string>                                  m_passthrough;
 	std::string                                  m_program;
+	mutable std::string                          m_errorMsg;
 	bool                                         m_showVersion = false;
 
 	bool isFlag(const std::string& name) const

@@ -24,11 +24,31 @@ struct Location
     Range range;
 };
 
+// LSP DiagnosticSeverity values.
+enum DiagnosticSeverity
+{
+    DiagnosticSeverityError       = 1,
+    DiagnosticSeverityWarning     = 2,
+    DiagnosticSeverityInformation = 3,
+    DiagnosticSeverityHint        = 4
+};
+
 // LSP DiagnosticTag values (textDocument/publishDiagnostics).
 enum DiagnosticTag
 {
     DiagnosticTagUnnecessary = 1,  // grayed-out / faded rendering for unused code
     DiagnosticTagDeprecated  = 2
+};
+
+// LSP CompletionItemKind values (subset used by this server).
+enum CompletionItemKind
+{
+    CompletionItemKindFunction  = 3,
+    CompletionItemKindField     = 5,
+    CompletionItemKindInterface = 8,
+    CompletionItemKindModule    = 9,
+    CompletionItemKindStruct    = 22,
+    CompletionItemKindTypeParam = 25
 };
 
 struct Diagnostic

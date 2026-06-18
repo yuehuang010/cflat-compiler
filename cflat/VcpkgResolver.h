@@ -361,8 +361,8 @@ private:
         std::vector<llvm::StringRef> args = { vcpkgExe, "install", "--triplet", triplet };
         if (verbose_)
         {
-            std::cout << "[verbose] vcpkg install --triplet " << triplet << "\n";
-            std::cout << "[verbose]   manifest dir: " << manifestDir_.string() << "\n";
+            std::cout << std::format("[verbose] vcpkg install --triplet {}\n", triplet);
+            std::cout << std::format("[verbose]   manifest dir: {}\n", manifestDir_.string());
         }
         std::string execErr;
         int rc = llvm::sys::ExecuteAndWait(vcpkgExe, args, std::nullopt, {}, 0, 0, &execErr);

@@ -87,9 +87,12 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
 // source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
 // form. Empty when the import carries no lib clause. Each is resolved to a link argument
 // by ResolveCLinkLib at the header-bind site.
-static std::string DequoteStringLiteral(const std::string& raw)
+// Returns the lowercased extension of a path (e.g. ".CB" -> ".cb").
+static std::string LowerExtension(const std::filesystem::path& p)
 {
-    return raw.size() >= 2 ? raw.substr(1, raw.size() - 2) : raw;
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return ext;
 }
 
 static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclarationContext* imp)
@@ -178,20 +181,20 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
         }
         else
         {
-            std::cerr << std::format("{}({},{}): error: {}\n", d.file, d.line, d.col, d.message);
+            std::cout << std::format("{}({},{}): error: {}\n", d.file, d.line, d.col, d.message);
 
             int lineIdx = d.line - 1;
             if (lineIdx >= 0 && lineIdx < static_cast<int>(sourceLines.size()))
             {
                 const std::string& srcLine = sourceLines[lineIdx];
-                std::cerr << "    " << srcLine << "\n";
+                std::cout << std::format("    {}\n", srcLine);
                 std::string caret(4 + std::min(d.col, static_cast<int>(srcLine.size())), ' ');
                 caret += '^';
-                std::cerr << caret << "\n";
+                std::cout << caret << "\n";
             }
 
             if (!d.hint.empty())
-                std::cerr << "hint: " << d.hint << "\n";
+                std::cout << std::format("hint: {}\n", d.hint);
         }
     }
 }
@@ -200,7 +203,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
 {
     if (!std::filesystem::exists(filename))
     {
-        std::cerr << "Error: input file '" << filename << "' does not exist.\n";
+        std::cout << std::format("Error: input file '{}' does not exist.\n", filename);
         return false;
     }
 
@@ -208,7 +211,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     stream.open(filename);
     if (!stream)
     {
-        std::cerr << "Error: cannot open input file '" << filename << "'.\n";
+        std::cout << std::format("Error: cannot open input file '{}'.\n", filename);
         return false;
     }
     auto sourceLines = ReadFileToLines(stream);
@@ -241,7 +244,7 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     if (errorListener.hasErrors())
     {
         ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
-        std::cerr << std::format("GRAMMAR FAIL: {} ({} error(s))\n",
+        std::cout << std::format("GRAMMAR FAIL: {} ({} error(s))\n",
                                  filename, errorListener.getDiagnostics().size());
         return false;
     }
@@ -307,6 +310,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Cross-thread sharing scan level (--xthread-scan N, N in 1..3); 0 = silent default.
     // Threads through --check too since that path also calls Compile(args, file).
     xthreadScanLevel_ = args.getXthreadScanLevel();
+    if (!args.getError().empty())
+    {
+        LogError(args.getError());
+        return false;
+    }
     // C library bindings: header search dirs, prebuilt import libraries, and defines.
     cIncludeDirs_ = args.getMultiOption("c-include");
     cLinkLibs_    = args.getMultiOption("c-lib");
@@ -320,19 +328,18 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     if (verbose)
     {
-        std::cout << "[verbose] input:        " << filename << "\n";
-        std::cout << "[verbose] output exe:   " << (exePath ? *exePath : "(none)") << "\n";
-        std::cout << "[verbose] output lli:   " << (lliPath ? *lliPath : "(none)") << "\n";
-        std::cout << "[verbose] runtime dir:  " << runtimeDir << "\n";
-        std::cout << "[verbose] import dir:   " << (importSearchDir.empty() ? "(none)" : importSearchDir) << "\n";
-        std::cout << "[verbose] debug info:   " << (debugInfo ? "yes" : "no") << "\n";
+        std::cout << std::format("[verbose] input:        {}\n", filename);
+        std::cout << std::format("[verbose] output exe:   {}\n", exePath ? *exePath : "(none)");
+        std::cout << std::format("[verbose] output lli:   {}\n", lliPath ? *lliPath : "(none)");
+        std::cout << std::format("[verbose] runtime dir:  {}\n", runtimeDir);
+        std::cout << std::format("[verbose] import dir:   {}\n", importSearchDir.empty() ? "(none)" : importSearchDir);
+        std::cout << std::format("[verbose] debug info:   {}\n", debugInfo ? "yes" : "no");
         // Effective codegen CPU: the platform default unless --cpu overrode it. Tune
         // defaults to the target CPU unless --tune set it (mirrors -mtune semantics).
         std::string effectiveCpu = targetCpu_.empty()
             ? (platformOption == "win32" ? "i686" : "x86-64") : targetCpu_;
-        std::cout << "[verbose] target cpu:   " << effectiveCpu << "\n";
-        std::cout << "[verbose] tune:         "
-                  << (tuneCpu_.empty() ? effectiveCpu + " (same as target cpu)" : tuneCpu_) << "\n";
+        std::cout << std::format("[verbose] target cpu:   {}\n", effectiveCpu);
+        std::cout << std::format("[verbose] tune:         {}\n", tuneCpu_.empty() ? effectiveCpu + " (same as target cpu)" : tuneCpu_);
     }
 
     auto checkOutputDir = [](const std::optional<std::string>& path, const char* flag) -> bool {
@@ -340,7 +347,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         auto dir = std::filesystem::path(*path).parent_path();
         if (!dir.empty() && !std::filesystem::exists(dir))
         {
-            std::cerr << "Error: output directory '" << dir.string() << "' does not exist (" << flag << " " << *path << ").\n";
+            std::cout << std::format("Error: output directory '{}' does not exist ({} {}).\n", dir.string(), flag, *path);
             return false;
         }
         return true;
@@ -350,14 +357,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     if (!std::filesystem::exists(filename))
     {
-        std::cerr << "Error: input file '" << filename << "' does not exist.\n";
+        std::cout << std::format("Error: input file '{}' does not exist.\n", filename);
         return false;
     }
 
     // Set the platform constant (__PLATFORM__) based on the target platform.
     // This is a compile-time constant available in all compiled files.
     platformValue = (platformOption == "win32") ? 32 : 64;
-    if (verbose) std::cout << "[verbose] __PLATFORM__ = " << platformValue << "\n";
+    if (verbose) std::cout << std::format("[verbose] __PLATFORM__ = {}\n", platformValue);
 
     // Try to load core bitcode cache BEFORE setting up the module, because
     // LoadCoreBitcodeIfFresh replaces context/module/builder with a fresh LLVM
@@ -374,7 +381,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             llvm::TimeTraceScope bcScope("RuntimeImport", "core.bc");
             bitcodeLoaded = LoadCoreBitcodeIfFresh(bcCacheDir, platformOption);
             if (verbose)
-                std::cout << "[verbose] core bitcode cache: " << (bitcodeLoaded ? "hit" : "miss") << "\n";
+                std::cout << std::format("[verbose] core bitcode cache: {}\n", bitcodeLoaded ? "hit" : "miss");
         }
     }
 
@@ -412,7 +419,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         SetPlatformMacros();
 
-        if (verbose) std::cout << "[verbose] macros: __FILE__ = \"" << sourceFileName << "\", __PLATFORM__ = " << platformValue << "\n";
+        if (verbose) std::cout << std::format("[verbose] macros: __FILE__ = \"{}\", __PLATFORM__ = {}\n", sourceFileName, platformValue);
     }
 
     if (!bitcodeLoaded && !runtimeDir.empty() && !skipRuntimeImport)
@@ -420,7 +427,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope runtimeScope("RuntimeImport", "runtime.cb");
             auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
-            if (verbose) std::cout << "[verbose] auto-importing runtime: " << runtimePath.string() << "\n";
+            if (verbose) std::cout << std::format("[verbose] auto-importing runtime: {}\n", runtimePath.string());
             if (std::filesystem::exists(runtimePath))
                 CompileImportedFile(runtimePath.string(), "runtime.cb");
             else if (verbose)
@@ -429,7 +436,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     }
 
     {
-        if (verbose) std::cout << "[verbose] parsing " << filename << "\n";
+        if (verbose) std::cout << std::format("[verbose] parsing {}\n", filename);
         std::ifstream stream;
         stream.open(filename);
         auto sourceLines = ReadFileToLines(stream);
@@ -451,7 +458,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             tokens.fill();
             computeUnit = parser.compilationUnit();
         }
-        if (verbose) std::cout << "[verbose]   parse complete (" << tokens.getTokens().size() << " tokens)\n";
+        if (verbose) std::cout << std::format("[verbose]   parse complete ({} tokens)\n", tokens.getTokens().size());
 
         if (errorListener.hasErrors())
         {
@@ -472,7 +479,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 if (ee && ee->externalDeclaration().empty())
                 {
                     std::string raw = ee->StringLiteral()->getText();
-                    fileScopeExpectedError_ = raw.substr(1, raw.size() - 2);  // strip quotes
+                    fileScopeExpectedError_ = DequoteStringLiteral(raw);
                     expectedError = fileScopeExpectedError_;
                     expectedErrorScopeDepth = SIZE_MAX;
                     break;
@@ -500,7 +507,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         auto groupedImports = DequoteImportGroup(imp);
                         if (groupedImports.size() > 1)
                         {
-                            if (verbose) std::cout << "[verbose] import requested (group of " << groupedImports.size() << ")\n";
+                            if (verbose) std::cout << std::format("[verbose] import requested (group of {})\n", groupedImports.size());
                             if (!CompileImportGroup(filename, groupedImports, DequoteLibClauses(imp),
                                                     DequoteDefineClauses(imp), HasCacheClause(imp)))
                                 return false;
@@ -514,14 +521,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         else
                         {
                             std::string raw = imp->StringLiteral()->getText();
-                            importFilename = raw.substr(1, raw.size() - 2);
+                            importFilename = DequoteStringLiteral(raw);
                         }
                         // `import package-vcpkg "header" from "port";` - dispatch to the
                         // vcpkg resolver and skip the regular import dedup/parse machinery.
                         if (IsPackageVcpkgImport(imp))
                         {
                             std::string portSpec = DequoteFromClause(imp);
-                            if (verbose) std::cout << "[verbose] vcpkg import: " << importFilename << " from " << portSpec << "\n";
+                            if (verbose) std::cout << std::format("[verbose] vcpkg import: {} from {}\n", importFilename, portSpec);
                             if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec))
                                 return false;
                             continue;
@@ -529,13 +536,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                         bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
                         std::string alias = isProgram ? imp->Identifier()->getText() : "";
-                        std::string impExt = std::filesystem::path(importFilename).extension().string();
-                        std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                        std::string impExt = LowerExtension(importFilename);
                         bool isCProgram = isProgram && impExt == ".c";
                         std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                         std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
                         bool cacheHeader = HasCacheClause(imp);
-                        if (verbose) std::cout << "[verbose] import requested: " << importFilename << (ns.empty() ? "" : " as " + ns) << (cacheHeader ? " (cache)" : "") << "\n";
+                        if (verbose) std::cout << std::format("[verbose] import requested: {}{}{}\n", importFilename, ns.empty() ? "" : " as " + ns, cacheHeader ? " (cache)" : "");
                         if (!CompileImportedFile(filename, importFilename, ns, isCProgram ? alias : "", explicitLibs, extraDefines, cacheHeader))
                             return false;
 
@@ -573,7 +579,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // that forward references resolve during the main code-gen walk.
         {
             llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
-            if (verbose) std::cout << "[verbose] forward-ref scan (" << sourceFileName << ")\n";
+            if (verbose) std::cout << std::format("[verbose] forward-ref scan ({})\n", sourceFileName);
             ForwardRefScanner scanner(this);
             scanner.SetTokens(&tokens);
             // First pass: pre-declare opaque types and constructors for every
@@ -593,7 +599,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // report non-atomic, non-guarded field accesses of those types. Silent at level 0.
         ScanCrossThreadEscapes(computeUnit);
 
-        if (verbose) std::cout << "[verbose] code-gen walk (" << sourceFileName << ")\n";
+        if (verbose) std::cout << std::format("[verbose] code-gen walk ({})\n", sourceFileName);
         {
             llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
@@ -631,14 +637,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     {
         for (const auto& stack : stackNamedVariable)
         {
-            std::cerr << "Warning: scope stack is not empty at end of compilation:\n";
+            std::cout << "Warning: scope stack is not empty at end of compilation:\n";
             for (const auto& funcVariable : stack.functionArgument)
             {
-                std::cerr << "  Function var: " << funcVariable.first << "\n";
+                std::cout << std::format("  Function var: {}\n", funcVariable.first);
             }
             for (const auto& namedVariable : stack.namedVariable)
             {
-                std::cerr << "  namedVar var: " << namedVariable.first << "\n";
+                std::cout << std::format("  namedVar var: {}\n", namedVariable.first);
             }
         }
     }
@@ -660,7 +666,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << "[verbose] verifying module\n";
         if (!VerifyModule())
         {
-            std::cerr << "Error: module verification failed.\n";
+            std::cout << "Error: module verification failed.\n";
             return false;
         }
     }
@@ -678,8 +684,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (optLevel > 0 || asan_)
     {
         llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
-        if (verbose) std::cout << "[verbose] running optimizations (O" << optLevel
-                               << (asan_ ? ", asan" : "") << ")\n";
+        if (verbose) std::cout << std::format("[verbose] running optimizations (O{}{})\n", optLevel, asan_ ? ", asan" : "");
         OptimizeModule(optLevel);
     }
 
@@ -688,20 +693,20 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (lliPath)
     {
         llvm::TimeTraceScope irScope("WriteIR", *lliPath);
-        if (verbose) std::cout << "[verbose] writing IR to " << *lliPath << "\n";
+        if (verbose) std::cout << std::format("[verbose] writing IR to {}\n", *lliPath);
         if (!SaveToFile(*lliPath))
         {
-            std::cerr << "Error: failed to save IR to '" << *lliPath << "'.\n";
+            std::cout << std::format("Error: failed to save IR to '{}'.\n", *lliPath);
             return false;
         }
     }
 
     if (!bitcodePath.empty())
     {
-        if (verbose) std::cout << "[verbose] writing bitcode to " << bitcodePath << "\n";
+        if (verbose) std::cout << std::format("[verbose] writing bitcode to {}\n", bitcodePath);
         if (!WriteBitcode(bitcodePath))
         {
-            std::cerr << "Error: failed to write bitcode to '" << bitcodePath << "'.\n";
+            std::cout << std::format("Error: failed to write bitcode to '{}'.\n", bitcodePath);
             return false;
         }
     }
@@ -711,9 +716,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (!checkOnly)
     {
         auto isCSource = [](const std::string& p) {
-            auto ext = std::filesystem::path(p).extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            return ext == ".c";
+            return LowerExtension(p) == ".c";
         };
         bool anyCSource = false;
         for (size_t i = 1; i < args.positionalCount(); ++i)
@@ -721,7 +724,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         if (anyCSource && !exePath)
         {
-            std::cerr << "Error: C source input requires -o to link the resulting object.\n";
+            std::cout << "Error: C source input requires -o to link the resulting object.\n";
             return false;
         }
         for (size_t i = 1; i < args.positionalCount(); ++i)
@@ -730,7 +733,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (!isCSource(cPath)) continue;
             if (!std::filesystem::exists(cPath))
             {
-                std::cerr << "Error: C source input '" << cPath << "' does not exist.\n";
+                std::cout << std::format("Error: C source input '{}' does not exist.\n", cPath);
                 return false;
             }
             if (!CompileCFile(cPath))
@@ -758,10 +761,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (exePath)
     {
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
-        if (verbose) std::cout << "[verbose] emitting executable to " << *exePath << "\n";
+        if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", *exePath);
         if (!EmitExecutable(*exePath, platformOption, debugInfo))
         {
-            std::cerr << "Error: failed to emit executable '" << *exePath << "'.\n";
+            std::cout << std::format("Error: failed to emit executable '{}'.\n", *exePath);
             return false;
         }
     }
@@ -782,7 +785,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
             if (!tec && wt == it->second->writeTime)
             {
                 llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
-                if (verbose) std::cout << "[verbose]   parse cache hit: " << displayName << "\n";
+                if (verbose) std::cout << std::format("[verbose]   parse cache hit: {}\n", displayName);
                 return it->second.get();
             }
             parseTreeCache_.erase(it);  // stale - re-parse below
@@ -795,7 +798,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     std::ifstream stream(canonicalPath);
     if (!stream.is_open())
     {
-        std::cerr << "Error: failed to open imported file '" << canonicalPath << "'.\n";
+        std::cout << std::format("Error: failed to open imported file '{}'.\n", canonicalPath);
         return nullptr;
     }
     auto sourceLines = ReadFileToLines(stream);  // also rewinds the stream to the start
@@ -816,7 +819,7 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
         entry->tokens->fill();
         entry->unit = entry->parser->compilationUnit();
     }
-    if (verbose) std::cout << "[verbose]   parse complete (" << entry->tokens->getTokens().size() << " tokens)\n";
+    if (verbose) std::cout << std::format("[verbose]   parse complete ({} tokens)\n", entry->tokens->getTokens().size());
 
     if (errorListener.hasErrors())
     {
@@ -882,56 +885,38 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
                                     std::string& outCanonical, bool quiet)
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
-    auto importPath = (importingDir / importFilename).lexically_normal();
 
     std::error_code ec;
-    auto canonical = std::filesystem::canonical(importPath, ec);
+    auto canonical = std::filesystem::canonical((importingDir / importFilename).lexically_normal(), ec);
+
+    // Try an additional base directory (no-op if already resolved or dir is empty).
+    auto tryDir = [&](const std::filesystem::path& dir) {
+        if (!ec || dir.empty()) return;
+        canonical = std::filesystem::canonical((dir / importFilename).lexically_normal(), ec);
+    };
+
     // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
-    if (ec && !sourceFileDir_.empty())
-    {
-        auto sourcePath = (std::filesystem::path(sourceFileDir_) / importFilename).lexically_normal();
-        canonical = std::filesystem::canonical(sourcePath, ec);
-    }
-    if (ec && !importSearchDir.empty())
-    {
-        auto searchPath = (std::filesystem::path(importSearchDir) / importFilename).lexically_normal();
-        canonical = std::filesystem::canonical(searchPath, ec);
-    }
+    tryDir(sourceFileDir_);
+    tryDir(importSearchDir);
     // C library headers (e.g. "curl/curl.h") live under the --c-include roots.
-    for (const auto& inc : cIncludeDirs_)
-    {
-        if (!ec) break;
-        auto incPath = (std::filesystem::path(inc) / importFilename).lexically_normal();
-        canonical = std::filesystem::canonical(incPath, ec);
-    }
+    for (const auto& inc : cIncludeDirs_) tryDir(inc);
     // Implicit fallback: look in the "core" directory beside the runtime.
-    if (ec && !runtimeDir.empty())
-    {
-        auto corePath = (std::filesystem::path(runtimeDir) / "core" / importFilename).lexically_normal();
-        canonical = std::filesystem::canonical(corePath, ec);
-    }
+    if (!runtimeDir.empty()) tryDir(std::filesystem::path(runtimeDir) / "core");
     // System headers (e.g. windows.h) live in the Windows SDK include dirs. Fall back to the
     // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
     // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
-    if (ec)
-    {
-        for (const auto& inc : WindowsSdkIncludeDirs())
-        {
-            if (!ec) break;
-            auto incPath = (std::filesystem::path(inc) / importFilename).lexically_normal();
-            canonical = std::filesystem::canonical(incPath, ec);
-        }
-    }
+    for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
     if (ec)
     {
         if (!quiet)
-            std::cerr << "Error: imported file not found: " << importFilename
-                      << " (searched relative to '" << importingDir.string() << "'"
-                      << (sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'")
-                      << (importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'")
-                      << (cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)")
-                      << (runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'")
-                      << ").\n";
+            std::cout << std::format(
+                "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}).\n",
+                importFilename,
+                importingDir.string(),
+                sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",
+                importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'",
+                cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)",
+                runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'");
         return false;
     }
     outCanonical = canonical.string();
@@ -953,8 +938,7 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
     bool anyNewHeader = false;
     for (const auto& entry : entries)
     {
-        std::string ext = std::filesystem::path(entry).extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        std::string ext = LowerExtension(entry);
         const bool isHeader = (ext == ".h" || ext == ".hpp" || ext == ".hh");
         if (!isHeader)
         {
@@ -975,7 +959,7 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         headerCanonicals.push_back(canonicalStr);
         if (importedFiles.count(canonicalStr))
         {
-            if (verbose) std::cout << "[verbose]   group header already imported - kept for include context, registration skipped: " << canonicalStr << "\n";
+            if (verbose) std::cout << std::format("[verbose]   group header already imported - kept for include context, registration skipped: {}\n", canonicalStr);
             continue;
         }
         importedFiles.insert(canonicalStr);
@@ -1021,7 +1005,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // Check dedup (file already fully processed or eagerly registered).
     if (importedFiles.count(canonicalStr))
     {
-        if (verbose) std::cout << "[verbose]   already imported: " << canonicalStr << "\n";
+        if (verbose) std::cout << std::format("[verbose]   already imported: {}\n", canonicalStr);
         return true;
     }
     // Cross-path dedup: the same filename may resolve to different canonical paths
@@ -1041,7 +1025,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             if (!alt.empty() && alt != canonicalStr && importedFiles.count(alt))
             {
-                if (verbose) std::cout << "[verbose]   already imported (alt path): " << canonicalStr << "\n";
+                if (verbose) std::cout << std::format("[verbose]   already imported (alt path): {}\n", canonicalStr);
                 importedFiles.insert(canonicalStr);
                 return true;
             }
@@ -1052,8 +1036,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // Real C source: hand off to clang-cl rather than the CFlat parser. The compiled
     // object is linked by EmitExecutable; the importing .cb supplies the declarations.
     {
-        auto ext = std::filesystem::path(canonicalStr).extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+        auto ext = LowerExtension(canonicalStr);
         if (ext == ".c")
             return CompileCFile(canonicalStr, programAlias);
         // A C header (real C, not CFlat): extract declarations + enums via clang's
@@ -1082,7 +1065,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         ~ImportGuard() { stack.pop_back(); }
     } importGuard{importStack};
 
-    if (verbose) std::cout << "[verbose] importing: " << canonicalStr << "\n";
+    if (verbose) std::cout << std::format("[verbose] importing: {}\n", canonicalStr);
     llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
     // Implicit core-library imports (files under runtimeDir/core) have stable content for
@@ -1096,8 +1079,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (!cec)
         {
             auto coreStr = coreDir.string();
-            isCoreImport = canonicalStr.size() > coreStr.size()
-                && canonicalStr.compare(0, coreStr.size(), coreStr) == 0;
+            isCoreImport = canonicalStr.starts_with(coreStr);
         }
     }
 
@@ -1124,7 +1106,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 auto groupedImports = DequoteImportGroup(imp);
                 if (groupedImports.size() > 1)
                 {
-                    if (verbose) std::cout << "[verbose]   nested import (group of " << groupedImports.size() << ")\n";
+                    if (verbose) std::cout << std::format("[verbose]   nested import (group of {})\n", groupedImports.size());
                     if (!CompileImportGroup(canonicalStr, groupedImports, DequoteLibClauses(imp),
                                             DequoteDefineClauses(imp), HasCacheClause(imp)))
                         return false;
@@ -1136,12 +1118,12 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 else
                 {
                     std::string raw = imp->StringLiteral()->getText();
-                    nested = raw.substr(1, raw.size() - 2);
+                    nested = DequoteStringLiteral(raw);
                 }
                 if (IsPackageVcpkgImport(imp))
                 {
                     std::string portSpec = DequoteFromClause(imp);
-                    if (verbose) std::cout << "[verbose]   nested vcpkg import: " << nested << " from " << portSpec << "\n";
+                    if (verbose) std::cout << std::format("[verbose]   nested vcpkg import: {} from {}\n", nested, portSpec);
                     if (!CompileVcpkgImport(canonicalStr, nested, portSpec))
                         return false;
                     continue;
@@ -1149,7 +1131,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
                 std::vector<std::string> nestedLibs = DequoteLibClauses(imp);
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
-                if (verbose) std::cout << "[verbose]   nested import: " << nested << (nestedNs.empty() ? "" : " as " + nestedNs) << "\n";
+                if (verbose) std::cout << std::format("[verbose]   nested import: {}{}\n", nested, nestedNs.empty() ? "" : " as " + nestedNs);
                 if (!CompileImportedFile(canonicalStr, nested, nestedNs, "", nestedLibs, nestedDefines))
                     return false;
             }
@@ -1177,7 +1159,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // Forward-ref scan the imported file
     {
         llvm::TimeTraceScope scanScope("ForwardRefScan", importFilename);
-        if (verbose) std::cout << "[verbose]   forward-ref scan: " << importFilename << "\n";
+        if (verbose) std::cout << std::format("[verbose]   forward-ref scan: {}\n", importFilename);
         ForwardRefScanner scanner(this);
         scanner.SetTokens(tokensPtr);
         // Pre-declare opaque types for all generic instantiations found in the file
@@ -1193,13 +1175,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
 
     // Code-gen walk the imported file
-    if (verbose) std::cout << "[verbose]   code-gen walk: " << importFilename << "\n";
+    if (verbose) std::cout << std::format("[verbose]   code-gen walk: {}\n", importFilename);
     {
         llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
         auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
         antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
     }
-    if (verbose) std::cout << "[verbose]   import done: " << importFilename << "\n";
+    if (verbose) std::cout << std::format("[verbose]   import done: {}\n", importFilename);
 
     // Register the file-scoped import alias.  The "$global$:<alias>" sentinel tells
     // ResolveQualifiedName and ParsePostfixExpression to resolve Alias.X -> X only
@@ -1249,12 +1231,12 @@ void LLVMBackend::ProcessPendingMacroSources()
         state.parser->removeErrorListeners();
 
         try { state.tokens->fill(); } catch (...) {
-            if (verbose) std::cout << "[verbose]   lex failed for " << state.label << ", dropping batch\n";
+            if (verbose) std::cout << std::format("[verbose]   lex failed for {}, dropping batch\n", state.label);
             continue;
         }
         CFlatParser::CompilationUnitContext* cu = nullptr;
         try { cu = state.parser->compilationUnit(); } catch (...) {
-            if (verbose) std::cout << "[verbose]   parse failed for " << state.label << ", dropping batch\n";
+            if (verbose) std::cout << std::format("[verbose]   parse failed for {}, dropping batch\n", state.label);
             continue;
         }
         if (!cu) continue;
@@ -1281,7 +1263,7 @@ void LLVMBackend::ProcessPendingMacroSources()
             ++registered;
         }
         if (verbose)
-            std::cout << "[verbose]   registered " << registered << " C function-like macro template(s) from " << state.label << "\n";
+            std::cout << std::format("[verbose]   registered {} C function-like macro template(s) from {}\n", registered, state.label);
         // Keep parse state alive for the rest of the compilation.
         syntheticParseStates_.push_back(std::move(state));
     }
@@ -1737,7 +1719,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
     if (!std::filesystem::exists(filePath))
     {
-        std::cerr << "Error: input file '" << filePath << "' does not exist.\n";
+        std::cout << std::format("Error: input file '{}' does not exist.\n", filePath);
         return false;
     }
 
@@ -1789,7 +1771,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     else
                     {
                         std::string raw = imp->StringLiteral()->getText();
-                        importFilename = raw.substr(1, raw.size() - 2);
+                        importFilename = DequoteStringLiteral(raw);
                     }
                     if (IsPackageVcpkgImport(imp))
                     {
@@ -1801,8 +1783,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
                     bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
                     std::string alias = isProgram && imp->Identifier() ? imp->Identifier()->getText() : "";
-                    std::string impExt = std::filesystem::path(importFilename).extension().string();
-                    std::transform(impExt.begin(), impExt.end(), impExt.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                    std::string impExt = LowerExtension(importFilename);
                     bool isCProgram = isProgram && impExt == ".c";
                     std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
                     std::vector<std::string> extraDefines = DequoteDefineClauses(imp);
@@ -2384,7 +2365,7 @@ bool LLVMBackend::PrintSupportedCpus()
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
     if (!target)
     {
-        std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+        std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
         return false;
     }
 
@@ -2392,7 +2373,7 @@ bool LLVMBackend::PrintSupportedCpus()
         target->createMCSubtargetInfo(triple, "", ""));
     if (!sti)
     {
-        std::cerr << "Error: could not create subtarget info for '" << triple << "'.\n";
+        std::cout << std::format("Error: could not create subtarget info for '{}'.\n", triple);
         return false;
     }
 
@@ -2402,7 +2383,7 @@ bool LLVMBackend::PrintSupportedCpus()
     for (const auto& kv : sti->getAllProcessorDescriptions())
     {
         if (kv.Key && *kv.Key)
-            std::cout << "  " << kv.Key << "\n";
+            std::cout << std::format("  {}\n", kv.Key);
     }
     return true;
 }
@@ -2414,7 +2395,7 @@ bool LLVMBackend::PrintHostCpu()
     llvm::StringRef host = llvm::sys::getHostCPUName();
     if (host.empty())
     {
-        std::cerr << "Error: could not determine the host CPU.\n";
+        std::cout << "Error: could not determine the host CPU.\n";
         return false;
     }
     std::cout << host.str() << "\n";
@@ -2429,7 +2410,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     {
         name = llvm::sys::getHostCPUName().str();
         if (verbose)
-            std::cout << "[verbose] " << label << " native resolved to: " << name << "\n";
+            std::cout << std::format("[verbose] {} native resolved to: {}\n", label, name);
     }
 
     llvm::InitializeAllTargets();
@@ -2439,7 +2420,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
     if (!target)
     {
-        std::cerr << "Error: no target for triple '" << triple << "': " << err << "\n";
+        std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
         return false;
     }
 
@@ -2447,8 +2428,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
         target->createMCSubtargetInfo(triple, "", ""));
     if (sti && !sti->isCPUStringValid(name))
     {
-        std::cerr << "Error: unknown " << label << " '" << name
-                  << "'. Run --print-supported-cpus for the list.\n";
+        std::cout << std::format("Error: unknown {} '{}'. Run --print-supported-cpus for the list.\n", label, name);
         return false;
     }
 
@@ -2461,60 +2441,60 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
     std::string cacheDir = GetCflatCacheDir();
     if (cacheDir.empty())
     {
-        std::cerr << "Error: USERPROFILE environment variable is not set.\n";
+        std::cout << "Error: USERPROFILE environment variable is not set.\n";
         return false;
     }
 
     if (std::error_code ec = llvm::sys::fs::create_directories(cacheDir); ec)
     {
-        std::cerr << "Error: could not create " << cacheDir << ": " << ec.message() << "\n";
+        std::cout << std::format("Error: could not create {}: {}\n", cacheDir, ec.message());
         return false;
     }
-    std::cout << "Cache directory: " << cacheDir << "\n";
+    std::cout << std::format("Cache directory: {}\n", cacheDir);
 
     for (const char* arch : {"x64", "x86"})
     {
-        std::cout << "Discovering linker paths for " << arch << "...\n";
+        std::cout << std::format("Discovering linker paths for {}...\n", arch);
         LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
 
-        std::cout << "  lld-link: " << (paths.lldLink.empty() ? "(not found)" : paths.lldLink) << "\n";
-        std::cout << "  msvc-lib: " << (paths.msvcLib.empty() ? "(not found)" : paths.msvcLib) << "\n";
-        std::cout << "  ucrt-lib: " << (paths.ucrtLib.empty() ? "(not found)" : paths.ucrtLib) << "\n";
-        std::cout << "  um-lib:   " << (paths.umLib.empty() ? "(not found)" : paths.umLib) << "\n";
+        std::cout << std::format("  lld-link: {}\n", paths.lldLink.empty() ? "(not found)" : paths.lldLink);
+        std::cout << std::format("  msvc-lib: {}\n", paths.msvcLib.empty() ? "(not found)" : paths.msvcLib);
+        std::cout << std::format("  ucrt-lib: {}\n", paths.ucrtLib.empty() ? "(not found)" : paths.ucrtLib);
+        std::cout << std::format("  um-lib:   {}\n", paths.umLib.empty() ? "(not found)" : paths.umLib);
 
         if (SaveLinkerPathsToCache(arch, paths))
-            std::cout << "  Saved linker_paths_" << arch << ".json\n";
+            std::cout << std::format("  Saved linker_paths_{}.json\n", arch);
         else
-            std::cerr << "  Warning: could not write cache file for " << arch << ".\n";
+            std::cout << std::format("  Warning: could not write cache file for {}.\n", arch);
     }
 
     // Build core bitcode cache for win64 (win32 has pre-existing compilation issues).
     for (const char* platform : {"win64"})
     {
-        std::cout << "Building core bitcode cache for " << platform << "...\n";
+        std::cout << std::format("Building core bitcode cache for {}...\n", platform);
         LLVMBackend coreCompiler;
         coreCompiler.SetRuntimeDir(runtimeDir);
         coreCompiler.SetVerbose(verbose);
         if (!coreCompiler.CompileCoreOnly(platform))
         {
-            std::cerr << "  Warning: core compilation failed for " << platform << ".\n";
+            std::cout << std::format("  Warning: core compilation failed for {}.\n", platform);
             continue;
         }
         std::string bcCacheDir = LLVMBackend::GetRuntimeBitcodeDir(runtimeDir);
         if (bcCacheDir.empty())
         {
-            std::cerr << "  Warning: could not determine bitcode cache dir.\n";
+            std::cout << "  Warning: could not determine bitcode cache dir.\n";
             continue;
         }
         if (std::error_code ec = llvm::sys::fs::create_directories(bcCacheDir); ec)
         {
-            std::cerr << "  Warning: could not create " << bcCacheDir << ": " << ec.message() << "\n";
+            std::cout << std::format("  Warning: could not create {}: {}\n", bcCacheDir, ec.message());
             continue;
         }
         if (coreCompiler.SaveCoreBitcode(bcCacheDir, platform))
-            std::cout << "  Saved core_" << platform << ".bc + .meta.json\n";
+            std::cout << std::format("  Saved core_{}.bc + .meta.json\n", platform);
         else
-            std::cerr << "  Warning: could not write core bitcode cache for " << platform << ".\n";
+            std::cout << std::format("  Warning: could not write core bitcode cache for {}.\n", platform);
     }
 
     return true;
@@ -2587,8 +2567,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (t.IsNullable)             o["nl"]  = true;
     if (t.IsMove)                 o["mv"]  = true;
     if (t.IsBond)                 o["bd"]  = true;
-    if (t.IsStdcall)              o["sc"]  = true;
-    if (t.IsCdecl)                o["cc"]  = true;
+    if (t.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(t.CallConv);
     if (t.LockThis)               o["lt"]  = true;
     if (!t.GuardedBy.empty())     o["gb"]  = t.GuardedBy;
     if (t.IsFunctionPointer)
@@ -2638,8 +2617,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
     if (auto v = o.getBoolean("mv")) t.IsMove = *v;
     if (auto v = o.getBoolean("bd")) t.IsBond = *v;
-    if (auto v = o.getBoolean("sc")) t.IsStdcall = *v;
-    if (auto v = o.getBoolean("cc")) t.IsCdecl = *v;
+    if (auto v = o.getInteger("cc")) t.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
     if (auto v = o.getBoolean("lt")) t.LockThis = *v;
     if (auto v = o.getString("gb"))  t.GuardedBy = v->str();
     if (auto v = o.getBoolean("fp")) t.IsFunctionPointer = *v;
@@ -2862,7 +2840,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     auto runtimePath = std::filesystem::path(runtimeDir) / "core" / "runtime.cb";
     if (!std::filesystem::exists(runtimePath))
     {
-        std::cerr << "Error: runtime.cb not found in " << runtimeDir << "/core\n";
+        std::cout << std::format("Error: runtime.cb not found in {}/core\n", runtimeDir);
         return false;
     }
     if (!CompileImportedFile(runtimePath.string(), "runtime.cb"))
@@ -3022,103 +3000,71 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         root["globals"] = std::move(arr);
     }
 
+    // Serialize one family of generic templates into root[jsonKey].
+    // All template context types expose getStart()/getStop() via ParserRuleContext, so the
+    // templates map is accepted as `const auto&` and the type is deduced per call site.
+    using TypeParamsMap  = std::unordered_map<std::string, std::vector<std::string>>;
+    using PackIndexMap   = std::unordered_map<std::string, size_t>;
+    using ConstraintsMap = std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>;
+
+    auto serializeGenericTemplates = [&](
+        const auto&           templatesMap,
+        const TypeParamsMap&  typeParams,
+        const PackIndexMap&   packIndex,
+        const ConstraintsMap* constraints,
+        llvm::StringRef       jsonKey)
+    {
+        llvm::json::Array arr;
+        for (auto& [name, ctx] : templatesMap)
+        {
+            auto* start = ctx->getStart();
+            auto* stop  = ctx->getStop();
+            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
+            std::string src = start->getInputStream()->getText(iv);
+            llvm::json::Object to;
+            to["name"]   = name;
+            to["source"] = src;
+            llvm::json::Array tps;
+            if (auto it = typeParams.find(name); it != typeParams.end())
+                for (auto& tp : it->second) tps.push_back(tp);
+            to["type_params"] = std::move(tps);
+            if (auto pit = packIndex.find(name); pit != packIndex.end())
+                to["pack_index"] = static_cast<int64_t>(pit->second);
+            if (constraints)
+                if (auto cit = constraints->find(name); cit != constraints->end())
+                    to["constraints"] = SerializeConstraints(cit->second);
+            arr.push_back(std::move(to));
+        }
+        root[jsonKey] = std::move(arr);
+    };
+
     // Generic struct templates: source text + type params + constraints
-    {
-        llvm::json::Array arr;
-        for (auto& [name, ctx] : gts.genericStructTemplates)
-        {
-            auto* start = ctx->getStart();
-            auto* stop  = ctx->getStop();
-            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
-            std::string src = start->getInputStream()->getText(iv);
-            llvm::json::Object to;
-            to["name"]   = name;
-            to["source"] = src;
-            llvm::json::Array tps;
-            if (auto it = gts.genericStructTypeParams.find(name); it != gts.genericStructTypeParams.end())
-                for (auto& tp : it->second) tps.push_back(tp);
-            to["type_params"] = std::move(tps);
-            if (auto pit = gts.genericStructPackIndex.find(name); pit != gts.genericStructPackIndex.end())
-                to["pack_index"] = static_cast<int64_t>(pit->second);
-            if (auto cit = gts.genericStructConstraints.find(name); cit != gts.genericStructConstraints.end())
-                to["constraints"] = SerializeConstraints(cit->second);
-            arr.push_back(std::move(to));
-        }
-        root["generic_structs"] = std::move(arr);
-    }
+    serializeGenericTemplates(gts.genericStructTemplates,
+                              gts.genericStructTypeParams,
+                              gts.genericStructPackIndex,
+                              &gts.genericStructConstraints,
+                              "generic_structs");
 
-    // Generic class templates
-    {
-        llvm::json::Array arr;
-        for (auto& [name, ctx] : gts.genericClassTemplates)
-        {
-            auto* start = ctx->getStart();
-            auto* stop  = ctx->getStop();
-            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
-            std::string src = start->getInputStream()->getText(iv);
-            llvm::json::Object to;
-            to["name"]   = name;
-            to["source"] = src;
-            llvm::json::Array tps;
-            if (auto it = gts.genericStructTypeParams.find(name); it != gts.genericStructTypeParams.end())
-                for (auto& tp : it->second) tps.push_back(tp);
-            to["type_params"] = std::move(tps);
-            if (auto pit = gts.genericClassPackIndex.find(name); pit != gts.genericClassPackIndex.end())
-                to["pack_index"] = static_cast<int64_t>(pit->second);
-            if (auto cit = gts.genericClassConstraints.find(name); cit != gts.genericClassConstraints.end())
-                to["constraints"] = SerializeConstraints(cit->second);
-            arr.push_back(std::move(to));
-        }
-        root["generic_classes"] = std::move(arr);
-    }
+    // Generic class templates (share genericStructTypeParams - no separate class type-param map)
+    serializeGenericTemplates(gts.genericClassTemplates,
+                              gts.genericStructTypeParams,
+                              gts.genericClassPackIndex,
+                              &gts.genericClassConstraints,
+                              "generic_classes");
 
-    // Generic interface templates
-    {
-        llvm::json::Array arr;
-        for (auto& [name, ctx] : gts.genericInterfaceTemplates)
-        {
-            auto* start = ctx->getStart();
-            auto* stop  = ctx->getStop();
-            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
-            std::string src = start->getInputStream()->getText(iv);
-            llvm::json::Object to;
-            to["name"]   = name;
-            to["source"] = src;
-            llvm::json::Array tps;
-            if (auto it = gts.genericInterfaceTypeParams.find(name); it != gts.genericInterfaceTypeParams.end())
-                for (auto& tp : it->second) tps.push_back(tp);
-            to["type_params"] = std::move(tps);
-            if (auto pit = gts.genericInterfacePackIndex.find(name); pit != gts.genericInterfacePackIndex.end())
-                to["pack_index"] = static_cast<int64_t>(pit->second);
-            arr.push_back(std::move(to));
-        }
-        root["generic_interfaces"] = std::move(arr);
-    }
+    // Generic interface templates (no constraints)
+    serializeGenericTemplates(gts.genericInterfaceTemplates,
+                              gts.genericInterfaceTypeParams,
+                              gts.genericInterfacePackIndex,
+                              nullptr,
+                              "generic_interfaces");
 
     // Generic function templates
-    {
-        llvm::json::Array arr;
-        for (auto& [name, ctx] : gts.genericFunctionTemplates)
-        {
-            auto* start = ctx->getStart();
-            auto* stop  = ctx->getStop();
-            antlr4::misc::Interval iv(start->getStartIndex(), stop->getStopIndex());
-            std::string src = start->getInputStream()->getText(iv);
-            llvm::json::Object to;
-            to["name"]   = name;
-            to["source"] = src;
-            llvm::json::Array tps;
-            if (auto it = gts.genericFunctionTypeParams.find(name); it != gts.genericFunctionTypeParams.end())
-                for (auto& tp : it->second) tps.push_back(tp);
-            to["type_params"] = std::move(tps);
-            if (auto pit = gts.genericFunctionPackIndex.find(name); pit != gts.genericFunctionPackIndex.end())
-                to["pack_index"] = static_cast<int64_t>(pit->second);
-            if (auto cit = gts.genericFunctionConstraints.find(name); cit != gts.genericFunctionConstraints.end())
-                to["constraints"] = SerializeConstraints(cit->second);
-            arr.push_back(std::move(to));
-        }
-        root["generic_functions"] = std::move(arr);
-    }
+    serializeGenericTemplates(gts.genericFunctionTemplates,
+                              gts.genericFunctionTypeParams,
+                              gts.genericFunctionPackIndex,
+                              &gts.genericFunctionConstraints,
+                              "generic_functions");
 
     // instantiatedGenerics / instantiatedInterfaces / instantiatedGenericFunctions
     {
