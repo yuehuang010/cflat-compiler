@@ -7,7 +7,7 @@
 // Keep these as plain decimal integers - do NOT write a leading zero
 // (e.g. 01), which C++ parses as an octal literal.
 #define CFLAT_VERSION_MAJOR 0
-#define CFLAT_VERSION_MINOR 3
+#define CFLAT_VERSION_MINOR 4
 
 // Monotonic integer form for ordered comparisons (CFLAT_VERSION_NUMBER < X, ==, etc.).
 // Do NOT compare CFLAT_VERSION_STRING - it sorts lexicographically ("0.10" < "0.5").
