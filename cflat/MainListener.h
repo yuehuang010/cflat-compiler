@@ -3237,6 +3237,20 @@ public:
         return hasEquality && !hasRelational;
     }
 
+    // Parse the body of a controlled statement (if/else/for/while/do/foreach) and free owned
+    // temporaries at its end. A braced compound body already flushes per block-item (the
+    // FlushOwnedTemps at the block-item boundary in ParseCompoundStatement); an UNBRACED single
+    // statement bypasses that loop, so a chained-concat intermediate like the `a + b` of
+    // `j = j + p + ","` would leak. Flush only for the non-compound case (a no-op otherwise).
+    // Must run while still in the body block: FlushOwnedTemps' dominance guard frees only temps
+    // registered in the current block, so the caller branches to the loop latch / resume after.
+    void ParseControlledBody(CFlatParser::StatementContext* body)
+    {
+        ParseStatement(body);
+        if (body != nullptr && body->compoundStatement() == nullptr)
+            Compiler(body)->FlushOwnedTemps();
+    }
+
     void ParseStatement(CFlatParser::StatementContext* statement)
     {
         auto* compiler = Compiler(statement);
@@ -3708,7 +3722,7 @@ public:
                 compiler->CreateBlockBreak(blockInner, false);
 
                 compiler->InitializeBlock(blockInner, true, blockCondition, blockResume, blockResume);
-                ParseStatement(innerStatement);
+                ParseControlledBody(innerStatement);
                 compiler->CreateContinueCall();
 
                 compiler->InitializeBlock(blockCondition, false);
@@ -3761,7 +3775,7 @@ public:
                 {
                     int prevBody = currentVectorizeBodyLine_;
                     if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
-                    ParseStatement(innerStatement);
+                    ParseControlledBody(innerStatement);
                     currentVectorizeBodyLine_ = prevBody;
                 }
                 compiler->CreateContinueCall();
@@ -3822,7 +3836,7 @@ public:
                     {
                         int prevBody = currentVectorizeBodyLine_;
                         if (doVectorize) currentVectorizeBodyLine_ = vectorizeLine;
-                        ParseStatement(innerStatement);
+                        ParseControlledBody(innerStatement);
                         currentVectorizeBodyLine_ = prevBody;
                     }
                     compiler->CreateContinueCall();
@@ -3971,7 +3985,7 @@ public:
                     if (elemVal)
                         compiler->CreateAssignment(elemVal, elemAlloca);
 
-                    ParseStatement(bodyStmt);
+                    ParseControlledBody(bodyStmt);
                     compiler->CreateContinueCall();
 
                     // Increment block: i++
@@ -4043,7 +4057,7 @@ public:
                 auto preIfMovedState = compiler->SaveMovedState();
 
                 compiler->InitializeBlock(blockTrue, false);
-                ParseStatement(innerStatement[0]);
+                ParseControlledBody(innerStatement[0]);
                 auto thenMovedState = compiler->SaveMovedState();
 
                 compiler->CreateBlockBreak(blockResume, true);
@@ -4055,7 +4069,7 @@ public:
 
                     // else statement
                     compiler->InitializeBlock(blockElse, true);
-                    ParseStatement(innerStatement[1]);
+                    ParseControlledBody(innerStatement[1]);
                     auto elseMovedState = compiler->SaveMovedState();
                     compiler->CreateBlockBreak(blockResume, true);
 
