@@ -2254,7 +2254,73 @@ std::string LLVMBackend::GetCflatCacheDir()
     return std::string(buf) + "\\.cflat";
 }
 
-LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir)
+// Win32 registry read. Declared bare (no windows.h) to keep this TU free of <winnt.h>, matching
+// the RtlAddFunctionTable pattern above. Resolves against advapi32.lib (inherited default lib).
+extern "C" long __stdcall RegGetValueA(
+    void* hkey, const char* lpSubKey, const char* lpValue, unsigned long dwFlags,
+    unsigned long* pdwType, void* pvData, unsigned long* pcbData);
+
+// Read HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots\KitsRoot10 - the canonical Windows SDK
+// install root, correct even for non-default install locations. The SDK installer writes it under
+// the 32-bit registry view, so try WOW6432 first then the native 64-bit view. Returns "" if absent.
+static std::string ReadKitsRoot10FromRegistry()
+{
+    void* const hklm = reinterpret_cast<void*>(static_cast<intptr_t>(static_cast<int32_t>(0x80000002)));
+    const char* subKey = "SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots";
+    const unsigned long views[2] = { 0x00020000UL /*RRF_SUBKEY_WOW6432KEY*/, 0x00010000UL /*RRF_SUBKEY_WOW6464KEY*/ };
+    for (unsigned long view : views)
+    {
+        char buf[1024];
+        unsigned long cb = sizeof(buf);
+        unsigned long flags = 0x00000002UL /*RRF_RT_REG_SZ*/ | view;
+        // RegGetValueA NUL-terminates REG_SZ output, so buf is a valid C string on success.
+        if (RegGetValueA(hklm, subKey, "KitsRoot10", flags, nullptr, buf, &cb) == 0 && cb > 1)
+            return std::string(buf);
+    }
+    return "";
+}
+
+extern "C" long __stdcall RegOpenKeyExA(
+    void* hKey, const char* lpSubKey, unsigned long ulOptions, unsigned long samDesired, void** phkResult);
+extern "C" long __stdcall RegEnumValueA(
+    void* hKey, unsigned long dwIndex, char* lpValueName, unsigned long* lpcchValueName,
+    unsigned long* lpReserved, unsigned long* lpType, unsigned char* lpData, unsigned long* lpcbData);
+extern "C" long __stdcall RegCloseKey(void* hKey);
+
+// Fallback VS install-path lookup via the legacy HKLM\SOFTWARE\Microsoft\VisualStudio\SxS\VS7 key
+// (32-bit view), mapping version ("17.0", "18.0", ...) to install dir. vswhere is preferred and
+// authoritative; this only covers a missing/silent vswhere. Returns the greatest version's path.
+static std::string ReadVsInstallPathFromRegistry()
+{
+    void* const hklm = reinterpret_cast<void*>(static_cast<intptr_t>(static_cast<int32_t>(0x80000002)));
+    const unsigned long keyReadWow32 = 0x20019UL /*KEY_READ*/ | 0x0200UL /*KEY_WOW64_32KEY*/;
+    void* hKey = nullptr;
+    if (RegOpenKeyExA(hklm, "SOFTWARE\\Microsoft\\VisualStudio\\SxS\\VS7", 0, keyReadWow32, &hKey) != 0)
+        return "";
+
+    std::string bestPath;
+    int bestMajor = -1;
+    for (unsigned long i = 0; ; ++i)
+    {
+        char name[64];  unsigned long nameLen = sizeof(name);
+        char data[1024]; unsigned long dataLen = sizeof(data);
+        unsigned long type = 0;
+        if (RegEnumValueA(hKey, i, name, &nameLen, nullptr, &type,
+                          reinterpret_cast<unsigned char*>(data), &dataLen) != 0)
+            break; // ERROR_NO_MORE_ITEMS or error
+        if (type != 1 /*REG_SZ*/) continue;
+        int major = 0;
+        for (const char* p = name; *p >= '0' && *p <= '9'; ++p) major = major * 10 + (*p - '0');
+        // REG_SZ data may not be NUL-terminated; trim any trailing NULs reported in dataLen.
+        size_t len = dataLen;
+        while (len > 0 && data[len - 1] == '\0') --len;
+        if (major > bestMajor) { bestMajor = major; bestPath.assign(data, len); }
+    }
+    RegCloseKey(hKey);
+    return bestPath;
+}
+
+LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose)
 {
     LinkerPaths result;
 
@@ -2310,6 +2376,22 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
         }
     }
 
+    // Fallback when vswhere is absent or returned nothing: the legacy SxS\VS7 registry key.
+    bool vsFromRegistry = false;
+    if (vsPath.empty())
+    {
+        vsPath = ReadVsInstallPathFromRegistry();
+        vsFromRegistry = !vsPath.empty();
+    }
+    if (verbose)
+    {
+        if (vsPath.empty())
+            std::cout << "[verbose] linker paths: Visual Studio install not found (vswhere + SxS\\VS7 registry)\n";
+        else
+            std::cout << std::format("[verbose] linker paths: Visual Studio via {} -> {}\n",
+                                     vsFromRegistry ? "SxS\\VS7 registry" : "vswhere", vsPath);
+    }
+
     // Find the latest MSVC lib directory.
     if (!vsPath.empty())
     {
@@ -2327,9 +2409,23 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
             result.msvcLib = msvcRoot + "\\" + latestVer + "\\lib\\" + arch;
     }
 
-    // Find the latest Windows SDK lib directories.
+    // Find the latest Windows SDK lib directories. Prefer the registry-reported install root
+    // (handles non-default install locations), falling back to the default install path.
     {
-        std::string wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+        std::string wkLib;
+        bool sdkFromRegistry = false;
+        std::string kitsRoot = ReadKitsRoot10FromRegistry();
+        if (!kitsRoot.empty())
+        {
+            if (kitsRoot.back() != '\\' && kitsRoot.back() != '/') kitsRoot += '\\';
+            std::string candidate = kitsRoot + "Lib";
+            if (llvm::sys::fs::exists(candidate)) { wkLib = candidate; sdkFromRegistry = true; }
+        }
+        if (wkLib.empty())
+            wkLib = "C:\\Program Files (x86)\\Windows Kits\\10\\Lib";
+        if (verbose)
+            std::cout << std::format("[verbose] linker paths: Windows SDK lib root via {} -> {}\n",
+                                     sdkFromRegistry ? "KitsRoot10 registry" : "default path", wkLib);
         std::string latestSDK;
         std::error_code ec;
         for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
@@ -2397,12 +2493,17 @@ bool LLVMBackend::SaveLinkerPathsToCache(const std::string& arch, const LinkerPa
     return true;
 }
 
-LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::string& runtimeDir)
+LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose)
 {
     if (auto cached = LoadLinkerPathsFromCache(arch))
+    {
+        if (verbose)
+            std::cout << std::format("[verbose] linker paths: loaded from cache ({}\\linker_paths_{}.json)\n",
+                                     GetCflatCacheDir(), arch);
         return *cached;
+    }
 
-    LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
+    LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir, verbose);
     SaveLinkerPathsToCache(arch, paths);
     return paths;
 }
@@ -2763,7 +2864,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
     for (const char* arch : {"x64", "x86"})
     {
         std::cout << std::format("Discovering linker paths for {}...\n", arch);
-        LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir);
+        LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir, verbose);
 
         std::cout << std::format("  lld-link: {}\n", paths.lldLink.empty() ? "(not found)" : paths.lldLink);
         std::cout << std::format("  msvc-lib: {}\n", paths.msvcLib.empty() ? "(not found)" : paths.msvcLib);

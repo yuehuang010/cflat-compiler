@@ -2647,10 +2647,10 @@ private:
     }
 
     static std::string GetCflatCacheDir();
-    static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir);
+    static LinkerPaths DiscoverLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose = false);
     static std::optional<LinkerPaths> LoadLinkerPathsFromCache(const std::string& arch);
     static bool SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths);
-    static LinkerPaths FindLinkerPaths(const std::string& arch, const std::string& runtimeDir);
+    static LinkerPaths FindLinkerPaths(const std::string& arch, const std::string& runtimeDir, bool verbose = false);
 
     // SDK-free system import libs synthesized from the OS-resident DLLs (Phase B/C).
     static std::string GetSyntheticLibDir(const std::string& arch);
@@ -4639,7 +4639,7 @@ private:
         LinkerPaths linkerPaths_;
         {
             llvm::TimeTraceScope pathScope("FindLinkerPaths", exePath);
-            linkerPaths_ = FindLinkerPaths(arch, runtimeDir);
+            linkerPaths_ = FindLinkerPaths(arch, runtimeDir, verbose);
         }
         const std::string& lldLinkPath = linkerPaths_.lldLink;
         const std::string& msvcLibPath = linkerPaths_.msvcLib;
@@ -4723,6 +4723,21 @@ private:
             if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
             if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
             if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+        }
+
+        // No source for the OS CRT import libs: neither the --init cache (synthetic libs)
+        // nor a Windows SDK ucrt.lib is present. Fail early with an actionable message
+        // instead of letting lld-link emit a raw "could not open ucrt.lib".
+        if (!useSyntheticLibs && ucrtLibPath.empty())
+        {
+            llvm::sys::fs::remove(objPath);
+            for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            if (!keepVcRuntime && arch == "x64")
+                LogError("Run cflat --init for the first time to finish setting up.");
+            else
+                LogError("Windows SDK / Visual Studio build tools are required for this build "
+                         "configuration but were not found.");
+            return false;
         }
 
         // AddressSanitizer: link the dynamic asan runtime (matches /MD-style CRT), force-include
