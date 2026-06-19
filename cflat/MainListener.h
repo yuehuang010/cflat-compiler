@@ -16286,6 +16286,18 @@ public:
                 compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {argvToFree});
             }
 
+            // Destruct the args list when main does NOT own it. Only main(move list<string>)
+            // takes ownership (and frees it at scope exit); a no-arg or main(argc,argv) entry
+            // never receives the list, so the packet's copy (_data buffer + owning string
+            // elements) would otherwise leak. The active allocator is already nulled above, so
+            // ~list__string frees under the CRT allocator the caller built the args with; the
+            // argv array (which only borrows each element's _ptr) was just freed above.
+            if (!isListArgs)
+            {
+                if (auto* argsDtor = compiler->GetOrCreateFullDestructor("list__string"))
+                    compiler->builder->CreateCall(argsDtor->getFunctionType(), argsDtor, {argsGEP});
+            }
+
             compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {ctxArg});
             auto* finalExitCode = compiler->builder->CreateLoad(i32Type, exitCodeGEP, "final_exit");
             compiler->CreateReturnCall(finalExitCode);
