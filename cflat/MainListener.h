@@ -10127,11 +10127,26 @@ public:
             return {};
         }
 
-        // 1. Call the full destructor (user dtor + member fields) if needed (non-array only)
+        // 1. Call the full destructor (user dtor + member fields) if needed (non-array only).
+        // Guard on null: 'delete nullptr' must be a no-op (operator delete below already
+        // null-checks). Without this, the destructor would dereference a null pointer - a
+        // recursive tree teardown ('delete left; delete right;' with null leaf children)
+        // would crash on the first null child.
         if (!isArray && !typeName.empty())
         {
             if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+            {
+                auto* nullPtr = llvm::ConstantPointerNull::get(
+                    llvm::cast<llvm::PointerType>(ptrVal->getType()));
+                auto* isNull  = compiler->builder->CreateICmpEQ(ptrVal, nullPtr, "del_isnull");
+                auto* dtorBB  = compiler->CreateBasicBlock("del_dtor");
+                auto* contBB  = compiler->CreateBasicBlock("del_dtor_cont");
+                compiler->builder->CreateCondBr(isNull, contBB, dtorBB);
+                compiler->builder->SetInsertPoint(dtorBB);
                 compiler->builder->CreateCall(dtor, { ptrVal });
+                compiler->builder->CreateBr(contBB);
+                compiler->builder->SetInsertPoint(contBB);
+            }
         }
 
         // 1b. For delete[n]: call ~T() on each element using the caller-supplied count.
@@ -12456,6 +12471,10 @@ public:
                                             elemNV.Storage = ownedAlloca;
                                             elemNV.BaseType = strLLTy;
                                             elemNV.TypeAndValue.TypeName = "string";
+                                            // `owned` is copy()'s result - an owning heap buffer. Flag it so the
+                                            // move-arg lowering hands that buffer straight to add() instead of
+                                            // heap-copying it again and orphaning the original (a leak per element).
+                                            elemNV.IsOwningString = true;
                                             compiler->CreateOverloadedFunctionCall("add", {listNV, elemNV});
                                         }
                                         else if (compiler->dataStructures.count(elemTypeName))

@@ -255,6 +255,39 @@ int testRecursiveTreeFree()
     return passed;
 }
 
+// A destructor that recursively deletes its own children. Leaf children are null,
+// so 'delete left'/'delete right' must treat a null pointer as a no-op rather than
+// invoking the destructor on null (which would dereference null and crash).
+struct CascadeNode
+{
+    CascadeNode* left  = nullptr;
+    CascadeNode* right = nullptr;
+    ~CascadeNode()
+    {
+        dtorCount = dtorCount + 1;
+        delete left;    // null on leaves: delete must be a safe no-op
+        delete right;
+    }
+};
+
+int testDeleteNullCascade()
+{
+    int passed = 0;
+
+    // root + 2 children; grandchildren are null. 'delete root' cascades through the
+    // destructor, hitting 'delete nullptr' on every leaf. All three freed once, no crash.
+    dtorCount = 0;
+    {
+        CascadeNode* root = new CascadeNode();
+        root->left  = new CascadeNode();
+        root->right = new CascadeNode();
+        delete root;
+    }
+    passed += Test("delete_null_cascade_frees_all", dtorCount, 3);
+
+    return passed;
+}
+
 int testFieldOwnership()
 {
     int passed = 0;
@@ -642,6 +675,9 @@ extern int main()
     total++;
 
     passed += testRecursiveTreeFree();
+    total += 1;
+
+    passed += testDeleteNullCascade();
     total += 1;
 
     passed += testFieldOwnership();

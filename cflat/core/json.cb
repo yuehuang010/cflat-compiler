@@ -108,12 +108,16 @@ class JsonBuilder : IReflector
         }
     }
 
-    string toString()
+    // toString/toJson return the freshly allocated buffer from sb.toString()
+    // (itself `move string`). The `move` return keeps the OWNED bit set so the
+    // caller takes ownership and frees it; a plain `string` return would clear
+    // the bit as a borrow and leak the buffer (see string.cb stringbuilder).
+    move string toString()
     {
         return sb.toString();
     }
 
-    static string toJson<T>(T obj)
+    static move string toJson<T>(T obj)
     {
         JsonBuilder builder;
         IReflector visitor = builder;
