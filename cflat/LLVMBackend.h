@@ -4587,6 +4587,13 @@ private:
             cpu = targetCpu_;
 
         llvm::TargetOptions opt;
+        // Emit one section per function/global so lld-link's /OPT:REF can garbage-collect
+        // unreferenced symbols at every opt level. At -O0 no IR DCE runs, so without this
+        // the whole core library ships in every exe. This is pure object layout - it adds
+        // no optimization and does not touch the IR, so --out-lli (written before codegen)
+        // still shows the full module.
+        opt.FunctionSections = true;
+        opt.DataSections     = true;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
         module->setDataLayout(TM->createDataLayout());
