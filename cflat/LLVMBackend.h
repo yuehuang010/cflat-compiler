@@ -4233,13 +4233,19 @@ private:
         {
             diskKey = CHeaderDiskCacheKey(realPaths, cIncludeDirs_, cDefines_, extraDefines);
             CFileSigCacheEntry diskEntry;
-            if (TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry))
+            bool diskHit;
+            {
+                llvm::TimeTraceScope loadScope("CHeaderJsonLoad", fileForLsp);
+                diskHit = TryLoadCHeaderDiskCache(cHeaderCacheDir, diskKey, currentMtime, hashNow(), diskEntry);
+            }
+            if (diskHit)
             {
                 if (verbose) std::cout << std::format("[verbose] C header disk cache hit for {}\n", fileForLsp);
                 {
                     std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
                     cFileSigCache_[cacheKey] = diskEntry;
                 }
+                llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
                 RegisterCRecords(diskEntry.records, fileForLsp);
                 RegisterRecordAliases(diskEntry.recordAliases);
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
@@ -4316,11 +4322,14 @@ private:
         }
 
         // Records were already registered inside ExtractCHeaderClang.
-        RegisterCSignatures(sigs, fileForLsp);
-        RegisterCEnums(enums, fileForLsp);
-        RegisterCMacros(macros);
-        RegisterCFunctionMacros(funcMacros, fileForLsp);
-        RegisterCGlobals(globals, fileForLsp);
+        {
+            llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
+            RegisterCSignatures(sigs, fileForLsp);
+            RegisterCEnums(enums, fileForLsp);
+            RegisterCMacros(macros);
+            RegisterCFunctionMacros(funcMacros, fileForLsp);
+            RegisterCGlobals(globals, fileForLsp);
+        }
         return true;
     }
 
@@ -11163,7 +11172,12 @@ public:
         std::ifstream f(cachePath);
         if (!f.is_open()) return false;
         nlohmann::json j;
-        try { f >> j; } catch (...) { return false; }
+        {
+            // Raw tokenize -> DOM. This is the portion a SIMD JSON parser would replace;
+            // it stays a distinct span so a future migration can be measured before/after.
+            llvm::TimeTraceScope parseScope("CHeaderJsonParse", cachePath.string());
+            try { f >> j; } catch (...) { return false; }
+        }
 
         int version = j.value("version", 0);
         // v1/v2 stored float macro values as JSON numbers, which encode inf/NaN as `null`
@@ -11192,6 +11206,9 @@ public:
         CFileSigCacheEntry entry;
         entry.mtime = mtime;
         entry.hash  = contentHash;
+        // DOM walk -> structs (plus deep-mode deps freshness check). Distinct from the parse
+        // span above so the allocation-bound conversion cost can be tracked separately.
+        llvm::TimeTraceScope convertScope("CHeaderJsonConvert", cachePath.string());
         try
         {
             if (j.contains("sigs"))       for (const auto& s : j["sigs"])       entry.sigs.push_back(SigFromJson(s));

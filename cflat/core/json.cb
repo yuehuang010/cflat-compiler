@@ -406,11 +406,13 @@ struct JsonParser
     }
 
     // Copy `len` bytes into a fresh NUL-terminated buffer wrapped as a string.
-    // With an arena active the bytes live in arena memory and the string is a
-    // non-owning view (reclaimed when the arena tears down); otherwise the string
-    // owns a heap buffer freed by its own destructor. This keeps each parsed string
-    // in the same ownership domain as the JsonNode that holds it - no orphan buffers.
-    string _copyOut(i8* src, int len)
+    // Returned `move`: the caller owns the result and must move it into its final
+    // slot (the OWNED bit is the runtime free-or-not gate). With an arena active the
+    // bytes live in arena memory and the result is a non-owning view (OWNED clear,
+    // reclaimed when the arena tears down); otherwise the result owns a heap buffer.
+    // The `move` return keeps each parsed string in the same ownership domain as the
+    // JsonNode field that consumes it - no orphan buffers, no double free.
+    move string _copyOut(i8* src, int len)
     {
         i8* buf = nullptr;
         if (_arena != nullptr) buf = (i8*)_arena.alloc((i64)(len + 1));
@@ -425,7 +427,7 @@ struct JsonParser
         return result;
     }
 
-    string _parseString()
+    move string _parseString()
     {
         _consume(); // opening "
         int start = _pos;
@@ -557,7 +559,7 @@ struct JsonParser
             JsonNode* val = _parseValue();
             if (val != nullptr)
             {
-                val.keyStr = key;
+                val.keyStr = move key;
                 node._appendChild(val);
             }
             _skipWs();

@@ -6,7 +6,7 @@
 // Build & run:
 //   x64/Debug/cflat.exe example/windows/sysinfo.cb -o out/sysinfo.exe
 //   out\sysinfo.exe
-import "windows.h";
+import "windows.h" cache;
 import "string.cb";
 
 extern int main()

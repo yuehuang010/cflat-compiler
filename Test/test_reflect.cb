@@ -652,6 +652,24 @@ extern int main()
     }
     total++; passed += Test("fromJson_no_leak", (i64)HeapAudit.reportLeaks(), (i64)0);
 
+    // Leak regression: the static JsonParser.parse() + `delete root` path (no arena)
+    // gives each parsed key/value an OWNED heap buffer. _parseString returns `move
+    // string` and the keyStr store moves it, so the JsonNode field is the sole owner
+    // and ~JsonNode frees it exactly once - no orphaned buffers, no double free.
+    // Guards against _copyOut/_parseString silently reverting to a plain `string`
+    // return (which classifies the buffer as a borrow and leaks/double-frees here).
+    {
+        int k = 0;
+        while (k < 8)
+        {
+            JsonNode* root = JsonParser.parse(
+                "{\"full_name\":\"Ada\\tLovelace\",\"city\":\"London\",\"nested\":{\"k\":\"v\"}}");
+            delete root;
+            k++;
+        }
+    }
+    total++; passed += Test("static_parse_no_leak", (i64)HeapAudit.reportLeaks(), (i64)0);
+
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
