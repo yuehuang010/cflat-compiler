@@ -2,6 +2,7 @@ import "test_helper.cb";
 import "list.cb";
 import "json.cb";
 import "xml.cb";
+import "diagnostic/heap_audit.cb";
 
 annotation Private   { };
 annotation JsonName  { string value; };
@@ -632,6 +633,24 @@ extern int main()
     Point xp0rt = XmlBuilder.fromXml<Point>(xmlP0);
     total++; passed += Test("xml_roundtrip_zero_x", xp0rt.x, 0);
     total++; passed += Test("xml_roundtrip_zero_y", xp0rt.y, 0);
+
+    // Leak regression: fromJson<T> parses each key/value into arena memory and
+    // reflect_set copies them into the result's owned fields; the arena is freed on
+    // return, so no parsed string buffer may outlive it. Enable HeapAudit late so only
+    // these allocations are tracked (earlier ones are invisible to the oracle), run a
+    // batch in a tight scope, then assert nothing leaked. Guards the arena-string fix.
+    HeapAudit.enable();
+    {
+        int k = 0;
+        while (k < 8)
+        {
+            Employee jeL = JsonBuilder.fromJson<Employee>(
+                "{\"full_name\":\"Ada\\tLovelace\",\"id\":7,\"addr\":{\"street_name\":\"London\",\"zip\":99}}");
+            total++; passed += Test("fromJson_leak_name", jeL.name, "Ada\tLovelace");
+            k++;
+        }
+    }
+    total++; passed += Test("fromJson_no_leak", (i64)HeapAudit.reportLeaks(), (i64)0);
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -375,3 +375,4 @@ FodyWeavers.xsd
 *.ll
 /out32/results
 *.vsix
+*.time-trace.json

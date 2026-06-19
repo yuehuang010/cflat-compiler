@@ -405,6 +405,26 @@ struct JsonParser
         return true;
     }
 
+    // Copy `len` bytes into a fresh NUL-terminated buffer wrapped as a string.
+    // With an arena active the bytes live in arena memory and the string is a
+    // non-owning view (reclaimed when the arena tears down); otherwise the string
+    // owns a heap buffer freed by its own destructor. This keeps each parsed string
+    // in the same ownership domain as the JsonNode that holds it - no orphan buffers.
+    string _copyOut(i8* src, int len)
+    {
+        i8* buf = nullptr;
+        if (_arena != nullptr) buf = (i8*)_arena.alloc((i64)(len + 1));
+        else                   buf = new i8[len + 1];
+        int i = 0;
+        while (i < len) { buf[i] = src[i]; i++; }
+        buf[len] = 0;
+        string result = default;
+        result._ptr = buf;
+        if (_arena != nullptr) result._len = len;                     // arena owns the bytes
+        else                   result._len = len | (i32)0x80000000;   // string owns the buffer
+        return result;
+    }
+
     string _parseString()
     {
         _consume(); // opening "
@@ -415,17 +435,10 @@ struct JsonParser
 
         if (_pos < _len && _src[_pos] == '"')
         {
-            // No escapes - copy directly, same pattern as stringbuilder.toString().
+            // No escapes - copy directly.
             int len = _pos - start;
             _pos++; // consume closing "
-            i8* buf = new i8[len + 1];
-            int i = 0;
-            while (i < len) { buf[i] = _src[start + i]; i++; }
-            buf[len] = 0;
-            string result;
-            result._ptr = buf;
-            result._len = len;
-            return result;
+            return _copyOut(_src + start, len);
         }
 
         // Slow path: escape sequences present.
@@ -452,7 +465,7 @@ struct JsonParser
             }
             sb.appendChar(c);
         }
-        return sb.toString();
+        return _copyOut(sb.data(), sb.length());
     }
 
     JsonNode* _parseNumber()
