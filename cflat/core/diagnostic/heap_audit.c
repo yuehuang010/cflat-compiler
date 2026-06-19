@@ -7,12 +7,14 @@
 //
 // Every allocation that flows through operator new is recorded live (with its size);
 // every free that flows through operator delete is checked. A free of a pointer that
-// is already recorded freed is a DOUBLE FREE: we print "ptr=0x... size=..." to stderr
-// and stop the process loudly and deterministically - at the bad free itself, no
-// matter when or on which thread it happens. This catches the double-free/UAF of a
-// large allocation (e.g. the ~2MB channel<Task> ring buffer) whose second free hits a
-// decommitted page (AV 0xC0000005) far away from the actual bug; size in the report
-// discriminates the big ring buffer from small ctx/handle allocations.
+// is already recorded freed is reported as a DOUBLE FREE ("ptr=0x... size=...") to
+// stderr. The report is advisory and non-fatal (report-only, like a LEAK): it does
+// NOT abort the process. A FREED-slot free is not always a true double-free - enable()
+// is installed at main entry, so allocations made before then (C-runtime/static init)
+// are untracked, and CRT address reuse can make an untracked operator delete land on a
+// stale FREED slot. Aborting on that would kill memory-correct programs, so it is
+// surfaced as a signal to investigate, not a hard failure. The reported size may be
+// stale (from whatever last allocated that address) for the same reason.
 //
 // Output goes through Win32 WriteFile (GetStdHandle(STD_ERROR_HANDLE)) rather than the
 // CRT's stdio: cflat's runtime (cruntime.cb) defines its own strong sprintf/vsprintf,
@@ -143,7 +145,15 @@ void cflat_heap_audit_alloc(void* p, unsigned long long size)
     LeaveCriticalSection(&cflat_ha_lock);
 }
 
-// Report a double free and stop the process loudly and unambiguously.
+// Report a double free. Report-only: print to stderr and return; do NOT abort.
+//
+// A FREED-slot free is not always a real double-free. enable() is installed at main
+// entry, so any buffer allocated before then (C-runtime/static initializers) is
+// untracked; when the CRT later reuses such a freed address through a path the alloc
+// hook never saw, an operator delete can land on a stale FREED slot and look like a
+// double free. Aborting on that would kill memory-correct programs, so this is advisory
+// only - same policy as a LEAK report. The reported size may be stale (from whatever
+// last allocated that address) for the same reason.
 static void cflat_ha_report_double_free_(void* p, unsigned long long size)
 {
     char line[160];
@@ -157,20 +167,10 @@ static void cflat_ha_report_double_free_(void* p, unsigned long long size)
     cflat_ha_append_dec_(line, sizeof(line), &pos, (unsigned long long)GetCurrentThreadId());
     cflat_ha_append_(line, sizeof(line), &pos, " ***\n");
     cflat_ha_write_stderr_(line);
-
-    // Stop loudly. Under a debugger, break in so the bad free can be inspected at the
-    // exact site. Otherwise terminate with a distinctive exit code (0xDF) so a
-    // non-interactive run records that the audit fired (not a stray AV / abort). An
-    // unguarded __debugbreak with no debugger raises an unhandled breakpoint that kills
-    // the process with exit 3 before TerminateProcess runs, masking the 0xDF code.
-    if (IsDebuggerPresent())
-        __debugbreak();
-    TerminateProcess(GetCurrentProcess(), 0xDF);
-    ExitProcess(0xDF);  // belt-and-suspenders if TerminateProcess is intercepted
 }
 
-// Check/record a free. Double free -> report + abort. Live -> mark freed (keep size).
-// Unknown pointer (allocated before enable(), or evicted) -> ignore.
+// Check/record a free. Double free -> report (advisory, non-fatal). Live -> mark freed
+// (keep size). Unknown pointer (allocated before enable(), or evicted) -> ignore.
 void cflat_heap_audit_free(void* p)
 {
     if (p == NULL || !cflat_ha_lock_ready) return;

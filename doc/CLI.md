@@ -133,6 +133,7 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 |--------|-------|-------|-------------|
 | `--debug-info` | `-g` | | Emit DWARF debug information. |
 | `--asan` | | | Instrument with AddressSanitizer and link the asan runtime (pair with `-g` for source-line reports). Alias: `-fsanitize=address`. |
+| `--heap-audit` | | | Instrument the program with the HeapAudit leak/double-free oracle (no source edits). Requires `-o`. See [below](#heap-audit). |
 | `--verbose` | `-v` | | Print detailed diagnostic messages during compilation. |
 | `--check` | | | Check one or more source files for errors without emitting output (batch; every positional is an independent source). |
 | `--grammar` | | | Validate the grammar (parse only) of one or more sources; add `-v` for the full parse-tree rule stack. |
@@ -141,6 +142,41 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 
 Diagnostic message conventions: [`doc/diagnostic.md`](diagnostic.md). Threading-specific
 analysis: [`doc/threading.md`](threading.md).
+
+### Heap audit
+
+`--heap-audit` instruments a program with the HeapAudit leak/double-free oracle without
+editing its source. The compiler auto-imports `core/diagnostic/heap_audit.cb`, calls
+`HeapAudit.enable()` at the top of `main`, and calls `HeapAudit.reportLeaks()` before every
+`return` from `main`. It is the no-source-edit equivalent of importing the module and wiring
+those calls by hand.
+
+```bash
+cflat.exe app.cb -i lib --heap-audit -o app.exe
+app.exe   # runs normally; the audit prints to stderr
+```
+
+Behavior:
+
+- **Leaks are report-only.** Allocations still live when `main` returns are printed to stderr
+  as `*** cflat heap-audit: LEAK ptr=... size=... ***`; the program's exit code is unchanged.
+  Note that globals and singletons intended to live for the whole process show up here - this
+  is a debug oracle, not a proof of leak-freedom.
+- **Double frees are report-only too.** A free of an already-freed pointer is printed as
+  `*** cflat heap-audit: DOUBLE FREE ptr=... size=... ***` to stderr; it does **not** abort or
+  change the exit code. The report is advisory: because `enable()` is injected at `main` entry,
+  any buffer allocated before then (C-runtime/static initializers) is untracked, and CRT
+  address reuse can make an untracked `delete` land on a stale freed slot and look like a
+  double free. Treat it as a lead to investigate (cross-check with `--asan`), not a verdict;
+  the reported size may be stale for the same reason.
+- **Requires `-o`.** The oracle links a C diagnostic object, so it cannot be used with `--run`
+  or with IR-only output; the compiler errors out if `-o` is missing.
+- **Self-auditing programs are left untouched.** If the program already calls
+  `HeapAudit.enable()` or `HeapAudit.reportLeaks()` itself, no instrumentation is injected, so
+  its own (typically narrower, quiescent-point) audit assertions are not perturbed.
+
+Only allocations made *after* `enable()` that flow through `operator new`/`operator delete`
+are tracked; see `core/diagnostic/heap_audit.cb` for the oracle's honest limits.
 
 ## Symbol lookup (`--symbol`)
 

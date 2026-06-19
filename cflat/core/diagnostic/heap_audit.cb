@@ -4,11 +4,12 @@
 // __alloc_audit_hook / __free_audit_hook (declared in memory.cb, alongside the
 // analogous __fuzz_hook / __try_owner_dealloc hooks, so they are cross-file visible
 // to operator new/delete). From then on operator new records every allocation live
-// (with its size) and operator delete checks every free against that table: a free of
-// an already-freed pointer is reported as a DOUBLE FREE - with the pointer and its
-// size - and stops the process at the bad free itself, deterministically, regardless
-// of timing or which thread does it. Size discriminates the large channel ring buffer
-// (~2MB) from small ctx/handle allocations.
+// (with its size) and operator delete checks every free against that table. Reports
+// are advisory / report-only (they never abort): a still-live allocation at the end is
+// a LEAK, and a free of an already-freed pointer is a DOUBLE FREE. LEAK reports are
+// reliable; DOUBLE FREE reports are a heuristic - raw malloc/free in core code shares
+// the heap with operator new/delete, so heap reuse can yield a false DOUBLE FREE.
+// Confirm any double-free with --asan, the deterministic oracle for that.
 //
 // The table, the lock, and the failure report live in the sibling C file
 // (diagnostic/heap_audit.c), imported below so it is compiled by clang-cl and merged
@@ -38,7 +39,10 @@ namespace HeapAudit {
     void enable() {
         __alloc_audit_hook = cflat_heap_audit_alloc;
         __free_audit_hook  = cflat_heap_audit_free;
-        printf("[heap_audit] enabled\n");
+        // Leak reports are reliable; DOUBLE FREE reports are advisory only - raw
+        // malloc/free in core code shares the heap with operator new/delete, so heap
+        // reuse can produce a false DOUBLE FREE. Confirm any with --asan.
+        printf("[heap_audit] enabled (leaks reliable; DOUBLE FREE advisory - confirm with --asan)\n");
     }
 
     // Scan the audit table for allocations still live (operator new with no matching

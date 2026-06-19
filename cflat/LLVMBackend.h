@@ -924,6 +924,10 @@ private:
     // Off by default; when off, codegen/linking is byte-for-byte identical (no overhead).
     bool asan_ = false;
 
+    // --heap-audit: when set, force-import diagnostic/heap_audit.cb and instrument main
+    // with HeapAudit.enable()/reportLeaks() (see InjectHeapAuditIntoMain). Report-only.
+    bool heapAudit_ = false;
+
     // --run: jitExitCode_ carries the program's exit status (Compile returns compile success only).
     // runArgs_ are forwarded as argv[1..] to main(int argc, char** argv); empty for main().
     bool runMode_ = false;
@@ -4591,6 +4595,74 @@ private:
             }
         }
         return false;
+    }
+
+    // --heap-audit instrumentation. Insert HeapAudit.enable() as main's first action and
+    // HeapAudit.reportLeaks() immediately before every return (after the function's scope
+    // destructors have run), so any program is audited for leaks/double-frees without source
+    // edits. Report-only: reportLeaks prints still-live allocations to stderr but does not
+    // alter the exit code; a double free is likewise printed (advisory) without aborting,
+    // since a FREED-slot free can be a reuse artifact of a pre-enable() allocation.
+    // enable() is idempotent, so a program that already audits itself just emits a duplicate
+    // report. No-op when this module has no user main (e.g. a C-only or library compile).
+    void InjectHeapAuditIntoMain()
+    {
+        llvm::Function* mainFn = module->getFunction("main");
+        if (!mainFn || mainFn->isDeclaration())
+            return;
+
+        llvm::Function* enableFn = module->getFunction("_HeapAudit.enable_void__");
+        llvm::Function* reportFn = module->getFunction("_HeapAudit.reportLeaks_u64__");
+        if (!enableFn || !reportFn)
+        {
+            LogError("--heap-audit: HeapAudit.enable/reportLeaks were not linked - "
+                     "diagnostic/heap_audit.cb failed to import; cannot instrument main.");
+            return;
+        }
+
+        // Leave a self-auditing program untouched: if it already calls enable()/reportLeaks()
+        // it audits at its own quiescent points, and injecting an earlier enable() would widen
+        // the tracked set and break its own reportLeaks()==0 assertions. The flag is for
+        // programs that do not instrument themselves.
+        if (enableFn->getNumUses() > 0 || reportFn->getNumUses() > 0)
+        {
+            if (verbose)
+                std::cout << "[verbose] --heap-audit: program already audits itself; "
+                             "leaving main uninstrumented\n";
+            return;
+        }
+
+        // Under -g every call in a function with debug info needs a !dbg location or the
+        // verifier rejects it. Reuse a nearby instruction's location; fall back to the
+        // subprogram scope (the prologue) when none is available. Empty when not -g.
+        llvm::DISubprogram* sp = mainFn->getSubprogram();
+        auto debugLocNear = [&](llvm::Instruction* anchor) -> llvm::DebugLoc {
+            if (anchor && anchor->getDebugLoc())
+                return anchor->getDebugLoc();
+            if (sp)
+                return llvm::DILocation::get(*context, sp->getLine(), 0, sp);
+            return llvm::DebugLoc();
+        };
+
+        // enable() before the first real instruction of the entry block.
+        llvm::BasicBlock& entry = mainFn->getEntryBlock();
+        llvm::BasicBlock::iterator entryIp = entry.getFirstInsertionPt();
+        {
+            llvm::IRBuilder<> b(&entry, entryIp);
+            b.SetCurrentDebugLocation(debugLocNear(entryIp != entry.end() ? &*entryIp : nullptr));
+            b.CreateCall(enableFn);
+        }
+
+        // reportLeaks() right before each return - the leak count is intentionally ignored
+        // (report-only); reportLeaks itself prints every live allocation to stderr.
+        for (llvm::BasicBlock& bb : *mainFn)
+        {
+            auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb.getTerminator());
+            if (!ret) continue;
+            llvm::IRBuilder<> b(ret);
+            b.SetCurrentDebugLocation(debugLocNear(ret));
+            b.CreateCall(reportFn);
+        }
     }
 
     bool JitRun(int& runExitCode)
@@ -10806,6 +10878,8 @@ public:
     bool IsVerbose() const { return verbose; }
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
     void SetAsan(bool v) { asan_ = v; }
+    // Instrument the program with the HeapAudit leak/double-free oracle without source edits.
+    void SetHeapAudit(bool v) { heapAudit_ = v; }
     void SetRunMode(bool v) { runMode_ = v; }
     void SetRunArgs(std::vector<std::string> a) { runArgs_ = std::move(a); }
     int  GetJitExitCode() const { return jitExitCode_; }

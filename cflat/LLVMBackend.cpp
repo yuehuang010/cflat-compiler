@@ -435,6 +435,21 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
+    // --heap-audit: pull in the leak/double-free oracle so its hooks and C backing object
+    // are linked, then InjectHeapAuditIntoMain() wires it into main below. Done here (not via
+    // a source import) so any program is auditable without editing it. This is a normal
+    // on-demand import - parsed even when the core bitcode cache above was hot.
+    if (heapAudit_ && !runtimeDir.empty())
+    {
+        auto auditPath = std::filesystem::path(runtimeDir) / "core" / "diagnostic" / "heap_audit.cb";
+        if (verbose) std::cout << std::format("[verbose] --heap-audit: importing {}\n", auditPath.string());
+        if (std::filesystem::exists(auditPath))
+            CompileImportedFile(auditPath.string(), "heap_audit.cb");
+        else
+            LogError("--heap-audit: diagnostic/heap_audit.cb not found next to the compiler; "
+                     "cannot instrument.");
+    }
+
     {
         if (verbose) std::cout << std::format("[verbose] parsing {}\n", filename);
         std::ifstream stream;
@@ -631,6 +646,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << "[verbose] finalizing debug info\n";
         FinalizeDebugInfo();
     }
+
+    // --heap-audit: now that all of main's returns are emitted, instrument it with the
+    // enable()/reportLeaks() oracle calls. Must run before VerifyModule.
+    if (heapAudit_)
+        InjectHeapAuditIntoMain();
 
     // validate that the stack is empty.
     if (stackNamedVariable.size() > 0)

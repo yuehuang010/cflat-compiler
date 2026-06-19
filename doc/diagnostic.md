@@ -18,6 +18,7 @@ and the fuzzer/heap-audit libraries when a bug is real but too rare to reproduce
 | `--asan` | compile flag | use-after-free, heap/stack overflow, double-free (dynamic) |
 | `-g` crash backtrace | compile flag | symbolized stack on any unhandled exception |
 | `--xthread-scan N` | compile flag | struct fields shared across a thread spawn without atomic/lock (static) |
+| `--heap-audit` | compile flag | applies `diagnostic/heap_audit.cb` with no source edits (leaks and double-free both report-only) |
 | `diagnostic/thread_fuzz.cb` | core library | timing-dependent races (perturbs scheduling, replayable by seed) |
 | `diagnostic/heap_audit.cb` | core library | double-free / free-of-unknown, reported at the bad free |
 
@@ -139,10 +140,13 @@ planned v2 (PCT) extension.
 
 Records every allocation that flows through `operator new` (with its size) and
 checks every `operator delete` against that table. A free of an already-freed
-pointer is reported as a DOUBLE FREE - with the pointer and its size - and the
-process is stopped at the bad free itself, deterministically, regardless of timing
-or which thread did it. The size discriminates a large allocation (e.g. a channel
-ring buffer) from a small handle/context allocation.
+pointer is reported as a DOUBLE FREE - with the pointer and its size - to stderr,
+regardless of timing or which thread did it. The report is **advisory and
+non-fatal**: it does not abort the process. A freed-slot free is not always a true
+double-free, because allocations made before `enable()` are untracked and CRT
+address reuse can make an untracked free land on a stale freed slot (so the size in
+the report may be stale too). Use it as a lead - cross-check a flagged pointer with
+`--asan`, which proves a real double-free/UAF deterministically.
 
 ```cflat
 import "diagnostic/heap_audit.cb";
@@ -150,6 +154,14 @@ import "diagnostic/heap_audit.cb";
 // Call once at startup, before spawning threads.
 HeapAudit.enable();
 ```
+
+To audit a program **without editing it**, pass `--heap-audit` (requires `-o`): the
+compiler auto-imports this module, calls `enable()` at the top of `main`, and reports
+still-live allocations before every `return`. There, both leaks and double-free reports are
+report-only (printed, exit code unchanged); a program that already calls `enable()` itself is
+left uninstrumented. See [`doc/CLI.md`](CLI.md#heap-audit) for the flag's full behavior. Call
+`reportLeaks()` by hand instead when you need the live count at a specific quiescent point
+rather than at process exit.
 
 The table, lock, and failure report live in the sibling `diagnostic/heap_audit.c`
 (merged in by `lld-link`, so building requires `-o`); output goes through Win32

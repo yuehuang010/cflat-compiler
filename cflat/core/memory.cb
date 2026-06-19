@@ -59,15 +59,20 @@ void operator delete(void* ptr)
 // Pointers from this overload MUST be freed via __delete_aligned.
 void* operator new(i64 size, i64 align)
 {
+    void* ptr = nullptr;
     if (__active_allocator != nullptr)
-        return __active_allocator.alloc_aligned(size, align);
-    return _aligned_malloc((win_size)size, (win_size)align);
+        ptr = __active_allocator.alloc_aligned(size, align);
+    else
+        ptr = _aligned_malloc((win_size)size, (win_size)align);
+    if (__alloc_audit_hook != nullptr) { __alloc_audit_hook(ptr, (u64)size); }
+    return ptr;
 }
 
 // Companion free for over-aligned allocations made via operator new(size, align).
 void __delete_aligned(void* ptr)
 {
     if (ptr == nullptr) return;
+    if (__free_audit_hook != nullptr) { __free_audit_hook(ptr); }
     if (__active_allocator != nullptr)
     {
         __active_allocator.dealloc_aligned(ptr);
