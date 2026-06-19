@@ -2955,6 +2955,13 @@ bool testFieldInit()
 
 struct FieldInitPacket { char data[64]; int length = 0; };
 
+// Type-first inline array field (u8[8]) - distinct from the C-style suffix form
+// above. The size lives on the declaration specifier, not the declarator; the
+// field-decl path used to drop it, collapsing the array and undersizing the
+// struct (sizeof was 8 instead of 16, element writes past [0] hit garbage).
+struct InlineArrField { u32 a = 0; u8[8] b = default; };
+struct InlineArr2D     { int[2][3] grid = default; };
+
 bool testStructInlineArrays()
 {
     bool result = true;
@@ -2974,6 +2981,21 @@ bool testStructInlineArrays()
     FieldInitPoint[3] pts;
     pts[0].x = 1; pts[1].x = 2; pts[2].x = 3;
     result &= Test("struct_arr_sum", pts[0].x + pts[1].x + pts[2].x, 6);
+
+    // Type-first array field: full 8 bytes inline (u32 + 8*u8 = 12, align 4).
+    result &= Test("typefirst_arr_sizeof", (int)sizeof(InlineArrField), 12);
+    InlineArrField iaf = default;
+    iaf.b[0] = (u8)11; iaf.b[7] = (u8)77;
+    result &= Test("typefirst_arr_elem0", (int)iaf.b[0], 11);
+    result &= Test("typefirst_arr_elem7", (int)iaf.b[7], 77);
+    result &= Test("typefirst_arr_default_mid", (int)iaf.b[3], 0);
+
+    // Multi-dimensional type-first array field.
+    result &= Test("typefirst_2d_sizeof", (int)sizeof(InlineArr2D), 24);
+    InlineArr2D g2 = default;
+    g2.grid[0][0] = 5; g2.grid[1][2] = 9;
+    result &= Test("typefirst_2d_elem00", g2.grid[0][0], 5);
+    result &= Test("typefirst_2d_elem12", g2.grid[1][2], 9);
 
     return result;
 }

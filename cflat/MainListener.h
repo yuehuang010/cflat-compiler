@@ -4872,7 +4872,11 @@ public:
 
                     auto* directDecl = declarator->directDeclarator();
                     std::string name = getDirectDeclName(directDecl);
+                    // Fixed-size array field - two forms, mirroring local declarations:
+                    //   C-style:    T buf[N]   - size on the directDeclarator
+                    //   Type-first: T[N] buf   - size on the declarationSpecifier (typeAndValue.ArraySize)
                     typeAndValue.ConstArraySize = 0;  // reset per-declarator
+                    typeAndValue.ConstInnerDimensions.clear();
                     if (directDecl->assignmentExpression())
                     {
                         // C-style fixed-size array field: char buf[N]
@@ -4881,6 +4885,30 @@ public:
                             typeAndValue.ConstArraySize = ci->getZExtValue();
                         else
                             LogErrorContext(directDecl, "array size must be a compile-time constant");
+                    }
+                    else if (typeAndValue.ArraySize != nullptr)
+                    {
+                        // Type-first fixed-size array field: u8[N] data (optionally multi-dim u8[N][M]).
+                        auto* sizeVal = ParseAssignmentExpression(typeAndValue.ArraySize);
+                        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
+                            typeAndValue.ConstArraySize = ci->getZExtValue();
+                        else
+                            LogErrorContext(directDecl, "array size must be a compile-time constant");
+                        for (auto* dimExpr : typeAndValue.ExtraArrayDims)
+                        {
+                            auto* dimVal = ParseAssignmentExpression(dimExpr);
+                            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(dimVal))
+                                typeAndValue.ConstInnerDimensions.push_back(ci->getZExtValue());
+                            else
+                                LogErrorContext(dimExpr, "array dimension must be a compile-time constant");
+                        }
+                    }
+                    else if (typeAndValue.AliasArraySize > 0)
+                    {
+                        // Size came from an array alias (using Bytes = u8[8]); shared by every declarator.
+                        typeAndValue.ConstArraySize = typeAndValue.AliasArraySize;
+                        if (!typeAndValue.AliasInnerDims.empty())
+                            typeAndValue.ConstInnerDimensions = typeAndValue.AliasInnerDims;
                     }
                     typeAndValue.VariableName = name;
                     typeAndValue.Initializer = initializer;

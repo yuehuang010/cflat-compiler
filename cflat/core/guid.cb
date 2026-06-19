@@ -1,0 +1,133 @@
+// guid.cb - GUID: a 128-bit globally unique identifier (Windows GUID / RFC 4122 UUID).
+//
+// The binary layout matches the Windows GUID / COM IID exactly (16 bytes):
+// Data1..Data3 are stored little-endian, Data4 is a raw 8-byte sequence in text
+// order. A GUID* can therefore be passed straight to COM APIs that take a
+// REFIID/REFGUID (CoCreateInstance, IUnknown::QueryInterface, ...).
+//
+// Usage:
+//   import "guid.cb";
+//
+//   // Parse the canonical text form (braces and case are optional):
+//   GUID iid = GUID.parse("00000000-0000-0000-C000-000000000046"); // IID_IUnknown
+//
+//   // Or build from the DEFINE_GUID-style components:
+//   GUID g = GUID.make((u32)0x00000000, (u16)0x0000, (u16)0x0000,
+//                      (u8)0xC0, (u8)0x00, (u8)0x00, (u8)0x00,
+//                      (u8)0x00, (u8)0x00, (u8)0x00, (u8)0x46);
+//
+//   if (a == b) { ... }
+//   string s = g.toString();   // "00000000-0000-0000-c000-000000000046"
+
+import "string.cb";
+
+// Map one hex character to its 0-15 value, or -1 if it is not a hex digit.
+i32 _guidNibble(char c)
+{
+    if (c >= '0' && c <= '9') return (i32)(c - '0');
+    if (c >= 'a' && c <= 'f') return (i32)(c - 'a') + 10;
+    if (c >= 'A' && c <= 'F') return (i32)(c - 'A') + 10;
+    return -1;
+}
+
+struct GUID
+{
+    u32   Data1 = 0;
+    u16   Data2 = 0;
+    u16   Data3 = 0;
+    u8[8] Data4 = default;
+
+    // Build from canonical components - the argument order matches the Win32
+    // DEFINE_GUID macro: {Data1, Data2, Data3, {b0, b1, b2, b3, b4, b5, b6, b7}}.
+    static GUID make(u32 d1, u16 d2, u16 d3,
+                     u8 c0, u8 c1, u8 c2, u8 c3, u8 c4, u8 c5, u8 c6, u8 c7)
+    {
+        GUID g = default;
+        g.Data1 = d1;
+        g.Data2 = d2;
+        g.Data3 = d3;
+        g.Data4[0] = c0; g.Data4[1] = c1; g.Data4[2] = c2; g.Data4[3] = c3;
+        g.Data4[4] = c4; g.Data4[5] = c5; g.Data4[6] = c6; g.Data4[7] = c7;
+        return g;
+    }
+
+    // Parse the canonical "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" text form. Any
+    // non-hex characters (dashes, surrounding braces, spaces) are skipped, so the
+    // braced registry form "{...}" parses too. Stops after 32 hex digits; a string
+    // with fewer leaves the remaining bytes zero.
+    static GUID parse(string s)
+    {
+        GUID g = default;
+        char* p = s.data();
+        i32 len = s.length();
+
+        // Accumulate the 32 textual nibbles into 16 raw bytes (text byte order).
+        u8[16] bytes = default;
+        i32 count = 0;
+        for (i32 i = 0; i < len && count < 32; i++)
+        {
+            i32 v = _guidNibble(p[i]);
+            if (v < 0) continue;
+            i32 bi = count / 2;
+            if ((count & 1) == 0)
+                bytes[bi] = (u8)(v << 4);
+            else
+                bytes[bi] = (u8)(bytes[bi] | v);
+            count++;
+        }
+
+        // Reassemble the mixed-endian fields from the textual bytes.
+        g.Data1 = ((u32)bytes[0] << 24) | ((u32)bytes[1] << 16) | ((u32)bytes[2] << 8) | (u32)bytes[3];
+        g.Data2 = (u16)(((u32)bytes[4] << 8) | (u32)bytes[5]);
+        g.Data3 = (u16)(((u32)bytes[6] << 8) | (u32)bytes[7]);
+        for (i32 j = 0; j < 8; j++)
+            g.Data4[j] = bytes[8 + j];
+        return g;
+    }
+
+    bool operator==(GUID other)
+    {
+        if (Data1 != other.Data1) return false;
+        if (Data2 != other.Data2) return false;
+        if (Data3 != other.Data3) return false;
+        for (i32 i = 0; i < 8; i++)
+            if (Data4[i] != other.Data4[i]) return false;
+        return true;
+    }
+
+    // True for the all-zero GUID (GUID_NULL).
+    bool isZero()
+    {
+        if (Data1 != 0 || Data2 != 0 || Data3 != 0) return false;
+        for (i32 i = 0; i < 8; i++)
+            if (Data4[i] != 0) return false;
+        return true;
+    }
+
+    // Canonical lowercase text form, no braces: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
+    move string toString()
+    {
+        // Flatten to the 16 textual bytes, then emit with dashes at 8-4-4-4-12.
+        u8[16] b = default;
+        b[0] = (u8)(Data1 >> 24); b[1] = (u8)(Data1 >> 16);
+        b[2] = (u8)(Data1 >> 8);  b[3] = (u8)Data1;
+        b[4] = (u8)(Data2 >> 8);  b[5] = (u8)Data2;
+        b[6] = (u8)(Data3 >> 8);  b[7] = (u8)Data3;
+        for (i32 i = 0; i < 8; i++) b[8 + i] = Data4[i];
+
+        char* hex = "0123456789abcdef";
+        char[37] out = default;   // 36 chars + NUL
+        i32 pos = 0;
+        for (i32 i = 0; i < 16; i++)
+        {
+            if (i == 4 || i == 6 || i == 8 || i == 10)
+                out[pos++] = '-';
+            out[pos++] = hex[(b[i] >> 4) & 0xF];
+            out[pos++] = hex[b[i] & 0xF];
+        }
+        out[pos] = (char)0;
+
+        string borrowed = (string)&out[0];
+        return borrowed.copy();
+    }
+};
