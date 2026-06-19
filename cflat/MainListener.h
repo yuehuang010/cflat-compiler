@@ -15630,6 +15630,17 @@ public:
         auto* allocFatPtrSlot = compiler->builder->CreateAlloca(fatTy, nullptr, "alloc_fat_slot");
         compiler->builder->CreateStore(allocFatPtr, allocFatPtrSlot);
         compiler->CallInterfaceMethod(allocFatPtrSlot, "IAllocator", "cleanup", {});
+        // The allocator object came from operator new (audited), but we free it via raw
+        // free() below (deterministic CRT free, independent of the thread-local active
+        // allocator). Notify the heap-audit oracle first so it does not flag the block as
+        // a false-positive LEAK; no-op unless HeapAudit is enabled.
+        if (compiler->GetFunction("__audit_note_free"))
+        {
+            LLVMBackend::NamedVariable noteArg;
+            noteArg.Primary  = allocDataPtr;
+            noteArg.BaseType = voidPtrType;
+            compiler->CreateOverloadedFunctionCall("__audit_note_free", { noteArg });
+        }
         // free the underlying memory (data ptr is already in allocDataPtr)
         compiler->builder->CreateCall(freeFn->getFunctionType(), freeFn, {allocDataPtr});
         compiler->builder->CreateStore(llvm::Constant::getNullValue(fatTy), dtor_allocFieldGEP);

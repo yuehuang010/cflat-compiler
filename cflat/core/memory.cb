@@ -54,6 +54,16 @@ void operator delete(void* ptr)
     free(ptr);
 }
 
+// Tell the heap-audit oracle that `p` is about to be freed through a raw path that
+// bypasses operator delete (e.g. the compiler's program-allocator teardown frees an
+// operator-new'd allocator object with raw free()). Without this the block stays
+// "live" in the audit table and reports as a false-positive LEAK. No-op unless
+// HeapAudit is enabled; does NOT free - the caller still performs the real free.
+void __audit_note_free(void* p)
+{
+    if (__free_audit_hook != nullptr) { __free_audit_hook(p); }
+}
+
 // Over-aligned allocation. Routes to the active allocator's alloc_aligned, or
 // falls back to _aligned_malloc. Used when alignof(T) exceeds the default threshold.
 // Pointers from this overload MUST be freed via __delete_aligned.
