@@ -5363,7 +5363,10 @@ public:
                                             compiler->builder->CreateStore(
                                                 llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
                                             if (!rightNV.CallerName.empty())
+                                            {
                                                 compiler->MarkVariableMoved(rightNV.CallerName);
+                                                compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
+                                            }
                                         }
                                     }
                                 }
@@ -6805,7 +6808,14 @@ public:
                         if (!rightNV.FieldName.empty())
                             compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);
                         else
+                        {
                             compiler->MarkVariableMoved(rightNV.CallerName);
+                            // Boxing into an interface ('live = sc') transfers ownership to a handle
+                            // that is not auto-destructed; flag the source so a later 'delete sc' is
+                            // rejected (it would be a no-op and leak).
+                            if (namedVar.TypeAndValue.IsInterface)
+                                compiler->MarkVariableMovedIntoInterface(rightNV.CallerName);
+                        }
                     }
                 }
             }
@@ -9946,6 +9956,22 @@ public:
             {
                 typeName  = castTypeName;
                 elemIsPtr = castElemPtr;
+            }
+
+            // Error: deleting a pointer whose ownership was boxed into an interface ('IFace x = ptr').
+            // The boxing transferred ownership to the interface and nulled the source, so this
+            // 'delete ptr' frees nothing; and because interface locals are not auto-destructed, the
+            // object leaks unless the interface itself is deleted. Scoped to the interface-box case
+            // (MovedIntoInterface) - a plain move into a 'move' param or a view alias is NOT flagged,
+            // since deleting the source there is either correct or a harmless no-op.
+            if (!sawCast && namedVar.MovedIntoInterface)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - its ownership was boxed into an interface, so this delete "
+                    "frees nothing and the object leaks (interface locals are not auto-destructed). "
+                    "Delete through the interface instead.",
+                    namedVar.CallerName.empty() ? "<expr>" : namedVar.CallerName));
+                return {};
             }
 
             // Error: deleting a borrowed (non-move) parameter directly. If the caller owns the

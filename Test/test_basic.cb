@@ -3080,7 +3080,10 @@ bool testInterfaceNullCheck()
     result &= Test("iface_nonnull_ne", live != nullptr,  true);
     result &= Test("iface_nonnull_eq", live == nullptr,  false);
 
-    // Reassign to nullptr clears the fat-ptr
+    // Reassign to nullptr clears the fat-ptr. 'live' now owns the boxed object (boxing a heap
+    // pointer into an interface moves ownership; interface locals are not auto-destructed), so
+    // delete through 'live' before clearing it - 'delete sc' after the move is a no-op and leaks.
+    delete live;
     live = nullptr;
     result &= Test("iface_reassign_null", live == nullptr, true);
 
@@ -3089,7 +3092,6 @@ bool testInterfaceNullCheck()
     result &= Test("iface_param_null",    checkIfaceNull(nullIface),    true);
     result &= Test("iface_param_nonnull", checkIfaceNotNull(nullIface), false);
 
-    delete sc;
     return result;
 }
 

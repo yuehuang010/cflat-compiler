@@ -531,6 +531,7 @@ public:
         bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
+        bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
         std::set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
@@ -4477,6 +4478,8 @@ private:
         {
             // DbgHelp for the in-process crash handler. Gated on crashHandlerLinked so a failed
             // handler compile doesn't /INCLUDE a symbol that was never emitted.
+            // (heap_audit.c pulls in dbghelp.lib itself via #pragma comment(lib) so its leak-site
+            // symbolization works whether or not the crash handler is linked.)
             linkArgStrs.push_back("dbghelp.lib");
             // Force-retain the crash handler's .CRT$XCU initializer - lld-link's /OPT:REF would
             // garbage-collect it since it has no external references. x86 uses a leading underscore.
@@ -9832,6 +9835,22 @@ public:
                 { it->second.IsMoved = true; return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
                 { it->second.IsMoved = true; return; }
+        }
+    }
+
+    // Mark a local whose ownership was boxed into an interface ('IFace x = ptr'). Distinct from
+    // the generic moved flag: deleting such a source is a no-op that leaks (the interface owns the
+    // object now and interface locals are not auto-destructed), so 'delete ptr' is rejected with a
+    // targeted message. Plain moves (into 'move' params, view aliases) do NOT set this.
+    void MarkVariableMovedIntoInterface(const std::string& name)
+    {
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                { it->second.MovedIntoInterface = true; return; }
+            if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
+                { it->second.MovedIntoInterface = true; return; }
         }
     }
 

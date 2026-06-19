@@ -163,6 +163,12 @@ left uninstrumented. See [`doc/CLI.md`](CLI.md#heap-audit) for the flag's full b
 `reportLeaks()` by hand instead when you need the live count at a specific quiescent point
 rather than at process exit.
 
+Each `LEAK` line is followed by the **allocation-site backtrace** - the call stack captured
+when that block was allocated, symbolized with DbgHelp the same way the `-g` crash handler is.
+Compile with `-g` to get cflat function names and `file:line` for each frame; without it the
+frames still print as `module+address`. The first one or two frames are the allocator plumbing
+(`operator new` and the audit hook); the first frame in your own code is the leaking `new`.
+
 The table, lock, and failure report live in the sibling `diagnostic/heap_audit.c`
 (merged in by `lld-link`, so building requires `-o`); output goes through Win32
 `WriteFile` for the same link-collision reason as `crashdump.c`. Honest limit:

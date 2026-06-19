@@ -101,9 +101,9 @@ bool testVTableDispatch()
     // Heap-allocated - interface holds pointer to heap object
     Circle* hc = new Circle();
     hc.r = 6;
-    IShape shc = hc;
+    IShape shc = hc;            // boxing moves ownership of hc into shc
     result &= Test("vtable_heap_circle_area", shc.area(), 108);  // 6*6*3
-    delete hc;
+    delete shc;                 // delete through the owning interface (hc is moved-from)
 
     return result;
 }

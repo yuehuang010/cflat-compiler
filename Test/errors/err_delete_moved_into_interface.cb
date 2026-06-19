@@ -1,0 +1,27 @@
+// Boxing an owning heap pointer into an interface ('IShape s = ptr') moves ownership into the
+// interface handle. The source pointer is nulled, so a later 'delete ptr' frees nothing and the
+// object leaks (interface locals are not auto-destructed). The compiler rejects the dangling
+// delete and directs the caller to delete through the interface instead.
+
+interface IShape { int area(); };
+
+class Circle : IShape
+{
+    int r = 0;
+    int area() { return r * r * 3; }
+};
+
+expect_error("its ownership was boxed into an interface") {
+    void leakIt()
+    {
+        Circle* c = new Circle();
+        c.r = 6;
+        IShape s = c;   // ownership of c moves into s
+        delete c;       // no-op on the moved-from pointer -> rejected (delete s instead)
+    }
+}
+
+extern int main()
+{
+    return 0;
+}
