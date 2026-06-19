@@ -326,7 +326,19 @@ int main(int argc, char* argv[])
 
     if (args.hasFlag("init"))
     {
+        // --init exits before the main -ftime-trace wiring below, so init/write the
+        // profiler here too. Captures the CoreCacheJsonBuild/Write scopes in SaveCoreBitcode.
+        bool ft = args.hasFlag("ftime-trace");
+        if (ft) llvm::timeTraceProfilerInitialize(500, "cflat");
         bool ok = LLVMBackend::RunInit(runtimeDir, args.hasFlag("verbose"));
+        if (ft)
+        {
+            if (auto err = llvm::timeTraceProfilerWrite("init.time-trace.json", ""))
+                llvm::consumeError(std::move(err));
+            else
+                std::cout << "Time trace written to init.time-trace.json\n";
+            llvm::timeTraceProfilerCleanup();
+        }
         return ok ? 0 : 1;
     }
 

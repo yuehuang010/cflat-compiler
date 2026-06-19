@@ -2908,14 +2908,18 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
 
     // Write LLVM bitcode.
     {
+        llvm::TimeTraceScope bcScope("CoreCacheBitcodeWrite", prefix);
         std::error_code ec;
         llvm::raw_fd_ostream bcOut(prefix + ".bc", ec);
         if (ec) return false;
         llvm::WriteBitcodeToFile(*module, bcOut);
     }
 
-    // Build metadata JSON.
+    // Build metadata JSON. Scope the serialization walk separately from the file
+    // write below so -ftime-trace mirrors the read-side split (deserialize vs parse).
     llvm::json::Object root;
+    {
+        llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
     root["version"]   = 1;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
@@ -3131,9 +3135,11 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         for (auto& s : gts.instantiatedGenericFunctions) arr.push_back(s);
         root["instantiated_generic_functions"] = std::move(arr);
     }
+    } // end CoreCacheJsonBuild scope
 
     // Write JSON.
     {
+        llvm::TimeTraceScope jsonScope("CoreCacheJsonWrite", prefix);
         std::error_code ec;
         llvm::raw_fd_ostream jsonOut(prefix + ".meta.json", ec);
         if (ec) return false;
@@ -3151,10 +3157,14 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (!std::filesystem::exists(bcPath) || !std::filesystem::exists(jsonPath))
         return false;
 
-    // Load and validate JSON metadata.
+    // Load and validate JSON metadata. Scope the read+parse separately from the
+    // bitcode parse and the deserialization walk so -ftime-trace shows each slice.
     auto jsonBuf = llvm::MemoryBuffer::getFile(jsonPath);
     if (!jsonBuf) return false;
-    auto parsed = llvm::json::parse((*jsonBuf)->getBuffer());
+    auto parsed = [&] {
+        llvm::TimeTraceScope jsonScope("CoreCacheJsonParse", jsonPath);
+        return llvm::json::parse((*jsonBuf)->getBuffer());
+    }();
     if (!parsed) return false;
     auto* root = parsed->getAsObject();
     if (!root) return false;
@@ -3172,7 +3182,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto freshCtx = std::make_unique<llvm::LLVMContext>();
     auto bcBuf = llvm::MemoryBuffer::getFile(bcPath);
     if (!bcBuf) return false;
-    auto parsedMod = llvm::parseBitcodeFile((*bcBuf)->getMemBufferRef(), *freshCtx);
+    auto parsedMod = [&] {
+        llvm::TimeTraceScope bcScope("CoreCacheBitcodeParse", bcPath);
+        return llvm::parseBitcodeFile((*bcBuf)->getMemBufferRef(), *freshCtx);
+    }();
     if (!parsedMod)
     {
         llvm::consumeError(parsedMod.takeError());
@@ -3201,11 +3214,14 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
     // verifies the functions are present in the bitcode.
 
-    // Restore symbol tables from JSON.
+    // Restore symbol tables from JSON. Scope covers the whole deserialization walk
+    // (lives until the function returns) so -ftime-trace separates it from the parses.
+    llvm::TimeTraceScope desScope("CoreCacheDeserialize", jsonPath);
 
     // importedFiles - paths may be relative to runtimeDir (new format) or
     // absolute (old format). Resolve relative paths against current runtimeDir
     // so the dedup check works even when Debug and Release builds share a cache.
+    { llvm::TimeTraceScope s("CoreDes:Metadata", jsonPath);
     if (auto* arr = root->getArray("imported_files"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString())
@@ -3233,7 +3249,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
         for (auto& kv : *obj)
             if (auto v = kv.second.getAsString()) enumBackingTypes[kv.first.str()] = v->str();
 
+    } // end CoreDes:Metadata
+
     // functionTable
+    { llvm::TimeTraceScope s("CoreDes:Functions", jsonPath);
     if (auto* arr = root->getArray("functions"))
         for (auto& elem : *arr)
         {
@@ -3260,7 +3279,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             functionTable[key->str()].push_back(std::move(sym));
         }
 
+    } // end CoreDes:Functions
+
     // dataStructures
+    { llvm::TimeTraceScope s("CoreDes:Structs", jsonPath);
     if (auto* arr = root->getArray("structs"))
         for (auto& elem : *arr)
         {
@@ -3300,7 +3322,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             dataStructures[sname] = std::move(sd);
         }
 
+    } // end CoreDes:Structs
+
     // interfaceTable + interfaceParents
+    { llvm::TimeTraceScope s("CoreDes:Interfaces", jsonPath);
     if (auto* arr = root->getArray("interfaces"))
         for (auto& elem : *arr)
         {
@@ -3323,7 +3348,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             interfaceTable[iname] = std::move(methods);
         }
 
+    } // end CoreDes:Interfaces
+
     // globalNamedVariable + globalVariableTypes
+    { llvm::TimeTraceScope s("CoreDes:Globals", jsonPath);
     if (auto* arr = root->getArray("globals"))
         for (auto& elem : *arr)
         {
@@ -3339,7 +3367,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 globalVariableTypes[gname->str()] = DeserializeTav(*to);
         }
 
+    } // end CoreDes:Globals
+
     // Load generic templates: re-parse source text via SyntheticParseState.
+    // This re-runs the ANTLR lexer+parser per template - not JSON work; scope it apart.
+    { llvm::TimeTraceScope s("CoreDes:GenericReparse", jsonPath);
     auto loadGenericTemplates = [&](const char* key,
         auto& templateMap, auto& typeParamsMap, auto& constraintsMap, auto& packIndexMap,
         auto extractCtx)
@@ -3430,7 +3462,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             return nullptr;
         });
 
+    } // end CoreDes:GenericReparse
+
     // Restore pre-instantiated generic sets.
+    { llvm::TimeTraceScope s("CoreDes:Instantiated", jsonPath);
     if (auto* arr = root->getArray("instantiated_generics"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString()) gts.instantiatedGenerics.insert(v->str());
@@ -3440,6 +3475,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (auto* arr = root->getArray("instantiated_generic_functions"))
         for (auto& elem : *arr)
             if (auto v = elem.getAsString()) gts.instantiatedGenericFunctions.insert(v->str());
+    } // end CoreDes:Instantiated
 
     // Mark lazy-registered functions as done if they were deserialized from the cache.
     // This prevents EnsureStrConcatRegistered / EnsureStringDtorRegistered from creating
