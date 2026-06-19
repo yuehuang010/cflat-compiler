@@ -2652,6 +2652,11 @@ private:
     static bool SaveLinkerPathsToCache(const std::string& arch, const LinkerPaths& paths);
     static LinkerPaths FindLinkerPaths(const std::string& arch, const std::string& runtimeDir);
 
+    // SDK-free system import libs synthesized from the OS-resident DLLs (Phase B/C).
+    static std::string GetSyntheticLibDir(const std::string& arch);
+    static bool SynthesizeSystemImportLibs(const std::string& arch, const std::string& lldLink);
+    static bool SynthesizeX86SystemImportLibs(const LinkerPaths& paths);
+
     bool CompileCFile(const std::string& cSourcePath, const std::string& programAlias = "")
     {
         // Auto-discover C function signatures so the importing .cb needs no hand-written extern declarations.
@@ -2682,7 +2687,26 @@ private:
             : "--target=x86_64-pc-windows-msvc";
         const std::string foArg = "/Fo" + objPath;
 
-        std::vector<std::string> argStrs = { clangPath, "/c", "/nologo", target, cSourcePath, foArg };
+        // /MD (dynamic UCRT) so this object's CRT /defaultlib directives are the dynamic set,
+        // not clang-cl's /MT default (libcmt) which the freestanding link cannot satisfy. Covers
+        // both user .c interop and the imported diagnostic/heap_audit.c.
+        std::vector<std::string> argStrs = { clangPath, "/c", "/MD", "/nologo", target, cSourcePath, foArg };
+        // cflat's own bundled runtime .c files (e.g. diagnostic/heap_audit.c) are compiled
+        // freestanding like crashdump.c/cflat_builtins.c: /GS- so they emit no __security_check_
+        // cookie reference (that symbol lives in msvcrt.lib, which the freestanding link drops).
+        // User .c interop keeps default /GS - its hardening is the user's call.
+        if (!runtimeDir.empty())
+        {
+            std::error_code pec;
+            auto canonSrc  = std::filesystem::weakly_canonical(cSourcePath, pec);
+            auto canonCore = std::filesystem::weakly_canonical(std::filesystem::path(runtimeDir) / "core", pec);
+            if (!pec)
+            {
+                std::string s = canonSrc.string(), c = canonCore.string();
+                if (s.size() >= c.size() && _strnicmp(s.c_str(), c.c_str(), c.size()) == 0)
+                    argStrs.push_back("/GS-");
+            }
+        }
         if (cOptLevel_ >= 2)      argStrs.push_back("/O2");
         else if (cOptLevel_ == 1) argStrs.push_back("/O1");
         if (cDebugInfo_)          argStrs.push_back("/Z7"); // CodeView in the obj -> PDB via /DEBUG
@@ -2760,8 +2784,12 @@ private:
         const std::string foArg = "/Fo" + objPath;
 
         // /Z7 puts CodeView in the object so the handler's own frames are symbolizable too.
+        // /MD selects the dynamic-CRT /defaultlib directives (suppressed at link time) instead
+        // of clang-cl's /MT default (libcmt), which the freestanding link cannot satisfy. /GS-
+        // so the buffers here emit no __security_check_cookie reference: that symbol comes from
+        // msvcrt.lib, which the freestanding (non-asan) link drops. See Phase A.
         std::vector<std::string> argStrs = {
-            clangPath, "/c", "/Z7", "/nologo", target, srcPath.str().str(), foArg
+            clangPath, "/c", "/Z7", "/MD", "/GS-", "/nologo", target, srcPath.str().str(), foArg
         };
 
         std::vector<llvm::StringRef> args;
@@ -2787,6 +2815,99 @@ private:
 
         cObjectFiles_.push_back(objPath);
         return true;
+    }
+
+    // Compile core/cflat_builtins.c (freestanding memcpy/memset/memcmp) so those
+    // compiler-emitted calls resolve locally instead of importing from VCRUNTIME140.dll.
+    // Must pass -fno-builtin or LLVM's loop-idiom pass rewrites the byte loops back into
+    // memcpy/memset calls, recursing into these very definitions. Returns false (and logs)
+    // on any failure; the caller treats it as best-effort.
+    bool CompileBuiltinsObject(const std::string& arch)
+    {
+        if (runtimeDir.empty())
+        {
+            LogError("cannot locate cflat_builtins.c: runtime directory is unset.");
+            return false;
+        }
+
+        llvm::SmallString<256> srcPath(runtimeDir);
+        llvm::sys::path::append(srcPath, "core", "cflat_builtins.c");
+        if (!llvm::sys::fs::exists(srcPath))
+        {
+            LogError(std::format("builtins source not found: '{}'.", srcPath.str().str()));
+            return false;
+        }
+
+        const std::string clangPath = FindClangCl();
+        if (clangPath.empty())
+        {
+            LogError("clang-cl.exe not found - cannot compile cflat_builtins.c.");
+            return false;
+        }
+
+        llvm::SmallString<256> objFile;
+        if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_builtins", "obj", objFile))
+        {
+            LogError(std::format("could not create temp object for builtins: {}", ec.message()));
+            return false;
+        }
+        std::string objPath = objFile.str().str();
+
+        const std::string target = (arch == "x86")
+            ? "--target=i686-pc-windows-msvc"
+            : "--target=x86_64-pc-windows-msvc";
+        const std::string foArg = "/Fo" + objPath;
+
+        // /MD so the object's CRT /defaultlib directives are the dynamic set (msvcrt/vcruntime/
+        // oldnames - all suppressed at link time) rather than clang-cl's /MT default (libcmt),
+        // which the freestanding link cannot satisfy. /GS- so cflat_start and friends emit no
+        // __security_check_cookie reference; that symbol lives in msvcrt.lib, which this object's
+        // whole point is to let us drop.
+        std::vector<std::string> argStrs = {
+            clangPath, "/c", "/O2", "/MD", "/GS-", "/nologo", "/clang:-fno-builtin",
+            target, srcPath.str().str(), foArg
+        };
+
+        std::vector<llvm::StringRef> args;
+        for (auto& s : argStrs) args.push_back(s);
+
+        if (verbose)
+        {
+            std::cout << std::format("[verbose] compiling builtins: {} -> {}\n", srcPath.str().str(), objPath);
+            std::cout << "[verbose]   clang-cl";
+            for (size_t i = 1; i < argStrs.size(); ++i) std::cout << " " << argStrs[i];
+            std::cout << "\n";
+        }
+
+        std::string clangCompileErr;
+        int rc = llvm::sys::ExecuteAndWait(clangPath, args, std::nullopt, {}, 0, 0, &clangCompileErr);
+        if (rc != 0)
+        {
+            llvm::sys::fs::remove(objPath);
+            LogError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}{}",
+                rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
+            return false;
+        }
+
+        cObjectFiles_.push_back(objPath);
+        return true;
+    }
+
+    // True if the Microsoft Visual C++ runtime (vcruntime140.dll) is present on this system.
+    // Used only to phrase a helpful note for --asan builds, which are the one output kind that
+    // still depends on it. Checks both System32 and SysWOW64 so 32-bit and 64-bit installs both
+    // count; if SystemRoot is somehow unknown we assume installed rather than nag.
+    static bool VcRuntimeInstalled()
+    {
+        char buf[260] = {};
+        size_t len = 0;
+        if (getenv_s(&len, buf, sizeof(buf), "SystemRoot") != 0 || len == 0)
+            return true;
+        std::filesystem::path root(buf);
+        for (const char* sub : { "System32", "SysWOW64" })
+            if (std::filesystem::exists(root / sub / "vcruntime140.dll"))
+                return true;
+        return false;
     }
 
     // Map a (preferably desugared) C type spelling onto a CFlat TypeAndValue.
@@ -4498,6 +4619,23 @@ private:
         // If CompileCrashHandlerObject fails, skip handler link args but still produce the PDB.
         bool crashHandlerLinked = debugInfo && CompileCrashHandlerObject(arch);
 
+        // Keep the stock VC CRT (msvcrt.lib + vcruntime140.dll + mainCRTStartup) when:
+        //   - ASan: its runtime expects the stock CRT and would clash with our mem*; or
+        //   - x86 (win32): freestanding x86 additionally needs the x86 64-bit compiler-runtime
+        //     intrinsics (__alldiv/__aulldiv/__allrem/__aullrem/__allmul/shifts), __tls_array,
+        //     and __fltused - normally from the VC CRT and not available to link as compiler-rt
+        //     here. Until those are ported, x86 stays on the proven stock path. The x86 import
+        //     libs are already synthesized (--init) and the cflat_builtins.c decoration guards
+        //     are in place, so finishing x86 is just that intrinsic set. See Phase D of
+        //     internal/plan/remove-vcruntime-dependency.md.
+        // Otherwise we drop vcruntime entirely: cflat_builtins.c supplies our own CRT entry, the
+        // mem*/str* intrinsics and (on x64) a real __C_specific_handler, so even the `program`
+        // construct's SEH crash isolation (catchpad personality, MainListener.h) works without it.
+        const bool keepVcRuntime = asan_ || arch == "x86";
+
+        if (!keepVcRuntime)
+            CompileBuiltinsObject(arch);
+
         LinkerPaths linkerPaths_;
         {
             llvm::TimeTraceScope pathScope("FindLinkerPaths", exePath);
@@ -4548,9 +4686,44 @@ private:
                 ? "/INCLUDE:_cflat_crash_init_"
                 : "/INCLUDE:cflat_crash_init_");
         }
-        if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
-        if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
-        if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+        // SDK-free path: if --init synthesized the system import libs (from the OS-resident
+        // DLLs) and this is a freestanding x64 build, link against those instead of the Windows
+        // SDK / VS lib directories - so the user needs neither installed. ASan still needs the
+        // VS libs (clang_rt.asan + the stock CRT), so it keeps the SDK paths. /nodefaultlib:
+        // oldnames suppresses the /defaultlib:oldnames directive the clang-cl (/MD) objects emit;
+        // oldnames.lib lives in the VS lib dir we are deliberately not adding, and nothing here
+        // needs its POSIX-name aliases.
+        // x64 only for now: x86 also reaches here as keepVcRuntime (stock path), and finishing
+        // x86 freestanding is gated on the x86 compiler-runtime intrinsics (see keepVcRuntime).
+        std::string syntheticLibDir = GetSyntheticLibDir(arch);
+        const bool useSyntheticLibs = !keepVcRuntime && arch == "x64"
+            && !syntheticLibDir.empty()
+            && std::filesystem::exists(std::filesystem::path(syntheticLibDir) / "ucrt.lib")
+            && std::filesystem::exists(std::filesystem::path(syntheticLibDir) / "kernel32.lib");
+
+        if (useSyntheticLibs)
+        {
+            // Synthetic dir first: ucrt/kernel32/ws2_32/ntdll/dbghelp resolve here (first match
+            // wins), so basic code links with no Windows SDK present. The SDK dirs are added
+            // after as a fallback chain for advanced cases that genuinely still need the SDK:
+            //   - 'um':       long-tail system import libs we do not synthesize (user32/gdi32/
+            //                 uuid/... pulled by system-header `#pragma comment(lib,...)`).
+            //   - 'msvc-lib': libcmt/msvcrt - reached only by a prebuilt user lib built /MT, a
+            //                 user .c using /GS (__security_cookie/check), or a CRT header-inline
+            //                 we have not shimmed. A basic build requests none of these, so it
+            //                 never consults this dir and stays SDK-free; lld pulls only the
+            //                 specific archive members an advanced build leaves undefined.
+            linkArgStrs.push_back("/libpath:" + syntheticLibDir);
+            linkArgStrs.push_back("/nodefaultlib:oldnames");
+            if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+            if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
+        }
+        else
+        {
+            if (!msvcLibPath.empty()) linkArgStrs.push_back("/libpath:" + msvcLibPath);
+            if (!ucrtLibPath.empty()) linkArgStrs.push_back("/libpath:" + ucrtLibPath);
+            if (!umLibPath.empty())   linkArgStrs.push_back("/libpath:" + umLibPath);
+        }
 
         // AddressSanitizer: link the dynamic asan runtime (matches /MD-style CRT), force-include
         // the thunk via /wholearchive to retain CRT$XI* interceptors. DLL copied next to exe.
@@ -4565,11 +4738,31 @@ private:
             }
         }
 
-        linkArgStrs.push_back("msvcrt.lib");
+        // ucrt.lib is always needed - it is the import lib for the OS-resident Universal CRT.
         linkArgStrs.push_back("ucrt.lib");
-        linkArgStrs.push_back("vcruntime.lib");
+        if (keepVcRuntime)
+        {
+            // ASan path: keep the stock VC CRT. msvcrt.lib provides mainCRTStartup (the default
+            // entry) and vcruntime140.dll provides the mem*/EH symbols ASan's runtime expects.
+            linkArgStrs.push_back("msvcrt.lib");
+            linkArgStrs.push_back("vcruntime.lib");
+        }
+        else
+        {
+            // Freestanding path: cflat_builtins.c supplies our own entry (cflat_start) plus the
+            // mem*/str* intrinsics and a real x64 __C_specific_handler. So we need neither the VC
+            // startup lib (msvcrt.lib, a Visual Studio component) nor VCRUNTIME140.dll (the VC++
+            // redistributable). /nodefaultlib suppresses the /defaultlib directives the clang-cl
+            // (/MD) builtins object emits that would otherwise re-pull both.
+            linkArgStrs.push_back("/entry:cflat_start");
+            linkArgStrs.push_back("/nodefaultlib:msvcrt.lib");
+            linkArgStrs.push_back("/nodefaultlib:vcruntime.lib");
+        }
         linkArgStrs.push_back("kernel32.lib");
         linkArgStrs.push_back("ws2_32.lib");
+        // ntdll.lib provides RtlUnwindEx, used by cflat_builtins.c's __C_specific_handler.
+        // Harmless when unreferenced (no DLL import is added unless a symbol is pulled).
+        linkArgStrs.push_back("ntdll.lib");
         linkArgStrs.push_back(objPath);
         // Merge any C objects compiled by clang-cl from .c inputs.
         for (auto& cObj : cObjectFiles_) linkArgStrs.push_back(cObj);
@@ -4621,6 +4814,21 @@ private:
                                      asanDllToCopy, exePath, ec.message()));
             else if (verbose)
                 std::cout << std::format("[verbose]   copied asan runtime DLL: {} -> {}\n", asanDllToCopy, dest.string());
+        }
+
+        // Normal builds are vcruntime-free, but an --asan build links the VC++ runtime (and its
+        // asan runtime DLL needs it too). If it is not installed the program fails to start with
+        // a cryptic loader error, so point the user at the redistributable - they may not know.
+        if (keepVcRuntime && !VcRuntimeInstalled())
+        {
+            const char* redist = (arch == "x86") ? "vc_redist.x86.exe" : "vc_redist.x64.exe";
+            std::cout << std::format(
+                "Note: this --asan build depends on the Microsoft Visual C++ runtime "
+                "(vcruntime140.dll),\n"
+                "      which was not found on this system. The program will not start until the\n"
+                "      Microsoft Visual C++ Redistributable is installed:\n"
+                "        https://aka.ms/vs/17/release/{}\n"
+                "      (Normal builds do not depend on it; only --asan does.)\n", redist);
         }
         return true;
     }

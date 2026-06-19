@@ -14,6 +14,11 @@
 #include <llvm\Transforms\InstCombine\InstCombine.h>
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
 #include <llvm\Transforms\Instrumentation\AddressSanitizer.h>
+#include <llvm\Object\COFF.h>
+#include <llvm\Object\Binary.h>
+#include <llvm\Object\Archive.h>
+#include <llvm\Object\COFFImportFile.h>
+#include <llvm\ADT\StringSet.h>
 #include <llvm\Support\CommandLine.h>
 #include <llvm\Support\TimeProfiler.h>
 #include <llvm\Support\JSON.h>
@@ -33,6 +38,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <set>
 
 // Win32 unwind registration for the --run JIT (see cflat_jit::SehRegistrationPlugin). Declared
 // here, not in LLVMBackend.h, so this stays in a TU that never includes <winnt.h> - otherwise
@@ -2485,6 +2491,259 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     return true;
 }
 
+// ---- Import-library synthesis (SDK-free system libs) ----
+//
+// Read a system DLL's export table and emit a name-only import library via
+// `lld-link /lib /def`. Lets cflat output link against kernel32/ws2_32/ntdll/dbghelp/ucrt
+// without the Windows SDK's .lib files: the DLLs are OS-resident, so --init can read their
+// exports on any Win10+ machine and rebuild the import libs locally. The link line keeps
+// the same lib NAMES (ucrt.lib, kernel32.lib, ...), so only the /libpath flips (Phase C).
+// See internal/plan/remove-vcruntime-dependency.md Phase B. x64 only for now - x86 stdcall
+// exports need @N decoration in the def (Phase D).
+
+// %SystemRoot%\System32 (64-bit system DLLs on a 64-bit OS). Empty if SystemRoot is unset.
+static std::string GetSystem32Dir()
+{
+    char buf[260] = {};
+    size_t len = 0;
+    if (getenv_s(&len, buf, sizeof(buf), "SystemRoot") != 0 || len == 0)
+        return {};
+    return std::string(buf) + "\\System32";
+}
+
+static bool ReadDllExportNames(const std::string& dllPath, std::vector<std::string>& names)
+{
+    auto binOrErr = llvm::object::createBinary(dllPath);
+    if (!binOrErr) { llvm::consumeError(binOrErr.takeError()); return false; }
+    auto owning = std::move(*binOrErr);
+    auto* coff = llvm::dyn_cast<llvm::object::COFFObjectFile>(owning.getBinary());
+    if (!coff) return false;
+    for (const auto& exp : coff->export_directories())
+    {
+        llvm::StringRef name;
+        if (exp.getSymbolName(name)) continue;   // error reading this entry -> skip
+        if (name.empty()) continue;              // ordinal-only export -> we import by name
+        names.push_back(name.str());
+    }
+    return !names.empty();
+}
+
+// Symbols cflat_builtins.c defines locally (it replaces VCRUNTIME140.dll). ucrtbase.dll and
+// ntdll.dll happen to export the same names; the Windows SDK's curated import libs omit them,
+// but reading a DLL's full export table does not - so we must skip them here or the link sees
+// a duplicate symbol (our definition vs the synthesized import). Mirror cflat_builtins.c.
+static const std::set<std::string>& CflatProvidedSymbols()
+{
+    static const std::set<std::string> s = {
+        "memcpy", "memset", "memcmp", "memmove", "memchr",
+        "strchr", "strrchr", "strstr", "wcschr", "wcsrchr", "wcsstr",
+        "__C_specific_handler", "__current_exception", "__current_exception_context",
+        "__std_type_info_destroy_list",
+    };
+    return s;
+}
+
+// Synthesize <outLib> as an import library for <importDllName>, exporting every name found in
+// <dllPath> except those cflat_builtins.c provides. Returns false (and fills errMsg) on failure.
+static bool SynthesizeImportLib(const std::string& lldLink, const std::string& dllPath,
+                                const std::string& importDllName, const std::string& outLib,
+                                const std::string& machine, std::string& errMsg)
+{
+    std::vector<std::string> names;
+    if (!ReadDllExportNames(dllPath, names))
+    { errMsg = "could not read exports from " + dllPath; return false; }
+
+    const auto& excluded = CflatProvidedSymbols();
+    names.erase(std::remove_if(names.begin(), names.end(),
+                    [&](const std::string& n) { return excluded.count(n) != 0; }),
+                names.end());
+
+    llvm::SmallString<256> defFile;
+    if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_imp", "def", defFile))
+    { errMsg = "could not create temp def: " + ec.message(); return false; }
+
+    {
+        std::error_code ec;
+        llvm::raw_fd_ostream os(defFile, ec);
+        if (ec) { errMsg = "could not open def: " + ec.message(); return false; }
+        os << "LIBRARY " << importDllName << "\nEXPORTS\n";
+        // Quote each name so C++-mangled exports (?, @) do not confuse the def parser.
+        for (const auto& n : names) os << "    \"" << n << "\"\n";
+    }
+
+    std::string defArg  = "/def:" + defFile.str().str();
+    std::string outArg  = "/out:" + outLib;
+    std::string machArg = "/machine:" + machine;
+    std::vector<std::string> argStrs = { lldLink, "/lib", defArg, outArg, machArg };
+    std::vector<llvm::StringRef> args(argStrs.begin(), argStrs.end());
+
+    std::string toolErr;
+    int rc = llvm::sys::ExecuteAndWait(lldLink, args, std::nullopt, {}, 0, 0, &toolErr);
+    llvm::sys::fs::remove(defFile);
+    if (rc != 0)
+    {
+        errMsg = std::format("lld-link /lib failed (exit {}){}{}", rc,
+                             toolErr.empty() ? "" : ": ", toolErr);
+        return false;
+    }
+    return true;
+}
+
+// x86 import-lib synthesis. Unlike x64, x86 stdcall imports are decorated with the parameter
+// byte count (_Foo@N), which a DLL export table does not carry and `lld-link /lib` cannot
+// reconstruct (it has no kill-at). So we read the decorated thunk symbols from the SDK's x86
+// import lib (the only reliable @N source, available at cflat build/CI time) and re-emit a
+// clean import lib via llvm::object::writeImportLibrary, which applies kill-at: the linker
+// symbol stays _Foo@N while the DLL-import name becomes the undecorated Foo. The result carries
+// only names (ABI facts), no Microsoft code - the same shape MinGW ships.
+static bool SynthesizeX86ImportLibFromSdk(const std::string& sdkLibPath,
+                                          const std::string& importDllName,
+                                          const std::string& outLib, std::string& errMsg)
+{
+    auto buf = llvm::MemoryBuffer::getFile(sdkLibPath, /*IsText=*/false, /*NullTerm=*/false);
+    if (!buf) { errMsg = "cannot read " + sdkLibPath; return false; }
+    auto archOr = llvm::object::Archive::create((*buf)->getMemBufferRef());
+    if (!archOr) { llvm::consumeError(archOr.takeError()); errMsg = "not an archive: " + sdkLibPath; return false; }
+
+    const auto& excluded = CflatProvidedSymbols();
+    std::vector<llvm::object::COFFShortExport> exports;
+    llvm::StringSet<> seen;
+    for (const auto& sym : (*archOr)->symbols())
+    {
+        llvm::StringRef s = sym.getName();
+        // Keep only the thunk symbols (_Foo / _Foo@N). Skip the import-address symbols and the
+        // import-descriptor bookkeeping - writeImportLibrary regenerates those itself.
+        if (!s.starts_with("_") || s.starts_with("__imp_")) continue;
+        if (s.contains("IMPORT_DESCRIPTOR") || s.contains("NULL_THUNK_DATA")) continue;
+        std::string importName = s.substr(1).str();           // strip leading underscore
+        if (auto at = importName.find('@'); at != std::string::npos)
+            importName.resize(at);                            // kill-at: drop @N for the DLL name
+        if (excluded.count(importName)) continue;             // cflat_builtins.c provides these
+        if (!seen.insert(s).second) continue;
+        llvm::object::COFFShortExport e;
+        e.Name = importName;        // undecorated DLL-import name (kill-at)
+        e.SymbolName = s.str();     // decorated linker symbol (_Foo@N)
+        exports.push_back(std::move(e));
+    }
+    if (exports.empty()) { errMsg = "no thunk symbols in " + sdkLibPath; return false; }
+
+    if (llvm::Error e = llvm::object::writeImportLibrary(
+            importDllName, outLib, exports, llvm::COFF::IMAGE_FILE_MACHINE_I386, /*MinGW=*/false))
+    {
+        errMsg = llvm::toString(std::move(e));
+        return false;
+    }
+    return true;
+}
+
+// %USERPROFILE%\.cflat\lib\<arch> - where synthesized import libs live. "" on failure.
+std::string LLVMBackend::GetSyntheticLibDir(const std::string& arch)
+{
+    std::string base = GetCflatCacheDir();
+    if (base.empty()) return {};
+    return base + "\\lib\\" + arch;
+}
+
+// Generate kernel32/ws2_32/ntdll/dbghelp/ucrt import libs for <arch> into the synthetic lib
+// dir. ucrt.lib is built from ucrtbase.dll (the OS-resident UCRT; the api-ms-win-crt-* apisets
+// all forward to it). Best-effort: logs each lib, returns true if all were written.
+bool LLVMBackend::SynthesizeSystemImportLibs(const std::string& arch, const std::string& lldLink)
+{
+    if (arch != "x64")
+        return false;   // x86 needs stdcall @N decoration - Phase D.
+    if (lldLink.empty())
+    {
+        std::cout << "  Warning: lld-link not found; cannot synthesize import libs.\n";
+        return false;
+    }
+    std::string sys32 = GetSystem32Dir();
+    if (sys32.empty())
+    {
+        std::cout << "  Warning: SystemRoot not set; cannot synthesize import libs.\n";
+        return false;
+    }
+    std::string libDir = GetSyntheticLibDir(arch);
+    if (libDir.empty()) return false;
+    if (std::error_code ec = llvm::sys::fs::create_directories(libDir); ec)
+    {
+        std::cout << std::format("  Warning: could not create {}: {}\n", libDir, ec.message());
+        return false;
+    }
+
+    // { source DLL, import DLL name, output lib name }. ucrt maps ucrtbase.dll -> ucrt.lib so
+    // the existing `ucrt.lib` link reference resolves unchanged.
+    struct LibSpec { const char* dll; const char* importName; const char* out; };
+    const LibSpec specs[] = {
+        { "kernel32.dll", "kernel32.dll", "kernel32.lib" },
+        { "ws2_32.dll",   "ws2_32.dll",   "ws2_32.lib"   },
+        { "ntdll.dll",    "ntdll.dll",    "ntdll.lib"    },
+        { "dbghelp.dll",  "dbghelp.dll",  "dbghelp.lib"  },
+        { "ucrtbase.dll", "ucrtbase.dll", "ucrt.lib"     },
+    };
+
+    bool allOk = true;
+    for (const auto& s : specs)
+    {
+        std::string dllPath = sys32 + "\\" + s.dll;
+        std::string outLib  = libDir + "\\" + s.out;
+        std::string err;
+        if (SynthesizeImportLib(lldLink, dllPath, s.importName, outLib, arch, err))
+        {
+            std::cout << std::format("  Synthesized {}\n", s.out);
+        }
+        else
+        {
+            std::cout << std::format("  Warning: could not synthesize {}: {}\n", s.out, err);
+            allOk = false;
+        }
+    }
+    return allOk;
+}
+
+// x86 system import libs. x86 stdcall needs @N decoration that only the SDK libs carry, so we
+// re-emit clean import libs from them (see SynthesizeX86ImportLibFromSdk). ucrt maps the SDK's
+// ucrt.lib -> our ucrt.lib but pointed at ucrtbase.dll (OS-resident; the apisets forward there).
+bool LLVMBackend::SynthesizeX86SystemImportLibs(const LinkerPaths& paths)
+{
+    std::string libDir = GetSyntheticLibDir("x86");
+    if (libDir.empty()) return false;
+    if (std::error_code ec = llvm::sys::fs::create_directories(libDir); ec)
+    {
+        std::cout << std::format("  Warning: could not create {}: {}\n", libDir, ec.message());
+        return false;
+    }
+    if (paths.umLib.empty() || paths.ucrtLib.empty())
+    {
+        std::cout << "  Warning: SDK x86 lib dirs not found; cannot synthesize x86 import libs.\n";
+        return false;
+    }
+
+    // { source SDK lib, import DLL name, output lib }. The um libs are stdcall; ucrt is cdecl.
+    struct LibSpec { std::string sdkLib; const char* importName; const char* out; };
+    const LibSpec specs[] = {
+        { paths.umLib   + "\\kernel32.lib", "kernel32.dll", "kernel32.lib" },
+        { paths.umLib   + "\\ws2_32.lib",   "ws2_32.dll",   "ws2_32.lib"   },
+        { paths.umLib   + "\\ntdll.lib",    "ntdll.dll",    "ntdll.lib"    },
+        { paths.umLib   + "\\dbghelp.lib",  "dbghelp.dll",  "dbghelp.lib"  },
+        { paths.ucrtLib + "\\ucrt.lib",     "ucrtbase.dll", "ucrt.lib"     },
+    };
+
+    bool allOk = true;
+    for (const auto& s : specs)
+    {
+        std::string outLib = libDir + "\\" + s.out;
+        std::string err;
+        if (SynthesizeX86ImportLibFromSdk(s.sdkLib, s.importName, outLib, err))
+            std::cout << std::format("  Synthesized {}\n", s.out);
+        else
+        {
+            std::cout << std::format("  Warning: could not synthesize {}: {}\n", s.out, err);
+            allOk = false;
+        }
+    }
+    return allOk;
+}
+
 bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
 {
     std::string cacheDir = GetCflatCacheDir();
@@ -2515,6 +2774,19 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             std::cout << std::format("  Saved linker_paths_{}.json\n", arch);
         else
             std::cout << std::format("  Warning: could not write cache file for {}.\n", arch);
+
+        // Synthesize SDK-free system import libs. x64 reads the OS DLLs directly; x86 re-emits
+        // from the SDK libs (stdcall @N is not in the DLL export table - see the helpers).
+        if (std::string(arch) == "x64")
+        {
+            std::cout << std::format("Synthesizing system import libs for {}...\n", arch);
+            SynthesizeSystemImportLibs(arch, paths.lldLink);
+        }
+        else if (std::string(arch) == "x86")
+        {
+            std::cout << std::format("Synthesizing system import libs for {}...\n", arch);
+            SynthesizeX86SystemImportLibs(paths);
+        }
     }
 
     // Build core bitcode cache for win64 (win32 has pre-existing compilation issues).
