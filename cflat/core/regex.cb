@@ -193,9 +193,7 @@ struct Match
         int i = 0;
         while (i < len) { buf[i] = src[gs + i]; i++; }
         buf[len] = 0;
-        r._ptr = buf;
-        r._len = len;
-        return r;
+        return _strOwned(move buf, len);
     }
 
     // The whole matched substring (group 0).
@@ -966,10 +964,7 @@ class Regex
         int i = 0;
         while (i < len) { buf[i] = s[a + i]; i++; }
         buf[len] = 0;
-        string r = default;
-        r._ptr = buf;
-        r._len = len;
-        return r;
+        return _strOwned(move buf, len);
     }
 
     // Split `input` around non-overlapping matches of the pattern.
