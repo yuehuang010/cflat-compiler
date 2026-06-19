@@ -19,3 +19,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-Party Notices
+
+This software builds against LLVM, which is licensed under the Apache License
+2.0 with LLVM Exceptions. See https://llvm.org/LICENSE.txt for the full text.
+
+This software builds against ANTLR4, which is licensed under the BSD 3-Clause
+License. See https://www.antlr.org/license.html for the full text.

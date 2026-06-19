@@ -140,8 +140,8 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 | `--xthread-scan` | | `1`..`3` | Cross-thread sharing scan level (default off). Reports non-atomic/unguarded struct fields shared across a thread spawn. 1=borrowed ctx, 2=+ptr handoff, 3=+any struct-ptr call arg. |
 | `-ftime-trace` | | | Write a Chrome-trace JSON of the compile to `<input>.time-trace.json` (single-dash spelling is canonical; `--ftime-trace` also parses). |
 
-Diagnostic message conventions: [`doc/diagnostic.md`](diagnostic.md). Threading-specific
-analysis: [`doc/threading.md`](threading.md).
+Diagnostic message conventions: [`doc/DIAGNOSTIC.md`](DIAGNOSTIC.md). Threading-specific
+analysis: [`doc/THREADING.md`](THREADING.md).
 
 ### Heap audit
 

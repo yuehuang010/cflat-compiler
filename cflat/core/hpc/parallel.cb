@@ -111,7 +111,7 @@ int __pfor_pool_tramp(move void* raw, stop_token tok) {
 
 // RAW THREAD overload. `pin` (default false) pins worker w to core
 // w % hardware_concurrency() via SetThreadAffinityMask, removing OS
-// scheduling jitter for compute-bound HPC kernels (see threading.md). Leave
+// scheduling jitter for compute-bound HPC kernels (see THREADING.md). Leave
 // it false when the region oversubscribes or shares cores with other work.
 void parallel_for_n(i64 n, int workers, function<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
     if (n <= 0) { return; }
@@ -224,7 +224,7 @@ int __pred_pool_tramp(move void* raw, stop_token tok) {
 
 // RAW THREAD overload. `pin` (default false) pins worker w to core
 // w % hardware_concurrency() (SetThreadAffinityMask), removing scheduling
-// jitter for compute-bound reductions (e.g. Monte Carlo). See threading.md.
+// jitter for compute-bound reductions (e.g. Monte Carlo). See THREADING.md.
 T parallel_reduce<T>(i64 n, int workers, T identity,
                      function<T(i64, i64)> partial,
                      function<T(T, T)> combine, bool pin = false, int fpConfig = 0) {

@@ -25,7 +25,7 @@ failure points you toward.
 - [Across-core data parallelism (`parallel_for_n` / `parallel_reduce`)](#across-core-data-parallelism-parallel_for_n--parallel_reduce)
 - [Numeric kernel libraries (`core/hpc`)](#numeric-kernel-libraries-corehpc)
 
-**Related:** [Threading & Memory Management](threading.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
+**Related:** [Threading & Memory Management](THREADING.md) (threads, affinity, thread pool, allocators, lock-set analysis) | [Language & Core Library Features](LANGUAGE.md)
 
 ---
 
@@ -536,7 +536,7 @@ i64 count = parallel_reduce<i64>(n, 0, (i64)0, countPartial, addI);
 The raw-thread `parallel_for_n` and `parallel_reduce<T>` take a trailing `bool pin = false`. Set it to
 `true` to pin worker `w` to core `w % hardware_concurrency()` (via `SetThreadAffinityMask`), which
 removes the OS scheduling jitter that otherwise caps speedup on compute-bound kernels - the single most
-important knob for steady throughput (see [threading.md](threading.md)):
+important knob for steady throughput (see [THREADING.md](THREADING.md)):
 
 ```c
 i64 count = parallel_reduce<i64>(n, 0, (i64)0, partial, addI, /*pin=*/true);
@@ -582,8 +582,8 @@ pool.init(8, cpu_mask_lowest(8), FP_FLUSH_DENORMALS);
 
 `FP_TRAP_DEFAULT` is the "catch NaN/Inf at the source" diagnostic; `FP_FLUSH_DENORMALS` is the
 throughput knob (denormals can cost 10-100x). The setting is per-thread, applied at worker creation,
-and never touches the main thread. See [Per-thread floating-point environment](threading.md#per-thread-floating-point-environment-corethreadcb)
-in threading.md for the full constant list, the `fp_enable_traps`/`fp_disable_traps` in-thread helpers,
+and never touches the main thread. See [Per-thread floating-point environment](THREADING.md#per-thread-floating-point-environment-corethreadcb)
+in THREADING.md for the full constant list, the `fp_enable_traps`/`fp_disable_traps` in-thread helpers,
 and the `program._fpConfig` field.
 
 ### Per-thread RNG for parallel Monte Carlo

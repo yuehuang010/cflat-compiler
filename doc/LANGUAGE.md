@@ -74,7 +74,7 @@
 - [Debug Info](#debug-info-work-in-progress)
 - [Compiler CLI](#compiler-cli)
 - [Standard Library](#standard-library)
-- [Threading & Memory Management](threading.md)
+- [Threading & Memory Management](THREADING.md)
 - [HPC & SIMD (`vectorize`, `simd<T,N>`)](HPC.md)
 
 ---
@@ -1852,7 +1852,7 @@ Vec2 d = a * 3.0f;       // (3, 6)
 bool eq = (a == a);      // true
 ```
 
-`operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](threading.md)).
+`operator<<` and `operator>>` are overloadable too. The core `channel<T>` uses `operator>>` as a pipe - `src >> dst` forwards every value from one channel into another (see [Threading](THREADING.md)).
 
 **Operator overloading binding rules:**
 

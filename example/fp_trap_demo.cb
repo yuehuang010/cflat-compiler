@@ -4,7 +4,7 @@
 // (an invalid operation) the hardware raises a floating-point exception
 // (SIGFPE) AT THE INSTRUCTION that produced the NaN, instead of silently
 // yielding a quiet NaN that would only surface much later. This is the
-// diagnostic the per-thread FP environment exists for - see doc/threading.md.
+// diagnostic the per-thread FP environment exists for - see doc/THREADING.md.
 //
 // Build (compiles cleanly):
 //     x64/Release/cflat.exe example/fp_trap_demo.cb -o out/fp_trap_demo.exe

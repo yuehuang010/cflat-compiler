@@ -4,7 +4,9 @@ A C-dialect language with modern features, compiled to LLVM IR.
 
 CFlat (`.cb`) extends C with generics, interfaces, namespaces, operator overloading, and null-safety - while keeping C's familiar syntax and control.
 
----
+## Requirements
+
+cflat links native Windows executables, so the **Windows SDK** is required to build and run the hello app. You do not need to install it separately - it ships with the **"Desktop development with C++"** workload in [Visual Studio 2022](https://visualstudio.microsoft.com/vs/).
 
 ## Quick Start
 
@@ -24,7 +26,10 @@ extern int main() {
 }
 ```
 
----
+### VS Code Setup
+
+1. Install the extension: in VS Code, open the Command Palette (`Ctrl+Shift+P`) -> **Extensions: Install from VSIX...** and pick `vscode-extension/cflat-language-*.vsix`.
+2. Point the extension at your compiler: set [`cflat.executablePath`](vscode://settings/cflat.executablePath) to the full path of `cflat.exe`.
 
 ## Documentation
 
