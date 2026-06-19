@@ -125,6 +125,11 @@ struct GenericTemplateState
     // when the tuple is reached only via a return type before its producer was code-generated.
     std::unordered_map<std::string, std::vector<std::string>>                   tupleTypeArgs;
 
+    // Templates loaded from the core cache but not yet parsed: name -> source text. The
+    // genericX Templates maps hold a null context placeholder until MaterializeGeneric* parses
+    // the source on first instantiation. Lives here so Clear() drops it with the maps it backs.
+    std::unordered_map<std::string, std::string>                                lazyTemplateSource;
+
     void Clear() { *this = GenericTemplateState{}; }
 };
 
@@ -11758,6 +11763,46 @@ public:
     // Load the core bitcode cache from cacheDir/core_<platform>.{bc,meta.json}.
     // Populates module, symbol tables, and generic templates. Returns false if absent or stale.
     bool LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std::string& platform);
+
+    // Lazy generic-template materialization. The core cache stores each generic template's
+    // source text instead of an eagerly re-parsed ANTLR tree; templates are parsed on first
+    // use so a compile only pays the ANTLR cost for the generics it actually instantiates.
+    // Returns nullptr if the name is unknown. See LoadCoreBitcodeIfFresh for the load side.
+    CFlatParser::StructDefinitionContext*    MaterializeGenericStruct(const std::string& name);
+    CFlatParser::ClassDefinitionContext*     MaterializeGenericClass(const std::string& name);
+    CFlatParser::InterfaceDefinitionContext* MaterializeGenericInterface(const std::string& name);
+    CFlatParser::FunctionDefinitionContext*  MaterializeGenericFunction(const std::string& name);
+
+private:
+    // Parse one lazily-stored template's source and patch its context pointer into `map` in
+    // place. The key already exists (inserted with a null value at cache load) so .count/.find
+    // existence checks stay valid; assigning the value does not invalidate other iterators.
+    template <typename CtxT, typename Extract>
+    CtxT* MaterializeGenericTemplate(std::unordered_map<std::string, CtxT*>& map,
+                                     const std::string& name, Extract extract)
+    {
+        auto it = map.find(name);
+        if (it == map.end()) return nullptr;
+        if (it->second) return it->second;            // user-defined or already materialized
+        auto srcIt = gts.lazyTemplateSource.find(name);
+        if (srcIt == gts.lazyTemplateSource.end()) return nullptr;
+
+        llvm::TimeTraceScope mat("GenericMaterialize", name);
+        SyntheticParseState state;
+        state.label  = "cached:" + name;
+        state.input  = std::make_unique<antlr4::ANTLRInputStream>(srcIt->second);
+        state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
+        state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
+        state.parser = std::make_unique<CFlatParser>(state.tokens.get());
+        state.parser->removeErrorListeners();
+        state.tokens->fill();
+        auto* cu = state.parser->compilationUnit();
+        CtxT* ctx = extract(cu);
+        it->second = ctx;
+        syntheticParseStates_.push_back(std::move(state));
+        gts.lazyTemplateSource.erase(srcIt);
+        return ctx;
+    }
 };
 
 // Defined here so LLVMBackend is fully declared before DumpState() is called.

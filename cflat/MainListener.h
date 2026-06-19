@@ -2296,7 +2296,8 @@ public:
         auto templateIt = genericInterfaceTemplates.find(baseName);
         if (templateIt == genericInterfaceTemplates.end()) return;
 
-        auto* ctx = templateIt->second;
+        auto* ctx = compilerLLVM->MaterializeGenericInterface(baseName);
+        if (!ctx) return;
 
         // Collect parent interface names
         std::vector<std::string> parentNames;
@@ -2341,11 +2342,13 @@ public:
 
         auto templateIt = genericFunctionTemplates.find(baseName);
         if (templateIt == genericFunctionTemplates.end()) return {};
+        auto* tmplCtx = compilerLLVM->MaterializeGenericFunction(baseName);
+        if (!tmplCtx) return {};
 
         const auto& typeParams = genericFunctionTypeParams[baseName];
         if (typeParams.size() != typeArgs.size()) return {};
 
-        if (!CheckConstraints(baseName, typeParams, typeArgs, genericFunctionConstraints, templateIt->second))
+        if (!CheckConstraints(baseName, typeParams, typeArgs, genericFunctionConstraints, tmplCtx))
             return {};
 
         auto savedSubst = activeTypeSubstitutions;
@@ -2354,7 +2357,7 @@ public:
 
         // Save the current IRBuilder insertion point so that emitting a new
         // function definition mid-block does not corrupt the caller's block.
-        auto* instCompiler = Compiler(templateIt->second);
+        auto* instCompiler = Compiler(tmplCtx);
         auto savedState = instCompiler->SaveBuilderState();
         // Isolate the outer function's local-variable stack: if we are
         // instantiating mid-emission of another function, its frames are still
@@ -2364,7 +2367,7 @@ public:
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
-        ParseFunctionDefinition(templateIt->second, {}, {}, mangledName);
+        ParseFunctionDefinition(tmplCtx, {}, {}, mangledName);
         instCompiler->stackNamedVariable = std::move(savedStack);
         instCompiler->RestoreBuilderState(savedState);
 
@@ -2380,7 +2383,8 @@ public:
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
 
-        auto* funcCtx = templateIt->second;
+        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
+        if (!funcCtx) return {};
         const auto& typeParams = genericFunctionTypeParams[funcName];
 
         auto* paramTypeList = funcCtx->parameterTypeList();
@@ -2443,7 +2447,8 @@ public:
         auto templateIt = genericFunctionTemplates.find(funcName);
         if (templateIt == genericFunctionTemplates.end()) return {};
 
-        auto* funcCtx = templateIt->second;
+        auto* funcCtx = compilerLLVM->MaterializeGenericFunction(funcName);
+        if (!funcCtx) return {};
         const auto& typeParams = genericFunctionTypeParams[funcName];
         if (typeParams.empty()) return {};
 
@@ -14922,11 +14927,16 @@ public:
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
 
-            // Verify where-clause constraints before instantiating
-            auto* ctxForError = structIt != genericStructTemplates.end()
-                ? (antlr4::ParserRuleContext*)structIt->second
-                : (antlr4::ParserRuleContext*)classIt->second;
-            const auto& constraintMap = structIt != genericStructTemplates.end()
+            // Materialize the template context (lazy-parses cached source on first use),
+            // then verify where-clause constraints before instantiating.
+            bool isStruct = structIt != genericStructTemplates.end();
+            auto* structCtx = isStruct ? compilerLLVM->MaterializeGenericStruct(pending.templateName) : nullptr;
+            auto* classCtx  = isStruct ? nullptr : compilerLLVM->MaterializeGenericClass(pending.templateName);
+            auto* ctxForError = isStruct
+                ? (antlr4::ParserRuleContext*)structCtx
+                : (antlr4::ParserRuleContext*)classCtx;
+            if (!ctxForError) continue;
+            const auto& constraintMap = isStruct
                 ? genericStructConstraints : genericClassConstraints;
             if (!CheckConstraints(pending.templateName, typeParams, pending.typeArgs, constraintMap, ctxForError))
                 continue;
@@ -14954,10 +14964,10 @@ public:
                     std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
             }
 
-            if (structIt != genericStructTemplates.end())
-                ParseStructDefinition(structIt->second, pending.mangledName);
+            if (isStruct)
+                ParseStructDefinition(structCtx, pending.mangledName);
             else
-                ParseClassDefinition(classIt->second, pending.mangledName);
+                ParseClassDefinition(classCtx, pending.mangledName);
 
             activeTypeSubstitutions = savedSubst;
             activePackSubstitutions = savedPackSubst;

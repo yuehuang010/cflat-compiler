@@ -3369,12 +3369,12 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 
     } // end CoreDes:Globals
 
-    // Load generic templates: re-parse source text via SyntheticParseState.
-    // This re-runs the ANTLR lexer+parser per template - not JSON work; scope it apart.
-    { llvm::TimeTraceScope s("CoreDes:GenericReparse", jsonPath);
-    auto loadGenericTemplates = [&](const char* key,
-        auto& templateMap, auto& typeParamsMap, auto& constraintsMap, auto& packIndexMap,
-        auto extractCtx)
+    // Register generic templates lazily: store each template's source text plus a null context
+    // placeholder. The ANTLR parse is deferred to MaterializeGeneric* on first instantiation,
+    // so a compile pays the parse cost only for the generics it actually uses.
+    { llvm::TimeTraceScope s("CoreDes:GenericRegister", jsonPath);
+    auto registerLazyTemplates = [&](const char* key,
+        auto& templateMap, auto& typeParamsMap, auto& constraintsMap, auto& packIndexMap)
     {
         auto* arr = root->getArray(key);
         if (!arr) return;
@@ -3385,84 +3385,42 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             auto tname   = to->getString("name");
             auto tsource = to->getString("source");
             if (!tname || !tsource) continue;
+            std::string name = tname->str();
 
             std::vector<std::string> tps;
             if (auto* tpsArr = to->getArray("type_params"))
                 for (auto& tp : *tpsArr)
                     if (auto v = tp.getAsString()) tps.push_back(v->str());
 
-            SyntheticParseState state;
-            state.label  = "cached:" + tname->str();
-            state.input  = std::make_unique<antlr4::ANTLRInputStream>(tsource->str());
-            state.lexer  = std::make_unique<CFlatLexer>(state.input.get());
-            state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
-            state.parser = std::make_unique<CFlatParser>(state.tokens.get());
-            state.parser->removeErrorListeners();
-            state.tokens->fill();
-            auto* cu = state.parser->compilationUnit();
-
-            auto* ctx = extractCtx(cu);
-            if (ctx)
-            {
-                templateMap[tname->str()] = ctx;
-                typeParamsMap[tname->str()] = std::move(tps);
-                if (auto* cobj = to->getObject("constraints"))
-                    constraintsMap[tname->str()] = DeserializeConstraints(cobj);
-                if (auto v = to->getInteger("pack_index"))
-                    packIndexMap[tname->str()] = static_cast<size_t>(*v);
-            }
-            syntheticParseStates_.push_back(std::move(state));
+            templateMap[name] = nullptr;            // parsed on first use (MaterializeGeneric*)
+            typeParamsMap[name] = std::move(tps);
+            if (auto* cobj = to->getObject("constraints"))
+                constraintsMap[name] = DeserializeConstraints(cobj);
+            if (auto v = to->getInteger("pack_index"))
+                packIndexMap[name] = static_cast<size_t>(*v);
+            gts.lazyTemplateSource[name] = tsource->str();
         }
     };
 
-    loadGenericTemplates("generic_structs",
+    registerLazyTemplates("generic_structs",
         gts.genericStructTemplates, gts.genericStructTypeParams,
-        gts.genericStructConstraints, gts.genericStructPackIndex,
-        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::StructDefinitionContext* {
-            if (!cu || !cu->translationUnit()) return nullptr;
-            for (auto* decl : cu->translationUnit()->externalDeclaration())
-                if (auto* sd = decl->structDefinition())
-                    if (sd->genericTypeParameters()) return sd;
-            return nullptr;
-        });
+        gts.genericStructConstraints, gts.genericStructPackIndex);
 
-    loadGenericTemplates("generic_classes",
+    registerLazyTemplates("generic_classes",
         gts.genericClassTemplates, gts.genericStructTypeParams,
-        gts.genericClassConstraints, gts.genericClassPackIndex,
-        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::ClassDefinitionContext* {
-            if (!cu || !cu->translationUnit()) return nullptr;
-            for (auto* decl : cu->translationUnit()->externalDeclaration())
-                if (auto* cd = decl->classDefinition())
-                    if (cd->genericTypeParameters()) return cd;
-            return nullptr;
-        });
+        gts.genericClassConstraints, gts.genericClassPackIndex);
 
     // Interfaces have no constraints map; use a local dummy to satisfy the lambda signature.
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> ifaceConstraintsDummy;
-    loadGenericTemplates("generic_interfaces",
+    registerLazyTemplates("generic_interfaces",
         gts.genericInterfaceTemplates, gts.genericInterfaceTypeParams,
-        ifaceConstraintsDummy, gts.genericInterfacePackIndex,
-        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::InterfaceDefinitionContext* {
-            if (!cu || !cu->translationUnit()) return nullptr;
-            for (auto* decl : cu->translationUnit()->externalDeclaration())
-                if (auto* id = decl->interfaceDefinition())
-                    if (id->genericIdentifier() && id->genericIdentifier()->genericTypeParameters())
-                        return id;
-            return nullptr;
-        });
+        ifaceConstraintsDummy, gts.genericInterfacePackIndex);
 
-    loadGenericTemplates("generic_functions",
+    registerLazyTemplates("generic_functions",
         gts.genericFunctionTemplates, gts.genericFunctionTypeParams,
-        gts.genericFunctionConstraints, gts.genericFunctionPackIndex,
-        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::FunctionDefinitionContext* {
-            if (!cu || !cu->translationUnit()) return nullptr;
-            for (auto* decl : cu->translationUnit()->externalDeclaration())
-                if (auto* fd = decl->functionDefinition())
-                    if (fd->genericTypeParameters()) return fd;
-            return nullptr;
-        });
+        gts.genericFunctionConstraints, gts.genericFunctionPackIndex);
 
-    } // end CoreDes:GenericReparse
+    } // end CoreDes:GenericRegister
 
     // Restore pre-instantiated generic sets.
     { llvm::TimeTraceScope s("CoreDes:Instantiated", jsonPath);
@@ -3484,4 +3442,57 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (dataStructures.count("string") && dataStructures["string"].Destructor) stringDtorRegistered = true;
 
     return true;
+}
+
+// Lazy materializers: parse a cached generic template's source on first instantiation.
+// The extractor pulls the relevant definition context out of the freshly parsed unit;
+// it matches the eager extractors that registerLazyTemplates replaced.
+
+CFlatParser::StructDefinitionContext* LLVMBackend::MaterializeGenericStruct(const std::string& name)
+{
+    return MaterializeGenericTemplate(gts.genericStructTemplates, name,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::StructDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* sd = decl->structDefinition())
+                    if (sd->genericTypeParameters()) return sd;
+            return nullptr;
+        });
+}
+
+CFlatParser::ClassDefinitionContext* LLVMBackend::MaterializeGenericClass(const std::string& name)
+{
+    return MaterializeGenericTemplate(gts.genericClassTemplates, name,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::ClassDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* cd = decl->classDefinition())
+                    if (cd->genericTypeParameters()) return cd;
+            return nullptr;
+        });
+}
+
+CFlatParser::InterfaceDefinitionContext* LLVMBackend::MaterializeGenericInterface(const std::string& name)
+{
+    return MaterializeGenericTemplate(gts.genericInterfaceTemplates, name,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::InterfaceDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* id = decl->interfaceDefinition())
+                    if (id->genericIdentifier() && id->genericIdentifier()->genericTypeParameters())
+                        return id;
+            return nullptr;
+        });
+}
+
+CFlatParser::FunctionDefinitionContext* LLVMBackend::MaterializeGenericFunction(const std::string& name)
+{
+    return MaterializeGenericTemplate(gts.genericFunctionTemplates, name,
+        [](CFlatParser::CompilationUnitContext* cu) -> CFlatParser::FunctionDefinitionContext* {
+            if (!cu || !cu->translationUnit()) return nullptr;
+            for (auto* decl : cu->translationUnit()->externalDeclaration())
+                if (auto* fd = decl->functionDefinition())
+                    if (fd->genericTypeParameters()) return fd;
+            return nullptr;
+        });
 }
