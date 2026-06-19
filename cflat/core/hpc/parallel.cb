@@ -143,7 +143,7 @@ void parallel_for_n(i64 n, int workers, function<void(i64, i64)> body, bool pin 
     while (w < workers) { threads[w].join(); w = w + 1; }
 
     delete[_] threads;
-    delete[_] boxes;
+    delete[workers] boxes;   // boxes own a clone of `body`; destruct each to free it
 }
 
 // THREAD POOL variant. Named with a `_pool` suffix rather than overloading
@@ -275,7 +275,7 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
     }
 
     delete[_] threads;
-    delete[_] boxes;
+    delete[workers] boxes;   // boxes own a clone of `partial`; destruct each to free it
     delete[_] partials;
     return total;
 }
