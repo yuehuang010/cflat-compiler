@@ -6720,18 +6720,24 @@ public:
                 return right;
             }
 
-            // Destruct old value of an owning-value-type struct FIELD before overwriting (closes
-            // field-reassignment leak). Limited to struct fields; container element stores double-free if touched here.
+            // Destruct old value of an owning-value-type struct FIELD or whole LOCAL variable before
+            // overwriting (closes the reassignment LEAK). For a struct field this guards field stores;
+            // for a local/global variable it covers `r = f()` where f returns an owned temp (the named-
+            // variable-RHS move is already handled and returned above at the MOVE path, and an explicit
+            // `move` RHS is nulled below, so only a temp/call-result RHS reaches here for a local dest).
+            // Container element stores are excluded (would double-free if touched here).
             bool sameField = !namedVar.FieldName.empty()
                 && namedVar.FieldName == rightNV.FieldName
                 && namedVar.CallerName == rightNV.CallerName;
+            bool destIsLocalOwningVar = namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination));
             if (operatorText == "=" && right && right->getType()->isStructTy()
-                && destIsStructField
+                && (destIsStructField || destIsLocalOwningVar)
                 && destination != rightNV.Storage
                 && !sameField
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
-                // NOTE: closes the field-reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
+                // NOTE: closes the reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });

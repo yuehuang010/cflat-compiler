@@ -63,7 +63,10 @@ class File
 
     // Read one line, stripping trailing \r and \n. Returns "" at EOF.
     // Uses fgetc so there is no line-length limit.
-    string readLine()
+    // 'move' so callers (e.g. readLines' `lines->add(line)`) treat the result as owned and the
+    // line buffer is transferred into the list instead of being deep-copied with the original leaked.
+    // The empty/EOF paths return a borrowed empty literal ("" has no buffer, so nothing leaks).
+    move string readLine()
     {
         if (_handle == nullptr) return "";
         int c = fgetc(_handle);
@@ -91,8 +94,9 @@ class File
         return lines;
     }
 
-    // Read the entire file and return its contents as a string.
-    string readAll()
+    // Read the entire file and return its contents as a string. 'move' marks the result owned so a
+    // caller binding it to a local (or returning it) keeps the OWNED bit instead of clearing it.
+    move string readAll()
     {
         if (_handle == nullptr) return "";
         os.windows.fseek(_handle, 0, 2);
@@ -101,10 +105,8 @@ class File
         i8* buf = new i8[isz + 1];
         os.windows.fread(buf, 1, isz, _handle);
         buf[isz] = 0;
-        string s;
-        s._ptr = buf;
-        s._len = isz;
-        return s;
+        // buf is heap-owned: wrap it as an OWNING string so the dtor frees it (avoids a leak).
+        return _strOwned(buf, isz);
     }
 
     // Read up to count bytes into buf. Returns number of bytes actually read.
@@ -209,7 +211,7 @@ class File
     }
 
     // Read the entire file at path in one call.
-    static string readAllText(string path)
+    static move string readAllText(string path)
     {
         File* f = new File;
         if (!f->openRead(path))
@@ -281,10 +283,10 @@ class File
 class Path
 {
     // Join two path segments with a backslash separator if a does not already end with one.
-    static string combine(string a, string b)
+    static move string combine(string a, string b)
     {
-        if (a.length() == 0) return b;
-        if (b.length() == 0) return a;
+        if (a.length() == 0) return b.copy();
+        if (b.length() == 0) return a.copy();
         i8 last = a.data()[a.length() - 1];
         bool needsSep = (last != '\\' && last != '/');
         stringbuilder sb;
@@ -295,7 +297,7 @@ class Path
     }
 
     // Return the filename component (everything after the last separator).
-    static string getFileName(string path)
+    static move string getFileName(string path)
     {
         i8* p = path.data();
         i32 len = path.length();
@@ -310,15 +312,12 @@ class Path
         i32 nameLen = len - start;
         i8* buf = new i8[nameLen + 1];
         memcpy(buf, p + start, nameLen + 1);
-        string s;
-        s._ptr = buf;
-        s._len = nameLen;
-        return s;
+        return _strOwned(buf, nameLen);
     }
 
     // Return the directory component (everything before the last separator).
     // Returns "" if path contains no separator.
-    static string getDirectory(string path)
+    static move string getDirectory(string path)
     {
         i8* p = path.data();
         i32 len = path.length();
@@ -334,14 +333,11 @@ class Path
         i8* buf = new i8[dirLen + 1];
         memcpy(buf, p, dirLen);
         buf[dirLen] = 0;
-        string s;
-        s._ptr = buf;
-        s._len = dirLen;
-        return s;
+        return _strOwned(buf, dirLen);
     }
 
     // Return the extension including the leading dot (e.g. ".txt"), or "" if none.
-    static string getExtension(string path)
+    static move string getExtension(string path)
     {
         i8* p = path.data();
         i32 len = path.length();
@@ -357,22 +353,22 @@ class Path
         i32 extLen = len - lastDot;
         i8* buf = new i8[extLen + 1];
         memcpy(buf, p + lastDot, extLen + 1);
-        string s;
-        s._ptr = buf;
-        s._len = extLen;
-        return s;
+        return _strOwned(buf, extLen);
     }
 
     // Return true if path has a non-empty extension.
     static bool hasExtension(string path)
     {
-        return Path.getExtension(path).length() > 0;
+        // Bind the owned result to a local so it is destructed at scope exit; an owned rvalue temp
+        // consumed inline by '.length()' inside a larger expression is not flushed (would leak).
+        string ext = Path.getExtension(path);
+        return ext.length() > 0;
     }
 
     // Return path with its extension replaced by ext.
     // If ext is non-empty and does not start with '.', one is prepended automatically.
     // Pass ext="" to strip the extension.
-    static string changeExtension(string path, string ext)
+    static move string changeExtension(string path, string ext)
     {
         i8* p = path.data();
         i32 len = path.length();
@@ -394,41 +390,32 @@ class Path
         if (needDot) { buf[pos] = '.'; pos++; }
         if (extLen > 0) memcpy(buf + pos, ext.data(), extLen);
         buf[totalLen] = 0;
-        string s;
-        s._ptr = buf;
-        s._len = totalLen;
-        return s;
+        return _strOwned(buf, totalLen);
     }
 
     // Resolve path to an absolute path. Returns path unchanged on failure.
-    static string getAbsolute(string path)
+    static move string getAbsolute(string path)
     {
         i8* buf = new i8[4096];
         win_int len = os.windows.GetFullPathNameA(path.data(), 4096, buf, nullptr);
-        if (len == 0 || len >= 4096) { delete[] buf; return path; }
-        string s;
-        s._ptr = buf;
-        s._len = len;
-        return s;
+        if (len == 0 || len >= 4096) { delete[] buf; return path.copy(); }
+        return _strOwned(buf, len);
     }
 
     // Return the system temporary directory path (no trailing backslash).
-    static string getTempPath()
+    static move string getTempPath()
     {
         i8* buf = new i8[260];
         win_int len = os.windows.GetTempPathA(260, buf);
         if (len == 0) { delete[] buf; return ""; }
         if (len > 0 && buf[len - 1] == '\\') { buf[len - 1] = 0; len--; }
-        string s;
-        s._ptr = buf;
-        s._len = len;
-        return s;
+        return _strOwned(buf, len);
     }
 
     // Create a uniquely named temporary file in the system temp directory.
     // prefix is up to 3 characters used at the start of the filename.
     // Returns the full path, or "" on failure. Caller must delete the file when done.
-    static string getTempFile(string prefix)
+    static move string getTempFile(string prefix)
     {
         i8* tmpDir = new i8[260];
         win_int tlen = os.windows.GetTempPathA(260, tmpDir);
@@ -437,10 +424,7 @@ class Path
         win_int ok = os.windows.GetTempFileNameA(tmpDir, prefix.data(), 0, buf);
         delete[] tmpDir;
         if (ok == 0) { delete[] buf; return ""; }
-        string s;
-        s._ptr = buf;
-        s._len = strlen(buf);
-        return s;
+        return _strOwned(buf, strlen(buf));
     }
 };
 
@@ -495,7 +479,7 @@ class Directory
     static bool remove(string path) { return os.windows._rmdir(path.data()) == 0; }
 
     // Return the process current working directory.
-    static string getCurrent()
+    static move string getCurrent()
     {
         i8* buf = new i8[4096];
         i8* result = os.windows._getcwd(buf, 4096);
@@ -504,10 +488,7 @@ class Directory
             delete[] buf;
             return "";
         }
-        string s;
-        s._ptr = buf;
-        s._len = strlen(buf);
-        return s;
+        return _strOwned(buf, strlen(buf));
     }
 
     static bool setCurrent(string path)
@@ -575,7 +556,7 @@ class Directory
     }
 
     // Return the system temporary directory path (no trailing backslash).
-    static string getTemp()
+    static move string getTemp()
     {
         return Path.getTempPath();
     }
@@ -605,10 +586,7 @@ class Directory
                 int len = strlen(name);
                 i8* nameBuf = new i8[len + 1];
                 memcpy(nameBuf, name, len + 1);
-                string entry;
-                entry._ptr = nameBuf;
-                entry._len = len;
-                result->add(entry);
+                result->add(_strOwned(nameBuf, len));
             }
         } while (os.windows.FindNextFileA(handle, findData) != 0);
         os.windows.FindClose(handle);
