@@ -690,7 +690,10 @@ class ValueHolderFP : IValueFP
     int getValue() { return this.n; }
 };
 
-IValueFP makeValueHolderWithLambda(int x)
+// 'move' return: ownership of the heap ValueHolderFP transfers to the caller through the
+// interface. Without 'move' the compiler now rejects this (the caller could not see it owns
+// the boxed object). Interface locals are not auto-destructed, so the caller still 'delete's it.
+move IValueFP makeValueHolderWithLambda(int x)
 {
     ValueHolderFP* vh = new ValueHolderFP();
     vh.n = x;
@@ -704,6 +707,7 @@ bool testInterfaceReturnWithLambda()
     bool result = true;
     IValueFP v = makeValueHolderWithLambda(42);
     result &= Test("iface return after lambda", v.getValue(), 42);
+    delete v;   // v owns the heap ValueHolderFP returned through the interface
     return result;
 }
 

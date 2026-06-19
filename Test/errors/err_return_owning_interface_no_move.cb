@@ -1,0 +1,26 @@
+// Returning a heap-allocated object boxed into a NON-'move' interface return type silently
+// transfers ownership the caller cannot see (it would leak). The fix is to declare the return
+// type 'move <interface>'. This guard is scoped to interface returns only - plain owning 'T*'
+// factories remain a valid manual-memory pattern and are not rejected.
+
+interface IThing { int value(); };
+
+class Thing : IThing
+{
+    int n = 0;
+    int value() { return n; }
+};
+
+expect_error("transfers ownership the caller cannot see - it will leak") {
+    IThing makeThing()
+    {
+        Thing* t = new Thing();
+        t->n = 5;
+        return t;   // owning heap object boxed into a non-'move' interface return -> rejected
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

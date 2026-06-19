@@ -69,7 +69,7 @@ class Counted : ICounted
     ~Counted() { gDelIfaceDtorCount = gDelIfaceDtorCount + 1; }
 };
 
-ICounted makeCounted()
+move ICounted makeCounted()
 {
     Counted* c = new Counted();
     c->v = 7;
@@ -399,7 +399,7 @@ bool testMultipleInterfaces()
 // returned concrete pointer was emitted as a bare `ret ptr` (verifier failure) and
 // the boxing workaround lost the object/vtable (silent 0 result).
 
-IShape makeCircleShape(int r)
+move IShape makeCircleShape(int r)
 {
     Circle* c = new Circle();
     c.r = r;
@@ -626,7 +626,7 @@ class ClosureNode : INode
     ~ClosureNode() { gNodeDtorCount = gNodeDtorCount + 1; }
 };
 
-INode makeNode(int k)
+move INode makeNode(int k)
 {
     ClosureNode* n = new ClosureNode();
     n->k = k;

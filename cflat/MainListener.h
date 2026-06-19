@@ -781,6 +781,13 @@ private:
         {
             returnsOwned = true;
         }
+        // 'move <interface>' transfers ownership of the boxed heap object to the caller (the
+        // caller is then responsible for 'delete'). An interface return type is not Pointer
+        // (its LLVM type is a { vtable, data } fat pointer), so it needs its own case.
+        else if (returnType.IsMove && returnType.IsInterface)
+        {
+            returnsOwned = true;
+        }
 
         compiler->CreateFunctionDeclaration(name, returnType, allParams, returnType.external, varargs, returnsOwned, false, returnType.CallConv);
 
@@ -3450,6 +3457,31 @@ public:
                                 LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                         }
 
+                        // Inverse check, scoped to INTERFACE returns. A concrete implementer pointer
+                        // boxed into an interface return is still a bare pointer here (boxing happens
+                        // just below). The caller receives a { vtable, data } fat pointer with no idea
+                        // it owns the boxed heap object, so it never frees it (leak). Require
+                        // 'move <interface>' so the transfer is explicit and the caller knows to
+                        // 'delete' it (interface locals are not auto-destructed). Raw and struct 'T*'
+                        // returns are deliberately not covered - owning-pointer factories are a valid
+                        // manual-memory pattern in this codebase.
+                        if (right != nullptr && right->getType()->isPointerTy()
+                            && !llvm::isa<llvm::Constant>(right)
+                            && compiler->currentFunction != nullptr
+                            && compiler->GetFatPtrType() != nullptr
+                            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
+                            && !compiler->currentFunctionReturnsOwned
+                            && (compiler->IsOwningValue(right) || compiler->lastCallReturnsOwned
+                                || compiler->lastOwningResult))
+                        {
+                            LogErrorContext(jump, std::format(
+                                "returning a heap object boxed into interface '{}' from a non-'move' function "
+                                "transfers ownership the caller cannot see - it will leak. Declare the return "
+                                "type 'move {}' so the caller knows to 'delete' it.",
+                                compiler->currentFunctionReturnTypeName,
+                                compiler->currentFunctionReturnTypeName));
+                        }
+
                         // Bond return check: bonded value may only be returned if all its sources
                         // are 'bond' parameters of the current function (not locals).
                         auto checkBondSources = [&](const std::vector<std::string>& sources) {
@@ -4613,6 +4645,11 @@ public:
         if (returnType.TypeName == "string" && returnType.IsMove)
             returnsOwned = true;
         else if (returnType.IsMove && returnType.Pointer)
+            returnsOwned = true;
+        // 'move <interface>' transfers ownership of the boxed heap object to the caller. An
+        // interface return type is not Pointer (its LLVM type is a fat pointer), so handle it
+        // here too - mirrors the forward-declaration copy above.
+        else if (returnType.IsMove && returnType.IsInterface)
             returnsOwned = true;
 
         // Pre-scan parameter types, return type, and function body to queue and emit any
