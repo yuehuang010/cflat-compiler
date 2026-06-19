@@ -12,7 +12,7 @@ class stack<T>
         int i = 0;
         while (i < _size)
         {
-            newData[i] = _data[i];
+            newData[i] = move _data[i];
             i++;
         }
         if (_data != nullptr) delete[_] _data;
@@ -20,20 +20,26 @@ class stack<T>
         _capacity = newCap;
     }
 
-    void push(T value)
+    // Push a value. An owning element (string, nested container) is moved into the slot
+    // so the stack takes ownership; the destructor frees it. A plain copy would share the
+    // element's buffer with the caller's temporary and dangle when it frees.
+    void push(move T value)
     {
         if (_size >= _capacity) _grow();
-        _data[_size] = value;
+        _data[_size] = move value;
         _size++;
     }
 
-    T pop()
+    // Remove and return the top element, transferring ownership to the caller.
+    move T pop()
     {
         _size--;
-        return _data[_size];
+        T value = move _data[_size];
+        return value;
     }
 
-    T peek()
+    // Borrow the top element without removing it (caller must not free it).
+    alias T peek()
     {
         return _data[_size - 1];
     }
@@ -50,6 +56,17 @@ class stack<T>
 
     ~stack()
     {
+        // Destruct owning value elements (string, nested containers); raw pointer
+        // elements are left to the caller. Then free the backing buffer.
+        if const (!is_pointer(T))
+        {
+            int i = 0;
+            while (i < _size)
+            {
+                _data[i].~();
+                i++;
+            }
+        }
         if (_data != nullptr) delete[_] _data;
     }
 };

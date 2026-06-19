@@ -13,7 +13,7 @@ class queue<T>
         int i = 0;
         while (i < _size)
         {
-            newData[i] = _data[_front + i];
+            newData[i] = move _data[_front + i];
             i++;
         }
         if (_data != nullptr) delete[_] _data;
@@ -22,23 +22,28 @@ class queue<T>
         _front = 0;
     }
 
-    void enqueue(T value)
+    // Append a value. An owning element (string, nested container) is moved into the
+    // slot so the queue takes ownership; the destructor frees it. A plain copy would
+    // share the element's buffer with the caller's temporary and dangle when it frees.
+    void enqueue(move T value)
     {
         if (_size >= _capacity) _grow();
-        _data[_front + _size] = value;
+        _data[_front + _size] = move value;
         _size++;
     }
 
-    T dequeue()
+    // Remove and return the front element, transferring ownership to the caller.
+    move T dequeue()
     {
-        T value = _data[_front];
+        T value = move _data[_front];
         _front++;
         _size--;
         if (_size == 0) _front = 0;
         return value;
     }
 
-    T peek()
+    // Borrow the front element without removing it (caller must not free it).
+    alias T peek()
     {
         return _data[_front];
     }
@@ -55,6 +60,18 @@ class queue<T>
 
     ~queue()
     {
+        // Destruct owning value elements (string, nested containers); raw pointer
+        // elements are left to the caller. Then free the backing buffer. Live elements
+        // start at _front; dequeued slots ahead of it were moved out and are empty.
+        if const (!is_pointer(T))
+        {
+            int i = 0;
+            while (i < _size)
+            {
+                _data[_front + i].~();
+                i++;
+            }
+        }
         if (_data != nullptr) delete[_] _data;
     }
 };

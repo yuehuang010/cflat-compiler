@@ -1130,6 +1130,10 @@ private:
     // or a synthesized wrapper that also runs dtor-bearing members.
     std::unordered_map<std::string, llvm::Function*> fullDestructorCache_;
     std::unordered_set<std::string> fullDestructorInProgress_;
+    // Deferred `delete`-site destructor wrappers (see GetFullDestructorForDelete): bound at
+    // a delete site when the element type is not yet complete; bodies emitted at finalization.
+    std::unordered_map<std::string, llvm::Function*> deferredFullDtor_;
+    std::vector<std::string> deferredFullDtorOrder_;
     std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
@@ -2297,6 +2301,57 @@ private:
 
         b.CreateRetVoid();
         return fn;
+    }
+
+    // Resolve the destructor to call from a `delete` site. Differs from
+    // GetOrCreateFullDestructor only when the eager resolve fails: a generic container
+    // (e.g. `list<Stmt*>`) is monomorphized while its element type is still incomplete -
+    // when Stmt itself has a `list<Stmt*>` field, registering Stmt forces the list
+    // instantiation mid-registration, so `delete _data[i]` inside ~list resolves Stmt's
+    // full dtor to null and the call is baked out permanently. To avoid that, bind the
+    // delete to a stable forward-declared `<type>.dtordeferred` symbol whose body is
+    // emitted at finalization (EmitDeferredFullDestructorBodies), once every type is
+    // complete. The boolean callers of GetOrCreateFullDestructor are unaffected.
+    llvm::Function* GetFullDestructorForDelete(const std::string& typeName)
+    {
+        if (llvm::Function* eager = GetOrCreateFullDestructor(typeName))
+            return eager;
+        // Eager resolve failed: trivially-destructible OR not-yet-complete. Only data
+        // structures can need a (possibly recursive) destructor; anything else is null.
+        if (dataStructures.find(typeName) == dataStructures.end())
+            return nullptr;
+        if (auto it = deferredFullDtor_.find(typeName); it != deferredFullDtor_.end())
+            return it->second;
+        auto* voidTy   = llvm::Type::getVoidTy(*context);
+        auto* selfPtrTy = llvm::PointerType::get(*context, 0);
+        auto* fnTy = llvm::FunctionType::get(voidTy, { selfPtrTy }, false);
+        auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                          typeName + ".dtordeferred", *module);
+        fn->arg_begin()->setName("self");
+        deferredFullDtor_[typeName] = fn;
+        deferredFullDtorOrder_.push_back(typeName);
+        return fn;
+    }
+
+    // Emit bodies for every deferred destructor wrapper handed out by
+    // GetFullDestructorForDelete. Called once at finalization, when all types (and their
+    // monomorphizations) are complete, so the real full destructor now resolves. The
+    // wrapper simply forwards to it (null-guarded by the delete call site); a type that
+    // turns out trivially-destructible gets an empty body, so the bound call is a no-op.
+    void EmitDeferredFullDestructorBodies()
+    {
+        for (const std::string& typeName : deferredFullDtorOrder_)
+        {
+            llvm::Function* fn = deferredFullDtor_[typeName];
+            if (!fn->empty())
+                continue;
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            auto* self = &*fn->arg_begin();
+            if (llvm::Function* real = GetOrCreateFullDestructor(typeName))
+                b.CreateCall(real->getFunctionType(), real, { self });
+            b.CreateRetVoid();
+        }
     }
 
     bool HasUserCopyMethod(const std::string& typeName) const

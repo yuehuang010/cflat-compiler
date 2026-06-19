@@ -594,6 +594,47 @@ int testQueue()
     return passed;
 }
 
+// ── stack/queue with owning string elements ──────────────────────────────────
+// Regression: push/enqueue must MOVE an owning element into the slot (take ownership),
+// not shallow-copy it. A copy shares the element's heap buffer with the caller's
+// temporary, which frees it at end of statement, leaving the slot dangling (asan:
+// heap-use-after-free on peek/pop/dequeue). pop/dequeue transfer ownership back out;
+// the destructor frees any elements still held. Run under --asan / HeapAudit to also
+// confirm no leak/double-free; a corrupted content assertion here flags the dangle.
+
+int testStackQueueOwning()
+{
+    int passed = 0;
+
+    // stack<string>: owned elements survive push (no dangle) and pop in LIFO order.
+    {
+        stack<string> s;
+        s.push("" + "alpha");
+        s.push("" + "beta");
+        s.push("" + "gamma");
+        passed += Test("stack<string> peek", s.peek(), "gamma");
+        passed += Test("stack<string> pop 1", s.pop(), "gamma");
+        passed += Test("stack<string> pop 2", s.pop(), "beta");
+        // "alpha" is left in the stack: the destructor must free it (no leak).
+    }
+
+    // queue<string>: FIFO, and exercise the _front offset - dequeue, enqueue more, then
+    // let the destructor drain the rest (live elements sit at _front, not index 0).
+    {
+        queue<string> q;
+        q.enqueue("" + "one");
+        q.enqueue("" + "two");
+        passed += Test("queue<string> peek", q.peek(), "one");
+        passed += Test("queue<string> dequeue 1", q.dequeue(), "one");
+        q.enqueue("" + "three");
+        passed += Test("queue<string> dequeue 2", q.dequeue(), "two");
+        passed += Test("queue<string> peek after", q.peek(), "three");
+        // "three" is left at the advanced _front: the destructor must free it.
+    }
+
+    return passed;
+}
+
 // ── for ──────────────────────────────────────────────────────────────────
 
 int testFor()
@@ -1765,6 +1806,7 @@ extern int main()
     r = testPair();             passed += r; total += 8;
     r = testStack();            passed += r; total += 8;
     r = testQueue();            passed += r; total += 8;
+    r = testStackQueueOwning(); passed += r; total += 7;
     r = testFor();              passed += r; total += 10;
     r = testString();           passed += r; total += 22;
     r = testStringConcat();     passed += r; total += 10;

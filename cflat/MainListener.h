@@ -10134,7 +10134,7 @@ public:
         // would crash on the first null child.
         if (!isArray && !typeName.empty())
         {
-            if (auto* dtor = compiler->GetOrCreateFullDestructor(typeName))
+            if (auto* dtor = compiler->GetFullDestructorForDelete(typeName))
             {
                 auto* nullPtr = llvm::ConstantPointerNull::get(
                     llvm::cast<llvm::PointerType>(ptrVal->getType()));
@@ -10154,7 +10154,7 @@ public:
         llvm::Value* freeBase = ptrVal;
         if (hasSizeExpr && !isRawFree && compiler->IsDataStructure(typeName) && !elemIsPtr)
         {
-            llvm::Function* elemDtor = compiler->GetOrCreateFullDestructor(typeName);
+            llvm::Function* elemDtor = compiler->GetFullDestructorForDelete(typeName);
             if (elemDtor)
             {
                 auto* i64Ty = compiler->builder->getInt64Ty();

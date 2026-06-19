@@ -288,6 +288,43 @@ int testDeleteNullCascade()
     return passed;
 }
 
+// Recursive container: a node owns its children in a `list<TreeBox*>` field. Because
+// TreeBox's own field forces `list<TreeBox*>` to be monomorphized while TreeBox is still
+// incomplete, the generic list destructor used to bind its element `delete` to a null
+// destructor and leak the entire subtree. The deferred delete-site destructor fix makes
+// `~list<TreeBox*>` free each element (recursing through this destructor).
+struct TreeBox
+{
+    int id = 0;
+    list<TreeBox*> children = default;
+    ~TreeBox()
+    {
+        dtorCount = dtorCount + 1;
+    }
+};
+
+int testRecursiveContainerFree()
+{
+    int passed = 0;
+
+    // 3-deep chain held through list<TreeBox*> fields: root -> child -> grandchild.
+    // When 'roots' goes out of scope, ~list frees root; ~TreeBox destructs root.children,
+    // which frees child; and so on. All three freed exactly once.
+    dtorCount = 0;
+    {
+        list<TreeBox*> roots;
+        TreeBox* root  = new TreeBox(); root->id  = 1;
+        TreeBox* child = new TreeBox(); child->id = 2;
+        TreeBox* grand = new TreeBox(); grand->id = 3;
+        child->children.add(grand);
+        root->children.add(child);
+        roots.add(root);
+    }
+    passed += Test("recursive_container_frees_all", dtorCount, 3);
+
+    return passed;
+}
+
 int testFieldOwnership()
 {
     int passed = 0;
@@ -678,6 +715,9 @@ extern int main()
     total += 1;
 
     passed += testDeleteNullCascade();
+    total += 1;
+
+    passed += testRecursiveContainerFree();
     total += 1;
 
     passed += testFieldOwnership();

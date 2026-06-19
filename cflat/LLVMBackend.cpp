@@ -620,6 +620,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
             auto walker = antlr4::tree::ParseTreeWalker();
             walker.walk(myListener.get(), computeUnit);
+            // Now that every type and generic monomorphization is registered, fill in the
+            // bodies of deferred delete-site destructor wrappers (recursive containers whose
+            // element type was incomplete when the container dtor was emitted).
+            EmitDeferredFullDestructorBodies();
         }
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
@@ -1860,6 +1864,10 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
+        // Now that every type and generic monomorphization is registered, fill in the
+        // bodies of deferred delete-site destructor wrappers (recursive containers whose
+        // element type was incomplete when the container dtor was emitted).
+        EmitDeferredFullDestructorBodies();
         stream.close();
     }
     catch (CompilerAbortException&) { return false; }
@@ -1923,6 +1931,10 @@ void LLVMBackend::ResetForReanalysis()
     // wrongly short-circuit on the next file.
     fullDestructorCache_.clear();
     fullDestructorInProgress_.clear();
+    // Deferred delete-site dtor wrappers are also module-bound Function* objects (same
+    // stale-pointer crash class as fullDestructorCache_), so discard them with the module.
+    deferredFullDtor_.clear();
+    deferredFullDtorOrder_.clear();
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
