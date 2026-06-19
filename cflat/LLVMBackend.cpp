@@ -906,41 +906,58 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
 {
     auto importingDir = std::filesystem::path(importingFilePath).parent_path();
 
-    std::error_code ec;
-    auto canonical = std::filesystem::canonical((importingDir / importFilename).lexically_normal(), ec);
+    // Resolve a candidate filename against the full import search order. Returns the canonical
+    // path on success, or an empty string if it was not found in any search location.
+    auto resolve = [&](const std::string& filename) -> std::string {
+        std::error_code ec;
+        auto canonical = std::filesystem::canonical((importingDir / filename).lexically_normal(), ec);
 
-    // Try an additional base directory (no-op if already resolved or dir is empty).
-    auto tryDir = [&](const std::filesystem::path& dir) {
-        if (!ec || dir.empty()) return;
-        canonical = std::filesystem::canonical((dir / importFilename).lexically_normal(), ec);
+        // Try an additional base directory (no-op if already resolved or dir is empty).
+        auto tryDir = [&](const std::filesystem::path& dir) {
+            if (!ec || dir.empty()) return;
+            canonical = std::filesystem::canonical((dir / filename).lexically_normal(), ec);
+        };
+
+        // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
+        tryDir(sourceFileDir_);
+        tryDir(importSearchDir);
+        // C library headers (e.g. "curl/curl.h") live under the --c-include roots.
+        for (const auto& inc : cIncludeDirs_) tryDir(inc);
+        // Implicit fallback: look in the "core" directory beside the runtime.
+        if (!runtimeDir.empty()) tryDir(std::filesystem::path(runtimeDir) / "core");
+        // System headers (e.g. windows.h) live in the Windows SDK include dirs. Fall back to the
+        // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
+        // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
+        for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
+        return ec ? std::string() : canonical.string();
     };
 
-    // For LSP analysis: the "importing" file is a temp file; try the real source directory first.
-    tryDir(sourceFileDir_);
-    tryDir(importSearchDir);
-    // C library headers (e.g. "curl/curl.h") live under the --c-include roots.
-    for (const auto& inc : cIncludeDirs_) tryDir(inc);
-    // Implicit fallback: look in the "core" directory beside the runtime.
-    if (!runtimeDir.empty()) tryDir(std::filesystem::path(runtimeDir) / "core");
-    // System headers (e.g. windows.h) live in the Windows SDK include dirs. Fall back to the
-    // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
-    // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
-    for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
-    if (ec)
+    if (auto resolved = resolve(importFilename); !resolved.empty())
     {
-        if (!quiet)
-            std::cout << std::format(
-                "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}).\n",
-                importFilename,
-                importingDir.string(),
-                sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",
-                importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'",
-                cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)",
-                runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'");
-        return false;
+        outCanonical = resolved;
+        return true;
     }
-    outCanonical = canonical.string();
-    return true;
+
+    if (!quiet)
+    {
+        // If the bare filename (with any directory prefix stripped) would resolve, suggest it.
+        // Catches the common `import "core/list.cb"` mistake where `list.cb` is the valid path.
+        std::string suggestion;
+        auto bare = std::filesystem::path(importFilename).filename().string();
+        if (bare != importFilename && !resolve(bare).empty())
+            suggestion = " Did you mean \"" + bare + "\"?";
+
+        std::cout << std::format(
+            "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}).{}\n",
+            importFilename,
+            importingDir.string(),
+            sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",
+            importSearchDir.empty() ? "" : ", import dir '" + importSearchDir + "'",
+            cIncludeDirs_.empty() ? "" : ", " + std::to_string(cIncludeDirs_.size()) + " --c-include dir(s)",
+            runtimeDir.empty() ? "" : ", runtime core '" + runtimeDir + "/core'",
+            suggestion);
+    }
+    return false;
 }
 
 // Bind a grouped import `import { "a", "b" } lib {...} define ...;`. Non-header entries route

@@ -14,7 +14,7 @@ cflat.exe hello.cb -o hello.exe
 ```
 
 ```c
-import "core/list.cb";
+import "list.cb";
 
 extern int main() {
     list<int> nums;

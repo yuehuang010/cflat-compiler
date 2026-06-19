@@ -1310,8 +1310,8 @@ errors. A bare-identifier RHS that does not name a known type is treated as a na
 Split code across multiple files with `import`:
 
 ```c
-import "utils.cb";
-import "math/vector.cb";
+import "list.cb";
+import "dictionary.cb";
 ```
 
 Imported functions, structs, and namespaces are available immediately after the import.
@@ -1322,7 +1322,7 @@ A brace-wrapped comma list imports several files on one line - a shorthand for w
 same plain `import "x";` statements separately:
 
 ```c
-import { "utils.cb", "math/vector.cb" };
+import { "list.cb", "dictionary.cb" };
 import { "sqlite3.h", "sqlite3.c" };   // binds the header, compiles the .c (see C Interop)
 ```
 
