@@ -43,7 +43,7 @@ def collect_files() -> list[Path]:
     return files
 
 
-def run_bulk(exe: str, extra_args: list) -> bool:
+def run_bulk(exe: str, extra_args: list, show_timings: bool = False) -> bool:
     paths = collect_files()
     print(f"Server: {exe}")
     print(f"Files:  {len(paths)}")
@@ -64,9 +64,11 @@ def run_bulk(exe: str, extra_args: list) -> bool:
         failures: list[tuple[Path, str]] = []
         total = len(paths)
 
-        # uri -> (index, path)
-        in_flight: dict[str, tuple[int, Path]] = {}
+        # uri -> (index, path, submit_time)
+        in_flight: dict[str, tuple[int, Path, float]] = {}
         next_idx = 0
+        # (path, seconds) for every completed file, for an end-of-run summary.
+        timings: list[tuple[Path, float]] = []
 
         def submit_one() -> bool:
             nonlocal next_idx
@@ -81,7 +83,7 @@ def run_bulk(exe: str, extra_args: list) -> bool:
                     nonlocal_failed_inc(e, path)
                     continue
                 uri = path.resolve().as_uri()
-                in_flight[uri] = (i, path)
+                in_flight[uri] = (i, path, time.monotonic())
                 client.notify("textDocument/didOpen", {
                     "textDocument": {
                         "uri":        uri,
@@ -111,11 +113,13 @@ def run_bulk(exe: str, extra_args: list) -> bool:
             uri = notif["params"]["uri"]
             if uri not in in_flight:
                 continue  # stale or unrelated publish
-            i, path = in_flight.pop(uri)
+            i, path, submitted_at = in_flight.pop(uri)
+            secs = time.monotonic() - submitted_at
+            timings.append((path, secs))
             diags = notif["params"]["diagnostics"]
             errors = [d for d in diags if d.get("severity", 1) == ERROR_SEVERITY]
             if errors:
-                print(f"  FAIL  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}  ({len(errors)} error diagnostic(s))")
+                print(f"  FAIL  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}  ({secs:6.2f}s, {len(errors)} error diagnostic(s))")
                 failed += 1
                 summary = " | ".join(
                     f"L{d.get('range', {}).get('start', {}).get('line', '?')+1}: {d.get('message','')}"
@@ -123,7 +127,7 @@ def run_bulk(exe: str, extra_args: list) -> bool:
                 )
                 failures.append((path, summary))
             else:
-                print(f"  PASS  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}")
+                print(f"  PASS  [{i+1:>3}/{total}] {path.relative_to(REPO_ROOT)}  ({secs:6.2f}s)")
                 passed += 1
             client.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
             # Refill the pipeline.
@@ -132,6 +136,15 @@ def run_bulk(exe: str, extra_args: list) -> bool:
         failed += _counters["failed"]
         elapsed = time.monotonic() - started_at
         print(f"\n{passed} passed, {failed} failed in {elapsed:.1f}s")
+
+        # Per-file wall-clock latency (submit -> diagnostics). Files run concurrently
+        # in the pipeline, so these include queueing time, not pure analysis cost.
+        # Opt-in via --timings; off by default to keep the normal sweep output terse.
+        if show_timings and timings:
+            print("\n--- slowest files (wall-clock latency, includes pipeline queueing) ---")
+            for p, secs in sorted(timings, key=lambda t: t[1], reverse=True)[:15]:
+                print(f"  {secs:6.2f}s  {p.relative_to(REPO_ROOT)}")
+
         if failures:
             print("\n--- failures ---")
             for p, msg in failures:
@@ -155,22 +168,27 @@ def run_bulk(exe: str, extra_args: list) -> bool:
 
 
 def main():
+    # --timings opts into the "slowest files" summary; it is not an LSP server arg.
+    argv = sys.argv[1:]
+    show_timings = "--timings" in argv
+    argv = [a for a in argv if a != "--timings"]
+
     extra_args: list[str] = []
     exe: str | None = None
-    if len(sys.argv) >= 2:
-        first = sys.argv[1]
+    if argv:
+        first = argv[0]
         if Path(first).exists() and first.lower().endswith(".exe"):
             exe = first
-            extra_args = sys.argv[2:]
+            extra_args = argv[1:]
         else:
-            extra_args = sys.argv[1:]
+            extra_args = argv
     if exe is None:
         exe = find_exe()
         if exe is None:
             print("error: cflat.exe not found. Build first or pass the path.", file=sys.stderr)
             sys.exit(1)
 
-    ok = run_bulk(exe, extra_args)
+    ok = run_bulk(exe, extra_args, show_timings)
     sys.exit(0 if ok else 1)
 
 
