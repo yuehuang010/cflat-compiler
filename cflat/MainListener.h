@@ -13581,6 +13581,11 @@ public:
                     len = compiler->builder->CreateAnd(
                         compiler->builder->CreateExtractValue(strVal, { 1u }),
                         compiler->builder->getInt32(0x7FFFFFFF));
+                    // `operator string` heap-allocates an owned conversion temp (e.g. int -> string).
+                    // __strconcat only reads its bytes, so register the temp for end-of-statement
+                    // cleanup or it leaks. (String args are already-registered operator+ temps or
+                    // borrowed locals, so they need no registration here - hence only this branch.)
+                    compiler->RegisterOwnedStringTemp(strVal);
                 }
 
                 segments.push_back({ ptr, len });

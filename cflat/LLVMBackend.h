@@ -8514,7 +8514,14 @@ public:
                     if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
                     else if (tmpArg.IsTypePromotion(tmpParam))
-                        result = tmpArg.IsInteger();  // positive: widening
+                    {
+                        // Positive = widening promotion (valid but non-perfect). Integer promotions
+                        // report the source bit width; a floating-point promotion (float -> double)
+                        // is not an integer, so IsInteger() returns -1 - use 1 so float -> double
+                        // still scores as a valid promotion instead of a spurious no-match.
+                        int bits = tmpArg.IsInteger();
+                        result = (bits != -1) ? bits : 1;
+                    }
                     else
                     {
                         // Same signedness group: int<->i32, long<->i64, char<->i8, etc.

@@ -1184,6 +1184,17 @@ bool testFormatString()
 	string pointStr = "Point is {p}.";
 	result &= Test("fmt_object", pointStr.data(), "Point is 10, 20.");
 
+    // Numeric interpolation: int goes through operator string(i32); float must
+    // promote to operator string(double) (regression for float -> double overload
+    // resolution). The owned conversion temp is freed at end of statement (no leak).
+    int n = 7;
+    string intStr = "n={n}";
+    result &= Test("fmt_int", intStr.data(), "n=7");
+
+    float f = 1.5;
+    string floatStr = "f={f}";
+    result &= Test("fmt_float", floatStr.data(), "f=1.5");
+
     return result;
 }
 
