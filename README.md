@@ -4,11 +4,9 @@ A C-dialect language with modern features, compiled to LLVM IR.
 
 CFlat (`.cb`) extends C with generics, interfaces, namespaces, operator overloading, and null-safety - while keeping C's familiar syntax and control.
 
-## Requirements
-
-cflat links native Windows executables, so the **Windows SDK** is required to build and run the hello app. You do not need to install it separately - it ships with the **"Desktop development with C++"** workload in [Visual Studio 2022](https://visualstudio.microsoft.com/vs/).
-
 ## Quick Start
+
+cflat is self-contained on Windows 10 and later - it links native executables without the Windows SDK or Visual Studio. The hello app below builds and runs on a clean machine. (The Windows SDK is only needed for advanced C interop against prebuilt system libraries; cflat falls back to it automatically when present.)
 
 ```bash
 # Compile a source file to native executable
