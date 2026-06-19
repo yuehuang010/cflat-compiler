@@ -4,6 +4,7 @@
   "dependencies": [
     "antlr4",
     "llvm",
-    "nlohmann-json"
+    "nlohmann-json",
+    "simdjson"
   ]
 }

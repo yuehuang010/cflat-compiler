@@ -29,3 +29,11 @@ This software builds against LLVM, which is licensed under the Apache License
 
 This software builds against ANTLR4, which is licensed under the BSD 3-Clause
 License. See https://www.antlr.org/license.html for the full text.
+
+This software builds against simdjson, which is licensed under the Apache
+License 2.0. See https://github.com/simdjson/simdjson/blob/master/LICENSE for
+the full text.
+
+This software builds against nlohmann/json, which is licensed under the MIT
+License. Copyright (c) 2013-2025 Niels Lohmann. See
+https://github.com/nlohmann/json/blob/master/LICENSE.MIT for the full text.

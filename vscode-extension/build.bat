@@ -13,8 +13,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Install dependencies if node_modules is missing
+REM Install deps if node_modules is missing OR out of sync with package.json.
+REM A bare "exist node_modules" check misses partial installs (e.g. esbuild
+REM absent), so also probe a known build-time dependency.
 if not exist node_modules (
+    set NEED_INSTALL=1
+) else if not exist node_modules\esbuild (
+    set NEED_INSTALL=1
+) else (
+    set NEED_INSTALL=0
+)
+if "%NEED_INSTALL%"=="1" (
     echo [1/2] Installing npm dependencies...
     call npm install
     if errorlevel 1 (

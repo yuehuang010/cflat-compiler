@@ -47,6 +47,7 @@
 #include <llvm\Support\FileSystem.h>
 #include <llvm\Support\MemoryBuffer.h>
 #include <llvm\Support\JSON.h>
+#include <simdjson.h>   // fast read path for the C-header disk cache (parse only; writes stay nlohmann)
 #include <llvm\Support\Path.h>
 #include <llvm\Support\Program.h>
 #include <llvm\Support\TimeProfiler.h>
@@ -11058,6 +11059,111 @@ public:
         return h;
     }
 
+    // Read-only adapter exposing the nlohmann subset the *FromJson converters use, backed by a
+    // simdjson DOM element. Keeps converter bodies unchanged while parsing with simdjson.
+    // Lifetime: the backing simdjson::dom::parser + padded_string must outlive every SjVal
+    // (all use is inside TryLoadCHeaderDiskCache). String reads return owning std::string copies.
+    struct SjVal
+    {
+        simdjson::dom::element e{};
+        bool ok = false;                 // false => missing/errored element, behaves as JSON null
+        mutable std::vector<SjVal> kids_;
+        mutable bool kidsBuilt_ = false;
+
+        SjVal() = default;
+        explicit SjVal(simdjson::dom::element el) : e(el), ok(true) {}
+
+        bool contains(std::string_view key) const
+        {
+            if (!ok) return false;
+            simdjson::dom::element t;
+            return e.at_key(key).get(t) == simdjson::SUCCESS;
+        }
+        SjVal operator[](std::string_view key) const
+        {
+            simdjson::dom::element t;
+            if (ok && e.at_key(key).get(t) == simdjson::SUCCESS) return SjVal{t};
+            return SjVal{};
+        }
+        SjVal at(std::string_view key) const { return (*this)[key]; }
+
+        // String read: copy out of the parser buffer so the result can outlive the parser.
+        std::string value(std::string_view key, std::string_view defv) const
+        {
+            if (ok)
+            {
+                simdjson::dom::element t; std::string_view sv;
+                if (e.at_key(key).get(t) == simdjson::SUCCESS && t.get(sv) == simdjson::SUCCESS)
+                    return std::string(sv);
+            }
+            return std::string(defv);
+        }
+        bool value(std::string_view key, bool defv) const
+        {
+            if (ok)
+            {
+                simdjson::dom::element t; bool b;
+                if (e.at_key(key).get(t) == simdjson::SUCCESS && t.get(b) == simdjson::SUCCESS)
+                    return b;
+            }
+            return defv;
+        }
+        // Integer read with the coercion nlohmann did implicitly: simdjson categorizes a number
+        // at parse time, so a value that fits int64 is stored as int64 and get_uint64 would reject
+        // it. Try uint64 -> int64 -> double so float-bits (fvb), array sizes, lanes, etc. survive.
+        template <class T, std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool>, int> = 0>
+        T value(std::string_view key, T defv) const
+        {
+            if (!ok) return defv;
+            simdjson::dom::element t;
+            if (e.at_key(key).get(t) != simdjson::SUCCESS) return defv;
+            uint64_t u; if (t.get(u) == simdjson::SUCCESS) return static_cast<T>(u);
+            int64_t  i; if (t.get(i) == simdjson::SUCCESS) return static_cast<T>(i);
+            double   d; if (t.get(d) == simdjson::SUCCESS) return static_cast<T>(d);
+            return defv;
+        }
+        // Replaces the single nlohmann j["idims"].get<std::vector<uint64_t>>() site.
+        std::vector<uint64_t> to_u64_vector() const
+        {
+            std::vector<uint64_t> out;
+            simdjson::dom::array arr;
+            if (ok && e.get(arr) == simdjson::SUCCESS)
+                for (auto x : arr)
+                {
+                    uint64_t u; int64_t i; double d;
+                    if      (x.get(u) == simdjson::SUCCESS) out.push_back(u);
+                    else if (x.get(i) == simdjson::SUCCESS) out.push_back(static_cast<uint64_t>(i));
+                    else if (x.get(d) == simdjson::SUCCESS) out.push_back(static_cast<uint64_t>(d));
+                }
+            return out;
+        }
+        // Replaces the nlohmann j["ps"].get<std::vector<std::string>>() site (func-macro params).
+        std::vector<std::string> to_string_vector() const
+        {
+            std::vector<std::string> out;
+            simdjson::dom::array arr;
+            if (ok && e.get(arr) == simdjson::SUCCESS)
+                for (auto x : arr)
+                {
+                    std::string_view sv;
+                    if (x.get(sv) == simdjson::SUCCESS) out.emplace_back(sv);
+                }
+            return out;
+        }
+        // Range-for support: materialize array children as SjVal once, so iterators stay valid for
+        // the loop (the range temporary's lifetime is extended). Non-arrays yield an empty range.
+        void buildKids() const
+        {
+            if (kidsBuilt_) return;
+            kidsBuilt_ = true;
+            simdjson::dom::array arr;
+            if (ok && e.get(arr) == simdjson::SUCCESS)
+                for (auto x : arr) kids_.push_back(SjVal{x});
+        }
+        std::vector<SjVal>::const_iterator begin() const { buildKids(); return kids_.begin(); }
+        std::vector<SjVal>::const_iterator end()   const { buildKids(); return kids_.end(); }
+    };
+
     static nlohmann::json TvToJson(const TypeAndValue& tv)
     {
         nlohmann::json j;
@@ -11088,7 +11194,7 @@ public:
         }
         return j;
     }
-    static TypeAndValue TvFromJson(const nlohmann::json& j)
+    static TypeAndValue TvFromJson(const SjVal& j)
     {
         TypeAndValue tv;
         tv.TypeName       = j.value("t",   std::string{});
@@ -11097,7 +11203,7 @@ public:
         tv.IsMove         = j.value("mv",  false);
         tv.CallConv = static_cast<CallingConv>(j.value("cc", 0));
         tv.ConstArraySize = j.value("arr", uint64_t{0});
-        if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].get<std::vector<uint64_t>>();
+        if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].to_u64_vector();
         tv.IsSimd   = j.value("sd",  false);
         tv.SimdLanes = j.value("sdl", uint64_t{0});
         tv.IsArrayView = j.value("av", false);
@@ -11126,7 +11232,7 @@ public:
         return {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
                 {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
     }
-    static CSigEntry SigFromJson(const nlohmann::json& j)
+    static CSigEntry SigFromJson(const SjVal& j)
     {
         CSigEntry e;
         e.name     = j.value("n",  std::string{});
@@ -11142,7 +11248,7 @@ public:
     {
         return {{"n", e.name}, {"v", e.value}, {"ln", e.line}, {"co", e.col}};
     }
-    static CEnumEntry EnumFromJson(const nlohmann::json& j)
+    static CEnumEntry EnumFromJson(const SjVal& j)
     {
         return {j.value("n", std::string{}), j.value("v", 0LL), j.value("ln", 1), j.value("co", 0)};
     }
@@ -11151,7 +11257,7 @@ public:
     {
         return {{"n", g.name}, {"t", TvToJson(g.type)}, {"ln", g.line}, {"co", g.col}};
     }
-    static CGlobalEntry GlobalFromJson(const nlohmann::json& j)
+    static CGlobalEntry GlobalFromJson(const SjVal& j)
     {
         CGlobalEntry g;
         g.name = j.value("n", std::string{});
@@ -11167,7 +11273,7 @@ public:
         if (f.isBitfield) { j["bf"] = true; j["bw"] = f.bitWidth; }
         return j;
     }
-    static CRecordFieldEntry FieldFromJson(const nlohmann::json& j)
+    static CRecordFieldEntry FieldFromJson(const SjVal& j)
     {
         CRecordFieldEntry f;
         f.name      = j.value("n",  std::string{});
@@ -11185,7 +11291,7 @@ public:
         if (r.isUnion) j["u"] = true;
         return j;
     }
-    static CRecordEntry RecordFromJson(const nlohmann::json& j)
+    static CRecordEntry RecordFromJson(const SjVal& j)
     {
         CRecordEntry r;
         r.name    = j.value("n", std::string{});
@@ -11215,7 +11321,7 @@ public:
         if (!m.intTypeName.empty()) j["ity"] = m.intTypeName;
         return j;
     }
-    static CMacroEntry MacroFromJson(const nlohmann::json& j)
+    static CMacroEntry MacroFromJson(const SjVal& j)
     {
         CMacroEntry m;
         m.name      = j.value("n",   std::string{});
@@ -11243,7 +11349,7 @@ public:
         return {{"n", m.name}, {"ps", m.params}, {"b", m.body},
                 {"f", m.file}, {"ln", m.line},   {"co", m.col}};
     }
-    static CFunctionMacroEntry FuncMacroFromJson(const nlohmann::json& j)
+    static CFunctionMacroEntry FuncMacroFromJson(const SjVal& j)
     {
         CFunctionMacroEntry m;
         m.name = j.value("n",  std::string{});
@@ -11251,7 +11357,7 @@ public:
         m.file = j.value("f",  std::string{});
         m.line = j.value("ln", 1);
         m.col  = j.value("co", 0);
-        if (j.contains("ps")) m.params = j["ps"].get<std::vector<std::string>>();
+        if (j.contains("ps")) m.params = j["ps"].to_string_vector();
         return m;
     }
 
@@ -11277,14 +11383,19 @@ public:
         auto cachePath = cacheDir / std::format("{:016x}.json", diskKey);
         if (!fs::exists(cachePath, ec)) return false;
 
-        std::ifstream f(cachePath);
-        if (!f.is_open()) return false;
-        nlohmann::json j;
+        // parser + jsonBuf own the storage that doc/SjVal reference; keep them alive for the
+        // whole function. Reads run through SjVal (simdjson DOM); writes still use nlohmann.
+        simdjson::dom::parser parser;
+        simdjson::padded_string jsonBuf;
+        simdjson::dom::element doc;
+        SjVal j;
         {
-            // Raw tokenize -> DOM. This is the portion a SIMD JSON parser would replace;
-            // it stays a distinct span so a future migration can be measured before/after.
             llvm::TimeTraceScope parseScope("CHeaderJsonParse", cachePath.string());
-            try { f >> j; } catch (...) { return false; }
+            auto loaded = simdjson::padded_string::load(cachePath.string());
+            if (loaded.error()) return false;
+            jsonBuf = std::move(loaded.value());
+            if (parser.parse(jsonBuf).get(doc) != simdjson::SUCCESS) return false;
+            j = SjVal{doc};
         }
 
         int version = j.value("version", 0);
