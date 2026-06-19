@@ -435,7 +435,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
-    // --heap-audit: pull in the leak/double-free oracle so its hooks and C backing object
+    // --heap-audit: pull in the leak oracle so its hooks and C backing object
     // are linked, then InjectHeapAuditIntoMain() wires it into main below. Done here (not via
     // a source import) so any program is auditable without editing it. This is a normal
     // on-demand import - parsed even when the core bitcode cache above was hot.

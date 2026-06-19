@@ -1,4 +1,4 @@
-// heap_audit.c - timing-independent double-free / heap-audit detector for cflat.
+// heap_audit.c - leak detector for cflat.
 //
 // Opt-in debugging tool. core/diagnostic/heap_audit.cb imports this file (so it is
 // compiled by clang-cl and merged into the image by lld-link, like crashdump.c) and
@@ -6,15 +6,13 @@
 // __free_audit_hook in memory.cb) to point at the two entry points below.
 //
 // Every allocation that flows through operator new is recorded live (with its size);
-// every free that flows through operator delete is checked. A free of a pointer that
-// is already recorded freed is reported as a DOUBLE FREE ("ptr=0x... size=...") to
-// stderr. The report is advisory and non-fatal (report-only, like a LEAK): it does
-// NOT abort the process. A FREED-slot free is not always a true double-free - enable()
-// is installed at main entry, so allocations made before then (C-runtime/static init)
-// are untracked, and CRT address reuse can make an untracked operator delete land on a
-// stale FREED slot. Aborting on that would kill memory-correct programs, so it is
-// surfaced as a signal to investigate, not a hard failure. The reported size may be
-// stale (from whatever last allocated that address) for the same reason.
+// every free that flows through operator delete flips the matching record to freed.
+// At a quiescent point cflat_heap_audit_report_leaks() walks the table and reports every
+// allocation still live (a LEAK) to stderr. Reports are advisory and non-fatal: they do
+// NOT change the exit code or abort. Double-free detection is intentionally NOT provided
+// here - operator new/delete share the CRT heap with raw malloc/free, so a freed address
+// reused by a raw allocator and later operator-deleted is indistinguishable from a real
+// double free; --asan is the deterministic oracle for double-free / use-after-free.
 //
 // Output goes through Win32 WriteFile (GetStdHandle(STD_ERROR_HANDLE)) rather than the
 // CRT's stdio: cflat's runtime (cruntime.cb) defines its own strong sprintf/vsprintf,
@@ -172,37 +170,13 @@ void cflat_heap_audit_alloc(void* p, unsigned long long size)
     LeaveCriticalSection(&cflat_ha_lock);
 }
 
-// Report a double free. Report-only: print to stderr and return; do NOT abort.
-//
-// A FREED-slot free is not always a real double-free. enable() is installed at main
-// entry, so any buffer allocated before then (C-runtime/static initializers) is
-// untracked; when the CRT later reuses such a freed address through a path the alloc
-// hook never saw, an operator delete can land on a stale FREED slot and look like a
-// double free. Aborting on that would kill memory-correct programs, so this is advisory
-// only - same policy as a LEAK report. The reported size may be stale (from whatever
-// last allocated that address) for the same reason.
-static void cflat_ha_report_double_free_(void* p, unsigned long long size)
-{
-    char line[160];
-    int pos = 0;
-    cflat_ha_append_(line, sizeof(line), &pos,
-                     "\n*** cflat heap-audit: DOUBLE FREE ptr=0x");
-    cflat_ha_append_hex_(line, sizeof(line), &pos, (unsigned long long)(ULONG_PTR)p, 0);
-    cflat_ha_append_(line, sizeof(line), &pos, " size=");
-    cflat_ha_append_dec_(line, sizeof(line), &pos, size);
-    cflat_ha_append_(line, sizeof(line), &pos, " thread=");
-    cflat_ha_append_dec_(line, sizeof(line), &pos, (unsigned long long)GetCurrentThreadId());
-    cflat_ha_append_(line, sizeof(line), &pos, " ***\n");
-    cflat_ha_write_stderr_(line);
-}
-
-// Check/record a free. Double free -> report (advisory, non-fatal). Live -> mark freed
-// (keep size). Unknown pointer (allocated before enable(), or evicted) -> ignore.
+// Record a free: flip a tracked LIVE allocation to FREED so the leak scan does not report
+// it. A FREED slot is left in place (an allocation reusing the address flips it back to
+// LIVE in the alloc hook). Unknown pointers (allocated before enable(), or evicted) are
+// ignored. No double-free detection - see the file header and use --asan instead.
 void cflat_heap_audit_free(void* p)
 {
     if (p == NULL || !cflat_ha_lock_ready) return;
-    int doubleFree = 0;
-    unsigned long long size = 0;
     EnterCriticalSection(&cflat_ha_lock);
     unsigned int idx = cflat_ha_hash_(p);
     for (unsigned int probe = 0; probe < CFLAT_HA_SLOTS; ++probe)
@@ -212,23 +186,12 @@ void cflat_heap_audit_free(void* p)
             break;  // pointer not tracked - ignore
         if (slot->key == p)
         {
-            if (slot->state == CFLAT_HA_STATE_FREED)
-            {
-                doubleFree = 1;
-                size = slot->size;
-            }
-            else
-            {
-                slot->state = CFLAT_HA_STATE_FREED;
-            }
+            slot->state = CFLAT_HA_STATE_FREED;
             break;
         }
         idx = (idx + 1u) & CFLAT_HA_MASK;
     }
     LeaveCriticalSection(&cflat_ha_lock);
-
-    if (doubleFree)
-        cflat_ha_report_double_free_(p, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +199,7 @@ void cflat_heap_audit_free(void* p)
 // the LIVE state - an allocation through operator new with no matching operator
 // delete. Prints "ptr=0x... size=..." per leak to stderr and returns the count.
 //
-// Honest limits (same as the double-free path): only allocations made AFTER
+// Honest limits: only allocations made AFTER
 // enable() that flow through operator new/delete are tracked. A still-LIVE entry
 // at program exit is a leak; a buffer freed via a raw allocator path that bypasses
 // operator delete will look LIVE here (false positive) - so this is a debug oracle,

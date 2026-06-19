@@ -18,9 +18,9 @@ and the fuzzer/heap-audit libraries when a bug is real but too rare to reproduce
 | `--asan` | compile flag | use-after-free, heap/stack overflow, double-free (dynamic) |
 | `-g` crash backtrace | compile flag | symbolized stack on any unhandled exception |
 | `--xthread-scan N` | compile flag | struct fields shared across a thread spawn without atomic/lock (static) |
-| `--heap-audit` | compile flag | applies `diagnostic/heap_audit.cb` with no source edits (leaks and double-free both report-only) |
+| `--heap-audit` | compile flag | applies `diagnostic/heap_audit.cb` with no source edits (leaks, report-only) |
 | `diagnostic/thread_fuzz.cb` | core library | timing-dependent races (perturbs scheduling, replayable by seed) |
-| `diagnostic/heap_audit.cb` | core library | double-free / free-of-unknown, reported at the bad free |
+| `diagnostic/heap_audit.cb` | core library | leaks (still-live allocations at a quiescent point) |
 
 ## `--asan` - AddressSanitizer
 
@@ -136,17 +136,16 @@ placement or other entropy sources, so replay is "very likely" rather than
 bit-for-bit. See `core/diagnostic/THREAD_FUZZ_PLAN.md` for the design and the
 planned v2 (PCT) extension.
 
-## `diagnostic/heap_audit.cb` - double-free detector
+## `diagnostic/heap_audit.cb` - leak detector
 
-Records every allocation that flows through `operator new` (with its size) and
-checks every `operator delete` against that table. A free of an already-freed
-pointer is reported as a DOUBLE FREE - with the pointer and its size - to stderr,
-regardless of timing or which thread did it. The report is **advisory and
-non-fatal**: it does not abort the process. A freed-slot free is not always a true
-double-free, because allocations made before `enable()` are untracked and CRT
-address reuse can make an untracked free land on a stale freed slot (so the size in
-the report may be stale too). Use it as a lead - cross-check a flagged pointer with
-`--asan`, which proves a real double-free/UAF deterministically.
+Records every allocation that flows through `operator new` (with its size) and flips
+the matching record to freed on every `operator delete`. At a quiescent point it
+reports every allocation still live - a LEAK, with the pointer and its size - to
+stderr. The report is **advisory and non-fatal**: it does not abort the process. It
+does **not** detect double frees: `operator new`/`delete` share the CRT heap with raw
+`malloc`/`free`, so a freed address reused by a raw allocator and later operator-deleted
+is indistinguishable from a real double free. Use `--asan`, which proves a real
+double-free/use-after-free deterministically.
 
 ```cflat
 import "diagnostic/heap_audit.cb";
@@ -157,9 +156,9 @@ HeapAudit.enable();
 
 To audit a program **without editing it**, pass `--heap-audit` (requires `-o`): the
 compiler auto-imports this module, calls `enable()` at the top of `main`, and reports
-still-live allocations before every `return`. There, both leaks and double-free reports are
-report-only (printed, exit code unchanged); a program that already calls `enable()` itself is
-left uninstrumented. See [`doc/CLI.md`](CLI.md#heap-audit) for the flag's full behavior. Call
+still-live allocations before every `return`. Leak reports are report-only (printed, exit code
+unchanged); a program that already calls `enable()` itself is left uninstrumented. See
+[`doc/CLI.md`](CLI.md#heap-audit) for the flag's full behavior. Call
 `reportLeaks()` by hand instead when you need the live count at a specific quiescent point
 rather than at process exit.
 
@@ -169,13 +168,13 @@ Compile with `-g` to get cflat function names and `file:line` for each frame; wi
 frames still print as `module+address`. The first one or two frames are the allocator plumbing
 (`operator new` and the audit hook); the first frame in your own code is the leaking `new`.
 
-The table, lock, and failure report live in the sibling `diagnostic/heap_audit.c`
+The table, lock, and leak report live in the sibling `diagnostic/heap_audit.c`
 (merged in by `lld-link`, so building requires `-o`); output goes through Win32
 `WriteFile` for the same link-collision reason as `crashdump.c`. Honest limit:
 only allocations made *after* `enable()` that flow through `operator new`/`delete`
 are tracked - pointers allocated earlier, or freed via a raw allocator path that
-bypasses `operator delete`, are ignored, not flagged. It catches double-frees, not
-use-after-free reads (use `--asan` for those).
+bypasses `operator delete`, are ignored, not flagged. It catches leaks, not
+double-frees or use-after-free reads (use `--asan` for those).
 
 ## Case study: the test_threadpool UAF
 

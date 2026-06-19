@@ -277,7 +277,7 @@ int main(int argc, char* argv[])
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
-    args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak/double-free oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - both leaks and double-free reports print to stderr but do not change the exit code or abort (a double-free can be a reuse artifact of an allocation made before enable()). Requires -o (links a C diagnostic object).");
+    args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - leaks print to stderr but do not change the exit code or abort. No double-free detection; use --asan for double-free/use-after-free. Requires -o (links a C diagnostic object).");
     args.addFlag("run", 0, "JIT-compile and run the program in-process without writing an exe to disk. Entry must be 'int main()' or 'int main(int argc, char** argv)'; arguments after a bare '--' are passed as argv[1..]. The process exit code is the program's exit code. Read-only: cannot be combined with -o, -l/--out-lli, or -b/--bitcode.");
     args.addOption("import-dir", 'i', "Directory to search for imported modules");
     args.addOption("platform", 'p', "Target platform: win64 (default) or win32", "win64");
