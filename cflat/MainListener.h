@@ -6775,8 +6775,13 @@ public:
             //   struct-field escapes use refcount above so both sides validly hold the pointer.
             // When the RHS came through a cast that cleared rightNV.Storage, fall back to
             // looking up the original variable by CallerName so the source is still nulled.
+            // Array-view RHS is excluded: `int[]` is a non-owning alias, so `view = view`
+            // must rebind the pointer only. Nulling/moving the source orphans the buffer
+            // because the destination view never frees it (the owner is the `new T[n]`
+            // variable, deleted explicitly). Mirrors the struct-move guard above.
             if (operatorText == "=" && rightNV.IsOwning
                 && rightNV.TypeAndValue.Pointer
+                && !rightNV.TypeAndValue.IsArrayView
                 && (!rightNV.IsNewAllocated
                     || destination == nullptr
                     || llvm::isa<llvm::AllocaInst>(destination)
