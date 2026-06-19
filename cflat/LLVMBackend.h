@@ -9501,6 +9501,21 @@ public:
             && result->getType() == GetClosureFatPtrType())
             RegisterOwnedClosureTemp(result);
 
+        // Register an owned-string-returning call RESULT as an owned string temp, mirroring the
+        // closure case above and TrackOwnedStringOperatorResult (operator+). A binding site
+        // (decl-init / assignment / field store / move-param / return) calls
+        // UnregisterOwnedStringTemp so only the owner frees it; a result used INLINE - passed by
+        // value as a borrow (non-move 'string') argument, or as an expression statement - is never
+        // bound and would otherwise leak, so it is freed by FlushOwnedStringTemps at end-of-full-
+        // expression. Exclude the 'copy' clone: the synthesized memberwise copy stores its result
+        // straight into a struct field (GetOrCreateMemberwiseCopy), bypassing the assignment-path
+        // unregister, so flushing it would double-free a now-owned field - same reasoning as closures.
+        if (result != nullptr
+            && candidate.ReturnsOwned
+            && functionName != "copy"
+            && result->getType() == llvm::StructType::getTypeByName(*context, "string"))
+            RegisterOwnedStringTemp(result);
+
         return result;
     }
 

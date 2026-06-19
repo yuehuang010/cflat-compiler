@@ -6737,6 +6737,23 @@ public:
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
             }
 
+            // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
+            // reassignment leak where a pre-declared string local reassigned in a loop
+            // (`last = name.copy();`) dropped each prior owned buffer. The string dtor checks the
+            // runtime owned bit, so freeing a currently-borrowed or empty local is a safe no-op.
+            // Limited to plain locals/globals (struct fields are handled just above; container
+            // element stores are excluded - they would double-free). Self-assign is guarded by
+            // destination != rightNV.Storage.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && NamedVarIsString(namedVar)
+                && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                && destination != rightNV.Storage)
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor("string"))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+            }
+
             auto* assignResult = derefAssign(right, rhsUnsigned);
             // Array-view element store: tag the store with the view's alias scope (matches the load
             // side in TagViewElementAccess) so the vectorizer proves distinct views disjoint.
@@ -13292,6 +13309,20 @@ public:
                                         lastLambdaType = {};
                                         Compiler(ctx)->lastCallLambdaCaptureNames.clear();
                                     }
+
+                                    // An owned-string CALL result passed as a by-value (borrow)
+                                    // argument has no named owner and must be freed at end-of-full-
+                                    // expression. The dispatch choke point registers most owned-string
+                                    // returns but excludes 'copy' (whose result is also stored directly
+                                    // by synthesized memberwise copy); a copy() used inline as an
+                                    // argument is not stored anywhere, so register it here. A 'move'
+                                    // param unregisters it in the call dispatch, and string.dtor's
+                                    // owned-bit check makes a borrowed (alias) result a safe no-op.
+                                    // Mirrors RegisterBorrowedStringOperandTemp for operator operands.
+                                    if (argValue && llvm::isa<llvm::CallInst>(argValue)
+                                        && argValue->getType() == llvm::StructType::getTypeByName(
+                                               *Compiler(ctx)->context, "string"))
+                                        Compiler(ctx)->RegisterOwnedStringTemp(argValue);
 
                                     arguments.emplace_back(argVar);
                                 }

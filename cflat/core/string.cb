@@ -828,8 +828,9 @@ struct stringbuilder
     }
 
     // Return a copy of the current buffer as a string.
-    // The builder remains intact; the returned string owns its own allocation.
-    string toString()
+    // The builder remains intact; the returned string owns its own allocation, so
+    // the return is `move` - the caller takes ownership and destructs it.
+    move string toString()
     {
         i8* copy = new i8[_length + 1];
         int i = 0;
@@ -842,7 +843,7 @@ struct stringbuilder
     // the IString ToString() convention used by the operator string / operator+ hooks.
     // toString() is the canonical builder method; keep both - they are intentionally the
     // same body under the two spellings.
-    string ToString()
+    move string ToString()
     {
         return toString();
     }

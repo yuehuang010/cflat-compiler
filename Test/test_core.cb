@@ -1602,6 +1602,8 @@ int testStringAPI()
         passed += Test("embedded-NUL == differ",       en1 == en2, false);
         passed += Test("embedded-NUL compare nonzero",  en1.compare(en2) != 0, true);
         passed += Test("embedded-NUL == equal",         en1 == en3, true);
+        // en1/en2/en3 are non-owning wrappers over the raw buffers - free the buffers explicitly.
+        delete[] nb1; delete[] nb2; delete[] nb3;
     }
 
     // Item 5: a borrowed (non-owning) string wrapped from a char* and moved into a list
