@@ -239,6 +239,13 @@ How it resolves:
 - **Skipping the install.** `--vcpkg-no-install` suppresses the `vcpkg install` spawn for a CLI build: cflat consumes an already-populated `vcpkg_installed/<triplet>/` tree and **errors out** if the port isn't present (useful for offline / locked-down or CI builds where packages are pre-provisioned). This is the same skip the LSP always applies, but in CLI mode a missing package is a hard error rather than a silent skip.
 - **LSP mode.** The `vcpkg install` subprocess is gated off when the compiler is running as the language server, so keystroke-driven analyses never spawn vcpkg. A package that isn't installed yet is skipped silently (no error diagnostic) - the symbols simply stay unindexed until a CLI build populates the tree.
 
+Like `import package`, a vcpkg import accepts inline `define` clauses scoped to that header's clang bind (same effect as `--c-define`, layered on top of it):
+
+```c
+import package-vcpkg "SDL3/SDL.h" from "sdl3" define "SDL_MAIN_HANDLED";
+import package-vcpkg "x.h" from "port" define "FOO" define "BAR=2";   // repeatable
+```
+
 The triplet defaults from `--platform` (`x64` -> `x64-windows`, `x86` -> `x86-windows`) and can be overridden:
 
 | Flag | Description |
@@ -248,4 +255,4 @@ The triplet defaults from `--platform` (`x64` -> `x64-windows`, `x86` -> `x86-wi
 | `--vcpkg-triplet <triplet>` | Override the platform-derived default (e.g. `x64-windows-static`) |
 | `--vcpkg-no-install` | Do not run `vcpkg install`; consume the existing `vcpkg_installed/` tree and error out if a port is missing |
 
-> `import package-vcpkg` and `import package` push into the same internal accumulators - you can mix a vcpkg-resolved port with a hand-pathed `--c-lib` in the same build. Defines from a vcpkg port's documented usage are applied automatically; add extra ones with `--c-define`.
+> `import package-vcpkg` and `import package` push into the same internal accumulators - you can mix a vcpkg-resolved port with a hand-pathed `--c-lib` in the same build. Defines from a vcpkg port's documented usage are applied automatically; add extra ones with an inline `define` clause or `--c-define`.

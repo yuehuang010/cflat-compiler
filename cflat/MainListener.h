@@ -2856,7 +2856,14 @@ public:
                             std::string fr = fc->StringLiteral()->getText();
                             if (fr.size() >= 2) portSpec = DequoteStringLiteral(fr);
                         }
-                    Compiler()->CompileVcpkgImport(Compiler()->RootVcpkgImportPath(Compiler()->currentSourceFilePath_), importFilename, portSpec);
+                    std::vector<std::string> vcpkgDefines;
+                    for (auto* dc : imp->defineClause())
+                        if (dc->StringLiteral())
+                        {
+                            std::string dr = dc->StringLiteral()->getText();
+                            if (dr.size() >= 2) vcpkgDefines.push_back(DequoteStringLiteral(dr));
+                        }
+                    Compiler()->CompileVcpkgImport(Compiler()->RootVcpkgImportPath(Compiler()->currentSourceFilePath_), importFilename, portSpec, vcpkgDefines);
                     continue;
                 }
                 std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";

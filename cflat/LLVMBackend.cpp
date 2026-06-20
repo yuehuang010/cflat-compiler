@@ -550,7 +550,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         {
                             std::string portSpec = DequoteFromClause(imp);
                             if (verbose) std::cout << std::format("[verbose] vcpkg import: {} from {}\n", importFilename, portSpec);
-                            if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec))
+                            if (!CompileVcpkgImport(RootVcpkgImportPath(filename), importFilename, portSpec, DequoteDefineClauses(imp)))
                                 return false;
                             continue;
                         }
@@ -1171,7 +1171,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 {
                     std::string portSpec = DequoteFromClause(imp);
                     if (verbose) std::cout << std::format("[verbose]   nested vcpkg import: {} from {}\n", nested, portSpec);
-                    if (!CompileVcpkgImport(canonicalStr, nested, portSpec))
+                    if (!CompileVcpkgImport(canonicalStr, nested, portSpec, DequoteDefineClauses(imp)))
                         return false;
                     continue;
                 }
@@ -1823,7 +1823,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     if (IsPackageVcpkgImport(imp))
                     {
                         std::string portSpec = DequoteFromClause(imp);
-                        if (!CompileVcpkgImport(RootVcpkgImportPath(filePath), importFilename, portSpec))
+                        if (!CompileVcpkgImport(RootVcpkgImportPath(filePath), importFilename, portSpec, DequoteDefineClauses(imp)))
                             return false;
                         continue;
                     }

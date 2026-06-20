@@ -657,7 +657,7 @@ importDeclaration
     : Import importGroup (As Identifier)? libClause? defineClause* cacheClause? ';'
     | Import 'program' StringLiteral As Identifier ';'
     | Import 'package' StringLiteral libClause? defineClause* cacheClause? ';'
-    | Import 'package-vcpkg' StringLiteral fromClause ';'
+    | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
@@ -688,6 +688,7 @@ libClause
 // Optional inline preprocessor define(s) for a header binding, scoped to THIS
 // import's clang AST dump and appended on top of the process-wide --c-define:
 //   import package "x.h" lib "y.lib" define "FOO" define "BAR=2";
+//   import package-vcpkg "SDL3/SDL.h" from "sdl3" define "SDL_MAIN_HANDLED";
 // Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
 defineClause
     : 'define' StringLiteral

@@ -11813,7 +11813,8 @@ public:
     // (the existing C-header binding path). Returns false on hard error.
     bool CompileVcpkgImport(const std::string& importingFilePath,
                             const std::string& header,
-                            const std::string& portSpec)
+                            const std::string& portSpec,
+                            const std::vector<std::string>& extraDefines = {})
     {
         // Mirror LSP/non-LSP mode and verbosity into the resolver.
         vcpkg_.SetVerbose(verbose);
@@ -11909,10 +11910,15 @@ public:
             fileForLsp = realPathBuf.str().str();
         // Mirror the in-memory cache key CompileCHeaderGroup builds (single-header form).
         std::string inMemKey = "|H" + fileForLsp;
-        for (const auto& inc : cIncludeDirs_) inMemKey += "|I" + inc;
-        for (const auto& def : cDefines_)     inMemKey += "|D" + def;
+        for (const auto& inc : cIncludeDirs_)  inMemKey += "|I" + inc;
+        for (const auto& def : cDefines_)      inMemKey += "|D" + def;
+        for (const auto& def : extraDefines)   inMemKey += "|d" + def;
 
-        uint64_t diskKey     = VcpkgDiskCacheKey(fileForLsp, cDefines_);
+        // Fold the inline `define` clauses into the disk key so a build with a different
+        // set of defines does not load a stale cached header bind.
+        std::vector<std::string> diskKeyDefines = cDefines_;
+        diskKeyDefines.insert(diskKeyDefines.end(), extraDefines.begin(), extraDefines.end());
+        uint64_t diskKey     = VcpkgDiskCacheKey(fileForLsp, diskKeyDefines);
         uint64_t contentHash = 0;
         bool haveHash        = HashFileContents(fileForLsp, contentHash);
         std::error_code mtEc;
@@ -11932,7 +11938,7 @@ public:
             }
         }
 
-        bool ok = CompileCHeader(headerCanon.string(), {});
+        bool ok = CompileCHeader(headerCanon.string(), extraDefines);
 
         // --run is read-only: skip persisting the vcpkg header cache to disk under run mode
         // (the in-memory cache entry from CompileCHeader still serves this compile).

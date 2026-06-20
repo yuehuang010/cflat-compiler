@@ -1,0 +1,10 @@
+// Regression: `import package-vcpkg ... define "<MACRO>"` must PARSE the inline
+// define clause (mirroring `import package`) and reach the vcpkg port resolver,
+// not fail with a misleading syntax error ("mismatched input 'define'").
+// The expectation is armed before imports run, so it catches the import-time
+// resolver error for a port absent from the manifest - which only fires if the
+// `define` clause parsed cleanly first.
+expect_error("references port 'zlib_not_a_dep'");
+import package-vcpkg "zlib.h" from "zlib_not_a_dep" define "SOME_MACRO";
+
+extern int main() { return 0; }
