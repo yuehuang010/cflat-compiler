@@ -1,0 +1,117 @@
+// SDL3 bouncing-rectangle demo, driven entirely from CFlat via C interop.
+//
+// Opens a window, runs a 2D-renderer loop that clears to an animated
+// background colour and draws a white rectangle bouncing off the walls.
+// Quits on window-close, on Escape, or after a frame cap so it can run
+// head-less / self-terminate. Pass a frame cap as argv[1] (default 600).
+//
+// SDL3 is resolved through vcpkg via the sibling vcpkg.json - cflat runs
+// `vcpkg install` itself and auto-resolves the include dir, link lib, and
+// runtime DLL (SDL3.dll, auto-copied next to the exe). No manual paths. The
+// first build runs `vcpkg install sdl3`, which can take a few minutes;
+// subsequent builds are fast.
+//
+// Build:
+//   x64/Debug/cflat.exe example/vcpkg/sdl3_demo.cb -o out/sdl3_demo.exe
+// Run (windowed, auto-quits after 600 frames):
+//   out\sdl3_demo.exe
+// Run a short self-test (30 frames then exit):
+//   out\sdl3_demo.exe 30
+import package-vcpkg "SDL3/SDL.h" from "sdl3";
+
+// Auto-extern does not pick up the SDL_main.h helpers (SDL_SetMainReady):
+// SDL.h deliberately does not include SDL_main.h, so declare it by hand. The
+// symbol lives in SDL3.lib; hand-written externs take precedence over auto-extern.
+extern void SDL_SetMainReady();
+
+extern int main(int argc, char** argv)
+{
+    int maxFrames = 600;
+    if (argc > 1) { maxFrames = atoi(argv[1]); }
+
+    SDL_SetMainReady();
+    if (!SDL_Init(SDL_INIT_VIDEO))
+    {
+        printf("SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    int width = 640;
+    int height = 480;
+    // SDL_Window / SDL_Renderer are opaque C handles; cflat registers them as
+    // pointer-only types, so they can be named directly instead of as void*.
+    SDL_Window* window = SDL_CreateWindow("CFlat + SDL3 bounce", width, height, (u64)0);
+    if (window == nullptr)
+    {
+        printf("SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
+    if (renderer == nullptr)
+    {
+        printf("SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    // Rectangle state: position + velocity in pixels / pixels-per-frame.
+    float rx = 50.0f;
+    float ry = 50.0f;
+    float vx = 4.0f;
+    float vy = 3.0f;
+    float rw = 80.0f;
+    float rh = 60.0f;
+
+    int running = 1;
+    int frame = 0;
+    while (running == 1)
+    {
+        // Drain the event queue; quit on close or Escape.
+        SDL_Event e = default;
+        while (SDL_PollEvent(&e))
+        {
+            if (e.type == (u32)SDL_EVENT_QUIT) { running = 0; }
+            else if (e.type == (u32)SDL_EVENT_KEY_DOWN)
+            {
+                if (e.key.scancode == SDL_SCANCODE_ESCAPE) { running = 0; }
+            }
+        }
+
+        // Advance the rectangle and bounce off the window edges.
+        rx = rx + vx;
+        ry = ry + vy;
+        if (rx < 0.0f) { rx = 0.0f; vx = -vx; }
+        if (ry < 0.0f) { ry = 0.0f; vy = -vy; }
+        if (rx + rw > (float)width) { rx = (float)width - rw; vx = -vx; }
+        if (ry + rh > (float)height) { ry = (float)height - rh; vy = -vy; }
+
+        // Animated background colour cycling with the frame counter.
+        u8 bg = (u8)(frame % 256);
+        SDL_SetRenderDrawColor(renderer, (u8)(bg / 2), (u8)32, (u8)(255 - bg), (u8)255);
+        SDL_RenderClear(renderer);
+
+        // White rectangle.
+        SDL_FRect rect = default;
+        rect.x = rx;
+        rect.y = ry;
+        rect.w = rw;
+        rect.h = rh;
+        SDL_SetRenderDrawColor(renderer, (u8)255, (u8)255, (u8)255, (u8)255);
+        SDL_RenderFillRect(renderer, &rect);
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay((u32)16);
+
+        frame++;
+        if (frame >= maxFrames) { running = 0; }
+    }
+
+    printf("Ran %d frames, shutting down cleanly.\n", frame);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}

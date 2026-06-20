@@ -107,6 +107,7 @@ namespace cflat_cinterop
             ExtractResult& out;
             std::vector<MacroProbe> probes;   // index == probe slot
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
+            std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
             ExtractState(const ExtractRequest& r, ExtractResult& o) : req(r), out(o)
             {
@@ -379,7 +380,34 @@ namespace cflat_cinterop
 
             bool VisitRecordDecl(RecordDecl* rd)
             {
-                if (!rd->isThisDeclarationADefinition() || !rd->getIdentifier()) return true;
+                if (!rd->getIdentifier()) return true;
+
+                // Opaque forward-declared handle (e.g. `typedef struct SDL_Window SDL_Window;` with
+                // no body anywhere in this TU). Register it as an empty-field shell so the backend
+                // creates an opaque struct: usable through a pointer (the C handle idiom), while a
+                // by-value use errors with "incomplete layout". A struct defined elsewhere in the TU
+                // is handled by its own definition decl below, so skip when a definition exists.
+                if (!rd->isThisDeclarationADefinition())
+                {
+                    // Header-bind path only: the in-scope filter confines this to the bound header's
+                    // own types. The .c auto-extern path has no scope filter, so emitting here would
+                    // register every opaque handle from system headers (FILE, ...).
+                    if (!st.req.requireInScope) return true;
+                    if (rd->getDefinition() != nullptr) return true;
+                    std::string ofile; int oline = 1, ocol = 0;
+                    if (!LocOfRaw(rd, ofile, oline, ocol)) return true;
+                    if (!PathInScope(ofile, st.normDirs)) return true;
+                    std::string tag = rd->getNameAsString();
+                    if (!st.emittedOpaqueForward.insert(tag).second) return true;
+                    RawRecord rec;
+                    rec.name = std::move(tag);
+                    rec.isUnion = rd->isUnion();
+                    rec.file = ofile; rec.line = oline; rec.col = ocol;
+                    rec.inScope = true;  // gated above; empty fields -> opaque shell downstream
+                    st.out.records.push_back(std::move(rec));
+                    return true;
+                }
+
                 std::string file; int line = 1, col = 0;
                 // Collect records regardless of scope (LocOfRaw, not LocOf): an in-scope struct
                 // may reference an out-of-scope struct by value (e.g. MSG.pt is a POINT defined

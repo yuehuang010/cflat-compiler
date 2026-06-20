@@ -203,4 +203,11 @@ typedef int (*ML_BinaryOp)(int a, int b);
 int         ml_apply(ML_BinaryOp op, int a, int b);
 ML_BinaryOp ml_pick_op(int which);
 
+/* Opaque forward-declared handle - declared but never defined anywhere in the
+ * translation unit. This is the SDL_Window / sqlite3_stmt / CURL* idiom. The
+ * C-interop extractor must register it as an opaque (pointer-only) type so CFlat
+ * can NAME `ML_Opaque*`; a by-value use is rejected as an incomplete layout.
+ * No library symbol is involved - it is purely a type. */
+typedef struct ML_Opaque ML_Opaque;
+
 #endif /* MATHLIB_H */

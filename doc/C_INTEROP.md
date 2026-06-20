@@ -116,6 +116,8 @@ A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is 
 
 A **fixed-size array struct field** (e.g. `CHAR szExeFile[260]` in `PROCESSENTRY32`) is registered as an inline CFlat array, not decayed to a pointer, so the C ABI `sizeof` is exact - `sizeof(PROCESSENTRY32)` is 304, not the 40 a decayed pointer would give. Only positive integer extents become inline arrays; an incomplete `[]` still decays to a pointer, and a field whose element type cannot be mapped abandons the whole record (an opaque shell that errors on use - never a silent size change).
 
+An **opaque forward-declared handle** (`typedef struct SDL_Window SDL_Window;` and similar - declared but never defined in the bound header, the universal C handle idiom used by SDL, `sqlite3_stmt`, libcurl's `CURL`, ...) is registered as an opaque, pointer-only type. You can therefore **name the handle**: `SDL_Window* w = SDL_CreateWindow(...)` reads like the C docs, instead of falling back to `void*`. The handle converts to and from `void*` with no cast in either direction, so existing `void*`-style code keeps working. Declaring one **by value** (`SDL_Window w;`) is a compile error ("incomplete layout - can only be used through a pointer"), exactly as for any other opaque shell. Only handles declared under the in-scope dirs are surfaced this way; a handle forward-declared in an out-of-scope system header still appears as `void*` in the signatures that use it.
+
 #### Non-self-contained headers (grouped import)
 
 Some headers are **not self-contained**: they use types (`HANDLE`, `DWORD`, ...) without including the header that defines them, relying on the translation unit having included a prerequisite first. The classic case is `tlhelp32.h`, which assumes `windows.h` was included before it. Bound on its own, clang cannot resolve the base types, drops every dependent function declaration, and the import fails with a loud diagnostic:
@@ -133,6 +135,22 @@ import { "windows.h", "tlhelp32.h" } lib { "user32.lib", "gdi32.lib" };
 ```
 
 Each header still registers only the decls that live in its own directory (the union of the group's header directories, plus the SDK `um/`<->`shared/` sibling expansion), so the group does not over-expose. Group-level `lib`, `define`, and `cache` clauses apply to the whole group; non-header (`.cb`/`.c`) entries in the same group route individually as usual. The grouped header set is folded into the cache key, so a header bound standalone never collides with the same header bound after a prerequisite.
+
+#### Companion headers a library intentionally does not include
+
+A separate, subtler case: a header that **compiles cleanly on its own** but deliberately leaves out a companion header, so a symbol you expected is simply absent from the bind (no error - the function just looks "undefined" at the call site). Auto-extern only sees decls reachable by `#include` from the header you bound; a companion that is never included is never parsed, so it is never externed - the in-scope directory filter never gets a chance to keep it.
+
+The textbook example is SDL3: `SDL3/SDL.h` documents that it does **not** include `SDL3/SDL_main.h` ("SDL_main.h is special and not included here"), because that companion is meant to be pulled in only by the translation unit that owns `main`. So `import package-vcpkg "SDL3/SDL.h" from "sdl3";` binds the full API except the handful of entry-point helpers declared in `SDL_main.h` (e.g. `SDL_SetMainReady`). Calling one yields `Undefined ... SDL_SetMainReady` even though the rest of SDL linked fine.
+
+Two ways to resolve it:
+
+- **Bind the companion too.** For the plain header-binding forms, add it to a grouped import so both share one translation unit: `import { "SDL3/SDL.h", "SDL3/SDL_main.h" } lib "SDL3.lib";`. (The `import package-vcpkg` form takes a single header - it has no grouped variant - so this route applies to the manual `--c-include` / `import package` style, not the one-line vcpkg port import.)
+- **Hand-declare the extern.** The missing symbol still lives in the import library, and hand-written `extern` declarations take precedence over auto-extern, so one line is enough regardless of import form:
+
+```c
+import package-vcpkg "SDL3/SDL.h" from "sdl3";
+extern void SDL_SetMainReady();   // declared in SDL_main.h, which SDL.h does not include
+```
 
 ### System headers (e.g. `windows.h`)
 

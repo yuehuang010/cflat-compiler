@@ -502,5 +502,16 @@ extern int main()
     // ---- Section L: float/double #define macro extraction -------------------
     if (!testFloatMacros())                     return 200;
 
+    // ---- Section S: opaque forward-declared handle type ---------------------
+    // mathlib.h declares `typedef struct ML_Opaque ML_Opaque;` with no body. The
+    // extractor registers it as an opaque (pointer-only) type, so it is nameable
+    // as a pointer (the SDL_Window / sqlite3_stmt handle idiom). Before the fix
+    // this failed with "unknown type 'ML_Opaque'". void* converts both ways with
+    // no cast; a by-value `ML_Opaque h;` would error with "incomplete layout".
+    ML_Opaque* oh = nullptr;
+    void* ohv = oh;                              // typed handle decays to void*
+    oh = (ML_Opaque*)ohv;                        // and back via cast
+    if (oh != nullptr)                           return 220;
+
     return 0;
 }
