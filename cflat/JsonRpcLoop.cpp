@@ -62,7 +62,7 @@ bool JsonRpcLoop::ReadMessage(std::string& out)
             break;  // blank line = end of headers
 
         const std::string_view prefix = "Content-Length: ";
-        if (line.size() > prefix.size() && std::string_view(line).substr(0, prefix.size()) == prefix)
+        if (line.size() > prefix.size() && line.starts_with(prefix))
             contentLength = std::stoul(line.substr(prefix.size()));
     }
 

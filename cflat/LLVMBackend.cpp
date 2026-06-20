@@ -87,12 +87,6 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
     return llvm::Error::success();
 }
 
-// Return the dequoted path from an inline `lib "..."` clause on an import declaration,
-// or "" if there is none. Used to wire `import package "x.h" lib "y.lib";` into the link.
-// Inline `lib "..."` clause(s) on an import line. Returns every named import library in
-// source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
-// form. Empty when the import carries no lib clause. Each is resolved to a link argument
-// by ResolveCLinkLib at the header-bind site.
 // Returns the lowercased extension of a path (e.g. ".CB" -> ".cb").
 static std::string LowerExtension(const std::filesystem::path& p)
 {
@@ -101,6 +95,18 @@ static std::string LowerExtension(const std::filesystem::path& p)
     return ext;
 }
 
+// LLVM data layout string for the target platform (32 = win32, else win64). Both little-endian MSVC.
+static const char* PlatformDataLayout(int platformValue)
+{
+    return (platformValue == 32)
+        ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
+        : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
+}
+
+// Inline `lib "..."` clause(s) on an import line. Returns every named import library in
+// source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
+// form. Empty when the import carries no lib clause. Each is resolved to a link argument
+// by ResolveCLinkLib at the header-bind site.
 static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> libs;
@@ -396,13 +402,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Must precede InitDebugInfo so pointer-width queries during DI construction
     // see the real layout instead of the LLVM default.
     if (!bitcodeLoaded)
-    {
-        // Win32: 32-bit pointers; Win64: 64-bit pointers. Both little-endian MSVC.
-        const char* dl = (platformValue == 32)
-            ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
-            : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
-        module->setDataLayout(llvm::DataLayout(dl));
-    }
+        module->setDataLayout(llvm::DataLayout(PlatformDataLayout(platformValue)));
 
     if (debugInfo)
     {
@@ -3235,9 +3235,6 @@ DeserializeConstraints(const llvm::json::Object* o)
 bool LLVMBackend::CompileCoreOnly(const std::string& platform)
 {
     platformValue = (platform == "win32") ? 32 : 64;
-    const char* dl = (platformValue == 32)
-        ? "e-m:x-p:32:32-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:32-n8:16:32-S32"
-        : "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128";
 
     // Reinitialize the LLVM module with the correct platform data layout BEFORE
     // RegisterBuiltinString creates pointer types, so %string fields have the right size.
@@ -3251,7 +3248,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         module  = std::make_unique<llvm::Module>("cflat", *context);
         builder = std::make_unique<llvm::IRBuilder<>>(*context);
     }
-    module->setDataLayout(llvm::DataLayout(dl));
+    module->setDataLayout(llvm::DataLayout(PlatformDataLayout(platformValue)));
     module->setTargetTriple((platformValue == 32) ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
     RegisterBuiltinString();
     RegisterBuiltinClosure();   // closure fat type as an owning value type (Option A)

@@ -6945,7 +6945,6 @@ public:
             return -1;  // pointer vs non-pointer: incompatible
         }
 
-        // auto srcType = value->getType();
         if (srcType->isIntegerTy() && destType->isIntegerTy())
         {
             auto targetSize = destType->getIntegerBitWidth();
@@ -7391,10 +7390,7 @@ public:
         }
         else if (auto* v = std::get_if<float>(&constantVariant))
         {
-            auto floatType = builder->getFloatTy();
             value = llvm::ConstantFP::get(builder->getFloatTy(), *v);
-            // auto doubleVal = llvm::ConstantFP::get(builder->getDoubleTy(), *v);
-            // value = builder->CreateFPTrunc(doubleVal, floatType);
         }
         else  if (auto* v = std::get_if<double>(&constantVariant))
         {
@@ -7696,7 +7692,7 @@ public:
                     right = builder->CreatePtrToInt(right, i64Ty);
                     return builder->CreateSub(left, right, "ptrdiff");
                 }
-                // ptr ± int (no element-type context here): byte arithmetic via i8 GEP.
+                // ptr +/- int (no element-type context here): byte arithmetic via i8 GEP.
                 auto* ptrVal = leftIsPtr  ? left  : right;
                 auto* intVal = leftIsPtr  ? right : left;
                 if ((op == Operation::Subtract || op == Operation::MinusAssignment) && leftIsPtr)

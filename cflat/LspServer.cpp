@@ -1192,7 +1192,7 @@ private:
     // ResetForReanalysis is needed before the next run on that slot.
     unsigned int poolSize_ = 1;
     std::vector<std::unique_ptr<LLVMBackend>> backendPool_;
-    std::vector<bool> backendAnalyzed_;  // sized on first use in WorkerLoop via lazy resize
+    std::vector<bool> backendAnalyzed_;  // sized to poolSize_ in the constructor; tracks per-slot reset need
     std::vector<size_t> freeBackends_;
     std::mutex backendMutex_;
     std::condition_variable backendCV_;

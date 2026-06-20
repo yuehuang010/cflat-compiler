@@ -50,6 +50,14 @@ namespace cflat_cinterop
             return qt.getCanonicalType().getAsString(ctx.getPrintingPolicy());
         }
 
+        // APSInt -> long long. Signed values sign-extend (they always fit in int64); unsigned
+        // values may exceed INT64_MAX (e.g. ~0ULL), so zero-extend and bit-reinterpret rather
+        // than call getSExtValue, which asserts isRepresentableByInt64 for those.
+        long long ApsIntToLongLong(const llvm::APSInt& v)
+        {
+            return v.isSigned() ? v.getSExtValue() : static_cast<long long>(v.getZExtValue());
+        }
+
         std::string NormPath(std::string p)
         {
             std::replace(p.begin(), p.end(), '\\', '/');
@@ -254,14 +262,7 @@ namespace cflat_cinterop
 
                 RawEnum e;
                 e.name = ec->getNameAsString();
-                // getSExtValue asserts isRepresentableByInt64 for unsigned values with the high
-                // bit set (e.g. ~0ULL). Discriminate on signedness: signed enum constants
-                // always fit in int64 (getSExtValue is safe and sign-extends correctly); unsigned
-                // enum constants may exceed INT64_MAX, so use getZExtValue and bit-reinterpret.
-                const llvm::APSInt& initVal = ec->getInitVal();
-                e.value = initVal.isSigned()
-                    ? initVal.getSExtValue()
-                    : static_cast<long long>(initVal.getZExtValue());
+                e.value = ApsIntToLongLong(ec->getInitVal());
                 e.file = file; e.line = line; e.col = col;
                 st.out.enums.push_back(std::move(e));
                 return true;
@@ -492,11 +493,7 @@ namespace cflat_cinterop
                     // function-pointer macro reads "int (*)(int, int)", not "int (*const)(...)".
                     m.naturalType = CanonicalSpelling(ctx, vd->getType().getUnqualifiedType());
                     const APValue& v = ev.Val;
-                    if (v.isInt())        { m.kind = RawMacro::Int;
-                                           const llvm::APSInt& iv = v.getInt();
-                                           m.intValue = iv.isSigned()
-                                               ? iv.getSExtValue()
-                                               : static_cast<long long>(iv.getZExtValue()); }
+                    if (v.isInt())        { m.kind = RawMacro::Int; m.intValue = ApsIntToLongLong(v.getInt()); }
                     else if (v.isFloat()) { m.kind = RawMacro::Float; m.floatValue = v.getFloat().convertToDouble(); }
                     else if (v.isLValue() && v.getLValueBase().isNull())
                                           { m.kind = RawMacro::Int;   m.intValue = v.getLValueOffset().getQuantity(); }

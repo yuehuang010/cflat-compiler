@@ -4855,6 +4855,19 @@ public:
     {
         std::vector<LLVMBackend::DeclTypeAndValue> result;
 
+        // Parse a fixed-array dimension expression to a compile-time constant.
+        // Returns nullopt (and logs) when the expression is not a ConstantInt.
+        auto parseConstDim = [&](CFlatParser::AssignmentExpressionContext* expr,
+                                 antlr4::ParserRuleContext* errCtx,
+                                 const char* msg) -> std::optional<uint64_t>
+        {
+            auto* sizeVal = ParseAssignmentExpression(expr);
+            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
+                return ci->getZExtValue();
+            LogErrorContext(errCtx, msg);
+            return std::nullopt;
+        };
+
         if (ctx.size() > 0)
         {
             for (auto decl : ctx)
@@ -4880,27 +4893,18 @@ public:
                     if (directDecl->assignmentExpression())
                     {
                         // C-style fixed-size array field: char buf[N]
-                        auto* sizeVal = ParseAssignmentExpression(directDecl->assignmentExpression());
-                        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
-                            typeAndValue.ConstArraySize = ci->getZExtValue();
-                        else
-                            LogErrorContext(directDecl, "array size must be a compile-time constant");
+                        if (auto sz = parseConstDim(directDecl->assignmentExpression(), directDecl, "array size must be a compile-time constant"))
+                            typeAndValue.ConstArraySize = *sz;
                     }
                     else if (typeAndValue.ArraySize != nullptr)
                     {
                         // Type-first fixed-size array field: u8[N] data (optionally multi-dim u8[N][M]).
-                        auto* sizeVal = ParseAssignmentExpression(typeAndValue.ArraySize);
-                        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(sizeVal))
-                            typeAndValue.ConstArraySize = ci->getZExtValue();
-                        else
-                            LogErrorContext(directDecl, "array size must be a compile-time constant");
+                        if (auto sz = parseConstDim(typeAndValue.ArraySize, directDecl, "array size must be a compile-time constant"))
+                            typeAndValue.ConstArraySize = *sz;
                         for (auto* dimExpr : typeAndValue.ExtraArrayDims)
                         {
-                            auto* dimVal = ParseAssignmentExpression(dimExpr);
-                            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(dimVal))
-                                typeAndValue.ConstInnerDimensions.push_back(ci->getZExtValue());
-                            else
-                                LogErrorContext(dimExpr, "array dimension must be a compile-time constant");
+                            if (auto dim = parseConstDim(dimExpr, dimExpr, "array dimension must be a compile-time constant"))
+                                typeAndValue.ConstInnerDimensions.push_back(*dim);
                         }
                     }
                     else if (typeAndValue.AliasArraySize > 0)

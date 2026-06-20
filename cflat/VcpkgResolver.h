@@ -308,7 +308,7 @@ private:
         // populates vcpkg_installed/; LSP queries piggy-back on that state. `--vcpkg-no-install`
         // opts a CLI build into the same skip: it consumes an already-installed tree and lets
         // the downstream header-resolution check error out if the package is missing.
-        if (lspMode_ || noInstall_)
+        if (InstallSuppressed())
         {
             if (verbose_)
                 std::cout << "[verbose] vcpkg: skipping `vcpkg install` ("
