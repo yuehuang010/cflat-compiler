@@ -57,6 +57,8 @@
 #include <llvm\ExecutionEngine\Orc\ExecutionUtils.h> // DynamicLibrarySearchGenerator
 #include <llvm\ExecutionEngine\Orc\ObjectLinkingLayer.h> // JITLink layer (--run threading/SEH)
 #include <llvm\ExecutionEngine\JITLink\JITLink.h>        // LinkGraph (SEH .pdata registration)
+#include <llvm\ExecutionEngine\JITLink\x86_64.h>          // jump-stub helpers for the SEH handler thunk
+#include <llvm\ExecutionEngine\Orc\Shared\MemoryFlags.h>  // orc::MemProt for synthesized stub sections
 #include <unordered_map>
 #include <malloc.h>  // _aligned_malloc for the emutls shim
 #include <llvm\MC\TargetRegistry.h>
@@ -173,9 +175,20 @@ namespace cflat_jit
                               llvm::jitlink::LinkGraph&,
                               llvm::jitlink::PassConfiguration& Config) override
         {
-            // PreFixup: __ImageBase is a placeholder (address 0) in the JITDylib; rewrite it
-            // to the real base before fixups so ADDR32NB RVAs in .pdata compute correctly.
-            Config.PreFixupPasses.push_back(
+            // PostPrune (before allocation, so synthesized blocks get memory): redirect the
+            // SEH language handler (__C_specific_handler, which resolves to ntdll >4GB away)
+            // through an in-image jump stub so its image-relative .xdata reference fits in 32 bits.
+            Config.PostPrunePasses.push_back(
+                [](llvm::jitlink::LinkGraph& G) { return LowerSEHHandler(G); });
+
+            // PostAllocation (addresses final, before the PreFixup ADDR32NB lowering runs):
+            // define __ImageBase ourselves. COFF/x86_64 lowering resolves the image base by
+            // scanning defined_symbols() for "__ImageBase"; only if absent does it fall back to
+            // an external process lookup that fails (nothing provides __ImageBase -> "Symbols
+            // not found"). By defining it at the lowest block, the lowering finds it and bakes
+            // .pdata/.xdata RVAs relative to a base inside the JIT'd region (so deltas fit in 32
+            // bits), and no external lookup is attempted.
+            Config.PostAllocationPasses.push_back(
                 [](llvm::jitlink::LinkGraph& G) { return FixImageBase(G); });
 
             // PostFixup: addresses are final and .pdata holds real RVAs; registering here
@@ -194,26 +207,65 @@ namespace cflat_jit
                                          llvm::orc::ResourceKey) override {}
 
     private:
-        static llvm::orc::ExecutorAddr LowestBlockAddress(llvm::jitlink::LinkGraph& G)
+        // The block with the lowest final address across all sections (the base of the JIT'd
+        // image for this graph). Null only if the graph has no blocks.
+        static llvm::jitlink::Block* LowestBlock(llvm::jitlink::LinkGraph& G)
         {
-            llvm::orc::ExecutorAddr base;
-            bool found = false;
+            llvm::jitlink::Block* lowest = nullptr;
             for (auto& Sec : G.sections())
                 for (auto* B : Sec.blocks())
-                    if (!found || B->getAddress() < base) { base = B->getAddress(); found = true; }
-            return base; // default-constructed (0) if the graph has no blocks
+                    if (!lowest || B->getAddress() < lowest->getAddress()) lowest = B;
+            return lowest;
+        }
+
+        static llvm::Error LowerSEHHandler(llvm::jitlink::LinkGraph& G)
+        {
+            llvm::jitlink::Symbol* handler = nullptr;
+            for (auto* S : G.external_symbols())
+                if (S->hasName() && S->getName() == "__C_specific_handler") { handler = S; break; }
+            if (!handler)
+                return llvm::Error::success(); // no SEH personality in this graph
+
+            // Collect existing references to the handler FIRST (these are the .xdata image-
+            // relative RVAs). Doing this before synthesizing the pointer slot below ensures the
+            // slot's own Pointer64 edge - which must hold the true ntdll address - is excluded;
+            // repointing it would make the stub jump to itself.
+            std::vector<llvm::jitlink::Edge*> toRepoint;
+            for (auto& Sec : G.sections())
+                for (auto* B : Sec.blocks())
+                    for (auto& E : B->edges())
+                        if (&E.getTarget() == handler)
+                            toRepoint.push_back(&E);
+
+            // 8-byte slot holding the real 64-bit handler address (Pointer64 -> ntdll), plus a
+            // 6-byte `jmp *slot(%rip)` stub. Both live in the JIT'd image next to the code, so
+            // an image-relative reference to the stub fits in 32 bits.
+            // MemProt's bitmask operator| is not exported into llvm::orc here; OR the bits by value.
+            auto memProt = [](unsigned bits) { return static_cast<llvm::orc::MemProt>(bits); };
+            constexpr unsigned R = (unsigned)llvm::orc::MemProt::Read;
+            constexpr unsigned W = (unsigned)llvm::orc::MemProt::Write;
+            constexpr unsigned X = (unsigned)llvm::orc::MemProt::Exec;
+            auto& ptrSec  = G.createSection("$__cflat_sehptr",  memProt(R | W));
+            auto& stubSec = G.createSection("$__cflat_sehstub", memProt(R | X));
+            auto& ptrSym  = llvm::jitlink::x86_64::createAnonymousPointer(G, ptrSec, handler);
+            auto& stubSym = llvm::jitlink::x86_64::createAnonymousPointerJumpStub(G, stubSec, ptrSym);
+
+            for (auto* E : toRepoint)
+                E->setTarget(stubSym);
+            return llvm::Error::success();
         }
 
         static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
         {
-            llvm::jitlink::Symbol* sym = nullptr;
-            for (auto* S : G.external_symbols())
-                if (S->hasName() && S->getName() == "__ImageBase") { sym = S; break; }
-            if (!sym)
-                for (auto* S : G.absolute_symbols())
-                    if (S->hasName() && S->getName() == "__ImageBase") { sym = S; break; }
-            if (sym)
-                sym->getAddressable().setAddress(LowestBlockAddress(G));
+            for (auto* S : G.defined_symbols())
+                if (S->hasName() && S->getName() == "__ImageBase")
+                    return llvm::Error::success(); // graph already supplies one
+            llvm::jitlink::Block* lowest = LowestBlock(G);
+            if (!lowest)
+                return llvm::Error::success(); // empty graph - nothing to anchor to
+            // Local scope: consumed by the lowering pass within this graph; not exported.
+            G.addDefinedSymbol(*lowest, 0, "__ImageBase", 0, llvm::jitlink::Linkage::Strong,
+                               llvm::jitlink::Scope::Local, /*IsCallable=*/false, /*IsLive=*/true);
             return llvm::Error::success();
         }
 
@@ -5003,17 +5055,11 @@ private:
             return false;
         }
 
-        // Guard: --run is single-threaded only. JIT'd thread workers lack SEH unwind tables,
-        // causing a crash on any unwind. Refuse early if main reachably spawns a thread.
-        if (ReachesThreadSpawn())
-        {
-            LogError(
-                "--run cannot execute a multi-threaded program in-process: this program spawns a "
-                "thread (via the 'program' construct or thread<T>), which the in-process JIT does "
-                "not support - worker threads need Windows SEH unwind tables that the JIT cannot "
-                "register. Compile to an exe instead: cflat <input> -o <output.exe>.");
-            return false;
-        }
+        // Multi-threaded --run is supported: the JITLink object-linking layer plus
+        // SehRegistrationPlugin (see the LLJITBuilder setup below) register .pdata unwind tables
+        // for the JIT'd image, so hardware faults on worker threads dispatch correctly (e.g. the
+        // 'program' construct's SEH crash isolation). ReachesThreadSpawn() is retained for
+        // diagnostics but no longer gates execution.
 
         // Build an LLJIT for the host. JITTargetMachineBuilder::detectHost picks up the host
         // triple, CPU, and features so the JIT'd code matches this machine.
@@ -5025,8 +5071,28 @@ private:
             return false;
         }
 
+        // Force the JITLink object-linking layer (instead of the default RuntimeDyld) and
+        // attach SehRegistrationPlugin. RuntimeDyld does not register .pdata in a way the OS
+        // exception dispatcher finds, so a hardware fault on a JIT'd WORKER thread (e.g. the
+        // 'program' construct's SEH crash-isolation catchpad) is never dispatched and the host
+        // process hard-crashes. JITLink gives the plugin the LinkGraph's .pdata so we can call
+        // RtlAddFunctionTable ourselves - this is what makes multi-threaded --run unwind-safe.
         auto jitOrErr = llvm::orc::LLJITBuilder()
                             .setJITTargetMachineBuilder(std::move(*jtmb))
+                            .setObjectLinkingLayerCreator(
+                                [](llvm::orc::ExecutionSession& ES, const llvm::Triple&)
+                                    -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
+                                    auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES);
+                                    // Under LLJIT, the IR layer pre-computes symbol flags from the
+                                    // IR; JITLink recomputes them from the linked COFF object and
+                                    // they can disagree (weak/COMDAT constants), tripping ORC's
+                                    // "Resolving symbol with incorrect flags" assert. Defer to the
+                                    // promised flags and claim any object-only symbols.
+                                    ol->setOverrideObjectFlagsWithResponsibilityFlags(true);
+                                    ol->setAutoClaimResponsibilityForObjectSymbols(true);
+                                    ol->addPlugin(std::make_unique<cflat_jit::SehRegistrationPlugin>());
+                                    return ol;
+                                })
                             .create();
         if (!jitOrErr)
         {
@@ -5095,6 +5161,9 @@ private:
                                  llvm::toString(mainSym.takeError())));
             return false;
         }
+
+        if (std::getenv("CFLAT_JIT_DIAG"))
+            fprintf(stderr, "[jitdiag] invoking JIT main @%p\n", (void*)mainSym->getValue());
 
         // Dispatch on the entry signature detected above.
         if (mainTakesArgv)
@@ -11350,6 +11419,7 @@ public:
     // Instrument the program with the HeapAudit leak/double-free oracle without source edits.
     void SetHeapAudit(bool v) { heapAudit_ = v; }
     void SetRunMode(bool v) { runMode_ = v; }
+    bool IsRunMode() const { return runMode_; }
     void SetRunArgs(std::vector<std::string> a) { runArgs_ = std::move(a); }
     int  GetJitExitCode() const { return jitExitCode_; }
     void SetBatchMode(bool v) { batchMode_ = v; }

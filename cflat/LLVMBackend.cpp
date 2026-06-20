@@ -49,37 +49,52 @@ extern "C" unsigned char RtlAddFunctionTable(
 
 llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
 {
+    if (std::getenv("CFLAT_JIT_NOSEH"))
+        return llvm::Error::success(); // DIAG: skip all unwind-table registration
+
     auto* pdata = G.findSectionByName(".pdata");
     if (!pdata)
         return llvm::Error::success(); // no unwind entries (e.g. all-leaf code)
 
-    // Recover JITLink's image base from the first readable ADDR32NB relocation: a stored RVA
-    // equals (target - imageBase), so imageBase = target - storedRVA.
-    std::optional<uint64_t> imageBase;
-    for (auto* B : pdata->blocks())
-    {
-        for (auto& E : B->edges())
-        {
-            size_t off = E.getOffset();
-            if (off + 4 > (size_t)B->getSize()) continue;
-            uint32_t storedRVA = 0;
-            std::memcpy(&storedRVA, B->getContent().data() + off, 4);
-            uint64_t target = E.getTarget().getAddress().getValue() + (uint64_t)E.getAddend();
-            imageBase = target - storedRVA;
-            break;
-        }
-        if (imageBase) break;
-    }
-    if (!imageBase)
-        return llvm::Error::success(); // no relocations to anchor the base
+    // The .pdata RUNTIME_FUNCTION RVAs were baked relative to __ImageBase by the COFF lowering
+    // pass, and FixImageBase pinned __ImageBase to the lowest block. Use that same base so the
+    // OS resolves base + RVA back to the real JIT'd addresses. (We must use the lowest block
+    // rather than reverse-engineering a relocation: lowering rewrites the .pdata edge addends to
+    // be base-relative, so the old "imageBase = target - storedRVA" heuristic would yield 0.)
+    llvm::jitlink::Block* lowest = LowestBlock(G);
+    if (!lowest)
+        return llvm::Error::success(); // empty graph
+    uint64_t imageBase = lowest->getAddress().getValue();
 
-    constexpr size_t kRuntimeFunctionSize = 12; // 3 x 4-byte RVA fields
+    // RUNTIME_FUNCTION: { BeginAddress, EndAddress, UnwindInfoAddress } - three 4-byte RVAs.
+    struct RuntimeFunction { uint32_t begin, end, unwind; };
+    constexpr size_t kRuntimeFunctionSize = sizeof(RuntimeFunction);
+    const bool diag = std::getenv("CFLAT_JIT_DIAG") != nullptr;
+
     for (auto* B : pdata->blocks())
     {
         size_t count = (size_t)B->getSize() / kRuntimeFunctionSize;
         if (count == 0) continue;
+
+        // Windows requires each dynamic function table to be sorted by BeginAddress
+        // (RtlLookupFunctionEntry binary-searches it). LLVM emits .pdata in function order, but
+        // JITLink may lay the functions out in a different order, leaving the post-fixup RVAs
+        // unsorted - which makes worker-thread SEH dispatch silently miss and crash (notably
+        // under the Release LLVM layout). Sort the table in working memory before registering;
+        // the sorted bytes are what finalization copies to the executable address we register.
+        auto content = B->getMutableContent(G);
+        auto* rf = reinterpret_cast<RuntimeFunction*>(content.data());
+        bool wasSorted = std::is_sorted(rf, rf + count,
+            [](const RuntimeFunction& a, const RuntimeFunction& b) { return a.begin < b.begin; });
+        if (!wasSorted)
+            std::sort(rf, rf + count,
+                [](const RuntimeFunction& a, const RuntimeFunction& b) { return a.begin < b.begin; });
+        if (diag)
+            fprintf(stderr, "[jitdiag] .pdata block @%p count=%zu base=%llx sorted=%d\n",
+                    B->getAddress().toPtr<void*>(), count, (unsigned long long)imageBase, (int)wasSorted);
+
         void* funcs = B->getAddress().toPtr<void*>();
-        if (!RtlAddFunctionTable(funcs, (unsigned long)count, *imageBase))
+        if (!RtlAddFunctionTable(funcs, (unsigned long)count, imageBase))
             return llvm::make_error<llvm::StringError>(
                 "RtlAddFunctionTable failed registering JIT'd .pdata unwind info",
                 llvm::inconvertibleErrorCode());

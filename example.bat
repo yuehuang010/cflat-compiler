@@ -21,10 +21,9 @@ set FAILED=0
 set SKIPPED=0
 
 REM Space-separated list of base filenames (without .cb) to skip. Library/helper
-REM files (no int main()) that are only meant to be imported by sibling examples,
-REM plus examples with external prerequisites (e.g. get pulls libcurl through
-REM example/vcpkg/vcpkg.json - cflat auto-invokes vcpkg install, so it works
-REM if vcpkg is available on the machine but is excluded from CI smoke runs).
+REM files (no int main()) that are only meant to be imported by sibling examples.
+REM The example/vcpkg/ examples are run too - cflat auto-invokes vcpkg install to
+REM pull their external packages (libcurl, SDL3, sqlite, zlib).
 set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io
 
 REM Helper function to try compile and run
