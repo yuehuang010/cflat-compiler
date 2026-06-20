@@ -44,7 +44,7 @@ double absd(double a) { if (a < 0.0) { return -a; } return a; }
 // `body` is the CAPTURING force kernel built in main() (it captures the SoA buffers and
 // scalars directly - no context struct, no void* cast). This call WAITS internally, so the
 // captured environment in main()'s frame safely outlives every worker that runs it.
-void computeForces(ThreadPool* pool, i64 n, int workers, Func<void(i64, i64)> body) {
+void computeForces(ThreadPool* pool, i64 n, int workers, Lambda<void(i64, i64)> body) {
     parallel_for_n_pool(pool, n, workers, body);
 }
 
@@ -196,7 +196,7 @@ extern int main() {
     // fma() CALL - which halved throughput here (46 -> 19 GFLOP/s). Plain mul+add
     // vectorizes to fmulpd/faddpd. (See doc/HPC.md - fma is for when you need single
     // rounding.)
-    Func<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
+    Lambda<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
         simd<double,8> eps2V = eps2;     // softening, splatted once
         simd<double,8> oneV  = 1.0;
 

@@ -5,7 +5,7 @@
 //   - Nodes are heap-allocated and owned by their parent through the Element
 //     interface; teardown walks the tree via destroyTree().
 //   - Children are list<Element> (avoids the T[] length-inference gap).
-//   - Events are Func<void()> closures with automatic capture.
+//   - Events are Lambda<void()> closures with automatic capture.
 //   - v1 does not render; it serializes the tree to a renderer-friendly JSON
 //     shape: { "type": ..., "props": {...}, "children": [...] }.
 
@@ -382,7 +382,7 @@ class Text : Element
 class Button : Element
 {
     string label = default;
-    Func<void()> onClick = default;
+    Lambda<void()> onClick = default;
     Rect bounds = default;
     string key = default;
 
@@ -536,7 +536,7 @@ Text* text(string s)
     return t;
 }
 
-Button* button(string label, Func<void()> onClick)
+Button* button(string label, Lambda<void()> onClick)
 {
     Button* b = new Button();
     b.label = label;

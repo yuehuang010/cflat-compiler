@@ -227,7 +227,7 @@ void __threadpool_run_inline(Task t) {
 }
 
 // Free a refused/dropped task ctx. When the submitter supplied a type-aware deleter
-// (the ctx is a struct that owns resources, e.g. a cloned Func<> closure), run it so
+// (the ctx is a struct that owns resources, e.g. a cloned Lambda<> closure), run it so
 // the destructor fires; otherwise a plain raw free (the ctx owns nothing). Every
 // submit/then failure path routes through here so a refused task never leaks its ctx.
 void __threadpool_drop_ctx(function<void(move void*)> ctxDtor, move void* ctx) {

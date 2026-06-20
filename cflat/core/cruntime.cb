@@ -20,15 +20,15 @@ if const (__PLATFORM__ == 32) {
 // and the FILE handle tracker.  All fields zero-initialize to "inactive".
 // Field indices must stay in sync with kPTLS_* constants in MainListener.h.
 struct __ProgramTLS {
-    Func<void(char*, int)> stdout_hook = default;   // field 0 - printf interceptor
+    Lambda<void(char*, int)> stdout_hook = default;   // field 0 - printf interceptor
     bool stdout_in_hook = false;                         // field 1 - re-entrancy guard
     char* stdout_tls_buf = nullptr;                      // field 2 - per-thread format buffer
     int stdout_tls_cap = 0;                              // field 3 - capacity of stdout_tls_buf
-    Func<char*()> stdin_hook = default;              // field 4 - fgets/scanf interceptor
+    Lambda<char*()> stdin_hook = default;              // field 4 - fgets/scanf interceptor
     bool stdin_in_hook = false;                          // field 5 - re-entrancy guard
     char* stdin_line = nullptr;                          // field 6 - current line from hook
     int stdin_line_pos = 0;                              // field 7 - read cursor within stdin_line
-    Func<void(char*)> stdin_return_hook = default;   // field 8 - return buffer to pool (stream path)
+    Lambda<void(char*)> stdin_return_hook = default;   // field 8 - return buffer to pool (stream path)
     void* cached_stdin = nullptr;                        // field 9 - cached stdin FILE* (pre-populated by trampoline)
     bool handle_tracker_enabled = false;                 // field 10 - FILE handle tracker on/off
     void* handle_tracker_head = nullptr;                 // field 11 - head of open-handle linked list

@@ -648,12 +648,12 @@ s.ready.acquire((i32 v) => {
 
 #### `lock(this)` on function parameters
 
-The `release` and `acquire` methods work because their `Func<>` parameter is declared with `lock(this)`. (The body captures the guarded fields, so it is a fat `Func<>` closure, not a thin `function<>` - see [Function Pointers](LANGUAGE.md#function-pointers).)
+The `release` and `acquire` methods work because their `Lambda<>` parameter is declared with `lock(this)`. (The body captures the guarded fields, so it is a fat `Lambda<>` closure, not a thin `function<>` - see [Function Pointers](LANGUAGE.md#function-pointers).)
 
 ```c
 // simplified signature in atomic.cb
-void release(i32 val, lock(this) Func<void()> body);
-void acquire(lock(this) Func<void(i32)> body);
+void release(i32 val, lock(this) Lambda<void()> body);
+void acquire(lock(this) Lambda<void(i32)> body);
 ```
 
 `lock(this)` is a parameter qualifier that tells the compiler: *when analysing the lambda passed here, seed `currentLockSet` with the call-site receiver.* At `s.ready.release(...)`, the receiver is `s.ready`, so the lambda body is checked as though `lock(s.ready)` was in effect - which satisfies the `GuardedBy` check on `s.value`.
@@ -661,12 +661,12 @@ void acquire(lock(this) Func<void(i32)> body);
 You can use the same qualifier in your own functions to propagate a guard into a callback:
 
 ```c
-void withData(SharedData* d, lock(this) Func<void()> body) lock(d->ready) {
+void withData(SharedData* d, lock(this) Lambda<void()> body) lock(d->ready) {
     body();
 }
 ```
 
-> `lock(this)` is only accepted on a callback parameter (a `function<>` or `Func<>`). Using it on any other parameter type is a compile error.
+> `lock(this)` is only accepted on a callback parameter (a `function<>` or `Lambda<>`). Using it on any other parameter type is a compile error.
 
 #### Available atomic guard types
 

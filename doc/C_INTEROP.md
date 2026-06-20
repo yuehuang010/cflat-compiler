@@ -184,7 +184,7 @@ cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL
 
 ## Passing a CFlat function as a C callback
 
-C APIs frequently take a function pointer (a `qsort` comparator, a Win32 `WNDPROC`, ...). A C function pointer is a **bare code address** - which is exactly what a CFlat thin `function<T>` is (an 8-byte `R(*)(Args)`). So a named function, a `function<>` value, or a *non-capturing* lambda passes straight across the C ABI. A **capturing** closure (`Func<T>`) has nowhere to carry its captured state in a bare C pointer, so it cannot - see [Function Pointers](LANGUAGE.md#function-pointers).
+C APIs frequently take a function pointer (a `qsort` comparator, a Win32 `WNDPROC`, ...). A C function pointer is a **bare code address** - which is exactly what a CFlat thin `function<T>` is (an 8-byte `R(*)(Args)`). So a named function, a `function<>` value, or a *non-capturing* lambda passes straight across the C ABI. A **capturing** closure (`Lambda<T>`) has nowhere to carry its captured state in a bare C pointer, so it cannot - see [Function Pointers](LANGUAGE.md#function-pointers).
 
 **Pass a named function or non-capturing lambda directly.** Declare the C parameter as `function<R(Args)>` and hand it a function name, a `function<>` value, or a non-capturing lambda - the compiler passes the bare code address:
 
@@ -215,7 +215,7 @@ qsort(&xs[0], 5u, 4u, (void* a, void* b) => {       // error: a capturing lambda
 });
 ```
 
-A `Func<T>` value cannot implicitly become a C function pointer either; call `.toFunction()` (which returns the code pointer when the closure does not capture, or `nullptr` when it does) and null-check, or refactor the captured state into explicit parameters / globals / a `void* userdata` channel and pass a plain named function.
+A `Lambda<T>` value cannot implicitly become a C function pointer either; call `.toFunction()` (which returns the code pointer when the closure does not capture, or `nullptr` when it does) and null-check, or refactor the captured state into explicit parameters / globals / a `void* userdata` channel and pass a plain named function.
 
 **Storing a callback in a C struct field** (e.g. `WNDCLASSEXA.lpfnWndProc`): the field is a bare `void*` (see above), so assign the function's address with a cast - `wc.lpfnWndProc = (void*)WndProc;`.
 

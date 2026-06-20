@@ -93,7 +93,7 @@ void testReduce_thread_dot() {
     i64 i = 0;
     while (i < n) { x[i] = 1.0; y[i] = 2.0; i = i + 1; }   // dot = 2*n
 
-    Func<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Lambda<double(i64, i64)> partial = (i64 lo, i64 hi) => {
         double s = 0.0;
         i64 j = lo;
         while (j < hi) { s = s + x[j] * y[j]; j = j + 1; }   // x, y captured
@@ -116,7 +116,7 @@ void testReduce_pool_dot() {
     ThreadPool pool;
     pool.init(4);
 
-    Func<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Lambda<double(i64, i64)> partial = (i64 lo, i64 hi) => {
         double s = 0.0;
         i64 j = lo;
         while (j < hi) { s = s + x[j] * y[j]; j = j + 1; }
@@ -138,7 +138,7 @@ void testReduce_thread_sum() {
     i64 i = 0;
     while (i < n) { v[i] = i; i = i + 1; }   // sum 0..n-1 = n*(n-1)/2
 
-    Func<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
         i64 s = 0;
         i64 j = lo;
         while (j < hi) { s = s + v[j]; j = j + 1; }   // v captured
@@ -214,7 +214,7 @@ void testReduce_moreWorkersThanN() {
     i64[] v = new i64[n];
     v[0] = 10; v[1] = 20; v[2] = 30;
 
-    Func<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Lambda<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
         i64 s = 0;
         i64 j = lo;
         while (j < hi) { s = s + v[j]; j = j + 1; }

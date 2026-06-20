@@ -83,7 +83,7 @@ void __pfor_raw_hotloop_check() {
 // captured environment travels inside `body` (a closure fat pointer), so the box
 // carries no user context of its own.
 struct __PForBox {
-    Func<void(i64, i64)> body = default;
+    Lambda<void(i64, i64)> body = default;
     i64   start = 0;
     i64   end   = 0;
 };
@@ -110,7 +110,7 @@ int __pfor_pool_tramp(move void* raw, stop_token tok) {
 }
 
 // ctx deleter handed to submit(): if the pool REFUSES a task it frees the box through
-// its real type so the owning `body` Func<> env is destructed (a raw void* delete would
+// its real type so the owning `body` Lambda<> env is destructed (a raw void* delete would
 // leak it). On acceptance the box is freed by __pfor_pool_tramp instead.
 void __pfor_box_free(move void* raw) { delete (__PForBox*)raw; }
 
@@ -118,7 +118,7 @@ void __pfor_box_free(move void* raw) { delete (__PForBox*)raw; }
 // w % hardware_concurrency() via SetThreadAffinityMask, removing OS
 // scheduling jitter for compute-bound HPC kernels (see THREADING.md). Leave
 // it false when the region oversubscribes or shares cores with other work.
-void parallel_for_n(i64 n, int workers, Func<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
+void parallel_for_n(i64 n, int workers, Lambda<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
     if (n <= 0) { return; }
     __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -155,7 +155,7 @@ void parallel_for_n(i64 n, int workers, Func<void(i64, i64)> body, bool pin = fa
 // parallel_for_n: the reduction's pool variant cannot overload (two generic
 // functions of the same name monomorphize to the same mangled symbol and
 // collide), so both pool entry points use the suffix for a consistent API.
-void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, Func<void(i64, i64)> body) {
+void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, Lambda<void(i64, i64)> body) {
     if (n <= 0) { return; }
     if (workers <= 0) { workers = pool->workerCount(); }
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -205,7 +205,7 @@ struct __PRedBox<T> {
     // trampoline can invoke the T-specialized work without being generic itself.
     // Takes `move void*`: the trampoline hands it the box, and run deletes it.
     function<int(move void*)> run    = default;
-    Func<T(i64, i64)>    partial = default;
+    Lambda<T(i64, i64)>    partial = default;
     i64   start = 0;
     i64   end   = 0;
     T*    slot  = nullptr;   // this chunk's partial lands here (distinct per worker)
@@ -233,7 +233,7 @@ int __pred_run<T>(move void* raw) {
 }
 
 // ctx deleter handed to submit(): frees a REFUSED reduction box through its real
-// __PRedBox<T>* type so the owning `partial` Func<> env is destructed (a raw void*
+// __PRedBox<T>* type so the owning `partial` Lambda<> env is destructed (a raw void*
 // delete would leak it). On acceptance __pred_run<T> frees the box instead.
 void __pred_box_free<T>(move void* raw) { delete (__PRedBox<T>*)raw; }
 
@@ -250,8 +250,8 @@ int __pred_pool_tramp(move void* raw, stop_token tok) {
 // w % hardware_concurrency() (SetThreadAffinityMask), removing scheduling
 // jitter for compute-bound reductions (e.g. Monte Carlo). See THREADING.md.
 T parallel_reduce<T>(i64 n, int workers, T identity,
-                     Func<T(i64, i64)> partial,
-                     Func<T(T, T)> combine, bool pin = false, int fpConfig = 0) {
+                     Lambda<T(i64, i64)> partial,
+                     Lambda<T(T, T)> combine, bool pin = false, int fpConfig = 0) {
     if (n <= 0) { return identity; }
     __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -306,8 +306,8 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
 
 // THREAD POOL variant (see parallel_for_n_pool for why this is a distinct name).
 T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
-                          Func<T(i64, i64)> partial,
-                          Func<T(T, T)> combine) {
+                          Lambda<T(i64, i64)> partial,
+                          Lambda<T(T, T)> combine) {
     if (n <= 0) { return identity; }
     if (workers <= 0) { workers = pool->workerCount(); }
     if (workers <= 0) { workers = hardware_concurrency(); }

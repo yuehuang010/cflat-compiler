@@ -16,13 +16,13 @@ void doNothing()          { }
 
 // ── Higher-order named helpers ────────────────────────────────────────────────
 
-int apply(Func<int(int, int)> f, int a, int b) { return f(a, b); }
-int transform(Func<int(int)> f, int x)         { return f(x); }
-bool applyPred(Func<bool(int)> f, int x)       { return f(x); }
-void callVoid(Func<void()> f)                   { f(); }
+int apply(Lambda<int(int, int)> f, int a, int b) { return f(a, b); }
+int transform(Lambda<int(int)> f, int x)         { return f(x); }
+bool applyPred(Lambda<bool(int)> f, int x)       { return f(x); }
+void callVoid(Lambda<void()> f)                   { f(); }
 
 // Reduce: fold an array with a binary function
-int reduce(Func<int(int, int)> f, int* arr, int len, int init)
+int reduce(Lambda<int(int, int)> f, int* arr, int len, int init)
 {
     int acc = init;
     for (int i = 0; i < len; i++)
@@ -31,7 +31,7 @@ int reduce(Func<int(int, int)> f, int* arr, int len, int init)
 }
 
 // Map-and-sum: apply unary f to each element then sum
-int mapSum(Func<int(int)> f, int* arr, int len)
+int mapSum(Lambda<int(int)> f, int* arr, int len)
 {
     int total = 0;
     for (int i = 0; i < len; i++)
@@ -40,7 +40,7 @@ int mapSum(Func<int(int)> f, int* arr, int len)
 }
 
 // Apply f n times to x
-int applyN(Func<int(int)> f, int x, int n)
+int applyN(Lambda<int(int)> f, int x, int n)
 {
     int v = x;
     for (int i = 0; i < n; i++)
@@ -49,7 +49,7 @@ int applyN(Func<int(int)> f, int x, int n)
 }
 
 // Count elements satisfying predicate
-int countIf(Func<bool(int)> pred, int* arr, int len)
+int countIf(Lambda<bool(int)> pred, int* arr, int len)
 {
     int count = 0;
     for (int i = 0; i < len; i++)
@@ -65,7 +65,7 @@ bool testExplicitFunctionPointer()
 {
     bool result = true;
 
-    Func<int(int, int)> f = add;
+    Lambda<int(int, int)> f = add;
     result &= Test("explicit add",    f(3, 4),  7);
 
     f = mul;
@@ -74,7 +74,7 @@ bool testExplicitFunctionPointer()
     f = sub;
     result &= Test("reassign to sub", f(10, 3), 7);
 
-    Func<int(int)> g = doubleIt;
+    Lambda<int(int)> g = doubleIt;
     result &= Test("unary funcptr",          g(6),  12);
 
     g = square;
@@ -83,7 +83,7 @@ bool testExplicitFunctionPointer()
     g = negate;
     result &= Test("negate funcptr", g(7), -7);
 
-    Func<bool(int)> pred = isEven;
+    Lambda<bool(int)> pred = isEven;
     result &= Test("bool funcptr even", pred(4), true);
     result &= Test("bool funcptr odd",  pred(7), false);
 
@@ -162,7 +162,7 @@ bool testVoidFunctionPointer()
 {
     bool result = true;
 
-    Func<void()> f = doNothing;
+    Lambda<void()> f = doNothing;
     callVoid(f);
     callVoid(doNothing);
     result &= Test("void funcptr", 1, 1);
@@ -174,7 +174,7 @@ bool testFunctionPointerClamp()
 {
     bool result = true;
 
-    Func<int(int)> f = clamp100;
+    Lambda<int(int)> f = clamp100;
     result &= Test("clamp mid",  f(50),   50);
     result &= Test("clamp high", f(200), 100);
     result &= Test("clamp low", f(-5), 0);
@@ -190,15 +190,15 @@ bool testLambdaBasic()
 {
     bool result = true;
 
-    Func<int(int, int)> addL = (int a, int b) => { return a + b; };
+    Lambda<int(int, int)> addL = (int a, int b) => { return a + b; };
     result &= Test("lambda add",   addL(3, 4),  7);
     result &= Test("lambda add 0", addL(0, 0),  0);
 
-    Func<int(int, int)> mulL = (int a, int b) => { return a * b; };
+    Lambda<int(int, int)> mulL = (int a, int b) => { return a * b; };
     result &= Test("lambda mul",   mulL(3, 4), 12);
     result &= Test("lambda mul 7", mulL(7, 7), 49);
 
-    Func<int()> getK = () => { return 42; };
+    Lambda<int()> getK = () => { return 42; };
     result &= Test("zero-param lambda", getK(), 42);
 
     return result;
@@ -209,7 +209,7 @@ bool testLambdaControlFlow()
     bool result = true;
 
     // Lambda with if/else
-    Func<int(int, int)> maxL = (int a, int b) => {
+    Lambda<int(int, int)> maxL = (int a, int b) => {
         if (a > b) return a;
         return b;
     };
@@ -218,7 +218,7 @@ bool testLambdaControlFlow()
     result &= Test("lambda max(5,5)", maxL(5, 5), 5);
 
     // Lambda with multi-branch if/else
-    Func<int(int)> sign = (int x) => {
+    Lambda<int(int)> sign = (int x) => {
         if (x > 0) return 1;
         if (x < 0) return -1;
         return 0;
@@ -235,7 +235,7 @@ bool testLambdaLocalVars()
     bool result = true;
 
     // Lambda that uses local variables in its body
-    Func<int(int, int)> hypoSq = (int a, int b) => {
+    Lambda<int(int, int)> hypoSq = (int a, int b) => {
         int aa = a * a;
         int bb = b * b;
         return aa + bb;
@@ -244,7 +244,7 @@ bool testLambdaLocalVars()
     result &= Test("hypoSq 5,12",  hypoSq(5, 12), 169);
 
     // Lambda with a loop body
-    Func<int(int)> sumTo = (int n) => {
+    Lambda<int(int)> sumTo = (int n) => {
         int s = 0;
         for (int i = 1; i <= n; i++)
             s = s + i;
@@ -261,12 +261,12 @@ bool testLambdaCallsNamedFunction()
     bool result = true;
 
     // Lambda body calling regular functions
-    Func<int(int)> doubleSq = (int x) => { return square(doubleIt(x)); };
+    Lambda<int(int)> doubleSq = (int x) => { return square(doubleIt(x)); };
     result &= Test("doubleSq 3", doubleSq(3),  36);   // square(6)=36
     result &= Test("doubleSq 5", doubleSq(5), 100);   // square(10)=100
 
     // isEven(square(x)): even input -> even square; odd input -> odd square
-    Func<bool(int)> evenSquare = (int x) => { return isEven(square(x)); };
+    Lambda<bool(int)> evenSquare = (int x) => { return isEven(square(x)); };
     result &= Test("evenSquare even",  evenSquare(4), true);   // square(4)=16, even
     result &= Test("evenSquare odd",   evenSquare(3), false);  // square(3)=9, odd
 
@@ -277,8 +277,8 @@ bool testLambdaBoolReturn()
 {
     bool result = true;
 
-    Func<bool(int)> gt10  = (int x) => { return x > 10; };
-    Func<bool(int)> ltNeg = (int x) => { return x < 0; };
+    Lambda<bool(int)> gt10  = (int x) => { return x > 10; };
+    Lambda<bool(int)> ltNeg = (int x) => { return x < 0; };
 
     result &= Test("gt10 true",   gt10(15),   true);
     result &= Test("gt10 false",  gt10(5),    false);
@@ -292,7 +292,7 @@ bool testLambdaReassignment()
 {
     bool result = true;
 
-    Func<int(int)> f = (int x) => { return x + 1; };
+    Lambda<int(int)> f = (int x) => { return x + 1; };
     result &= Test("lambda f=x+1",    f(5),  6);
 
     // Reassign to a different lambda
@@ -359,12 +359,12 @@ bool testLambdaThreeParam()
     bool result = true;
 
     // Lambda with 3 parameters
-    Func<int(int, int, int)> fmaL = (int a, int b, int c) => { return a * b + c; };
+    Lambda<int(int, int, int)> fmaL = (int a, int b, int c) => { return a * b + c; };
     result &= Test("fma 2*3+4", fmaL(2, 3, 4),  10);
     result &= Test("fma 5*5+1", fmaL(5, 5, 1),  26);
     result &= Test("fma 0*9+7", fmaL(0, 9, 7),   7);
 
-    Func<int(int, int, int)> clampL = (int v, int lo, int hi) => {
+    Lambda<int(int, int, int)> clampL = (int v, int lo, int hi) => {
         if (v < lo) return lo;
         if (v > hi) return hi;
         return v;
@@ -380,7 +380,7 @@ bool testVoidLambda()
 {
     bool result = true;
 
-    Func<void()> noopLambda = () => { };
+    Lambda<void()> noopLambda = () => { };
     callVoid(noopLambda);
     callVoid(() => { doNothing(); });
     result &= Test("void lambda", 1, 1);
@@ -391,24 +391,24 @@ bool testVoidLambda()
 // ── Returning a lambda LITERAL directly from a function ───────────────────────
 // Regression: `return () => {...};` once failed module verification ("ret i32 in
 // void function") because the return handler did not thread the function's
-// declared Func<> return type into the lambda's expected type. It must also
+// declared Lambda<> return type into the lambda's expected type. It must also
 // move the closure env to the caller (not free it as a returning temp).
 
-Func<int()> makeConst()           { return () => { return 7; }; }
-Func<int(int)> makeAdder(int n)   { return (int x) => { return x + n; }; }
-Func<int()> makeLen(string s)     { return () => { return s.length(); }; }
+Lambda<int()> makeConst()           { return () => { return 7; }; }
+Lambda<int(int)> makeAdder(int n)   { return (int x) => { return x + n; }; }
+Lambda<int()> makeLen(string s)     { return () => { return s.length(); }; }
 
 bool testReturnLambdaLiteral()
 {
     bool result = true;
 
-    Func<int()> k = makeConst();
+    Lambda<int()> k = makeConst();
     result &= Test("return lambda const", k(), 7);
 
-    Func<int(int)> add5 = makeAdder(5);
+    Lambda<int(int)> add5 = makeAdder(5);
     result &= Test("return lambda capture int", add5(10), 15);
 
-    Func<int()> len = makeLen("hello");
+    Lambda<int()> len = makeLen("hello");
     result &= Test("return lambda capture string", len(), 5);
 
     return result;
@@ -449,7 +449,7 @@ bool testCapturePrimitives()
     // int - value copy; outer mutation does not affect captured snapshot
     {
         int x = 10;
-        Func<int()> getX = () => { return x; };
+        Lambda<int()> getX = () => { return x; };
         result &= Test("int capture",        getX(), 10);
         x = 99;
         result &= Test("int capture stable", getX(), 10);
@@ -458,7 +458,7 @@ bool testCapturePrimitives()
     // float - value copy
     {
         float factor = 2.5f;
-        Func<float(float)> scale = (float v) => { return v * factor; };
+        Lambda<float(float)> scale = (float v) => { return v * factor; };
         result &= Test("float capture",        scale(4.0f), 10.0f);
         factor = 999.0f;
         result &= Test("float capture stable", scale(4.0f), 10.0f);
@@ -467,7 +467,7 @@ bool testCapturePrimitives()
     // bool - value copy
     {
         bool enabled = true;
-        Func<bool()> check = () => { return enabled; };
+        Lambda<bool()> check = () => { return enabled; };
         result &= Test("bool capture", check(), true);
         enabled = false;
         result &= Test("bool capture stable", check(), true);
@@ -476,7 +476,7 @@ bool testCapturePrimitives()
     // i64 - value copy
     {
         i64 big = 4000000000;
-        Func<i64()> getBig = () => { return big; };
+        Lambda<i64()> getBig = () => { return big; };
         result &= Test("i64 capture",        getBig(), 4000000000);
         big = 0;
         result &= Test("i64 capture stable", getBig(), 4000000000);
@@ -485,7 +485,7 @@ bool testCapturePrimitives()
     // char* - pointer copy; both sides read the same bytes
     {
         char* msg = "hello";
-        Func<int()> getLen = () => { return strlen(msg); };
+        Lambda<int()> getLen = () => { return strlen(msg); };
         result &= Test("char* capture", getLen(), 5);
     }
 
@@ -493,7 +493,7 @@ bool testCapturePrimitives()
     {
         int* p = new int;
         *p = 42;
-        Func<int()> read = () => { return *p; };
+        Lambda<int()> read = () => { return *p; };
         result &= Test("int* initial",  read(), 42);
         *p = 77;
         result &= Test("int* mutation", read(), 77);
@@ -510,7 +510,7 @@ bool testCaptureString()
     // string - value copy taken at capture time; outer reassignment invisible
     {
         string label = "world";
-        Func<int()> getLen = () => { return label.length(); };
+        Lambda<int()> getLen = () => { return label.length(); };
         result &= Test("string capture len",    getLen(), 5);
         label = "hi";
         result &= Test("string capture stable", getLen(), 5);
@@ -519,7 +519,7 @@ bool testCaptureString()
     // string equality check inside lambda
     {
         string greeting = "hello";
-        Func<bool(string)> matches = (string s) => { return greeting == s; };
+        Lambda<bool(string)> matches = (string s) => { return greeting == s; };
         result &= Test("string eq match",    matches("hello"), true);
         result &= Test("string eq no-match", matches("world"), false);
     }
@@ -527,7 +527,7 @@ bool testCaptureString()
     // string data() access inside lambda
     {
         string word = "abc";
-        Func<char*()> getPtr = () => { return word.data(); };
+        Lambda<char*()> getPtr = () => { return word.data(); };
         char* ptr = getPtr();
         result &= Test("string data() non-null", ptr != nullptr, true);
         result &= Test("string data() len",      strlen(ptr),    3);
@@ -543,7 +543,7 @@ bool testCaptureStructRef()
     // struct (Counter) - reference capture; lambda mutations visible to caller
     {
         Counter c;
-        Func<void()> inc = () => { c.value = c.value + 1; };
+        Lambda<void()> inc = () => { c.value = c.value + 1; };
         inc(); inc(); inc();
         result &= Test("struct ref capture", c.value, 3);
     }
@@ -551,7 +551,7 @@ bool testCaptureStructRef()
     // struct (Stats) - reference capture of multi-field struct
     {
         Stats s;
-        Func<void(float)> observe = (float v) => {
+        Lambda<void(float)> observe = (float v) => {
             if (s.count == 0 || v < s.min) s.min = v;
             if (s.count == 0 || v > s.max) s.max = v;
             s.count = s.count + 1;
@@ -568,7 +568,7 @@ bool testCaptureStructRef()
     {
         Multiplier m;
         m.factor = 3;
-        Func<int(int)> tripleIt = (int x) => { return m.apply(x); };
+        Lambda<int(int)> tripleIt = (int x) => { return m.apply(x); };
         result &= Test("class ref factor=3", tripleIt(7), 21);
         m.factor = 5;
         result &= Test("class ref factor=5", tripleIt(7), 35);
@@ -578,7 +578,7 @@ bool testCaptureStructRef()
     {
         Adder a;
         a.offset = 100;
-        Func<int(int)> add100 = (int x) => { return a.apply(x); };
+        Lambda<int(int)> add100 = (int x) => { return a.apply(x); };
         result &= Test("adder +100 5",  add100(5),  105);
         result &= Test("adder +100 -3", add100(-3),  97);
     }
@@ -588,7 +588,7 @@ bool testCaptureStructRef()
         Multiplier m;
         m.factor = 4;
         ITransform t = m;
-        Func<int(int)> callT = (int x) => { return t.apply(x); };
+        Lambda<int(int)> callT = (int x) => { return t.apply(x); };
         result &= Test("iface capture 6", callT(6), 24);
         result &= Test("iface capture 3", callT(3), 12);
     }
@@ -605,7 +605,7 @@ bool testCaptureMultiple()
         int base = 10;
         float rate = 1.5f;
         Counter total;
-        Func<void(int)> accumulate = (int n) => {
+        Lambda<void(int)> accumulate = (int n) => {
             total.value = total.value + (int)(n * rate) + base;
         };
         accumulate(2);   // (int)(2*1.5) + 10 = 3+10 = 13
@@ -617,7 +617,7 @@ bool testCaptureMultiple()
     {
         string prefix = "item_";
         Counter counter;
-        Func<int()> nextId = () => {
+        Lambda<int()> nextId = () => {
             counter.value = counter.value + 1;
             return prefix.length() + counter.value;
         };
@@ -629,17 +629,17 @@ bool testCaptureMultiple()
     // lambda passed as argument, captures struct
     {
         Counter c;
-        Func<int(int)> addToC = (int n) => { c.value = c.value + n; return c.value; };
+        Lambda<int(int)> addToC = (int n) => { c.value = c.value + n; return c.value; };
         result &= Test("capture in arg 5",     transform(addToC, 5), 5);
         result &= Test("capture in arg 3",     transform(addToC, 3), 8);
         result &= Test("capture struct after",  c.value,              8);
     }
 
-    // Func<T> variable - value capture of fat struct
+    // Lambda<T> variable - value capture of fat struct
     {
         int base = 100;
-        Func<int(int)> addBase = (int x) => { return x + base; };
-        Func<int(int)> doubleAndAdd = (int x) => { return addBase(x * 2); };
+        Lambda<int(int)> addBase = (int x) => { return x + base; };
+        Lambda<int(int)> doubleAndAdd = (int x) => { return addBase(x * 2); };
         result &= Test("nested lambda 5", doubleAndAdd(5),  110);
         result &= Test("nested lambda 0", doubleAndAdd(0),  100);
     }
@@ -651,10 +651,10 @@ bool testCaptureMultiple()
 class ThisBox
 {
     int v = 0;
-    Func<void()> makeInc() { return () => { this.v = this.v + 1; }; }
-    Func<int()>  makeGet() { return () => { return this.v; }; }
+    Lambda<void()> makeInc() { return () => { this.v = this.v + 1; }; }
+    Lambda<int()>  makeGet() { return () => { return this.v; }; }
     // Capture 'this' AND a value-captured parameter together.
-    Func<int(int)> makeAddBoth(int base) { return (int n) => { return this.v + base + n; }; }
+    Lambda<int(int)> makeAddBoth(int base) { return (int n) => { return this.v + base + n; }; }
 };
 
 bool testCaptureThis()
@@ -664,18 +664,18 @@ bool testCaptureThis()
     // void lambda mutating a field through captured 'this'
     ThisBox b;
     b.v = 0;
-    Func<void()> inc = b.makeInc();
+    Lambda<void()> inc = b.makeInc();
     inc(); inc();
     result &= Test("capture this void", b.v, 2);
 
     // value-returning lambda reading a field through captured 'this'
-    Func<int()> get = b.makeGet();
+    Lambda<int()> get = b.makeGet();
     result &= Test("capture this value-return", get(), 2);
 
     // mixed: captured 'this' plus a captured parameter
     ThisBox c;
     c.v = 10;
-    Func<int(int)> addBoth = c.makeAddBoth(5);
+    Lambda<int(int)> addBoth = c.makeAddBoth(5);
     result &= Test("capture this + param", addBoth(3), 18);  // 10 + 5 + 3
 
     return result;
@@ -697,7 +697,7 @@ move IValueFP makeValueHolderWithLambda(int x)
 {
     ValueHolderFP* vh = new ValueHolderFP();
     vh.n = x;
-    Func<void()> noop = () => { };
+    Lambda<void()> noop = () => { };
     noop();
     return vh;   // must box into IValueFP, not the lambda's 'void'
 }
@@ -719,7 +719,7 @@ bool testCaptureRegression()
     // resolution. lastLambdaType was not cleared after ParsePostfixExpression consumed
     // it, causing CompareUpconvert on a struct arg to return -1 (no match).
     {
-        Func<void(int)> cb = (int x) => { };
+        Lambda<void(int)> cb = (int x) => { };
 
         list<string>* L = new list<string>;
         string s = "world";
@@ -745,7 +745,7 @@ bool testCaptureNameCollidesWithFunction()
     // 'doubleIt' is a top-level function in this file; the same-named local must
     // shadow it and be captured by value.
     int doubleIt = 21;
-    Func<int()> f = () => { return doubleIt + doubleIt; };
+    Lambda<int()> f = () => { return doubleIt + doubleIt; };
     result &= Test("capture shadows function name", f(), 42);
 
     // The bug only bit when a struct ctor/method call sat between the capture
@@ -755,7 +755,7 @@ bool testCaptureNameCollidesWithFunction()
     int square = 5;
     Counter acc;
     acc.value = 0;
-    Func<void()> g = () => { acc.value = acc.value + square; };
+    Lambda<void()> g = () => { acc.value = acc.value + square; };
     g();
     g();
     result &= Test("capture name collision w/ struct local", acc.value, 10);
@@ -801,7 +801,7 @@ bool testLambdaAllocaInLoop()
     for (int i = 0; i < n; i++)
     {
         int delta = i + 1;
-        Func<void()> inc = () => { c.value = c.value + delta; };
+        Lambda<void()> inc = () => { c.value = c.value + delta; };
         inc();
     }
     // 1+2+3+4+5 = 15
@@ -824,7 +824,7 @@ bool testCaptureBondReassign()
     Counter b; b.value = 2;
 
     // Build the closure ONCE, capturing both struct locals by reference.
-    Func<int()> f = () => { return a.value + b.value; };
+    Lambda<int()> f = () => { return a.value + b.value; };
 
     // Double-buffer swap: reassign the captured sources. Must compile without the
     // spurious bond-reassignment error; the closure observes the new slot contents.
@@ -872,7 +872,7 @@ bool testGenericFuncPtrBasic()
 {
     bool result = true;
 
-    Func<int(void*)> fn = readAs<int>;
+    Lambda<int(void*)> fn = readAs<int>;
     int x = 42;
     result &= Test("generic read int", fn((void*)&x), 42);
 
@@ -887,7 +887,7 @@ bool testGenericFuncPtrSizeof()
 {
     bool result = true;
 
-    Func<int(void*)> fn = sizeOf<int>;
+    Lambda<int(void*)> fn = sizeOf<int>;
     result &= Test("sizeof<int>",  fn(nullptr), 4);
 
     fn = sizeOf<i64>;
@@ -903,7 +903,7 @@ bool testGenericFuncPtrWrite()
 {
     bool result = true;
 
-    Func<int(void*)> fn = writeAs<int>;
+    Lambda<int(void*)> fn = writeAs<int>;
     int x = 0;
     fn((void*)&x);
     result &= Test("generic write int", x, 7);
@@ -915,7 +915,7 @@ bool testGenericFuncPtrDoubleInPlace()
 {
     bool result = true;
 
-    Func<int(void*)> fn = doubleInPlace<int>;
+    Lambda<int(void*)> fn = doubleInPlace<int>;
     int v = 5;
     fn((void*)&v);
     result &= Test("doubleInPlace<int>", v, 10);
@@ -933,7 +933,7 @@ bool testGenericFuncPtrHigherOrder()
 {
     bool result = true;
 
-    Func<int(void*)> fn = readAs<int>;
+    Lambda<int(void*)> fn = readAs<int>;
     int a = 99;
     result &= Test("higher order int", fn((void*)&a), 99);
 
@@ -957,11 +957,11 @@ bool testGenericFuncPtrHigherOrder()
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct Handler {
-    Func<int(int)> fn = default;
+    Lambda<int(int)> fn = default;
 };
 
 struct VoidHandler {
-    Func<void()> fn = default;
+    Lambda<void()> fn = default;
 };
 
 bool testFuncPtrInStructField()
@@ -1001,7 +1001,7 @@ bool testFuncPtrInStructFieldVoid()
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DispatchEntry {
-    Func<int(void*)> fn  = default;
+    Lambda<int(void*)> fn  = default;
     void*                ctx = nullptr;
 };
 
@@ -1103,7 +1103,7 @@ bool testListSortNamedComparator()
     list<int> nums;
     nums.add(7); nums.add(3); nums.add(5);
 
-    Func<bool(int, int)> asc = (int a, int b) => { return a < b; };
+    Lambda<bool(int, int)> asc = (int a, int b) => { return a < b; };
     nums.sort(asc);
 
     result &= Test("named cmp[0]", nums.get(0), 3);
@@ -1114,7 +1114,7 @@ bool testListSortNamedComparator()
 }
 
 // ── 'move' in function pointer signatures ────────────────────────────────────
-// Func<R(move T*)> is a distinct type from Func<R(T*)>. Calling through
+// Lambda<R(move T*)> is a distinct type from Lambda<R(T*)>. Calling through
 // such a pointer transfers ownership of the matching argument to the callee
 // (the caller's storage is auto-nulled), and the named function used to
 // initialize the pointer must declare the same 'move' modifier on that param.
@@ -1134,7 +1134,7 @@ int consume_payload(move MovePayload* p) {
 bool testFuncPtrMoveSignature()
 {
     g_move_fp_dtor_count = 0;
-    Func<int(move MovePayload*)> fp = consume_payload;
+    Lambda<int(move MovePayload*)> fp = consume_payload;
     MovePayload* p = new MovePayload();
     p->value = 7;
     int got = fp(p);
@@ -1146,9 +1146,9 @@ bool testFuncPtrMoveSignature()
 // A C function pointer is a bare code address with no env slot. The closure ABI is
 // env-last, so the invoker of a *non-capturing* lambda is directly callable as a
 // C callback - the C caller never supplies the trailing (unused) env arg. A capturing
-// lambda or a Func<> variable still cannot cross the C ABI (see err_lambda_to_c_funcptr).
+// lambda or a Lambda<> variable still cannot cross the C ABI (see err_lambda_to_c_funcptr).
 
-extern void qsort(void* base, u64 num, u64 size, Func<int(void*, void*)> cmp);
+extern void qsort(void* base, u64 num, u64 size, Lambda<int(void*, void*)> cmp);
 
 bool testNonCapturingLambdaToCFuncPtr()
 {
@@ -1171,7 +1171,7 @@ bool testNonCapturingLambdaToCFuncPtr()
     return result;
 }
 
-// ── Func<T>.toFunction(): fat closure -> thin C function pointer ───────────
+// ── Lambda<T>.toFunction(): fat closure -> thin C function pointer ───────────
 // Returns the bare code ptr when the closure does not capture (env null), or a
 // null thin pointer when it captures. The null return IS the contract - a
 // capturing closure has no C-ABI representation.
@@ -1182,22 +1182,22 @@ bool testFuncToFunction()
 {
     bool result = true;
 
-    // Non-capturing Func (named function) -> non-null callable thin ptr.
-    Func<int(int)> f = tf_add1;
+    // Non-capturing Lambda (named function) -> non-null callable thin ptr.
+    Lambda<int(int)> f = tf_add1;
     function<int(int)> g = f.toFunction();
     result &= Test("toFunction non-capturing non-null", g != nullptr ? 1 : 0, 1);
     result &= Test("toFunction non-capturing call",     g(41),               42);
 
-    // Capturing Func -> null thin ptr (fails closed; caller must null-check).
+    // Capturing Lambda -> null thin ptr (fails closed; caller must null-check).
     int base = 100;
-    Func<int(int)> cap = (int x) => { return x + base; };
+    Lambda<int(int)> cap = (int x) => { return x + base; };
     function<int(int)> h = cap.toFunction();
     result &= Test("toFunction capturing is null", h == nullptr ? 1 : 0, 1);
 
-    // thin -> Func -> toFunction round-trip: widening stores {code, null}, so the
+    // thin -> Lambda -> toFunction round-trip: widening stores {code, null}, so the
     // thin ptr is recovered intact and stays callable.
     function<int(int)> t = tf_add1;
-    Func<int(int)> wide = t;
+    Lambda<int(int)> wide = t;
     function<int(int)> back = wide.toFunction();
     result &= Test("toFunction round-trip non-null", back != nullptr ? 1 : 0, 1);
     result &= Test("toFunction round-trip call",     back(7),              8);
@@ -1205,11 +1205,11 @@ bool testFuncToFunction()
     return result;
 }
 
-// ── function-type aliases (using Cb = Func<R(Args)>) ──────────────────────
-// A `using` alias whose RHS is a function type is usable everywhere a Func<...>
+// ── function-type aliases (using Cb = Lambda<R(Args)>) ──────────────────────
+// A `using` alias whose RHS is a function type is usable everywhere a Lambda<...>
 // type is: parameter, local variable, struct field, and return type. The alias
 // expands to the closure type, so ownership (capture/copy/free) flows through it.
-using IntUnaryOp = Func<int(int)>;          // HANDLE/EVENT-style: Func<void(void*)> etc.
+using IntUnaryOp = Lambda<int(int)>;          // HANDLE/EVENT-style: Lambda<void(void*)> etc.
 
 struct AliasHandlerBox { IntUnaryOp op = default; };   // alias as a struct field type
 
@@ -1308,7 +1308,7 @@ extern int main()
     // Non-capturing lambda across the C ABI
     total++; passed += testNonCapturingLambdaToCFuncPtr() ? 1 : 0;
 
-    // Func<T>.toFunction() fat -> thin lowering
+    // Lambda<T>.toFunction() fat -> thin lowering
     total++; passed += testFuncToFunction()             ? 1 : 0;
 
     // List sort tests
@@ -1317,7 +1317,7 @@ extern int main()
     total++; passed += testListSortEdgeCases()         ? 1 : 0;
     total++; passed += testListSortNamedComparator()   ? 1 : 0;
 
-    // Function-type aliases (using Cb = Func<R(Args)>)
+    // Function-type aliases (using Cb = Lambda<R(Args)>)
     total++; passed += testFunctionTypeAlias()          ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);

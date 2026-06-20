@@ -521,12 +521,12 @@ private:
                         declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
                         break;
                     }
-                    // function pointer type: `function<...>` (thin C ptr) or `Func<...>` (fat closure)
+                    // function pointer type: `function<...>` (thin C ptr) or `Lambda<...>` (fat closure)
                     if (typeSpec->functionPointerSpecifier() != nullptr)
                     {
                         auto* fpSpec = typeSpec->functionPointerSpecifier();
                         declType.IsFunctionPointer = true;
-                        // `function` = thin C ptr ("__c_fn_ptr"); `Func` = fat ("__closure_fat_ptr").
+                        // `function` = thin C ptr ("__c_fn_ptr"); `Lambda` = fat ("__closure_fat_ptr").
                         declType.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
                         if (fpSpec->typeSpecifier() != nullptr)
                         {
@@ -585,7 +585,7 @@ private:
                 else if (auto fit = compiler->functionTypeAliases.find(typeSpec->getText());
                          fit != compiler->functionTypeAliases.end())
                 {
-                    // Function-type alias (using Cb = function<R(Args)> | Func<R(Args)>): expand
+                    // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
                     // into the stored signature, mirroring the functionPointerSpecifier branch above.
                     declType.IsFunctionPointer     = true;
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
@@ -1167,7 +1167,7 @@ public:
     {
         LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
-        // `function` = thin C ptr ("__c_fn_ptr"); `Func` = fat ("__closure_fat_ptr"). IsThinFnPtr() derives from this.
+        // `function` = thin C ptr ("__c_fn_ptr"); `Lambda` = fat ("__closure_fat_ptr"). IsThinFnPtr() derives from this.
         tv.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
         if (fpSpec->typeSpecifier() != nullptr)
         {
@@ -1852,12 +1852,12 @@ private:
                     declType.ArraySize = ArrayDimsOf(declSpec) ? ArrayDimsOf(declSpec)->assignmentExpression(0) : nullptr;
                     break;
                 }
-                // function pointer type: `function<...>` (thin C ptr) or `Func<...>` (fat closure)
+                // function pointer type: `function<...>` (thin C ptr) or `Lambda<...>` (fat closure)
                 if (typeSpec->functionPointerSpecifier() != nullptr)
                 {
                     auto* fpSpec = typeSpec->functionPointerSpecifier();
                     declType.IsFunctionPointer = true;
-                    // `function` = thin C ptr ("__c_fn_ptr"); `Func` = fat ("__closure_fat_ptr").
+                    // `function` = thin C ptr ("__c_fn_ptr"); `Lambda` = fat ("__closure_fat_ptr").
                     declType.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
                     if (fpSpec->typeSpecifier() != nullptr)
                     {
@@ -1959,7 +1959,7 @@ private:
                 else if (auto fit = Compiler(declSpecs)->functionTypeAliases.find(typeSpec->getText());
                          fit != Compiler(declSpecs)->functionTypeAliases.end())
                 {
-                    // Function-type alias (using Cb = function<R(Args)> | Func<R(Args)>): expand
+                    // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
                     // into the stored signature, mirroring the functionPointerSpecifier branch above.
                     declType.IsFunctionPointer     = true;
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
@@ -2505,7 +2505,7 @@ public:
     {
         LLVMBackend::TypeAndValue tv;
         tv.IsFunctionPointer = true;
-        // `function` = thin C ptr ("__c_fn_ptr"); `Func` = fat ("__closure_fat_ptr"). IsThinFnPtr() derives from this.
+        // `function` = thin C ptr ("__c_fn_ptr"); `Lambda` = fat ("__closure_fat_ptr"). IsThinFnPtr() derives from this.
         tv.TypeName = (fpSpec->Function() != nullptr) ? "__c_fn_ptr" : "__closure_fat_ptr";
         if (fpSpec->typeSpecifier() != nullptr)
         {
@@ -5601,7 +5601,7 @@ public:
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                 {
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
-                                    // thin `function<T>`: bare fn ptr; fat `Func<T>`: closure fat struct.
+                                    // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = typeAndValue.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(fn, typeAndValue)
                                           : compiler->WrapBareValueAsFatStruct(fn);
@@ -5622,7 +5622,7 @@ public:
                                 }
                             }
                             // Fat closure -> thin function<T>: allowed only when provably non-capturing
-                            // (env is a compile-time null). A capturing lambda literal or a stored Func<>
+                            // (env is a compile-time null). A capturing lambda literal or a stored Lambda<>
                             // value cannot carry captures across the C ABI, so reject it with guidance
                             // instead of dropping the env (a thin ptr over freed/absent state -> crash).
                             if (right && typeAndValue.IsFunctionPointer && typeAndValue.IsThinFnPtr()
@@ -5638,8 +5638,8 @@ public:
                                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(typeAndValue));
                                 }
                             }
-                            // Widen a thin function<T> value to a fat Func<T>: store {code, null}, no
-                            // thunk. Mirrors the call-arg widen; keeps thin -> Func -> toFunction lossless.
+                            // Widen a thin function<T> value to a fat Lambda<T>: store {code, null}, no
+                            // thunk. Mirrors the call-arg widen; keeps thin -> Lambda -> toFunction lossless.
                             if (right && typeAndValue.IsFunctionPointer && !typeAndValue.IsThinFnPtr()
                                 && rhsIsThinFnPtr && !right->getType()->isStructTy())
                             {
@@ -6494,8 +6494,8 @@ public:
                     right = llvm::UndefValue::get(compiler->BuildThinFnPtrType(namedVar.TypeAndValue));
                 }
             }
-            // Widen a thin function<T> value to a fat Func<T>: store {code, null}, no thunk
-            // (mirrors the decl path). Keeps thin -> Func -> toFunction lossless.
+            // Widen a thin function<T> value to a fat Lambda<T>: store {code, null}, no thunk
+            // (mirrors the decl path). Keeps thin -> Lambda -> toFunction lossless.
             if (operatorText == "=" && right && namedVar.TypeAndValue.IsFunctionPointer
                 && !namedVar.TypeAndValue.IsThinFnPtr() && rightNV.TypeAndValue.IsThinFnPtr()
                 && !right->getType()->isStructTy())
@@ -11341,7 +11341,7 @@ public:
                                      || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr"))
                             {
                                 // Not a field - a member function, an extension method template, or the
-                                // Func<T>.toFunction() builtin (lowered at the call dispatch below).
+                                // Lambda<T>.toFunction() builtin (lowered at the call dispatch below).
                                 namedVar = {};
                             }
                             else if (LLVMBackend::NamedVariable anonNV;
@@ -11893,7 +11893,7 @@ public:
 
                         auto argumentList = ctx->argumentExpressionList();
 
-                        // Func<T>.toFunction(): lower a fat closure to a thin `function<T>` C pointer.
+                        // Lambda<T>.toFunction(): lower a fat closure to a thin `function<T>` C pointer.
                         // Returns the bare code ptr when the closure does not capture (env null), or a
                         // null thin pointer when it does. No args; the receiver is the fat closure.
                         if (functionName == "toFunction"

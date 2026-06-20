@@ -5,10 +5,10 @@ struct Counter {
     int value = default;
 };
 
-Func<void()> escape() {
+Lambda<void()> escape() {
     expect_error("bonded value whose source 'c' is not a 'bond' parameter");
     Counter c;
-    Func<void()> inc = () => { c.value = c.value + 1; };
+    Lambda<void()> inc = () => { c.value = c.value + 1; };
     return inc;
 }
 

@@ -385,7 +385,7 @@ public:
         // When IsFunctionPointer is set, the closure TypeName distinguishes the two flavours:
         //   thin  (`function<T>`): a bare C function pointer R(*)(Args), 8 bytes, no env,
         //                          non-capturing, C-ABI compatible. TypeName == "__c_fn_ptr".
-        //   fat   (`Func<T>`):     the owning closure {code, env}, 16 bytes. TypeName == "__closure_fat_ptr".
+        //   fat   (`Lambda<T>`):     the owning closure {code, env}, 16 bytes. TypeName == "__closure_fat_ptr".
         // IsThinFnPtr() is DERIVED from TypeName (not stored) so the two can never drift; set
         // TypeName to one of the two names above and this follows.
         bool IsThinFnPtr() const { return TypeName == "__c_fn_ptr"; }
@@ -1440,7 +1440,7 @@ private:
 
     // True when `value` is a freshly-lowered lambda-literal temp (registered, not yet claimed).
     // Used to gate the implicit non-capturing-lambda -> thin function<T> coercion: a stored
-    // Func<T> value is NOT a temp, so it cannot implicitly narrow (must use .toFunction()).
+    // Lambda<T> value is NOT a temp, so it cannot implicitly narrow (must use .toFunction()).
     bool IsOwnedClosureTemp(llvm::Value* value) const
     {
         for (const auto& e : pendingOwnedClosureTemps)
@@ -5685,7 +5685,7 @@ public:
 
     // True iff a fat closure value is PROVABLY non-capturing: its env field is a compile-time
     // null constant (a non-capturing lambda literal or a named-fn wrap). A capturing lambda or a
-    // stored/loaded Func<> value is not provable here and returns false. This is the static gate
+    // stored/loaded Lambda<> value is not provable here and returns false. This is the static gate
     // for narrowing a fat closure to a thin `function<T>` - the same env-null signal the extern
     // function-pointer argument path uses.
     bool ClosureIsStaticallyNonCapturing(llvm::Value* fatVal)
@@ -5695,14 +5695,14 @@ public:
     }
 
     // Diagnostic for an illegal fat-closure -> thin `function<T>` narrowing. With capture names
-    // (a capturing lambda literal) it lists them; with none (a stored Func<> value) it points at
+    // (a capturing lambda literal) it lists them; with none (a stored Lambda<> value) it points at
     // .toFunction(). Shared by the declaration, assignment, and return coercion sites.
     std::string DescribeCapturingClosureToThin(const std::vector<std::string>& captureNames) const
     {
         if (captureNames.empty())
             return "a closure that may carry captured state cannot become a C function pointer "
                    "'function<T>'; call .toFunction() instead (it returns the code pointer when the "
-                   "closure does not capture, or null when it does), or use Func<T> to keep the captures.";
+                   "closure does not capture, or null when it does), or use Lambda<T> to keep the captures.";
         const size_t count = captureNames.size();
         const size_t shown = count < 5 ? count : 5;
         std::string list;
@@ -5710,12 +5710,12 @@ public:
         std::string more = count > shown ? std::format(", ... (and {} more)", count - shown) : "";
         return std::format(
             "a capturing lambda cannot become a C function pointer 'function<T>': it captured {} {} "
-            "[{}{}]. Use Func<T> to keep the captures, or call .toFunction() (which returns null when "
+            "[{}{}]. Use Lambda<T> to keep the captures, or call .toFunction() (which returns null when "
             "the closure captures).",
             count, (count == 1 ? "variable" : "variables"), list, more);
     }
 
-    // Func<T>.toFunction(): lower a fat closure value to a thin `function<T>` C pointer.
+    // Lambda<T>.toFunction(): lower a fat closure value to a thin `function<T>` C pointer.
     // env == null (non-capturing) -> the bare code ptr; env != null (captures) -> a null thin
     // pointer. The env==null test is the entire contract: a capturing closure has no C-ABI
     // representation, so the lowering fails closed and the caller must null-check. No trap, no
@@ -5757,8 +5757,8 @@ public:
         return val;   // already a fat closure value
     }
 
-    // Widen a thin `function<T>` (bare C ptr) to a fat `Func<T>` value {code, null}. No thunk:
-    // the thin ptr goes straight into the code slot, env is null. When the resulting Func is
+    // Widen a thin `function<T>` (bare C ptr) to a fat `Lambda<T>` value {code, null}. No thunk:
+    // the thin ptr goes straight into the code slot, env is null. When the resulting Lambda is
     // invoked (env-last ABI), the trailing null env arg is harmlessly ignored by the bare C
     // function (caller-cleanup tolerance). The null env makes .toFunction() round-trip it back.
     llvm::Value* WidenThinToFat(llvm::Value* thinPtr)
@@ -9740,7 +9740,7 @@ public:
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
                             val = WrapBareValueAsFatStruct(fn);
                         else if (val && val->getType()->isPointerTy())
-                            val = WidenThinToFat(val);   // thin function<T> -> fat Func<T> {code, null}
+                            val = WidenThinToFat(val);   // thin function<T> -> fat Lambda<T> {code, null}
                     }
                 }
                 else

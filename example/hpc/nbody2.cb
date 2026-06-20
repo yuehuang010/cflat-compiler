@@ -189,7 +189,7 @@ extern int main(int argc, char** argv) {
     span<double> sAz;  sAz.wrap(az, (i64)n);
 
     // Capturing O(N^2) force kernel (explicit SIMD inner loop), same as nbody.cb.
-    Func<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
+    Lambda<void(i64, i64)> forceRange = (i64 lo, i64 hi) => {
         simd<double,8> eps2V = eps2;
         i64 bi = lo;
         while (bi < hi) {
