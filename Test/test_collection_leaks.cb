@@ -27,33 +27,33 @@ import "test_helper.cb";
 struct LeakRow { string name = default; };
 struct LeakBox { list<int> nums = default; };
 struct LeakPair { string name = default; list<int> nums = default; };
-// Owning function<> field (lambda Option A): a closure stored in a struct field owns its heap
+// Owning Func<> field (lambda Option A): a closure stored in a struct field owns its heap
 // env and is freed by the struct's destructor, like a string/list field.
-struct LeakHandler { function<int(int)> fn = default; };
+struct LeakHandler { Func<int(int)> fn = default; };
 
 // Function-type alias: ownership/clone/free flow through the alias exactly as through the
-// underlying function<int(int)>, so clone-by-default reassignment must not leak.
-using EVENT = function<int(int)>;
+// underlying Func<int(int)>, so clone-by-default reassignment must not leak.
+using EVENT = Func<int(int)>;
 
 // Returns a CAPTURING closure - its env must be heap-owned so the value can escape the frame
 // (Bug 8). Built in a local and returned by variable (the escape pattern real code uses).
-function<int(int)> makeLeakAdder(int base)
+Func<int(int)> makeLeakAdder(int base)
 {
-    function<int(int)> f = (int x) => x + base;
+    Func<int(int)> f = (int x) => x + base;
     return f;
 }
 
 // Same, but returns the capturing lambda LITERAL directly (no intermediate variable). This is a
 // distinct codegen path from makeLeakAdder; the returned env must still transfer to the caller's
 // local and free exactly once (no leak, no double-free) when that local goes out of scope.
-function<int(int)> makeLeakAdderLiteral(int base)
+Func<int(int)> makeLeakAdderLiteral(int base)
 {
     return (int x) => x + base;
 }
 
 // Borrow a closure by value and invoke it (exercises the by-value argument copy site - the
 // caller's temporary env is freed at end of the call statement by FlushOwnedClosureTemps).
-int applyLeak(function<int(int)> fn, int v) { return fn(v); }
+int applyLeak(Func<int(int)> fn, int v) { return fn(v); }
 
 // === String-RETURN ownership (runtime-bit model) regression helpers ===
 // Before the fix, the string destructor was gated on a COMPILE-TIME `IsOwningString` flag
@@ -303,7 +303,7 @@ extern int main()
         total++; passed += Test("memberwise copy string value", b.name, "SRC");
     }
 
-    // === Bug 7: closure (function<...>) ownership - lambda Option A ===
+    // === Bug 7: closure (Func<...>) ownership - lambda Option A ===
     // A capturing closure owns a heap env. As an owning value type it must: be freed at scope
     // exit / struct teardown, clone-on-copy (.copy() and clone-by-default `b = a`), be stored
     // into a struct field cleanly, and have an unbound by-value-argument temporary freed at the
@@ -315,17 +315,17 @@ extern int main()
         total++; passed += Test("closure field store invoke", h.fn(5), 105);
 
         // (b) returned capturing closure held in a local (escape via return)
-        function<int(int)> r = makeLeakAdder(1000);
+        Func<int(int)> r = makeLeakAdder(1000);
         total++; passed += Test("closure return->var invoke", r(1), 1001);
 
         // (c) explicit .copy() -> two independent envs, both valid
-        function<int(int)> a = makeLeakAdder(10);
-        function<int(int)> b = a.copy();
+        Func<int(int)> a = makeLeakAdder(10);
+        Func<int(int)> b = a.copy();
         total++; passed += Test("closure copy independent (orig)", a(2), 12);
         total++; passed += Test("closure copy independent (copy)", b(3), 13);
 
         // (d) clone-by-default: `c = a` deep-copies the env, a stays valid (no use-after-move)
-        function<int(int)> c = a;
+        Func<int(int)> c = a;
         total++; passed += Test("closure clone-by-default (clone)", c(7), 17);
         total++; passed += Test("closure clone-by-default (source live)", a(8), 18);
 
@@ -334,7 +334,7 @@ extern int main()
         total++; passed += Test("closure literal by-value arg", applyLeak((int x) => x + cap, 4), 54);
 
         // (f) named closure passed by value (caller retains ownership; callee borrows)
-        function<int(int)> g = (int x) => x + 1;
+        Func<int(int)> g = (int x) => x + 1;
         total++; passed += Test("closure named by-value arg", applyLeak(g, 9), 10);
 
         // (g) reassigning a closure LOCAL frees the previous heap env (no leak of the old env).
@@ -342,10 +342,10 @@ extern int main()
         // before the new value lands. Covers a lambda-literal RHS, a named-source clone, and a
         // self-assign (which must not double-free the slot it just cloned from).
         int rk = 3;
-        function<int(int)> rf = (int x) => x + rk;   // env #1
+        Func<int(int)> rf = (int x) => x + rk;   // env #1
         rf = (int x) => x * rk;                       // frees env #1, stores env #2
         rf = rf;                                       // clone-then-free-old: no double-free
-        function<int(int)> rsrc = (int x) => x - rk;
+        Func<int(int)> rsrc = (int x) => x - rk;
         rf = rsrc;                                     // named-source clone; frees prior env
         total++; passed += Test("closure reassign result", rf(10), 7);
         total++; passed += Test("closure reassign source live", rsrc(10), 7);
@@ -354,16 +354,16 @@ extern int main()
         // source env (clone-by-default) AND frees the tmp's PREVIOUS clone first, so reassigning
         // a tmp via a name does not leak the prior cloned env. The named sources stay live (a
         // clone, never a move), so they remain callable after being assigned into the tmp.
-        function<int(int)> src1 = makeLeakAdder(20);
-        function<int(int)> src2 = makeLeakAdder(30);
-        function<int(int)> tmp = src1;   // clone src1 -> tmp env #1
+        Func<int(int)> src1 = makeLeakAdder(20);
+        Func<int(int)> src2 = makeLeakAdder(30);
+        Func<int(int)> tmp = src1;   // clone src1 -> tmp env #1
         tmp = src2;                       // free tmp env #1, clone src2 -> tmp env #2
         tmp = src1;                       // free tmp env #2, clone src1 -> tmp env #3
         total++; passed += Test("closure tmp via name (result)", tmp(1), 21);
         total++; passed += Test("closure tmp via name (src1 live)", src1(2), 22);
         total++; passed += Test("closure tmp via name (src2 live)", src2(3), 33);
 
-        // (i) function-type alias `using EVENT = function<int(int)>`: two alias-typed locals,
+        // (i) function-type alias `using EVENT = Func<int(int)>`: two alias-typed locals,
         // then clone-by-default reassignment `v2 = v1` through the alias. The store frees v2's
         // previous env and clones v1's into v2 (no leak), and v1 stays live (clone, not move).
         EVENT v1 = makeLeakAdder(40);
@@ -385,11 +385,11 @@ extern int main()
         // (k) returning a capturing lambda LITERAL directly (no intermediate variable): the env
         // transfers to the caller's local and frees on scope exit. Exercised once and in a loop
         // (each iteration's local frees independently - the envs must not accumulate).
-        function<int(int)> lit = makeLeakAdderLiteral(60);
+        Func<int(int)> lit = makeLeakAdderLiteral(60);
         total++; passed += Test("returned lambda literal invoke", lit(5), 65);
         int li = 0;
         int lsum = 0;
-        while (li < 16) { function<int(int)> lg = makeLeakAdderLiteral(li); lsum = lsum + lg(1); li = li + 1; }
+        while (li < 16) { Func<int(int)> lg = makeLeakAdderLiteral(li); lsum = lsum + lg(1); li = li + 1; }
         total++; passed += Test("returned lambda literal loop sum", lsum, 136);   // sum of (1 + li), li=0..15
 
         // (l) UNBOUND closure call result used INLINE: a closure-returning call whose result is
@@ -423,11 +423,11 @@ extern int main()
         // Lambda returning a string: the lambda invoker shares the same return-ownership path,
         // so an owned temp (concat) and an owned local moved out of the body both transfer to
         // the caller's local and free on scope exit - no leak, no double-free.
-        function<string()> tempFn = () => { return "lam" + "bda"; };   // owned concat in a lambda
+        Func<string()> tempFn = () => { return "lam" + "bda"; };   // owned concat in a lambda
         string fromLambdaTemp = tempFn();
         total++; passed += Test("lambda owned temp return", fromLambdaTemp.length(), 6);
 
-        function<string()> localFn = () => { string t = "x" + "y"; return t; };  // owned local
+        Func<string()> localFn = () => { string t = "x" + "y"; return t; };  // owned local
         string fromLambdaLocal = localFn();
         total++; passed += Test("lambda owned local return", fromLambdaLocal.length(), 2);
 

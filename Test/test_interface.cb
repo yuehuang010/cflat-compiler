@@ -620,7 +620,7 @@ interface INode { int kind(); };
 
 class ClosureNode : INode
 {
-    function<void()> cb = default;
+    Func<void()> cb = default;
     int k = 0;
     int kind() { return k; }
     ~ClosureNode() { gNodeDtorCount = gNodeDtorCount + 1; }

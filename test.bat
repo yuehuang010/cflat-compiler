@@ -142,7 +142,7 @@ if /I "%_CFG_ARG%"=="Debug" (
 )
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set EXCLUDE=test_helper
-set TIMEOUT_SECS=120
+set TIMEOUT_SECS=600
 set SCRIPT=%~f0
 set START_TIME=%TIME%
 

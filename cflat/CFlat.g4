@@ -319,9 +319,14 @@ tupleTypeEntry
     : typeSpecifier pointer? arrayTypeSuffix?   // `T[]` element = a noalias array-view member; `[N]`/`[]*` rejected in the listener
     ;
 
+// `function<...>` is the thin C function pointer; `Func<...>` is the fat owning
+// closure (library type). Both share this rule; the listener distinguishes them
+// by which keyword token is present.
 functionPointerSpecifier
     : Function '<' typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
     | Function
+    | Func '<' typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    | Func
     ;
 
 functionPointerParamList
@@ -855,6 +860,10 @@ For
 
 Function
     : 'function'
+    ;
+
+Func
+    : 'Func'
     ;
 
 Goto

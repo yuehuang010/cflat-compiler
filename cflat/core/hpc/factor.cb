@@ -217,7 +217,7 @@ namespace Factor
             i64 rows = (i64)(n - (k + 1));
             if (pool != nullptr && rows * rows >= LU_PAR_MIN_WORK)
             {
-                function<void(i64, i64)> body = (i64 lo, i64 hi) => {
+                Func<void(i64, i64)> body = (i64 lo, i64 hi) => {
                     for (i64 ii = lo; ii < hi; ii = ii + 1)
                     {
                         int i = (int)ii + kk + 1;

@@ -161,7 +161,7 @@ namespace Mat
         // own pack scratch (allocated per worker, outside the tile loop - the hot
         // path never allocates). Serial is body(0, tiles): identical order, identical
         // result. Locals below are captured by value.
-        function<void(i64, i64)> body = (i64 lo, i64 hi) => {
+        Func<void(i64, i64)> body = (i64 lo, i64 hi) => {
             double[] packA = new double[mb * kcap];
             double[] packB = new double[kcap * nb];
             for (i64 t = lo; t < hi; t = t + 1)

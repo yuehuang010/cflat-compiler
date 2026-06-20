@@ -112,7 +112,7 @@ extern int main()
 
 A source-location filter keeps only **functions / enum constants / macros** declared under the `--c-include` roots / the header's own directory, so the transitively-included SDK/CRT API surface is excluded. **Structs are an exception**: an in-scope struct often embeds a struct defined in a sibling SDK directory by value (e.g. `MSG` contains a `POINT`, which lives in the SDK `shared/` dir), so the compiler additionally registers the transitive by-value dependency closure of the in-scope structs. You therefore get `MSG`, `RECT`, `POINT`, `WNDCLASSEXA`, ... from `import "windows.h"` without hand-declaring them. **The Windows SDK `shared/` dir is another exception**: when the bound header sits in the SDK `um/` dir, the sibling `shared/` dir is treated as in-scope too (and vice versa), so the constants MSDN-style code reaches for immediately - `ERROR_SUCCESS` and the other `winerror.h` codes, `MAX_PATH`, HRESULTs like `E_FAIL` - fold without hand-transcribing. Variadics are supported. **Object-like `#define` constants are folded** and surfaced as bare globals (e.g. `WM_DESTROY`, `WS_OVERLAPPEDWINDOW`, `SW_SHOW` resolve to their numeric values), provided the macro body folds to an integer / float / string constant; a macro that does not fold to a constant (e.g. one that expands to a function name or token paste) is skipped. A folded integer macro keeps its **natural C type** (`((DWORD)-10)` registers as `u32`, not a width-guessed `i64`), so it passes to the corresponding API parameter without a cast, and a pseudo-handle cast macro (`HKEY_LOCAL_MACHINE`, `INVALID_HANDLE_VALUE`) folds to a `void*` constant. After a successful link, a sibling runtime DLL of each `--c-lib` is auto-copied next to the exe.
 
-A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is registered as a bare `void*`, since a C callback slot is a single pointer (CFlat's `function<T>` is a 16-byte closure and would corrupt the struct's ABI layout). Store a CFlat callback into such a field by casting the function's name: `wc.lpfnWndProc = (void*)WndProc;`. See [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback).
+A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`) is registered as a bare `void*`, since a C callback slot is a single pointer. Store a CFlat callback into such a field by casting the function's name: `wc.lpfnWndProc = (void*)WndProc;`. See [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback).
 
 A **fixed-size array struct field** (e.g. `CHAR szExeFile[260]` in `PROCESSENTRY32`) is registered as an inline CFlat array, not decayed to a pointer, so the C ABI `sizeof` is exact - `sizeof(PROCESSENTRY32)` is 304, not the 40 a decayed pointer would give. Only positive integer extents become inline arrays; an incomplete `[]` still decays to a pointer, and a field whose element type cannot be mapped abandons the whole record (an opaque shell that errors on use - never a silent size change).
 
@@ -184,32 +184,38 @@ cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL
 
 ## Passing a CFlat function as a C callback
 
-C APIs frequently take a function pointer (a `qsort` comparator, a Win32 `WNDPROC`, ...). A C function pointer is a **bare code address**. CFlat's `function<T>` is a 16-byte `{code, env}` closure that can carry captured state, so the two are not interchangeable.
+C APIs frequently take a function pointer (a `qsort` comparator, a Win32 `WNDPROC`, ...). A C function pointer is a **bare code address** - which is exactly what a CFlat thin `function<T>` is (an 8-byte `R(*)(Args)`). So a named function, a `function<>` value, or a *non-capturing* lambda passes straight across the C ABI. A **capturing** closure (`Func<T>`) has nowhere to carry its captured state in a bare C pointer, so it cannot - see [Function Pointers](LANGUAGE.md#function-pointers).
 
-**Pass a non-capturing named function directly.** Declare the C parameter as `function<R(Args)>` and hand it the function's name - the compiler lowers the bare code address across the C ABI:
+**Pass a named function or non-capturing lambda directly.** Declare the C parameter as `function<R(Args)>` and hand it a function name, a `function<>` value, or a non-capturing lambda - the compiler passes the bare code address:
 
 ```c
 extern void qsort(void* base, u64 num, u64 size, function<int(void*, void*)> cmp);
 
-int byInt(void* a, void* b) { return *(int*)a - *(int*)b; }
+int byInt(void* a, void* b) { int* pa = (int*)a; int* pb = (int*)b; return *pa - *pb; }
 
 extern int main()
 {
     int[5] xs = {5, 3, 1, 4, 2};
-    qsort(&xs[0], 5u, 4u, byInt);   // OK - named function passed directly
-    return xs[0];                   // 1
+    qsort(&xs[0], 5u, 4u, byInt);                            // named function - OK
+    qsort(&xs[0], 5u, 4u, (void* a, void* b) => {            // non-capturing lambda - OK
+        int* pa = (int*)a; int* pb = (int*)b; return *pa - *pb;
+    });
+    function<int(void*, void*)> f = byInt;
+    qsort(&xs[0], 5u, 4u, f);                                // function<> value - OK
+    return xs[0];                                           // 1
 }
 ```
 
-**A lambda or a `function<>` variable is rejected at compile time** when passed to a C function-pointer parameter:
+**A capturing closure is rejected at compile time** when passed to a C function-pointer parameter:
 
 ```c
-qsort(&xs[0], 5u, 4u, (int a, int b) => { ... });   // error: cannot pass a lambda ...
-function<int(void*,void*)> f = byInt;
-qsort(&xs[0], 5u, 4u, f);                            // error: ... or 'function<>' variable ...
+int base = 0;
+qsort(&xs[0], 5u, 4u, (void* a, void* b) => {       // error: a capturing lambda cannot become
+    return *(int*)a - *(int*)b + base;              //        a C function pointer 'function<T>'
+});
 ```
 
-C cannot carry the closure's env slot, so allowing this would silently drop captured state and crash. Refactor the capture into explicit parameters / globals and pass a plain named function.
+A `Func<T>` value cannot implicitly become a C function pointer either; call `.toFunction()` (which returns the code pointer when the closure does not capture, or `nullptr` when it does) and null-check, or refactor the captured state into explicit parameters / globals / a `void* userdata` channel and pass a plain named function.
 
 **Storing a callback in a C struct field** (e.g. `WNDCLASSEXA.lpfnWndProc`): the field is a bare `void*` (see above), so assign the function's address with a cast - `wc.lpfnWndProc = (void*)WndProc;`.
 

@@ -96,17 +96,17 @@ struct _ProcessInfo {
 
 struct __ProcessReaderCtx {
     void*                     pipe    = nullptr;
-    function<void(char*, int)> callback = nullptr;
+    Func<void(char*, int)> callback = nullptr;
 };
 
 struct __ProcessWriterCtx {
     void*              pipe    = nullptr;
-    function<char*()>  provider = nullptr;
+    Func<char*()>  provider = nullptr;
 };
 
 // Reader thread: loops ReadFile on the pipe, calls onStdout(buf, len).
 // ctx->callback is always set - we only start this thread when onStdout != nullptr.
-int __process_reader_fn(void* rawCtx) {
+int __process_reader_fn(move void* rawCtx) {
     __ProcessReaderCtx* ctx = (__ProcessReaderCtx*)rawCtx;
     i8* buf = (i8*)malloc(4096);
     i32 nRead = 0;
@@ -115,25 +115,29 @@ int __process_reader_fn(void* rawCtx) {
     }
     free((void*)buf);
     os.windows.CloseHandle(ctx->pipe);
-    free((void*)ctx);
+    delete ctx;   // typed delete runs the dtor, freeing the Func callback/provider env
     return 0;
 }
 
 // Writer thread: calls onStdin() to get a line, writes it to the pipe.
 // ctx->provider is always set - we only start this thread when onStdin != nullptr.
 // onStdin returns nullptr to signal EOF.
-int __process_writer_fn(void* rawCtx) {
+int __process_writer_fn(move void* rawCtx) {
     __ProcessWriterCtx* ctx = (__ProcessWriterCtx*)rawCtx;
-    while (true) {
-        char* line = ctx->provider();
-        if (line == nullptr) break;
+    void* pipe = ctx->pipe;
+    // Own the provider closure in a local, then free the struct. `provide` destructs at
+    // function exit, freeing the captured env; the struct's only owning field is now null.
+    Func<char*()> provide = move ctx->provider;
+    delete ctx;
+    char* line = provide();
+    while (line != nullptr) {
         i32 len = (i32)strlen(line);
         i32 written = 0;
-        os.windows.WriteFile(ctx->pipe, line, len, &written, nullptr);
+        os.windows.WriteFile(pipe, line, len, &written, nullptr);
         free((void*)line);
+        line = provide();
     }
-    os.windows.CloseHandle(ctx->pipe);
-    free((void*)ctx);
+    os.windows.CloseHandle(pipe);
     return 0;
 }
 
@@ -180,8 +184,8 @@ class process : IProcess {
     //           Buffer is non-owning; do not free it.
     // onStdin:  called to get each line to send to child stdin.
     //           Return nullptr to close stdin. Returned string is freed by the runtime.
-    function<void(char*, int)> onStdout = nullptr;
-    function<char*()>          onStdin  = nullptr;
+    Func<void(char*, int)> onStdout = nullptr;
+    Func<char*()>          onStdin  = nullptr;
 
     // Private Win32 state.
     void* _proc_handle   = nullptr;
@@ -241,7 +245,7 @@ class process : IProcess {
 
         // Start reader thread if onStdout was wired.
         if (_want_stdout) {
-            __ProcessReaderCtx* rctx = (__ProcessReaderCtx*)malloc(sizeof(__ProcessReaderCtx));
+            __ProcessReaderCtx* rctx = new __ProcessReaderCtx;
             rctx->pipe     = _stdout_read;
             rctx->callback = onStdout;
             _stdout_read = nullptr;  // ownership transferred to thread
@@ -251,7 +255,7 @@ class process : IProcess {
 
         // Start writer thread if onStdin was wired.
         if (_want_stdin) {
-            __ProcessWriterCtx* wctx = (__ProcessWriterCtx*)malloc(sizeof(__ProcessWriterCtx));
+            __ProcessWriterCtx* wctx = new __ProcessWriterCtx;
             wctx->pipe     = _stdin_write;
             wctx->provider = onStdin;
             _stdin_write = nullptr;  // ownership transferred to thread

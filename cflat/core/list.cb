@@ -163,7 +163,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Lomuto partition: pivot at _data[hi], returns final pivot index.
-    int _partition(int lo, int hi, function<bool(T, T)> compare)
+    int _partition(int lo, int hi, Func<bool(T, T)> compare)
     {
         int i = lo - 1;
         int j = lo;
@@ -186,7 +186,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Place the median of _data[lo], _data[mid], _data[hi] at position hi.
-    void _medianPivot(int lo, int mid, int hi, function<bool(T, T)> compare)
+    void _medianPivot(int lo, int mid, int hi, Func<bool(T, T)> compare)
     {
         if (compare(_data[hi], _data[lo])) { T t = _data[lo]; _data[lo] = _data[hi]; _data[hi] = t; }
         if (compare(_data[mid], _data[lo])) { T t = _data[lo]; _data[lo] = _data[mid]; _data[mid] = t; }
@@ -196,7 +196,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
         _data[hi] = tmp;
     }
 
-    void _qsort(int lo, int hi, function<bool(T, T)> compare)
+    void _qsort(int lo, int hi, Func<bool(T, T)> compare)
     {
         if (lo >= hi) return;
         int mid = lo + (hi - lo) / 2;
@@ -208,7 +208,7 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 
     // Sort in-place using a comparator: compare(a, b) returns true if a should
     // come before b.  Uses quicksort (O(n log n) average).  Not stable.
-    void sort(function<bool(T, T)> compare)
+    void sort(Func<bool(T, T)> compare)
     {
         if (_size > 1)
             _qsort(0, _size - 1, compare);

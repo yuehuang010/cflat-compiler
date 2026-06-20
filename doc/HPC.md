@@ -510,7 +510,7 @@ plain named function:
 ```c
 double addD(double x, double y) { return x + y; }       // combine (associative, no capture)
 
-function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+Func<double(i64, i64)> partial = (i64 lo, i64 hi) => {       // captures a, b -> Func<...>
     double s = 0.0;
     for (i64 i = lo; i < hi; i = i + 1) { s = s + a[i] * b[i]; }   // a, b captured
     return s;
@@ -605,7 +605,7 @@ import "random.cb";
 
 i64 drawsPerSample = 2;                // 2 draws (x, y) per sample
 
-function<i64(i64, i64)> piPartial = (i64 lo, i64 hi) => {
+Func<i64(i64, i64)> piPartial = (i64 lo, i64 hi) => {        // captures drawsPerSample -> Func<...>
     Random rng = default;
     rng.seed(0x1234567);                   // same base seed on every worker...
     rng.jump(lo * drawsPerSample);         // ...then jump to this chunk's window (no overlap)

@@ -89,14 +89,14 @@ struct atomic_flag {
 
     // Publish guarded data: run body (writes), then store val with a release fence.
     // Fields declared in a lock(this) group on the containing struct are accessible inside body.
-    void release(bool val, lock(this) function<void()> body) {
+    void release(bool val, lock(this) Func<void()> body) {
         body();
         __atomic_release_store_flag(&_value, val);
     }
 
     // Observe guarded data: acquire_load, then run body with the loaded value.
     // Fields declared in a lock(this) group on the containing struct are accessible inside body.
-    void acquire(lock(this) function<void(bool)> body) {
+    void acquire(lock(this) Func<void(bool)> body) {
         bool v = __atomic_acquire_load_flag(&_value);
         body(v);
     }
@@ -125,13 +125,13 @@ struct atomic__i32 {
     }
 
     // Publish guarded data: run body (writes), then store val with a release fence.
-    void release(i32 val, lock(this) function<void()> body) {
+    void release(i32 val, lock(this) Func<void()> body) {
         body();
         __atomic_release_store_i32(&_value, val);
     }
 
     // Observe guarded data: acquire_load, then run body with the loaded value.
-    void acquire(lock(this) function<void(i32)> body) {
+    void acquire(lock(this) Func<void(i32)> body) {
         i32 v = __atomic_acquire_load_i32(&_value);
         body(v);
     }
@@ -160,13 +160,13 @@ struct atomic__i64 {
     }
 
     // Publish guarded data: run body (writes), then store val with a release fence.
-    void release(i64 val, lock(this) function<void()> body) {
+    void release(i64 val, lock(this) Func<void()> body) {
         body();
         __atomic_release_store_i64(&_value, val);
     }
 
     // Observe guarded data: acquire_load, then run body with the loaded value.
-    void acquire(lock(this) function<void(i64)> body) {
+    void acquire(lock(this) Func<void(i64)> body) {
         i64 v = __atomic_acquire_load_i64(&_value);
         body(v);
     }

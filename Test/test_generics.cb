@@ -1173,7 +1173,7 @@ bool testSortCapturedKey()
     list<int> nums;
     nums.add(5); nums.add(2); nums.add(8);
 
-    function<bool(int,int)> cmpAsc = (int a, int b) => {
+    Func<bool(int,int)> cmpAsc = (int a, int b) => {
         if (flipSort) return a > b;
         return a < b;
     };
@@ -1186,7 +1186,7 @@ bool testSortCapturedKey()
     ok &= nums.get(0) == 2;
     ok &= nums.get(2) == 8;
 
-    function<bool(int,int)> cmpDesc = (int a, int b) => {
+    Func<bool(int,int)> cmpDesc = (int a, int b) => {
         if (flipSort) return a > b;
         return a < b;
     };

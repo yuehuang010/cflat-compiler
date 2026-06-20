@@ -548,7 +548,14 @@ bool runTest()
 
 ### Function Pointers
 
-Use `function<ReturnType(ParamTypes...)>` for typed function pointers. The bare `function` keyword infers the type from the assigned function:
+CFlat has two callable types - choose by whether the callable must capture state:
+
+| Type | Layout | Captures? | Use it for |
+|------|--------|-----------|-----------|
+| `function<R(Args)>` | thin: an 8-byte bare C function pointer `R(*)(Args)` | No | C-ABI callbacks and non-capturing callables. This is the type you hand to real C APIs. |
+| `Func<R(Args)>` | fat: a 16-byte owning closure `{code, env}` | Yes | Capturing lambdas and stored callbacks that close over state. An owning value type (moves by default - see [Ownership](#ownership--lifetime)). |
+
+Use `function<ReturnType(ParamTypes...)>` for a thin function pointer. The bare `function` keyword infers the type from the assigned function:
 
 ```c
 int add(int a, int b) { return a + b; }
@@ -572,13 +579,24 @@ int apply(function<int(int, int)> f, int a, int b) { return f(a, b); }
 apply(add, 5, 6);   // 11
 ```
 
-> **Passing a function to C code.** A CFlat `function<T>` is a 16-byte `{code, env}` closure, not a bare C function pointer. To pass a callback to a C function-pointer parameter (`qsort`, a Win32 `WNDPROC`, ...), pass a **non-capturing named function directly**; a lambda or a `function<>` variable is rejected at compile time because C cannot carry the closure's captured state. Win32 callbacks should also be marked `stdcall`. See [C Interop: passing a CFlat function as a C callback](C_INTEROP.md#passing-a-cflat-function-as-a-c-callback).
+**Converting between the two:**
+
+- A thin `function<T>` converts implicitly to a fat `Func<T>` - the bare pointer is stored with a null environment, so no captured state is added.
+- A `Func<T>` does **not** convert implicitly to `function<T>` (a closure that captures has no C-ABI representation). Use the explicit member `fn.toFunction()`, which returns the bare code pointer when the closure does not capture, or `nullptr` when it does - the caller null-checks:
+
+```c
+Func<int(int)> add1 = makeAdder(1);            // may or may not capture
+function<int(int)> c = add1.toFunction();      // bare ptr if non-capturing, else nullptr
+if (c != nullptr) { passToCApi(c); }
+```
+
+> **Passing a function to C code.** A `function<T>` *is* a bare C function pointer, so a non-capturing named function or non-capturing lambda passes directly to a C function-pointer parameter (`qsort`, a Win32 `WNDPROC`, ...). A capturing closure (`Func<T>`) cannot cross the C ABI; convert it with `.toFunction()` and null-check, or pass state through a `void* userdata` channel. Win32 callbacks should also be marked `stdcall`. See [C Interop: passing a CFlat function as a C callback](C_INTEROP.md#passing-a-cflat-function-as-a-c-callback).
 
 ### Lambdas
 
-Anonymous functions use C#-style arrow syntax and are compatible with `function<T>`. Capture is automatic - the lambda body is scanned at compile time and outer variables are captured without any explicit capture list.
+Anonymous functions use C#-style arrow syntax. Capture is automatic - the lambda body is scanned at compile time and outer variables are captured without an explicit capture list. **The target type decides the representation:** a non-capturing lambda can become either a thin `function<T>` or a fat `Func<T>`; a **capturing** lambda must become a `Func<T>` (assigning one to a thin `function<T>` is a compile error, since a C function pointer cannot carry captured state).
 
-**Non-capturing lambda** - captures nothing; works identically to a named function:
+**Non-capturing lambda** - captures nothing; works identically to a named function and fits a thin `function<T>`:
 
 ```c
 function<int(int, int)> add = (int a, int b) => { return a + b; };
@@ -598,11 +616,11 @@ function<int(int)> sign = (int x) => {
 };
 ```
 
-**Value capture** - primitives, pointer types, and `string` are copied into the closure at lambda creation time. Subsequent changes to the outer variable do not affect the captured copy:
+**Value capture** - primitives, pointer types, and `string` are copied into the closure at lambda creation time. A capturing lambda is a `Func<T>`. Subsequent changes to the outer variable do not affect the captured copy:
 
 ```c
 int offset = 10;
-function<int(int)> addOffset = (int x) => { return x + offset; };
+Func<int(int)> addOffset = (int x) => { return x + offset; };
 addOffset(5);   // 15
 offset = 99;    // does NOT change the captured copy
 addOffset(5);   // still 15
@@ -613,7 +631,7 @@ Pointer captures copy the pointer value - both the lambda and the outer code sha
 ```c
 int* p = new int;
 *p = 42;
-function<int()> read = () => { return *p; };
+Func<int()> read = () => { return *p; };
 *p = 77;
 read();   // 77 - both sides access the same heap cell
 ```
@@ -624,7 +642,7 @@ read();   // 77 - both sides access the same heap cell
 struct Counter { int value = 0; };
 
 Counter c;
-function<void()> inc = () => { c.value = c.value + 1; };
+Func<void()> inc = () => { c.value = c.value + 1; };
 inc(); inc(); inc();
 c.value;   // 3 - lambda mutations are visible in the caller
 
@@ -636,10 +654,10 @@ c.value;   // 11 - outer mutation was visible inside the lambda
 **Lifetime constraint** - a lambda that reference-captures a local variable is *bonded* to it. The lambda cannot be returned from the function or assigned to a variable in a wider scope, because doing so would leave the lambda holding a dangling pointer to a stack variable that has gone out of scope:
 
 ```c
-function<void()> bad()
+Func<void()> bad()
 {
     Counter c;
-    function<void()> inc = () => { c.value = c.value + 1; };
+    Func<void()> inc = () => { c.value = c.value + 1; };
     return inc;   // compile error: bonded value whose source 'c' is not a 'bond' parameter
 }
 ```
@@ -1278,21 +1296,22 @@ using Handle  = void*;       // pointer alias - lowers to i8*
 using Vec3    = float[3];    // fixed-array alias - Vec3 v = default; v[0] = 1.0f;
 ```
 
-It may also name a **function (callback) type** - a `function<R(Args)>`. The alias is usable
-everywhere the spelled-out type is: a parameter, a local, a struct field, or a return type, and
-ownership of any captured state flows through it unchanged.
+It may also name a **function (callback) type** - either a thin `function<R(Args)>` or a fat
+`Func<R(Args)>` (see [Function Pointers](#function-pointers)). The alias is usable everywhere the
+spelled-out type is: a parameter, a local, a struct field, or a return type. For a `Func<...>`
+alias, ownership of any captured state flows through it unchanged.
 
 ```c
-using EventCallback = function<void(void*)>;        // HANDLE is void*; an event/handler callback
-using WaitCallback  = function<void(void*, bool)>;  // e.g. a WAITORTIMERCALLBACK shape
-using IntUnaryOp    = function<int(int)>;
+using WaitCallback  = function<void(void*, bool)>;  // thin: a WAITORTIMERCALLBACK (C ABI) shape
+using EventCallback = Func<void(void*)>;            // fat: an event/handler that may capture
+using IntUnaryOp    = Func<int(int)>;               // fat: makeAdder below captures `base`
 
 struct Button { EventCallback onClick = default; }  // alias as a field type
 
 int apply(IntUnaryOp f, int x) { return f(x); }     // alias as a parameter type
 IntUnaryOp makeAdder(int base)                      // alias as a return type
 {
-    IntUnaryOp f = (int x) => x + base;             // bind to a local, then return it
+    IntUnaryOp f = (int x) => x + base;             // captures base -> must be a Func<...>
     return f;
 }
 ```
@@ -2027,8 +2046,8 @@ extern int main()
 | Field | Type | Description |
 |-------|------|-------------|
 | `exitCode` | `int` | Exit code returned by `main`; valid after `WaitForExit()` |
-| `onStdout` | `function<void(string)>` | Called for each line printed to stdout inside `main` |
-| `onStderr` | `function<void(string)>` | Called for each line printed to stderr inside `main` |
+| `onStdout` | `Func<void(string)>` | Called for each line printed to stdout inside `main` (may capture state) |
+| `onStderr` | `Func<void(string)>` | Called for each line printed to stderr inside `main` (may capture state) |
 | `inbox` / `outbox` | `arena_channel<IMessage>*` | Zero-copy messaging mailbox; wire with `producer >> consumer`, then send via `outbox` and receive via `inbox` inside `main` (requires `import "arena_channel.cb"` and `useChannel = true` on both) |
 | `useChannel` | `int` (0/1) | Opt-in flag: `producer >> consumer` only wires the arena mailbox when **both** programs set `useChannel = true` before the `>>`. Defaults to 0, so a pipe used only for stdout pays nothing for an arena channel. |
 

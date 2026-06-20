@@ -226,6 +226,15 @@ void __threadpool_run_inline(Task t) {
     }
 }
 
+// Free a refused/dropped task ctx. When the submitter supplied a type-aware deleter
+// (the ctx is a struct that owns resources, e.g. a cloned Func<> closure), run it so
+// the destructor fires; otherwise a plain raw free (the ctx owns nothing). Every
+// submit/then failure path routes through here so a refused task never leaks its ctx.
+void __threadpool_drop_ctx(function<void(move void*)> ctxDtor, move void* ctx) {
+    if (ctxDtor != nullptr) { ctxDtor(move ctx); return; }
+    delete ctx;
+}
+
 // Push a task onto the queue selected by priority.  Returns false if that
 // channel is saturated.  Shared by submit(), then(), and the worker so the
 // priority-to-queue mapping lives in exactly one place.
@@ -411,11 +420,11 @@ class ThreadPool {
     // is not running, is shutting down, or the targeted priority queue is
     // full; in that case the pool deletes ctx, so the caller never frees ctx
     // after this call.
-    move TaskHandle* submit(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+    move TaskHandle* submit(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL, function<void(move void*)> ctxDtor = nullptr) {
         // Refuse BEFORE consuming ctx; all ctx consumption funnels through
         // the single store into t.ctx below.
         if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
-            delete (void*)ctx;
+            __threadpool_drop_ctx(ctxDtor, move ctx);
             return nullptr;
         }
 
@@ -443,7 +452,7 @@ class ThreadPool {
             __threadpool_release_inflight(&_ctx);
             void* lost = t.ctx;
             t.ctx = nullptr;
-            delete lost;
+            __threadpool_drop_ctx(ctxDtor, move lost);
             h->done.store(1);   // unblock ~TaskHandle's wait
             delete h;
             return nullptr;
@@ -456,10 +465,10 @@ class ThreadPool {
     // the pool, and the caller cannot wait or cancel.  Returns true if the
     // task was accepted, false if the pool refused (queue full / shutdown),
     // in which case the pool deletes ctx.
-    bool submitDetached(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+    bool submitDetached(function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL, function<void(move void*)> ctxDtor = nullptr) {
         // Refuse BEFORE consuming ctx; all ctx consumption goes through t.ctx below.
         if (!_inlineMode && (_workers == nullptr || _stop.stop_requested())) {
-            delete (void*)ctx;
+            __threadpool_drop_ctx(ctxDtor, move ctx);
             return false;
         }
 
@@ -479,7 +488,7 @@ class ThreadPool {
             __threadpool_release_inflight(&_ctx);
             void* lost = t.ctx;
             t.ctx = nullptr;
-            delete lost;
+            __threadpool_drop_ctx(ctxDtor, move lost);
             return false;
         }
         _ready.release();
@@ -500,9 +509,9 @@ class ThreadPool {
     //
     // Returns an owning TaskHandle* on success, nullptr on shutdown / queue
     // saturation / duplicate-then.  On nullptr the pool deletes ctx.
-    move TaskHandle* then(TaskHandle* dep, function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL) {
+    move TaskHandle* then(TaskHandle* dep, function<int(move void*, stop_token)> fn, move void* ctx, int priority = THREADPOOL_PRIORITY_NORMAL, function<void(move void*)> ctxDtor = nullptr) {
         if (_workers == nullptr || _stop.stop_requested()) {
-            delete (void*)ctx;
+            __threadpool_drop_ctx(ctxDtor, move ctx);
             return nullptr;
         }
 
@@ -542,7 +551,7 @@ class ThreadPool {
             __threadpool_release_inflight(&_ctx);
             void* lost = t.ctx;
             t.ctx = nullptr;
-            delete lost;
+            __threadpool_drop_ctx(ctxDtor, move lost);
             h->done.store(1);
             delete h;
             return nullptr;
@@ -553,7 +562,7 @@ class ThreadPool {
                 __threadpool_release_inflight(&_ctx);
                 void* lost = t.ctx;
                 t.ctx = nullptr;
-                delete lost;
+                __threadpool_drop_ctx(ctxDtor, move lost);
                 h->done.store(1);
                 delete h;
                 return nullptr;

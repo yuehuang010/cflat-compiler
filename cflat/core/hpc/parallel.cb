@@ -83,7 +83,7 @@ void __pfor_raw_hotloop_check() {
 // captured environment travels inside `body` (a closure fat pointer), so the box
 // carries no user context of its own.
 struct __PForBox {
-    function<void(i64, i64)> body = default;
+    Func<void(i64, i64)> body = default;
     i64   start = 0;
     i64   end   = 0;
 };
@@ -109,11 +109,16 @@ int __pfor_pool_tramp(move void* raw, stop_token tok) {
     return 0;
 }
 
+// ctx deleter handed to submit(): if the pool REFUSES a task it frees the box through
+// its real type so the owning `body` Func<> env is destructed (a raw void* delete would
+// leak it). On acceptance the box is freed by __pfor_pool_tramp instead.
+void __pfor_box_free(move void* raw) { delete (__PForBox*)raw; }
+
 // RAW THREAD overload. `pin` (default false) pins worker w to core
 // w % hardware_concurrency() via SetThreadAffinityMask, removing OS
 // scheduling jitter for compute-bound HPC kernels (see THREADING.md). Leave
 // it false when the region oversubscribes or shares cores with other work.
-void parallel_for_n(i64 n, int workers, function<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
+void parallel_for_n(i64 n, int workers, Func<void(i64, i64)> body, bool pin = false, int fpConfig = 0) {
     if (n <= 0) { return; }
     __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -150,7 +155,7 @@ void parallel_for_n(i64 n, int workers, function<void(i64, i64)> body, bool pin 
 // parallel_for_n: the reduction's pool variant cannot overload (two generic
 // functions of the same name monomorphize to the same mangled symbol and
 // collide), so both pool entry points use the suffix for a consistent API.
-void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, function<void(i64, i64)> body) {
+void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, Func<void(i64, i64)> body) {
     if (n <= 0) { return; }
     if (workers <= 0) { workers = pool->workerCount(); }
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -168,7 +173,7 @@ void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, function<void(i64
         box->body  = body;
         box->start = start;
         box->end   = start + count;
-        handles[w].h = pool->submit(__pfor_pool_tramp, box);
+        handles[w].h = pool->submit(__pfor_pool_tramp, box, THREADPOOL_PRIORITY_NORMAL, __pfor_box_free);
         if (handles[w].h == nullptr) {
             // Pool refused (queue saturated / shutting down): submit already
             // freed the box, so run this range inline on the calling thread.
@@ -198,8 +203,9 @@ void parallel_for_n_pool(ThreadPool* pool, i64 n, int workers, function<void(i64
 struct __PRedBox<T> {
     // `run` MUST stay first: __PRedHeader aliases it so the non-generic pool
     // trampoline can invoke the T-specialized work without being generic itself.
-    function<int(void*)>     run     = default;
-    function<T(i64, i64)>    partial = default;
+    // Takes `move void*`: the trampoline hands it the box, and run deletes it.
+    function<int(move void*)> run    = default;
+    Func<T(i64, i64)>    partial = default;
     i64   start = 0;
     i64   end   = 0;
     T*    slot  = nullptr;   // this chunk's partial lands here (distinct per worker)
@@ -211,23 +217,41 @@ struct __PRedBox<T> {
 // non-capturing `function<int(void*)>` (which is T-independent in type) and this
 // non-generic trampoline dispatches through it.
 struct __PRedHeader {
-    function<int(void*)> run = default;
+    function<int(move void*)> run = default;
 };
 
-// ThreadPool.submit trampoline for the reduction (owns the box; frees it).
-int __pred_pool_tramp(move void* raw, stop_token tok) {
-    __PRedHeader* hdr = (__PRedHeader*)raw;
-    hdr->run((void*)hdr);   // run casts back to __PRedBox<T>* and stores its partial
-    delete raw;             // box has no destructor; free as a raw allocation
+// T-specialized chunk runner stored in __PRedBox<T>.run (a generic named function,
+// not a lambda - `move` params are not allowed in lambda syntax). Reduces [start,end)
+// into the box's slot, then deletes the box through its real type so the owning
+// `partial` closure env is freed by the destructor. Takes `move void*`: the pool
+// trampoline hands it ownership of the box.
+int __pred_run<T>(move void* raw) {
+    __PRedBox<T>* b = (__PRedBox<T>*)raw;
+    *b->slot = b->partial(b->start, b->end);
+    delete b;
     return 0;
+}
+
+// ctx deleter handed to submit(): frees a REFUSED reduction box through its real
+// __PRedBox<T>* type so the owning `partial` Func<> env is destructed (a raw void*
+// delete would leak it). On acceptance __pred_run<T> frees the box instead.
+void __pred_box_free<T>(move void* raw) { delete (__PRedBox<T>*)raw; }
+
+// ThreadPool.submit trampoline for the reduction. It owns the box (`move void*`) and
+// hands that ownership to run (= __pred_run<T>), which deletes it through the real
+// __PRedBox<T>* type. A raw `delete raw` here would skip the destructor (this
+// non-generic trampoline cannot name __PRedBox<T>) and leak one `partial` env per box.
+int __pred_pool_tramp(move void* raw, stop_token tok) {
+    function<int(move void*)> fn = ((__PRedHeader*)raw)->run;   // borrow to read thunk
+    return fn(move raw);                                        // then hand it the box
 }
 
 // RAW THREAD overload. `pin` (default false) pins worker w to core
 // w % hardware_concurrency() (SetThreadAffinityMask), removing scheduling
 // jitter for compute-bound reductions (e.g. Monte Carlo). See THREADING.md.
 T parallel_reduce<T>(i64 n, int workers, T identity,
-                     function<T(i64, i64)> partial,
-                     function<T(T, T)> combine, bool pin = false, int fpConfig = 0) {
+                     Func<T(i64, i64)> partial,
+                     Func<T(T, T)> combine, bool pin = false, int fpConfig = 0) {
     if (n <= 0) { return identity; }
     __pfor_raw_hotloop_check();
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -282,8 +306,8 @@ T parallel_reduce<T>(i64 n, int workers, T identity,
 
 // THREAD POOL variant (see parallel_for_n_pool for why this is a distinct name).
 T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
-                          function<T(i64, i64)> partial,
-                          function<T(T, T)> combine) {
+                          Func<T(i64, i64)> partial,
+                          Func<T(T, T)> combine) {
     if (n <= 0) { return identity; }
     if (workers <= 0) { workers = pool->workerCount(); }
     if (workers <= 0) { workers = hardware_concurrency(); }
@@ -292,13 +316,9 @@ T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
     __HandleSlot* handles  = new __HandleSlot[workers];
     T*            partials = new T[workers];
 
-    // Non-capturing trampoline (reads everything from the box). Stored in each
-    // box so the non-generic __pred_pool_tramp can dispatch through it.
-    function<int(void*)> run = (void* raw) => {
-        __PRedBox<T>* b = (__PRedBox<T>*)raw;
-        *b->slot = b->partial(b->start, b->end);
-        return 0;
-    };
+    // Each box dispatches through __pred_run<T> (reduces its chunk, then deletes the
+    // box - freeing its owning `partial` env - via the real __PRedBox<T>* type).
+    function<int(move void*)> run = __pred_run<T>;
 
     i64 base  = n / (i64)workers;
     i64 rem   = n % (i64)workers;
@@ -313,7 +333,7 @@ T parallel_reduce_pool<T>(ThreadPool* pool, i64 n, int workers, T identity,
         box->start   = start;
         box->end     = start + count;
         box->slot    = &partials[w];
-        handles[w].h = pool->submit(__pred_pool_tramp, box);
+        handles[w].h = pool->submit(__pred_pool_tramp, box, THREADPOOL_PRIORITY_NORMAL, __pred_box_free<T>);
         if (handles[w].h == nullptr) {
             // Pool refused: box already freed; reduce this range inline.
             partials[w] = partial(start, start + count);

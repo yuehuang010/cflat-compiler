@@ -39,7 +39,7 @@ double addDouble(double a, double b) { return a + b; }
 // ---- drivers --------------------------------------------------------------
 
 double estimatePi(i64 n, int workers, i64 seed) {
-    function<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Func<i64(i64, i64)> partial = (i64 lo, i64 hi) => {
         Random rng;
         rng.seed(seed);            // base seed captured; same on every worker...
         rng.jump(lo * 2);          // ...then jump to this chunk's window (no overlap)
@@ -58,7 +58,7 @@ double estimatePi(i64 n, int workers, i64 seed) {
 }
 
 double estimateIntegral(i64 n, int workers, i64 seed) {
-    function<double(i64, i64)> partial = (i64 lo, i64 hi) => {
+    Func<double(i64, i64)> partial = (i64 lo, i64 hi) => {
         Random rng;
         rng.seed(seed);
         rng.jump(lo);              // 1 draw per sample; window is non-overlapping

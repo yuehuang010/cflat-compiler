@@ -330,6 +330,13 @@ public:
 
         // Function pointer fields (IsFunctionPointer == true)
         bool IsFunctionPointer = false;
+        // When IsFunctionPointer is set, the closure TypeName distinguishes the two flavours:
+        //   thin  (`function<T>`): a bare C function pointer R(*)(Args), 8 bytes, no env,
+        //                          non-capturing, C-ABI compatible. TypeName == "__c_fn_ptr".
+        //   fat   (`Func<T>`):     the owning closure {code, env}, 16 bytes. TypeName == "__closure_fat_ptr".
+        // IsThinFnPtr() is DERIVED from TypeName (not stored) so the two can never drift; set
+        // TypeName to one of the two names above and this follows.
+        bool IsThinFnPtr() const { return TypeName == "__c_fn_ptr"; }
         std::string FuncPtrReturnTypeName;
         bool FuncPtrReturnPointer = false;
         struct FuncPtrParam { std::string TypeName; bool Pointer = false; bool IsMove = false; };
@@ -458,7 +465,8 @@ public:
         {
             if (IsFunctionPointer)
             {
-                std::string s = "funcptr_" + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
+                std::string s = (IsThinFnPtr() ? "cfuncptr_" : "funcptr_")
+                              + FuncPtrReturnTypeName + (FuncPtrReturnPointer ? "Ptr" : "");
                 for (const auto& p : FuncPtrParams)
                     s += "_" + p.TypeName + (p.Pointer ? "Ptr" : "") + (p.IsMove ? "M" : "");
                 return s;
@@ -1376,6 +1384,16 @@ private:
         if (value == nullptr) return;
         std::erase_if(pendingOwnedClosureTemps,
             [&](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first == value; });
+    }
+
+    // True when `value` is a freshly-lowered lambda-literal temp (registered, not yet claimed).
+    // Used to gate the implicit non-capturing-lambda -> thin function<T> coercion: a stored
+    // Func<T> value is NOT a temp, so it cannot implicitly narrow (must use .toFunction()).
+    bool IsOwnedClosureTemp(llvm::Value* value) const
+    {
+        for (const auto& e : pendingOwnedClosureTemps)
+            if (e.first == value) return true;
+        return false;
     }
 
     void FlushOwnedClosureTemps()
@@ -2964,6 +2982,7 @@ private:
 
         out = TypeAndValue();
         out.IsFunctionPointer = true;
+        out.TypeName = "__c_fn_ptr";       // thin: a C function pointer is the thin `function<T>`
         out.FuncPtrReturnTypeName = retTV.TypeName;
         out.FuncPtrReturnPointer = retTV.Pointer;
 
@@ -3965,30 +3984,13 @@ private:
             }
             else if (m.isFuncPtr)
             {
-                // Register as a function<R(P...)> fat struct {thunk_const, env=intToPtr(value)};
-                // same wire shape as a C-returned function pointer, frozen at link time.
-                tv = m.funcPtrTV;
+                // A C function-pointer macro (e.g. ((int(*)(int,int))0)) is the THIN
+                // function<R(P...)>: a bare C function pointer frozen at link time. The
+                // constant is just the bit pattern reinterpreted as the thin signature.
+                tv = m.funcPtrTV;          // already thin (IsThinFnPtr) from MapCTypeToTypeAndValue
                 tv.VariableName = m.name;
-
-                // Build the C-side LLVM FunctionType for the thunk lookup.
-                std::vector<llvm::Type*> paramTypes;
-                for (const auto& p : tv.FuncPtrParams)
-                {
-                    TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
-                    paramTypes.push_back(GetType(pTV));
-                }
-                TypeAndValue retTV;
-                retTV.TypeName = tv.FuncPtrReturnTypeName;
-                retTV.Pointer  = tv.FuncPtrReturnPointer;
-                auto* cFnTy = llvm::FunctionType::get(GetType(retTV), paramTypes, false);
-                auto* thunk = GetOrCreateCFuncPtrThunk(cFnTy);
-
-                auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
-                auto* closureTy = GetClosureFatPtrType();
-                llvm::Constant* thunkC = llvm::ConstantExpr::getBitCast(thunk, i8PtrTy);
-                llvm::Constant* envC = llvm::ConstantExpr::getIntToPtr(
-                    builder->getInt64((uint64_t)m.value), i8PtrTy);
-                c = llvm::ConstantStruct::get(closureTy, { thunkC, envC });
+                c = llvm::ConstantExpr::getIntToPtr(
+                    builder->getInt64((uint64_t)m.value), BuildThinFnPtrType(tv));
             }
             else if (m.isPointer)
             {
@@ -5595,6 +5597,113 @@ public:
     }
 
     // Wraps a named function in a {shim_i8ptr, null} closure fat struct value.
+    // Thin sibling of WrapBareValueAsFatStruct: a thin `function<T>` value is just the
+    // bare function pointer, bitcast to the declared thin signature R(*)(Args). No shim,
+    // no env, no fat struct. `fpTV` carries the target thin signature.
+    llvm::Value* MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
+    {
+        return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
+    }
+
+    // Extract the bare code pointer from a closure fat-struct value and present it as a thin
+    // `function<T>`. Caller must ensure the closure does NOT capture (env null). Relies on the
+    // trailing-env-ignored ABI tolerance (caller-cleanup conventions: Win x64, cdecl).
+    llvm::Value* CoerceClosureFatToThin(llvm::Value* fatVal, const TypeAndValue& thinTV)
+    {
+        auto* code = builder->CreateExtractValue(fatVal, {0u}, "clo_code");
+        return builder->CreateBitCast(code, BuildThinFnPtrType(thinTV), "thinfn");
+    }
+
+    // True iff a fat closure value is PROVABLY non-capturing: its env field is a compile-time
+    // null constant (a non-capturing lambda literal or a named-fn wrap). A capturing lambda or a
+    // stored/loaded Func<> value is not provable here and returns false. This is the static gate
+    // for narrowing a fat closure to a thin `function<T>` - the same env-null signal the extern
+    // function-pointer argument path uses.
+    bool ClosureIsStaticallyNonCapturing(llvm::Value* fatVal)
+    {
+        auto* envField = builder->CreateExtractValue(fatVal, {1u}, "closure_env_probe");
+        return llvm::isa<llvm::ConstantPointerNull>(envField);
+    }
+
+    // Diagnostic for an illegal fat-closure -> thin `function<T>` narrowing. With capture names
+    // (a capturing lambda literal) it lists them; with none (a stored Func<> value) it points at
+    // .toFunction(). Shared by the declaration, assignment, and return coercion sites.
+    std::string DescribeCapturingClosureToThin(const std::vector<std::string>& captureNames) const
+    {
+        if (captureNames.empty())
+            return "a closure that may carry captured state cannot become a C function pointer "
+                   "'function<T>'; call .toFunction() instead (it returns the code pointer when the "
+                   "closure does not capture, or null when it does), or use Func<T> to keep the captures.";
+        const size_t count = captureNames.size();
+        const size_t shown = count < 5 ? count : 5;
+        std::string list;
+        for (size_t k = 0; k < shown; k++) { if (k != 0) list += ", "; list += captureNames[k]; }
+        std::string more = count > shown ? std::format(", ... (and {} more)", count - shown) : "";
+        return std::format(
+            "a capturing lambda cannot become a C function pointer 'function<T>': it captured {} {} "
+            "[{}{}]. Use Func<T> to keep the captures, or call .toFunction() (which returns null when "
+            "the closure captures).",
+            count, (count == 1 ? "variable" : "variables"), list, more);
+    }
+
+    // Func<T>.toFunction(): lower a fat closure value to a thin `function<T>` C pointer.
+    // env == null (non-capturing) -> the bare code ptr; env != null (captures) -> a null thin
+    // pointer. The env==null test is the entire contract: a capturing closure has no C-ABI
+    // representation, so the lowering fails closed and the caller must null-check. No trap, no
+    // diagnostic. A non-capturing closure's code ignores the trailing env arg under the
+    // caller-cleanup ABI tolerance (Win x64, cdecl), so the returned bare ptr is C-callable.
+    llvm::Value* EmitFuncToFunctionLowering(llvm::Value* fatVal, const TypeAndValue& thinTV)
+    {
+        auto* code     = builder->CreateExtractValue(fatVal, {0u}, "clo_code");
+        auto* env      = builder->CreateExtractValue(fatVal, {1u}, "clo_env");
+        auto* thinTy   = llvm::cast<llvm::PointerType>(BuildThinFnPtrType(thinTV));
+        auto* codeThin = builder->CreateBitCast(code, thinTy, "thinfn");
+        auto* nullThin = llvm::ConstantPointerNull::get(thinTy);
+        auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
+        auto* envNull  = builder->CreateICmpEQ(env, llvm::ConstantPointerNull::get(i8PtrTy), "env_isnull");
+        return builder->CreateSelect(envNull, codeThin, nullThin, "tofn");
+    }
+
+    // Coerce a returned value to the declared function-pointer return type. Handles a named
+    // function, a thin function<> value, and a fat closure value in either direction.
+    llvm::Value* CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndValue& retTV)
+    {
+        bool valIsStruct = val->getType()->isStructTy();   // fat closure value
+        if (retTV.IsThinFnPtr())
+        {
+            if (auto* fn = llvm::dyn_cast<llvm::Function>(val)) return MakeThinFnPtrValue(fn, retTV);
+            if (valIsStruct)
+            {
+                // Fat closure returned as thin function<T>: only safe when provably non-capturing.
+                // A capturing closure has no C-ABI representation, so reject it instead of dropping
+                // the env (which yields a thin ptr that reads freed/absent captures when called).
+                if (ClosureIsStaticallyNonCapturing(val)) return CoerceClosureFatToThin(val, retTV);
+                LogError(DescribeCapturingClosureToThin({}));
+                return llvm::UndefValue::get(BuildThinFnPtrType(retTV));
+            }
+            return builder->CreateBitCast(val, BuildThinFnPtrType(retTV), "thinret");
+        }
+        if (auto* fn = llvm::dyn_cast<llvm::Function>(val)) return WrapBareValueAsFatStruct(fn);
+        if (!valIsStruct && val->getType()->isPointerTy()) return WidenThinToFat(val);   // thin -> fat
+        return val;   // already a fat closure value
+    }
+
+    // Widen a thin `function<T>` (bare C ptr) to a fat `Func<T>` value {code, null}. No thunk:
+    // the thin ptr goes straight into the code slot, env is null. When the resulting Func is
+    // invoked (env-last ABI), the trailing null env arg is harmlessly ignored by the bare C
+    // function (caller-cleanup tolerance). The null env makes .toFunction() round-trip it back.
+    llvm::Value* WidenThinToFat(llvm::Value* thinPtr)
+    {
+        auto* i8PtrTy   = builder->getInt8Ty()->getPointerTo();
+        auto* codeI8    = builder->CreateBitCast(thinPtr, i8PtrTy, "thin_code_i8");
+        auto* nullEnv   = llvm::ConstantPointerNull::get(i8PtrTy);
+        auto* closureTy = GetClosureFatPtrType();
+        llvm::Value* fat = llvm::UndefValue::get(closureTy);
+        fat = builder->CreateInsertValue(fat, codeI8,  {0u});
+        fat = builder->CreateInsertValue(fat, nullEnv, {1u});
+        return fat;
+    }
+
     llvm::Value* WrapBareValueAsFatStruct(llvm::Function* original)
     {
         auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
@@ -8045,6 +8154,35 @@ public:
     {
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
 
+        // Thin `function<T>`: a bare C function pointer. Direct call, no env, exact C signature.
+        if (funcPtrType.IsThinFnPtr())
+        {
+            std::vector<llvm::Type*> paramTypes;
+            for (const auto& p : funcPtrType.FuncPtrParams)
+            {
+                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+                paramTypes.push_back(GetType(pTV));
+            }
+            TypeAndValue retTV;
+            retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
+            retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
+            auto* retTy   = GetType(retTV);
+            auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
+            auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
+            for (size_t i = 0; i < args.size() && i < paramTypes.size(); i++)
+            {
+                auto* destTy = paramTypes[i];
+                auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
+                if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
+                    args[i] = WrapStringLiteralAsString(args[i]);
+                else
+                    args[i] = Upconvert(args[i], destTy);
+            }
+            lastCallReturnType = retTV;
+            auto* result = builder->CreateCall(cFnTy, fnPtr, args);
+            return retTy->isVoidTy() ? nullptr : result;
+        }
+
         // Extract fn ptr (field 0) and env ptr (field 1) from the closure fat struct.
         auto* fnPtrI8 = builder->CreateExtractValue(funcPtr, {0u}, "fn_i8");
         auto* envPtr  = builder->CreateExtractValue(funcPtr, {1u}, "env_ptr");
@@ -8431,23 +8569,28 @@ public:
             it->second.back().RequiredLocks = std::move(locks);
     }
 
+    // Builds the bare LLVM function-pointer type R(*)(Args) for a function-pointer TypeAndValue.
+    // This is the wire type of a thin `function<T>` and of any C-ABI function pointer.
+    llvm::Type* BuildThinFnPtrType(const TypeAndValue& tv) const
+    {
+        std::vector<llvm::Type*> paramTypes;
+        for (const auto& p : tv.FuncPtrParams)
+        {
+            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            paramTypes.push_back(GetType(pTV));
+        }
+        TypeAndValue retTV;
+        retTV.TypeName = tv.FuncPtrReturnTypeName;
+        retTV.Pointer  = tv.FuncPtrReturnPointer;
+        return llvm::FunctionType::get(GetType(retTV), paramTypes, false)->getPointerTo();
+    }
+
     // Returns the C-compatible LLVM type: for IsFunctionPointer, bare fn ptr (not fat struct).
     // Used for extern function declarations to preserve C ABI compatibility.
     llvm::Type* GetCCompatibleType(const TypeAndValue& tv) const
     {
         if (tv.IsFunctionPointer)
-        {
-            std::vector<llvm::Type*> paramTypes;
-            for (const auto& p : tv.FuncPtrParams)
-            {
-                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
-                paramTypes.push_back(GetType(pTV));
-            }
-            TypeAndValue retTV;
-            retTV.TypeName = tv.FuncPtrReturnTypeName;
-            retTV.Pointer  = tv.FuncPtrReturnPointer;
-            return llvm::FunctionType::get(GetType(retTV), paramTypes, false)->getPointerTo();
-        }
+            return BuildThinFnPtrType(tv);
         return GetType(tv);
     }
 
@@ -8666,6 +8809,8 @@ public:
     {
         if (typeAndValue.IsFunctionPointer)
         {
+            if (typeAndValue.IsThinFnPtr())
+                return BuildThinFnPtrType(typeAndValue);
             return GetClosureFatPtrType();
         }
 
@@ -9525,6 +9670,8 @@ public:
                         }
                         if (auto* fn = llvm::dyn_cast<llvm::Function>(val))
                             val = WrapBareValueAsFatStruct(fn);
+                        else if (val && val->getType()->isPointerTy())
+                            val = WidenThinToFat(val);   // thin function<T> -> fat Func<T> {code, null}
                     }
                 }
                 else
@@ -9657,6 +9804,7 @@ public:
         // Wrap via a per-signature thunk so the indirect-call path (which always prepends
         // env to the args) reaches the real C function correctly.
         if (candidate.ReturnType.IsFunctionPointer
+            && !candidate.ReturnType.IsThinFnPtr()
             && result != nullptr
             && result->getType()->isPointerTy())
         {

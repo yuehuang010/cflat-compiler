@@ -2907,11 +2907,11 @@ bool testSizeof()
         if (sizeof(SizeofDunder) != 8)  r = false;
     }
 
-    // Struct with function<T> field: {i8*,i8*}+void* = 24 on x64, 12 on x86
+    // Struct with thin function<T> field: bare C fn ptr + void* = 16 on x64, 8 on x86
     if const (__PLATFORM__ == 64) {
-        if (sizeof(SizeofFuncField) != 24) r = false;
+        if (sizeof(SizeofFuncField) != 16) r = false;
     } else {
-        if (sizeof(SizeofFuncField) != 12) r = false;
+        if (sizeof(SizeofFuncField) != 8) r = false;
     }
 
     return r;
