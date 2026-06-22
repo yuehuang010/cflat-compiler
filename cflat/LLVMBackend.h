@@ -158,7 +158,12 @@ namespace cflat_jit
         if (it != storage.end())
             return it->second;
 
+        // Floor at 16 bytes: JIT'd code initializes some thread-locals with aligned SIMD
+        // stores (vmovaps), which require 16-byte alignment. Native .tls over-aligns the whole
+        // section to 16, so this only bites under emutls, where each var is allocated on its
+        // own declared alignment. Match the native guarantee here as a safety net.
         size_t align = c->align ? c->align : alignof(std::max_align_t);
+        if (align < 16) align = 16;
         void* mem = _aligned_malloc(c->size, align);
         if (c->value) std::memcpy(mem, c->value, c->size);
         else          std::memset(mem, 0, c->size);
@@ -6813,6 +6818,11 @@ public:
         // Apply effective alignment (decl-level alignas, struct alignas, or ABI).
         uint64_t effAlign = GetEffectiveAlignmentForType(typeValue.TypeName, destinationType);
         if (userAlign > effAlign) effAlign = userAlign;
+        // Floor thread-locals at 16: the store vectorizer pairs adjacent 8-byte field stores into
+        // a 16-byte aligned store (vmovaps), and emutls (--run) allocates each TLS block on the
+        // global's declared alignment. Without an explicit 16 here the control records 8 and the
+        // aligned store faults. Native .tls over-aligns the section to 16, so this only bites --run.
+        if (threadLocal && effAlign < 16) effAlign = 16;
         uint64_t abiAlign = (destinationType && destinationType->isSized())
             ? module->getDataLayout().getABITypeAlign(destinationType).value() : 0;
         if (effAlign > abiAlign)
