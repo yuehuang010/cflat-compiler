@@ -1,18 +1,22 @@
-// guid.cb - GUID: a 128-bit globally unique identifier (Windows GUID / RFC 4122 UUID).
+// guid.cb - Guid: a 128-bit globally unique identifier (Windows GUID / RFC 4122 UUID).
+//
+// The type is named `Guid` (not `GUID`) so it does not collide with the `GUID` that
+// Windows C headers (guiddef.h via windows.h/objbase.h/d2d1.h) register through C
+// interop - a `Guid` value can be used alongside an imported Windows header.
 //
 // The binary layout matches the Windows GUID / COM IID exactly (16 bytes):
 // Data1..Data3 are stored little-endian, Data4 is a raw 8-byte sequence in text
-// order. A GUID* can therefore be passed straight to COM APIs that take a
+// order. A Guid* can therefore be passed straight to COM APIs that take a
 // REFIID/REFGUID (CoCreateInstance, IUnknown::QueryInterface, ...).
 //
 // Usage:
 //   import "guid.cb";
 //
 //   // Parse the canonical text form (braces and case are optional):
-//   GUID iid = GUID.parse("00000000-0000-0000-C000-000000000046"); // IID_IUnknown
+//   Guid iid = Guid.parse("00000000-0000-0000-C000-000000000046"); // IID_IUnknown
 //
 //   // Or build from the DEFINE_GUID-style components:
-//   GUID g = GUID.make((u32)0x00000000, (u16)0x0000, (u16)0x0000,
+//   Guid g = Guid.make((u32)0x00000000, (u16)0x0000, (u16)0x0000,
 //                      (u8)0xC0, (u8)0x00, (u8)0x00, (u8)0x00,
 //                      (u8)0x00, (u8)0x00, (u8)0x00, (u8)0x46);
 //
@@ -30,7 +34,7 @@ i32 _guidNibble(char c)
     return -1;
 }
 
-struct GUID
+struct Guid
 {
     u32   Data1 = 0;
     u16   Data2 = 0;
@@ -39,10 +43,10 @@ struct GUID
 
     // Build from canonical components - the argument order matches the Win32
     // DEFINE_GUID macro: {Data1, Data2, Data3, {b0, b1, b2, b3, b4, b5, b6, b7}}.
-    static GUID make(u32 d1, u16 d2, u16 d3,
+    static Guid make(u32 d1, u16 d2, u16 d3,
                      u8 c0, u8 c1, u8 c2, u8 c3, u8 c4, u8 c5, u8 c6, u8 c7)
     {
-        GUID g = default;
+        Guid g = default;
         g.Data1 = d1;
         g.Data2 = d2;
         g.Data3 = d3;
@@ -55,9 +59,9 @@ struct GUID
     // non-hex characters (dashes, surrounding braces, spaces) are skipped, so the
     // braced registry form "{...}" parses too. Stops after 32 hex digits; a string
     // with fewer leaves the remaining bytes zero.
-    static GUID parse(string s)
+    static Guid parse(string s)
     {
-        GUID g = default;
+        Guid g = default;
         char* p = s.data();
         i32 len = s.length();
 
@@ -85,7 +89,7 @@ struct GUID
         return g;
     }
 
-    bool operator==(GUID other)
+    bool operator==(Guid other)
     {
         if (Data1 != other.Data1) return false;
         if (Data2 != other.Data2) return false;

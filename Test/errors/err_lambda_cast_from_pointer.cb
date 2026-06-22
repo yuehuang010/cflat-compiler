@@ -1,0 +1,17 @@
+// A fat `Lambda<...>` closure is a 16-byte {code, env} struct. It must be CONSTRUCTED
+// from a lambda or named function, never reinterpreted from a raw pointer - an 8-byte
+// pointer bitcast into the 16-byte struct is an illegal cast that fails LLVM module
+// verification. The compiler rejects the cast with a clear diagnostic and points at the
+// supported thin `function<...>` form for invoking a raw code address (e.g. a COM
+// vtable slot).
+
+stdcall int castTarget(void* self, int d) { return d + 1; }
+
+expect_error("cannot cast to a 'Lambda<...>' closure") {
+    int useLambdaCast()
+    {
+        void* addr = (void*)castTarget;
+        Lambda<int(void*, int)> f = (Lambda<int(void*, int)>)addr;
+        return f(nullptr, 41);
+    }
+}

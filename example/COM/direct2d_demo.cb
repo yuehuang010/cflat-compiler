@@ -1,0 +1,318 @@
+// direct2d_demo.cb - a real Direct2D window, drawn entirely through hand-modeled COM
+// vtables. This is the payoff of CFlat's thin `function<...>` type: a COM interface is
+// just a struct whose first field points at a vtable, and a vtable is a struct of thin
+// `function<...>` slots (bare C code pointers) called with the interface as `this`.
+//
+// What it does: D2D1CreateFactory -> ID2D1Factory, create an ID2D1HwndRenderTarget bound
+// to a Win32 window, then each WM_PAINT runs BeginDraw / Clear / FillRectangle /
+// FillEllipse / EndDraw - every call dispatched through a vtable slot. No d2d1.h types are
+// imported (its structs would clash with hand-declared ones); the layouts below mirror the
+// SDK headers exactly. Vtable slot indices are from d2d1.h and must stay in order.
+//
+// Build:  x64/Debug/cflat.exe example/COM/direct2d_demo.cb -o out/direct2d_demo.exe
+// Run:    out\direct2d_demo.exe   (opens a window; close it to exit)
+//
+// windows.h is imported for the Win32 windowing surface (WNDCLASSEXA, CreateWindowExA,
+// the message loop) and to link the system import libs, including d2d1.lib. The core
+// `Guid` type coexists with windows.h's `GUID` (different name) and supplies the factory
+// IID without hand-packed bytes.
+import "windows.h" lib { "user32.lib", "gdi32.lib", "d2d1.lib" } cache;
+import "guid.cb";
+
+// ---- Direct2D value types (FLOAT-based, matching the SDK struct layouts) -------------
+
+struct ColorF   { float r = default; float g = default; float b = default; float a = default; };
+struct RectF    { float left = default; float top = default; float right = default; float bottom = default; };
+struct EllipseF { float x = default; float y = default; float rx = default; float ry = default; };
+
+// D2D1_RENDER_TARGET_PROPERTIES: all-zero selects default type/format/dpi/usage/level.
+// pixelFormat (DXGI_FORMAT + D2D1_ALPHA_MODE) is flattened into two u32 fields.
+struct RtProps
+{
+    u32 type = default;
+    u32 dxgiFormat = default;
+    u32 alphaMode = default;
+    float dpiX = default;
+    float dpiY = default;
+    u32 usage = default;
+    u32 minLevel = default;
+};
+
+// D2D1_HWND_RENDER_TARGET_PROPERTIES: { HWND; D2D1_SIZE_U{w,h}; D2D1_PRESENT_OPTIONS }.
+struct HwndRtProps
+{
+    void* hwnd = default;
+    u32 width = default;
+    u32 height = default;
+    u32 presentOptions = default;
+};
+
+// ---- COM vtables (one thin function<...> per slot, in exact d2d1.h order) -------------
+// Unused slots are placeholders typed `function<void()>`; a thin function<...> is always a
+// bare pointer, so only the slot COUNT and POSITION matter for the layout - not the
+// placeholder signature. The slots actually called carry their real C signatures.
+
+// IUnknown - Release lives at slot 2 for every COM object, so this minimal vtable can
+// release any interface by reinterpreting its first field.
+struct UnknownVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface = default;  // 0
+    function<u32(void*)>                AddRef         = default;  // 1
+    function<u32(void*)>                Release        = default;  // 2
+};
+struct Unknown { UnknownVtbl* lpVtbl = default; };
+
+// ID2D1Factory : IUnknown - need slot 14 (CreateHwndRenderTarget).
+struct FactoryVtbl
+{
+    function<i32(void*, void*, void**)>       QueryInterface                 = default;  // 0
+    function<u32(void*)>                      AddRef                         = default;  // 1
+    function<u32(void*)>                      Release                        = default;  // 2
+    function<void()>                          ReloadSystemMetrics            = default;  // 3
+    function<void()>                          GetDesktopDpi                  = default;  // 4
+    function<void()>                          CreateRectangleGeometry        = default;  // 5
+    function<void()>                          CreateRoundedRectangleGeometry = default;  // 6
+    function<void()>                          CreateEllipseGeometry          = default;  // 7
+    function<void()>                          CreateGeometryGroup            = default;  // 8
+    function<void()>                          CreateTransformedGeometry      = default;  // 9
+    function<void()>                          CreatePathGeometry             = default;  // 10
+    function<void()>                          CreateStrokeStyle              = default;  // 11
+    function<void()>                          CreateDrawingStateBlock        = default;  // 12
+    function<void()>                          CreateWicBitmapRenderTarget    = default;  // 13
+    function<i32(void*, void*, void*, void**)> CreateHwndRenderTarget        = default;  // 14
+};
+struct Factory { FactoryVtbl* lpVtbl = default; };
+
+// ID2D1RenderTarget : ID2D1Resource : IUnknown - slot 3 is GetFactory; render-target
+// methods start at slot 4. Need CreateSolidColorBrush(8), FillRectangle(17),
+// FillEllipse(21), Clear(47), BeginDraw(48), EndDraw(49).
+struct RenderTargetVtbl
+{
+    function<i32(void*, void*, void**)>       QueryInterface               = default;  // 0
+    function<u32(void*)>                      AddRef                       = default;  // 1
+    function<u32(void*)>                      Release                      = default;  // 2
+    function<void()>                          GetFactory                   = default;  // 3
+    function<void()>                          CreateBitmap                 = default;  // 4
+    function<void()>                          CreateBitmapFromWicBitmap    = default;  // 5
+    function<void()>                          CreateSharedBitmap           = default;  // 6
+    function<void()>                          CreateBitmapBrush            = default;  // 7
+    function<i32(void*, ColorF*, void*, void**)> CreateSolidColorBrush     = default;  // 8
+    function<void()>                          CreateGradientStopCollection = default;  // 9
+    function<void()>                          CreateLinearGradientBrush    = default;  // 10
+    function<void()>                          CreateRadialGradientBrush    = default;  // 11
+    function<void()>                          CreateCompatibleRenderTarget = default;  // 12
+    function<void()>                          CreateLayer                  = default;  // 13
+    function<void()>                          CreateMesh                   = default;  // 14
+    function<void()>                          DrawLine                     = default;  // 15
+    function<void()>                          DrawRectangle                = default;  // 16
+    function<void(void*, RectF*, void*)>      FillRectangle                = default;  // 17
+    function<void()>                          DrawRoundedRectangle         = default;  // 18
+    function<void()>                          FillRoundedRectangle         = default;  // 19
+    function<void()>                          DrawEllipse                  = default;  // 20
+    function<void(void*, EllipseF*, void*)>   FillEllipse                  = default;  // 21
+    function<void()>                          DrawGeometry                 = default;  // 22
+    function<void()>                          FillGeometry                 = default;  // 23
+    function<void()>                          FillMesh                     = default;  // 24
+    function<void()>                          FillOpacityMask              = default;  // 25
+    function<void()>                          DrawBitmap                   = default;  // 26
+    function<void()>                          DrawText                     = default;  // 27
+    function<void()>                          DrawTextLayout               = default;  // 28
+    function<void()>                          DrawGlyphRun                 = default;  // 29
+    function<void()>                          SetTransform                 = default;  // 30
+    function<void()>                          GetTransform                 = default;  // 31
+    function<void()>                          SetAntialiasMode             = default;  // 32
+    function<void()>                          GetAntialiasMode             = default;  // 33
+    function<void()>                          SetTextAntialiasMode         = default;  // 34
+    function<void()>                          GetTextAntialiasMode         = default;  // 35
+    function<void()>                          SetTextRenderingParams       = default;  // 36
+    function<void()>                          GetTextRenderingParams       = default;  // 37
+    function<void()>                          SetTags                      = default;  // 38
+    function<void()>                          GetTags                      = default;  // 39
+    function<void()>                          PushLayer                    = default;  // 40
+    function<void()>                          PopLayer                     = default;  // 41
+    function<void()>                          Flush                        = default;  // 42
+    function<void()>                          SaveDrawingState             = default;  // 43
+    function<void()>                          RestoreDrawingState          = default;  // 44
+    function<void()>                          PushAxisAlignedClip          = default;  // 45
+    function<void()>                          PopAxisAlignedClip           = default;  // 46
+    function<void(void*, ColorF*)>            Clear                        = default;  // 47
+    function<void(void*)>                     BeginDraw                    = default;  // 48
+    function<i32(void*, u64*, u64*)>          EndDraw                      = default;  // 49
+};
+struct RenderTarget { RenderTargetVtbl* lpVtbl = default; };
+
+// D2D1CreateFactory: factoryType, REFIID, options(optional), out factory.
+extern stdcall i32 D2D1CreateFactory(u32 factoryType, void* riid, void* options, void** ppFactory);
+
+// Device-independent factory (created once) and device-dependent resources (recreated on
+// demand). Single-window, single-thread - the documented constraint for these globals.
+Factory* g_factory = nullptr;
+RenderTarget* g_rt = nullptr;
+void* g_brush = nullptr;
+
+// Release any COM object via its slot-2 Release (IUnknown layout).
+void comRelease(void* obj)
+{
+    if (obj == nullptr)
+        return;
+    Unknown* u = (Unknown*)obj;
+    u->lpVtbl->Release(u);
+}
+
+void releaseDeviceResources()
+{
+    comRelease(g_brush);
+    g_brush = nullptr;
+    comRelease(g_rt);
+    g_rt = nullptr;
+}
+
+// Lazily build the hwnd render target + solid brush sized to the client area. Returns
+// false if the window has no drawable area yet (e.g. minimized).
+bool ensureRenderTarget(void* hwnd)
+{
+    if (g_rt != nullptr)
+        return true;
+
+    RECT rc = default;
+    GetClientRect(hwnd, &rc);
+    u32 w = (u32)(rc.right - rc.left);
+    u32 h = (u32)(rc.bottom - rc.top);
+    if (w == 0u || h == 0u)
+        return false;
+
+    RtProps rtp = default;
+    HwndRtProps hp = default;
+    hp.hwnd = hwnd;
+    hp.width = w;
+    hp.height = h;
+
+    RenderTarget* rt = default;
+    i32 hr = g_factory->lpVtbl->CreateHwndRenderTarget(g_factory, &rtp, &hp, (void**)&rt);
+    if (hr != 0)
+    {
+        printf("CreateHwndRenderTarget failed: 0x%08X\n", hr);
+        return false;
+    }
+    g_rt = rt;
+
+    ColorF blue = default;
+    blue.r = 0.20f; blue.g = 0.40f; blue.b = 0.85f; blue.a = 1.0f;
+    void* brush = default;
+    hr = g_rt->lpVtbl->CreateSolidColorBrush(g_rt, &blue, nullptr, &brush);
+    if (hr != 0)
+    {
+        printf("CreateSolidColorBrush failed: 0x%08X\n", hr);
+        return false;
+    }
+    g_brush = brush;
+    return true;
+}
+
+void renderFrame(void* hwnd)
+{
+    if (g_factory == nullptr || !ensureRenderTarget(hwnd))
+        return;
+
+    g_rt->lpVtbl->BeginDraw(g_rt);
+
+    ColorF bg = default;
+    bg.r = 0.95f; bg.g = 0.95f; bg.b = 0.97f; bg.a = 1.0f;
+    g_rt->lpVtbl->Clear(g_rt, &bg);
+
+    RectF rect = default;
+    rect.left = 40.0f; rect.top = 40.0f; rect.right = 260.0f; rect.bottom = 200.0f;
+    g_rt->lpVtbl->FillRectangle(g_rt, &rect, g_brush);
+
+    EllipseF ell = default;
+    ell.x = 430.0f; ell.y = 280.0f; ell.rx = 150.0f; ell.ry = 95.0f;
+    g_rt->lpVtbl->FillEllipse(g_rt, &ell, g_brush);
+
+    // EndDraw reports D2DERR_RECREATE_TARGET (0x8899000C) when the device is lost; drop
+    // the device-dependent resources so the next paint rebuilds them.
+    i32 hr = g_rt->lpVtbl->EndDraw(g_rt, nullptr, nullptr);
+    if ((u32)hr == 0x8899000Cu)
+        releaseDeviceResources();
+}
+
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_PAINT)
+    {
+        PAINTSTRUCT ps = default;
+        BeginPaint(hwnd, &ps);
+        renderFrame(hwnd);
+        EndPaint(hwnd, &ps);
+        return (i64)0;
+    }
+
+    if (msg == WM_DESTROY)
+    {
+        releaseDeviceResources();
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    // IID_ID2D1Factory. A core `Guid` lays out exactly like REFIID, so &iid passes in.
+    Guid iid = Guid.parse("06152247-6f50-465a-9245-118bfd3b6007");
+
+    // D2D1_FACTORY_TYPE_SINGLE_THREADED = 0. No CoInitialize needed - the factory is a
+    // plain export, not a CoCreateInstance object.
+    Factory* factory = default;
+    i32 hr = D2D1CreateFactory((u32)0, &iid, nullptr, (void**)&factory);
+    if (hr != 0 || factory == nullptr)
+    {
+        printf("D2D1CreateFactory failed: 0x%08X\n", hr);
+        return 1;
+    }
+    g_factory = factory;
+    printf("ID2D1Factory created: %p\n", g_factory);
+
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.lpszClassName = "CFlatDirect2DWindow";
+    RegisterClassExA(&wc);
+
+    // Fixed-size window (no thick frame / maximize box) so the render target never needs
+    // resizing - keeps the demo to the draw path without a WM_SIZE / Resize slot.
+    u32 style = (u32)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatDirect2DWindow",
+        "CFlat Direct2D (COM via thin function<>)",
+        style,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        660, 420,
+        nullptr, nullptr, hInst, nullptr);
+    if (hwnd == nullptr)
+    {
+        printf("CreateWindowExA failed\n");
+        comRelease(g_factory);
+        return 1;
+    }
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    MSG msg = default;
+    while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+
+    comRelease(g_factory);
+    g_factory = nullptr;
+    return (int)msg.wParam;
+}

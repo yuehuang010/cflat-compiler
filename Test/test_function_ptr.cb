@@ -1205,6 +1205,35 @@ bool testFuncToFunction()
     return result;
 }
 
+// ── Cast a raw code address to a thin function<...> (the COM/foreign-vtable shape) ──
+// A thin `function<...>` is a single bare C function pointer, so a raw address can be
+// reinterpreted into one and called directly with no env arg. This is the supported
+// path for invoking a method loaded out of a foreign object's vtable.
+
+int tf_castA(void* self, int d) { return d + 1; }
+int tf_castB(void* self, int d) { return d * 2; }
+
+bool testCastAddrToThinFnPtr()
+{
+    bool result = true;
+
+    // Cast form: (function<...>)addr - reinterprets a void* as a thin callable.
+    void* addr = (void*)tf_castA;
+    function<int(void*, int)> f = (function<int(void*, int)>)addr;
+    result &= Test("cast addr to thin fnptr", f(nullptr, 41), 42);
+
+    // Load bare code addresses out of a fabricated vtable and call with explicit this.
+    void*[2] vtbl = default;
+    vtbl[0] = (void*)tf_castA;
+    vtbl[1] = (void*)tf_castB;
+    function<int(void*, int)> m0 = (function<int(void*, int)>)vtbl[0];
+    function<int(void*, int)> m1 = (function<int(void*, int)>)vtbl[1];
+    result &= Test("vtable slot 0 call", m0(nullptr, 20), 21);
+    result &= Test("vtable slot 1 call", m1(nullptr, 21), 42);
+
+    return result;
+}
+
 // ── function-type aliases (using Cb = Lambda<R(Args)>) ──────────────────────
 // A `using` alias whose RHS is a function type is usable everywhere a Lambda<...>
 // type is: parameter, local variable, struct field, and return type. The alias
@@ -1310,6 +1339,9 @@ extern int main()
 
     // Lambda<T>.toFunction() fat -> thin lowering
     total++; passed += testFuncToFunction()             ? 1 : 0;
+
+    // Cast a raw code address to a thin function<...> (COM/foreign-vtable shape)
+    total++; passed += testCastAddrToThinFnPtr()        ? 1 : 0;
 
     // List sort tests
     total++; passed += testListSortAscending()         ? 1 : 0;

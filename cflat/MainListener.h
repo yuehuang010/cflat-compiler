@@ -8652,6 +8652,21 @@ public:
 
             materialize(namedVar);
 
+            // A fat `Lambda<...>` closure is a 16-byte {code, env} struct; it must be
+            // CONSTRUCTED from a lambda/named function, never reinterpreted from a scalar.
+            // Casting a raw pointer (or any non-closure value) to it would emit an illegal
+            // 8B->16B bitcast that fails module verification. The thin `function<...>` cast
+            // is the supported path for a raw code address (e.g. a COM vtable slot).
+            if (destTypeName.IsFunctionPointer && !destTypeName.IsThinFnPtr()
+                && namedVar.Primary != nullptr && !namedVar.Primary->getType()->isStructTy())
+            {
+                LogErrorContext(ctx, "cannot cast to a 'Lambda<...>' closure; a fat closure "
+                    "must be built from a lambda or named function, not reinterpreted from a "
+                    "pointer. Cast to the thin 'function<...>' to call a raw code address.");
+                namedVar.TypeAndValue = destTypeName;
+                return namedVar;
+            }
+
             // Explicit `(T[])p` escape: re-establish the noalias array-view from a raw
             // pointer. `T*` and `T[]` share an identical representation, so this is a pure
             // reinterpret (no bit manipulation) - the sanctioned inverse of the implicit
@@ -8693,7 +8708,14 @@ public:
             {
                 // TODO Collect all of them.
                 auto* typeSpec = typeSpecs[0];
-                if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
+                if (auto* fpSpec = typeSpec->functionPointerSpecifier())
+                {
+                    // Cast target `(function<R(Args)>)addr` / `(Lambda<...>)x`: build the
+                    // resolved closure type so a raw code address can be reinterpreted as a
+                    // thin C function pointer. Mirrors the declaration path (BuildFuncPtrAliasType).
+                    typeValue = BuildFuncPtrAliasType(fpSpec);
+                }
+                else if (typeSpec->genericIdentifier() != nullptr && typeSpec->genericIdentifier()->genericTypeParameters() != nullptr)
                 {
                     // Generic cast: (channel<int>*) -> mangle to channel__int
                     std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
