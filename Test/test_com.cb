@@ -1,0 +1,157 @@
+// test_com.cb - produce-side COM object lowering for [winrt] classes.
+//
+// A [winrt] class lowers to a thin COM object: a struct whose first field is a vtable pointer,
+// followed by a refcount and the user fields. The compiler generates QueryInterface / AddRef /
+// Release (+ IInspectable stubs) and one thunk per interface method, then wires a static vtable
+// instance into every object's lpVtbl. Calls are made through the COM vtable - exactly how a
+// foreign WinRT/COM consumer (XAML, C#, cppwinrt) would call a CFlat-authored control.
+//
+// Member-call sugar hides the vtable: `c->Eat()` lowers to `c->lpVtbl->Eat(c)`, and the
+// vtable-only methods (AddRef/Release/QueryInterface) become callable by name too. The explicit
+// `c->lpVtbl->...` form still works and is exercised once below as a regression guard.
+// See internal/plan/winmd-projection.md.
+
+import "test_helper.cb";
+import "com.cb";
+
+// === Single-method interface: dispatch + lifecycle (via the c->Method() sugar) ===
+
+int gCatDtorCount = 0;
+
+[uuid("4d57f3c2-8e1a-4b9d-9d3a-1f2e3c4b5a60")]
+interface IPurr { i32 Eat(); };
+
+[winrt] class Cat : IPurr
+{
+    i32 meals = default;
+    Cat(i32 start) { this.meals = start; }
+    i32 Eat() { this.meals = this.meals + 1; return 0; }
+    ~Cat() { gCatDtorCount = gCatDtorCount + 1; }
+};
+
+bool testDispatchAndLifecycle()
+{
+    bool result = true;
+    gCatDtorCount = 0;
+
+    Cat* c = new Cat(3);
+    result &= Test("com_ctor_field", c->meals, 3);
+
+    // Dispatch Eat through the COM vtable with implicit `this` (proves the slot reaches the
+    // real method). The explicit lpVtbl form is checked once afterwards.
+    i32 r = c->Eat();
+    result &= Test("com_eat_return", r, 0);
+    result &= Test("com_eat_mutated", c->meals, 4);
+    c->Eat();
+    c->Eat();
+    result &= Test("com_eat_thrice", c->meals, 6);
+
+    // Regression: the explicit c->lpVtbl->Eat(c) form still dispatches identically.
+    i32 r2 = c->lpVtbl->Eat(c);
+    result &= Test("com_eat_explicit_vtbl", r2, 0);
+    result &= Test("com_eat_explicit_mutated", c->meals, 7);
+
+    // Refcount lifecycle - AddRef/Release exist only in the vtable, reached by name via the sugar.
+    result &= Test("com_addref", (int)c->AddRef(), 2);
+    result &= Test("com_release", (int)c->Release(), 1);
+
+    // Final Release drops to zero, runs the destructor, and frees.
+    result &= Test("com_not_freed_yet", gCatDtorCount, 0);
+    result &= Test("com_final_release", (int)c->Release(), 0);
+    result &= Test("com_freed_once", gCatDtorCount, 1);
+
+    return result;
+}
+
+// === QueryInterface identity matching (well-known IIDs from com.cb) ===
+
+bool testQueryInterface()
+{
+    bool result = true;
+    Cat* c = new Cat(0);
+
+    // IUnknown matches: returns S_OK, sets *ppv, and AddRefs (refcount 1 -> 2).
+    Guid unk = IID_IUnknown();
+    void* outUnk = default;
+    i32 hrUnk = c->QueryInterface(&unk, &outUnk);
+    result &= Test("com_qi_unknown_hr", hrUnk, S_OK);
+    result &= Test("com_qi_unknown_out", outUnk != nullptr ? 1 : 0, 1);
+    result &= Test("com_qi_unknown_identity", outUnk == (void*)c ? 1 : 0, 1);
+
+    // IInspectable matches too (every WinRT interface derives from it).
+    Guid insp = IID_IInspectable();
+    void* outInsp = default;
+    i32 hrInsp = c->QueryInterface(&insp, &outInsp);
+    result &= Test("com_qi_inspectable_hr", hrInsp, S_OK);
+    result &= Test("com_qi_inspectable_out", outInsp != nullptr ? 1 : 0, 1);
+
+    // A random IID is rejected with E_NOINTERFACE and a null out-param.
+    Guid rnd = Guid.parse("11111111-2222-3333-4444-555566667777");
+    void* outRnd = default;
+    i32 hrRnd = c->QueryInterface(&rnd, &outRnd);
+    result &= Test("com_qi_random_hr", hrRnd, E_NOINTERFACE);
+    result &= Test("com_qi_random_failed", FAILED(hrRnd) ? 1 : 0, 1);
+    result &= Test("com_qi_random_null", outRnd == nullptr ? 1 : 0, 1);
+
+    // Two successful QIs each AddRef'd; release them, then the original reference (frees).
+    c->Release();   // balance IInspectable QI
+    c->Release();   // balance IUnknown QI
+    c->Release();   // original -> frees
+    return result;
+}
+
+// === Multi-method interface: thunk forwards a parameter and a non-zero return ===
+
+[uuid("a1b2c3d4-e5f6-4789-8abc-def012345678")]
+interface ICounter
+{
+    i32 Add(i32 by);   // returns the new total
+    i32 Value();
+};
+
+[winrt] class Counter : ICounter
+{
+    i32 total = default;
+    Counter(i32 start) { this.total = start; }
+    i32 Add(i32 by) { this.total = this.total + by; return this.total; }
+    i32 Value() { return this.total; }
+};
+
+bool testMultiMethodAndParamForwarding()
+{
+    bool result = true;
+    Counter* k = new Counter(10);
+
+    // Add(by) exercises a thunk that forwards a real argument and returns a non-zero value.
+    i32 a1 = k->Add(5);
+    result &= Test("com_add_returns_total", a1, 15);
+    i32 a2 = k->Add(100);
+    result &= Test("com_add_accumulates", a2, 115);
+
+    // Value() reads back through a separate slot.
+    result &= Test("com_value_slot", k->Value(), 115);
+
+    // QueryInterface for ICounter's own IID succeeds.
+    Guid iid = Guid.parse("a1b2c3d4-e5f6-4789-8abc-def012345678");
+    void* outC = default;
+    i32 hrC = k->QueryInterface(&iid, &outC);
+    result &= Test("com_qi_own_iid_hr", hrC, S_OK);
+    result &= Test("com_qi_own_iid_out", outC != nullptr ? 1 : 0, 1);
+
+    k->Release();   // balance the QI AddRef
+    k->Release();   // original -> frees
+    return result;
+}
+
+extern int main()
+{
+    int passed = 0;
+    int total  = 0;
+
+    total++; passed += testDispatchAndLifecycle()         ? 1 : 0;
+    total++; passed += testQueryInterface()               ? 1 : 0;
+    total++; passed += testMultiMethodAndParamForwarding() ? 1 : 0;
+
+    printf("COM produce-side tests: %d/%d passed.\n", passed, total);
+    return passed == total ? 0 : 1;
+}

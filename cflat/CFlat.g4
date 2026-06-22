@@ -731,7 +731,7 @@ structDefinition
     ;
 
 classDefinition
-    : Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' aggregateMember* '}' ';'
+    : annotationList? Class alignmentSpecifier? directDeclarator genericTypeParameters? whereClause? (':' genericIdentifier (',' genericIdentifier)*)? '{' aggregateMember* '}' ';'
     ;
 
 // A struct/class body member. Extracted into a named rule (rather than an inline
@@ -795,7 +795,7 @@ operatorFunctionId
     ;
 
 interfaceDefinition
-    : Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
+    : annotationList? Interface genericIdentifier (':' Identifier (',' Identifier)*)? '{' interfaceMethod* '}' ';'
     ;
 
 interfaceMethod

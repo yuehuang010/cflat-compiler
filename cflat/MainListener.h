@@ -2,22 +2,25 @@
 // ============================================================
 // MainListener.h - CFlat front-end: ForwardRefScanner + MainListener
 // ============================================================
-// SECTION         LINE      DESCRIPTION               FUNCTION
-// ───────────────────────────────────────────────────────────
-// §1              39-491    File-level helpers               IsReturnBlockFunction, getOperatorName
-// §2              492-1557  ForwardRefScanner class (pre-pass)
-// §3              1558+     MainListener class (code generation)
-//   §3.1  1760             ParseDeclarationSpecifiers (codegen)  ParseDeclarationSpecifiers
-//   §3.2  2280             Interface/generic instantiation   InstantiateGenericInterface, InstantiateGenericFunction
-//   §3.3  2509             Top-level declarations            ParseUsingDeclaration, ParseExternalDeclaration
-//   §3.4  2939             Statement parsing                 ParseBlockItemList, ParseStatement
-//   §3.5  4430             Function/parameter declarations   ParseFunctionDefinition, ParseDeclaration
-//   §3.6  5706             Expression parsing                ParseAssignmentExpressionNamed, ParseConditionalExpression
-//   §3.7 10120             ParsePostfixExpression (~3000 lines)  ParsePostfixExpression, ParseLambdaExpression
-//   §3.8 14053             Generic instantiation queue       QueueInstantiateGenericType
-//   §3.9 14311             Struct/Class definitions          ParseStructDefinition, ParseClassDefinition
-//   §3.10 17072            Constructor/Destructor            ParseConstructorDefinition, ParseDestructorDefinition
-//   §3.11 17236            Utilities                         ParseParameterTypeList, ParseNumberConstant
+// SECTION   DESCRIPTION                       JUMP TO (grep a function name; line numbers drift)
+// ────────────────────────────────────────────────────────────────────────────────────────────
+// §1   File-level helpers                IsReturnBlockFunction, getOperatorName
+// §2   ForwardRefScanner class (pre-pass)  class ForwardRefScanner
+// §3   MainListener class (codegen)        class MainListener
+//   §3.1  ParseDeclarationSpecifiers (codegen)  ParseDeclarationSpecifiers
+//   §3.2  Interface/generic instantiation       InstantiateGenericInterface, InstantiateGenericFunction
+//   §3.3  Top-level declarations                ParseUsingDeclaration, ParseExternalDeclaration
+//   §3.4  Statement parsing                     ParseBlockItemList, ParseStatement
+//   §3.5  Function/parameter declarations       ParseFunctionDefinition, ParseDeclaration
+//   §3.6  Expression parsing                    ParseAssignmentExpressionNamed, ParseConditionalExpression
+//   §3.7  ParsePostfixExpression (~3000 lines)  ParsePostfixExpression, ParseLambdaExpression
+//         grep "[PFX-n]" inside: 1 member-access op . -> ?. | 2 member name (field/defer) |
+//         3 subscript [] | 4 call (args) | 5 indirect fn-ptr call | 6 arg assembly + implicit this |
+//         7 call lowering (winrt vtable / null-conditional / overloaded)
+//   §3.8  Generic instantiation queue           QueueInstantiateGenericType
+//   §3.9  Struct/Class definitions              ParseStructDefinition, ParseClassDefinition
+//   §3.10 Constructor/Destructor                ParseConstructorDefinition, ParseDestructorDefinition
+//   §3.11 Utilities                             ParseParameterTypeList, ParseNumberConstant
 // ============================================================
 
 #include <iostream>
@@ -123,6 +126,31 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     if (auto* opId = m->operatorFunctionId())
         return getOperatorName(opId);
     return m->directDeclarator()->getText();
+}
+
+// True if annList carries an annotation with the given name (e.g. "winrt"). Tolerates null.
+inline bool HasAnnotation(CFlatParser::AnnotationListContext* annList, const char* name)
+{
+    if (!annList) return false;
+    for (auto* ann : annList->annotation())
+        if (ann->Identifier() && ann->Identifier()->getText() == name) return true;
+    return false;
+}
+
+// Return the (quote-stripped) string argument of annotation `name`, or empty if absent.
+inline std::string GetAnnotationArg(CFlatParser::AnnotationListContext* annList, const char* name)
+{
+    if (!annList) return {};
+    for (auto* ann : annList->annotation())
+    {
+        if (!ann->Identifier() || ann->Identifier()->getText() != name) continue;
+        if (!ann->annotationArg()) return {};
+        std::string raw = ann->annotationArg()->getText();
+        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
+            return raw.substr(1, raw.size() - 2);
+        return raw;
+    }
+    return {};
 }
 
 // Extract the plain identifier from a directDeclarator (handles both bare names and C-style array syntax).
@@ -878,6 +906,10 @@ private:
 
         if (!nameGid || !nameGid->Identifier()) return;
         std::string name = nameGid->Identifier()->getText();
+
+        // Capture [uuid("...")] so a [winrt] class implementing this interface can emit its IID.
+        if (std::string uuid = GetAnnotationArg(ctx->annotationList(), "uuid"); !uuid.empty())
+            Compiler(ctx)->interfaceUuids[name] = uuid;
 
         std::vector<std::string> parentNames;
         for (auto* term : ctx->Identifier())
@@ -10041,6 +10073,11 @@ public:
         if (auto* initList = ctx->initializerList())
             EmitFieldInitializer(typedPtr, typeName, initList);
 
+        // [winrt] object: wire lpVtbl -> static vtable and set refcount = 1 after the ctor ran.
+        bool isWinrtNew = !isArray && !typeIsPtr && compiler->IsWinrtClass(typeName);
+        if (isWinrtNew)
+            compiler->WireWinrtObject(typedPtr, typeName);
+
         LLVMBackend::NamedVariable result;
         result.TypeAndValue.TypeName = typeName;
         result.TypeAndValue.Pointer = true;
@@ -10049,7 +10086,9 @@ public:
         result.TypeAndValue.IsArrayView = isArray;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
-        compiler->lastOwningResult = true;
+        // A COM object's lifetime is refcounted via Release, not owning-pointer auto-free, so the
+        // caller must NOT auto-delete it at scope exit.
+        compiler->lastOwningResult = !isWinrtNew;
         return result;
     }
 
@@ -10898,6 +10937,16 @@ public:
         }
     }
 
+    // §3.7 ParsePostfixExpression - walks `primary (suffix)*`, threading the running receiver
+    // through structVar/interfaceVar/namedVar. Each suffix is one loop iteration. Internal map
+    // (grep the "// [PFX-n]" anchors to jump):
+    //   [PFX-1] member-access operator (. -> ?.): auto-deref receiver into structVar
+    //   [PFX-2] member name: field GEP, else defer to call (member fn / winrt slot / UFCS)
+    //   [PFX-3] subscript `[expr]` (array / pointer / simd / span / operator[])
+    //   [PFX-4] call `(args)`: builtins, then the member/free-call path
+    //   [PFX-5]   indirect call through a function<...> value (vtable slot, callback field)
+    //   [PFX-6]   argument assembly + implicit-this prepend
+    //   [PFX-7]   call lowering: [winrt] vtable dispatch | null-conditional | overloaded call
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false)
     {
         /*
@@ -10953,6 +11002,8 @@ public:
                     case CFlatParser::RightBracket:
                     case CFlatParser::LeftParen:
                     case CFlatParser::RightParen: { prevToken = tokenType; break; }
+                    // [PFX-1] member-access operator (. -> ?.): auto-deref the receiver (pointer or
+                    // embedded struct) into structVar so the next identifier resolves against it.
                     case CFlatParser::Dot:
                     case CFlatParser::Arrow:
                     case CFlatParser::QuestionDot:
@@ -11086,6 +11137,9 @@ public:
                         }
                         break;
                     }
+                    // [PFX-2] member name after . / -> (or a namespaced name): resolve to a struct
+                    // field (GEP/load), else clear namedVar and defer to the call path [PFX-7] as a
+                    // member fn / [winrt] vtable slot / UFCS target. Unresolved -> "Unknown identifier".
                     case CFlatParser::Identifier:
                     {
                         if (!namespaceContext.empty())
@@ -11360,10 +11414,12 @@ public:
                                 }
                             }
                             else if (Compiler(ctx)->GetFunction(primaryIdentifier) || genericFunctionTemplates.count(primaryIdentifier)
-                                     || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr"))
+                                     || (primaryIdentifier == "toFunction" && structVar.TypeAndValue.TypeName == "__closure_fat_ptr")
+                                     || Compiler(ctx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
-                                // Not a field - a member function, an extension method template, or the
-                                // Lambda<T>.toFunction() builtin (lowered at the call dispatch below).
+                                // Not a field - a member function, an extension method template, the
+                                // Lambda<T>.toFunction() builtin, or a [winrt] COM vtable slot (e.g.
+                                // AddRef/Release/QueryInterface). All are lowered at the call dispatch below.
                                 namedVar = {};
                             }
                             else if (LLVMBackend::NamedVariable anonNV;
@@ -11650,6 +11706,7 @@ public:
 
                         break;
                     }
+                    // [PFX-3] subscript `[expr]`: array / pointer / simd / span fast path / user operator[].
                     case CFlatParser::RuleExpression:
                     {
                         // Bracket [] operation
@@ -11908,6 +11965,8 @@ public:
                         }
                         break;
                     }
+                    // [PFX-4] call `(args)`: handles builtins (toFunction, va_start, ...), then the
+                    // indirect-call [PFX-5] and member/free-call [PFX-6]/[PFX-7] paths below.
                     case CFlatParser::RuleArgumentExpressionList:
                     {
                         // Create Function Call
@@ -12931,6 +12990,8 @@ public:
                             break;
                         }
 
+                        // [PFX-5] indirect call through a function<...> value (a loaded vtable slot,
+                        // a callback field, or a thin/fat closure). No implicit receiver is prepended.
                         // Check if this is a function pointer variable - emit an indirect call.
                         if (namedVar.TypeAndValue.IsFunctionPointer)
                         {
@@ -13312,6 +13373,9 @@ public:
                                 }
                             }
 
+                            // [PFX-6] argument assembly: prepend the receiver as implicit `this`
+                            // (or inject the enclosing method's `this` for a bare call), then evaluate
+                            // the user arguments into `arguments`.
                             std::vector<LLVMBackend::NamedVariable> arguments;
                             if (structVar.BaseType)
                             {
@@ -13540,7 +13604,36 @@ public:
                                 }
                             }
 
-                            if (nullConditionalPending && structVar.Storage != nullptr)
+                            // [PFX-7] call lowering, three ways: a [winrt] COM vtable dispatch
+                            // (recv->lpVtbl->slot), a null-conditional `?.` guarded call, or the
+                            // normal overloaded (member/free/extension) function call.
+                            const LLVMBackend::DeclTypeAndValue* winrtSlot =
+                                (structVar.BaseType && !structVar.TypeAndValue.TypeName.empty())
+                                ? Compiler(primaryCtx)->GetWinrtSlot(structVar.TypeAndValue.TypeName, functionName)
+                                : nullptr;
+                            if (winrtSlot)
+                            {
+                                // [winrt] COM sugar: recv->Slot(args) dispatches through the vtable as
+                                // recv->lpVtbl->Slot(recv, args). `arguments[0]` is the receiver; user
+                                // args follow. QI/AddRef/Release exist ONLY in the vtable, so this is the
+                                // only by-name path to them.
+                                std::vector<llvm::Value*> argVals;
+                                argVals.push_back(structVar.Storage);
+                                for (size_t ai = 1; ai < arguments.size(); ai++)
+                                {
+                                    auto& a = arguments[ai];
+                                    llvm::Value* v = a.Primary ? a.Primary : LoadNamedVariable(a);
+                                    if (v) argVals.push_back(v);
+                                }
+                                namedVar = {};
+                                namedVar.Primary = Compiler(primaryCtx)->EmitWinrtSlotCall(
+                                    structVar.TypeAndValue.TypeName, functionName, argVals);
+                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                namedVar.TypeAndValue.TypeName = winrtSlot->FuncPtrReturnTypeName;
+                                namedVar.TypeAndValue.Pointer  = winrtSlot->FuncPtrReturnPointer;
+                                globalScopeCall = false;
+                            }
+                            else if (nullConditionalPending && structVar.Storage != nullptr)
                             {
                                 // Null-conditional method call: gate the call on a null check
                                 // Resolve generic extension method if needed
@@ -17491,6 +17584,29 @@ public:
             return;
         }
 
+        // [winrt] class: lower to a thin COM object (vtable ptr + refcount + fields) instead of
+        // the fat-ptr interface path. Exactly one interface is supported in this milestone. The
+        // vtable struct is created up front so the injected lpVtbl field type resolves.
+        bool isWinrt = HasAnnotation(ctx->annotationList(), "winrt");
+        std::string winrtIface;
+        std::string winrtVtblName;
+        if (isWinrt)
+        {
+            auto ids = ctx->genericIdentifier();
+            if (ids.empty() || !ids[0]->Identifier())
+            {
+                LogErrorContext(ctx, "[winrt] class '" + structName + "' must implement exactly one interface");
+                return;
+            }
+            if (ids.size() > 1)
+            {
+                LogErrorContext(ctx, "[winrt] class '" + structName + "' may implement only one interface in this milestone");
+                return;
+            }
+            winrtIface = ids[0]->Identifier()->getText();
+            winrtVtblName = compiler->CreateWinrtVtableStruct(structName, winrtIface);
+        }
+
         // Re-emission guard: if this struct was already fully emitted via a transitive import,
         // CreateFunctionDefinition's duplicate-skip leaves the builder out of scope - skip the walk.
         {
@@ -17598,6 +17714,21 @@ public:
                     declList.push_back(f);
                 }
             }
+        }
+
+        // Prepend the COM header fields (vtable pointer @0, refcount @1) so the user fields
+        // follow. `new` wires lpVtbl/refcount after the constructor; both are zero meanwhile.
+        if (isWinrt)
+        {
+            LLVMBackend::DeclTypeAndValue lpVtbl;
+            lpVtbl.VariableName = "lpVtbl";
+            lpVtbl.TypeName = winrtVtblName;
+            lpVtbl.Pointer = true;
+            LLVMBackend::DeclTypeAndValue refcount;
+            refcount.VariableName = "__refcount";
+            refcount.TypeName = "u32";
+            declList.insert(declList.begin(), refcount);
+            declList.insert(declList.begin(), lpVtbl);
         }
 
         if (compiler->IsVerbose())
@@ -17792,7 +17923,7 @@ public:
                 }
                 earlyIfaceNames.push_back(ifaceName);
             }
-            if (!earlyIfaceNames.empty())
+            if (!earlyIfaceNames.empty() && !isWinrt)
                 compiler->RegisterStructInterfaces(structName, earlyIfaceNames);
         }
 
@@ -17891,9 +18022,18 @@ public:
 
             ifaceNames.push_back(ifaceName);
         }
-        compiler->RegisterStructInterfaces(structName, ifaceNames);
-        for (const auto& interfaceName : ifaceNames)
-            compiler->VerifyInterfaceImplementation(structName, interfaceName);
+        // A [winrt] class emits COM runtime functions + the static vtable instead of registering
+        // a fat-ptr interface vtable. Runs after member functions/dtor so thunks can find them.
+        if (isWinrt)
+        {
+            compiler->EmitWinrtRuntime(structName, winrtIface, winrtVtblName);
+        }
+        else
+        {
+            compiler->RegisterStructInterfaces(structName, ifaceNames);
+            for (const auto& interfaceName : ifaceNames)
+                compiler->VerifyInterfaceImplementation(structName, interfaceName);
+        }
 
         // Process any generic instantiations that were queued during this class definition
         // ProcessPendingInstantiations();

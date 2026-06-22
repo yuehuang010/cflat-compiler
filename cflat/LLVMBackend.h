@@ -961,6 +961,20 @@ private:
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
+    // [uuid("...")] string per interface name, captured during the forward scan and used to
+    // emit the IID constant for a [winrt] class that implements the interface.
+    std::unordered_map<std::string, std::string> interfaceUuids;
+
+    // Bookkeeping for a [winrt] class lowered to a COM object (thin-ptr ABI). Records the
+    // implemented interface, its generated vtable struct type, and the static vtable instance
+    // wired into every object's lpVtbl field by `new`.
+    struct WinrtClassInfo
+    {
+        std::string InterfaceName;
+        llvm::StructType* VtableType = nullptr;
+        llvm::GlobalVariable* VtableInstance = nullptr;
+    };
+    std::unordered_map<std::string, WinrtClassInfo> winrtClasses;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
     // Set/restored around a namespace member's body so unqualified sibling references
@@ -5360,6 +5374,9 @@ public:
     LLVMBackend()
     {
         Init();
+        // Builtin annotations for WinRT/COM produce-side: [winrt] (no-arg), [uuid("...")].
+        annotationRegistry["winrt"] = {};
+        annotationRegistry["uuid"] = { "" };
         CompilerManager::Instance().Register(this);
     }
     ~LLVMBackend()
@@ -6004,6 +6021,376 @@ public:
         v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
         v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
         return v;
+    }
+
+    // ===== WinRT / COM produce-side codegen (see internal/plan/winmd-projection.md) =====
+    // A [winrt] class lowers to a thin COM object: a struct whose first field is a vtable
+    // pointer, followed by a refcount and the user fields. The vtable holds IUnknown +
+    // IInspectable slots plus the interface methods (raw 1:1 ABI for this milestone). All
+    // runtime functions (QueryInterface/AddRef/Release/thunks) are generated here.
+
+    bool IsWinrtClass(const std::string& name) const { return winrtClasses.count(name) > 0; }
+
+    // Parse a canonical GUID string into its 16-byte little-endian memory image (matching the
+    // in-memory layout of core/guid.cb's Guid: u32 Data1, u16 Data2, u16 Data3, u8[8] Data4).
+    // Non-hex characters (dashes, braces) are skipped. Returns false if fewer than 32 nibbles.
+    static bool ParseUuidToBytes(const std::string& text, uint8_t out[16])
+    {
+        uint8_t textBytes[16] = {};
+        int count = 0;
+        for (char c : text)
+        {
+            int v;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else continue;
+            if (count >= 32) break;
+            int bi = count / 2;
+            if ((count & 1) == 0) textBytes[bi] = (uint8_t)(v << 4);
+            else                  textBytes[bi] = (uint8_t)(textBytes[bi] | v);
+            count++;
+        }
+        if (count < 32) return false;
+        // Data1 (u32) and Data2/Data3 (u16) are stored little-endian; Data4 is raw byte order.
+        out[0] = textBytes[3]; out[1] = textBytes[2]; out[2] = textBytes[1]; out[3] = textBytes[0];
+        out[4] = textBytes[5]; out[5] = textBytes[4];
+        out[6] = textBytes[7]; out[7] = textBytes[6];
+        for (int i = 8; i < 16; i++) out[i] = textBytes[i];
+        return true;
+    }
+
+    // Emit (or reuse) an internal-linkage [16 x i8] constant holding a GUID's memory image.
+    // Deduplicated by content so IID_IUnknown/IID_IInspectable are shared across classes.
+    llvm::GlobalVariable* EmitGuidGlobal(const uint8_t bytes[16])
+    {
+        std::string name = "__winrt_iid_";
+        for (int i = 0; i < 16; i++)
+        {
+            char buf[3];
+            snprintf(buf, sizeof(buf), "%02x", bytes[i]);
+            name += buf;
+        }
+        if (auto* existing = module->getNamedGlobal(name)) return existing;
+
+        std::vector<llvm::Constant*> elems;
+        for (int i = 0; i < 16; i++) elems.push_back(builder->getInt8(bytes[i]));
+        auto* arrTy = llvm::ArrayType::get(builder->getInt8Ty(), 16);
+        auto* init = llvm::ConstantArray::get(arrTy, elems);
+        return new llvm::GlobalVariable(*module, arrTy, true,
+            llvm::GlobalValue::InternalLinkage, init, name);
+    }
+
+    // Build a single vtable slot: a thin `function<Ret(params)>` field with the given name.
+    static DeclTypeAndValue MakeWinrtSlot(const std::string& name, const std::string& retType,
+        bool retPtr, std::vector<TypeAndValue::FuncPtrParam> params)
+    {
+        DeclTypeAndValue f;
+        f.VariableName = name;
+        f.TypeName = "__c_fn_ptr";
+        f.IsFunctionPointer = true;
+        f.FuncPtrReturnTypeName = retType;
+        f.FuncPtrReturnPointer = retPtr;
+        f.FuncPtrParams = std::move(params);
+        return f;
+    }
+
+    // Create the COM vtable struct for className implementing ifaceName. Flat IInspectable
+    // layout: [QueryInterface, AddRef, Release, GetIids, GetRuntimeClassName, GetTrustLevel,
+    // <interface methods in slot order>]. Returns the registered struct name.
+    std::string CreateWinrtVtableStruct(const std::string& className, const std::string& ifaceName)
+    {
+        std::string vtblName = className + "__" + ifaceName + "_comvtbl";
+        if (dataStructures.count(vtblName)) return vtblName;
+
+        auto vp = []() { TypeAndValue::FuncPtrParam p; p.TypeName = "void"; p.Pointer = true; return p; };
+        std::vector<DeclTypeAndValue> slots;
+        slots.push_back(MakeWinrtSlot("QueryInterface", "i32", false, { vp(), vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("AddRef", "u32", false, { vp() }));
+        slots.push_back(MakeWinrtSlot("Release", "u32", false, { vp() }));
+        slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
+
+        auto it = interfaceTable.find(ifaceName);
+        if (it != interfaceTable.end())
+        {
+            for (const auto& m : it->second)
+            {
+                std::vector<TypeAndValue::FuncPtrParam> params = { vp() };  // this
+                for (const auto& mp : m.Parameters)
+                {
+                    TypeAndValue::FuncPtrParam p;
+                    p.TypeName = mp.TypeName;
+                    p.Pointer = mp.Pointer;
+                    params.push_back(p);
+                }
+                slots.push_back(MakeWinrtSlot(m.Name, m.ReturnType.TypeName, m.ReturnType.Pointer, params));
+            }
+        }
+
+        CreateStructType(vtblName, slots);
+        return vtblName;
+    }
+
+    // Find the user member function implementing interface method m on className. Mirrors the
+    // overload match in GetOrCreateVTable (this-pointer + remaining params).
+    llvm::Function* FindWinrtMethod(const std::string& className, const InterfaceMethod& m)
+    {
+        auto it = functionTable.find(m.Name);
+        if (it == functionTable.end()) return nullptr;
+        size_t expected = 1 + m.Parameters.size();
+        for (const auto& sym : it->second)
+        {
+            if (sym.Parameters.size() != expected) continue;
+            if (sym.Parameters[0].TypeName != className || !sym.Parameters[0].Pointer) continue;
+            bool ok = true;
+            for (size_t pi = 0; pi < m.Parameters.size(); pi++)
+                if (sym.Parameters[1 + pi].TypeName != m.Parameters[pi].TypeName) { ok = false; break; }
+            if (ok) return sym.Function;
+        }
+        return nullptr;
+    }
+
+    // Store &g_vtbl into lpVtbl (field 0) and 1 into __refcount (field 1) of a freshly
+    // allocated [winrt] object. Called by `new` after the constructor runs.
+    void WireWinrtObject(llvm::Value* objPtr, const std::string& className)
+    {
+        auto wi = winrtClasses.at(className);
+        auto* objTy = dataStructures[className].StructType;
+        auto* vtblFieldPtr = builder->CreateStructGEP(objTy, objPtr, 0, "lpVtbl");
+        auto* vtblPtrTy = objTy->getStructElementType(0);
+        builder->CreateStore(builder->CreateBitCast(wi.VtableInstance, vtblPtrTy), vtblFieldPtr);
+        auto* rcFieldPtr = builder->CreateStructGEP(objTy, objPtr, 1, "__refcount");
+        builder->CreateStore(builder->getInt32(1), rcFieldPtr);
+    }
+
+    // If `slotName` names a vtable slot of the [winrt] class `className` (a generated
+    // QueryInterface/AddRef/Release/IInspectable method or an interface method), return its
+    // field descriptor; else nullptr. Lets `recv->Slot(args)` be recognized as a COM call.
+    const DeclTypeAndValue* GetWinrtSlot(const std::string& className, const std::string& slotName) const
+    {
+        auto wi = winrtClasses.find(className);
+        if (wi == winrtClasses.end()) return nullptr;
+        std::string vtblName = className + "__" + wi->second.InterfaceName + "_comvtbl";
+        auto ds = dataStructures.find(vtblName);
+        if (ds == dataStructures.end()) return nullptr;
+        for (const auto& f : ds->second.StructFields)
+            if (f.VariableName == slotName) return &f;
+        return nullptr;
+    }
+
+    // Emit a COM dispatch `recv->lpVtbl->slot(args)`: load the vtable pointer (field 0), load the
+    // named slot, and indirect-call it. argVals[0] is the receiver `this` (also used to reach the
+    // vtable); argVals[1..] are the user arguments. Returns the call result (or null for void).
+    llvm::Value* EmitWinrtSlotCall(const std::string& className, const std::string& slotName,
+        const std::vector<llvm::Value*>& argVals)
+    {
+        auto wi = winrtClasses.at(className);
+        auto* objTy = dataStructures[className].StructType;
+        auto* vtblTy = wi.VtableType;
+        std::string vtblName = className + "__" + wi.InterfaceName + "_comvtbl";
+        auto& vtblSD = dataStructures[vtblName];
+
+        unsigned slotIdx = 0;
+        const DeclTypeAndValue* slot = nullptr;
+        for (unsigned i = 0; i < vtblSD.StructFields.size(); i++)
+            if (vtblSD.StructFields[i].VariableName == slotName) { slotIdx = i; slot = &vtblSD.StructFields[i]; break; }
+        if (!slot || argVals.empty())
+        {
+            LogError(std::format("EmitWinrtSlotCall: bad slot '{}' on '{}'", slotName, className));
+            return nullptr;
+        }
+
+        auto* objPtr = builder->CreateBitCast(argVals[0], objTy->getPointerTo());
+        auto* vtblFieldPtr = builder->CreateStructGEP(objTy, objPtr, 0);
+        auto* vtblPtr = builder->CreateLoad(vtblTy->getPointerTo(), vtblFieldPtr);
+        auto* slotPtr = builder->CreateStructGEP(vtblTy, vtblPtr, slotIdx);
+        auto* fnPtr = builder->CreateLoad(BuildThinFnPtrType(*slot), slotPtr);
+        return CreateIndirectCall(*slot, fnPtr, argVals);
+    }
+
+    // Emit all runtime functions and the static vtable instance for a [winrt] class. Must run
+    // AFTER the object struct body, the vtable struct, and the user member functions exist.
+    void EmitWinrtRuntime(const std::string& className, const std::string& ifaceName,
+        const std::string& vtblName)
+    {
+        auto* objTy = dataStructures[className].StructType;
+        auto* vtblTy = dataStructures[vtblName].StructType;
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i32Ty = builder->getInt32Ty();
+
+        // GUID constants: IUnknown, IInspectable, and this class's interface IID.
+        uint8_t unkB[16], inspB[16], ifaceB[16];
+        ParseUuidToBytes("00000000-0000-0000-C000-000000000046", unkB);
+        ParseUuidToBytes("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90", inspB);
+        std::string ifaceUuid;
+        if (auto u = interfaceUuids.find(ifaceName); u != interfaceUuids.end()) ifaceUuid = u->second;
+        bool haveIfaceIid = ParseUuidToBytes(ifaceUuid, ifaceB);
+        auto* gUnk = EmitGuidGlobal(unkB);
+        auto* gInsp = EmitGuidGlobal(inspB);
+        auto* gIface = haveIfaceIid ? EmitGuidGlobal(ifaceB) : nullptr;
+
+        auto makeFn = [&](const std::string& nm, llvm::FunctionType* ty) {
+            return llvm::Function::Create(ty, llvm::Function::InternalLinkage,
+                "__winrt_" + className + "_" + nm, module.get());
+        };
+        std::string prefix = "__winrt_" + className + "_";
+
+        // QueryInterface(i8* self, i8* riid, i8* ppv) -> i32
+        auto* qiTy = llvm::FunctionType::get(i32Ty, { i8PtrTy, i8PtrTy, i8PtrTy }, false);
+        auto* qiFn = makeFn("QueryInterface", qiTy);
+        {
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", qiFn);
+            auto* matchBB = llvm::BasicBlock::Create(*context, "match", qiFn);
+            auto* noBB = llvm::BasicBlock::Create(*context, "nomatch", qiFn);
+            llvm::IRBuilder<> b(entry);
+            auto* self = qiFn->getArg(0);
+            auto* riid = qiFn->getArg(1);
+            auto* ppv = qiFn->getArg(2);
+
+            // Compare two 8-byte halves of the 16-byte GUID (unaligned loads are fine on x64).
+            auto guidEq = [&](llvm::Value* a, llvm::GlobalVariable* g) -> llvm::Value* {
+                auto* i64Ty = b.getInt64Ty();
+                auto* i64PtrTy = i64Ty->getPointerTo();
+                auto* aLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(a, i64PtrTy), llvm::MaybeAlign(1));
+                auto* aHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), a, 8);
+                auto* aHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(aHiPtr, i64PtrTy), llvm::MaybeAlign(1));
+                auto* gI8 = b.CreateBitCast(g, i8PtrTy);
+                auto* bLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(gI8, i64PtrTy), llvm::MaybeAlign(1));
+                auto* bHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), gI8, 8);
+                auto* bHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(bHiPtr, i64PtrTy), llvm::MaybeAlign(1));
+                return b.CreateAnd(b.CreateICmpEQ(aLo, bLo), b.CreateICmpEQ(aHi, bHi));
+            };
+
+            llvm::Value* match = b.CreateOr(guidEq(riid, gUnk), guidEq(riid, gInsp));
+            if (gIface) match = b.CreateOr(match, guidEq(riid, gIface));
+            b.CreateCondBr(match, matchBB, noBB);
+
+            b.SetInsertPoint(matchBB);
+            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            b.CreateStore(self, b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateRet(b.getInt32(0));
+
+            b.SetInsertPoint(noBB);
+            b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
+                b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateRet(b.getInt32((uint32_t)0x80004002));  // E_NOINTERFACE
+        }
+
+        // AddRef(i8* self) -> i32
+        auto* refTy = llvm::FunctionType::get(i32Ty, { i8PtrTy }, false);
+        auto* addRefFn = makeFn("AddRef", refTy);
+        {
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", addRefFn);
+            llvm::IRBuilder<> b(entry);
+            auto* objP = b.CreateBitCast(addRefFn->getArg(0), objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            b.CreateRet(b.CreateAdd(old, b.getInt32(1)));
+        }
+
+        // Release(i8* self) -> i32: atomic dec; free at zero (full dtor + operator delete).
+        auto* releaseFn = makeFn("Release", refTy);
+        {
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", releaseFn);
+            auto* freeBB = llvm::BasicBlock::Create(*context, "free", releaseFn);
+            auto* doneBB = llvm::BasicBlock::Create(*context, "done", releaseFn);
+            llvm::IRBuilder<> b(entry);
+            auto* self = releaseFn->getArg(0);
+            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* rcP = b.CreateStructGEP(objTy, objP, 1);
+            auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, rcP, b.getInt32(1),
+                llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+            auto* nw = b.CreateSub(old, b.getInt32(1));
+            b.CreateCondBr(b.CreateICmpEQ(nw, b.getInt32(0)), freeBB, doneBB);
+
+            b.SetInsertPoint(freeBB);
+            if (auto* dtor = GetOrCreateFullDestructor(className))
+                b.CreateCall(dtor->getFunctionType(), dtor,
+                    { b.CreateBitCast(self, objTy->getPointerTo()) });
+            if (auto* del = GetFunction("operator delete"))
+                b.CreateCall(del->getFunctionType(), del,
+                    { b.CreateBitCast(self, del->getArg(0)->getType()) });
+            b.CreateBr(doneBB);
+
+            b.SetInsertPoint(doneBB);
+            b.CreateRet(nw);
+        }
+
+        // IInspectable stubs: store null/zero out-params and return S_OK.
+        auto emitInspStub = [&](const std::string& nm, unsigned outParams) {
+            std::vector<llvm::Type*> ps(1 + outParams, i8PtrTy);
+            auto* ty = llvm::FunctionType::get(i32Ty, ps, false);
+            auto* fn = makeFn(nm, ty);
+            auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+            llvm::IRBuilder<> b(entry);
+            b.CreateRet(b.getInt32(0));
+            return fn;
+        };
+        auto* getIidsFn = emitInspStub("GetIids", 2);
+        auto* getNameFn = emitInspStub("GetRuntimeClassName", 1);
+        auto* getTrustFn = emitInspStub("GetTrustLevel", 1);
+
+        // Per-method thunks: bitcast i8* self to the object pointer and forward to the member fn.
+        std::vector<llvm::Function*> thunks;
+        auto ifIt = interfaceTable.find(ifaceName);
+        if (ifIt != interfaceTable.end())
+        {
+            for (const auto& m : ifIt->second)
+            {
+                llvm::Function* impl = FindWinrtMethod(className, m);
+                if (!impl)
+                {
+                    LogError(std::format("[winrt] class '{}' does not implement '{}::{}'",
+                        className, ifaceName, m.Name));
+                    thunks.push_back(nullptr);
+                    continue;
+                }
+                auto* implTy = impl->getFunctionType();
+                std::vector<llvm::Type*> ps;
+                ps.push_back(i8PtrTy);  // this
+                for (unsigned i = 1; i < implTy->getNumParams(); i++)
+                    ps.push_back(implTy->getParamType(i));
+                auto* ty = llvm::FunctionType::get(implTy->getReturnType(), ps, false);
+                auto* fn = makeFn(m.Name, ty);
+                auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
+                llvm::IRBuilder<> b(entry);
+                std::vector<llvm::Value*> args;
+                args.push_back(b.CreateBitCast(fn->getArg(0), implTy->getParamType(0)));
+                for (unsigned i = 1; i < fn->arg_size(); i++) args.push_back(fn->getArg(i));
+                auto* call = b.CreateCall(implTy, impl, args);
+                if (implTy->getReturnType()->isVoidTy()) b.CreateRetVoid();
+                else b.CreateRet(call);
+                thunks.push_back(fn);
+            }
+        }
+
+        // Static vtable instance: a ConstantStruct of the generated functions, each bitcast to
+        // the exact thin-fn-ptr type of its slot field.
+        std::vector<llvm::Function*> slotFns = {
+            qiFn, addRefFn, releaseFn, getIidsFn, getNameFn, getTrustFn };
+        for (auto* t : thunks) slotFns.push_back(t);
+
+        const auto& slotFields = dataStructures[vtblName].StructFields;
+        std::vector<llvm::Constant*> entries;
+        for (size_t i = 0; i < slotFields.size(); i++)
+        {
+            auto* slotTy = GetType(slotFields[i]);
+            llvm::Constant* fnC = slotFns[i]
+                ? (llvm::Constant*)llvm::ConstantExpr::getBitCast(slotFns[i], slotTy)
+                : llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(slotTy));
+            entries.push_back(fnC);
+        }
+        auto* init = llvm::ConstantStruct::get(vtblTy, entries);
+        auto* vtblGlobal = new llvm::GlobalVariable(*module, vtblTy, true,
+            llvm::GlobalValue::InternalLinkage, init, prefix + "vtbl");
+
+        winrtClasses[className] = WinrtClassInfo{ ifaceName, vtblTy, vtblGlobal };
     }
 
     // delete through an interface fat pointer: the operand is a {vtable, data} struct, not a

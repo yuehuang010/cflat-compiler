@@ -1,0 +1,68 @@
+// com.cb - shared COM/WinRT helpers: well-known IIDs and HRESULT codes.
+//
+// COM identities (interface IDs) and result codes are otherwise hand-copied into every
+// program that talks to COM - the foreign-vtable demos (example/COM/*) and the produce-side
+// [winrt] classes both need them. This module is the single home for the well-known values so
+// they are spelled once and stay consistent.
+//
+// IIDs are exposed as functions (a `Guid` global cannot be a compile-time constant), each
+// returning a fresh value. Take its address for the REFIID an API expects:
+//
+//   import "com.cb";
+//   Guid iid = IID_IUnknown();
+//   i32 hr = obj->lpVtbl->QueryInterface(obj, &iid, &out);
+//   if (FAILED(hr)) { ... }
+//
+// The binary layout of `Guid` matches a Windows GUID / COM IID exactly (see guid.cb), so the
+// returned value passes straight to COM APIs that take a REFIID/REFGUID.
+
+import "guid.cb";
+
+// ===== HRESULT result codes =====
+// An HRESULT is a 32-bit status: the high bit is the failure flag, so success codes are
+// non-negative and failure codes are negative when read as a signed i32.
+
+i32 S_OK            = 0;
+i32 S_FALSE         = 1;
+i32 E_NOTIMPL       = (i32)0x80004001;
+i32 E_NOINTERFACE   = (i32)0x80004002;
+i32 E_POINTER       = (i32)0x80004003;
+i32 E_ABORT         = (i32)0x80004004;
+i32 E_FAIL          = (i32)0x80004005;
+i32 E_UNEXPECTED    = (i32)0x8000FFFF;
+i32 E_ACCESSDENIED  = (i32)0x80070005;
+i32 E_HANDLE        = (i32)0x80070006;
+i32 E_OUTOFMEMORY   = (i32)0x8007000E;
+i32 E_INVALIDARG    = (i32)0x80070057;
+
+// SUCCEEDED/FAILED test the failure (high) bit, exactly like the Win32 macros.
+bool SUCCEEDED(i32 hr) { return hr >= 0; }
+bool FAILED(i32 hr)    { return hr < 0; }
+
+// ===== Well-known interface IDs =====
+
+// IID_IUnknown {00000000-0000-0000-C000-000000000046} - the root COM interface.
+Guid IID_IUnknown()
+{
+    return Guid.make((u32)0x00000000, (u16)0x0000, (u16)0x0000,
+                     (u8)0xC0, (u8)0x00, (u8)0x00, (u8)0x00,
+                     (u8)0x00, (u8)0x00, (u8)0x00, (u8)0x46);
+}
+
+// IID_IInspectable {AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90} - the WinRT root interface
+// (derives from IUnknown); every WinRT runtime class answers to it.
+Guid IID_IInspectable()
+{
+    return Guid.make((u32)0xAF86E2E0, (u16)0xB12D, (u16)0x4C6A,
+                     (u8)0x9C, (u8)0x5A, (u8)0xD7, (u8)0xAA,
+                     (u8)0x65, (u8)0x10, (u8)0x1E, (u8)0x90);
+}
+
+// IID_IAgileObject {94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90} - marker interface declaring an
+// object is free-threaded (safe to call from any apartment).
+Guid IID_IAgileObject()
+{
+    return Guid.make((u32)0x94EA2B94, (u16)0xE9CC, (u16)0x49E0,
+                     (u8)0xC0, (u8)0xFF, (u8)0xEE, (u8)0x64,
+                     (u8)0xCA, (u8)0x8F, (u8)0x5B, (u8)0x90);
+}
