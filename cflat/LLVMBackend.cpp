@@ -49,7 +49,8 @@ extern "C" unsigned char RtlAddFunctionTable(
 
 llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::LinkGraph& G)
 {
-    if (std::getenv("CFLAT_JIT_NOSEH"))
+    char nosehBuf[16]; size_t nosehLen = 0;
+    if (getenv_s(&nosehLen, nosehBuf, sizeof(nosehBuf), "CFLAT_JIT_NOSEH") == 0 && nosehLen > 0)
         return llvm::Error::success(); // DIAG: skip all unwind-table registration
 
     auto* pdata = G.findSectionByName(".pdata");
@@ -69,7 +70,8 @@ llvm::Error cflat_jit::SehRegistrationPlugin::RegisterUnwindInfo(llvm::jitlink::
     // RUNTIME_FUNCTION: { BeginAddress, EndAddress, UnwindInfoAddress } - three 4-byte RVAs.
     struct RuntimeFunction { uint32_t begin, end, unwind; };
     constexpr size_t kRuntimeFunctionSize = sizeof(RuntimeFunction);
-    const bool diag = std::getenv("CFLAT_JIT_DIAG") != nullptr;
+    char diagBuf[16]; size_t diagEnvLen = 0;
+    const bool diag = (getenv_s(&diagEnvLen, diagBuf, sizeof(diagBuf), "CFLAT_JIT_DIAG") == 0 && diagEnvLen > 0);
 
     for (auto* B : pdata->blocks())
     {

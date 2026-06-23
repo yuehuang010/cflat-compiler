@@ -403,6 +403,15 @@ extern int main()
     if (invalid_h != CB_INVALID_HANDLE) return 123;
     if (h == CB_INVALID_HANDLE)         return 124;   // real handle, not sentinel
 
+    // Function-pointer-sentinel macro: CB_TRANSIENT_DTOR = ((CB_DTOR_FN)-1), the
+    // SQLITE_TRANSIENT pattern. It registers as a THIN C function-pointer global; the
+    // global's type and its inttoptr initializer must agree. Regression: a fat-closure
+    // global type vs a thin-ptr initializer failed LLVM module verification, so merely
+    // referencing this macro (which emits the global) is the core check; the bit
+    // pattern is verified too.
+    void* dtor = (void*)CB_TRANSIENT_DTOR;
+    if (dtor != (void*)(i64)(-1)) return 125;
+
     // ---- Section N: anonymous union inside struct (C11) ---------------------
     // mathlib.h declares `struct ML_Overlap { int header; union { int as_int;
     // float as_float; }; int trailer; }`. The C-interop extractor synthesizes a

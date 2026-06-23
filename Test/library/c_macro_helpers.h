@@ -31,6 +31,16 @@ typedef long long CB_LONG_PTR;
 typedef void* CB_HANDLE;
 #define CB_INVALID_HANDLE ((CB_HANDLE)(CB_LONG_PTR)-1)
 
+/* Function-pointer-sentinel macro, mirroring sqlite3's
+   SQLITE_TRANSIENT == ((sqlite3_destructor_type)-1). The macro's natural type is a
+   C function pointer, so it registers as the THIN `function<...>` (a bare C fn ptr).
+   Regression: the global's declared type and its inttoptr initializer must BOTH be the
+   thin fn-ptr. A path that left the type unmarked picked the fat closure {ptr,ptr} for
+   the global while the initializer stayed a thin ptr, failing LLVM module verification
+   ("Global variable initializer type does not match global variable type"). */
+typedef void (*CB_DTOR_FN)(void*);
+#define CB_TRANSIENT_DTOR ((CB_DTOR_FN)-1)
+
 /* Each of the following must still be silently rejected (dropped) by the
    translator - if any were accepted, its generated source would fail to compile,
    so their presence here exercises the drop path: */

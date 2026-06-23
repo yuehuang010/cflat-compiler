@@ -4082,7 +4082,12 @@ private:
                 // A C function-pointer macro (e.g. ((int(*)(int,int))0)) is the THIN
                 // function<R(P...)>: a bare C function pointer frozen at link time. The
                 // constant is just the bit pattern reinterpreted as the thin signature.
-                tv = m.funcPtrTV;          // already thin (IsThinFnPtr) from MapCTypeToTypeAndValue
+                // Force the thin marker: funcPtrTV can arrive with an empty TypeName (e.g.
+                // from a cached extraction), which would make GetType pick the fat closure
+                // type {ptr,ptr} for the global while the initializer below is a thin ptr -
+                // a definition the verifier rejects. A C macro fn-ptr is always thin.
+                tv = m.funcPtrTV;
+                tv.TypeName = "__c_fn_ptr";
                 tv.VariableName = m.name;
                 c = llvm::ConstantExpr::getIntToPtr(
                     builder->getInt64((uint64_t)m.value), BuildThinFnPtrType(tv));
@@ -5205,7 +5210,8 @@ private:
             return false;
         }
 
-        if (std::getenv("CFLAT_JIT_DIAG"))
+        char jitDiagBuf[16]; size_t jitDiagLen = 0;
+        if (getenv_s(&jitDiagLen, jitDiagBuf, sizeof(jitDiagBuf), "CFLAT_JIT_DIAG") == 0 && jitDiagLen > 0)
             fprintf(stderr, "[jitdiag] invoking JIT main @%p\n", (void*)mainSym->getValue());
 
         // Dispatch on the entry signature detected above.
@@ -6504,7 +6510,7 @@ public:
                     llvm::Value* val;
                     if (implHResult) { hr = b.CreateExtractValue(call, { 0u }); val = b.CreateExtractValue(call, { 1u }); }
                     else             { hr = b.getInt32(0); val = call; }
-                    auto* retPtr = b.CreateBitCast(fn->getArg(fn->arg_size() - 1), val->getType()->getPointerTo());
+                    auto* retPtr = b.CreateBitCast(fn->getArg(static_cast<unsigned>(fn->arg_size() - 1)), val->getType()->getPointerTo());
                     b.CreateStore(val, retPtr);
                     b.CreateRet(hr);
                 }
