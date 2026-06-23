@@ -522,5 +522,17 @@ extern int main()
     oh = (ML_Opaque*)ohv;                        // and back via cast
     if (oh != nullptr)                           return 220;
 
+    // ---- Section T: C function-pointer struct fields + typed struct pointers -
+    // cinterop.c's CbVtbl is a struct of function pointers (a mini COM vtable) and
+    // CbObj.vtbl points at it. The C-fn-ptr fields must import as callable thin
+    // function<> slots, and the `vtbl` pointer field must keep its CbVtbl* type, so
+    // `o.vtbl->add(&o, ...)` dispatches with no hand-written cast - the COM idiom.
+    CbObj cbo = default;
+    cb_init_obj(&cbo, 10);
+    if (cbo.value != 10)                         return 230;   // typed field readable
+    if (cbo.vtbl->add(&cbo, 2, 3) != 15)         return 231;   // dispatch through fn-ptr slot
+    if (cbo.vtbl->get(&cbo) != 15)               return 232;   // mutation landed via `this`
+    if (cbo.vtbl->add(&cbo, 100, 0) != 115)      return 233;   // accumulates
+
     return 0;
 }

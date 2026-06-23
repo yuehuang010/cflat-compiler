@@ -1,10 +1,11 @@
-// imalloc_demo.cb - a real, headless Windows COM call through a foreign vtable.
+// imalloc_demo.cb - a real, headless Windows COM call through a header-imported vtable.
 //
 // COM is "call a method whose code address lives in an object's vtable, passing the
-// object as an explicit `this`". CFlat expresses each vtable slot as a thin
-// `function<...>` - a bare C function pointer (8 bytes, no captured environment) - so a
-// struct of `function<...>` fields lays out byte-for-byte like the C vtable the runtime
-// hands back. No glue, no hand-written assembly: load the slot, call it with `this`.
+// object as an explicit `this`". The Windows SDK headers already describe that layout: in
+// their C path (cflat parses headers as C) a COM interface is a struct whose first field
+// `lpVtbl` points at a struct of function pointers - exactly cflat's thin `function<...>`.
+// So `import "objbase.h";` hands us `IMalloc` and `IMallocVtbl` ready to call - no
+// hand-declared structs, no hand-written `extern` for CoGetMalloc (it is auto-externed).
 //
 // This demo asks COM for its process-wide task allocator (IMalloc) via CoGetMalloc, then
 // drives it entirely through the vtable: Alloc, GetSize, Free, QueryInterface, Release.
@@ -15,38 +16,16 @@
 // Build:  x64/Debug/cflat.exe example/COM/imalloc_demo.cb -o out/imalloc_demo.exe
 // Run:    out\imalloc_demo.exe
 
-// objbase.h is imported only to link ole32.lib (CoGetMalloc lives there); the COM
-// functions are hand-declared below so their signatures stay explicit.
+// objbase.h supplies IMalloc + CoGetMalloc (both from the header) and links ole32.lib.
 import "objbase.h" lib "ole32.lib" cache;
 import "guid.cb";
-
-// IMalloc's vtable: IUnknown's 3 methods followed by IMalloc's 6, in exact COM order.
-// Every slot takes the interface pointer as its first `this` argument. The field order
-// and count must match the C layout precisely - a vtable is a positional array.
-struct IMallocVtbl
-{
-    function<i32(void*, void*, void**)> QueryInterface = default;  // 0  IUnknown
-    function<u32(void*)>                AddRef         = default;  // 1
-    function<u32(void*)>                Release        = default;  // 2
-    function<void*(void*, u64)>         Alloc          = default;  // 3  IMalloc
-    function<void*(void*, void*, u64)>  Realloc        = default;  // 4
-    function<void(void*, void*)>        Free           = default;  // 5
-    function<u64(void*, void*)>         GetSize        = default;  // 6
-    function<i32(void*, void*)>         DidAlloc       = default;  // 7
-    function<void(void*)>               HeapMinimize   = default;  // 8
-};
-
-// A COM interface pointer is a pointer to a struct whose first field is its vtable.
-struct IMalloc { IMallocVtbl* lpVtbl = default; };
-
-extern stdcall i32 CoGetMalloc(u32 dwMemContext, void** ppMalloc);
 
 extern int main()
 {
     // CoGetMalloc(MEMCTX_TASK = 1) hands back the process task allocator as an IMalloc*.
-    IMalloc* m = default;
-    i32 hr = CoGetMalloc((u32)1, (void**)&m);
-    if (hr != 0)
+    IMalloc* m = nullptr;
+    i32 hr = CoGetMalloc(1, (void**)&m);
+    if (hr != 0 || m == nullptr)
     {
         printf("CoGetMalloc failed: hr=0x%08X\n", hr);
         return 1;
@@ -55,7 +34,7 @@ extern int main()
 
     // Allocate through the vtable, confirm the size, then free - each is one indirect
     // call with `m` passed as the explicit `this`.
-    void* p = m->lpVtbl->Alloc(m, (u64)64);
+    void* p = m->lpVtbl->Alloc(m, 64);
     u64 sz = m->lpVtbl->GetSize(m, p);
     printf("Alloc(64) -> %p, GetSize -> %llu bytes\n", p, sz);
     m->lpVtbl->Free(m, p);
@@ -65,14 +44,18 @@ extern int main()
     // same object (with an extra ref) and proves the QI slot dispatches correctly. The
     // IID is a core `Guid`; its 16-byte layout matches REFIID, so &iid passes straight in.
     Guid iid = Guid.parse("00000000-0000-0000-C000-000000000046");
-    void* unk = default;
+    void* unk = nullptr;
     i32 qi = m->lpVtbl->QueryInterface(m, &iid, &unk);
     printf("QueryInterface(IUnknown) -> hr=0x%08X, unk=%p (same object: %s)\n",
            qi, unk, ((void*)m == unk) ? "yes" : "no");
 
     // Release the QI reference, then the allocator reference. The task allocator is a
     // process singleton, so its final count is implementation-defined, not necessarily 0.
-    if (unk != nullptr) m->lpVtbl->Release(unk);
+    if (unk != nullptr)
+    {
+        IMalloc* unkM = (IMalloc*)unk;
+        unkM->lpVtbl->Release(unkM);
+    }
     u32 rc = m->lpVtbl->Release(m);
     printf("final Release -> refcount=%u\n", rc);
     return 0;

@@ -57,3 +57,28 @@ C_HANDLE c_get_invalid_handle(void)
 {
     return (C_HANDLE)(C_LONG_PTR)-1;
 }
+
+/* A mini COM-style vtable: a struct of function pointers plus an object whose first
+   field points at it. Exercises CFlat's C function-pointer struct fields (mapped to a
+   thin function<>, so they are callable) and typed struct-pointer fields (so
+   obj.vtbl->fn(&obj) dispatches with no hand-written cast - the same shape a real COM
+   lpVtbl has). No allocation: the caller supplies the object by value. */
+struct CbObj;
+typedef struct CbVtbl {
+    int (*add)(struct CbObj*, int, int);
+    int (*get)(struct CbObj*);
+} CbVtbl;
+typedef struct CbObj {
+    const CbVtbl* vtbl;
+    int value;
+} CbObj;
+
+static int cb_vt_add(struct CbObj* self, int a, int b) { self->value += a + b; return self->value; }
+static int cb_vt_get(struct CbObj* self) { return self->value; }
+static const CbVtbl cb_global_vtbl = { cb_vt_add, cb_vt_get };
+
+void cb_init_obj(CbObj* obj, int start)
+{
+    obj->vtbl = &cb_global_vtbl;
+    obj->value = start;
+}

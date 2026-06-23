@@ -5,9 +5,16 @@
 //
 // What it does: D2D1CreateFactory -> ID2D1Factory, create an ID2D1HwndRenderTarget bound
 // to a Win32 window, then each WM_PAINT runs BeginDraw / Clear / FillRectangle /
-// FillEllipse / EndDraw - every call dispatched through a vtable slot. No d2d1.h types are
-// imported (its structs would clash with hand-declared ones); the layouts below mirror the
-// SDK headers exactly. Vtable slot indices are from d2d1.h and must stay in order.
+// FillEllipse / EndDraw - every call dispatched through a vtable slot.
+//
+// Why hand-model the vtables here (unlike imalloc_demo.cb, which imports IMalloc straight
+// from objbase.h)? Direct2D is C++-only at the interface ABI: in its C path d2d1.h emits
+// only opaque forward typedefs (`typedef interface ID2D1Factory ID2D1Factory;`) - no
+// `lpVtbl` structs of function pointers. The COM methods live solely in the C++
+// `interface ID2D1Resource : public IUnknown` declarations. So there is no C vtable to
+// import; the layouts below mirror the SDK's method order by hand. (MIDL-generated headers
+// like objbase.h / d3d12.h / dxgi.h DO emit explicit C `*Vtbl` structs, so those import
+// and call directly - see imalloc_demo.cb.) Vtable slot indices are from d2d1.h.
 //
 // Build:  x64/Debug/cflat.exe example/COM/direct2d_demo.cb -o out/direct2d_demo.exe
 // Run:    out\direct2d_demo.exe   (opens a window; close it to exit)

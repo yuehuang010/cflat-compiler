@@ -3157,6 +3157,29 @@ private:
         return elem;
     }
 
+    // For a pointer-to-aggregate spelling like "const struct Foo *", return the tag ("Foo")
+    // and the indirection level via outPtr. Returns "" (and leaves outPtr at 0) when the
+    // spelling is not a struct/union pointer. Used to keep `Foo*` record fields typed instead
+    // of decaying to void* - so COM `lpVtbl` member access resolves.
+    static std::string AggregatePointeeTag(const std::string& spelling, int& outPtr)
+    {
+        outPtr = 0;
+        std::string s = spelling;
+        for (const char* w : { "const", "volatile", "restrict", "__restrict", "__restrict__",
+                               "_Nonnull", "_Nullable", "_Null_unspecified" })
+            for (size_t pos; (pos = s.find(w)) != std::string::npos; ) s.erase(pos, std::strlen(w));
+        outPtr = (int)std::count(s.begin(), s.end(), '*');
+        if (outPtr == 0) return std::string();
+        s.erase(std::remove(s.begin(), s.end(), '*'), s.end());
+        size_t a = s.find_first_not_of(" \t");
+        size_t b = s.find_last_not_of(" \t");
+        if (a == std::string::npos) return std::string();
+        s = s.substr(a, b - a + 1);
+        if (s.rfind("struct ", 0) == 0) return s.substr(7);
+        if (s.rfind("union ", 0) == 0)  return s.substr(6);
+        return std::string();
+    }
+
     bool MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited)
     {
@@ -3966,13 +3989,23 @@ private:
                     tv.ConstArraySize = arrDims[0];
                     tv.ConstInnerDimensions.assign(arrDims.begin() + 1, arrDims.end());
                 }
-                // C fn-ptr fields are bare pointers (8 bytes); CFlat function<T> is 16 bytes.
-                // Collapse to void* to keep struct layout correct; user casts explicitly.
-                if (tv.IsFunctionPointer)
+                // A C fn-ptr field maps to a THIN function<T> ("__c_fn_ptr") - a bare,
+                // pointer-sized C function pointer, same size as the void* it replaces, so the
+                // struct layout is unchanged. Keeping the real signature makes MIDL COM vtable
+                // slots (e.g. ID3D12DeviceVtbl) callable as `obj->lpVtbl->Method(obj, ...)`
+                // through the existing thin-call path, instead of an opaque void* the user
+                // must reinterpret by hand.
+
+                // A pointer field to a KNOWN aggregate keeps its pointee type instead of decaying
+                // to opaque void* (the shared mapper's default for struct pointers). This is what
+                // makes a COM object's `lpVtbl` typed as `<Interface>Vtbl*` so the member-access
+                // chain resolves; unknown/opaque pointees still fall back to void*.
+                if (!tv.IsFunctionPointer && tv.Pointer && tv.TypeName == "void")
                 {
-                    tv = TypeAndValue{};
-                    tv.TypeName = "void";
-                    tv.Pointer  = true;
+                    int ptrLevels = 0;
+                    std::string tag = AggregatePointeeTag(elemSpelling, ptrLevels);
+                    if (!tag.empty() && ptrLevels <= 2 && dataStructures.find(tag) != dataStructures.end())
+                        tv.TypeName = tag;   // keep Pointer / ElemPointer as the mapper set them
                 }
                 DeclTypeAndValue d;
                 static_cast<TypeAndValue&>(d) = tv;
