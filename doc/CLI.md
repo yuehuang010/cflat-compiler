@@ -127,6 +127,21 @@ Full details, including the `import package` / inline `lib`/`define`/`cache` cla
 
 Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 
+## WinMD / COM
+
+| Switch | Value | Description |
+|--------|-------|-------------|
+| `--emit-winmd` | path | After compiling, write the program's `[winrt]` interfaces and classes to a `.winmd` file. |
+| `--dump-winmd` | path | Read a `.winmd` into the projection model and print it (diagnostic), then exit. |
+| `--winmd-instantiate` | path | Import a `.winmd` and instantiate well-known parameterized interfaces (`IVector<i32>`, `IReference<i32>`, ...), checking each derived PIID + vtable shape, then exit. |
+| `--winmd-sig-selftest` | | Validate the parameterized-type signature encoder + PIID derivation against published reference IIDs and the RFC 4122 v5 vector, then exit. |
+
+A `.winmd` brought in via `import "x.winmd";` registers its interfaces / structs / enums as CFlat
+types (consume), and parameterized interfaces (`IVector<int>`, `IReference<T>`, ...) are instantiated
+on demand with a derived PIID; `iidof(T)` exposes that IID. A `.winmd` passed to `--check` is
+parse-verified only (no registration). Authoring COM objects with `[winrt] class`, the HRESULT /
+`HResult<T>` ABI, consuming and emitting metadata: [`doc/WINMD.md`](WINMD.md).
+
 ## Diagnostics and debugging
 
 | Switch | Short | Value | Description |

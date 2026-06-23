@@ -39,6 +39,27 @@ i32 E_INVALIDARG    = (i32)0x80070057;
 bool SUCCEEDED(i32 hr) { return hr >= 0; }
 bool FAILED(i32 hr)    { return hr < 0; }
 
+// ===== HResult<T>: an HRESULT and its logical return value, carried together =====
+// A WinRT method returns HRESULT at the ABI with its logical value passed back through a
+// trailing [out] pointer. HResult<T> bundles both into one value so a CFlat caller can inspect
+// the outcome without try/catch: `hr` is the status, `value` is meaningful only on success.
+// A [winrt] method body may return HResult<T> to be fallible (vs a plain T, which the compiler
+// wraps as always-S_OK); a consume-side call returns HResult<T> for the caller to check.
+struct HResult<T>
+{
+    i32 hr    = default;   // S_OK (0) on success; a failure HRESULT otherwise
+    T   value = default;   // valid only when ok()
+
+    bool ok()     { return this.hr >= 0; }
+    bool failed() { return this.hr < 0; }
+
+    // Fill this result in place. `succeed(v)` sets S_OK + value; `fail(hr)` sets a failure.
+    // Methods (not free functions) so T is the enclosing type's parameter - this sidesteps a
+    // monomorphizer gap when a generic function's T appears only in its return type.
+    void succeed(T v) { this.hr = 0; this.value = v; }
+    void fail(i32 e)  { this.hr = e; }
+};
+
 // ===== Well-known interface IDs =====
 
 // IID_IUnknown {00000000-0000-0000-C000-000000000046} - the root COM interface.

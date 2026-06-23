@@ -70,6 +70,7 @@
   - [Compile-Time Conditionals (`if const`)](#compile-time-conditionals-if-const)
 - [`program` Keyword](#program-keyword)
 - [C Interop](#c-interop) ([full reference](C_INTEROP.md))
+- [WinMD / COM](#winmd--com) ([full reference](WINMD.md))
 - [JSON](#json-libjsoncb)
 - [Debug Info](#debug-info-work-in-progress)
 - [Compiler CLI](#compiler-cli)
@@ -2073,6 +2074,12 @@ Run the consumer and producer, then `WaitForExit()` on both; the synthesized str
 ## C Interop
 
 CFlat can compile your own `.c` source, import another file's `main` as a program, and bind prebuilt C libraries via header extraction or vcpkg. See [`C_INTEROP.md`](C_INTEROP.md) for the full reference (`import "x.c"`, `import program`, `import package`, `import package-vcpkg`, and the `--c-*` / `--vcpkg-*` flags).
+
+---
+
+## WinMD / COM
+
+CFlat can author a COM/WinRT object with `[winrt] class` (it lowers to a thin-pointer COM object with the WinRT HRESULT ABI and `HResult<T>`), consume WinRT metadata with `import "Foo.winmd";`, and emit a `.winmd` with `--emit-winmd`. See [`WINMD.md`](WINMD.md) for the full reference.
 
 ---
 

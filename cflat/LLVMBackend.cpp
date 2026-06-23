@@ -1101,6 +1101,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         auto ext = LowerExtension(canonicalStr);
         if (ext == ".c")
             return CompileCFile(canonicalStr, programAlias);
+        // WinRT metadata: read the .winmd and register its interfaces/structs/enums as CFlat
+        // types (consume side). Not parsed by the CFlat parser; no object is linked.
+        if (ext == ".winmd")
+            return CompileWinmdFile(canonicalStr);
         // A C header (real C, not CFlat): extract declarations + enums via clang's
         // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
         if (ext == ".h" || ext == ".hpp" || ext == ".hh")

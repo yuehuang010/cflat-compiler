@@ -195,6 +195,13 @@
     <ClInclude Include="LLVMBackend.h" />
     <ClCompile Include="CClangExtract.cpp" />
     <ClInclude Include="CClangExtract.h" />
+    <ClCompile Include="WinmdExtract.cpp" />
+    <ClInclude Include="WinmdExtract.h" />
+    <ClCompile Include="WinmdEmit.cpp" />
+    <ClInclude Include="WinmdEmit.h" />
+    <ClCompile Include="WinmdSignature.cpp" />
+    <ClInclude Include="WinmdSignature.h" />
+    <ClInclude Include="WinmdModel.h" />
     <ClInclude Include="MainListener.h" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="JsonRpcLoop.cpp" />

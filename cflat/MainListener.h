@@ -10981,6 +10981,12 @@ public:
 
             int functionArgCounter = 0;
             bool nullConditionalPending = false;
+            // HResult `?.`/`?->` chaining: armed by [PFX-1] when the receiver is an HResult<T*>.
+            // structVar is redirected to the unwrapped `.value` object; hresultChainStorage holds
+            // the source HResult so the call dispatch can branch on failed() and propagate hr.
+            bool hresultChainPending = false;
+            llvm::Value* hresultChainStorage = nullptr;
+            std::string hresultChainType;
             // Set when the primary was a `global::name` form whose base resolved to a dot-less
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
@@ -11049,6 +11055,39 @@ public:
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
                                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                            }
+                        }
+                        else if (nullConditionalPending
+                                 && LLVMBackend::IsHResultType(namedVar.TypeAndValue.TypeName))
+                        {
+                            // HResult `?.`/`?->` chain: unwrap `.value` (an object pointer) as the
+                            // receiver for the next call and arm the failure short-circuit; the call
+                            // dispatch reads the source HResult's hr to decide skip-vs-call + propagate.
+                            auto* compiler = Compiler(ctx);
+                            auto hrSD = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                            if (hrSD.StructType && hrSD.StructFields.size() >= 2)
+                            {
+                                llvm::Value* hrMem = namedVar.Storage;
+                                if (!hrMem)
+                                {
+                                    hrMem = compiler->AllocaAtEntry(hrSD.StructType, nullptr, "hrchain");
+                                    compiler->builder->CreateStore(
+                                        namedVar.Primary ? namedVar.Primary : LoadNamedVariable(namedVar), hrMem);
+                                }
+                                const auto& valField = hrSD.StructFields[1];
+                                auto* valuePtr = compiler->builder->CreateLoad(
+                                    compiler->GetType(valField, nullptr, true),
+                                    compiler->builder->CreateStructGEP(hrSD.StructType, hrMem, 1));
+                                auto valSD = compiler->GetDataStructure(valField.TypeName);
+                                structVar.Storage      = valuePtr;
+                                structVar.Primary      = nullptr;
+                                structVar.BaseType     = valSD.StructType;
+                                structVar.TypeAndValue = valField;
+                                structVar.TypeAndValue.Pointer = false;
+                                hresultChainPending = true;
+                                hresultChainStorage = hrMem;
+                                hresultChainType    = namedVar.TypeAndValue.TypeName;
+                                nullConditionalPending = false;  // the HResult path supersedes null-ptr
                             }
                         }
                         break;
@@ -13625,13 +13664,74 @@ public:
                                     llvm::Value* v = a.Primary ? a.Primary : LoadNamedVariable(a);
                                     if (v) argVals.push_back(v);
                                 }
-                                namedVar = {};
-                                namedVar.Primary = Compiler(primaryCtx)->EmitWinrtSlotCall(
-                                    structVar.TypeAndValue.TypeName, functionName, argVals);
-                                namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
-                                namedVar.TypeAndValue.TypeName = winrtSlot->FuncPtrReturnTypeName;
-                                namedVar.TypeAndValue.Pointer  = winrtSlot->FuncPtrReturnPointer;
-                                globalScopeCall = false;
+                                auto* compiler = Compiler(primaryCtx);
+                                if (hresultChainPending)
+                                {
+                                    // HResult `?.`/`?->` chain: structVar is the unwrapped `.value`
+                                    // object. Skip the call and propagate hr when the source HResult
+                                    // failed; otherwise dispatch and keep the call's HResult. The
+                                    // whole chain stays an HResult<U> (U = this call's logical return).
+                                    std::string resultHr;
+                                    if (auto it = compiler->winrtSlotHResultType_.find(
+                                            structVar.TypeAndValue.TypeName + "::" + functionName);
+                                        it != compiler->winrtSlotHResultType_.end())
+                                        resultHr = it->second;
+                                    auto resSD = resultHr.empty() ? LLVMBackend::StructData{}
+                                                                  : compiler->GetDataStructure(resultHr);
+                                    if (!resSD.StructType)
+                                    {
+                                        LogErrorContext(primaryCtx, "'?.'/'?->' chains a method whose result "
+                                            "is not an HResult<T> (void-returning chained calls are not supported yet)");
+                                        hresultChainPending = false;
+                                    }
+                                    else
+                                    {
+                                        auto* b = compiler->builder.get();
+                                        auto* srcSD = compiler->GetDataStructure(hresultChainType).StructType;
+                                        auto* hr = b->CreateLoad(b->getInt32Ty(),
+                                            b->CreateStructGEP(srcSD, hresultChainStorage, 0), "chain.hr");
+                                        auto* failed = b->CreateICmpSLT(hr, b->getInt32(0), "chain.failed");
+                                        auto* resAlloca = compiler->AllocaAtEntry(resSD.StructType, nullptr, "chain.res");
+                                        auto* okBB = compiler->CreateBasicBlock("chain.ok");
+                                        auto* failBB = compiler->CreateBasicBlock("chain.fail");
+                                        auto* mergeBB = compiler->CreateBasicBlock("chain.merge");
+                                        b->CreateCondBr(failed, failBB, okBB);
+
+                                        compiler->SwitchToBlock(okBB);
+                                        std::string rt2; bool rp2 = false;
+                                        auto* okRes = compiler->EmitWinrtSlotCall(
+                                            structVar.TypeAndValue.TypeName, functionName, argVals, rt2, rp2);
+                                        if (okRes) b->CreateStore(okRes, resAlloca);
+                                        b->CreateBr(mergeBB);
+
+                                        compiler->SwitchToBlock(failBB);
+                                        b->CreateStore(llvm::Constant::getNullValue(resSD.StructType), resAlloca);
+                                        b->CreateStore(hr, b->CreateStructGEP(resSD.StructType, resAlloca, 0));
+                                        b->CreateBr(mergeBB);
+
+                                        compiler->SwitchToBlock(mergeBB);
+                                        namedVar = {};
+                                        namedVar.Primary = b->CreateLoad(resSD.StructType, resAlloca);
+                                        namedVar.BaseType = resSD.StructType;
+                                        namedVar.TypeAndValue.TypeName = resultHr;
+                                        namedVar.TypeAndValue.Pointer = false;
+                                    }
+                                    hresultChainPending = false;
+                                    globalScopeCall = false;
+                                }
+                                else
+                                {
+                                    namedVar = {};
+                                    std::string winrtResultType;
+                                    bool winrtResultPtr = false;
+                                    namedVar.Primary = compiler->EmitWinrtSlotCall(
+                                        structVar.TypeAndValue.TypeName, functionName, argVals,
+                                        winrtResultType, winrtResultPtr);
+                                    namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
+                                    namedVar.TypeAndValue.TypeName = winrtResultType;
+                                    namedVar.TypeAndValue.Pointer  = winrtResultPtr;
+                                    globalScopeCall = false;
+                                }
                             }
                             else if (nullConditionalPending && structVar.Storage != nullptr)
                             {
@@ -14636,6 +14736,34 @@ public:
             std::string name = fullText.substr(lastSep);
             return compiler->CreateGlobalString("nameof", name);
         }
+        else if (ctx->IidOf())
+        {
+            // iidof(IReference<int>) / iidof(ISomeInterface) -> a REFIID-shaped pointer to a
+            // static 16-byte GUID. For a parameterized type the IID is the derived PIID (the type
+            // is instantiated on demand here); for a plain interface it is its stored IID.
+            auto* ts = ctx->typeSpecifier();
+            std::string base;
+            std::vector<std::string> typeArgs;
+            if (ts && ts->genericIdentifier())
+            {
+                base = ts->genericIdentifier()->Identifier()->getText();
+                if (auto* gp = ts->genericIdentifier()->genericTypeParameters())
+                    for (auto* entry : gp->typeParameterList()->typeParameterEntry())
+                        typeArgs.push_back(ResolveTypeArgEntry(entry));
+            }
+            else
+            {
+                base = ts ? ts->getText() : "";
+            }
+            std::string mangled = typeArgs.empty() ? base : MangledGenericName(base, typeArgs);
+            if (!typeArgs.empty())
+                compiler->InstantiateWinrtGenericInterface(base, typeArgs, mangled);
+            if (auto* g = compiler->EmitIidGlobalFor(mangled))
+                return g;
+            compiler->LogError("iidof: no IID known for type '" + (typeArgs.empty() ? base : mangled) +
+                               "' (only [winrt]/imported interfaces and parameterized WinRT interfaces have one)");
+            return llvm::Constant::getNullValue(compiler->builder->getPtrTy());
+        }
         else if (expressionCtx != nullptr)
         {
             // Use ParseAssignmentExpressionNamed to preserve TypeAndValue (e.g. cast type)
@@ -15174,6 +15302,12 @@ public:
                             std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
                     }
                     InstantiateGenericInterface(pending.templateName, pending.mangledName, ifaceSubst, ifacePackSubst);
+                }
+                else if (compilerLLVM->InstantiateWinrtGenericInterface(
+                             pending.templateName, pending.typeArgs, pending.mangledName))
+                {
+                    // Resolved as an imported parameterized WinRT interface (IVector<int>, ...):
+                    // a concrete COM vtable + thin pointer + derived PIID were synthesized.
                 }
                 else if (Compiler()->IsVerbose())
                 {
@@ -17605,6 +17739,24 @@ public:
             }
             winrtIface = ids[0]->Identifier()->getText();
             winrtVtblName = compiler->CreateWinrtVtableStruct(structName, winrtIface);
+
+            // The value-returning member-call sugar `recv->Method()` produces an HResult<T>, a
+            // type never spelled in user source - so prime its instantiation here (we have the
+            // method return types) and record the mangled name for EmitWinrtSlotCall to build.
+            if (auto it = compiler->interfaceTable.find(winrtIface); it != compiler->interfaceTable.end())
+                for (const auto& m : it->second)
+                {
+                    if (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer) continue;
+                    std::string arg = m.ReturnType.TypeName + (m.ReturnType.Pointer ? "*" : "");
+                    std::string mangled = MangledGenericName("HResult", { arg });
+                    compiler->winrtSlotHResultType_[structName + "::" + m.Name] = mangled;
+                    if (!instantiatedGenerics.count(mangled))
+                    {
+                        pendingInstantiations.push_back({ "HResult", { arg }, mangled });
+                        instantiatedGenerics.insert(mangled);
+                    }
+                }
+            ProcessPendingInstantiations();
         }
 
         // Re-emission guard: if this struct was already fully emitted via a transitive import,

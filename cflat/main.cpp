@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cctype>
+#include <cstring>
 #include <chrono>
 #include <fstream>
 
@@ -21,6 +22,9 @@
 #include "ArgParser.h"
 #include "Version.h"
 #include "LspServer.h"
+#include "WinmdExtract.h"
+#include "WinmdEmit.h"
+#include "WinmdSignature.h"
 
 // ---- --symbol query mode -------------------------------------------------
 // A lightweight "IDE quick search" over the symbol index that a real analysis
@@ -307,6 +311,10 @@ int main(int argc, char* argv[])
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
+    args.addOption("dump-winmd", 0, "Read a WinRT metadata file (.winmd) into the projection model and dump it (diagnostic), then exit");
+    args.addOption("emit-winmd", 0, "After compiling, write this program's [winrt] interfaces and classes to the given .winmd file");
+    args.addFlag("winmd-sig-selftest", 0, "Validate the WinRT parameterized-type signature encoder and PIID derivation against reference IIDs, then exit");
+    args.addOption("winmd-instantiate", 0, "Import the given .winmd and instantiate well-known parameterized interfaces (IVector<i32>, IReference<i32>, ...), checking each derived PIID + vtable shape, then exit");
 
     if (!args.parse(argc, argv))
     {
@@ -347,6 +355,44 @@ int main(int argc, char* argv[])
 
     if (args.hasFlag("print-host-cpu"))
         return LLVMBackend::PrintHostCpu() ? 0 : 1;
+
+    // --winmd-sig-selftest: validate the parameterized-type signature encoder + PIID derivation
+    // against published reference IIDs. Self-contained; no input file needed.
+    if (args.hasFlag("winmd-sig-selftest"))
+    {
+        std::string report;
+        bool ok = cflat_winmd::WinmdSignatureSelfTest(report);
+        std::cout << report;
+        return ok ? 0 : 1;
+    }
+
+    // --dump-winmd: read a .winmd into the projection model and print it (Phase 0 validation
+    // of the WinrtModel + reader). Handled before the input-file check; it is self-contained.
+    if (auto winmd = args.getOption("dump-winmd"))
+    {
+        cflat_winmd::Model model;
+        std::string err;
+        if (!cflat_winmd::ReadWinmd(*winmd, model, err))
+        {
+            std::cout << "Error: " << err << "\n";
+            return 1;
+        }
+        std::cout << cflat_winmd::DumpModel(model);
+        return 0;
+    }
+
+    // --winmd-instantiate: import a .winmd and instantiate well-known parameterized interfaces,
+    // checking each derived PIID + vtable shape (M2 acceptance). Self-contained.
+    if (auto winmd = args.getOption("winmd-instantiate"))
+    {
+        LLVMBackend compiler;
+        compiler.SetRuntimeDir(runtimeDir);
+        compiler.SetVerbose(args.hasFlag("verbose"));
+        std::string report;
+        bool ok = compiler.WinmdInstantiateSelfTest(*winmd, report);
+        std::cout << report;
+        return ok ? 0 : 1;
+    }
 
     // --symbol: IDE-style quick symbol lookup. Handled before the "input file required"
     // check because it falls back to indexing the whole core library when no file is given.
@@ -428,7 +474,11 @@ int main(int argc, char* argv[])
             bool fileOk = false;
             try
             {
-                fileOk = compiler.Compile(args, file);
+                // A .winmd is WinRT metadata, not CFlat source: verify it parses into the
+                // projection model (parse-only, no registration) instead of compiling it.
+                bool isWinmd = file.size() >= 6 &&
+                    _stricmp(file.c_str() + file.size() - 6, ".winmd") == 0;
+                fileOk = isWinmd ? compiler.CheckWinmd(file) : compiler.Compile(args, file);
             }
             catch (const CompilerAbortException&) { fileOk = false; }
             catch (const ExpectedErrorReceived&)  { fileOk = false; }
@@ -498,6 +548,17 @@ int main(int argc, char* argv[])
     // unless --nologo).
     if (runMode)
         return compiler.GetJitExitCode();
+
+    // --emit-winmd: after a successful compile, write the [winrt] surface to a .winmd. The
+    // assembly name is the output file stem (e.g. Zoo.winmd -> "Zoo").
+    if (auto winmdOut = args.getOption("emit-winmd"))
+    {
+        std::string asmName = std::filesystem::path(*winmdOut).stem().string();
+        if (!compiler.EmitWinmd(*winmdOut, asmName))
+            return 1;
+        if (showLogo)
+            std::cout << std::format("Emitted {}\n", *winmdOut);
+    }
 
     if (showLogo)
         std::cout << "Done.\n";

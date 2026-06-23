@@ -45,6 +45,7 @@ primaryExpression
     | NameOf '(' expression ')'
     | TypeOf '(' expression ')'
     | TypeOf '(' typeSpecifier ')'
+    | IidOf '(' typeSpecifier ')'
     ;
 
 tupleExpression
@@ -928,6 +929,10 @@ NameOf
 
 TypeOf
     : 'typeof'
+    ;
+
+IidOf
+    : 'iidof'
     ;
 
 Is

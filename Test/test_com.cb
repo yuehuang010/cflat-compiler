@@ -6,15 +6,17 @@
 // instance into every object's lpVtbl. Calls are made through the COM vtable - exactly how a
 // foreign WinRT/COM consumer (XAML, C#, cppwinrt) would call a CFlat-authored control.
 //
-// Member-call sugar hides the vtable: `c->Eat()` lowers to `c->lpVtbl->Eat(c)`, and the
-// vtable-only methods (AddRef/Release/QueryInterface) become callable by name too. The explicit
-// `c->lpVtbl->...` form still works and is exercised once below as a regression guard.
+// Interface methods use the real WinRT ABI: each vtable slot returns HRESULT and the logical
+// return value comes back through a trailing [out,retval] pointer. So a value-returning method
+// is driven as `i32 hr = c->lpVtbl->Method(c, ..., &out);`. The infrastructure methods
+// (QueryInterface/AddRef/Release) keep their COM signatures and are reachable by name via the
+// member-call sugar (`c->AddRef()`), which hides lpVtbl for them.
 // See internal/plan/winmd-projection.md.
 
 import "test_helper.cb";
 import "com.cb";
 
-// === Single-method interface: dispatch + lifecycle (via the c->Method() sugar) ===
+// === Single-method interface: dispatch + lifecycle ===
 
 int gCatDtorCount = 0;
 
@@ -37,21 +39,24 @@ bool testDispatchAndLifecycle()
     Cat* c = new Cat(3);
     result &= Test("com_ctor_field", c->meals, 3);
 
-    // Dispatch Eat through the COM vtable with implicit `this` (proves the slot reaches the
-    // real method). The explicit lpVtbl form is checked once afterwards.
-    i32 r = c->Eat();
-    result &= Test("com_eat_return", r, 0);
+    // Dispatch Eat through the member-call sugar: it hides lpVtbl AND the [out,retval] pointer,
+    // returning an HResult<i32> whose hr is the status and value is the logical return (0).
+    HResult<i32> r = c->Eat();
+    result &= Test("com_eat_hr", r.hr, S_OK);
+    result &= Test("com_eat_return", r.value, 0);
     result &= Test("com_eat_mutated", c->meals, 4);
     c->Eat();
     c->Eat();
     result &= Test("com_eat_thrice", c->meals, 6);
 
-    // Regression: the explicit c->lpVtbl->Eat(c) form still dispatches identically.
-    i32 r2 = c->lpVtbl->Eat(c);
-    result &= Test("com_eat_explicit_vtbl", r2, 0);
+    // Regression: the explicit lpVtbl HRESULT-ABI form still dispatches identically.
+    i32 ret = 0;
+    i32 hrExplicit = c->lpVtbl->Eat(c, (void*)&ret);
+    result &= Test("com_eat_explicit_hr", hrExplicit, S_OK);
     result &= Test("com_eat_explicit_mutated", c->meals, 7);
 
-    // Refcount lifecycle - AddRef/Release exist only in the vtable, reached by name via the sugar.
+    // Refcount lifecycle - AddRef/Release keep their COM signatures and are reached by name via
+    // the member-call sugar (slots 1/2, unchanged by the HRESULT ABI).
     result &= Test("com_addref", (int)c->AddRef(), 2);
     result &= Test("com_release", (int)c->Release(), 1);
 
@@ -70,7 +75,8 @@ bool testQueryInterface()
     bool result = true;
     Cat* c = new Cat(0);
 
-    // IUnknown matches: returns S_OK, sets *ppv, and AddRefs (refcount 1 -> 2).
+    // IUnknown matches: returns S_OK, sets *ppv, and AddRefs (refcount 1 -> 2). QueryInterface
+    // is slot 0 (infrastructure), reached by name via the sugar.
     Guid unk = IID_IUnknown();
     void* outUnk = default;
     i32 hrUnk = c->QueryInterface(&unk, &outUnk);
@@ -85,6 +91,13 @@ bool testQueryInterface()
     result &= Test("com_qi_inspectable_hr", hrInsp, S_OK);
     result &= Test("com_qi_inspectable_out", outInsp != nullptr ? 1 : 0, 1);
 
+    // IAgileObject matches: a free-threaded WinRT object answers to it.
+    Guid agile = IID_IAgileObject();
+    void* outAgile = default;
+    i32 hrAgile = c->QueryInterface(&agile, &outAgile);
+    result &= Test("com_qi_agile_hr", hrAgile, S_OK);
+    result &= Test("com_qi_agile_out", outAgile != nullptr ? 1 : 0, 1);
+
     // A random IID is rejected with E_NOINTERFACE and a null out-param.
     Guid rnd = Guid.parse("11111111-2222-3333-4444-555566667777");
     void* outRnd = default;
@@ -93,7 +106,8 @@ bool testQueryInterface()
     result &= Test("com_qi_random_failed", FAILED(hrRnd) ? 1 : 0, 1);
     result &= Test("com_qi_random_null", outRnd == nullptr ? 1 : 0, 1);
 
-    // Two successful QIs each AddRef'd; release them, then the original reference (frees).
+    // Three successful QIs each AddRef'd; release them, then the original reference (frees).
+    c->Release();   // balance IAgileObject QI
     c->Release();   // balance IInspectable QI
     c->Release();   // balance IUnknown QI
     c->Release();   // original -> frees
@@ -122,14 +136,17 @@ bool testMultiMethodAndParamForwarding()
     bool result = true;
     Counter* k = new Counter(10);
 
-    // Add(by) exercises a thunk that forwards a real argument and returns a non-zero value.
-    i32 a1 = k->Add(5);
-    result &= Test("com_add_returns_total", a1, 15);
-    i32 a2 = k->Add(100);
-    result &= Test("com_add_accumulates", a2, 115);
+    // Add(by) via the sugar: forwards a real argument and returns the new total in the
+    // HResult<i32>'s value (proving param forwarding + a non-zero return through the out-param).
+    HResult<i32> a1 = k->Add(5);
+    result &= Test("com_add_hr", a1.hr, S_OK);
+    result &= Test("com_add_returns_total", a1.value, 15);
+    HResult<i32> a2 = k->Add(100);
+    result &= Test("com_add_accumulates", a2.value, 115);
 
     // Value() reads back through a separate slot.
-    result &= Test("com_value_slot", k->Value(), 115);
+    HResult<i32> v = k->Value();
+    result &= Test("com_value_slot", v.value, 115);
 
     // QueryInterface for ICounter's own IID succeeds.
     Guid iid = Guid.parse("a1b2c3d4-e5f6-4789-8abc-def012345678");
@@ -143,6 +160,46 @@ bool testMultiMethodAndParamForwarding()
     return result;
 }
 
+// === HResult `?.`/`?->` chaining: short-circuit on the first failure ===
+
+[uuid("b1b2c3d4-e5f6-4789-8abc-def012345678")]
+interface IMaker { Counter* Make(bool fail); };
+
+[winrt] class Maker : IMaker
+{
+    i32 unused = default;
+    Maker() { this.unused = 0; }
+    // Fallible: returns HResult<Counter*> so it can report failure (vs the logical Counter*).
+    HResult<Counter*> Make(bool fail)
+    {
+        HResult<Counter*> r = default;
+        if (fail) { r.fail(E_FAIL); return r; }
+        r.succeed(new Counter(7));
+        return r;
+    }
+};
+
+bool testChaining()
+{
+    bool result = true;
+    Maker* m = new Maker();
+
+    // Success chain: Make(false) -> Counter*, then Value() -> 7. The chain stays HResult<i32>;
+    // check once at the end. `?.` chains through the HResult (auto-detecting pointer vs value).
+    HResult<i32> ok = m->Make(false)?.Value();
+    result &= Test("com_chain_ok_hr", ok.hr, S_OK);
+    result &= Test("com_chain_ok_value", ok.value, 7);
+
+    // Short-circuit: Make(true) fails, so Value() is never called and the failure HRESULT
+    // propagates straight through to the final HResult.
+    HResult<i32> bad = m->Make(true)?.Value();
+    result &= Test("com_chain_fail_hr", bad.hr, E_FAIL);
+    result &= Test("com_chain_fail_value", bad.value, 0);
+
+    m->Release();
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -151,6 +208,7 @@ extern int main()
     total++; passed += testDispatchAndLifecycle()         ? 1 : 0;
     total++; passed += testQueryInterface()               ? 1 : 0;
     total++; passed += testMultiMethodAndParamForwarding() ? 1 : 0;
+    total++; passed += testChaining()                     ? 1 : 0;
 
     printf("COM produce-side tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

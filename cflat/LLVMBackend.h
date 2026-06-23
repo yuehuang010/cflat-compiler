@@ -71,6 +71,10 @@
 #include <fstream>
 #include "ArgParser.h"
 #include "CClangExtract.h"
+#include "WinmdExtract.h"
+#include "WinmdEmit.h"
+#include "WinmdSignature.h"
+#include <array>
 #include "CompilerManager.h"
 
 #include "LspSymbolIndex.h"
@@ -975,6 +979,26 @@ private:
         llvm::GlobalVariable* VtableInstance = nullptr;
     };
     std::unordered_map<std::string, WinrtClassInfo> winrtClasses;
+    // Mangled HResult<T> type name for each value-returning [winrt] vtable slot, keyed by
+    // "className::methodName". Populated when the [winrt] class is parsed (MainListener primes the
+    // HResult<T> instantiation there); read by EmitWinrtSlotCall to build the sugar's result.
+    std::unordered_map<std::string, std::string> winrtSlotHResultType_;
+    // Consume-side (imported .winmd) bookkeeping. Keyed by WinRT full name. Underlying scalar
+    // for each imported enum (so an enum-typed param maps to its integer); the set of imported
+    // value structs (so a struct-typed field/param can pass by value when we have registered it).
+    std::unordered_map<std::string, std::string> winrtEnumUnderlying_;
+    std::unordered_set<std::string> winrtValueStructs_;
+    // Parameterized (generic) interface templates from imported .winmd, keyed by simple name
+    // (IVector, IMap, IReference, ...). Kept so `IVector<int>` can be instantiated on demand into a
+    // concrete COM vtable + thin pointer + derived PIID. See InstantiateWinrtGenericInterface.
+    std::unordered_map<std::string, cflat_winmd::Interface> winrtGenericTemplates_;
+    // Derived per-instantiation IID (PIID) keyed by mangled name (e.g. "IVector__int"), used for
+    // QueryInterface identity and the `iidof(...)` builtin.
+    std::unordered_map<std::string, std::array<uint8_t, 16>> winrtInstanceIid_;
+    // All imported winmd types accumulated across every imported file, so the signature encoder
+    // can resolve nested named type args (enums/structs/interfaces) when deriving a PIID.
+    cflat_winmd::Model winrtConsumedModel_;
+    std::string winrtConsumedLspFile_;
     std::unordered_map<std::string, llvm::Constant*> stringPool;
     std::unordered_set<std::string> namespaceTable;
     // Set/restored around a namespace member's body so unqualified sibling references
@@ -6060,6 +6084,23 @@ public:
         return true;
     }
 
+    // Resolve `name` (a mangled generic instance like "IReference__int", a [uuid] interface, or an
+    // imported non-generic interface simple name) to a static 16-byte GUID/PIID global for the
+    // `iidof(...)` builtin. Returns nullptr if no IID is known. The result is a REFIID-shaped
+    // pointer suitable for QueryInterface.
+    llvm::GlobalVariable* EmitIidGlobalFor(const std::string& name)
+    {
+        if (auto it = winrtInstanceIid_.find(name); it != winrtInstanceIid_.end())
+            return EmitGuidGlobal(it->second.data());
+        uint8_t bytes[16];
+        if (auto u = interfaceUuids.find(name); u != interfaceUuids.end() && ParseUuidToBytes(u->second, bytes))
+            return EmitGuidGlobal(bytes);
+        for (const auto& i : winrtConsumedModel_.interfaces)
+            if (WinrtSimpleName(i.fullName) == name && !i.iid.empty() && ParseUuidToBytes(i.iid, bytes))
+                return EmitGuidGlobal(bytes);
+        return nullptr;
+    }
+
     // Emit (or reuse) an internal-linkage [16 x i8] constant holding a GUID's memory image.
     // Deduplicated by content so IID_IUnknown/IID_IInspectable are shared across classes.
     llvm::GlobalVariable* EmitGuidGlobal(const uint8_t bytes[16])
@@ -6125,7 +6166,11 @@ public:
                     p.Pointer = mp.Pointer;
                     params.push_back(p);
                 }
-                slots.push_back(MakeWinrtSlot(m.Name, m.ReturnType.TypeName, m.ReturnType.Pointer, params));
+                // WinRT ABI: the slot returns HRESULT (i32); a non-void logical return is passed
+                // back through a trailing [out,retval] pointer (opaque void* in the slot type).
+                bool voidRet = (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer);
+                if (!voidRet) params.push_back(vp());
+                slots.push_back(MakeWinrtSlot(m.Name, "i32", false, params));
             }
         }
 
@@ -6134,8 +6179,11 @@ public:
     }
 
     // Find the user member function implementing interface method m on className. Mirrors the
-    // overload match in GetOrCreateVTable (this-pointer + remaining params).
-    llvm::Function* FindWinrtMethod(const std::string& className, const InterfaceMethod& m)
+    // overload match in GetOrCreateVTable (this-pointer + remaining params). Returns the full
+    // symbol so the HRESULT-ABI thunk can see the impl's return type (plain T vs HResult<T>).
+    // The impl's return type is NOT part of the match (an impl may return T or HResult<T> for
+    // the same logical interface method).
+    const FunctionSymbol* FindWinrtMethod(const std::string& className, const InterfaceMethod& m)
     {
         auto it = functionTable.find(m.Name);
         if (it == functionTable.end()) return nullptr;
@@ -6147,9 +6195,15 @@ public:
             bool ok = true;
             for (size_t pi = 0; pi < m.Parameters.size(); pi++)
                 if (sym.Parameters[1 + pi].TypeName != m.Parameters[pi].TypeName) { ok = false; break; }
-            if (ok) return sym.Function;
+            if (ok) return &sym;
         }
         return nullptr;
+    }
+
+    // True if a type name is a monomorphized HResult<T> (the fallible method return form).
+    static bool IsHResultType(const std::string& typeName)
+    {
+        return typeName.rfind("HResult__", 0) == 0;
     }
 
     // Store &g_vtbl into lpVtbl (field 0) and 1 into __refcount (field 1) of a freshly
@@ -6182,9 +6236,16 @@ public:
 
     // Emit a COM dispatch `recv->lpVtbl->slot(args)`: load the vtable pointer (field 0), load the
     // named slot, and indirect-call it. argVals[0] is the receiver `this` (also used to reach the
-    // vtable); argVals[1..] are the user arguments. Returns the call result (or null for void).
+    // vtable); argVals[1..] are the user arguments. `outResultType`/`outResultPtr` receive the
+    // CFlat type of the produced value so the caller can type the result.
+    //
+    // Slots 0-5 are the IUnknown+IInspectable infrastructure (QI/AddRef/Release/...), dispatched
+    // raw. Interface-method slots (>=6) use the HRESULT ABI `i32(this, ...in, RetType* retval)`:
+    //  - void logical return -> the call yields the raw HRESULT (i32).
+    //  - non-void -> allocate a retval out-slot, call, and package {hr, *retval} into an
+    //    HResult<T> (primed at [winrt] class parse time); result type is "HResult__<T>".
     llvm::Value* EmitWinrtSlotCall(const std::string& className, const std::string& slotName,
-        const std::vector<llvm::Value*>& argVals)
+        const std::vector<llvm::Value*>& argVals, std::string& outResultType, bool& outResultPtr)
     {
         auto wi = winrtClasses.at(className);
         auto* objTy = dataStructures[className].StructType;
@@ -6202,12 +6263,57 @@ public:
             return nullptr;
         }
 
+        // A value-returning interface method: build the HResult<T> wrapper around the ABI call.
+        const InterfaceMethod* im = nullptr;
+        if (slotIdx >= 6)
+            if (auto it = interfaceTable.find(wi.InterfaceName); it != interfaceTable.end())
+                for (const auto& m : it->second) if (m.Name == slotName) { im = &m; break; }
+        bool nonVoidIface = im && !(im->ReturnType.TypeName == "void" && !im->ReturnType.Pointer);
+
+        llvm::Value* retvalAlloca = nullptr;
+        std::string hresultTypeName;
+        if (nonVoidIface)
+        {
+            auto rt = winrtSlotHResultType_.find(className + "::" + slotName);
+            if (rt == winrtSlotHResultType_.end() || !dataStructures.count(rt->second))
+            {
+                LogError(std::format("[winrt] '{}::{}' sugar needs HResult<{}> instantiated "
+                    "(import \"com.cb\")", className, slotName, im->ReturnType.TypeName));
+                return nullptr;
+            }
+            hresultTypeName = rt->second;
+            auto* retElemTy = GetType(im->ReturnType);
+            retvalAlloca = AllocaAtEntry(retElemTy, nullptr, "winrt.retval");
+        }
+
+        std::vector<llvm::Value*> callArgs = argVals;
+        if (nonVoidIface)
+            callArgs.push_back(builder->CreateBitCast(retvalAlloca, builder->getInt8Ty()->getPointerTo()));
+
         auto* objPtr = builder->CreateBitCast(argVals[0], objTy->getPointerTo());
         auto* vtblFieldPtr = builder->CreateStructGEP(objTy, objPtr, 0);
         auto* vtblPtr = builder->CreateLoad(vtblTy->getPointerTo(), vtblFieldPtr);
         auto* slotPtr = builder->CreateStructGEP(vtblTy, vtblPtr, slotIdx);
         auto* fnPtr = builder->CreateLoad(BuildThinFnPtrType(*slot), slotPtr);
-        return CreateIndirectCall(*slot, fnPtr, argVals);
+        llvm::Value* callRes = CreateIndirectCall(*slot, fnPtr, callArgs);
+
+        if (!nonVoidIface)
+        {
+            // Infra method or void interface method: the raw return (slot's declared type).
+            outResultType = slot->FuncPtrReturnTypeName;
+            outResultPtr = slot->FuncPtrReturnPointer;
+            return callRes;
+        }
+
+        // Package {hr = callRes, value = *retval} into the primed HResult<T>.
+        auto* hrTy = dataStructures[hresultTypeName].StructType;
+        auto* hrAlloca = AllocaAtEntry(hrTy, nullptr, "winrt.hr");
+        builder->CreateStore(callRes, builder->CreateStructGEP(hrTy, hrAlloca, 0));
+        auto* loadedVal = builder->CreateLoad(GetType(im->ReturnType), retvalAlloca);
+        builder->CreateStore(loadedVal, builder->CreateStructGEP(hrTy, hrAlloca, 1));
+        outResultType = hresultTypeName;
+        outResultPtr = false;
+        return builder->CreateLoad(hrTy, hrAlloca);
     }
 
     // Emit all runtime functions and the static vtable instance for a [winrt] class. Must run
@@ -6220,15 +6326,18 @@ public:
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
         auto* i32Ty = builder->getInt32Ty();
 
-        // GUID constants: IUnknown, IInspectable, and this class's interface IID.
-        uint8_t unkB[16], inspB[16], ifaceB[16];
+        // GUID constants: IUnknown, IInspectable, IAgileObject (every free-threaded WinRT object
+        // answers to it), and this class's interface IID.
+        uint8_t unkB[16], inspB[16], agileB[16], ifaceB[16];
         ParseUuidToBytes("00000000-0000-0000-C000-000000000046", unkB);
         ParseUuidToBytes("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90", inspB);
+        ParseUuidToBytes("94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90", agileB);
         std::string ifaceUuid;
         if (auto u = interfaceUuids.find(ifaceName); u != interfaceUuids.end()) ifaceUuid = u->second;
         bool haveIfaceIid = ParseUuidToBytes(ifaceUuid, ifaceB);
         auto* gUnk = EmitGuidGlobal(unkB);
         auto* gInsp = EmitGuidGlobal(inspB);
+        auto* gAgile = EmitGuidGlobal(agileB);
         auto* gIface = haveIfaceIid ? EmitGuidGlobal(ifaceB) : nullptr;
 
         auto makeFn = [&](const std::string& nm, llvm::FunctionType* ty) {
@@ -6264,6 +6373,7 @@ public:
             };
 
             llvm::Value* match = b.CreateOr(guidEq(riid, gUnk), guidEq(riid, gInsp));
+            match = b.CreateOr(match, guidEq(riid, gAgile));
             if (gIface) match = b.CreateOr(match, guidEq(riid, gIface));
             b.CreateCondBr(match, matchBB, noBB);
 
@@ -6343,29 +6453,61 @@ public:
         {
             for (const auto& m : ifIt->second)
             {
-                llvm::Function* impl = FindWinrtMethod(className, m);
-                if (!impl)
+                const FunctionSymbol* implSym = FindWinrtMethod(className, m);
+                if (!implSym)
                 {
                     LogError(std::format("[winrt] class '{}' does not implement '{}::{}'",
                         className, ifaceName, m.Name));
                     thunks.push_back(nullptr);
                     continue;
                 }
+                llvm::Function* impl = implSym->Function;
                 auto* implTy = impl->getFunctionType();
+                bool voidRet = (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer);
+                bool implHResult = IsHResultType(implSym->ReturnType.TypeName);
+
+                // A struct returned via the sret ABI (hidden pointer param) is not yet handled
+                // by the wrapping thunk; diagnose rather than miscompile.
+                if (impl->hasStructRetAttr())
+                {
+                    LogError(std::format("[winrt] '{}::{}' returns a struct via the sret ABI, "
+                        "which the WinRT thunk does not support yet", className, m.Name));
+                    thunks.push_back(nullptr);
+                    continue;
+                }
+
+                // WinRT thunk: i32 (i8* this, <in-params>, [RetType* retval]). It forwards to the
+                // user method and adapts the result to (HRESULT, *retval).
                 std::vector<llvm::Type*> ps;
                 ps.push_back(i8PtrTy);  // this
                 for (unsigned i = 1; i < implTy->getNumParams(); i++)
                     ps.push_back(implTy->getParamType(i));
-                auto* ty = llvm::FunctionType::get(implTy->getReturnType(), ps, false);
+                if (!voidRet) ps.push_back(i8PtrTy);  // retval out-pointer
+                auto* ty = llvm::FunctionType::get(i32Ty, ps, false);
                 auto* fn = makeFn(m.Name, ty);
                 auto* entry = llvm::BasicBlock::Create(*context, "entry", fn);
                 llvm::IRBuilder<> b(entry);
+
                 std::vector<llvm::Value*> args;
                 args.push_back(b.CreateBitCast(fn->getArg(0), implTy->getParamType(0)));
-                for (unsigned i = 1; i < fn->arg_size(); i++) args.push_back(fn->getArg(i));
+                for (unsigned i = 1; i < implTy->getNumParams(); i++) args.push_back(fn->getArg(i));
                 auto* call = b.CreateCall(implTy, impl, args);
-                if (implTy->getReturnType()->isVoidTy()) b.CreateRetVoid();
-                else b.CreateRet(call);
+
+                if (voidRet)
+                {
+                    // void logical return: forward the impl's hr if it is HResult<void>, else S_OK.
+                    b.CreateRet(implHResult ? b.CreateExtractValue(call, { 0u }) : b.getInt32(0));
+                }
+                else
+                {
+                    llvm::Value* hr;
+                    llvm::Value* val;
+                    if (implHResult) { hr = b.CreateExtractValue(call, { 0u }); val = b.CreateExtractValue(call, { 1u }); }
+                    else             { hr = b.getInt32(0); val = call; }
+                    auto* retPtr = b.CreateBitCast(fn->getArg(fn->arg_size() - 1), val->getType()->getPointerTo());
+                    b.CreateStore(val, retPtr);
+                    b.CreateRet(hr);
+                }
                 thunks.push_back(fn);
             }
         }
@@ -6391,6 +6533,470 @@ public:
             llvm::GlobalValue::InternalLinkage, init, prefix + "vtbl");
 
         winrtClasses[className] = WinrtClassInfo{ ifaceName, vtblTy, vtblGlobal };
+    }
+
+    // ========================================================================================
+    // WinMD CONSUME (Phase 1): register an imported .winmd's types as CFlat types so a program
+    // can drive WinRT objects by hand through their COM vtable (raw HRESULT / out-param ABI),
+    // exactly like the hand-written example/COM demos.
+    // ========================================================================================
+
+    // Last dotted segment of a WinRT full name ("Windows.Foundation.IFoo" -> "IFoo").
+    static std::string WinrtSimpleName(const std::string& fullName)
+    {
+        auto dot = fullName.rfind('.');
+        return dot == std::string::npos ? fullName : fullName.substr(dot + 1);
+    }
+
+    // Map a WinRT signature type to a (CFlat type name, pointer) pair for a vtable slot. Scalars
+    // map precisely; String(HSTRING)/Object(IInspectable*)/interfaces/classes/arrays/generics/
+    // by-ref all degrade to an opaque void* - ABI-correct under LLVM opaque pointers and exactly
+    // what the hand-written COM demo uses. An imported enum collapses to its underlying integer;
+    // an imported value struct we have registered passes by value.
+    void MapWinrtTypeForSlot(const cflat_winmd::TypeRef& t, std::string& outName, bool& outPtr)
+    {
+        if (t.pointerDepth > 0 || t.isArray || t.isGenericVar || !t.genericArgs.empty())
+        {
+            outName = "void"; outPtr = true; return;
+        }
+        std::string fund = cflat_winmd::WinrtFundamentalToCFlat(t.fullName);
+        if (!fund.empty())
+        {
+            if (fund == "string" || fund == "object") { outName = "void"; outPtr = true; return; }
+            // Guid maps to core/guid.cb's 16-byte `Guid` by value when that type is in scope;
+            // without it (guid.cb not imported) degrade to an opaque pointer (REFGUID-style).
+            if (fund == "Guid" && !dataStructures.count("Guid")) { outName = "void"; outPtr = true; return; }
+            // The typeMap yields user-facing CFlat spellings; the backend's direct type
+            // resolution uses internal names for floats (i32/u32/... already match).
+            if (fund == "f32") fund = "float";
+            else if (fund == "f64") fund = "double";
+            outName = fund; outPtr = false; return;
+        }
+        if (auto e = winrtEnumUnderlying_.find(t.fullName); e != winrtEnumUnderlying_.end())
+        {
+            outName = e->second; outPtr = false; return;
+        }
+        std::string simple = WinrtSimpleName(t.fullName);
+        if (winrtValueStructs_.count(t.fullName) && dataStructures.count(simple))
+        {
+            outName = simple; outPtr = false; return;
+        }
+        outName = "void"; outPtr = true;   // interface / class / forward -> opaque thin pointer
+    }
+
+    // Build the COM vtable struct (`<thinName>Vtbl`, flat IInspectable layout) and the thin
+    // pointer struct (`<thinName>` with a single `lpVtbl` field) for a non-generic interface or a
+    // concrete generic instantiation, from already-resolved (substituted) method signatures.
+    // Returns true if it registered, false if a struct of that name already exists.
+    bool BuildWinrtInterfaceStructs(const std::string& thinName,
+        const std::vector<cflat_winmd::Method>& methods, const std::string& lspDesc,
+        const std::string& fileForLsp)
+    {
+        std::string vtblName = thinName + "Vtbl";
+        // A forward/opaque shell for the thin pointer may already exist (created by type
+        // resolution); fill it rather than bail. Only skip when it is already fully built.
+        auto filled = [&](const std::string& n) {
+            auto it = dataStructures.find(n);
+            return it != dataStructures.end() && !it->second.StructFields.empty();
+        };
+        if (filled(thinName)) return false;
+
+        auto vp = []() { TypeAndValue::FuncPtrParam p; p.TypeName = "void"; p.Pointer = true; return p; };
+        std::vector<DeclTypeAndValue> slots;
+        slots.push_back(MakeWinrtSlot("QueryInterface", "i32", false, { vp(), vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("AddRef", "u32", false, { vp() }));
+        slots.push_back(MakeWinrtSlot("Release", "u32", false, { vp() }));
+        slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
+        slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
+        for (const cflat_winmd::Method& m : methods)
+        {
+            std::vector<TypeAndValue::FuncPtrParam> params = { vp() };   // this
+            for (const cflat_winmd::Param& mp : m.params)
+            {
+                TypeAndValue::FuncPtrParam p;
+                MapWinrtTypeForSlot(mp.type, p.TypeName, p.Pointer);
+                params.push_back(p);
+            }
+            // A non-void logical return is passed back through a trailing [out,retval] pointer;
+            // the WinRT ABI itself always returns HRESULT (i32).
+            bool voidRet = (m.returnType.fullName == "Void" && m.returnType.pointerDepth == 0);
+            if (!voidRet) params.push_back(vp());
+            slots.push_back(MakeWinrtSlot(m.name, "i32", false, params));
+        }
+        if (!filled(vtblName)) CreateStructType(vtblName, slots);
+
+        DeclTypeAndValue lp;
+        lp.VariableName = "lpVtbl";
+        lp.TypeName = vtblName;
+        lp.Pointer = true;
+        CreateStructType(thinName, { lp });
+        if (auto* s = GetSymbolSink())
+            s->Register(SymbolKind::Struct, thinName, fileForLsp, 0, 0, lspDesc);
+        return true;
+    }
+
+    // Substitute generic VAR placeholders in a template TypeRef with the concrete argument
+    // TypeRefs (by VAR index), preserving any pointer/array decoration on the placeholder and
+    // recursing into nested generic instantiations.
+    cflat_winmd::TypeRef SubstWinrtVar(const cflat_winmd::TypeRef& t,
+        const std::vector<cflat_winmd::TypeRef>& args)
+    {
+        if (t.isGenericVar)
+        {
+            cflat_winmd::TypeRef r =
+                (t.genericVarIndex >= 0 && (size_t)t.genericVarIndex < args.size()) ? args[t.genericVarIndex] : t;
+            r.pointerDepth += t.pointerDepth;
+            r.isArray = r.isArray || t.isArray;
+            return r;
+        }
+        if (!t.genericArgs.empty())
+        {
+            cflat_winmd::TypeRef r = t;
+            for (auto& g : r.genericArgs) g = SubstWinrtVar(g, args);
+            return r;
+        }
+        return t;
+    }
+
+    // Map a CFlat type-argument spelling (as written in `IVector<int>`) to the WinRT TypeRef used
+    // for signature/PIID derivation. Only the unambiguous scalar set is accepted, plus named
+    // imported winmd types; anything else is rejected rather than silently deriving a wrong PIID.
+    bool CFlatArgToWinrtTypeRef(const std::string& cflatName, cflat_winmd::TypeRef& out, std::string& err)
+    {
+        // Normalize the few safe C aliases onto the explicit-width family.
+        std::string n = cflatName;
+        if (n == "int") n = "i32";
+        else if (n == "uint") n = "u32";
+        else if (n == "float") n = "f32";
+        else if (n == "double") n = "f64";
+
+        std::string w = cflat_winmd::CFlatToWinrtFundamental(n);
+        if (!w.empty()) { out.fullName = w; return true; }
+
+        // Named imported winmd type (interface / struct / enum / delegate / runtime class).
+        std::string full = WinrtFullNameForSimple(cflatName);
+        if (!full.empty()) { out.fullName = full; return true; }
+
+        err = "cannot map type argument '" + cflatName + "' to a WinRT type (use an explicit-width "
+              "scalar like i32/u32/f32/f64/bool/string/object or an imported winmd type)";
+        return false;
+    }
+
+    // Find the full WinRT name of an imported type given its simple (last-segment) name.
+    std::string WinrtFullNameForSimple(const std::string& simple)
+    {
+        for (const auto& i : winrtConsumedModel_.interfaces)   if (WinrtSimpleName(i.fullName) == simple) return i.fullName;
+        for (const auto& s : winrtConsumedModel_.structs)      if (WinrtSimpleName(s.fullName) == simple) return s.fullName;
+        for (const auto& e : winrtConsumedModel_.enums)        if (WinrtSimpleName(e.fullName) == simple) return e.fullName;
+        for (const auto& d : winrtConsumedModel_.delegates)    if (WinrtSimpleName(d.fullName) == simple) return d.fullName;
+        for (const auto& rc : winrtConsumedModel_.runtimeClasses) if (WinrtSimpleName(rc.fullName) == simple) return rc.fullName;
+        return "";
+    }
+
+    // Instantiate an imported generic WinRT interface (`base` = simple name like "IVector",
+    // `cflatArgs` = the concrete CFlat type arguments, `mangledName` = "IVector__int") into a
+    // concrete COM vtable + thin pointer struct and a derived PIID. Returns false if `base` is not
+    // a registered winmd generic template (so the caller can fall through to other resolution).
+    bool InstantiateWinrtGenericInterface(const std::string& base,
+        const std::vector<std::string>& cflatArgs, const std::string& mangledName)
+    {
+        auto it = winrtGenericTemplates_.find(base);
+        if (it == winrtGenericTemplates_.end()) return false;
+        const cflat_winmd::Interface& tpl = it->second;
+        if (auto ds = dataStructures.find(mangledName);
+            ds != dataStructures.end() && !ds->second.StructFields.empty())
+            return true;   // already fully instantiated
+        if (verbose) std::cout << "[winmd] instantiate parameterized interface " << mangledName << "\n";
+
+        if (cflatArgs.size() != tpl.genericParams.size())
+        {
+            LogError(std::format("'{}<...>' expects {} type argument(s), got {}",
+                base, tpl.genericParams.size(), cflatArgs.size()));
+            return true;   // handled (it IS a winmd generic), just mis-arity
+        }
+
+        std::vector<cflat_winmd::TypeRef> argRefs;
+        for (const auto& a : cflatArgs)
+        {
+            cflat_winmd::TypeRef r;
+            std::string err;
+            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogError(base + "<...>: " + err); return true; }
+            argRefs.push_back(r);
+        }
+
+        std::vector<cflat_winmd::Method> methods;
+        for (const auto& m : tpl.methods)
+        {
+            cflat_winmd::Method nm = m;
+            nm.returnType = SubstWinrtVar(m.returnType, argRefs);
+            for (auto& p : nm.params) p.type = SubstWinrtVar(p.type, argRefs);
+            methods.push_back(std::move(nm));
+        }
+        BuildWinrtInterfaceStructs(mangledName, methods, "interface " + tpl.fullName, winrtConsumedLspFile_);
+
+        // Derive and stash the parameterized IID (shared algorithm; see WinmdSignature).
+        cflat_winmd::TypeRef inst;
+        inst.fullName = tpl.fullName;
+        inst.genericArgs = argRefs;
+        uint8_t img[16];
+        std::string err;
+        if (cflat_winmd::DerivePiid(inst, winrtConsumedModel_, img, err))
+        {
+            std::array<uint8_t, 16> a;
+            for (int i = 0; i < 16; i++) a[i] = img[i];
+            winrtInstanceIid_[mangledName] = a;
+        }
+        else
+        {
+            LogError("PIID derivation for '" + mangledName + "': " + err);
+        }
+        return true;
+    }
+
+    // Register every projectable type in `model` as CFlat types: value structs, enums (named
+    // constants + underlying), and interfaces (COM vtable struct + thin pointer struct). Runtime
+    // classes, delegates, generics, and HSTRING/string ergonomics are deferred (counted + noted).
+    void RegisterWinrtModel(const cflat_winmd::Model& model, const std::string& fileForLsp)
+    {
+        using namespace cflat_winmd;
+
+        // Retain everything imported so the signature encoder can resolve nested named type args
+        // (an enum/struct/interface used as a generic argument) when deriving a PIID later.
+        winrtConsumedLspFile_ = fileForLsp;
+        for (const auto& i : model.interfaces)    winrtConsumedModel_.interfaces.push_back(i);
+        for (const auto& s : model.structs)       winrtConsumedModel_.structs.push_back(s);
+        for (const auto& e : model.enums)         winrtConsumedModel_.enums.push_back(e);
+        for (const auto& d : model.delegates)     winrtConsumedModel_.delegates.push_back(d);
+        for (const auto& rc : model.runtimeClasses) winrtConsumedModel_.runtimeClasses.push_back(rc);
+
+        // Pass A: enums. Record the underlying scalar (for type mapping) and expose members as
+        // named constants "<Simple>_<Member>" (unambiguous across namespaces, first-writer-wins).
+        for (const Enum& e : model.enums)
+        {
+            std::string under = WinrtFundamentalToCFlat(e.underlying);
+            if (under != "i32" && under != "u32" && under != "i64" && under != "u64") under = "i32";
+            winrtEnumUnderlying_[e.fullName] = under;
+            std::string simple = WinrtSimpleName(e.fullName);
+            bool wide = (under == "i64" || under == "u64");
+            for (const EnumMember& m : e.members)
+            {
+                std::string name = simple + "_" + m.name;
+                if (globalNamedVariable.count(name)) continue;
+                TypeAndValue tv; tv.TypeName = wide ? "i64" : "i32"; tv.VariableName = name;
+                llvm::Constant* c = wide
+                    ? (llvm::Constant*)builder->getInt64((uint64_t)m.value)
+                    : (llvm::Constant*)builder->getInt32((uint32_t)(int32_t)m.value);
+                CreateGlobalVariable(tv, c);
+                if (auto* s = GetSymbolSink())
+                    s->Register(SymbolKind::Variable, name, fileForLsp, 0, 0, tv.TypeName + " " + name);
+            }
+        }
+
+        // Pass B: value structs. Shells first so a field can reference a peer struct by value.
+        for (const Struct& st : model.structs)
+        {
+            winrtValueStructs_.insert(st.fullName);
+            std::string simple = WinrtSimpleName(st.fullName);
+            if (!dataStructures.count(simple)) CreateStructType(simple, {});
+        }
+        for (const Struct& st : model.structs)
+        {
+            std::string simple = WinrtSimpleName(st.fullName);
+            std::vector<DeclTypeAndValue> fields;
+            for (const Field& f : st.fields)
+            {
+                DeclTypeAndValue d;
+                d.VariableName = f.name;
+                MapWinrtTypeForSlot(f.type, d.TypeName, d.Pointer);
+                fields.push_back(d);
+            }
+            CreateStructType(simple, fields);   // fills the shell created above
+            if (auto* s = GetSymbolSink())
+                s->Register(SymbolKind::Struct, simple, fileForLsp, 0, 0, "struct " + st.fullName);
+        }
+
+        // Pass C: interfaces -> COM vtable struct (flat IInspectable layout) + thin pointer struct.
+        // Generic interfaces (IVector<T>, IMap<K,V>, ...) cannot be lowered until their type args
+        // are known, so they are stashed as templates (keyed by simple name) and instantiated on
+        // demand by InstantiateWinrtGenericInterface when the user writes e.g. `IVector<int>`.
+        size_t registered = 0, deferredGeneric = 0;
+        for (const Interface& iface : model.interfaces)
+        {
+            std::string simple = WinrtSimpleName(iface.fullName);
+            if (!iface.genericParams.empty())
+            {
+                deferredGeneric++;
+                if (!winrtGenericTemplates_.count(simple)) winrtGenericTemplates_[simple] = iface;
+                continue;
+            }
+            if (BuildWinrtInterfaceStructs(simple, iface.methods, "interface " + iface.fullName, fileForLsp))
+                registered++;
+        }
+
+        // Deferrals are diagnosed, not silently dropped (per the projection plan). Runtime-class
+        // activation, delegates, and generic interfaces are not yet projected.
+        std::cout << std::format(
+            "[winmd] {}: registered {} interface(s), {} struct(s), {} enum(s); deferred {} generic interface(s), {} runtime class(es), {} delegate(s)\n",
+            fileForLsp, registered, model.structs.size(), model.enums.size(),
+            deferredGeneric, model.runtimeClasses.size(), model.delegates.size());
+    }
+
+    // Read a .winmd into the projection model and register its types. Entry point for the
+    // import dispatch when it sees a `.winmd` extension.
+    bool CompileWinmdFile(const std::string& path)
+    {
+        cflat_winmd::Model model;
+        std::string err;
+        if (!cflat_winmd::ReadWinmd(path, model, err))
+        {
+            LogError("Failed to read WinRT metadata '" + path + "': " + err);
+            return false;
+        }
+        RegisterWinrtModel(model, path);
+        return true;
+    }
+
+    // Diagnostic (M2 acceptance): import `path`, instantiate a few well-known parameterized
+    // interfaces found in it, and check each derived PIID against the published reference IID plus
+    // report the concrete vtable slot count. Drives the full reader -> template -> substitute ->
+    // build -> PIID chain over REAL metadata. Returns true only if every present case matches.
+    bool WinmdInstantiateSelfTest(const std::string& path, std::string& report)
+    {
+        // The constructor already brought up context/module/builder; no Init() here.
+        cflat_winmd::Model model;
+        std::string err;
+        if (!cflat_winmd::ReadWinmd(path, model, err)) { report = "read failed: " + err + "\n"; return false; }
+        RegisterWinrtModel(model, path);
+
+        struct Case { const char* base; std::vector<std::string> args; const char* iid; };
+        std::vector<Case> cases = {
+            { "IReference", { "i32" }, "548cefbd-bc8a-5fa0-8df2-957440fc8bf4" },
+            { "IVector",    { "i32" }, "b939af5b-b45d-5489-9149-61442c1905fe" },
+            { "IVectorView",{ "i32" }, "8d720cdf-3934-5d3f-9a55-40e8063b086a" },
+            { "IIterable",  { "i32" }, "81a643fb-f51c-5565-83c4-f96425777b66" },
+        };
+
+        bool allOk = true;
+        for (const auto& c : cases)
+        {
+            if (!winrtGenericTemplates_.count(c.base)) { report += std::string("[skip] ") + c.base + " (not in winmd)\n"; continue; }
+            std::string mangled = c.base;
+            for (const auto& a : c.args) mangled += "__" + a;
+            InstantiateWinrtGenericInterface(c.base, c.args, mangled);
+
+            auto iidIt = winrtInstanceIid_.find(mangled);
+            std::string got = iidIt != winrtInstanceIid_.end()
+                ? cflat_winmd::FormatGuidImage(iidIt->second.data()) : "(none)";
+            auto vtbl = dataStructures.find(mangled + "Vtbl");
+            size_t slots = vtbl != dataStructures.end() ? vtbl->second.StructFields.size() : 0;
+            bool ok = (got == c.iid) && slots >= 6;
+            allOk = allOk && ok;
+            report += std::format("[{}] {} -> {} ({} vtbl slots){}\n", ok ? " ok " : "FAIL",
+                mangled, got, slots, ok ? "" : std::string("  want ") + c.iid);
+        }
+        report += allOk ? "\nALL PASS\n" : "\nFAILURES PRESENT\n";
+        return allOk;
+    }
+
+    // ========================================================================================
+    // WinMD PRODUCE (Phase 2): emit a .winmd from this compilation's [winrt] surface.
+    // ========================================================================================
+
+    // Convert a CFlat type to a WinRT logical signature type: fundamentals via the shared
+    // typeMap; a [winrt] interface/class by name; anything else degrades to Object. A pointer
+    // on a fundamental becomes one indirection level (interface/class refs carry no pointer in
+    // the logical signature - the COM thinness is an ABI detail, not metadata).
+    cflat_winmd::TypeRef CFlatTypeToWinrt(const TypeAndValue& tv)
+    {
+        cflat_winmd::TypeRef t;
+        std::string w = cflat_winmd::CFlatToWinrtFundamental(tv.TypeName);
+        if (!w.empty())
+        {
+            t.fullName = w;
+            if (tv.Pointer && w != "string" && w != "object") t.pointerDepth = 1;
+        }
+        else if (interfaceUuids.count(tv.TypeName) || winrtClasses.count(tv.TypeName))
+            t.fullName = tv.TypeName;
+        else
+            t.fullName = "Object";
+        return t;
+    }
+
+    // Build a winmd model from the [winrt] interfaces (those carrying a [uuid]) and [winrt]
+    // classes declared in this compilation, then write it to `path`. The interface methods come
+    // from interfaceTable; the runtime classes from winrtClasses.
+    bool EmitWinmd(const std::string& path, const std::string& assemblyName)
+    {
+        cflat_winmd::Model model;
+
+        for (const auto& [name, iid] : interfaceUuids)
+        {
+            cflat_winmd::Interface iface;
+            iface.fullName = name;
+            iface.iid = iid;
+            if (auto it = interfaceTable.find(name); it != interfaceTable.end())
+                for (const auto& m : it->second)
+                {
+                    cflat_winmd::Method wm;
+                    wm.name = m.Name;
+                    wm.returnType = CFlatTypeToWinrt(m.ReturnType);
+                    for (const auto& p : m.Parameters)
+                    {
+                        cflat_winmd::Param wp;
+                        wp.type = CFlatTypeToWinrt(p);
+                        wm.params.push_back(std::move(wp));
+                    }
+                    iface.methods.push_back(std::move(wm));
+                }
+            model.interfaces.push_back(std::move(iface));
+        }
+
+        for (const auto& [cls, info] : winrtClasses)
+        {
+            cflat_winmd::RuntimeClass rc;
+            rc.fullName = cls;
+            rc.defaultInterface = info.InterfaceName;
+            rc.interfaces.push_back(info.InterfaceName);
+            rc.activatable = true;
+            model.runtimeClasses.push_back(std::move(rc));
+        }
+
+        if (model.interfaces.empty() && model.runtimeClasses.empty())
+        {
+            LogError("--emit-winmd: no [winrt] interfaces or classes found to emit");
+            return false;
+        }
+
+        std::string err;
+        if (!cflat_winmd::WriteWinmd(model, assemblyName, path, err))
+        {
+            LogError("Failed to emit winmd '" + path + "': " + err);
+            return false;
+        }
+        if (verbose)
+            std::cout << std::format("[winmd] wrote {} ({} interface(s), {} runtime class(es))\n",
+                path, model.interfaces.size(), model.runtimeClasses.size());
+        return true;
+    }
+
+    // Parse-only verification of a .winmd (the `--check` path for metadata files): read it into
+    // the model and report success/failure WITHOUT registering types or emitting anything. Used
+    // by test_winmd.bat to batch-validate the whole SDK's metadata in one process.
+    bool CheckWinmd(const std::string& path)
+    {
+        cflat_winmd::Model model;
+        std::string err;
+        if (!cflat_winmd::ReadWinmd(path, model, err))
+        {
+            LogError("Failed to read WinRT metadata '" + path + "': " + err);
+            return false;
+        }
+        if (verbose)
+            std::cout << std::format("[winmd] {}: {} interfaces, {} structs, {} enums, {} delegates, {} runtime classes\n",
+                path, model.interfaces.size(), model.structs.size(), model.enums.size(),
+                model.delegates.size(), model.runtimeClasses.size());
+        return true;
     }
 
     // delete through an interface fat pointer: the operand is a {vtable, data} struct, not a

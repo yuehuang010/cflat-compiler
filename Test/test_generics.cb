@@ -2212,6 +2212,27 @@ bool testGenericArgInference()
     return result;
 }
 
+// -- regression: generic free function whose type parameter T appears ONLY in the
+// return type (never in a parameter), called with explicit instantiation. Previously
+// this monomorphized to a zero-parameter instance and failed overload resolution.
+
+Box<T> makeBoxTagged<T>(int tag)
+{
+    Box<T> b = default;
+    b.value = tag;
+    return b;
+}
+
+bool testReturnOnlyTypeParam()
+{
+    bool result = true;
+    Box<int> bi = makeBoxTagged<int>(7);
+    result &= Test("return_only_T_int", bi.value, 7);
+    Box<i64> bl = makeBoxTagged<i64>(9);
+    result &= Test("return_only_T_i64", bl.value, (i64)9);
+    return result;
+}
+
 // Regression: an outer generic's method calls a method on an INNER generic type
 // instantiated with the same type arg. When the inner is instantiated standalone
 // (queued first) before any top-level call to its methods, its member bodies must
@@ -2433,6 +2454,7 @@ extern int main()
     total++; passed += testThisMemberAccess()            ? 1 : 0;
     total++; passed += testThisInGenericMethod()         ? 1 : 0;
     total++; passed += testGenericArgInference()         ? 1 : 0;
+    total++; passed += testReturnOnlyTypeParam()         ? 1 : 0;
     total++; passed += testNestedGenericInnerMethod()    ? 1 : 0;
     total++; passed += testListOfListByValue()           ? 1 : 0;
     total++; passed += testListOfListOfListByValue()     ? 1 : 0;
