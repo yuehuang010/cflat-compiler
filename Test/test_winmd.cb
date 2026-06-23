@@ -76,9 +76,13 @@ bool testLiveParameterizedRoundtrip()
     result &= Test("winmd_activation_hr", (hr == 0 && factory != nullptr) ? 1 : 0, 1);
     if (hr != 0 || factory == nullptr) { WindowsDeleteString(hClass); return false; }
 
-    // Box an Int32 -> IInspectable, QI for IReference<int>, read the value back.
+    // Box an Int32 -> IInspectable, QI for IReference<int>, read the value back. This path uses the
+    // `recv->Method(recv, ...)` sugar (a vtable-slot name routes through lpVtbl automatically); the
+    // bool path below keeps the explicit `recv->lpVtbl->Method(...)` form, so both are regression-
+    // covered against a live object. QueryInterface stays explicit because its receiver is a cast
+    // rvalue with no addressable storage, which the sugar (storage-based) does not apply to.
     void* boxedInt = nullptr;
-    factory->lpVtbl->CreateInt32(factory, 1234, &boxedInt);
+    factory->CreateInt32(factory, 1234, &boxedInt);
     IReference<int>* refInt = nullptr;
     i32 qiInt = ((IReference<int>*)boxedInt)->lpVtbl->QueryInterface(
         boxedInt, iidof(IReference<int>), (void**)&refInt);
@@ -86,9 +90,9 @@ bool testLiveParameterizedRoundtrip()
     if (qiInt == 0 && refInt != nullptr)
     {
         int value = default;
-        refInt->lpVtbl->get_Value(refInt, &value);
+        refInt->get_Value(refInt, &value);
         result &= Test("winmd_ref_int_value", value, 1234);
-        refInt->lpVtbl->Release(refInt);
+        refInt->Release(refInt);
     }
     ((IReference<int>*)boxedInt)->lpVtbl->Release(boxedInt);
 

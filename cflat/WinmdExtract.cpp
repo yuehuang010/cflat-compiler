@@ -233,6 +233,11 @@ namespace
             if (callconv & kCallConvGeneric) c.Data();   // generic param count
             unsigned paramCount = c.Data();
             m.returnType = DecodeType(c);
+            // WinRT metadata stores the logical return and carries HRESULT implicitly (projected
+            // back as a trailing [out,retval] param). Win32 (raw-COM) metadata spells the HRESULT
+            // return explicitly and lists every out-param, so there is no implicit retval.
+            if (m.returnType.fullName == "Windows.Win32.Foundation.HRESULT" && m.returnType.pointerDepth == 0)
+                m.hresultImplicit = false;
             for (unsigned i = 0; i < paramCount && c.ok; i++)
             {
                 Param p;

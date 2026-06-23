@@ -24,7 +24,10 @@ REM Space-separated list of base filenames (without .cb) to skip. Library/helper
 REM files (no int main()) that are only meant to be imported by sibling examples.
 REM The example/vcpkg/ examples are run too - cflat auto-invokes vcpkg install to
 REM pull their external packages (libcurl, SDL3, sqlite, zlib).
-set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io
+REM direct2d_demo imports the Win32 metadata winmd, which ships in the
+REM Microsoft.Windows.SDK.Win32Metadata nuget package (not the system) and needs an
+REM explicit -i to it; build it manually per the command in the file header.
+set EXCLUDE=test_helper ui win32host http_parser http_response http_json http_server http_client router rest_server http_io direct2d_demo
 
 REM Helper function to try compile and run
 for /r example %%F in (*.cb) do (

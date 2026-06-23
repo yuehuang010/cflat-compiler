@@ -6631,9 +6631,48 @@ public:
     // pointer struct (`<thinName>` with a single `lpVtbl` field) for a non-generic interface or a
     // concrete generic instantiation, from already-resolved (substituted) method signatures.
     // Returns true if it registered, false if a struct of that name already exists.
+    // True if `fullName`'s transitive `requires_` chain reaches an interface simple-named `target`
+    // (e.g. "IUnknown" / "IInspectable"). `seen` guards against cycles. Used to tell classic-COM
+    // (IUnknown-rooted) interfaces from WinRT (IInspectable) ones during consume registration.
+    static bool WinrtRequiresReaches(const std::string& fullName,
+        const std::unordered_map<std::string, const cflat_winmd::Interface*>& byName,
+        const char* target, std::set<std::string>& seen)
+    {
+        auto it = byName.find(fullName);
+        if (it == byName.end()) return false;
+        for (const std::string& req : it->second->requires_)
+        {
+            if (WinrtSimpleName(req) == target) return true;
+            if (seen.insert(req).second && WinrtRequiresReaches(req, byName, target, seen)) return true;
+        }
+        return false;
+    }
+
+    // Flatten a classic-COM single-inheritance method list into vtable-slot order: base-most
+    // interface methods first, then this interface's own. IUnknown/IInspectable contribute no
+    // methods (they are the synthetic header). `seen` guards against diamond duplication.
+    static void CollectComBaseMethods(const cflat_winmd::Interface& iface,
+        const std::unordered_map<std::string, const cflat_winmd::Interface*>& byName,
+        std::set<std::string>& seen, std::vector<cflat_winmd::Method>& out)
+    {
+        for (const std::string& req : iface.requires_)
+        {
+            std::string rs = WinrtSimpleName(req);
+            if (rs == "IUnknown" || rs == "IInspectable") continue;
+            if (!seen.insert(req).second) continue;
+            auto it = byName.find(req);
+            if (it != byName.end()) CollectComBaseMethods(*it->second, byName, seen, out);
+        }
+        for (const cflat_winmd::Method& m : iface.methods) out.push_back(m);
+    }
+
+    // `inspectable` selects the synthetic header: WinRT interfaces derive from IInspectable
+    // (6 slots: IUnknown's 3 + GetIids/GetRuntimeClassName/GetTrustLevel); classic-COM interfaces
+    // (IUnknown-rooted, e.g. Direct2D from Win32 metadata) use the 3-slot IUnknown header. Pass the
+    // method list already flattened across the COM single-inheritance chain in vtable-slot order.
     bool BuildWinrtInterfaceStructs(const std::string& thinName,
         const std::vector<cflat_winmd::Method>& methods, const std::string& lspDesc,
-        const std::string& fileForLsp)
+        const std::string& fileForLsp, bool inspectable = true)
     {
         std::string vtblName = thinName + "Vtbl";
         // A forward/opaque shell for the thin pointer may already exist (created by type
@@ -6649,9 +6688,12 @@ public:
         slots.push_back(MakeWinrtSlot("QueryInterface", "i32", false, { vp(), vp(), vp() }));
         slots.push_back(MakeWinrtSlot("AddRef", "u32", false, { vp() }));
         slots.push_back(MakeWinrtSlot("Release", "u32", false, { vp() }));
-        slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
-        slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
-        slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
+        if (inspectable)
+        {
+            slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
+            slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
+            slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
+        }
         for (const cflat_winmd::Method& m : methods)
         {
             std::vector<TypeAndValue::FuncPtrParam> params = { vp() };   // this
@@ -6661,10 +6703,11 @@ public:
                 MapWinrtTypeForSlot(mp.type, p.TypeName, p.Pointer);
                 params.push_back(p);
             }
-            // A non-void logical return is passed back through a trailing [out,retval] pointer;
-            // the WinRT ABI itself always returns HRESULT (i32).
+            // A non-void logical return is passed back through a trailing [out,retval] pointer
+            // ONLY for the WinRT implicit-HRESULT projection. Raw-COM methods (Win32 metadata)
+            // return HRESULT explicitly and already list every out-param, so nothing is appended.
             bool voidRet = (m.returnType.fullName == "Void" && m.returnType.pointerDepth == 0);
-            if (!voidRet) params.push_back(vp());
+            if (m.hresultImplicit && !voidRet) params.push_back(vp());
             slots.push_back(MakeWinrtSlot(m.name, "i32", false, params));
         }
         if (!filled(vtblName)) CreateStructType(vtblName, slots);
@@ -6912,6 +6955,9 @@ public:
         // Generic interfaces (IVector<T>, IMap<K,V>, ...) cannot be lowered until their type args
         // are known, so they are stashed as templates (keyed by simple name) and instantiated on
         // demand by InstantiateWinrtGenericInterface when the user writes e.g. `IVector<int>`.
+        std::unordered_map<std::string, const cflat_winmd::Interface*> byName;
+        for (const Interface& iface : model.interfaces) byName[iface.fullName] = &iface;
+
         size_t registered = 0, deferredGeneric = 0;
         for (const Interface& iface : model.interfaces)
         {
@@ -6922,8 +6968,25 @@ public:
                 if (!winrtGenericTemplates_.count(simple)) winrtGenericTemplates_[simple] = iface;
                 continue;
             }
-            if (BuildWinrtInterfaceStructs(simple, iface.methods, "interface " + iface.fullName, fileForLsp))
-                registered++;
+            // Classic-COM (IUnknown-rooted, not IInspectable) interfaces from Win32 metadata use the
+            // 3-slot IUnknown header and inline their single-inheritance base methods into the vtable.
+            // WinRT interfaces (implicit IInspectable base) keep the 6-slot header + own methods only.
+            std::set<std::string> s1, s2;
+            bool unknownRooted = WinrtRequiresReaches(iface.fullName, byName, "IUnknown", s1)
+                              && !WinrtRequiresReaches(iface.fullName, byName, "IInspectable", s2);
+            bool ok;
+            if (unknownRooted)
+            {
+                std::vector<cflat_winmd::Method> flat;
+                std::set<std::string> seen;
+                CollectComBaseMethods(iface, byName, seen, flat);
+                ok = BuildWinrtInterfaceStructs(simple, flat, "interface " + iface.fullName, fileForLsp, false);
+            }
+            else
+            {
+                ok = BuildWinrtInterfaceStructs(simple, iface.methods, "interface " + iface.fullName, fileForLsp);
+            }
+            if (ok) registered++;
         }
 
         // Deferrals are diagnosed, not silently dropped (per the projection plan). Runtime-class

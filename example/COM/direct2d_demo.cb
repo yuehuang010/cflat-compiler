@@ -1,39 +1,48 @@
-// direct2d_demo.cb - a real Direct2D window, drawn entirely through hand-modeled COM
-// vtables. This is the payoff of CFlat's thin `function<...>` type: a COM interface is
-// just a struct whose first field points at a vtable, and a vtable is a struct of thin
-// `function<...>` slots (bare C code pointers) called with the interface as `this`.
+// direct2d_demo.cb - a real Direct2D window whose COM interfaces are imported straight from
+// Win32 metadata. There is no hand-modeled vtable here: `import "Windows.Win32.winmd"` raises
+// ID2D1Factory / ID2D1HwndRenderTarget / ID2D1SolidColorBrush (and their whole IUnknown-rooted
+// inheritance chains) into CFlat types, each a thin struct whose first field `lpVtbl` points at
+// a machine-generated vtable of `function<...>` slots. A name that is a vtable slot routes through
+// `lpVtbl` automatically, so `rt->BeginDraw(rt)` dispatches through the exact SDK slot order without
+// a line of hand-transcription (the explicit `rt->lpVtbl->BeginDraw(rt)` form still works too).
 //
-// What it does: D2D1CreateFactory -> ID2D1Factory, create an ID2D1HwndRenderTarget bound
-// to a Win32 window, then each WM_PAINT runs BeginDraw / Clear / FillRectangle /
-// FillEllipse / EndDraw - every call dispatched through a vtable slot.
+// What it does: D2D1CreateFactory -> ID2D1Factory, create an ID2D1HwndRenderTarget bound to a
+// Win32 window, then each WM_PAINT runs BeginDraw / Clear / FillRectangle / FillEllipse / EndDraw.
+// The render-target draw methods live on the base ID2D1RenderTarget; the metadata reader flattens
+// that single-inheritance chain into the ID2D1HwndRenderTarget vtable, so they are callable
+// directly on the derived pointer.
 //
-// Why hand-model the vtables here (unlike imalloc_demo.cb, which imports IMalloc straight
-// from objbase.h)? Direct2D is C++-only at the interface ABI: in its C path d2d1.h emits
-// only opaque forward typedefs (`typedef interface ID2D1Factory ID2D1Factory;`) - no
-// `lpVtbl` structs of function pointers. The COM methods live solely in the C++
-// `interface ID2D1Resource : public IUnknown` declarations. So there is no C vtable to
-// import; the layouts below mirror the SDK's method order by hand. (MIDL-generated headers
-// like objbase.h / d3d12.h / dxgi.h DO emit explicit C `*Vtbl` structs, so those import
-// and call directly - see imalloc_demo.cb.) Vtable slot indices are from d2d1.h.
+// Why metadata instead of d2d1.h? Direct2D is C++-only at the interface ABI: in its C path d2d1.h
+// emits only opaque forward typedefs, no `lpVtbl` structs. The classic-COM ABI it really uses is
+// described exactly by the Win32 metadata (the same winmd that drives Rust's `windows` crate), and
+// that metadata also pre-lowers Direct2D's by-value struct returns (e.g. GetDesktopDpi) into
+// out-params, sidestepping the broken-C-interface problem entirely. (Contrast imalloc_demo.cb,
+// which imports IMalloc from objbase.h because MIDL-generated headers DO emit C vtables.)
 //
-// Build:  x64/Debug/cflat.exe example/COM/direct2d_demo.cb -o out/direct2d_demo.exe
-// Run:    out\direct2d_demo.exe   (opens a window; close it to exit)
+// Build (the winmd ships in the Win32 metadata nuget package, not the system, so point -i at it):
+//   set M=%USERPROFILE%\.nuget\packages\microsoft.windows.sdk.win32metadata\70.0.11-preview
+//   x64\Debug\cflat.exe example/COM/direct2d_demo.cb -i %M% -o out/direct2d_demo.exe
+// Run:  out\direct2d_demo.exe   (opens a window; close it to exit)
 //
-// windows.h is imported for the Win32 windowing surface (WNDCLASSEXA, CreateWindowExA,
-// the message loop) and to link the system import libs, including d2d1.lib. The core
-// `Guid` type coexists with windows.h's `GUID` (different name) and supplies the factory
-// IID without hand-packed bytes.
+// windows.h supplies the Win32 windowing surface (WNDCLASSEXA, CreateWindowExA, the message loop)
+// and links the system import libs including d2d1.lib. D2D1CreateFactory is a plain DLL export
+// (not a COM-registered object), so it stays a hand `extern`; everything reached through it comes
+// from the metadata. The core `Guid` type lays out exactly like REFIID and supplies the factory
+// IID (iidof is not yet wired for Win32-metadata interfaces - WinRT only).
 import "windows.h" lib { "user32.lib", "gdi32.lib", "d2d1.lib" } cache;
+import "Windows.Win32.winmd";
 import "guid.cb";
 
 // ---- Direct2D value types (FLOAT-based, matching the SDK struct layouts) -------------
+// These are passed by pointer into the imported vtable slots, whose parameter types degrade to
+// void* under LLVM opaque pointers, so the demo's own POD layouts marshal correctly. (The winmd
+// also defines D2D1_COLOR_F / D2D_RECT_F / D2D1_ELLIPSE; local structs keep the demo self-evident.)
 
 struct ColorF   { float r = default; float g = default; float b = default; float a = default; };
 struct RectF    { float left = default; float top = default; float right = default; float bottom = default; };
 struct EllipseF { float x = default; float y = default; float rx = default; float ry = default; };
 
 // D2D1_RENDER_TARGET_PROPERTIES: all-zero selects default type/format/dpi/usage/level.
-// pixelFormat (DXGI_FORMAT + D2D1_ALPHA_MODE) is flattened into two u32 fields.
 struct RtProps
 {
     u32 type = default;
@@ -54,116 +63,23 @@ struct HwndRtProps
     u32 presentOptions = default;
 };
 
-// ---- COM vtables (one thin function<...> per slot, in exact d2d1.h order) -------------
-// Unused slots are placeholders typed `function<void()>`; a thin function<...> is always a
-// bare pointer, so only the slot COUNT and POSITION matter for the layout - not the
-// placeholder signature. The slots actually called carry their real C signatures.
-
-// IUnknown - Release lives at slot 2 for every COM object, so this minimal vtable can
-// release any interface by reinterpreting its first field.
-struct UnknownVtbl
-{
-    function<i32(void*, void*, void**)> QueryInterface = default;  // 0
-    function<u32(void*)>                AddRef         = default;  // 1
-    function<u32(void*)>                Release        = default;  // 2
-};
-struct Unknown { UnknownVtbl* lpVtbl = default; };
-
-// ID2D1Factory : IUnknown - need slot 14 (CreateHwndRenderTarget).
-struct FactoryVtbl
-{
-    function<i32(void*, void*, void**)>       QueryInterface                 = default;  // 0
-    function<u32(void*)>                      AddRef                         = default;  // 1
-    function<u32(void*)>                      Release                        = default;  // 2
-    function<void()>                          ReloadSystemMetrics            = default;  // 3
-    function<void()>                          GetDesktopDpi                  = default;  // 4
-    function<void()>                          CreateRectangleGeometry        = default;  // 5
-    function<void()>                          CreateRoundedRectangleGeometry = default;  // 6
-    function<void()>                          CreateEllipseGeometry          = default;  // 7
-    function<void()>                          CreateGeometryGroup            = default;  // 8
-    function<void()>                          CreateTransformedGeometry      = default;  // 9
-    function<void()>                          CreatePathGeometry             = default;  // 10
-    function<void()>                          CreateStrokeStyle              = default;  // 11
-    function<void()>                          CreateDrawingStateBlock        = default;  // 12
-    function<void()>                          CreateWicBitmapRenderTarget    = default;  // 13
-    function<i32(void*, void*, void*, void**)> CreateHwndRenderTarget        = default;  // 14
-};
-struct Factory { FactoryVtbl* lpVtbl = default; };
-
-// ID2D1RenderTarget : ID2D1Resource : IUnknown - slot 3 is GetFactory; render-target
-// methods start at slot 4. Need CreateSolidColorBrush(8), FillRectangle(17),
-// FillEllipse(21), Clear(47), BeginDraw(48), EndDraw(49).
-struct RenderTargetVtbl
-{
-    function<i32(void*, void*, void**)>       QueryInterface               = default;  // 0
-    function<u32(void*)>                      AddRef                       = default;  // 1
-    function<u32(void*)>                      Release                      = default;  // 2
-    function<void()>                          GetFactory                   = default;  // 3
-    function<void()>                          CreateBitmap                 = default;  // 4
-    function<void()>                          CreateBitmapFromWicBitmap    = default;  // 5
-    function<void()>                          CreateSharedBitmap           = default;  // 6
-    function<void()>                          CreateBitmapBrush            = default;  // 7
-    function<i32(void*, ColorF*, void*, void**)> CreateSolidColorBrush     = default;  // 8
-    function<void()>                          CreateGradientStopCollection = default;  // 9
-    function<void()>                          CreateLinearGradientBrush    = default;  // 10
-    function<void()>                          CreateRadialGradientBrush    = default;  // 11
-    function<void()>                          CreateCompatibleRenderTarget = default;  // 12
-    function<void()>                          CreateLayer                  = default;  // 13
-    function<void()>                          CreateMesh                   = default;  // 14
-    function<void()>                          DrawLine                     = default;  // 15
-    function<void()>                          DrawRectangle                = default;  // 16
-    function<void(void*, RectF*, void*)>      FillRectangle                = default;  // 17
-    function<void()>                          DrawRoundedRectangle         = default;  // 18
-    function<void()>                          FillRoundedRectangle         = default;  // 19
-    function<void()>                          DrawEllipse                  = default;  // 20
-    function<void(void*, EllipseF*, void*)>   FillEllipse                  = default;  // 21
-    function<void()>                          DrawGeometry                 = default;  // 22
-    function<void()>                          FillGeometry                 = default;  // 23
-    function<void()>                          FillMesh                     = default;  // 24
-    function<void()>                          FillOpacityMask              = default;  // 25
-    function<void()>                          DrawBitmap                   = default;  // 26
-    function<void()>                          DrawText                     = default;  // 27
-    function<void()>                          DrawTextLayout               = default;  // 28
-    function<void()>                          DrawGlyphRun                 = default;  // 29
-    function<void()>                          SetTransform                 = default;  // 30
-    function<void()>                          GetTransform                 = default;  // 31
-    function<void()>                          SetAntialiasMode             = default;  // 32
-    function<void()>                          GetAntialiasMode             = default;  // 33
-    function<void()>                          SetTextAntialiasMode         = default;  // 34
-    function<void()>                          GetTextAntialiasMode         = default;  // 35
-    function<void()>                          SetTextRenderingParams       = default;  // 36
-    function<void()>                          GetTextRenderingParams       = default;  // 37
-    function<void()>                          SetTags                      = default;  // 38
-    function<void()>                          GetTags                      = default;  // 39
-    function<void()>                          PushLayer                    = default;  // 40
-    function<void()>                          PopLayer                     = default;  // 41
-    function<void()>                          Flush                        = default;  // 42
-    function<void()>                          SaveDrawingState             = default;  // 43
-    function<void()>                          RestoreDrawingState          = default;  // 44
-    function<void()>                          PushAxisAlignedClip          = default;  // 45
-    function<void()>                          PopAxisAlignedClip           = default;  // 46
-    function<void(void*, ColorF*)>            Clear                        = default;  // 47
-    function<void(void*)>                     BeginDraw                    = default;  // 48
-    function<i32(void*, u64*, u64*)>          EndDraw                      = default;  // 49
-};
-struct RenderTarget { RenderTargetVtbl* lpVtbl = default; };
-
 // D2D1CreateFactory: factoryType, REFIID, options(optional), out factory.
 extern stdcall i32 D2D1CreateFactory(u32 factoryType, void* riid, void* options, void** ppFactory);
 
 // Device-independent factory (created once) and device-dependent resources (recreated on
 // demand). Single-window, single-thread - the documented constraint for these globals.
-Factory* g_factory = nullptr;
-RenderTarget* g_rt = nullptr;
+ID2D1Factory* g_factory = nullptr;
+ID2D1HwndRenderTarget* g_rt = nullptr;
 void* g_brush = nullptr;
 
-// Release any COM object via its slot-2 Release (IUnknown layout).
+// Release any COM object via its slot-2 Release. Release lives at slot 2 for every IUnknown-rooted
+// interface, so reinterpreting through one imported COM type releases any of them.
 void comRelease(void* obj)
 {
     if (obj == nullptr)
         return;
-    Unknown* u = (Unknown*)obj;
-    u->lpVtbl->Release(u);
+    ID2D1Factory* u = (ID2D1Factory*)obj;
+    u->Release(u);
 }
 
 void releaseDeviceResources()
@@ -194,8 +110,8 @@ bool ensureRenderTarget(void* hwnd)
     hp.width = w;
     hp.height = h;
 
-    RenderTarget* rt = default;
-    i32 hr = g_factory->lpVtbl->CreateHwndRenderTarget(g_factory, &rtp, &hp, (void**)&rt);
+    ID2D1HwndRenderTarget* rt = nullptr;
+    i32 hr = g_factory->CreateHwndRenderTarget(g_factory, &rtp, &hp, (void**)&rt);
     if (hr != 0)
     {
         printf("CreateHwndRenderTarget failed: 0x%08X\n", hr);
@@ -205,8 +121,10 @@ bool ensureRenderTarget(void* hwnd)
 
     ColorF blue = default;
     blue.r = 0.20f; blue.g = 0.40f; blue.b = 0.85f; blue.a = 1.0f;
-    void* brush = default;
-    hr = g_rt->lpVtbl->CreateSolidColorBrush(g_rt, &blue, nullptr, &brush);
+    void* brush = nullptr;
+    // CreateSolidColorBrush is inherited from ID2D1RenderTarget; the metadata flattening makes it
+    // a slot on the derived ID2D1HwndRenderTarget vtable.
+    hr = g_rt->CreateSolidColorBrush(g_rt, &blue, nullptr, &brush);
     if (hr != 0)
     {
         printf("CreateSolidColorBrush failed: 0x%08X\n", hr);
@@ -221,23 +139,24 @@ void renderFrame(void* hwnd)
     if (g_factory == nullptr || !ensureRenderTarget(hwnd))
         return;
 
-    g_rt->lpVtbl->BeginDraw(g_rt);
+    g_rt->BeginDraw(g_rt);
 
     ColorF bg = default;
     bg.r = 0.95f; bg.g = 0.95f; bg.b = 0.97f; bg.a = 1.0f;
-    g_rt->lpVtbl->Clear(g_rt, &bg);
+    g_rt->Clear(g_rt, &bg);
 
     RectF rect = default;
     rect.left = 40.0f; rect.top = 40.0f; rect.right = 260.0f; rect.bottom = 200.0f;
-    g_rt->lpVtbl->FillRectangle(g_rt, &rect, g_brush);
+    g_rt->FillRectangle(g_rt, &rect, g_brush);
 
     EllipseF ell = default;
     ell.x = 430.0f; ell.y = 280.0f; ell.rx = 150.0f; ell.ry = 95.0f;
-    g_rt->lpVtbl->FillEllipse(g_rt, &ell, g_brush);
+    g_rt->FillEllipse(g_rt, &ell, g_brush);
 
-    // EndDraw reports D2DERR_RECREATE_TARGET (0x8899000C) when the device is lost; drop
-    // the device-dependent resources so the next paint rebuilds them.
-    i32 hr = g_rt->lpVtbl->EndDraw(g_rt, nullptr, nullptr);
+    // EndDraw reports D2DERR_RECREATE_TARGET (0x8899000C) when the device is lost; drop the
+    // device-dependent resources so the next paint rebuilds them. The two tag out-params are
+    // unused here (pass nullptr).
+    i32 hr = g_rt->EndDraw(g_rt, nullptr, nullptr);
     if ((u32)hr == 0x8899000Cu)
         releaseDeviceResources();
 }
@@ -268,9 +187,9 @@ extern int main()
     // IID_ID2D1Factory. A core `Guid` lays out exactly like REFIID, so &iid passes in.
     Guid iid = Guid.parse("06152247-6f50-465a-9245-118bfd3b6007");
 
-    // D2D1_FACTORY_TYPE_SINGLE_THREADED = 0. No CoInitialize needed - the factory is a
-    // plain export, not a CoCreateInstance object.
-    Factory* factory = default;
+    // D2D1_FACTORY_TYPE_SINGLE_THREADED = 0. No CoInitialize needed - the factory is a plain
+    // export, not a CoCreateInstance object.
+    ID2D1Factory* factory = nullptr;
     i32 hr = D2D1CreateFactory((u32)0, &iid, nullptr, (void**)&factory);
     if (hr != 0 || factory == nullptr)
     {
@@ -278,7 +197,7 @@ extern int main()
         return 1;
     }
     g_factory = factory;
-    printf("ID2D1Factory created: %p\n", g_factory);
+    printf("ID2D1Factory created from Win32 metadata: %p\n", g_factory);
 
     void* hInst = GetModuleHandleA(nullptr);
 
@@ -297,7 +216,7 @@ extern int main()
     void* hwnd = CreateWindowExA(
         0u,
         "CFlatDirect2DWindow",
-        "CFlat Direct2D (COM via thin function<>)",
+        "CFlat Direct2D (COM imported from Win32 metadata)",
         style,
         CW_USEDEFAULT, CW_USEDEFAULT,
         660, 420,

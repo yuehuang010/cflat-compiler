@@ -11364,6 +11364,35 @@ public:
                             primaryIdentifier = terminal->getText();
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 
+                            // [PFX-2a] Consumed-COM member sugar: on a thin winmd interface pointer (whose
+                            // only field is `lpVtbl`), a name that is not a field but IS a vtable slot routes
+                            // through the vtable - `recv->Method(args)` means `recv->lpVtbl->Method(args)`.
+                            // Redirect structVar to the dereferenced vtable struct so the slot resolves as an
+                            // ordinary thin fn-ptr field below and the existing call path dispatches it.
+                            if (auto* compiler = Compiler(ctx);
+                                primaryIdentifier != "lpVtbl" && structVar.Storage
+                                && compiler->IsWinrtThinInterface(structVar.TypeAndValue.TypeName))
+                            {
+                                std::string vtblName = structVar.TypeAndValue.TypeName + "Vtbl";
+                                auto vtblData = compiler->GetDataStructure(vtblName);
+                                bool isSlot = false;
+                                if (vtblData.StructType)
+                                    for (const auto& f : vtblData.StructFields)
+                                        if (f.VariableName == primaryIdentifier) { isSlot = true; break; }
+                                if (isSlot)
+                                {
+                                    auto* vtblPtr = compiler->builder->CreateLoad(
+                                        vtblData.StructType->getPointerTo(),
+                                        compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, 0));
+                                    structVar.Storage      = vtblPtr;
+                                    structVar.Primary      = nullptr;
+                                    structVar.BaseType     = vtblData.StructType;
+                                    structVar.TypeAndValue = {};
+                                    structVar.TypeAndValue.TypeName = vtblName;
+                                    dataStructure = vtblData;
+                                }
+                            }
+
                             // Bitfield access path: side-table lookup, GEP to the storage word,
                             // emit shift+mask for the read, remember enough on the NamedVariable
                             // that write-side codegen can do a read-modify-write later.
