@@ -183,6 +183,26 @@ You get an interface pointer from a WinRT API call and drive it through `lpVtbl`
 map precisely; `String`/`Object`/interfaces/arrays/by-ref map to opaque `void*` (the COM thin
 pointer), which is ABI-correct.
 
+### Calling consumed interfaces - the member-call sugar
+
+The same `recv->Method(args)` sugar shown for the produce side applies to **consumed** interfaces -
+both winmd-imported and [header-imported COM](C_INTEROP.md#com-interfaces-straight-from-a-header). A
+vtable-slot name routes through `lpVtbl` and the receiver is supplied as the implicit `this`, so the
+explicit example above can drop both the `->lpVtbl` step and the repeated receiver:
+
+```cflat
+void* str = default;
+i32 hr = s->ToString(&str);   // sugar for: s->lpVtbl->ToString(s, &str)
+s->Release();                 // sugar for: s->lpVtbl->Release(s)
+```
+
+The sugar fires on any **thin COM interface pointer** - a struct whose sole field is `lpVtbl` - which
+is exactly the shape of both an imported winmd interface and a MIDL C-header interface. `QueryInterface`/
+`AddRef`/`Release` live only in the vtable and are reachable by name through this sugar. The fully
+explicit `s->lpVtbl->ToString(s, &str)` form always works too; reach for it when the receiver is an
+rvalue with no storage (e.g. a freshly cast pointer `((IReference<int>*)boxed)->lpVtbl->QueryInterface(...)`),
+which the storage-based sugar cannot rewrite.
+
 ---
 
 ## Parameterized (generic) interfaces: `IVector<int>`, `IReference<T>`, ...

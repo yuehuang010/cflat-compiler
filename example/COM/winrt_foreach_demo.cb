@@ -44,7 +44,7 @@ extern int main()
     // JsonArray.Parse("[10,20,30]") -> IJsonArray (an IVector<IJsonValue>).
     void* hJson = MakeHString("[10,20,30]");
     IJsonArray* arr = nullptr;
-    hr = factory->lpVtbl->Parse(factory, hJson, (void**)&arr);
+    hr = factory->Parse(hJson, (void**)&arr);
     if (hr != 0 || arr == nullptr) { printf("Parse failed: 0x%08X\n", hr); return 2; }
 
     // The whole point: drive the collection with foreach. Each element is an IJsonValue we read
@@ -54,15 +54,15 @@ extern int main()
     for (IJsonValue* x in arr)
     {
         double d = default;
-        x->lpVtbl->GetNumber(x, &d);
+        x->GetNumber(&d);
         sum = sum + d;
         count = count + 1;
     }
 
     printf("iterated %d element(s), sum=%g\n", count, sum);
 
-    arr->lpVtbl->Release(arr);
-    factory->lpVtbl->Release(factory);
+    arr->Release();
+    factory->Release();
     WindowsDeleteString(hJson);
     WindowsDeleteString(hClass);
     RoUninitialize();

@@ -6,8 +6,10 @@
 // as C) every interface is a struct whose first field `lpVtbl` points at a struct of
 // function pointers - exactly cflat's thin `function<...>`. So `import "dxgi.h";` hands
 // us IDXGIFactory + IDXGIAdapter ready to call, and CreateDXGIFactory is auto-externed -
-// no hand-declared structs, no hand-written `extern`. This is the same path that drives
-// IMalloc in imalloc_demo.cb, here on a real, much larger Microsoft graphics API.
+// no hand-declared structs, no hand-written `extern`. Calls use the thin-COM member sugar
+// `adapter->GetDesc(&desc)` - the slot routes through `lpVtbl` and the receiver is the implicit
+// `this` (the explicit `adapter->lpVtbl->GetDesc(adapter, &desc)` form works too). This is the
+// same path that drives IMalloc in imalloc_demo.cb, here on a much larger Microsoft graphics API.
 //
 // It is fully headless: it creates no window and needs no live 3D device (DXGI
 // enumeration is a thin layer over the driver list), so it runs anywhere.
@@ -48,18 +50,18 @@ extern int main()
     // `factory` passed as the explicit `this`.
     IDXGIAdapter* adapter = nullptr;
     u32 idx = 0;
-    while (factory->lpVtbl->EnumAdapters(factory, idx, &adapter) == 0)
+    while (factory->EnumAdapters(idx, &adapter) == 0)
     {
         DXGI_ADAPTER_DESC desc = default;
-        adapter->lpVtbl->GetDesc(adapter, &desc);
+        adapter->GetDesc(&desc);
         u64 vramMB = (u64)desc.DedicatedVideoMemory / (1024 * 1024);
         printf("adapter %u: %-16s vendor=0x%04X device=0x%04X  dedicated VRAM=%llu MB\n",
                idx, vendorName(desc.VendorId), desc.VendorId, desc.DeviceId, vramMB);
-        adapter->lpVtbl->Release(adapter);
+        adapter->Release();
         idx = idx + 1;
     }
 
-    u32 rc = factory->lpVtbl->Release(factory);
+    u32 rc = factory->Release();
     printf("enumerated %u adapter(s); factory final Release -> refcount=%u\n", idx, rc);
     return 0;
 }

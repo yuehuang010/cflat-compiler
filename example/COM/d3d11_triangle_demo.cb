@@ -8,10 +8,12 @@
 // pixels back, asserts the centroid is the interpolated triangle color (not the clear
 // color), and writes the image to triangle.bmp so the result is visible.
 //
-// Every Direct3D call goes through `obj->lpVtbl->Method(obj, ...)` - the same thin
-// header-imported COM vtable path as imalloc_demo.cb, here on a full GPU pipeline. The
-// .bmp dump uses the CRT file I/O already exposed by core/os.windows.cb (fopen/fwrite/
-// fclose) - declaring our own global `extern fopen/fwrite` would collide with those.
+// Every Direct3D call uses the thin-COM member sugar `obj->Method(args)`: a vtable-slot name
+// routes through `lpVtbl` and the receiver is supplied as the implicit `this`, so `ctx->Draw(3, 0)`
+// dispatches as `ctx->lpVtbl->Draw(ctx, 3, 0)` (the fully explicit form still works too) - the same
+// header-imported COM vtable path as imalloc_demo.cb, here on a full GPU pipeline. The .bmp dump
+// uses the CRT file I/O already exposed by core/os.windows.cb (fopen/fwrite/fclose) - declaring
+// our own global `extern fopen/fwrite` would collide with those.
 //
 // Build:  x64/Debug/cflat.exe example/COM/d3d11_triangle_demo.cb -o out/d3d11_triangle_demo.exe
 // Run:    out\d3d11_triangle_demo.exe   (writes triangle.bmp in the working directory)
@@ -38,7 +40,7 @@ ID3DBlob* compileShader(char* src, char* entry, char* target)
     if (hr != 0 || code == nullptr)
     {
         if (errors != nullptr)
-            printf("shader compile failed (%s): %s\n", entry, (char*)errors->lpVtbl->GetBufferPointer(errors));
+            printf("shader compile failed (%s): %s\n", entry, (char*)errors->GetBufferPointer());
         else
             printf("shader compile failed (%s): hr=0x%08X\n", entry, hr);
         return nullptr;
@@ -124,8 +126,8 @@ extern int main()
     if (vsb == nullptr || psb == nullptr) return 2;
     ID3D11VertexShader* vs = nullptr;
     ID3D11PixelShader* ps = nullptr;
-    dev->lpVtbl->CreateVertexShader(dev, vsb->lpVtbl->GetBufferPointer(vsb), vsb->lpVtbl->GetBufferSize(vsb), nullptr, &vs);
-    dev->lpVtbl->CreatePixelShader(dev, psb->lpVtbl->GetBufferPointer(psb), psb->lpVtbl->GetBufferSize(psb), nullptr, &ps);
+    dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
+    dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
 
     // 3. Input layout: float2 POS at offset 0, float3 COL at offset 8.
     D3D11_INPUT_ELEMENT_DESC[2] ied = default;
@@ -134,7 +136,7 @@ extern int main()
     ied[1].SemanticName = "COL"; ied[1].Format = DXGI_FORMAT_R32G32B32_FLOAT;
     ied[1].AlignedByteOffset = 8; ied[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
     ID3D11InputLayout* il = nullptr;
-    dev->lpVtbl->CreateInputLayout(dev, &ied[0], 2, vsb->lpVtbl->GetBufferPointer(vsb), vsb->lpVtbl->GetBufferSize(vsb), &il);
+    dev->CreateInputLayout(&ied[0], 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &il);
 
     // 4. Vertex buffer: 3 vertices, each {x, y, r, g, b} = 5 floats = 20 bytes.
     float[15] verts = { 0.0, 0.6, 1.0, 0.0, 0.0,
@@ -145,7 +147,7 @@ extern int main()
     D3D11_SUBRESOURCE_DATA srd = default;
     srd.pSysMem = &verts[0];
     ID3D11Buffer* vb = nullptr;
-    dev->lpVtbl->CreateBuffer(dev, &bd, &srd, &vb);
+    dev->CreateBuffer(&bd, &srd, &vb);
 
     // 5. Offscreen render-target texture + view.
     D3D11_TEXTURE2D_DESC td = default;
@@ -153,25 +155,25 @@ extern int main()
     td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
     ID3D11Texture2D* rt = nullptr;
-    dev->lpVtbl->CreateTexture2D(dev, &td, nullptr, &rt);
+    dev->CreateTexture2D(&td, nullptr, &rt);
     ID3D11RenderTargetView* rtv = nullptr;
-    dev->lpVtbl->CreateRenderTargetView(dev, (ID3D11Resource*)rt, nullptr, &rtv);
+    dev->CreateRenderTargetView((ID3D11Resource*)rt, nullptr, &rtv);
 
     // 6. Bind the pipeline and draw.
     D3D11_VIEWPORT vp = default;
     vp.Width = (float)W; vp.Height = (float)H; vp.MaxDepth = 1.0;
-    ctx->lpVtbl->RSSetViewports(ctx, 1, &vp);
-    ctx->lpVtbl->OMSetRenderTargets(ctx, 1, &rtv, nullptr);
+    ctx->RSSetViewports(1, &vp);
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
     float[4] clear = { 0.1, 0.1, 0.15, 1.0 };
-    ctx->lpVtbl->ClearRenderTargetView(ctx, rtv, &clear[0]);
+    ctx->ClearRenderTargetView(rtv, &clear[0]);
     u32 stride = 20;
     u32 offset = 0;
-    ctx->lpVtbl->IASetInputLayout(ctx, il);
-    ctx->lpVtbl->IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset);
-    ctx->lpVtbl->IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->lpVtbl->VSSetShader(ctx, vs, nullptr, 0);
-    ctx->lpVtbl->PSSetShader(ctx, ps, nullptr, 0);
-    ctx->lpVtbl->Draw(ctx, 3, 0);
+    ctx->IASetInputLayout(il);
+    ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(vs, nullptr, 0);
+    ctx->PSSetShader(ps, nullptr, 0);
+    ctx->Draw(3, 0);
 
     // 7. Copy to a staging texture and map it for CPU readback.
     D3D11_TEXTURE2D_DESC sd = default;
@@ -179,10 +181,10 @@ extern int main()
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1;
     sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ID3D11Texture2D* stg = nullptr;
-    dev->lpVtbl->CreateTexture2D(dev, &sd, nullptr, &stg);
-    ctx->lpVtbl->CopyResource(ctx, (ID3D11Resource*)stg, (ID3D11Resource*)rt);
+    dev->CreateTexture2D(&sd, nullptr, &stg);
+    ctx->CopyResource((ID3D11Resource*)stg, (ID3D11Resource*)rt);
     D3D11_MAPPED_SUBRESOURCE ms = default;
-    hr = ctx->lpVtbl->Map(ctx, (ID3D11Resource*)stg, 0, D3D11_MAP_READ, 0, &ms);
+    hr = ctx->Map((ID3D11Resource*)stg, 0, D3D11_MAP_READ, 0, &ms);
     if (hr != 0) { printf("Map failed: hr=0x%08X\n", hr); return 3; }
 
     u8* px = (u8*)ms.pData;
@@ -197,20 +199,20 @@ extern int main()
     if (corner[0] > 60 || corner[1] > 60) ok = 0;                   // corner not clear color
 
     writeBmp("triangle.bmp", px, ms.RowPitch);
-    ctx->lpVtbl->Unmap(ctx, (ID3D11Resource*)stg, 0);
+    ctx->Unmap((ID3D11Resource*)stg, 0);
 
     // 8. Release everything (reverse order). Each is one vtable dispatch.
-    stg->lpVtbl->Release(stg);
-    rtv->lpVtbl->Release(rtv);
-    rt->lpVtbl->Release(rt);
-    vb->lpVtbl->Release(vb);
-    il->lpVtbl->Release(il);
-    ps->lpVtbl->Release(ps);
-    vs->lpVtbl->Release(vs);
-    psb->lpVtbl->Release(psb);
-    vsb->lpVtbl->Release(vsb);
-    ctx->lpVtbl->Release(ctx);
-    dev->lpVtbl->Release(dev);
+    stg->Release();
+    rtv->Release();
+    rt->Release();
+    vb->Release();
+    il->Release();
+    ps->Release();
+    vs->Release();
+    psb->Release();
+    vsb->Release();
+    ctx->Release();
+    dev->Release();
 
     if (ok == 0) { printf("FAIL: pixels did not match a rendered triangle\n"); return 4; }
     printf("OK: GPU rendered a triangle; wrote triangle.bmp\n");

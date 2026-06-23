@@ -9,6 +9,9 @@
 //
 // This demo asks COM for its process-wide task allocator (IMalloc) via CoGetMalloc, then
 // drives it entirely through the vtable: Alloc, GetSize, Free, QueryInterface, Release.
+// Calls use the thin-COM member sugar `m->Alloc(64)` - a vtable-slot name routes through
+// `lpVtbl` and the object is supplied as the implicit `this`, so that dispatches as
+// `m->lpVtbl->Alloc(m, 64)` (the fully explicit form still works too).
 // It needs no UI and creates no files. The QueryInterface IID is built with the core
 // `Guid` type (core/guid.cb): because that type is named `Guid`, not `GUID`, it coexists
 // with the `GUID` that objbase.h registers through C interop - no name collision.
@@ -34,10 +37,10 @@ extern int main()
 
     // Allocate through the vtable, confirm the size, then free - each is one indirect
     // call with `m` passed as the explicit `this`.
-    void* p = m->lpVtbl->Alloc(m, 64);
-    u64 sz = m->lpVtbl->GetSize(m, p);
+    void* p = m->Alloc(64);
+    u64 sz = m->GetSize(p);
     printf("Alloc(64) -> %p, GetSize -> %llu bytes\n", p, sz);
-    m->lpVtbl->Free(m, p);
+    m->Free(p);
     printf("Free(%p) done\n", p);
 
     // QueryInterface for IUnknown: IMalloc derives from IUnknown, so this returns the
@@ -45,7 +48,7 @@ extern int main()
     // IID is a core `Guid`; its 16-byte layout matches REFIID, so &iid passes straight in.
     Guid iid = Guid.parse("00000000-0000-0000-C000-000000000046");
     void* unk = nullptr;
-    i32 qi = m->lpVtbl->QueryInterface(m, &iid, &unk);
+    i32 qi = m->QueryInterface(&iid, &unk);
     printf("QueryInterface(IUnknown) -> hr=0x%08X, unk=%p (same object: %s)\n",
            qi, unk, ((void*)m == unk) ? "yes" : "no");
 
@@ -54,9 +57,9 @@ extern int main()
     if (unk != nullptr)
     {
         IMalloc* unkM = (IMalloc*)unk;
-        unkM->lpVtbl->Release(unkM);
+        unkM->Release();
     }
-    u32 rc = m->lpVtbl->Release(m);
+    u32 rc = m->Release();
     printf("final Release -> refcount=%u\n", rc);
     return 0;
 }

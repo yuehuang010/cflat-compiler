@@ -3,8 +3,9 @@
 // ID2D1Factory / ID2D1HwndRenderTarget / ID2D1SolidColorBrush (and their whole IUnknown-rooted
 // inheritance chains) into CFlat types, each a thin struct whose first field `lpVtbl` points at
 // a machine-generated vtable of `function<...>` slots. A name that is a vtable slot routes through
-// `lpVtbl` automatically, so `rt->BeginDraw(rt)` dispatches through the exact SDK slot order without
-// a line of hand-transcription (the explicit `rt->lpVtbl->BeginDraw(rt)` form still works too).
+// `lpVtbl` automatically and the receiver is supplied as the implicit `this`, so `rt->BeginDraw()`
+// dispatches as `rt->lpVtbl->BeginDraw(rt)` through the exact SDK slot order without a line of
+// hand-transcription (the fully explicit `rt->lpVtbl->BeginDraw(rt)` form still works too).
 //
 // What it does: D2D1CreateFactory -> ID2D1Factory, create an ID2D1HwndRenderTarget bound to a
 // Win32 window, then each WM_PAINT runs BeginDraw / Clear / FillRectangle / FillEllipse / EndDraw.
@@ -79,7 +80,7 @@ void comRelease(void* obj)
     if (obj == nullptr)
         return;
     ID2D1Factory* u = (ID2D1Factory*)obj;
-    u->Release(u);
+    u->Release();
 }
 
 void releaseDeviceResources()
@@ -111,7 +112,7 @@ bool ensureRenderTarget(void* hwnd)
     hp.height = h;
 
     ID2D1HwndRenderTarget* rt = nullptr;
-    i32 hr = g_factory->CreateHwndRenderTarget(g_factory, &rtp, &hp, (void**)&rt);
+    i32 hr = g_factory->CreateHwndRenderTarget(&rtp, &hp, (void**)&rt);
     if (hr != 0)
     {
         printf("CreateHwndRenderTarget failed: 0x%08X\n", hr);
@@ -124,7 +125,7 @@ bool ensureRenderTarget(void* hwnd)
     void* brush = nullptr;
     // CreateSolidColorBrush is inherited from ID2D1RenderTarget; the metadata flattening makes it
     // a slot on the derived ID2D1HwndRenderTarget vtable.
-    hr = g_rt->CreateSolidColorBrush(g_rt, &blue, nullptr, &brush);
+    hr = g_rt->CreateSolidColorBrush(&blue, nullptr, &brush);
     if (hr != 0)
     {
         printf("CreateSolidColorBrush failed: 0x%08X\n", hr);
@@ -139,24 +140,24 @@ void renderFrame(void* hwnd)
     if (g_factory == nullptr || !ensureRenderTarget(hwnd))
         return;
 
-    g_rt->BeginDraw(g_rt);
+    g_rt->BeginDraw();
 
     ColorF bg = default;
     bg.r = 0.95f; bg.g = 0.95f; bg.b = 0.97f; bg.a = 1.0f;
-    g_rt->Clear(g_rt, &bg);
+    g_rt->Clear(&bg);
 
     RectF rect = default;
     rect.left = 40.0f; rect.top = 40.0f; rect.right = 260.0f; rect.bottom = 200.0f;
-    g_rt->FillRectangle(g_rt, &rect, g_brush);
+    g_rt->FillRectangle(&rect, g_brush);
 
     EllipseF ell = default;
     ell.x = 430.0f; ell.y = 280.0f; ell.rx = 150.0f; ell.ry = 95.0f;
-    g_rt->FillEllipse(g_rt, &ell, g_brush);
+    g_rt->FillEllipse(&ell, g_brush);
 
     // EndDraw reports D2DERR_RECREATE_TARGET (0x8899000C) when the device is lost; drop the
     // device-dependent resources so the next paint rebuilds them. The two tag out-params are
     // unused here (pass nullptr).
-    i32 hr = g_rt->EndDraw(g_rt, nullptr, nullptr);
+    i32 hr = g_rt->EndDraw(nullptr, nullptr);
     if ((u32)hr == 0x8899000Cu)
         releaseDeviceResources();
 }

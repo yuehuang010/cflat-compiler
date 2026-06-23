@@ -1,0 +1,368 @@
+// d3d11_cube_demo.cb - a real-time spinning, depth-tested 3D cube in a window, driven
+// entirely by COM vtables imported straight from the Direct3D 11 SDK headers.
+//
+// Where d3d11_triangle_demo.cb renders one offscreen frame and reads it back, this drives
+// a live pipeline: a DXGI swap chain bound to a Win32 window, a depth-stencil buffer, an
+// indexed 36-index cube, and a per-frame constant buffer holding the model-view-projection
+// matrix. Each frame recomputes the rotation from the wall clock, uploads the matrix, draws
+// the cube, and Presents - so the cube spins until the window is closed.
+//
+// Every Direct3D call uses the thin-COM member sugar `obj->Method(args)`: a vtable-slot name
+// routes through `lpVtbl` and the receiver is supplied as the implicit `this`, so `g_swap->Present(1, 0)`
+// dispatches as `g_swap->lpVtbl->Present(g_swap, 1, 0)` (the fully explicit form still works too).
+// windows.h supplies the window + message loop; the cube math (perspective + rotation) is plain
+// CFlat using Math.sin/cos/tan from core/math.cb.
+//
+// Build:  x64/Debug/cflat.exe example/COM/d3d11_cube_demo.cb -o out/d3d11_cube_demo.exe
+// Run:    out\d3d11_cube_demo.exe   (opens a window; close it to exit)
+
+import { "windows.h", "d3d11.h", "d3dcompiler.h" }
+    lib { "user32.lib", "gdi32.lib", "d3d11.lib", "d3dcompiler.lib", "dxgi.lib" } cache;
+import "math.cb";
+import "guid.cb";
+
+const i32 W = 640;
+const i32 H = 480;
+
+u64 cstrlen(char* s)
+{
+    u64 n = 0;
+    while (s[n] != 0) n = n + 1;
+    return n;
+}
+
+// Device-dependent pipeline objects reached every frame. Single-window, single-thread - the
+// documented constraint for these globals (mirrors direct2d_demo.cb).
+IDXGISwapChain* g_swap = nullptr;
+ID3D11DeviceContext* g_ctx = nullptr;
+ID3D11RenderTargetView* g_rtv = nullptr;
+ID3D11DepthStencilView* g_dsv = nullptr;
+ID3D11Buffer* g_cb = nullptr;
+
+// ---- 4x4 matrix helpers (row-major; a row vector v transforms as v*M) ----------------
+
+void mat4Identity(float* m)
+{
+    i32 i = 0;
+    while (i < 16) { m[i] = 0.0f; i = i + 1; }
+    m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
+}
+
+// out = a * b. out must not alias a or b.
+void mat4Mul(float* a, float* b, float* out)
+{
+    i32 r = 0;
+    while (r < 4)
+    {
+        i32 c = 0;
+        while (c < 4)
+        {
+            float s = 0.0f;
+            i32 k = 0;
+            while (k < 4) { s = s + a[r * 4 + k] * b[k * 4 + c]; k = k + 1; }
+            out[r * 4 + c] = s;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+}
+
+void mat4RotY(float* m, float a)
+{
+    mat4Identity(m);
+    float cs = Math.cos(a);
+    float sn = Math.sin(a);
+    m[0] = cs; m[2] = -sn; m[8] = sn; m[10] = cs;
+}
+
+void mat4RotX(float* m, float a)
+{
+    mat4Identity(m);
+    float cs = Math.cos(a);
+    float sn = Math.sin(a);
+    m[5] = cs; m[6] = sn; m[9] = -sn; m[10] = cs;
+}
+
+void mat4Translate(float* m, float tx, float ty, float tz)
+{
+    mat4Identity(m);
+    m[12] = tx; m[13] = ty; m[14] = tz;
+}
+
+// Left-handed perspective projection (Direct3D convention), row-major: clip.w = view.z.
+void mat4PerspectiveLH(float* m, float fovY, float aspect, float zn, float zf)
+{
+    i32 i = 0;
+    while (i < 16) { m[i] = 0.0f; i = i + 1; }
+    float ys = 1.0f / Math.tan(fovY * 0.5f);
+    float xs = ys / aspect;
+    m[0] = xs;
+    m[5] = ys;
+    m[10] = zf / (zf - zn);
+    m[11] = 1.0f;
+    m[14] = -zn * zf / (zf - zn);
+}
+
+// World(spin) * View(push back) * Projection into mvp[16] for rotation angle `a`.
+void computeMvp(float* mvp, float a)
+{
+    float[16] ry = default;
+    float[16] rx = default;
+    float[16] tr = default;
+    float[16] pr = default;
+    mat4RotY(&ry[0], a);
+    mat4RotX(&rx[0], a * 0.7f);
+    mat4Translate(&tr[0], 0.0f, 0.0f, 4.0f);
+    mat4PerspectiveLH(&pr[0], 1.0f, (float)W / (float)H, 0.1f, 100.0f);
+
+    float[16] m1 = default;
+    float[16] m2 = default;
+    mat4Mul(&ry[0], &rx[0], &m1[0]);   // model rotation
+    mat4Mul(&m1[0], &tr[0], &m2[0]);   // + view translate
+    mat4Mul(&m2[0], &pr[0], mvp);      // + projection
+}
+
+// Compile one HLSL entry point to bytecode, or report the compiler's error blob and exit.
+ID3DBlob* compileShader(char* src, char* entry, char* target)
+{
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    i32 hr = D3DCompile((void*)src, cstrlen(src), nullptr, nullptr, nullptr,
+                        entry, target, 0, 0, &code, &errors);
+    if (hr != 0 || code == nullptr)
+    {
+        if (errors != nullptr)
+            printf("shader compile failed (%s): %s\n", entry, (char*)errors->GetBufferPointer());
+        else
+            printf("shader compile failed (%s): hr=0x%08X\n", entry, hr);
+        return nullptr;
+    }
+    return code;
+}
+
+void renderFrame()
+{
+    // Spin from the wall clock so the rate is frame-rate independent.
+    float a = (float)GetTickCount() * 0.001f;
+    float[16] mvp = default;
+    computeMvp(&mvp[0], a);
+
+    // Upload the matrix into the dynamic constant buffer (DISCARD = rename, no GPU stall).
+    D3D11_MAPPED_SUBRESOURCE ms = default;
+    i32 hr = g_ctx->Map((ID3D11Resource*)g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
+    if (hr == 0)
+    {
+        float* dst = (float*)ms.pData;
+        i32 i = 0;
+        while (i < 16) { dst[i] = mvp[i]; i = i + 1; }
+        g_ctx->Unmap((ID3D11Resource*)g_cb, 0);
+    }
+
+    float[4] clear = { 0.06, 0.07, 0.10, 1.0 };
+    g_ctx->ClearRenderTargetView(g_rtv, &clear[0]);
+    g_ctx->ClearDepthStencilView(g_dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    g_ctx->DrawIndexed(36, 0, 0);
+    g_swap->Present(1, 0);
+}
+
+stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    if (msg == WM_DESTROY)
+    {
+        PostQuitMessage(0);
+        return (i64)0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+extern int main()
+{
+    // HLSL: a constant buffer holding the row-major MVP, a vertex shader that transforms the
+    // position and forwards the color, and a passthrough pixel shader. Single literal, every
+    // brace doubled (cflat interpolates strings, so a lone `{` would start an interpolation).
+    char* hlsl = "cbuffer Cb:register(b0){{row_major float4x4 gT;}}; struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float3 p:POSITION,float3 c:COLOR){{VOut o;o.pos=mul(float4(p,1),gT);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
+
+    void* hInst = GetModuleHandleA(nullptr);
+
+    WNDCLASSEXA wc = default;
+    wc.cbSize        = (u32)sizeof(WNDCLASSEXA);
+    wc.style         = (u32)(CS_HREDRAW | CS_VREDRAW);
+    wc.lpfnWndProc   = (void*)WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
+    wc.lpszClassName = "CFlatD3D11CubeWindow";
+    RegisterClassExA(&wc);
+
+    // Grow the window so its CLIENT area is exactly WxH (the swap chain size).
+    RECT wr = default;
+    wr.right = W; wr.bottom = H;
+    u32 style = (u32)(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX);
+    AdjustWindowRect(&wr, style, 0);
+    void* hwnd = CreateWindowExA(
+        0u,
+        "CFlatD3D11CubeWindow",
+        "CFlat Direct3D 11 spinning cube (COM imported from d3d11.h)",
+        style,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        wr.right - wr.left, wr.bottom - wr.top,
+        nullptr, nullptr, hInst, nullptr);
+    if (hwnd == nullptr) { printf("CreateWindowExA failed\n"); return 1; }
+
+    // 1. Device + immediate context + swap chain in one call (feature level 11_0).
+    DXGI_SWAP_CHAIN_DESC scd = default;
+    scd.BufferDesc.Width = (u32)W;
+    scd.BufferDesc.Height = (u32)H;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.SampleDesc.Count = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.BufferCount = 1;
+    scd.OutputWindow = hwnd;
+    scd.Windowed = 1;
+    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    i32[1] levels = default;
+    levels[0] = D3D_FEATURE_LEVEL_11_0;
+    i32 gotFL = default;
+    ID3D11Device* dev = nullptr;
+    i32 hr = D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        &levels[0], 1, D3D11_SDK_VERSION,
+        &scd, &g_swap, &dev, &gotFL, &g_ctx);
+    if (hr != 0 || dev == nullptr)
+    {
+        printf("D3D11CreateDeviceAndSwapChain failed: hr=0x%08X\n", hr);
+        return 2;
+    }
+    printf("D3D11 device + swap chain created (feature level 0x%04X)\n", (u32)gotFL);
+
+    // 2. Render-target view over the swap chain's back buffer.
+    Guid iidTex = Guid.parse("6f15aaf2-d208-4e89-9ab4-489535d34f9c"); // IID_ID3D11Texture2D
+    ID3D11Texture2D* backbuf = nullptr;
+    g_swap->GetBuffer(0, &iidTex, (void**)&backbuf);
+    dev->CreateRenderTargetView((ID3D11Resource*)backbuf, nullptr, &g_rtv);
+
+    // 3. Depth-stencil buffer + view (so cube faces occlude correctly).
+    D3D11_TEXTURE2D_DESC dd = default;
+    dd.Width = (u32)W; dd.Height = (u32)H; dd.MipLevels = 1; dd.ArraySize = 1;
+    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = 1;
+    dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    ID3D11Texture2D* depth = nullptr;
+    dev->CreateTexture2D(&dd, nullptr, &depth);
+    dev->CreateDepthStencilView((ID3D11Resource*)depth, nullptr, &g_dsv);
+
+    // 4. Compile + create the shaders.
+    ID3DBlob* vsb = compileShader(hlsl, "VSMain", "vs_4_0");
+    ID3DBlob* psb = compileShader(hlsl, "PSMain", "ps_4_0");
+    if (vsb == nullptr || psb == nullptr) return 3;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs);
+    dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps);
+
+    // 5. Input layout: float3 POSITION at 0, float3 COLOR at 12.
+    D3D11_INPUT_ELEMENT_DESC[2] ied = default;
+    ied[0].SemanticName = "POSITION"; ied[0].Format = DXGI_FORMAT_R32G32B32_FLOAT;
+    ied[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    ied[1].SemanticName = "COLOR"; ied[1].Format = DXGI_FORMAT_R32G32B32_FLOAT;
+    ied[1].AlignedByteOffset = 12; ied[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    ID3D11InputLayout* il = nullptr;
+    dev->CreateInputLayout(&ied[0], 2, vsb->GetBufferPointer(), vsb->GetBufferSize(), &il);
+
+    // 6. Cube geometry: 8 corners at +-1, color = position mapped to [0,1]; 36 indices.
+    float[48] verts = {
+        -1.0, -1.0, -1.0, 0.0, 0.0, 0.0,
+         1.0, -1.0, -1.0, 1.0, 0.0, 0.0,
+         1.0,  1.0, -1.0, 1.0, 1.0, 0.0,
+        -1.0,  1.0, -1.0, 0.0, 1.0, 0.0,
+        -1.0, -1.0,  1.0, 0.0, 0.0, 1.0,
+         1.0, -1.0,  1.0, 1.0, 0.0, 1.0,
+         1.0,  1.0,  1.0, 1.0, 1.0, 1.0,
+        -1.0,  1.0,  1.0, 0.0, 1.0, 1.0 };
+    u16[36] idx = {
+        0, 1, 2,  0, 2, 3,    // front  (z = -1)
+        4, 6, 5,  4, 7, 6,    // back   (z = +1)
+        4, 0, 3,  4, 3, 7,    // left   (x = -1)
+        1, 5, 6,  1, 6, 2,    // right  (x = +1)
+        3, 2, 6,  3, 6, 7,    // top    (y = +1)
+        4, 5, 1,  4, 1, 0 };  // bottom (y = -1)
+
+    D3D11_BUFFER_DESC vbd = default;
+    vbd.ByteWidth = 48 * 4; vbd.Usage = D3D11_USAGE_DEFAULT; vbd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA vsrd = default;
+    vsrd.pSysMem = &verts[0];
+    ID3D11Buffer* vb = nullptr;
+    dev->CreateBuffer(&vbd, &vsrd, &vb);
+
+    D3D11_BUFFER_DESC ibd = default;
+    ibd.ByteWidth = 36 * 2; ibd.Usage = D3D11_USAGE_DEFAULT; ibd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA isrd = default;
+    isrd.pSysMem = &idx[0];
+    ID3D11Buffer* ib = nullptr;
+    dev->CreateBuffer(&ibd, &isrd, &ib);
+
+    // 7. Dynamic constant buffer for the 64-byte MVP matrix.
+    D3D11_BUFFER_DESC cbd = default;
+    cbd.ByteWidth = 64; cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    dev->CreateBuffer(&cbd, nullptr, &g_cb);
+
+    // 8. Cull nothing so winding never hides a face; depth test (default state) handles occlusion.
+    D3D11_RASTERIZER_DESC rd = default;
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE;
+    ID3D11RasterizerState* rs = nullptr;
+    dev->CreateRasterizerState(&rd, &rs);
+
+    // 9. Bind the pipeline once - state persists across Present on the immediate context.
+    D3D11_VIEWPORT vp = default;
+    vp.Width = (float)W; vp.Height = (float)H; vp.MaxDepth = 1.0;
+    u32 stride = 24;
+    u32 offset = 0;
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->RSSetState(rs);
+    g_ctx->OMSetRenderTargets(1, &g_rtv, g_dsv);
+    g_ctx->IASetInputLayout(il);
+    g_ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+    g_ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R16_UINT, 0);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(vs, nullptr, 0);
+    g_ctx->VSSetConstantBuffers(0, 1, &g_cb);
+    g_ctx->PSSetShader(ps, nullptr, 0);
+
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+    // 10. Peek-message render loop: drain input, then draw a frame, until WM_QUIT.
+    i32 running = 1;
+    MSG msg = default;
+    while (running == 1)
+    {
+        while (PeekMessageA(&msg, nullptr, 0u, 0u, PM_REMOVE) != 0)
+        {
+            if (msg.message == WM_QUIT) running = 0;
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        if (running == 1)
+            renderFrame();
+    }
+
+    // 11. Release everything (reverse order). Each is one vtable dispatch.
+    rs->Release();
+    ib->Release();
+    vb->Release();
+    il->Release();
+    ps->Release();
+    vs->Release();
+    psb->Release();
+    vsb->Release();
+    g_cb->Release();
+    g_dsv->Release();
+    depth->Release();
+    g_rtv->Release();
+    backbuf->Release();
+    g_ctx->Release();
+    g_swap->Release();
+    dev->Release();
+
+    return (int)msg.wParam;
+}

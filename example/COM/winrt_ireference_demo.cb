@@ -44,14 +44,14 @@ extern int main()
 
     // Box an Int32 -> an IInspectable.
     void* boxed = nullptr;
-    hr = factory->lpVtbl->CreateInt32(factory, 1234, &boxed);
+    hr = factory->CreateInt32(1234, &boxed);
     printf("CreateInt32(1234) -> hr=0x%08X, IInspectable=%p\n", hr, boxed);
 
     // QueryInterface for IReference<int> using the COMPILER-DERIVED PIID. QI slot 0 is identical
     // across every WinRT vtable, so we drive it through the IReference<int> thin pointer shape.
     IReference<int>* boxedObj = (IReference<int>*)boxed;
     IReference<int>* ref = nullptr;
-    i32 qi = boxedObj->lpVtbl->QueryInterface(boxedObj, iidof(IReference<int>), (void**)&ref);
+    i32 qi = boxedObj->QueryInterface(iidof(IReference<int>), (void**)&ref);
     printf("QueryInterface(IReference<int>) -> hr=0x%08X, ref=%p\n", qi, ref);
     if (qi != 0 || ref == nullptr)
     {
@@ -61,12 +61,12 @@ extern int main()
 
     // Read the value back through the parameterized interface.
     int value = default;
-    i32 gv = ref->lpVtbl->get_Value(ref, &value);
+    i32 gv = ref->get_Value(&value);
     printf("IReference<int>.Value -> hr=0x%08X, value=%d\n", gv, value);
 
-    ref->lpVtbl->Release(ref);
-    boxedObj->lpVtbl->Release(boxedObj);
-    factory->lpVtbl->Release(factory);
+    ref->Release();
+    boxedObj->Release();
+    factory->Release();
     WindowsDeleteString(hClass);
     RoUninitialize();
 

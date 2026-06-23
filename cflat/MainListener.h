@@ -11097,6 +11097,11 @@ public:
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
             bool globalScopeCall = false;
+            // Consumed-COM sugar receiver: when [PFX-2a] redirects a thin interface pointer through
+            // its lpVtbl, this holds the original object pointer so the following call ([PFX-5])
+            // can inject it as the implicit `this` first argument - `rs->Release()` dispatches as
+            // `rs->lpVtbl->Release(rs)`. Set on redirect, consumed (and cleared) by the call.
+            llvm::Value* pendingThinComReceiver = nullptr;
 
             for (auto parseTree : ctx->children)
             {
@@ -11364,23 +11369,32 @@ public:
                             primaryIdentifier = terminal->getText();
                             auto dataStructure = Compiler(ctx)->GetDataStructure(llvm::dyn_cast<llvm::StructType>(structVar.BaseType));
 
-                            // [PFX-2a] Consumed-COM member sugar: on a thin winmd interface pointer (whose
-                            // only field is `lpVtbl`), a name that is not a field but IS a vtable slot routes
-                            // through the vtable - `recv->Method(args)` means `recv->lpVtbl->Method(args)`.
-                            // Redirect structVar to the dereferenced vtable struct so the slot resolves as an
-                            // ordinary thin fn-ptr field below and the existing call path dispatches it.
+                            // [PFX-2a] Consumed-COM member sugar: on a thin COM interface pointer - a struct
+                            // whose SOLE field `lpVtbl` points at a vtable of function-pointer slots - a name
+                            // that is not a field but IS a vtable slot routes through the vtable, so
+                            // `recv->Method(args)` means `recv->lpVtbl->Method(args)`. Covers both winmd- and
+                            // header-imported COM (the vtable struct comes from the actual `lpVtbl` field, not a
+                            // name convention). The single-field shape is what distinguishes a consumed thin
+                            // interface from a produce-side `[winrt] class` object (lpVtbl + refcount + fields),
+                            // which keeps its own receiver-injecting dispatch. Redirect structVar to the
+                            // dereferenced vtable so the slot resolves as a fn-ptr field below and dispatches.
                             if (auto* compiler = Compiler(ctx);
-                                primaryIdentifier != "lpVtbl" && structVar.Storage
-                                && compiler->IsWinrtThinInterface(structVar.TypeAndValue.TypeName))
+                                primaryIdentifier != "lpVtbl" && structVar.Storage && dataStructure.StructType
+                                && dataStructure.StructFields.size() == 1
+                                && dataStructure.StructFields[0].VariableName == "lpVtbl")
                             {
-                                std::string vtblName = structVar.TypeAndValue.TypeName + "Vtbl";
+                                std::string vtblName = dataStructure.StructFields[0].TypeName;
                                 auto vtblData = compiler->GetDataStructure(vtblName);
                                 bool isSlot = false;
                                 if (vtblData.StructType)
                                     for (const auto& f : vtblData.StructFields)
-                                        if (f.VariableName == primaryIdentifier) { isSlot = true; break; }
+                                        if (f.VariableName == primaryIdentifier && f.IsFunctionPointer)
+                                        { isSlot = true; break; }
                                 if (isSlot)
                                 {
+                                    // Capture the object pointer (the `this`) BEFORE overwriting
+                                    // Storage with the vtable pointer, so the call can inject it.
+                                    pendingThinComReceiver = structVar.Storage;
                                     auto* vtblPtr = compiler->builder->CreateLoad(
                                         vtblData.StructType->getPointerTo(),
                                         compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, 0));
@@ -13179,6 +13193,16 @@ public:
                             {
                                 std::vector<llvm::Value*> callArgs;
                                 std::vector<LLVMBackend::NamedVariable> argNVs;
+                                // Consumed-COM sugar ([PFX-2a]): the receiver was redirected through
+                                // lpVtbl, so inject the captured object pointer as the implicit `this`
+                                // first argument. A placeholder NamedVariable keeps argNVs 1:1 with
+                                // callArgs for the move/bond checks below (`this` is never move/bonded).
+                                if (pendingThinComReceiver != nullptr)
+                                {
+                                    callArgs.push_back(pendingThinComReceiver);
+                                    argNVs.emplace_back();
+                                    pendingThinComReceiver = nullptr;
+                                }
                                 if (argumentList.size() > 0)
                                 {
                                     auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();

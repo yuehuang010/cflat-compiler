@@ -116,6 +116,18 @@ A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`, or 
 
 A **pointer-to-struct field** whose pointee is a known (registered) record keeps its **typed pointer** rather than decaying to `void*`. Combined with the callable function-pointer slots above, this makes a Windows COM interface usable **straight from its header** with no hand-modeled vtable: `import "d3d12.h";` then drive `ID3D12Device` through `dev->lpVtbl->CreateCommandQueue(dev, ...)`. The dual-mode SDK headers expose the explicit `<Interface>Vtbl` struct (a struct of function pointers) and the `{ const <Interface>Vtbl* lpVtbl; }` object struct in their C path, which is exactly what cflat parses (headers are extracted as C). A pointer to an *unknown*/opaque pointee still falls back to `void*`.
 
+#### COM interfaces straight from a header
+
+The explicit `dev->lpVtbl->CreateCommandQueue(dev, ...)` form above always works, but a thin COM interface - any struct whose **sole field is `lpVtbl`** (exactly the MIDL `{ const <Interface>Vtbl* lpVtbl; }` shape) - also gets **member-call sugar**: a vtable-slot name routes through `lpVtbl` and the receiver is passed as the implicit `this`. So the two lines below are equivalent:
+
+```cflat
+hr = dev->lpVtbl->CreateCommandQueue(dev, &desc, &iid, (void**)&q);  // explicit
+hr = dev->CreateCommandQueue(&desc, &iid, (void**)&q);               // sugar (implicit this)
+rt->Release();                                                       // sugar for rt->lpVtbl->Release(rt)
+```
+
+This is the same sugar used for [winmd-imported interfaces](WINMD.md#calling-consumed-interfaces---the-member-call-sugar) - one rule covers both header-imported and winmd COM, because both lower to the identical thin `{ lpVtbl }` shape. The single-field test is what separates a *consumed* interface (sugar: receiver injected) from an authored `[winrt]` object, which has additional fields and its own dispatch. Reach for the explicit form when the receiver is an rvalue with no storage (e.g. a freshly cast pointer), which the storage-based sugar cannot rewrite. See `example/COM/d3d11_cube_demo.cb` for a full pipeline written in the sugar form.
+
 A **fixed-size array struct field** (e.g. `CHAR szExeFile[260]` in `PROCESSENTRY32`) is registered as an inline CFlat array, not decayed to a pointer, so the C ABI `sizeof` is exact - `sizeof(PROCESSENTRY32)` is 304, not the 40 a decayed pointer would give. Only positive integer extents become inline arrays; an incomplete `[]` still decays to a pointer, and a field whose element type cannot be mapped abandons the whole record (an opaque shell that errors on use - never a silent size change).
 
 An **opaque forward-declared handle** (`typedef struct SDL_Window SDL_Window;` and similar - declared but never defined in the bound header, the universal C handle idiom used by SDL, `sqlite3_stmt`, libcurl's `CURL`, ...) is registered as an opaque, pointer-only type. You can therefore **name the handle**: `SDL_Window* w = SDL_CreateWindow(...)` reads like the C docs, instead of falling back to `void*`. The handle converts to and from `void*` with no cast in either direction, so existing `void*`-style code keeps working. Declaring one **by value** (`SDL_Window w;`) is a compile error ("incomplete layout - can only be used through a pointer"), exactly as for any other opaque shell. Only handles declared under the in-scope dirs are surfaced this way; a handle forward-declared in an out-of-scope system header still appears as `void*` in the signatures that use it.
