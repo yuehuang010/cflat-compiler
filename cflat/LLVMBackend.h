@@ -995,6 +995,10 @@ private:
     // Derived per-instantiation IID (PIID) keyed by mangled name (e.g. "IVector__int"), used for
     // QueryInterface identity and the `iidof(...)` builtin.
     std::unordered_map<std::string, std::array<uint8_t, 16>> winrtInstanceIid_;
+    // Thin COM interface pointer structs built by BuildWinrtInterfaceStructs (both non-generic
+    // imports and concrete generic instantiations). Used to route foreach over a winmd interface
+    // through the IIterable<T>/IIterator<T> protocol instead of the count()/get() index path.
+    std::unordered_set<std::string> winrtThinInterfaces_;
     // All imported winmd types accumulated across every imported file, so the signature encoder
     // can resolve nested named type args (enums/structs/interfaces) when deriving a PIID.
     cflat_winmd::Model winrtConsumedModel_;
@@ -6637,9 +6641,58 @@ public:
         lp.TypeName = vtblName;
         lp.Pointer = true;
         CreateStructType(thinName, { lp });
+        winrtThinInterfaces_.insert(thinName);
         if (auto* s = GetSymbolSink())
             s->Register(SymbolKind::Struct, thinName, fileForLsp, 0, 0, lspDesc);
         return true;
+    }
+
+    // True if `name` is a thin COM interface pointer struct built from imported winmd (a
+    // non-generic interface or a concrete generic instantiation like "IVector__int").
+    bool IsWinrtThinInterface(const std::string& name) const
+    {
+        return winrtThinInterfaces_.count(name) != 0;
+    }
+
+    // Emit a raw COM dispatch `obj->lpVtbl->slot(obj, extraArgs...)` on a consume-side thin WinRT
+    // interface pointer (built by BuildWinrtInterfaceStructs). Returns the i32 HRESULT. `extraArgs`
+    // are passed verbatim after the receiver; out-params should already be void* (i8*).
+    llvm::Value* EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::string& thinName,
+        const std::string& slotName, const std::vector<llvm::Value*>& extraArgs)
+    {
+        auto dsIt = dataStructures.find(thinName);
+        std::string vtblName = thinName + "Vtbl";
+        auto vtblIt = dataStructures.find(vtblName);
+        if (dsIt == dataStructures.end() || vtblIt == dataStructures.end())
+        {
+            LogError(std::format("EmitWinrtThinSlotCall: '{}' is not a built WinRT interface", thinName));
+            return nullptr;
+        }
+        auto* objTy = dsIt->second.StructType;     // { <vtbl>* }
+        auto* vtblTy = vtblIt->second.StructType;
+        const auto& slots = vtblIt->second.StructFields;
+
+        unsigned slotIdx = 0;
+        const DeclTypeAndValue* slot = nullptr;
+        for (unsigned i = 0; i < slots.size(); i++)
+            if (slots[i].VariableName == slotName) { slotIdx = i; slot = &slots[i]; break; }
+        if (!slot)
+        {
+            LogError(std::format("EmitWinrtThinSlotCall: no slot '{}' on '{}'", slotName, thinName));
+            return nullptr;
+        }
+
+        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* typedObj = builder->CreateBitCast(objPtr, objTy->getPointerTo());
+        auto* vtblFieldPtr = builder->CreateStructGEP(objTy, typedObj, 0);
+        auto* vtblPtr = builder->CreateLoad(vtblTy->getPointerTo(), vtblFieldPtr);
+        auto* slotPtr = builder->CreateStructGEP(vtblTy, vtblPtr, slotIdx);
+        auto* fnPtr = builder->CreateLoad(BuildThinFnPtrType(*slot), slotPtr);
+
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(builder->CreateBitCast(objPtr, i8PtrTy));
+        for (auto* a : extraArgs) callArgs.push_back(a);
+        return CreateIndirectCall(*slot, fnPtr, callArgs);
     }
 
     // Substitute generic VAR placeholders in a template TypeRef with the concrete argument

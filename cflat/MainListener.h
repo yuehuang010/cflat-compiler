@@ -3960,6 +3960,112 @@ public:
                         collNV.Primary = nullptr;
                     }
 
+                    // Imported winmd interface receiver -> iterate through the WinRT IIterable<T> /
+                    // IIterator<T> COM protocol instead of the count()/get() index path below.
+                    if (compiler->IsWinrtThinInterface(collNV.TypeAndValue.TypeName))
+                    {
+                        std::string collTypeName = collNV.TypeAndValue.TypeName;
+
+                        auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
+                        elemType.VariableName = varName;
+                        std::string elemArg = elemType.TypeName;
+
+                        // Synthesize IIterable<T> and IIterator<T> (COM vtable + thin ptr + PIID).
+                        std::string iterableName = MangledGenericName("IIterable", { elemArg });
+                        std::string iteratorName = MangledGenericName("IIterator", { elemArg });
+                        bool haveIterable = compiler->InstantiateWinrtGenericInterface("IIterable", { elemArg }, iterableName);
+                        bool haveIterator = compiler->InstantiateWinrtGenericInterface("IIterator", { elemArg }, iteratorName);
+                        auto* iidGlobal = haveIterable ? compiler->EmitIidGlobalFor(iterableName) : nullptr;
+                        if (!haveIterable || !haveIterator || !iidGlobal)
+                        {
+                            LogErrorContext(iterationStatement,
+                                "foreach over a WinRT interface needs IIterable<T>/IIterator<T> "
+                                "(import \"Windows.Foundation.winmd\") and a scalar/named element type");
+                            return;
+                        }
+
+                        auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                        auto* i8Ty    = compiler->builder->getInt8Ty();
+                        auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
+
+                        // The live interface pointer (load it out of storage if it is a variable).
+                        llvm::Value* objVal = collNV.Primary;
+                        if (!objVal) objVal = compiler->builder->CreateLoad(i8PtrTy, collNV.Storage);
+
+                        auto iterableAlloca = compiler->CreateAlloca(i8PtrTy);
+                        auto iteratorAlloca = compiler->CreateAlloca(i8PtrTy);
+                        auto hasAlloca      = compiler->CreateAlloca(i8Ty);
+                        compiler->builder->CreateStore(nullPtr, iterableAlloca);
+                        compiler->builder->CreateStore(nullPtr, iteratorAlloca);
+
+                        auto elemAlloca = compiler->CreateLocalVariable(elemType);
+
+                        // QueryInterface the receiver for IIterable<T> (IVector<T> only *requires*
+                        // it; an object that already is IIterable answers with itself + AddRef).
+                        auto* iidPtr = compiler->builder->CreateBitCast(iidGlobal, i8PtrTy);
+                        auto* ppvIterable = compiler->builder->CreateBitCast(iterableAlloca, i8PtrTy);
+                        auto* hrQI = compiler->EmitWinrtThinSlotCall(objVal, collTypeName, "QueryInterface", { iidPtr, ppvIterable });
+                        auto* iterableV = compiler->builder->CreateLoad(i8PtrTy, iterableAlloca);
+                        auto* qiOk = compiler->builder->CreateAnd(
+                            compiler->builder->CreateICmpEQ(hrQI, compiler->builder->getInt32(0)),
+                            compiler->builder->CreateICmpNE(iterableV, nullPtr));
+
+                        auto blockFirst = compiler->CreateBasicBlock("forIterFirst");
+                        compiler->CreateConditionJump(qiOk, blockFirst, blockResume);
+
+                        // First(&iterator) -> the IIterator<T>; bail to cleanup if it fails.
+                        compiler->InitializeBlock(blockFirst, false);
+                        auto* ppvIter = compiler->builder->CreateBitCast(iteratorAlloca, i8PtrTy);
+                        auto* hrFirst = compiler->EmitWinrtThinSlotCall(iterableV, iterableName, "First", { ppvIter });
+                        auto* iterV0 = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* firstOk = compiler->builder->CreateAnd(
+                            compiler->builder->CreateICmpEQ(hrFirst, compiler->builder->getInt32(0)),
+                            compiler->builder->CreateICmpNE(iterV0, nullPtr));
+                        compiler->CreateConditionJump(firstOk, blockCond, blockResume);
+
+                        // Condition: get_HasCurrent.
+                        compiler->InitializeBlock(blockCond, false);
+                        auto* iterC = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* ppHas = compiler->builder->CreateBitCast(hasAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterC, iteratorName, "get_HasCurrent", { ppHas });
+                        auto* hasV = compiler->builder->CreateICmpNE(
+                            compiler->builder->CreateLoad(i8Ty, hasAlloca), compiler->builder->getInt8(0));
+                        compiler->CreateConditionJump(hasV, blockInner, blockResume);
+
+                        // Body: bind the element via get_Current, run the loop body.
+                        compiler->InitializeBlock(blockInner, false);
+                        auto* iterI = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* elemOut = compiler->builder->CreateBitCast(elemAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterI, iteratorName, "get_Current", { elemOut });
+                        ParseControlledBody(bodyStmt);
+                        compiler->CreateContinueCall();
+
+                        // Increment slot (continue target): MoveNext, then re-test HasCurrent.
+                        compiler->InitializeBlock(blockIncrement, false);
+                        auto* iterM = compiler->builder->CreateLoad(i8PtrTy, iteratorAlloca);
+                        auto* ppHas2 = compiler->builder->CreateBitCast(hasAlloca, i8PtrTy);
+                        compiler->EmitWinrtThinSlotCall(iterM, iteratorName, "MoveNext", { ppHas2 });
+                        compiler->CreateBlockBreak(blockCond, false);
+
+                        // Resume: null-safe Release of the iterator and the QI'd iterable.
+                        compiler->InitializeBlock(blockResume, false);
+                        auto releaseIfNonNull = [&](llvm::AllocaInst* slotAlloca, const std::string& thinNm) {
+                            auto* p = compiler->builder->CreateLoad(i8PtrTy, slotAlloca);
+                            auto* nn = compiler->builder->CreateICmpNE(p, nullPtr);
+                            auto relBB  = compiler->CreateBasicBlock("forIterRel");
+                            auto contBB = compiler->CreateBasicBlock("forIterRelCont");
+                            compiler->CreateConditionJump(nn, relBB, contBB);
+                            compiler->InitializeBlock(relBB, false);
+                            compiler->EmitWinrtThinSlotCall(p, thinNm, "Release", {});
+                            compiler->CreateBlockBreak(contBB, false);
+                            compiler->InitializeBlock(contBB, false);
+                        };
+                        releaseIfNonNull(iteratorAlloca, iteratorName);
+                        releaseIfNonNull(iterableAlloca, iterableName);
+                        compiler->CreateBlockBreak(nullptr, true);
+                        return;
+                    }
+
                     bool isFaceType   = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
                     bool isFixedArray = collNV.BaseType && llvm::isa<llvm::ArrayType>(collNV.BaseType);
 

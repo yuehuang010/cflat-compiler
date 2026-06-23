@@ -13,16 +13,12 @@
 // Build:  x64/Debug/cflat.exe example/COM/winrt_ireference_demo.cb -o out/winrt_ireference_demo.exe
 // Run:    out\winrt_ireference_demo.exe
 
-import "C:/Windows/System32/WinMetadata/Windows.Foundation.winmd";
-import "windows.h" lib { "RuntimeObject.lib", "ole32.lib" } cache;
-import "guid.cb";
+import "Windows.Foundation.winmd";   // resolved from the system WinMetadata store by bare name
 
-// Hand-declared so signatures stay explicit (these take precedence over any header prototype).
-extern stdcall i32 RoInitialize(i32 initType);
-extern stdcall void RoUninitialize();
-extern stdcall i32 WindowsCreateString(u16* src, u32 length, void** hstring);
-extern stdcall i32 WindowsDeleteString(void* hstring);
-extern stdcall i32 RoGetActivationFactory(void* classId, void* iid, void** factory);
+// roapi.h (RoInitialize/RoGetActivationFactory) and winstring.h (WindowsCreateString/...) are real
+// WinRT SDK headers - import them so their prototypes are auto-externed; no hand-written decls.
+import { "windows.h", "roapi.h", "winstring.h" } lib { "RuntimeObject.lib", "ole32.lib" } cache;
+import "guid.cb";
 
 extern int main()
 {

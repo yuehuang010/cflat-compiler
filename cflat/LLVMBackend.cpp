@@ -926,6 +926,21 @@ static const std::vector<std::string>& WindowsSdkIncludeDirs()
     return dirs;
 }
 
+// %SystemRoot%\System32\WinMetadata - the system WinRT metadata store - so a bare
+// `import "Windows.Foundation.winmd";` resolves without spelling out the full path. Empty if
+// SystemRoot is unset. Scanned once and cached.
+static const std::string& WinMetadataDir()
+{
+    static const std::string dir = [] {
+        char buf[260] = {};
+        size_t len = 0;
+        if (getenv_s(&len, buf, sizeof(buf), "SystemRoot") != 0 || len == 0)
+            return std::string();
+        return std::string(buf) + "\\System32\\WinMetadata";
+    }();
+    return dir;
+}
+
 // Resolve an import filename against the search order described in the header. Logs the
 // not-found error (unless quiet) and returns false on failure.
 bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const std::string& importFilename,
@@ -956,6 +971,8 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
         // detected SDK include dirs so `import "windows.h"` resolves with no --c-include flag; the
         // header's own dir then becomes an in-scope root automatically (see ExtractCHeaderClang).
         for (const auto& inc : WindowsSdkIncludeDirs()) tryDir(inc);
+        // System WinRT metadata: let `import "Windows.Foundation.winmd";` resolve by bare name.
+        tryDir(WinMetadataDir());
         return ec ? std::string() : canonical.string();
     };
 
@@ -975,7 +992,8 @@ bool LLVMBackend::ResolveImportPath(const std::string& importingFilePath, const 
             suggestion = " Did you mean \"" + bare + "\"?";
 
         std::cout << std::format(
-            "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}).{}\n",
+            "Error: imported file not found: {} (searched relative to '{}'{}{}{}{}, Windows SDK, "
+            "WinMetadata).{}\n",
             importFilename,
             importingDir.string(),
             sourceFileDir_.empty() ? "" : ", source dir '" + sourceFileDir_ + "'",

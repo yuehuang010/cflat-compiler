@@ -151,8 +151,12 @@ If `Make()` fails, `Value()` is never called and `Make`'s HRESULT propagates str
 `.winmd` is an import file type. The interfaces, value structs, and enums become CFlat types you
 drive by hand through the COM vtable - exactly like the hand-written COM demos under `example/COM/`.
 
+A bare name (`import "Windows.Foundation.winmd";`) resolves against the system WinRT metadata store
+(`%SystemRoot%\System32\WinMetadata`), so the in-box winmds need no full path; a relative or absolute
+path also works for a winmd you ship yourself.
+
 ```cflat
-import "C:/Windows/System32/WinMetadata/Windows.Foundation.winmd";
+import "Windows.Foundation.winmd";       // resolved from %SystemRoot%\System32\WinMetadata
 
 extern int main()
 {
@@ -191,7 +195,7 @@ and derives the instance's IID (the **PIID**) by the standard RFC 4122 v5 / SHA-
 WinRT type signature - byte-for-byte what cppwinrt and windows-rs compute.
 
 ```cflat
-import "C:/Windows/System32/WinMetadata/Windows.Foundation.winmd";
+import "Windows.Foundation.winmd";
 
 IReference<int>* r = default;            // resolves to a synthesized concrete COM interface
 int v = default;
@@ -218,8 +222,36 @@ read it back). Type arguments must be an explicit-width scalar (`i32`/`u32`/`f32
 `object`, or the `int`/`uint`/`float`/`double` aliases) or an imported winmd type; arrays are not
 permitted as type arguments (a WinRT rule).
 
-> `foreach` over an `IIterable<T>` and projecting `IVector<T>`/`IMap<K,V>` onto CFlat's core
-> `list`/`dictionary` are not done yet - drive the iterator interfaces by hand for now.
+### `foreach` over a WinRT collection
+
+`for (T x in coll)` works when `coll` is any imported winmd interface that is (or *requires*)
+`IIterable<T>` - `IVector<T>`, `IVectorView<T>`, `IIterable<T>` itself, and so on. The compiler
+synthesizes `IIterable<T>` / `IIterator<T>` on demand, `QueryInterface`s the receiver for
+`IIterable<T>` with the derived PIID, then drives `First` / `get_HasCurrent` / `get_Current` /
+`MoveNext` and `Release`s the iterator afterwards:
+
+```cflat
+import "Windows.Foundation.winmd";   // IIterable`1 / IIterator`1 (from system WinMetadata)
+import "Windows.Data.winmd";         // JsonArray, IJsonValue
+
+// arr is an IJsonArray* (an IVector<IJsonValue>) from JsonArray.Parse("[10,20,30]").
+double sum = 0.0;
+for (IJsonValue* x in arr)
+{
+    double d = default;
+    x->lpVtbl->GetNumber(x, &d);   // each element is a live IJsonValue
+    sum = sum + d;
+}
+```
+
+The element type is the loop variable's type (a scalar, or a named winmd type held by pointer for
+interface elements). `Windows.Foundation.winmd` must be imported so the `IIterable`/`IIterator`
+templates are available. See `example/COM/winrt_foreach_demo.cb` for the full live program. A
+receiver that does not actually implement `IIterable<T>` fails the runtime `QueryInterface` and
+iterates zero times (there is no compile-time iterability check yet).
+
+> Projecting `IVector<T>`/`IMap<K,V>` onto CFlat's core `list`/`dictionary` is not done - use the
+> interfaces directly.
 
 ---
 
@@ -259,8 +291,8 @@ A `.winmd` brought in via `import "x.winmd";` registers its types (consume). A `
   activation factory + `DllGetActivationFactory` (for an external WinRT host to `RoActivateInstance`
   across a DLL boundary) is intentionally not generated - CFlat does not output DLLs.
 - **Parameterized (generic) WinRT interfaces** (`IVector<T>`, `IReference<T>`, ...) are instantiated
-  on consume (see above), but `foreach` over `IIterable<T>` and projection onto core `list`/
-  `dictionary` are not yet provided - drive the iterator protocol by hand.
+  on consume and support `foreach` (see above), but projection onto core `list`/`dictionary` is not
+  yet provided; non-iterating method calls drive the COM vtable by hand.
 - **Properties / events** are surfaced as their underlying methods (`get_X`/`put_X`, `add_X`/
   `remove_X`), not as `obj.X` / `obj.E += h` sugar.
 - A `[winrt]` class implements a **single** primary interface; `requires`/multi-interface composition
