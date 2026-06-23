@@ -1,0 +1,8 @@
+// Adjacent string literals are NOT concatenated (unlike C). Keeping only the first would
+// silently drop data, so this must be a clear error pointing at the '+' operator.
+extern int main()
+{
+    expect_error("adjacent string literals are not concatenated");
+    char* s = "hello " "world";
+    return 0;
+}

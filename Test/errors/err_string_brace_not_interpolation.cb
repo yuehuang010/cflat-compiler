@@ -1,0 +1,9 @@
+// A '{' in a string literal starts an interpolation. When the brace content is not a
+// single valid expression (e.g. embedded HLSL/JSON/code), the diagnostic must say so and
+// point at the '{{' escape - not fail later as a confusing "undefined variable".
+extern int main()
+{
+    expect_error("not a single valid expression");
+    char* hlsl = "struct VOut{float4 pos; float4 col;}";
+    return 0;
+}

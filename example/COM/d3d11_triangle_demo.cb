@@ -1,0 +1,218 @@
+// d3d11_triangle_demo.cb - make the GPU actually render a triangle, headlessly,
+// driven entirely by COM vtables imported straight from the Direct3D 11 SDK headers.
+//
+// This goes past adapter enumeration (dxgi_adapters_demo.cb): it creates a real D3D11
+// device, compiles a vertex + pixel shader from HLSL at runtime with D3DCompile, uploads
+// a 3-vertex triangle, and draws it into an offscreen R8G8B8A8 render target (no window,
+// no swapchain). It then copies the result to a CPU-readable staging texture, reads the
+// pixels back, asserts the centroid is the interpolated triangle color (not the clear
+// color), and writes the image to triangle.bmp so the result is visible.
+//
+// Every Direct3D call goes through `obj->lpVtbl->Method(obj, ...)` - the same thin
+// header-imported COM vtable path as imalloc_demo.cb, here on a full GPU pipeline. The
+// .bmp dump uses the CRT file I/O already exposed by core/os.windows.cb (fopen/fwrite/
+// fclose) - declaring our own global `extern fopen/fwrite` would collide with those.
+//
+// Build:  x64/Debug/cflat.exe example/COM/d3d11_triangle_demo.cb -o out/d3d11_triangle_demo.exe
+// Run:    out\d3d11_triangle_demo.exe   (writes triangle.bmp in the working directory)
+
+import { "d3d11.h", "d3dcompiler.h" } lib { "d3d11.lib", "d3dcompiler.lib" } cache;
+
+const i32 W = 256;
+const i32 H = 256;
+
+u64 cstrlen(char* s)
+{
+    u64 n = 0;
+    while (s[n] != 0) n = n + 1;
+    return n;
+}
+
+// Compile one HLSL entry point to bytecode, or report the compiler's error blob and exit.
+ID3DBlob* compileShader(char* src, char* entry, char* target)
+{
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    i32 hr = D3DCompile((void*)src, cstrlen(src), nullptr, nullptr, nullptr,
+                        entry, target, 0, 0, &code, &errors);
+    if (hr != 0 || code == nullptr)
+    {
+        if (errors != nullptr)
+            printf("shader compile failed (%s): %s\n", entry, (char*)errors->lpVtbl->GetBufferPointer(errors));
+        else
+            printf("shader compile failed (%s): hr=0x%08X\n", entry, hr);
+        return nullptr;
+    }
+    return code;
+}
+
+// Little-endian writers for the BMP headers.
+void putU16(u8* p, u16 v) { p[0] = (u8)(v & 0xFF); p[1] = (u8)((v >> 8) & 0xFF); }
+void putU32(u8* p, u32 v)
+{
+    p[0] = (u8)(v & 0xFF);          p[1] = (u8)((v >> 8) & 0xFF);
+    p[2] = (u8)((v >> 16) & 0xFF);  p[3] = (u8)((v >> 24) & 0xFF);
+}
+
+// Write a 24-bit, bottom-up BMP from the mapped RGBA pixels (rowPitch from the GPU map).
+void writeBmp(char* path, u8* pixels, u32 rowPitch)
+{
+    u32 rowBytes = (u32)(W * 3);
+    u32 dataSize = rowBytes * (u32)H;
+    u8[54] hdr = default;
+    hdr[0] = 0x42; hdr[1] = 0x4D;                 // "BM"
+    putU32(&hdr[2], 54 + dataSize);               // file size
+    putU32(&hdr[10], 54);                         // pixel data offset
+    putU32(&hdr[14], 40);                         // info header size
+    putU32(&hdr[18], (u32)W);
+    putU32(&hdr[22], (u32)H);
+    putU16(&hdr[26], 1);                          // planes
+    putU16(&hdr[28], 24);                         // bits per pixel
+    putU32(&hdr[34], dataSize);
+
+    void* f = os.windows.fopen(path, "wb");
+    if (f == nullptr) { printf("could not open %s\n", path); return; }
+    os.windows.fwrite((i8*)&hdr[0], 1, 54, f);
+
+    // BMP rows run bottom-to-top and store BGR; the GPU buffer is top-down RGBA.
+    u8[768] row = default; // W*3, W==256
+    i32 y = H - 1;
+    while (y >= 0)
+    {
+        u8* src = pixels + (u32)y * rowPitch;
+        i32 x = 0;
+        while (x < W)
+        {
+            row[x * 3 + 0] = src[x * 4 + 2]; // B
+            row[x * 3 + 1] = src[x * 4 + 1]; // G
+            row[x * 3 + 2] = src[x * 4 + 0]; // R
+            x = x + 1;
+        }
+        os.windows.fwrite((i8*)&row[0], 1, (i32)rowBytes, f);
+        y = y - 1;
+    }
+    os.windows.fclose(f);
+}
+
+extern int main()
+{
+    // HLSL source. Single literal (cflat does not concatenate adjacent string literals)
+    // and every brace is doubled, because cflat strings are interpolated: a lone `{`
+    // would start an interpolation expression. `{{`/`}}` emit a literal `{`/`}`.
+    char* hlsl = "struct VOut{{float4 pos:SV_POSITION; float4 col:COLOR;}}; VOut VSMain(float2 p:POS, float3 c:COL){{VOut o;o.pos=float4(p,0,1);o.col=float4(c,1);return o;}} float4 PSMain(VOut i):SV_TARGET{{return i.col;}}";
+
+    // 1. Device + immediate context on the hardware adapter (feature level 11_0).
+    // D3D_FEATURE_LEVEL is an i32-backed enum; cflat exposes its constants but not the
+    // enum as a named type, so the level array and out-param are typed i32.
+    i32[1] levels = default;
+    levels[0] = D3D_FEATURE_LEVEL_11_0;
+    i32 gotFL = default;
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    i32 hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+                               &levels[0], 1, D3D11_SDK_VERSION, &dev, &gotFL, &ctx);
+    if (hr != 0 || dev == nullptr)
+    {
+        printf("D3D11CreateDevice failed: hr=0x%08X\n", hr);
+        return 1;
+    }
+    printf("D3D11 device created (feature level 0x%04X)\n", (u32)gotFL);
+
+    // 2. Compile and create the shaders.
+    ID3DBlob* vsb = compileShader(hlsl, "VSMain", "vs_4_0");
+    ID3DBlob* psb = compileShader(hlsl, "PSMain", "ps_4_0");
+    if (vsb == nullptr || psb == nullptr) return 2;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    dev->lpVtbl->CreateVertexShader(dev, vsb->lpVtbl->GetBufferPointer(vsb), vsb->lpVtbl->GetBufferSize(vsb), nullptr, &vs);
+    dev->lpVtbl->CreatePixelShader(dev, psb->lpVtbl->GetBufferPointer(psb), psb->lpVtbl->GetBufferSize(psb), nullptr, &ps);
+
+    // 3. Input layout: float2 POS at offset 0, float3 COL at offset 8.
+    D3D11_INPUT_ELEMENT_DESC[2] ied = default;
+    ied[0].SemanticName = "POS"; ied[0].Format = DXGI_FORMAT_R32G32_FLOAT;
+    ied[0].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    ied[1].SemanticName = "COL"; ied[1].Format = DXGI_FORMAT_R32G32B32_FLOAT;
+    ied[1].AlignedByteOffset = 8; ied[1].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    ID3D11InputLayout* il = nullptr;
+    dev->lpVtbl->CreateInputLayout(dev, &ied[0], 2, vsb->lpVtbl->GetBufferPointer(vsb), vsb->lpVtbl->GetBufferSize(vsb), &il);
+
+    // 4. Vertex buffer: 3 vertices, each {x, y, r, g, b} = 5 floats = 20 bytes.
+    float[15] verts = { 0.0, 0.6, 1.0, 0.0, 0.0,
+                        0.6, -0.6, 0.0, 1.0, 0.0,
+                        -0.6, -0.6, 0.0, 0.0, 1.0 };
+    D3D11_BUFFER_DESC bd = default;
+    bd.ByteWidth = 60; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA srd = default;
+    srd.pSysMem = &verts[0];
+    ID3D11Buffer* vb = nullptr;
+    dev->lpVtbl->CreateBuffer(dev, &bd, &srd, &vb);
+
+    // 5. Offscreen render-target texture + view.
+    D3D11_TEXTURE2D_DESC td = default;
+    td.Width = (u32)W; td.Height = (u32)H; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D* rt = nullptr;
+    dev->lpVtbl->CreateTexture2D(dev, &td, nullptr, &rt);
+    ID3D11RenderTargetView* rtv = nullptr;
+    dev->lpVtbl->CreateRenderTargetView(dev, (ID3D11Resource*)rt, nullptr, &rtv);
+
+    // 6. Bind the pipeline and draw.
+    D3D11_VIEWPORT vp = default;
+    vp.Width = (float)W; vp.Height = (float)H; vp.MaxDepth = 1.0;
+    ctx->lpVtbl->RSSetViewports(ctx, 1, &vp);
+    ctx->lpVtbl->OMSetRenderTargets(ctx, 1, &rtv, nullptr);
+    float[4] clear = { 0.1, 0.1, 0.15, 1.0 };
+    ctx->lpVtbl->ClearRenderTargetView(ctx, rtv, &clear[0]);
+    u32 stride = 20;
+    u32 offset = 0;
+    ctx->lpVtbl->IASetInputLayout(ctx, il);
+    ctx->lpVtbl->IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset);
+    ctx->lpVtbl->IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->lpVtbl->VSSetShader(ctx, vs, nullptr, 0);
+    ctx->lpVtbl->PSSetShader(ctx, ps, nullptr, 0);
+    ctx->lpVtbl->Draw(ctx, 3, 0);
+
+    // 7. Copy to a staging texture and map it for CPU readback.
+    D3D11_TEXTURE2D_DESC sd = default;
+    sd.Width = (u32)W; sd.Height = (u32)H; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* stg = nullptr;
+    dev->lpVtbl->CreateTexture2D(dev, &sd, nullptr, &stg);
+    ctx->lpVtbl->CopyResource(ctx, (ID3D11Resource*)stg, (ID3D11Resource*)rt);
+    D3D11_MAPPED_SUBRESOURCE ms = default;
+    hr = ctx->lpVtbl->Map(ctx, (ID3D11Resource*)stg, 0, D3D11_MAP_READ, 0, &ms);
+    if (hr != 0) { printf("Map failed: hr=0x%08X\n", hr); return 3; }
+
+    u8* px = (u8*)ms.pData;
+    u8* center = px + (u32)(H / 2) * ms.RowPitch + (u32)(W / 2) * 4;
+    printf("centroid pixel RGBA = %u %u %u %u\n", center[0], center[1], center[2], center[3]);
+    u8* corner = px; // top-left, should be the clear color (~26,26,38)
+    printf("corner   pixel RGBA = %u %u %u %u\n", corner[0], corner[1], corner[2], corner[3]);
+
+    // The centroid must be a blended triangle color, the corner the clear color.
+    i32 ok = 1;
+    if (center[0] < 40 || center[1] < 40 || center[2] < 40) ok = 0; // centroid not lit
+    if (corner[0] > 60 || corner[1] > 60) ok = 0;                   // corner not clear color
+
+    writeBmp("triangle.bmp", px, ms.RowPitch);
+    ctx->lpVtbl->Unmap(ctx, (ID3D11Resource*)stg, 0);
+
+    // 8. Release everything (reverse order). Each is one vtable dispatch.
+    stg->lpVtbl->Release(stg);
+    rtv->lpVtbl->Release(rtv);
+    rt->lpVtbl->Release(rt);
+    vb->lpVtbl->Release(vb);
+    il->lpVtbl->Release(il);
+    ps->lpVtbl->Release(ps);
+    vs->lpVtbl->Release(vs);
+    psb->lpVtbl->Release(psb);
+    vsb->lpVtbl->Release(vsb);
+    ctx->lpVtbl->Release(ctx);
+    dev->lpVtbl->Release(dev);
+
+    if (ok == 0) { printf("FAIL: pixels did not match a rendered triangle\n"); return 4; }
+    printf("OK: GPU rendered a triangle; wrote triangle.bmp\n");
+    return 0;
+}

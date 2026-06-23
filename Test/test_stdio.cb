@@ -38,6 +38,20 @@ extern int main()
     total++; passed += Test("sscanf first value", a, 42);
     total++; passed += Test("sscanf second value", b, -7);
 
+    // --- variadic default-argument promotion must respect signedness. A u8 of 255
+    //     zero-extends to 255 ("255", length 3), NOT sign-extend to 4294967295
+    //     ("4294967295", length 10). A signed i8 of -1 still sign-extends to -1
+    //     ("-1", length 2). snprintf returns the full needed length, so the length
+    //     alone discriminates the bug without a strcmp dependency. ---
+    u8 hi = 255;
+    char[16] u8buf = default;
+    int u8len = snprintf(&u8buf[0], (i64)16, "%u", hi);
+    total++; passed += Test("u8 255 variadic arg zero-extends (len 3, not 10)", u8len, 3);
+    i8 neg = -1;
+    char[16] i8buf = default;
+    int i8len = snprintf(&i8buf[0], (i64)16, "%d", neg);
+    total++; passed += Test("i8 -1 variadic arg sign-extends (len 2)", i8len, 2);
+
     // --- smoke: the new stdout convenience writers must link and run ---
     puts("test_stdio: puts writes a line");
     putchar((int)'X');

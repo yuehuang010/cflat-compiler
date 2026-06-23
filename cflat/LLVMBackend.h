@@ -9670,7 +9670,7 @@ public:
         std::string mangledName = external ? (linkageName.empty() ? functionName : linkageName)
                                            : ComputeMangledName(functionName, returnType, arguments, varargs);
 
-        if (module->getFunction(mangledName) != nullptr)
+        if (llvm::Function* existing = module->getFunction(mangledName))
         {
             // A repeat declaration under the same lookup name is a no-op. A *different*
             // lookup name for an already-emitted linkage symbol (core's os.windows.Sleep
@@ -9679,6 +9679,23 @@ public:
             for (const auto& sym : functionTable[functionName])
                 if (sym.UniqueName == mangledName)
                     return;
+
+            // The linkage symbol already exists with a DIFFERENT signature. This happens
+            // when a user `extern` collides with a core-library extern of the same name
+            // (e.g. fwrite, declared in os.windows with 32-bit params). getOrInsertFunction
+            // would hand back the existing function, so the new overload's calls coerce
+            // args to the user's types but dispatch to the old callee - an LLVM "bad
+            // signature" assert at codegen. Reject with a clear diagnostic instead.
+            if (external && existing->getFunctionType() != functionType)
+            {
+                LogError(std::format(
+                    "conflicting declaration of extern '{}': a function with this linkage "
+                    "name already exists with a different signature (e.g. in a core library "
+                    "such as os.windows). Rename your extern, or call the existing one "
+                    "(for file I/O use os.windows.fopen/fread/fwrite/fclose).",
+                    functionName));
+                return;
+            }
         }
 
         auto funcCallee = module->getOrInsertFunction(mangledName, functionType);
@@ -10925,6 +10942,14 @@ public:
                     // Canonical by-value arg lowering (string coercion + move heap-copy);
                     // shared with virtual dispatch via CallInterfaceMethod.
                     value = LowerByValueArg(value, *candParamItr, arg);
+                }
+                else if (value->getType()->isIntegerTy(8) || value->getType()->isIntegerTy(16))
+                {
+                    // C default argument promotion for a variadic slot: widen a sub-int
+                    // integer to int, choosing zero- vs sign-extension by the source type's
+                    // signedness so that e.g. u8 255 promotes to 255, not -1. Signedness is
+                    // only known here (CreateFunctionCall sees a bare llvm::Value).
+                    value = PromoteToInt(value, arg.TypeAndValue.IsUnsignedInteger() != -1);
                 }
 
                 argList.push_back(value);

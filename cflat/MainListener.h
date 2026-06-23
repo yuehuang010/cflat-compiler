@@ -14157,7 +14157,24 @@ public:
                 CFlatLexer exprLexer(&exprInput);
                 antlr4::CommonTokenStream exprTokens(&exprLexer);
                 CFlatParser exprParser(&exprTokens);
+                exprParser.removeErrorListeners(); // we emit our own targeted diagnostic
                 auto* exprCtx = exprParser.assignmentExpression();
+
+                // The braces must enclose exactly one complete expression. Leftover tokens
+                // or syntax errors mean this was almost certainly not meant as interpolation
+                // (e.g. embedded HLSL/JSON/code with literal braces). Emit a targeted hint
+                // instead of letting the partial parse fail later as a confusing
+                // "undefined variable" at a synthetic location.
+                if (exprParser.getNumberOfSyntaxErrors() > 0
+                    || exprParser.getCurrentToken()->getType() != antlr4::Token::EOF)
+                {
+                    std::string shown = exprText.size() > 40 ? exprText.substr(0, 40) + "..." : exprText;
+                    LogErrorContext(ctx, std::format(
+                        "'{{' in this string starts an interpolation, but the text between the "
+                        "braces (\"{}\") is not a single valid expression. If you meant a literal "
+                        "brace, double it: write '{{{{' and '}}}}'.", shown));
+                    return nullptr;
+                }
 
                 auto nv = ParseAssignmentExpressionNamed(exprCtx);
 
@@ -14882,6 +14899,15 @@ public:
         }
         else if (stringLiteral.size() > 0)
         {
+            // Adjacent string literals are NOT concatenated (unlike C). Silently keeping
+            // only the first would lose data, so require the explicit '+' operator.
+            if (stringLiteral.size() > 1)
+            {
+                LogErrorContext(ctx,
+                    "adjacent string literals are not concatenated. Join them with the '+' "
+                    "operator, e.g. \"a\" + \"b\".");
+                return nullptr;
+            }
             // TODO handle encoding u8,u,U,L
             std::string rawText = ctx->getText();
             if (HasInterpolation(rawText))
