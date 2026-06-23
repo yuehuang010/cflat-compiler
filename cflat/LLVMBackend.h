@@ -2721,6 +2721,7 @@ private:
     }
 
     void RunBaselinePasses();
+    void RunGlobalDCE();
     void OptimizeModule(int optimizationLevel);
 
     bool SaveToFile(const std::string& filename)
@@ -4685,7 +4686,8 @@ private:
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
     }
 
-    bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false)
+    bool EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo = false,
+                        const std::optional<std::string>& lliPath = std::nullopt)
     {
         std::string triple;
         std::string clangTarget;
@@ -4727,15 +4729,28 @@ private:
 
         llvm::TargetOptions opt;
         // Emit one section per function/global so lld-link's /OPT:REF can garbage-collect
-        // unreferenced symbols at every opt level. At -O0 no IR DCE runs, so without this
-        // the whole core library ships in every exe. This is pure object layout - it adds
-        // no optimization and does not touch the IR, so --out-lli (written before codegen)
-        // still shows the full module.
+        // unreferenced symbols. This is pure object layout - it adds no optimization and does
+        // not touch the IR, so it has no effect on the --out-lli dump written just below.
         opt.FunctionSections = true;
         opt.DataSections     = true;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
         module->setDataLayout(TM->createDataLayout());
+
+        // --out-lli for an -o build: dump the IR here, after the target triple and data layout
+        // are finalized and immediately before codegen, so the .ll is exactly what gets
+        // instruction-selected into the object. (Standalone --out-lli without -o is written in
+        // Compile, since EmitExecutable does not run there.)
+        if (lliPath)
+        {
+            llvm::TimeTraceScope irScope("WriteIR", *lliPath);
+            if (verbose) std::cout << std::format("[verbose] writing IR to {}\n", *lliPath);
+            if (!SaveToFile(*lliPath))
+            {
+                std::cout << std::format("Error: failed to save IR to '{}'.\n", *lliPath);
+                return false;
+            }
+        }
 
         auto objPath = exePath + ".obj";
         std::error_code EC;

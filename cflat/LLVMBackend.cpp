@@ -13,6 +13,7 @@
 #include <llvm\Transforms\Scalar\SROA.h>
 #include <llvm\Transforms\InstCombine\InstCombine.h>
 #include <llvm\Transforms\Scalar\SimplifyCFG.h>
+#include <llvm\Transforms\IPO\GlobalDCE.h>
 #include <llvm\Transforms\Instrumentation\AddressSanitizer.h>
 #include <llvm\Object\COFF.h>
 #include <llvm\Object\Binary.h>
@@ -734,10 +735,21 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << std::format("[verbose] running optimizations (O{}{})\n", optLevel, asan_ ? ", asan" : "");
         OptimizeModule(optLevel);
     }
+    else if (!args.hasFlag("no-opt"))
+    {
+        // -O0 (no asan): OptimizeModule was skipped, so nothing pruned the unreachable
+        // internal functions the whole core library contributes. Run GlobalDCE alone so
+        // codegen does not instruction-select dead core. Before the --out-lli write below
+        // so the dumped IR still matches what lands in the object.
+        llvm::TimeTraceScope dceScope("GlobalDCE", "O0");
+        if (verbose) std::cout << "[verbose] running -O0 global dead-code elimination\n";
+        RunGlobalDCE();
+    }
 
-    // Written after optimization so --out-lli reflects the final IR (vectorized
-    // loops, inlining, etc.) that actually lands in the object.
-    if (lliPath)
+    // Standalone --out-lli (no -o): dump the post-optimization IR here, since EmitExecutable
+    // does not run. For an -o build the dump is deferred into EmitExecutable (after the target
+    // triple/data layout are finalized, right before codegen) so the .ll matches the object.
+    if (lliPath && !exePath)
     {
         llvm::TimeTraceScope irScope("WriteIR", *lliPath);
         if (verbose) std::cout << std::format("[verbose] writing IR to {}\n", *lliPath);
@@ -809,7 +821,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     {
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
         if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", *exePath);
-        if (!EmitExecutable(*exePath, platformOption, debugInfo))
+        if (!EmitExecutable(*exePath, platformOption, debugInfo, lliPath))
         {
             std::cout << std::format("Error: failed to emit executable '{}'.\n", *exePath);
             return false;
@@ -1377,6 +1389,31 @@ void LLVMBackend::RunBaselinePasses()
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+    MPM.run(*module, MAM);
+}
+
+// At -O0 no module-level reachability pass runs, so every internal-linkage function
+// (CreateFunctionDefinition internalizes all non-extern, non-main functions) survives
+// into codegen - including the whole core library the program never calls. GlobalDCE
+// deletes those unreachable internals; main and the extern/auto-extern surface stay
+// external, so they remain roots and the linker entry + C-interop ABI are preserved.
+// O1+ already get this via buildPerModuleDefaultPipeline, so this is the -O0-only path.
+void LLVMBackend::RunGlobalDCE()
+{
+    llvm::PassBuilder PB;
+    llvm::LoopAnalysisManager LAM;
+    llvm::FunctionAnalysisManager FAM;
+    llvm::CGSCCAnalysisManager CGAM;
+    llvm::ModuleAnalysisManager MAM;
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    llvm::ModulePassManager MPM;
+    MPM.addPass(llvm::GlobalDCEPass());
     MPM.run(*module, MAM);
 }
 
