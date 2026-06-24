@@ -1,0 +1,88 @@
+// weather-cli/main.cb - fetch current weather over WinRT HTTP and print it.
+//
+// Uses Windows.Web.Http.HttpClient (WinRT, async) to GET a JSON forecast from
+// wttr.in (no API key needed), then parses it with CFlat's json.cb.
+//
+// NOTE: this hits http:// (not https) only because the build host's clock is set
+// to a future date, which makes the OS reject every TLS cert as expired
+// (HttpClient over https returns 0x80072F8F WININET_E_SECURE_FAILURE). On a host
+// with a correct clock, switch the URL back to https and it works unchanged.
+//
+// Build: x64/Release/cflat.exe example/customer/weather-cli/main.cb -o example/customer/weather-cli/weather.exe
+// Run:   example/customer/weather-cli/weather.exe
+
+import "winrt.cb";              // winrtInit / hstring / activationFactory / awaitAsync + Foundation.winmd
+import "Windows.Web.winmd";     // IHttpClient
+import "json.cb";               // JsonParser / JsonNode
+
+// HttpClient has a default constructor; activate it directly to an IInspectable.
+extern stdcall i32 RoActivateInstance(void* activatableClassId, void** instance);
+
+extern int main()
+{
+    winrtInit();
+
+    string url = "http://wttr.in/Berlin?format=j1";
+
+    // Build a Windows.Foundation.Uri from the URL string.
+    IUriRuntimeClassFactory* uriFactory = nullptr;
+    i32 hr = activationFactory("Windows.Foundation.Uri", iidof(IUriRuntimeClassFactory), (void**)&uriFactory);
+    if (hr != 0 || uriFactory == nullptr) { printf("Uri factory failed: 0x%08X\n", hr); return 1; }
+
+    void* hUrl = hstring(url);
+    IUriRuntimeClass* uri = nullptr;
+    hr = uriFactory->CreateUri(hUrl, &uri);
+    if (hr != 0 || uri == nullptr) { printf("CreateUri failed: 0x%08X\n", hr); return 2; }
+
+    // Activate HttpClient and QI for IHttpClient.
+    void* hClassId = hstring("Windows.Web.Http.HttpClient");
+    void* inst = nullptr;
+    hr = RoActivateInstance(hClassId, &inst);
+    if (hr != 0 || inst == nullptr) { printf("RoActivateInstance failed: 0x%08X\n", hr); return 3; }
+    freeHString(hClassId);
+
+    IHttpClient* client = nullptr;
+    hr = ((IHttpClient*)inst)->lpVtbl->QueryInterface(inst, iidof(IHttpClient), (void**)&client);
+    if (hr != 0 || client == nullptr) { printf("QI IHttpClient failed: 0x%08X\n", hr); return 4; }
+
+    // GetStringAsync(uri) -> IAsyncOperationWithProgress<String, HttpProgress>.
+    void* op = nullptr;
+    hr = client->GetStringAsync(uri, &op);
+    if (hr != 0 || op == nullptr) { printf("GetStringAsync failed: 0x%08X\n", hr); return 5; }
+
+    i32 status = awaitAsync(op);
+    if (status != 1) {
+        IAsyncInfo* info = nullptr;
+        i32 q = ((IHttpClient*)op)->lpVtbl->QueryInterface(op, iidof(IAsyncInfo), (void**)&info);
+        i32 errCode = 0;
+        if (q == 0 && info != nullptr) { info->get_ErrorCode(&errCode); }
+        printf("async did not complete: status=%d errorcode=0x%08X\n", status, errCode);
+        return 6;
+    }
+
+    void* hBody = nullptr;
+    ((IAsyncOperationWithProgress<string, HttpProgress>*)op)->lpVtbl->GetResults(op, &hBody);
+    string body = fromHString(hBody);
+
+    // Parse and extract the current_weather fields.
+    JsonNode* root = JsonParser.parse(body);
+    // wttr.in j1 shape: current_condition[0].{temp_C, FeelsLikeC, windspeedKmph, weatherDesc[0].value}
+    IJSON cur = root.getArray("current_condition").getObject(0);
+    string temp = cur.getString("temp_C");
+    string feels = cur.getString("FeelsLikeC");
+    string wind = cur.getString("windspeedKmph");
+    string desc = cur.getArray("weatherDesc").getObject(0).getString("value");
+    string area = root.getArray("nearest_area").getObject(0).getArray("areaName").getObject(0).getString("value");
+
+    printf("Weather for %s:\n", area.data());
+    printf("  Conditions:   %s\n", desc.data());
+    printf("  Temperature:  %s C (feels like %s C)\n", temp.data(), feels.data());
+    printf("  Wind speed:   %s km/h\n", wind.data());
+
+    freeHString(hBody);
+    freeHString(hUrl);
+    client->Release();
+    uri->Release();
+    winrtUninit();
+    return 0;
+}

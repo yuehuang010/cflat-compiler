@@ -835,7 +835,7 @@ private:
 
         if (auto* s = compiler->GetSymbolSink())
         {
-            std::string sig = returnType.TypeName + " " + name + "(";
+            std::string sig = returnType.TypeName + (returnType.Pointer ? "*" : "") + " " + name + "(";
             bool first = true;
             for (const auto& p : params)
             {

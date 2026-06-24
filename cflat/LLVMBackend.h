@@ -6762,7 +6762,29 @@ public:
         CreateStructType(thinName, { lp });
         winrtThinInterfaces_.insert(thinName);
         if (auto* s = GetSymbolSink())
+        {
             s->Register(SymbolKind::Struct, thinName, fileForLsp, 0, 0, lspDesc);
+            // Register each real interface method as a "<Interface>.<Method>" member so --symbol
+            // and dot-completion expose the WinRT call surface. `methods` is already the flattened
+            // vtable-order list with the synthetic IUnknown/IInspectable base slots excluded, so
+            // QueryInterface/AddRef/Release never appear here. The signature uses the logical WinRT
+            // spelling (declared return + in/out params), matching how the docs describe the call.
+            for (const cflat_winmd::Method& m : methods)
+            {
+                std::string sig = m.returnType.Spelling() + " " + m.name + "(";
+                bool first = true;
+                for (const cflat_winmd::Param& p : m.params)
+                {
+                    if (!first) sig += ", ";
+                    first = false;
+                    if (p.dir == cflat_winmd::ParamDir::Out) sig += "out ";
+                    sig += p.type.Spelling();
+                    if (!p.name.empty()) sig += " " + p.name;
+                }
+                sig += ")";
+                s->Register(SymbolKind::Function, thinName + "." + m.name, fileForLsp, 0, 0, sig);
+            }
+        }
         return true;
     }
 
