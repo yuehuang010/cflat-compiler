@@ -2512,6 +2512,9 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
         if (verbose)
             std::cout << std::format("[verbose] linker paths: Windows SDK lib root via {} -> {}\n",
                                      sdkFromRegistry ? "KitsRoot10 registry" : "default path", wkLib);
+        // Pick the latest version folder that actually carries ucrt\<arch>. The Lib root also
+        // holds non-version siblings (e.g. 'wdf') and partial installs may lack a given arch;
+        // requiring the ucrt subdir keeps a bogus non-existent path out of the result.
         std::string latestSDK;
         std::error_code ec;
         for (auto it = llvm::sys::fs::directory_iterator(wkLib, ec);
@@ -2519,7 +2522,9 @@ LinkerPaths LLVMBackend::DiscoverLinkerPaths(const std::string& arch, const std:
         {
             if (ec) break;
             auto ver = llvm::sys::path::filename(it->path()).str();
-            if (ver > latestSDK) latestSDK = ver;
+            if (ver <= latestSDK) continue;
+            if (!llvm::sys::fs::exists(wkLib + "\\" + ver + "\\ucrt\\" + arch)) continue;
+            latestSDK = ver;
         }
         if (!latestSDK.empty())
         {
@@ -2583,10 +2588,22 @@ LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::str
 {
     if (auto cached = LoadLinkerPathsFromCache(arch))
     {
+        // A cached empty ucrtLib means an earlier discovery found no Windows SDK (e.g. the
+        // first compile ran before the SDK was installed). AllExist() accepts empty paths, so
+        // such a stale entry would otherwise stick forever - re-prompting for --init even after
+        // the SDK is installed. Only trust an empty ucrtLib when synthetic libs (from --init)
+        // exist to cover it; otherwise fall through to re-discover and pick up a newer SDK.
+        bool emptyUcrtCovered = !cached->ucrtLib.empty()
+            || std::filesystem::exists(std::filesystem::path(GetSyntheticLibDir(arch)) / "ucrt.lib");
+        if (emptyUcrtCovered)
+        {
+            if (verbose)
+                std::cout << std::format("[verbose] linker paths: loaded from cache ({}\\linker_paths_{}.json)\n",
+                                         GetCflatCacheDir(), arch);
+            return *cached;
+        }
         if (verbose)
-            std::cout << std::format("[verbose] linker paths: loaded from cache ({}\\linker_paths_{}.json)\n",
-                                     GetCflatCacheDir(), arch);
-        return *cached;
+            std::cout << "[verbose] linker paths: cached ucrt-lib empty and no synthetic libs; re-discovering\n";
     }
 
     LinkerPaths paths = DiscoverLinkerPaths(arch, runtimeDir, verbose);

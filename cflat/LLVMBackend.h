@@ -4933,6 +4933,12 @@ private:
             linkArgStrs.push_back("/entry:cflat_start");
             linkArgStrs.push_back("/nodefaultlib:msvcrt.lib");
             linkArgStrs.push_back("/nodefaultlib:vcruntime.lib");
+            // _fltused (the MSVC FP-usage marker) is dropped with the VC CRT. The synthetic
+            // ntdll.lib re-exports it, but the Windows SDK's ntdll.lib does not - so on the
+            // SDK-fallback path (no --init) it is unresolved. Redirect it to our private
+            // definition only when nothing else supplies it; /alternatename is a no-op when
+            // _fltused already resolves (synthetic path), avoiding a duplicate symbol.
+            linkArgStrs.push_back("/alternatename:_fltused=__cflat_fltused");
         }
         linkArgStrs.push_back("kernel32.lib");
         linkArgStrs.push_back("ws2_32.lib");

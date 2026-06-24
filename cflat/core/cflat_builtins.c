@@ -17,6 +17,18 @@
 // clang always predefines __SIZE_TYPE__ (correct width per target), so we get it without <stddef.h>.
 typedef __SIZE_TYPE__ size_t;
 
+// The MSVC code generator emits a reference to _fltused in any object that uses floating
+// point, as a marker that pulls the CRT's FP support. The stock CRT (libcmt/msvcrt) defines
+// it; the freestanding link drops those, and the Windows SDK's ucrt.lib/ntdll.lib do not carry
+// it either - so the SDK-fallback link (no --init) fails to resolve it. We provide it under a
+// private name and let the link redirect _fltused to it via /alternatename ONLY when nothing
+// else defines it: the synthetic ntdll.lib (built from ntdll.dll) does export _fltused, so on
+// that path _fltused stays resolved and our fallback is ignored (no duplicate symbol). x64 only:
+// x86 keeps the stock CRT (keepVcRuntime), which already supplies __fltused.
+#if defined(_M_X64)
+int __cflat_fltused = 0x9875;
+#endif
+
 void* memcpy(void* dst, const void* src, size_t n)
 {
     unsigned char* d = (unsigned char*)dst;
