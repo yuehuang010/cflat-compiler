@@ -19,6 +19,7 @@ import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
 extern stdcall i32   RoInitialize(i32 initType);
 extern stdcall void  RoUninitialize();
 extern stdcall i32   RoGetActivationFactory(void* activatableClassId, void* iid, void** factory);
+extern stdcall i32   RoActivateInstance(void* activatableClassId, void** instance);
 extern stdcall i32   WindowsCreateString(u16* sourceString, u32 length, void** hstring);
 extern stdcall i32   WindowsDeleteString(void* hstring);
 extern stdcall u16*  WindowsGetStringRawBuffer(void* hstring, u32* length);
@@ -58,6 +59,29 @@ i32 activationFactory(string className, void* iid, void** out)
     void* h = hstring(className);
     i32 hr = RoGetActivationFactory(h, iid, out);
     freeHString(h);
+    return hr;
+}
+
+// Activate a default-constructable runtime class (one with a parameterless constructor, e.g.
+// HttpClient or JsonObject) and QueryInterface the resulting IInspectable to `iid` (an iidof(T)).
+// This is the RoActivateInstance counterpart to activationFactory, which is instead for classes
+// you construct through a static/factory interface. *out receives the requested interface on
+// success; the intermediate IInspectable is released either way. Returns the first failing HRESULT.
+// The IAsyncInfo* cast is only a vtable shape to reach QueryInterface/Release - slots 0 and 2 are
+// identical across every WinRT vtable (same trick as awaitAsync).
+//
+//   IHttpClient* client = nullptr;
+//   activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), (void**)&client);
+i32 activateInstance(string className, void* iid, void** out)
+{
+    void* h = hstring(className);
+    void* inst = nullptr;
+    i32 hr = RoActivateInstance(h, &inst);
+    freeHString(h);
+    if (hr != 0 || inst == nullptr) return hr;
+
+    hr = ((IAsyncInfo*)inst)->lpVtbl->QueryInterface(inst, iid, out);
+    ((IAsyncInfo*)inst)->lpVtbl->Release(inst);
     return hr;
 }
 
