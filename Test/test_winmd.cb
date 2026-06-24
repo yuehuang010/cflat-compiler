@@ -331,6 +331,56 @@ bool testUsingAliasOfWinmdGeneric()
     return result;
 }
 
+// === ComPtr<T> RAII: own a real activation factory, borrow via .get(), drop at scope end ===
+//
+// Acquires IPropertyValueStatics into a ComPtr via put(), boxes an Int32 through a live .get() call,
+// QIs the box into a SECOND ComPtr, reads the value back, then lets both ComPtrs fall out of scope.
+// The owning-value/move machinery must Release each underlying interface exactly once - no leak, no
+// double-free. The value surviving the scope drop (read back == 7777 afterward) is the functional
+// proof that release happened cleanly without corrupting state.
+bool testComPtrRaii()
+{
+    bool result = true;
+
+    int boxedValue = 0;
+    {
+        // put() now returns a typed T**; activationFactory takes void**, so cast at the call site.
+        ComPtr<IPropertyValueStatics> factory = default;
+        i32 hr = activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)factory.put());
+        result &= Test("comptr_activation_hr", (hr == 0 && factory.valid()) ? 1 : 0, 1);
+        if (hr != 0 || !factory.valid()) return false;
+
+        // .get() borrows the raw pointer for a live vtable call; the ComPtr keeps ownership.
+        void* boxed = nullptr;
+        factory.get()->CreateInt32(7777, &boxed);
+        result &= Test("comptr_box_nonnull", boxed != nullptr ? 1 : 0, 1);
+
+        // tryAs() QIs `boxed` into the holder and keeps the HRESULT - one call replacing the manual
+        // QueryInterface(iid, (void**)&out) dance. The IID is named at the call site (iidof needs a
+        // concrete type). The OS accepting the derived PIID and the value reading back prove the QI
+        // landed a live IReference<int> in the holder.
+        ComPtr<IReference<int>> refInt = default;
+        i32 qi = refInt.tryAs(boxed, iidof(IReference<int>));
+        result &= Test("comptr_qi_accepted", (qi == 0 && refInt.valid()) ? 1 : 0, 1);
+        if (qi == 0 && refInt.valid())
+        {
+            int value = default;
+            refInt.get()->get_Value(&value);
+            boxedValue = value;
+        }
+
+        // reset() releases the held ref early and empties the holder; valid() must be false and the
+        // end-of-scope dtor becomes a no-op (one Release total - asan would flag a double-release).
+        refInt.reset();
+        result &= Test("comptr_reset_clears", refInt.valid() ? 1 : 0, 0);
+
+        ((IReference<int>*)boxed)->lpVtbl->Release(boxed);
+    }   // factory releases exactly once here; refInt was already reset.
+
+    result &= Test("comptr_ref_value", boxedValue, 7777);
+    return result;
+}
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED
@@ -345,6 +395,7 @@ extern int main()
     total++; passed += testUsingAliasOfWinmdGeneric()    ? 1 : 0;
     total++; passed += testForeachCollection()          ? 1 : 0;
     total++; passed += testAsyncRoundtrip()             ? 1 : 0;
+    total++; passed += testComPtrRaii()                 ? 1 : 0;
 
     winrtUninit();
 

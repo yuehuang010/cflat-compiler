@@ -94,3 +94,76 @@ Guid IID_IAgileObject()
                      (u8)0xC0, (u8)0xFF, (u8)0xEE, (u8)0x64,
                      (u8)0xCA, (u8)0x8F, (u8)0x5B, (u8)0x90);
 }
+
+// ===== IUnknown - the minimal, winmd-free COM root =====
+// Every COM object (header-COM/DirectX or winmd-projected alike) starts its vtable with the same
+// three IUnknown slots in the same order, so this hand-declared shape can drive any of them:
+//   slot 0 QueryInterface, slot 1 AddRef, slot 2 Release - byte-identical across all COM vtables.
+// Each field is a thin `function<...>` (a bare C function pointer, 8 bytes), so the vtable layout
+// matches a real COM vtable exactly. Dispatch through it explicitly: ((IUnknown*)p)->lpVtbl->Release(p).
+struct IUnknownVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface = nullptr;
+    function<u32(void*)>                AddRef         = nullptr;
+    function<u32(void*)>                Release        = nullptr;
+};
+
+struct IUnknown
+{
+    IUnknownVtbl* lpVtbl = nullptr;
+};
+
+// ComPtr<T> - an owning RAII holder for a COM/WinRT interface pointer. Having a destructor makes it
+// an owning value type, so it is move-by-default: `ComPtr<T> b = a` transfers the pointer and zeroes
+// `a`, and the destructor Releases exactly once across moves and early returns - no hand-written
+// Release() calls. It is winmd-free: Release/QueryInterface dispatch through the hand-declared
+// IUnknown above (slots 2/0), so header-COM/DirectX consumers can use it without any winmd import.
+class ComPtr<T>
+{
+    T* ptr = default;
+
+    // Borrow the raw pointer for a method call; no ref transfer (caller must not Release it).
+    T* get() { return ptr; }
+
+    bool valid() { return ptr != nullptr; }
+
+    // Release any held pointer and null the slot, without leaving the holder. Lets a caller drop the
+    // ref early (before winrtUninit, say) instead of wrapping the lifetime in an artificial { } scope.
+    void reset()
+    {
+        if (ptr != nullptr) ((IUnknown*)ptr)->lpVtbl->Release(ptr);
+        ptr = nullptr;
+    }
+
+    // Out-param sink for `api->Method(args, comptr.put())`: drop any existing ref, then hand back the
+    // typed address of the internal slot (T**) so a winmd method's typed out-param needs no cast. For
+    // a void** out-param (activationFactory/QueryInterface), cast the result: (void**)comptr.put().
+    T** put()
+    {
+        reset();
+        return &ptr;
+    }
+
+    // QueryInterface `src` into this holder; returns the HRESULT (check with FAILED()). Releases any
+    // pointer already held, then writes the queried interface into the slot. Pass the target IID as
+    // iidof(T) at the call site - iidof needs a concrete type, so it cannot be derived from the bare
+    // generic parameter T here. The void** cast adapts put()'s typed T** to QueryInterface's void**.
+    i32 tryAs(void* src, void* iid)
+    {
+        reset();
+        return ((IUnknown*)src)->lpVtbl->QueryInterface(src, iid, (void**)put());
+    }
+
+    // Transfer ownership OUT: capture the raw, null the slot so the dtor will not Release, return raw.
+    T* detach()
+    {
+        T* raw = ptr;
+        this.ptr = nullptr;
+        return raw;
+    }
+
+    ~ComPtr()
+    {
+        reset();
+    }
+};

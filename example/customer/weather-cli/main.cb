@@ -24,24 +24,29 @@ extern int main()
 
     string url = "http://wttr.in/Berlin?format=j1";
 
-    // Build a Windows.Foundation.Uri from the URL string.
-    IUriRuntimeClassFactory* uriFactory = nullptr;
-    i32 hr = activationFactory("Windows.Foundation.Uri", iidof(IUriRuntimeClassFactory), &uriFactory);
-    if (hr != 0 || uriFactory == nullptr) { printf("Uri factory failed: 0x%08X\n", hr); return 1; }
+    // The three ComPtr<T> holders own their interfaces; early returns drop them via the destructor
+    // (the old code leaked on those error paths). On the success path reset() releases them before
+    // winrtUninit, so ownership is explicit without wrapping the body in an artificial { } scope.
+
+    // Build a Windows.Foundation.Uri from the URL string. put() returns T**; activationFactory takes
+    // void**, so cast at the call. CreateUri's typed IUriRuntimeClass** out-param needs no cast.
+    ComPtr<IUriRuntimeClassFactory> uriFactory = default;
+    i32 hr = activationFactory("Windows.Foundation.Uri", iidof(IUriRuntimeClassFactory), (void**)uriFactory.put());
+    if (hr != 0 || !uriFactory.valid()) { printf("Uri factory failed: 0x%08X\n", hr); return 1; }
 
     HSTRING hUrl = hstring(url);
-    IUriRuntimeClass* uri = nullptr;
-    hr = uriFactory->CreateUri(hUrl, &uri);
-    if (hr != 0 || uri == nullptr) { printf("CreateUri failed: 0x%08X\n", hr); return 2; }
+    ComPtr<IUriRuntimeClass> uri = default;
+    hr = uriFactory.get()->CreateUri(hUrl, uri.put());
+    if (hr != 0 || !uri.valid()) { printf("CreateUri failed: 0x%08X\n", hr); return 2; }
 
     // HttpClient has a default constructor; activate it directly and QI for IHttpClient.
-    IHttpClient* client = nullptr;
-    hr = activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), &client);
-    if (hr != 0 || client == nullptr) { printf("activate IHttpClient failed: 0x%08X\n", hr); return 4; }
+    ComPtr<IHttpClient> client = default;
+    hr = activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), (void**)client.put());
+    if (hr != 0 || !client.valid()) { printf("activate IHttpClient failed: 0x%08X\n", hr); return 4; }
 
-    // GetStringAsync(uri) -> StringOp; the out-param and dispatch are now fully typed, no void*.
+    // GetStringAsync(uri) -> StringOp; .get() borrows the raw IUriRuntimeClass* for the call.
     StringOp* op = nullptr;
-    hr = client->GetStringAsync(uri, &op);
+    hr = client.get()->GetStringAsync(uri.get(), &op);
     if (hr != 0 || op == nullptr) { printf("GetStringAsync failed: 0x%08X\n", hr); return 5; }
 
     i32 status = awaitAsync(op);
@@ -71,8 +76,12 @@ extern int main()
 
     freeHString(hBody);
     freeHString(hUrl);
-    client->Release();
-    uri->Release();
+
+    // Release the COM interfaces explicitly before tearing down the apartment.
+    client.reset();
+    uri.reset();
+    uriFactory.reset();
+
     winrtUninit();
     return 0;
 }
