@@ -1134,9 +1134,19 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (ext == ".c")
             return CompileCFile(canonicalStr, programAlias);
         // WinRT metadata: read the .winmd and register its interfaces/structs/enums as CFlat
-        // types (consume side). Not parsed by the CFlat parser; no object is linked.
+        // types (consume side). Not parsed by the CFlat parser; no object is linked. An inline
+        // `lib { "RuntimeObject.lib", "ole32.lib" }` clause names the import libs the projected
+        // WinRT APIs need at link time - WinRT has no header to hang them on, so the .winmd
+        // import is their home. Resolve each onto the link line, same as the .h branch below.
         if (ext == ".winmd")
+        {
+            for (const auto& explicitLib : explicitLibs)
+            {
+                if (explicitLib.empty()) continue;
+                cLinkLibs_.push_back(ResolveCLinkLib(explicitLib, importingFilePath));
+            }
             return CompileWinmdFile(canonicalStr);
+        }
         // A C header (real C, not CFlat): extract declarations + enums via clang's
         // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
         if (ext == ".h" || ext == ".hpp" || ext == ".hh")

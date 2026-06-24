@@ -1,0 +1,115 @@
+// wstring.cb - an owned UTF-16 string for Win32 wide-char (`...W`) and WinRT APIs.
+//
+// `string` is UTF-8 (byte-oriented). Windows wide APIs want UTF-16 (`wchar_t`, 16-bit on
+// Windows), so this is its UTF-16 complement: a value type holding a heap buffer of u16 code
+// units and a count.
+//   u16* data()   - pointer to the NUL-terminated UTF-16 code units
+//   i32  length() - number of code units, not counting the terminator
+//
+// Ownership: every wstring owns its heap buffer and frees it on scope exit (the `~wstring`
+// destructor makes it an owning value type, so it is also move-by-default: `wstring b = a`
+// transfers the buffer and consumes `a`; use `b = a.copy()` for an independent copy). There is
+// no borrowed form - unlike `string`, a wstring is never produced by the compiler (no wide
+// literals), so it has no special compiler support; it is a pure library type.
+//
+// Conversion is a real UTF-8 <-> UTF-16 transcode (surrogate pairs and all) via the OS, NOT a
+// byte-widen, so non-ASCII text round-trips correctly.
+
+import "string.cb";
+
+// kernel32 (always linked): UTF-8 <-> UTF-16 transcoding. CodePage 65001 = CP_UTF8.
+extern stdcall i32 MultiByteToWideChar(u32 codePage, u32 flags, i8* mbStr, i32 mbBytes, u16* wideStr, i32 wideChars);
+extern stdcall i32 WideCharToMultiByte(u32 codePage, u32 flags, u16* wideStr, i32 wideChars, i8* mbStr, i32 mbBytes, i8* defaultChar, i32* usedDefault);
+
+struct wstring
+{
+    u16* _ptr = nullptr;
+    i32  _len = 0;     // UTF-16 code-unit count, not counting the NUL terminator
+
+    u16* data()   { return _ptr; }
+    i32  length() { return _len; }
+
+    // Copy `len` UTF-16 code units from a borrowed buffer into an owned wstring. Used to take
+    // ownership of a transient UTF-16 pointer (e.g. WindowsGetStringRawBuffer's HSTRING buffer).
+    static move wstring fromUtf16(u16* src, i32 len)
+    {
+        wstring w = default;
+        if (src == nullptr || len <= 0) return w;
+        u16* buf = new u16[len + 1];
+        i32 i = 0;
+        while (i < len) { buf[i] = src[i]; i = i + 1; }
+        buf[len] = (u16)0;
+        w._ptr = buf;
+        w._len = len;
+        return w;
+    }
+
+    // UTF-16 -> owned UTF-8 `string`.
+    move string toString()
+    {
+        if (_ptr == nullptr || _len == 0)
+        {
+            i8* empty = new i8[1];
+            empty[0] = (i8)0;
+            return _strOwned(move empty, 0);
+        }
+        i32 mbLen = WideCharToMultiByte((u32)65001, (u32)0, _ptr, _len, nullptr, 0, nullptr, nullptr);
+        if (mbLen <= 0)
+        {
+            i8* empty = new i8[1];
+            empty[0] = (i8)0;
+            return _strOwned(move empty, 0);
+        }
+        i8* buf = new i8[mbLen + 1];
+        WideCharToMultiByte((u32)65001, (u32)0, _ptr, _len, buf, mbLen, nullptr, nullptr);
+        buf[mbLen] = (i8)0;
+        return _strOwned(move buf, mbLen);
+    }
+
+    // Independent owned copy of self.
+    move wstring copy()
+    {
+        return wstring.fromUtf16(_ptr, _len);
+    }
+
+    ~wstring()
+    {
+        if (_ptr != nullptr) delete[] _ptr;
+    }
+};
+
+// UTF-8 `string` -> owned UTF-16 wstring (an empty input yields an empty wstring). Named so it
+// reads as `s.toWString()`, mirroring `value.toString()`; `from` is unavailable as a method name
+// (it is the import-clause soft keyword).
+move wstring toWString(string s)
+{
+    wstring w = default;
+    i32 mbLen = s.length();
+    if (mbLen == 0) return w;
+    i32 wlen = MultiByteToWideChar((u32)65001, (u32)0, s.data(), mbLen, nullptr, 0);
+    if (wlen <= 0) return w;
+    u16* buf = new u16[wlen + 1];
+    MultiByteToWideChar((u32)65001, (u32)0, s.data(), mbLen, buf, wlen);
+    buf[wlen] = (u16)0;
+    w._ptr = buf;
+    w._len = wlen;
+    return w;
+}
+
+// Code-unit-wise equality (length then content).
+bool operator==(wstring a, wstring b)
+{
+    if (a._len != b._len) return false;
+    i32 i = 0;
+    while (i < a._len)
+    {
+        if (a._ptr[i] != b._ptr[i]) return false;
+        i = i + 1;
+    }
+    return true;
+}
+
+bool operator!=(wstring a, wstring b)
+{
+    return !(a == b);
+}

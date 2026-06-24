@@ -10,26 +10,16 @@
 // Build:  x64/Debug/cflat.exe Test/test_winmd.cb -i Test/library -o out/test_winmd.exe
 // Run:    out\test_winmd.exe
 
-import "Windows.Foundation.winmd";   // PropertyValue, IReference`1, IIterable`1 / IIterator`1
 import "Windows.Data.winmd";         // JsonArray, IJsonValue, IJsonArrayStatics
+import "Windows.Storage.winmd";      // IPathIOStatics - async file round-trip (IAsyncOperation`1)
 
-// roapi.h (RoInitialize/RoGetActivationFactory) and winstring.h (WindowsCreateString/...) are
-// real WinRT SDK headers - import them so their prototypes are auto-externed; no hand-written
-// decls. The .winmd files above resolve by bare name from %SystemRoot%\System32\WinMetadata.
-import { "windows.h", "roapi.h", "winstring.h" } lib { "RuntimeObject.lib", "ole32.lib" } cache;
+// winrt.cb pulls Windows.Foundation.winmd (PropertyValue, IReference`1, IIterable`1, IAsync*) +
+// the WinRT import libs, and supplies hstring/activationFactory/awaitAsync/winrtInit. windows.h
+// supplies the kernel32 calls the async test uses (GetTempPathW/CreateFileW/CloseHandle).
+import "winrt.cb";
+import "windows.h" cache;
 import "test_helper.cb";
 import "guid.cb";
-
-// Widen an ASCII cflat string into a UTF-16 HSTRING (every input here is pure ASCII).
-void* MakeHString(string s)
-{
-    u16[128] wbuf = default;
-    int i = 0;
-    while (i < s.length()) { wbuf[i] = (u16)s.data()[i]; i = i + 1; }
-    void* h = nullptr;
-    WindowsCreateString(&wbuf[0], (u32)s.length(), &h);
-    return h;
-}
 
 // === iidof byte-exactness: a stored IID and a DERIVED parameterized IID (no OS needed) ===
 //
@@ -70,11 +60,10 @@ bool testLiveParameterizedRoundtrip()
 {
     bool result = true;
 
-    void* hClass = MakeHString("Windows.Foundation.PropertyValue");
     IPropertyValueStatics* factory = nullptr;
-    i32 hr = RoGetActivationFactory(hClass, iidof(IPropertyValueStatics), (void**)&factory);
+    i32 hr = activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&factory);
     result &= Test("winmd_activation_hr", (hr == 0 && factory != nullptr) ? 1 : 0, 1);
-    if (hr != 0 || factory == nullptr) { WindowsDeleteString(hClass); return false; }
+    if (hr != 0 || factory == nullptr) return false;
 
     // Box an Int32 -> IInspectable, QI for IReference<int>, read the value back. This path uses the
     // `recv->Method(args)` sugar: a vtable-slot name routes through lpVtbl AND the receiver is passed
@@ -114,7 +103,6 @@ bool testLiveParameterizedRoundtrip()
     ((IReference<bool>*)boxedBool)->lpVtbl->Release(boxedBool);
 
     factory->lpVtbl->Release(factory);
-    WindowsDeleteString(hClass);
     return result;
 }
 
@@ -127,13 +115,12 @@ bool testForeachCollection()
 {
     bool result = true;
 
-    void* hClass = MakeHString("Windows.Data.Json.JsonArray");
     IJsonArrayStatics* factory = nullptr;
-    i32 hr = RoGetActivationFactory(hClass, iidof(IJsonArrayStatics), (void**)&factory);
+    i32 hr = activationFactory("Windows.Data.Json.JsonArray", iidof(IJsonArrayStatics), (void**)&factory);
     result &= Test("winmd_json_activation_hr", (hr == 0 && factory != nullptr) ? 1 : 0, 1);
-    if (hr != 0 || factory == nullptr) { WindowsDeleteString(hClass); return false; }
+    if (hr != 0 || factory == nullptr) return false;
 
-    void* hJson = MakeHString("[10,20,30]");
+    void* hJson = hstring("[10,20,30]");
     IJsonArray* arr = nullptr;
     i32 parseHr = factory->lpVtbl->Parse(factory, hJson, (void**)&arr);
     result &= Test("winmd_json_parse_hr", (parseHr == 0 && arr != nullptr) ? 1 : 0, 1);
@@ -154,23 +141,154 @@ bool testForeachCollection()
     }
 
     factory->lpVtbl->Release(factory);
-    WindowsDeleteString(hJson);
-    WindowsDeleteString(hClass);
+    freeHString(hJson);
+    return result;
+}
+
+// === WinRT async via polling: IAsyncAction + IAsyncOperation<String> through PathIO ===
+//
+// Drives a real WinRT async file round-trip without a completion-handler delegate. Proves the
+// generic IAsyncOperation`1 template instantiates on demand (deriving a PIID like IReference<T>)
+// and that IAsyncAction / IAsyncInfo project as plain interfaces. PathIO opens an existing file,
+// so a Win32 CreateFileW pre-creates the empty target.
+bool testAsyncRoundtrip()
+{
+    bool result = true;
+
+    u16[260] pathBuf = default;
+    u32 baseLen = GetTempPathW(260, &pathBuf[0]);
+    string fname = "cflat_winmd_async_test.txt";
+    int j = 0;
+    while (j < fname.length()) { pathBuf[baseLen + (u32)j] = (u16)fname.data()[j]; j = j + 1; }
+    u32 pathLen = baseLen + (u32)fname.length();
+    void* hPath = nullptr;
+    WindowsCreateString(&pathBuf[0], pathLen, &hPath);
+
+    IPathIOStatics* pathIO = nullptr;
+    i32 hr = activationFactory("Windows.Storage.PathIO", iidof(IPathIOStatics), (void**)&pathIO);
+    result &= Test("winmd_async_activation_hr", (hr == 0 && pathIO != nullptr) ? 1 : 0, 1);
+    if (hr != 0 || pathIO == nullptr) { freeHString(hPath); return false; }
+
+    void* hFile = CreateFileW(&pathBuf[0], 0x40000000, 0, nullptr, 2, 0x80, nullptr);
+    CloseHandle(hFile);
+
+    string content = "hello from cflat async";
+    void* hContent = hstring(content);
+
+    void* writeOp = nullptr;
+    hr = pathIO->WriteTextAsync(hPath, hContent, &writeOp);
+    i32 wStatus = (hr == 0 && writeOp != nullptr) ? awaitAsync(writeOp) : -1;
+    if (writeOp != nullptr)
+    {
+        ((IAsyncAction*)writeOp)->lpVtbl->GetResults(writeOp);
+        ((IAsyncAction*)writeOp)->lpVtbl->Release(writeOp);
+    }
+    result &= Test("winmd_async_write_completed", wStatus, 1);
+
+    void* readOp = nullptr;
+    hr = pathIO->ReadTextAsync(hPath, &readOp);
+    i32 rStatus = (hr == 0 && readOp != nullptr) ? awaitAsync(readOp) : -1;
+    void* hOut = nullptr;
+    if (readOp != nullptr)
+    {
+        ((IAsyncOperation<string>*)readOp)->lpVtbl->GetResults(readOp, &hOut);
+        ((IAsyncOperation<string>*)readOp)->lpVtbl->Release(readOp);
+    }
+    result &= Test("winmd_async_read_completed", rStatus, 1);
+
+    string readBack = fromHString(hOut);
+    result &= Test("winmd_async_roundtrip_text", (readBack == content) ? 1 : 0, 1);
+
+    pathIO->lpVtbl->Release(pathIO);
+    freeHString(hOut);
+    freeHString(hContent);
+    freeHString(hPath);
+    return result;
+}
+
+// === wstring unit coverage: real UTF-8 <-> UTF-16 transcode + move/copy/equality ===
+//
+// Proves wstring transcodes (BMP path here) rather than byte-widening: a 3-byte UTF-8 euro sign
+// U+20AC must become a SINGLE UTF-16 code unit 0x20AC (a byte-widen would wrongly yield 3 units).
+// Non-ASCII inputs are built from raw bytes so this source file stays ASCII.
+bool testWString()
+{
+    bool result = true;
+
+    // ASCII round-trips: code-unit length, and identical bytes back.
+    string ascii = "hello wstring";
+    wstring wa = ascii.toWString();
+    result &= Test("wstring_ascii_len", wa.length(), 13);
+    result &= Test("wstring_ascii_roundtrip", (wa.toString() == ascii) ? 1 : 0, 1);
+
+    // U+20AC EURO SIGN: UTF-8 E2 82 AC (3 bytes) -> one UTF-16 unit 0x20AC -> 3 bytes back.
+    i8[4] eu = default;
+    eu[0] = (i8)0xE2; eu[1] = (i8)0x82; eu[2] = (i8)0xAC; eu[3] = (i8)0;
+    string euro = (string)&eu[0];
+    wstring we = euro.toWString();
+    result &= Test("wstring_utf8_to_one_unit", we.length(), 1);
+    result &= Test("wstring_utf8_unit_value", (int)we.data()[0], 0x20AC);
+    result &= Test("wstring_utf16_to_utf8_len", we.toString().length(), 3);
+
+    // Empty input -> empty wstring -> empty string.
+    string emptyStr = "";
+    wstring wem = emptyStr.toWString();
+    result &= Test("wstring_empty_len", wem.length(), 0);
+    result &= Test("wstring_empty_roundtrip", wem.toString().isEmpty() ? 1 : 0, 1);
+
+    // fromUtf16 copies a borrowed buffer; copy() is independent; equality is code-unit-wise.
+    u16[3] units = default;
+    units[0] = (u16)65; units[1] = (u16)66; units[2] = (u16)67;   // "ABC"
+    wstring wf = wstring.fromUtf16(&units[0], 3);
+    result &= Test("wstring_fromUtf16_text", (wf.toString() == "ABC") ? 1 : 0, 1);
+    result &= Test("wstring_neq", (wf == wa) ? 1 : 0, 0);
+    wstring wc = wa.copy();
+    result &= Test("wstring_copy_equal", (wc == wa) ? 1 : 0, 1);
+
+    // Move-by-default: `wstring m = src` transfers the buffer (single free; no leak/double-free).
+    wstring src = ascii.toWString();
+    wstring m = src;
+    result &= Test("wstring_move_len", m.length(), 13);
+
+    return result;
+}
+
+// === HSTRING bridge via winrt.cb: string -> HSTRING -> string round-trips (ASCII + non-ASCII) ===
+bool testWinrtBridge()
+{
+    bool result = true;
+
+    void* h = hstring("bridge round-trip");
+    string back = fromHString(h);
+    freeHString(h);
+    result &= Test("winrt_hstring_bridge", (back == "bridge round-trip") ? 1 : 0, 1);
+
+    i8[4] eu = default;
+    eu[0] = (i8)0xE2; eu[1] = (i8)0x82; eu[2] = (i8)0xAC; eu[3] = (i8)0;   // U+20AC euro
+    string euro = (string)&eu[0];
+    void* he = hstring(euro);
+    string backe = fromHString(he);
+    freeHString(he);
+    result &= Test("winrt_hstring_nonascii", (backe == euro) ? 1 : 0, 1);
+
     return result;
 }
 
 extern int main()
 {
-    RoInitialize(1);   // RO_INIT_MULTITHREADED
+    winrtInit();   // RO_INIT_MULTITHREADED
 
     int passed = 0;
     int total  = 0;
 
+    total++; passed += testWString()                    ? 1 : 0;
+    total++; passed += testWinrtBridge()                ? 1 : 0;
     total++; passed += testIidofByteExact()            ? 1 : 0;
     total++; passed += testLiveParameterizedRoundtrip() ? 1 : 0;
     total++; passed += testForeachCollection()          ? 1 : 0;
+    total++; passed += testAsyncRoundtrip()             ? 1 : 0;
 
-    RoUninitialize();
+    winrtUninit();
 
     printf("WinMD consume-side tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

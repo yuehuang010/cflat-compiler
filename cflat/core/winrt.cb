@@ -1,0 +1,94 @@
+// winrt.cb - WinRT runtime plumbing every consume-side program repeats: the HSTRING bridge,
+// activation, apartment lifecycle, and async polling. Built on wstring.cb for correct UTF-8 <->
+// UTF-16 transcoding.
+//
+// Importing this also imports Windows.Foundation.winmd (the foundation every WinRT API builds on:
+// IReference`1, IIterable`1, IAsync*, ...) AND links the WinRT import libs, so a consumer needs
+// only `import "winrt.cb";` plus the .winmd of whatever specific API it calls - no `lib { ... }`
+// clause of its own.
+//
+//   import "winrt.cb";
+//   winrtInit();
+//   IFooStatics* f = nullptr;
+//   activationFactory("Windows.Foo.Bar", iidof(IFooStatics), (void**)&f);
+
+import "wstring.cb";
+import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
+
+// combase.dll (via RuntimeObject.lib / ole32.lib).
+extern stdcall i32   RoInitialize(i32 initType);
+extern stdcall void  RoUninitialize();
+extern stdcall i32   RoGetActivationFactory(void* activatableClassId, void* iid, void** factory);
+extern stdcall i32   WindowsCreateString(u16* sourceString, u32 length, void** hstring);
+extern stdcall i32   WindowsDeleteString(void* hstring);
+extern stdcall u16*  WindowsGetStringRawBuffer(void* hstring, u32* length);
+
+// kernel32 (always linked) - back off between async status polls. Matches windows.h's Sleep(DWORD).
+extern stdcall void  Sleep(u32 ms);
+
+// UTF-8 string -> HSTRING. WindowsCreateString copies the buffer, so the temporary wstring is
+// free to be destructed on return. The caller owns the HSTRING and must freeHString it.
+void* hstring(string s)
+{
+    wstring w = s.toWString();
+    void* h = nullptr;
+    WindowsCreateString(w.data(), (u32)w.length(), &h);
+    return h;
+}
+
+// HSTRING -> owned UTF-8 string (reuses wstring's UTF-16 -> UTF-8 transcode).
+move string fromHString(void* h)
+{
+    u32 len = 0;
+    u16* raw = WindowsGetStringRawBuffer(h, &len);
+    wstring w = wstring.fromUtf16(raw, (i32)len);
+    return w.toString();
+}
+
+// Release an HSTRING created by hstring().
+void freeHString(void* h)
+{
+    WindowsDeleteString(h);
+}
+
+// Build the class-name HSTRING, fetch the activation factory for `iid` (an iidof(TFactory)),
+// free the HSTRING, and return the HRESULT. *out receives the factory on success.
+i32 activationFactory(string className, void* iid, void** out)
+{
+    void* h = hstring(className);
+    i32 hr = RoGetActivationFactory(h, iid, out);
+    freeHString(h);
+    return hr;
+}
+
+// Apartment lifecycle. 1 == RO_INIT_MULTITHREADED.
+void winrtInit()   { RoInitialize(1); }
+void winrtUninit() { RoUninitialize(); }
+
+// Block until an async object (IAsyncAction* or IAsyncOperation<T>*) leaves the Started state,
+// with no completion-handler delegate. QueryInterface to IAsyncInfo (slot 0 QI is identical
+// across every WinRT vtable) and poll get_Status. Returns the terminal AsyncStatus (Started=0,
+// Completed=1, Canceled=2, Error=3), or -1 if IAsyncInfo could not be obtained. The ~20s poll
+// ceiling stops a stuck op hanging.
+//
+//   void* op = nullptr;
+//   factory->ReadTextAsync(hPath, &op);          // -> IAsyncOperation<String>
+//   if (awaitAsync(op) == 1) { ((IAsyncOperation<string>*)op)->lpVtbl->GetResults(op, &h); }
+i32 awaitAsync(void* asyncObj)
+{
+    IAsyncInfo* info = nullptr;
+    i32 qi = ((IAsyncInfo*)asyncObj)->lpVtbl->QueryInterface(asyncObj, iidof(IAsyncInfo), (void**)&info);
+    if (qi != 0 || info == nullptr) return -1;
+
+    i32 status = 0;
+    int guard = 0;
+    while (guard < 20000)
+    {
+        info->get_Status(&status);
+        if (status != 0) break;
+        Sleep((u32)1);
+        guard = guard + 1;
+    }
+    info->lpVtbl->Release(info);
+    return status;
+}

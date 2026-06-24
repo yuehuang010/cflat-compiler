@@ -1,0 +1,100 @@
+// winrt_async_demo.cb - consume a WinRT *async* API end-to-end by polling.
+//
+// Most of the useful WinRT surface is asynchronous: a method hands back an IAsyncAction (no
+// result) or an IAsyncOperation<T> (a future T), and the caller waits for it to finish. This
+// demo drives both, without any completion-handler delegate, by polling with awaitAsync (from
+// winrt_async.cb) until the operation leaves the Started state - the simplest correct way to
+// consume async.
+//
+// It round-trips a file through Windows.Storage.PathIO entirely in WinRT:
+//   WriteTextAsync(path, text) -> IAsyncAction            (wait, then GetResults surfaces errors)
+//   ReadTextAsync(path)        -> IAsyncOperation<String> (wait, then GetResults yields the text)
+// PathIO takes plain path strings, so no StorageFile/StorageFolder projection is needed. PathIO
+// opens an *existing* file (it does GetFileFromPathAsync internally), so we pre-create an empty
+// target with one Win32 CreateFileW call before the async write.
+//
+// IAsyncOperation<String> is NOT in metadata; CFlat synthesizes its vtable + parameterized IID
+// on demand from the generic IAsyncOperation`1 template in Windows.Foundation.winmd, exactly as
+// it does for IReference<int>. The HSTRING/activation/await boilerplate lives in core winrt.cb /
+// winrt_async.cb; this file is just the async logic.
+//
+// Build:  x64/Debug/cflat.exe example/COM/winrt_async_demo.cb -o out/winrt_async_demo.exe
+// Run:    out\winrt_async_demo.exe
+
+import "winrt.cb";                // hstring/activationFactory/awaitAsync + Windows.Foundation.winmd + WinRT libs
+import "Windows.Storage.winmd";   // IPathIOStatics (the PathIO activation factory)
+import "windows.h" cache;         // kernel32: GetTempPathW, CreateFileW, CloseHandle
+
+extern int main()
+{
+    winrtInit();   // RO_INIT_MULTITHREADED
+
+    // Build an absolute path in the user temp dir: GetTempPathW gives "...\\" (trailing slash).
+    u16[260] pathBuf = default;
+    u32 baseLen = GetTempPathW(260, &pathBuf[0]);
+    string fname = "cflat_async_demo.txt";
+    int j = 0;
+    while (j < fname.length()) { pathBuf[baseLen + (u32)j] = (u16)fname.data()[j]; j = j + 1; }
+    void* hPath = nullptr;
+    WindowsCreateString(&pathBuf[0], baseLen + (u32)fname.length(), &hPath);
+
+    // Activate the PathIO static methods (a plain imported interface; iidof reads its stored IID).
+    IPathIOStatics* pathIO = nullptr;
+    i32 hr = activationFactory("Windows.Storage.PathIO", iidof(IPathIOStatics), (void**)&pathIO);
+    if (hr != 0 || pathIO == nullptr)
+    {
+        printf("activationFactory(PathIO) failed: hr=0x%08X\n", hr);
+        return 1;
+    }
+
+    // Pre-create an empty target file (GENERIC_WRITE=0x40000000, CREATE_ALWAYS=2,
+    // FILE_ATTRIBUTE_NORMAL=0x80) so PathIO.WriteTextAsync has an existing file to open.
+    void* hFile = CreateFileW(&pathBuf[0], 0x40000000, 0, nullptr, 2, 0x80, nullptr);
+    CloseHandle(hFile);
+
+    string content = "hello from cflat async";
+    void* hContent = hstring(content);
+
+    // --- WriteTextAsync -> IAsyncAction (no result) ---
+    void* writeOp = nullptr;
+    hr = pathIO->WriteTextAsync(hPath, hContent, &writeOp);
+    if (hr != 0 || writeOp == nullptr)
+    {
+        printf("WriteTextAsync launch failed: hr=0x%08X\n", hr);
+        return 2;
+    }
+    i32 wStatus = awaitAsync(writeOp);
+    ((IAsyncAction*)writeOp)->lpVtbl->GetResults(writeOp);   // surfaces a deferred write error
+    ((IAsyncAction*)writeOp)->lpVtbl->Release(writeOp);
+    printf("WriteTextAsync -> status=%d (1=Completed)\n", wStatus);
+
+    // --- ReadTextAsync -> IAsyncOperation<String> (a future String) ---
+    void* readOp = nullptr;
+    hr = pathIO->ReadTextAsync(hPath, &readOp);
+    if (hr != 0 || readOp == nullptr)
+    {
+        printf("ReadTextAsync launch failed: hr=0x%08X\n", hr);
+        return 3;
+    }
+    i32 rStatus = awaitAsync(readOp);
+
+    void* hOut = nullptr;
+    ((IAsyncOperation<string>*)readOp)->lpVtbl->GetResults(readOp, &hOut);
+    ((IAsyncOperation<string>*)readOp)->lpVtbl->Release(readOp);
+    printf("ReadTextAsync  -> status=%d (1=Completed)\n", rStatus);
+
+    // Read the HSTRING back into a string and compare against what we wrote.
+    string readBack = fromHString(hOut);
+    bool match = (readBack == content);
+
+    pathIO->lpVtbl->Release(pathIO);
+    freeHString(hOut);
+    freeHString(hContent);
+    freeHString(hPath);
+    winrtUninit();
+
+    bool ok = (wStatus == 1) && (rStatus == 1) && match;
+    printf("%s\n", ok ? "PASS: WinRT async round-trip read back the written text"
+                      : "FAIL: async round-trip mismatch");
+    return ok ? 0 : 4;
+}
