@@ -15,6 +15,9 @@ import "winrt.cb";              // winrtInit / hstring / activationFactory / awa
 import "Windows.Web.winmd";     // IHttpClient
 import "json.cb";               // JsonParser / JsonNode
 
+// Abbreviate the async result type so the operation handle can be a typed local, not a void*.
+using StringOp = IAsyncOperationWithProgress<string, HttpProgress>;
+
 extern int main()
 {
     winrtInit();
@@ -23,36 +26,36 @@ extern int main()
 
     // Build a Windows.Foundation.Uri from the URL string.
     IUriRuntimeClassFactory* uriFactory = nullptr;
-    i32 hr = activationFactory("Windows.Foundation.Uri", iidof(IUriRuntimeClassFactory), (void**)&uriFactory);
+    i32 hr = activationFactory("Windows.Foundation.Uri", iidof(IUriRuntimeClassFactory), &uriFactory);
     if (hr != 0 || uriFactory == nullptr) { printf("Uri factory failed: 0x%08X\n", hr); return 1; }
 
-    void* hUrl = hstring(url);
+    HSTRING hUrl = hstring(url);
     IUriRuntimeClass* uri = nullptr;
     hr = uriFactory->CreateUri(hUrl, &uri);
     if (hr != 0 || uri == nullptr) { printf("CreateUri failed: 0x%08X\n", hr); return 2; }
 
     // HttpClient has a default constructor; activate it directly and QI for IHttpClient.
     IHttpClient* client = nullptr;
-    hr = activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), (void**)&client);
+    hr = activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), &client);
     if (hr != 0 || client == nullptr) { printf("activate IHttpClient failed: 0x%08X\n", hr); return 4; }
 
-    // GetStringAsync(uri) -> IAsyncOperationWithProgress<String, HttpProgress>.
-    void* op = nullptr;
+    // GetStringAsync(uri) -> StringOp; the out-param and dispatch are now fully typed, no void*.
+    StringOp* op = nullptr;
     hr = client->GetStringAsync(uri, &op);
     if (hr != 0 || op == nullptr) { printf("GetStringAsync failed: 0x%08X\n", hr); return 5; }
 
     i32 status = awaitAsync(op);
     if (status != 1) {
         IAsyncInfo* info = nullptr;
-        i32 q = ((IHttpClient*)op)->lpVtbl->QueryInterface(op, iidof(IAsyncInfo), (void**)&info);
+        i32 q = op->QueryInterface(iidof(IAsyncInfo), &info);
         i32 errCode = 0;
         if (q == 0 && info != nullptr) { info->get_ErrorCode(&errCode); }
         printf("async did not complete: status=%d errorcode=0x%08X\n", status, errCode);
         return 6;
     }
 
-    void* hBody = nullptr;
-    ((IAsyncOperationWithProgress<string, HttpProgress>*)op)->lpVtbl->GetResults(op, &hBody);
+    HSTRING hBody = nullptr;
+    op->GetResults(&hBody);
     string body = fromHString(hBody);
 
     // Parse and extract the current_weather fields.

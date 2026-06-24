@@ -15,30 +15,35 @@
 import "wstring.cb";
 import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
 
+// An HSTRING is an opaque OS-owned handle to an immutable UTF-16 string; it is pointer-sized but
+// is NOT a char buffer (use WindowsGetStringRawBuffer to read it). Naming it keeps the handle out
+// of bare `void*` at call sites while staying ABI-identical to the Windows HSTRING.
+using HSTRING = void*;
+
 // combase.dll (via RuntimeObject.lib / ole32.lib).
 extern stdcall i32   RoInitialize(i32 initType);
 extern stdcall void  RoUninitialize();
 extern stdcall i32   RoGetActivationFactory(void* activatableClassId, void* iid, void** factory);
 extern stdcall i32   RoActivateInstance(void* activatableClassId, void** instance);
-extern stdcall i32   WindowsCreateString(u16* sourceString, u32 length, void** hstring);
-extern stdcall i32   WindowsDeleteString(void* hstring);
-extern stdcall u16*  WindowsGetStringRawBuffer(void* hstring, u32* length);
+extern stdcall i32   WindowsCreateString(u16* sourceString, u32 length, HSTRING* hstring);
+extern stdcall i32   WindowsDeleteString(HSTRING hstring);
+extern stdcall u16*  WindowsGetStringRawBuffer(HSTRING hstring, u32* length);
 
 // kernel32 (always linked) - back off between async status polls. Matches windows.h's Sleep(DWORD).
 extern stdcall void  Sleep(u32 ms);
 
 // UTF-8 string -> HSTRING. WindowsCreateString copies the buffer, so the temporary wstring is
 // free to be destructed on return. The caller owns the HSTRING and must freeHString it.
-void* hstring(string s)
+HSTRING hstring(string s)
 {
     wstring w = s.toWString();
-    void* h = nullptr;
+    HSTRING h = nullptr;
     WindowsCreateString(w.data(), (u32)w.length(), &h);
     return h;
 }
 
 // HSTRING -> owned UTF-8 string (reuses wstring's UTF-16 -> UTF-8 transcode).
-move string fromHString(void* h)
+move string fromHString(HSTRING h)
 {
     u32 len = 0;
     u16* raw = WindowsGetStringRawBuffer(h, &len);
@@ -47,7 +52,7 @@ move string fromHString(void* h)
 }
 
 // Release an HSTRING created by hstring().
-void freeHString(void* h)
+void freeHString(HSTRING h)
 {
     WindowsDeleteString(h);
 }
@@ -56,7 +61,7 @@ void freeHString(void* h)
 // free the HSTRING, and return the HRESULT. *out receives the factory on success.
 i32 activationFactory(string className, void* iid, void** out)
 {
-    void* h = hstring(className);
+    HSTRING h = hstring(className);
     i32 hr = RoGetActivationFactory(h, iid, out);
     freeHString(h);
     return hr;
@@ -74,7 +79,7 @@ i32 activationFactory(string className, void* iid, void** out)
 //   activateInstance("Windows.Web.Http.HttpClient", iidof(IHttpClient), (void**)&client);
 i32 activateInstance(string className, void* iid, void** out)
 {
-    void* h = hstring(className);
+    HSTRING h = hstring(className);
     void* inst = nullptr;
     i32 hr = RoActivateInstance(h, &inst);
     freeHString(h);

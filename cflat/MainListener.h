@@ -2636,21 +2636,28 @@ public:
             && typeSpec->genericIdentifier()->Identifier() != nullptr)
         {
             std::string baseName = typeSpec->genericIdentifier()->Identifier()->getText();
-            if (genericStructTemplates.count(baseName) == 0
-                && genericClassTemplates.count(baseName) == 0
-                && genericInterfaceTemplates.count(baseName) == 0)
+            std::vector<std::string> typeArgs;
+            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                typeArgs.push_back(ResolveTypeArgEntry(entry));
+            std::string mangledName = MangledGenericName(baseName, typeArgs);
+
+            if (genericStructTemplates.count(baseName) != 0
+                || genericClassTemplates.count(baseName) != 0
+                || genericInterfaceTemplates.count(baseName) != 0)
+            {
+                // CFlat generic: enqueue the instantiation (shell + default ctor created
+                // immediately, body emitted by the next ProcessPendingInstantiations).
+                QueueGenericInstantiation(baseName, typeArgs, mangledName);
+            }
+            // A deferred winmd generic interface (e.g. IAsyncOperationWithProgress<string,
+            // HttpProgress>): instantiate the concrete thin interface + PIID on demand, exactly as
+            // a cast or iidof use-site does, so the alias names a real type instead of erroring.
+            else if (!compiler->InstantiateWinrtGenericInterface(baseName, typeArgs, mangledName))
             {
                 compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a generic type",
                                                alias, target, baseName));
                 return;
             }
-            std::vector<std::string> typeArgs;
-            for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                typeArgs.push_back(ResolveTypeArgEntry(entry));
-            std::string mangledName = MangledGenericName(baseName, typeArgs);
-            // Enqueue the instantiation (shell + default ctor created immediately, body emitted
-            // by the next ProcessPendingInstantiations) and alias to the mangled name - a string.
-            QueueGenericInstantiation(baseName, typeArgs, mangledName);
             compiler->RegisterTypeAlias(alias, mangledName + suffix);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),

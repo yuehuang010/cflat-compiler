@@ -274,6 +274,44 @@ bool testWinrtBridge()
     return result;
 }
 
+// === `using` alias of a deferred winmd generic interface ===
+//
+// A `using` alias whose RHS is a parameterized WinRT interface must instantiate that interface
+// on demand (same path as a cast / iidof use-site), not error "is not a generic type". Regression
+// for the alias-RHS instantiation fix. The alias is proven REAL by driving it against a live OS
+// object: box an Int32, QI through the aliased type, and read the value back.
+using RefInt = IReference<int>;
+
+bool testUsingAliasOfWinmdGeneric()
+{
+    bool result = true;
+
+    IPropertyValueStatics* factory = nullptr;
+    i32 hr = activationFactory("Windows.Foundation.PropertyValue", iidof(IPropertyValueStatics), (void**)&factory);
+    result &= Test("winmd_alias_activation_hr", (hr == 0 && factory != nullptr) ? 1 : 0, 1);
+    if (hr != 0 || factory == nullptr) return false;
+
+    void* boxed = nullptr;
+    factory->CreateInt32(4242, &boxed);
+
+    // The aliased type is a typed local whose vtable dispatch resolves to the instantiated thin
+    // interface - the same typed-local-plus-`->` shape the GetStringAsync fix enables. A live
+    // get_Value of 4242 proves the alias names the real IReference<int>, not a stub.
+    RefInt* ref = nullptr;
+    i32 qi = ((IReference<int>*)boxed)->lpVtbl->QueryInterface(boxed, iidof(IReference<int>), (void**)&ref);
+    result &= Test("winmd_alias_qi_accepted", (qi == 0 && ref != nullptr) ? 1 : 0, 1);
+    if (qi == 0 && ref != nullptr)
+    {
+        int value = default;
+        ref->get_Value(&value);
+        result &= Test("winmd_alias_ref_value", value, 4242);
+        ref->Release();
+    }
+    ((IReference<int>*)boxed)->lpVtbl->Release(boxed);
+    factory->lpVtbl->Release(factory);
+    return result;
+}
+
 extern int main()
 {
     winrtInit();   // RO_INIT_MULTITHREADED
@@ -285,6 +323,7 @@ extern int main()
     total++; passed += testWinrtBridge()                ? 1 : 0;
     total++; passed += testIidofByteExact()            ? 1 : 0;
     total++; passed += testLiveParameterizedRoundtrip() ? 1 : 0;
+    total++; passed += testUsingAliasOfWinmdGeneric()    ? 1 : 0;
     total++; passed += testForeachCollection()          ? 1 : 0;
     total++; passed += testAsyncRoundtrip()             ? 1 : 0;
 
