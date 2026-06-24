@@ -315,6 +315,8 @@ What `winrt.cb` provides:
   `HSTRING` bridge (UTF-8 <-> UTF-16, built on `wstring` below). You own an `HSTRING` from
   `hstring()` and must `freeHString` it.
 - `awaitAsync(void*) -> i32` - block on an `IAsyncAction*` / `IAsyncOperation<T>*` (see Async below).
+- `asyncError(void*) -> i32` - the failure HRESULT (`IAsyncInfo.ErrorCode`) when `awaitAsync` did
+  not return `1`; `0` if there was no error.
 
 ```cpp
 winrtInit();
@@ -370,6 +372,18 @@ if (awaitAsync(readOp) == 1) {
     freeHString(hOut);
 }
 ((IAsyncOperation<string>*)readOp)->lpVtbl->Release(readOp);
+```
+
+When `awaitAsync` returns anything other than `1` (Completed), the failure HRESULT lives on the
+op's `IAsyncInfo.ErrorCode`. `asyncError(void*) -> i32` does that `QueryInterface` + `get_ErrorCode`
+for you (returning `0` when there was no error), so a caller never has to hand-write it:
+
+```cpp
+i32 status = awaitAsync(readOp);
+if (status != 1) {
+    printf("async failed: status=%d hr=0x%08X\n", status, asyncError(readOp));
+    return 1;
+}
 ```
 
 `IAsyncOperation<String>` is not stored in metadata; CFlat synthesizes its vtable and parameterized

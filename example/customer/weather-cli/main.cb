@@ -46,11 +46,7 @@ extern int main()
 
     i32 status = awaitAsync(op);
     if (status != 1) {
-        IAsyncInfo* info = nullptr;
-        i32 q = op->QueryInterface(iidof(IAsyncInfo), &info);
-        i32 errCode = 0;
-        if (q == 0 && info != nullptr) { info->get_ErrorCode(&errCode); }
-        printf("async did not complete: status=%d errorcode=0x%08X\n", status, errCode);
+        printf("async did not complete: status=%d errorcode=0x%08X\n", status, asyncError(op));
         return 6;
     }
 

@@ -13,6 +13,8 @@
 //   activationFactory("Windows.Foo.Bar", iidof(IFooStatics), (void**)&f);
 
 import "wstring.cb";
+import "guid.cb";   // Guid layout shared with COM IIDs
+import "com.cb";    // SUCCEEDED/FAILED + well-known IIDs and HRESULT codes
 import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
 
 // An HSTRING is an opaque OS-owned handle to an immutable UTF-16 string; it is pointer-sized but
@@ -83,10 +85,11 @@ i32 activateInstance(string className, void* iid, void** out)
     void* inst = nullptr;
     i32 hr = RoActivateInstance(h, &inst);
     freeHString(h);
-    if (hr != 0 || inst == nullptr) return hr;
+    if (FAILED(hr) || inst == nullptr) return hr;
 
-    hr = ((IAsyncInfo*)inst)->lpVtbl->QueryInterface(inst, iid, out);
-    ((IAsyncInfo*)inst)->lpVtbl->Release(inst);
+    IAsyncInfo* unk = (IAsyncInfo*)inst;
+    hr = unk->QueryInterface(iid, out);
+    unk->Release();
     return hr;
 }
 
@@ -105,9 +108,10 @@ void winrtUninit() { RoUninitialize(); }
 //   if (awaitAsync(op) == 1) { ((IAsyncOperation<string>*)op)->lpVtbl->GetResults(op, &h); }
 i32 awaitAsync(void* asyncObj)
 {
+    IAsyncInfo* probe = (IAsyncInfo*)asyncObj;
     IAsyncInfo* info = nullptr;
-    i32 qi = ((IAsyncInfo*)asyncObj)->lpVtbl->QueryInterface(asyncObj, iidof(IAsyncInfo), (void**)&info);
-    if (qi != 0 || info == nullptr) return -1;
+    i32 qi = probe->QueryInterface(iidof(IAsyncInfo), (void**)&info);
+    if (FAILED(qi) || info == nullptr) return -1;
 
     i32 status = 0;
     int guard = 0;
@@ -118,6 +122,25 @@ i32 awaitAsync(void* asyncObj)
         Sleep((u32)1);
         guard = guard + 1;
     }
-    info->lpVtbl->Release(info);
+    info->Release();
     return status;
+}
+
+// Retrieve the failure HRESULT of an async object that did not complete - call after awaitAsync
+// returns anything other than 1 (Completed). QueryInterface to IAsyncInfo (same slot-0 QI trick as
+// awaitAsync) and read get_ErrorCode. Returns 0 if the op actually succeeded or carried no error;
+// returns the QI HRESULT if IAsyncInfo could not be obtained.
+//
+//   if (awaitAsync(op) != 1) { printf("async failed: 0x%08X\n", asyncError(op)); return 1; }
+i32 asyncError(void* asyncObj)
+{
+    IAsyncInfo* probe = (IAsyncInfo*)asyncObj;
+    IAsyncInfo* info = nullptr;
+    i32 qi = probe->QueryInterface(iidof(IAsyncInfo), (void**)&info);
+    if (FAILED(qi) || info == nullptr) return qi;
+
+    i32 errCode = 0;
+    info->get_ErrorCode(&errCode);
+    info->Release();
+    return errCode;
 }
