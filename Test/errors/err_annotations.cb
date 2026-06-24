@@ -26,3 +26,19 @@ expect_error("requires an argument") {
         int x = 0;
     };
 }
+
+// Unknown annotation on a class (type-level annotations are validated like fields)
+expect_error("Unknown annotation 'Bogus'") {
+    interface IThing { int Go(); };
+    [Bogus] class BadClass : IThing {
+        int Go() { return 0; }
+    };
+}
+
+// [winrt] without importing com.cb is an unknown annotation (it is declared there, not built in)
+expect_error("Unknown annotation 'winrt'") {
+    interface IPurrLocal { int Eat(); };
+    [winrt] class CatLocal : IPurrLocal {
+        int Eat() { return 0; }
+    };
+}

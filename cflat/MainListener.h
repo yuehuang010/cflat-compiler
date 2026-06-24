@@ -128,29 +128,27 @@ inline std::string getInterfaceMethodName(CFlatParser::InterfaceMethodContext* m
     return m->directDeclarator()->getText();
 }
 
-// True if annList carries an annotation with the given name (e.g. "winrt"). Tolerates null.
-inline bool HasAnnotation(CFlatParser::AnnotationListContext* annList, const char* name)
+// The quote-stripped argument text of a single annotation (empty if it has none). A string
+// literal loses its surrounding quotes; any other token is returned verbatim.
+inline std::string AnnotationArgText(CFlatParser::AnnotationContext* ann)
 {
-    if (!annList) return false;
-    for (auto* ann : annList->annotation())
-        if (ann->Identifier() && ann->Identifier()->getText() == name) return true;
-    return false;
+    if (!ann->annotationArg()) return {};
+    std::string raw = ann->annotationArg()->getText();
+    if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
+        return raw.substr(1, raw.size() - 2);
+    return raw;
 }
 
-// Return the (quote-stripped) string argument of annotation `name`, or empty if absent.
-inline std::string GetAnnotationArg(CFlatParser::AnnotationListContext* annList, const char* name)
+// Extract every [Name(arg)] as a raw (name, value) pair, WITHOUT registry validation. Used by
+// the forward scan to record type-level annotations (e.g. [uuid]) before the main pass validates.
+inline std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser::AnnotationListContext* annList)
 {
-    if (!annList) return {};
+    std::vector<LLVMBackend::AnnotationValue> result;
+    if (!annList) return result;
     for (auto* ann : annList->annotation())
-    {
-        if (!ann->Identifier() || ann->Identifier()->getText() != name) continue;
-        if (!ann->annotationArg()) return {};
-        std::string raw = ann->annotationArg()->getText();
-        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
-            return raw.substr(1, raw.size() - 2);
-        return raw;
-    }
-    return {};
+        if (ann->Identifier())
+            result.push_back({ ann->Identifier()->getText(), AnnotationArgText(ann) });
+    return result;
 }
 
 // Extract the plain identifier from a directDeclarator (handles both bare names and C-style array syntax).
@@ -907,9 +905,9 @@ private:
         if (!nameGid || !nameGid->Identifier()) return;
         std::string name = nameGid->Identifier()->getText();
 
-        // Capture [uuid("...")] so a [winrt] class implementing this interface can emit its IID.
-        if (std::string uuid = GetAnnotationArg(ctx->annotationList(), "uuid"); !uuid.empty())
-            Compiler(ctx)->interfaceUuids[name] = uuid;
+        // Record the interface's type-level annotations now (raw, unvalidated) so [uuid] is
+        // available before a [winrt] class implementing it is emitted. The main pass validates.
+        Compiler(ctx)->SetTypeAnnotations(name, ExtractAnnotations(ctx->annotationList()));
 
         std::vector<std::string> parentNames;
         for (auto* term : ctx->Identifier())
@@ -1075,6 +1073,12 @@ private:
     void ScanClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& namespaceName = {})
     {
         ScanStructOrClassDefinition(ctx, namespaceName);
+        // Record class type-level annotations now (raw, like the interface scan) so
+        // annotationof(Class,...) is available regardless of source order. The main pass
+        // overwrites this with the validated set.
+        std::string typeName = ctx->directDeclarator()->getText();
+        if (!namespaceName.empty()) typeName = namespaceName + "." + typeName;
+        Compiler(ctx)->SetTypeAnnotations(typeName, ExtractAnnotations(ctx->annotationList()));
     }
 
 public:
@@ -2283,6 +2287,11 @@ public:
         if (!nameGid || !nameGid->Identifier()) return;
 
         std::string name = nameGid->Identifier()->getText();
+
+        // Validate type-level annotations (e.g. [uuid("...")]) against the registry and replace the
+        // forward scan's raw record with the validated set, so an unknown annotation that errored
+        // does not linger as queryable.
+        Compiler(ctx)->SetTypeAnnotations(name, ParseAnnotationList(ctx->annotationList()));
 
         // Collect parent interface names from direct Identifier terminals (after ':')
         std::vector<std::string> parentNames;
@@ -4997,14 +5006,7 @@ public:
             }
 
             if (hasArg)
-            {
-                // Strip surrounding quotes from string literals
-                std::string raw = ann->annotationArg()->getText();
-                if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"')
-                    argValue = raw.substr(1, raw.size() - 2);
-                else
-                    argValue = raw;
-            }
+                argValue = AnnotationArgText(ann);
 
             result.push_back({ annName, argValue });
         }
@@ -12255,8 +12257,9 @@ public:
                         }
 
                         // Compile-time intrinsic: annotationof(TypeName, "fieldName", "AnnotationName")
-                        // Returns the annotation's argument value as a string constant, or "" if absent.
-                        // For no-arg annotations, returns "1" if present or "" if absent.
+                        // queries a field; annotationof(TypeName, "AnnotationName") queries the type
+                        // itself (e.g. a class's [winrt]). Returns the annotation's argument value as
+                        // a string constant, "1" for a present no-arg annotation, or "" if absent.
                         // Usable with `if const` to branch on annotation presence.
                         if (functionName == "annotationof")
                         {
@@ -12275,26 +12278,40 @@ public:
                                     return t;
                                 };
 
+                                // Two arities: annotationof(Type, "Ann") queries the type's own
+                                // annotations; annotationof(Type, "field", "Ann") queries a field.
+                                bool typeLevel = allArgs.size() < 3;
                                 std::string typeName  = getArgText(0);
-                                std::string fieldName = getArgText(1);
-                                std::string annName   = getArgText(2);
+                                std::string fieldName = typeLevel ? std::string{} : getArgText(1);
+                                std::string annName   = typeLevel ? getArgText(1) : getArgText(2);
 
                                 // Resolve generic type substitutions
                                 auto substIt = activeTypeSubstitutions.find(typeName);
                                 if (substIt != activeTypeSubstitutions.end())
                                     typeName = substIt->second;
 
-                                auto structData = compiler->GetDataStructure(typeName);
-                                for (const auto& field : structData.StructFields)
+                                // The matched annotation's value: "1" for a present no-arg marker,
+                                // the argument otherwise, or "" when absent (a null match).
+                                auto annText = [](const LLVMBackend::AnnotationValue* a) -> std::string {
+                                    if (!a) return {};
+                                    return a->Value.empty() ? "1" : a->Value;
+                                };
+
+                                if (typeLevel)
                                 {
-                                    if (field.VariableName != fieldName) continue;
-                                    for (const auto& ann : field.Annotations)
+                                    // Type-level annotations ([winrt], [uuid], ...) live in the shared map.
+                                    annValue = annText(compiler->FindTypeAnnotation(typeName, annName));
+                                }
+                                else
+                                {
+                                    auto structData = compiler->GetDataStructure(typeName);
+                                    for (const auto& field : structData.StructFields)
                                     {
-                                        if (ann.Name != annName) continue;
-                                        annValue = ann.Value.empty() ? "1" : ann.Value;
+                                        if (field.VariableName != fieldName) continue;
+                                        for (const auto& ann : field.Annotations)
+                                            if (ann.Name == annName) { annValue = annText(&ann); break; }
                                         break;
                                     }
-                                    break;
                                 }
                             }
                             namedVar.Primary = compiler->CreateGlobalString("annotationof", annValue);
@@ -17903,10 +17920,15 @@ public:
             return;
         }
 
+        // Validate type-level annotations against the registry (errors on unknown) and keep them
+        // for storage on the StructData below. winrt/uuid are ordinary annotations from com.cb.
+        auto classAnnotations = ParseAnnotationList(ctx->annotationList());
+
         // [winrt] class: lower to a thin COM object (vtable ptr + refcount + fields) instead of
         // the fat-ptr interface path. Exactly one interface is supported in this milestone. The
         // vtable struct is created up front so the injected lpVtbl field type resolves.
-        bool isWinrt = HasAnnotation(ctx->annotationList(), "winrt");
+        bool isWinrt = std::any_of(classAnnotations.begin(), classAnnotations.end(),
+                                   [](const auto& a) { return a.Name == "winrt"; });
         std::string winrtIface;
         std::string winrtVtblName;
         if (isWinrt)
@@ -18083,6 +18105,8 @@ public:
         // so that alloca/sizeof work correctly (e.g. when passed via interface).
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        // Record validated type-level annotations for annotationof(Type,"Ann") queries.
+        compiler->SetTypeAnnotations(structName, classAnnotations);
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
         LLVMBackend::TypeAndValue returnType{

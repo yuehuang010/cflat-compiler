@@ -1631,7 +1631,7 @@ On a name collision the type meaning wins, matching C. The result is typed
 
 ## Annotations
 
-Annotations are user-defined metadata attached to struct fields. Define an annotation struct with `annotation`, then apply it with `[Name]` or `[Name(args)]`:
+Annotations are user-defined metadata attached to struct fields, classes, or interfaces. Define an annotation struct with `annotation`, then apply it with `[Name]` or `[Name(args)]`. An annotation must be declared (in the current file or an import) before use; an undeclared annotation is an "Unknown annotation" error. The COM/WinRT `[winrt]` and `[uuid(...)]` markers are ordinary annotations declared in `com.cb`.
 
 ```c
 annotation Private   { };
@@ -1659,6 +1659,15 @@ string fn  = annotationof(Person, "name",   "JsonName");   // "full_name"
 string prv = annotationof(Person, "_token", "Private");    // "1"
 string ml  = annotationof(Person, "age",    "MaxLength");  // "50"
 string none = annotationof(Person, "age",   "Private");    // ""  (not present)
+```
+
+An annotation applied to a class or interface is read with the two-argument form `annotationof(Type, "AnnotationName")`:
+
+```c
+[winrt] class Cat : IPurr { ... };
+
+string isWinrt = annotationof(Cat, "winrt");   // "1"  (present)
+string none    = annotationof(Cat, "Private"); // ""   (not present)
 ```
 
 ---

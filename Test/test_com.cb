@@ -16,6 +16,17 @@
 import "test_helper.cb";
 import "com.cb";
 
+// Order independence: annotationof must resolve a class/interface defined LATER in the file
+// (Maker and IMaker appear far below). Forward-scanned annotations make this work regardless
+// of source order; without it this query would return "" instead of "1".
+bool testAnnotationBeforeDef()
+{
+    bool result = true;
+    result &= Test("com_ann_class_forward", annotationof(Maker, "winrt"), "1");
+    result &= Test("com_ann_iface_forward", annotationof(IMaker, "uuid"), "b1b2c3d4-e5f6-4789-8abc-def012345678");
+    return result;
+}
+
 // === Single-method interface: dispatch + lifecycle ===
 
 int gCatDtorCount = 0;
@@ -200,6 +211,17 @@ bool testChaining()
     return result;
 }
 
+// === Type-level annotation query: annotationof(Type, "Ann") ===
+// [winrt] is an ordinary annotation (declared in com.cb), stored on the class and queryable.
+
+bool testTypeLevelAnnotation()
+{
+    bool result = true;
+    result &= Test("com_ann_winrt_present", annotationof(Cat, "winrt"), "1");
+    result &= Test("com_ann_winrt_absent",  annotationof(Cat, "Private"), "");
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -209,6 +231,8 @@ extern int main()
     total++; passed += testQueryInterface()               ? 1 : 0;
     total++; passed += testMultiMethodAndParamForwarding() ? 1 : 0;
     total++; passed += testChaining()                     ? 1 : 0;
+    total++; passed += testTypeLevelAnnotation()          ? 1 : 0;
+    total++; passed += testAnnotationBeforeDef()          ? 1 : 0;
 
     printf("COM produce-side tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

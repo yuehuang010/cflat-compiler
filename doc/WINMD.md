@@ -39,6 +39,10 @@ This page covers what is implemented today. See the end for current limitations.
 A `[winrt]` class implements exactly one `[uuid]`-annotated interface and lowers to a thin COM
 object: a struct whose first field is a vtable pointer, followed by a refcount and your fields.
 
+The `[winrt]` and `[uuid(...)]` annotations are declared in `com.cb` (as ordinary `annotation`
+definitions), so authoring a COM object requires `import "com.cb";` - using them without it is an
+"Unknown annotation" error.
+
 ```cpp
 import "com.cb";
 

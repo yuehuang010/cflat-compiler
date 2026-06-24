@@ -965,9 +965,32 @@ private:
     std::unordered_map<std::string, std::vector<FunctionSymbol>> functionTable;
     std::unordered_map<std::string, std::vector<InterfaceMethod>> interfaceTable;
     std::unordered_map<std::string, std::vector<std::string>> interfaceParents;
-    // [uuid("...")] string per interface name, captured during the forward scan and used to
-    // emit the IID constant for a [winrt] class that implements the interface.
-    std::unordered_map<std::string, std::string> interfaceUuids;
+    // Type-level annotations keyed by type/interface name ([winrt] on a class, [uuid("...")] on an
+    // interface, ...). Field annotations are separate (StructData.StructFields[].Annotations).
+    std::unordered_map<std::string, std::vector<AnnotationValue>> typeAnnotations_;
+
+    // Set (or, when empty, clear) the annotations recorded for a type/interface. Empty erases so a
+    // re-analysis where a type loses its annotations does not keep the stale entry.
+    void SetTypeAnnotations(const std::string& name, std::vector<AnnotationValue> anns)
+    {
+        if (anns.empty()) typeAnnotations_.erase(name);
+        else typeAnnotations_[name] = std::move(anns);
+    }
+    // Find a single named annotation on a type/interface, or nullptr if absent.
+    const AnnotationValue* FindTypeAnnotation(const std::string& name, const std::string& annName) const
+    {
+        auto it = typeAnnotations_.find(name);
+        if (it == typeAnnotations_.end()) return nullptr;
+        for (const auto& a : it->second)
+            if (a.Name == annName) return &a;
+        return nullptr;
+    }
+    // The raw argument of a named type/interface annotation (e.g. the GUID of [uuid]); empty if absent.
+    std::string GetTypeAnnotationArg(const std::string& name, const std::string& annName) const
+    {
+        auto* a = FindTypeAnnotation(name, annName);
+        return a ? a->Value : std::string{};
+    }
 
     // Bookkeeping for a [winrt] class lowered to a COM object (thin-ptr ABI). Records the
     // implemented interface, its generated vtable struct type, and the static vtable instance
@@ -5463,9 +5486,8 @@ public:
     LLVMBackend()
     {
         Init();
-        // Builtin annotations for WinRT/COM produce-side: [winrt] (no-arg), [uuid("...")].
-        annotationRegistry["winrt"] = {};
-        annotationRegistry["uuid"] = { "" };
+        // Annotations (including the WinRT/COM produce-side [winrt]/[uuid]) are declared in
+        // source via `annotation X { ... }`; the registry is populated as those are scanned.
         CompilerManager::Instance().Register(this);
     }
     ~LLVMBackend()
@@ -6158,7 +6180,7 @@ public:
         if (auto it = winrtInstanceIid_.find(name); it != winrtInstanceIid_.end())
             return EmitGuidGlobal(it->second.data());
         uint8_t bytes[16];
-        if (auto u = interfaceUuids.find(name); u != interfaceUuids.end() && ParseUuidToBytes(u->second, bytes))
+        if (std::string u = GetTypeAnnotationArg(name, "uuid"); !u.empty() && ParseUuidToBytes(u, bytes))
             return EmitGuidGlobal(bytes);
         for (const auto& i : winrtConsumedModel_.interfaces)
             if (WinrtSimpleName(i.fullName) == name && !i.iid.empty() && ParseUuidToBytes(i.iid, bytes))
@@ -6397,8 +6419,7 @@ public:
         ParseUuidToBytes("00000000-0000-0000-C000-000000000046", unkB);
         ParseUuidToBytes("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90", inspB);
         ParseUuidToBytes("94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90", agileB);
-        std::string ifaceUuid;
-        if (auto u = interfaceUuids.find(ifaceName); u != interfaceUuids.end()) ifaceUuid = u->second;
+        std::string ifaceUuid = GetTypeAnnotationArg(ifaceName, "uuid");
         bool haveIfaceIid = ParseUuidToBytes(ifaceUuid, ifaceB);
         auto* gUnk = EmitGuidGlobal(unkB);
         auto* gInsp = EmitGuidGlobal(inspB);
@@ -7093,7 +7114,7 @@ public:
             t.fullName = w;
             if (tv.Pointer && w != "string" && w != "object") t.pointerDepth = 1;
         }
-        else if (interfaceUuids.count(tv.TypeName) || winrtClasses.count(tv.TypeName))
+        else if (FindTypeAnnotation(tv.TypeName, "uuid") || winrtClasses.count(tv.TypeName))
             t.fullName = tv.TypeName;
         else
             t.fullName = "Object";
@@ -7107,25 +7128,26 @@ public:
     {
         cflat_winmd::Model model;
 
-        for (const auto& [name, iid] : interfaceUuids)
+        for (const auto& [name, methods] : interfaceTable)
         {
+            std::string iid = GetTypeAnnotationArg(name, "uuid");
+            if (iid.empty()) continue;   // only [uuid]-bearing interfaces describe a winmd type
             cflat_winmd::Interface iface;
             iface.fullName = name;
             iface.iid = iid;
-            if (auto it = interfaceTable.find(name); it != interfaceTable.end())
-                for (const auto& m : it->second)
+            for (const auto& m : methods)
+            {
+                cflat_winmd::Method wm;
+                wm.name = m.Name;
+                wm.returnType = CFlatTypeToWinrt(m.ReturnType);
+                for (const auto& p : m.Parameters)
                 {
-                    cflat_winmd::Method wm;
-                    wm.name = m.Name;
-                    wm.returnType = CFlatTypeToWinrt(m.ReturnType);
-                    for (const auto& p : m.Parameters)
-                    {
-                        cflat_winmd::Param wp;
-                        wp.type = CFlatTypeToWinrt(p);
-                        wm.params.push_back(std::move(wp));
-                    }
-                    iface.methods.push_back(std::move(wm));
+                    cflat_winmd::Param wp;
+                    wp.type = CFlatTypeToWinrt(p);
+                    wm.params.push_back(std::move(wp));
                 }
+                iface.methods.push_back(std::move(wm));
+            }
             model.interfaces.push_back(std::move(iface));
         }
 

@@ -18,6 +18,13 @@
 
 import "guid.cb";
 
+// ===== COM/WinRT produce-side annotations =====
+// `[winrt]` marks a class that lowers to a thin COM object (vtable ptr + refcount + fields)
+// with the WinRT HRESULT ABI; `[uuid("...")]` tags the interface it implements so its IID can
+// be emitted. Authoring a [winrt] class therefore requires `import "com.cb";`.
+annotation winrt { };
+annotation uuid { string value; };
+
 // ===== HRESULT result codes =====
 // An HRESULT is a 32-bit status: the high bit is the failure flag, so success codes are
 // non-negative and failure codes are negative when read as a signed i32.
