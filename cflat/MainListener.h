@@ -8870,6 +8870,11 @@ public:
                     for (auto* entry : typeSpec->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     typeValue.TypeName = MangledGenericName(baseName, typeArgs);
+                    // A deferred winmd generic interface named directly in a cast (no `using` or
+                    // forward-ref scan reached it) is instantiated on demand here. Idempotent/cached,
+                    // and a no-op false for CFlat generics (already queued by the scanner).
+                    if (compilerLLVM->GetDataStructure(typeValue.TypeName).StructType == nullptr)
+                        compilerLLVM->InstantiateWinrtGenericInterface(baseName, typeArgs, typeValue.TypeName);
                 }
                 else
                 {
@@ -8877,14 +8882,15 @@ public:
                     // Apply active type-parameter substitutions (e.g. T -> int inside a generic function body).
                     auto substIt = activeTypeSubstitutions.find(typeValue.TypeName);
                     if (substIt != activeTypeSubstitutions.end())
-                    {
                         typeValue.TypeName = substIt->second;
-                        while (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
-                        {
-                            typeValue.TypeName.pop_back();
-                            typeValue.Pointer = true;
-                        }
-                    }
+                    // Expand a `using` alias so a cast through it names a real type, e.g.
+                    // (StringOp*)p -> the instantiated thin-interface struct. One-hop, matching the
+                    // declaration path (ParseDeclarationSpecifiers); covers generic and plain aliases.
+                    typeValue.TypeName = compilerLLVM->ResolveTypeAlias(typeValue.TypeName);
+                    // Peel any trailing stars baked into a substitution or pointer alias
+                    // (using Handle = void*) onto the pointer flag.
+                    if (PeelAliasPointerStars(typeValue.TypeName) > 0)
+                        typeValue.Pointer = true;
                 }
             }
         }

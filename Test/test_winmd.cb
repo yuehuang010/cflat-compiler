@@ -281,6 +281,8 @@ bool testWinrtBridge()
 // for the alias-RHS instantiation fix. The alias is proven REAL by driving it against a live OS
 // object: box an Int32, QI through the aliased type, and read the value back.
 using RefInt = IReference<int>;
+// Non-generic winmd interface alias - the cast-through-alias path must expand it too.
+using PVStatics = IPropertyValueStatics;
 
 bool testUsingAliasOfWinmdGeneric()
 {
@@ -292,7 +294,10 @@ bool testUsingAliasOfWinmdGeneric()
     if (hr != 0 || factory == nullptr) return false;
 
     void* boxed = nullptr;
-    factory->CreateInt32(4242, &boxed);
+    // Cast through the NON-GENERIC alias `PVStatics`: ((PVStatics*)factory)->lpVtbl->... must
+    // expand the alias to IPropertyValueStatics, else "Undefined variable lpVtbl". Proven live.
+    ((PVStatics*)factory)->lpVtbl->CreateInt32(factory, 4242, &boxed);
+    result &= Test("winmd_alias_cast_nongeneric_box", boxed != nullptr ? 1 : 0, 1);
 
     // The aliased type is a typed local whose vtable dispatch resolves to the instantiated thin
     // interface - the same typed-local-plus-`->` shape the GetStringAsync fix enables. A live
@@ -307,6 +312,20 @@ bool testUsingAliasOfWinmdGeneric()
         result &= Test("winmd_alias_ref_value", value, 4242);
         ref->Release();
     }
+
+    // Cast through the GENERIC alias `RefInt`: ((RefInt*)boxed)->lpVtbl->... must expand to the
+    // instantiated IReference<int> thin struct (the remaining cast-in-alias gap this fix closes).
+    RefInt* ref2 = nullptr;
+    i32 qi2 = ((RefInt*)boxed)->lpVtbl->QueryInterface(boxed, iidof(IReference<int>), (void**)&ref2);
+    result &= Test("winmd_alias_cast_generic_qi", (qi2 == 0 && ref2 != nullptr) ? 1 : 0, 1);
+    if (qi2 == 0 && ref2 != nullptr)
+    {
+        int value2 = default;
+        ((RefInt*)ref2)->lpVtbl->get_Value(ref2, &value2);
+        result &= Test("winmd_alias_cast_generic_value", value2, 4242);
+        ((RefInt*)ref2)->lpVtbl->Release(ref2);
+    }
+
     ((IReference<int>*)boxed)->lpVtbl->Release(boxed);
     factory->lpVtbl->Release(factory);
     return result;
