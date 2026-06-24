@@ -43,7 +43,7 @@ copies. The full `-O2` pipeline (if requested) runs before execution.
 
 **Entry point.** `--run` looks up a function named `main`, which must be one of:
 
-```cflat
+```cpp
 extern int main() { ... }                       // no arguments
 extern int main(int argc, char** argv) { ... }  // receives program arguments
 ```
@@ -135,6 +135,7 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 | `--dump-winmd` | path | Read a `.winmd` into the projection model and print it (diagnostic), then exit. |
 | `--winmd-instantiate` | path | Import a `.winmd` and instantiate well-known parameterized interfaces (`IVector<i32>`, `IReference<i32>`, ...), checking each derived PIID + vtable shape, then exit. |
 | `--winmd-sig-selftest` | | Validate the parameterized-type signature encoder + PIID derivation against published reference IIDs and the RFC 4122 v5 vector, then exit. |
+| `--check` | | A `.winmd` passed to `--check` is parse-verified only (no registration). `test_winmd.bat` uses this to batch-validate every SDK `.winmd`. |
 
 A `.winmd` brought in via `import "x.winmd";` registers its interfaces / structs / enums as CFlat
 types (consume), and parameterized interfaces (`IVector<int>`, `IReference<T>`, ...) are instantiated

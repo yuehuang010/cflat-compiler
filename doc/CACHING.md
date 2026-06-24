@@ -71,7 +71,7 @@ visible as the `CHeaderExtract` phase under `-ftime-trace`). The in-memory cache
 
 Opt a header into a persistent disk cache with the inline `cache` clause:
 
-```cflat
+```cpp
 import "windows.h" cache;
 import package "curl/curl.h" lib "libcurl.lib" cache;   // clause comes last
 ```

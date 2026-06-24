@@ -116,7 +116,7 @@ per-thread seeded RNG and sometimes yields, perturbing interleavings so a
 timing-dependent bug is hit far more often than the OS scheduler hits it by luck.
 A captured seed makes a crash far more likely to reproduce.
 
-```cflat
+```cpp
 import "diagnostic/thread_fuzz.cb";
 
 // Call once at startup, before spawning threads.
@@ -147,7 +147,7 @@ does **not** detect double frees: `operator new`/`delete` share the CRT heap wit
 is indistinguishable from a real double free. Use `--asan`, which proves a real
 double-free/use-after-free deterministically.
 
-```cflat
+```cpp
 import "diagnostic/heap_audit.cb";
 
 // Call once at startup, before spawning threads.

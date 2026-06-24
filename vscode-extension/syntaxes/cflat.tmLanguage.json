@@ -135,7 +135,7 @@
     },
     "keywords-storage": {
       "name": "storage.modifier.cflat",
-      "match": "\\b(typedef|extern|static|register|inline|auto|thread_local|_Thread_local|__inline__|__forceinline)\\b"
+      "match": "\\b(typedef|extern|static|register|inline|stdcall|cdecl|declspec|auto|thread_local|_Thread_local|__inline__|__forceinline)\\b"
     },
     "keywords-type": {
       "patterns": [

@@ -67,13 +67,14 @@
   - [Bitwise and Shift Operators](#bitwise-and-shift-operators)
   - [Numeric Literals](#numeric-literals)
   - [Built-in Identifiers](#built-in-identifiers)
+  - [Reserved Keywords and Intrinsics](#reserved-keywords-and-intrinsics)
   - [Compile-Time Conditionals (`if const`)](#compile-time-conditionals-if-const)
 - [`program` Keyword](#program-keyword)
 - [C Interop](#c-interop) ([full reference](C_INTEROP.md))
 - [WinMD / COM](#winmd--com) ([full reference](WINMD.md))
 - [JSON](#json-libjsoncb)
-- [Debug Info](#debug-info-work-in-progress)
-- [Compiler CLI](#compiler-cli)
+- [Debug Info](#debug-info)
+- [Compiler CLI](#compiler-cli) ([full reference](CLI.md))
 - [Standard Library](#standard-library)
 - [Threading & Memory Management](THREADING.md)
 - [HPC & SIMD (`vectorize`, `simd<T,N>`)](HPC.md)
@@ -1963,13 +1964,16 @@ variable, function, struct, or namespace names.
 
 **Hard keywords** (ANTLR lexer tokens - always reserved):
 
-`annotation`, `as`, `auto`, `bool`, `break`, `case`, `char`, `class`, `const`,
-`continue`, `default`, `delete`, `do`, `double`, `else`, `enum`, `extern`,
-`float`, `for`, `function`, `goto`, `if`, `in`, `inline`, `int`, `interface`,
-`is`, `long`, `move`, `namespace`, `nameof`, `new`, `operator`, `register`,
-`restrict`, `return`, `short`, `signed`, `sizeof`, `static`, `string`, `struct`,
-`switch`, `typedef`, `typeof`, `union`, `unsigned`, `using`, `void`, `volatile`,
-`where`, `while`
+`annotation`, `as`, `auto`, `bool`, `break`, `case`, `cdecl`, `char`, `class`,
+`const`, `continue`, `declspec`, `default`, `delete`, `do`, `double`, `else`,
+`enum`, `extern`, `float`, `for`, `function`, `goto`, `if`, `in`, `inline`, `int`,
+`interface`, `is`, `long`, `move`, `namespace`, `nameof`, `new`, `operator`,
+`register`, `restrict`, `return`, `short`, `signed`, `sizeof`, `static`,
+`stdcall`, `string`, `struct`, `switch`, `typedef`, `typeof`, `union`,
+`unsigned`, `using`, `void`, `volatile`, `where`, `while`
+
+`stdcall`, `cdecl`, and `declspec` are function specifiers (calling-convention /
+`__declspec(...)` markers on an `extern` declaration); `inline` is the same family.
 
 **Soft keywords** (text-matched by the listener - reserved in the positions where
 they have syntactic meaning, but legal as identifiers in other positions):
@@ -1985,6 +1989,15 @@ name at all.
 
 `annotationof`, `expect_error`, `is_pointer`, `nameof`, `reflect`, `reflect_set`,
 `sizeof`, `typeof`
+
+**Compiler-recognized methods** (not reserved - you define them on a type, the
+compiler auto-invokes them by name):
+
+`copy` - the copy constructor for an owning value type (`string`, `wstring`,
+containers, closures): `b = a.copy()` makes an independent deep copy instead of the
+default move, and the compiler synthesizes `copy` calls when it must duplicate an
+owned field or element rather than alias it. See
+[Ownership / Lifetime](#ownership--lifetime-move-keyword).
 
 If you accidentally use a reserved word as an identifier, the error message may
 point to a nearby token rather than the reserved word itself. Check your names
@@ -2056,7 +2069,7 @@ extern int main()
 - **stdout -> stdin stream (always)**: the compiler synthesizes a `stream`, connects the producer's stdout to the consumer's stdin, and auto-closes it after the producer's `main` returns. So `printf` in the producer is read by `fgets` in the consumer - no hand-written `stream`/`close()`. (Equivalent to the explicit `producer >> s; s >> consumer;` form, which you use when you want to configure `bufferSize` or close manually.)
 - **arena mailbox (opt-in)**: when **both** programs set `useChannel = true` before `>>`, the consumer's `inbox` is bound to the producer's `outbox` for structured `IMessage` passing. Without it, no arena channel is allocated.
 
-```cflat
+```cpp
 Producer p; Consumer c;
 p.useChannel = true;   // both sides must opt in for the mailbox
 c.useChannel = true;
@@ -2149,14 +2162,9 @@ string template = "{{\"key\": \"{value}\"}}";   // {"key": "<value of 'value'>"}
 string literal  = "result: {{value}}";           // "result: {value}"
 ```
 
-If you forget to escape and accidentally write `{"key": "val"}` as a string
-literal, the compiler reports an "Undefined variable 'key'" error at the start of
-the file rather than at the brace - the `{` triggers interpolation before the
-error location can be narrowed.
-
 ---
 
-## Debug Info (Work in Progress)
+## Debug Info
 
 Pass `-g` to emit DWARF debug information for use with debuggers:
 
@@ -2168,29 +2176,8 @@ cflat.exe app.cb -o app.ll -g
 
 ## Compiler CLI
 
-```
-cflat.exe <input.cb> [options]
-```
-
-| Flag | Description |
-|------|-------------|
-| `-o / --output <file>`  | Output native executable path (`.exe`) |
-| `-l / --out-lli <file>` | Output LLVM IR file (`.ll`) |
-| `-b / --bitcode <file>` | Output LLVM bitcode file (`.bc`) |
-| `-g / --debug-info`     | Emit DWARF debug information |
-| `-i / --import-dir <dir>` | Directory to search for imported modules |
-| `-p / --platform <target>` | Target platform: `x64` (default) or `x86`; sets `__PLATFORM__` to 64 or 32 |
-| `-v / --verbose`        | Print detailed diagnostic messages during compilation |
-| `-O1`, `-O2`            | Set optimization level |
-| `--c-include <dir>`     | Header search dir for C library bindings (repeatable) |
-| `--c-lib <path>`        | Prebuilt C import library (`.lib`) to link (repeatable) |
-| `--c-define <NAME[=val]>` | Preprocessor define passed to all clang-cl C compiles/dumps (repeatable) |
-| `--vcpkg-exe <path>`    | Explicit `vcpkg.exe` (overrides VS-bundled / `VCPKG_ROOT` / `PATH` discovery) |
-| `--vcpkg-manifest <path>` | Explicit `vcpkg.json` (skips the upward walk from the source file) |
-| `--vcpkg-triplet <triplet>` | vcpkg triplet (default derived from `--platform`: `x64-windows` / `x86-windows`) |
-| `--help`                | Show usage and available options |
-
-See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `import "x.c"`, `import package`, and `import package-vcpkg`.
+Every switch accepted by `cflat.exe`, grouped by purpose, is documented in the
+command-line reference: [`doc/CLI.md`](CLI.md).
 
 ---
 
@@ -2198,35 +2185,127 @@ See [C Interop](#c-interop) for how the `--c-*` / `--vcpkg-*` flags pair with `i
 
 `core/` is implicitly on the import search path. Only `runtime.cb` is auto-imported; all others require an explicit `import`.
 
-| File | Exports |
+Method-level API discovery is via the LSP (hover / completion / `--symbol`); this
+table is a file index of what each library is for.
+
+**Types & collections**
+
+| File | Purpose |
 |------|---------|
 | `runtime.cb` | Allocator hooks (`new`, `delete`); exit/abort - **auto-imported** |
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
-| `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type; fields `item_0`, `item_1`, ...; `size()` |
-| `string.cb` | `string` value type, manipulation, `IString` implementation |
-| `list.cb` | `list<T>` - growable array; `add(move T)`, `get()`, `set(move T)`, `removeAt()`, `sort(comparator)` |
-| `span.cb` | `span<T>` - non-owning **noalias** window (`T[]` + len); pass by value for vectorization. See [HPC.md](HPC.md) |
-| `view.cb` | `view<T>` - non-owning **may-alias** window (`T*` + len); `slice(start,end)`; sibling of `span<T>` |
+| `string.cb` | `string` - owned/borrowed UTF-8 value type; `IString` implementation |
+| `wstring.cb` | `wstring` - owned UTF-16 string for Win32 `...W` / WinRT APIs |
+| `array.cb` | `array<T>` - owning fixed-size heap array with destructor support |
+| `list.cb` | `list<T>` - growable array |
+| `span.cb` | `span<T>` - non-owning **noalias** window (`T[]` + len); for vectorization. See [HPC.md](HPC.md) |
+| `view.cb` | `view<T>` - non-owning **may-alias** window (`T*` + len); sibling of `span<T>` |
 | `hashset.cb` | `hashset<T>` - open-addressed set; T must be integer-like |
-| `dictionary.cb` | `dictionary<K,V>` - hash map; `add(K, move V)`, `set(K, move V)`, `get()`, `remove()` |
-| `math.cb` | `Math` namespace: `abs`, `min`, `max`, `pow`, `sqrt`, `clamp`, trig, rounding; constants `Math.PI`, `Math.TAU`, `Math.E`, `Math.SQRT2`, `Math.LN2`, `Math.LN10` (namespace `const` globals - no parens) |
-| `stack.cb` | `stack<T>` - LIFO; `push()`, `pop()`, `peek()` |
-| `queue.cb` | `queue<T>` - FIFO; `enqueue()`, `dequeue()`, `peek()` |
+| `dictionary.cb` | `dictionary<K,V>` - hash map |
+| `stack.cb` | `stack<T>` - LIFO |
+| `queue.cb` | `queue<T>` - FIFO |
 | `pair.cb` | `pair<A,B>` - two-field generic struct |
-| `filesystem.cb` | `File.exists()`, `File.readAllText()`, `File.writeAllText()`, `File.move()`, `File.isFile()`, `File.remove()`, `File.copy()`; `Path.combine()`, `Path.getFileName()`, `Path.getDirectory()`, `Path.changeExtension()`; `Directory.list()`, `Directory.listFiles()`, `Directory.createAll()` |
-| `thread.cb` | `Thread` - Win32 thread wrapper; `start(fn, ctx)`, `join()` |
-| `random.cb` | `Random` - splitmix64 PRNG; `seed(i64)`, `seedFromTime()`, `next()`, `nextInt(min, max)`, `nextDouble()`; independent substreams via `jump(i64)` / `split()` |
-| `time.cb` | `Duration`, `TimePoint`, `Stopwatch` - high-resolution timing |
-| `mutex.cb` | `Mutex` - Win32 CRITICAL_SECTION wrapper |
-| `atomic.cb` | `Atomic<T>` - load/store/fetchAdd with LLVM atomic IR |
+| `tuple.cb` | `tuple<T...>` - variadic heterogeneous value type |
+| `function.cb` | Closure-environment memory primitives backing `function<T>` / lambdas |
+| `guid.cb` | `Guid` - 128-bit GUID / RFC 4122 UUID |
+
+**Math & numerics**
+
+| File | Purpose |
+|------|---------|
+| `math.cb` | `Math` namespace: `abs`/`min`/`max`/`pow`/`sqrt`/`clamp`/`fma`, trig, rounding; constants `Math.PI`/`TAU`/`E`/`SQRT2`/`LN2`/`LN10` |
+| `random.cb` | `Random` - splitmix64 PRNG with independent substreams (`jump`/`split`) |
+| `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()` |
+
+**Memory & allocators**
+
+| File | Purpose |
+|------|---------|
+| `memory.cb` | `operator new`/`delete` and the active-allocator slot |
+| `arena.cb` | `Arena` - bump allocator |
+| `arena_allocator.cb` | Mixed-size bump arena backed by the page pool |
+| `page_pool.cb` | Process-global pool of 64 KB pages for slab/arena backing |
+| `page_arena.cb` | Self-contained bump-allocation region for zero-copy transfer |
+| `vmem.cb` | OS virtual-memory abstraction |
+| `block_allocator.cb` | Block-based pooled allocator (used by `program` thread startup) |
+| `bucket_allocator.cb` | Segregated free-list allocator (size-class buckets) |
+| `entry_allocator.cb` | Variable-size bump allocator with per-page entry tables |
+| `fit_allocator.cb` | Fit allocation strategy |
+| `malloc_allocator.cb` | Thin wrapper around system malloc/free |
+
+**Concurrency**
+
+| File | Purpose |
+|------|---------|
+| `thread.cb` | `thread<T>` - Win32 thread wrapper |
+| `threadpool.cb` | `ThreadPool` - priority work queue with `submit`/`then`/`drain` |
+| `mutex.cb` | `mutex`, `atomic<T>`, `lock` statement - synchronization primitives |
+| `atomic.cb` | `Atomic<T>` - load/store/fetchAdd over LLVM atomic IR |
 | `semaphore.cb` | `Semaphore` - counting semaphore |
-| `latch.cb` | `Latch` - countdown latch |
+| `latch.cb` | `Latch` - one-shot countdown latch |
 | `rwlock.cb` | `RwLock` - readers-writer lock |
+| `barrier.cb` | Reusable (cyclic) thread barriers |
 | `channel.cb` | `channel<T>` - blocking MPMC queue |
+| `arena_channel.cb` | Bucket-backed allocator + zero-copy MPMC channel |
 | `spsc_queue.cb` | `spsc_queue<T>` - wait-free single-producer/single-consumer ring |
 | `stop_token.cb` | `StopSource` / `StopToken` - cooperative cancellation |
-| `arena.cb` | `Arena` - bump allocator |
-| `json.cb` | `JsonBuilder.toJson<T>`, `JsonBuilder.fromJson<T>` - JSON serialization/deserialization |
-| `graphic/bitmap.cb` | `Bitmap` - load/create/save Windows BMP files (`load(path)`, `save(path)`, `create(w,h)`, `get(x,y)`, `set(x,y,px)`, `width()`, `height()`); `BitmapPixel` struct (u8 fields `r`, `g`, `b`, `a`). `save` writes a real 24 bpp BMP file to disk. Import as `import "graphic/bitmap.cb";` |
+| `program.cb` | `program` construct runtime support (thread + allocator lifecycle) |
+
+**I/O, system & time**
+
+| File | Purpose |
+|------|---------|
+| `filesystem.cb` | `File`, `Path`, `Directory` - file and directory operations |
+| `cruntime.cb` | Raw C runtime bindings: `printf` family, stdout/stdin writers, `string.h`/`ctype.h` (hook-aware, VT-correct) |
+| `terminal.cb` | Win32 console terminal utilities |
+| `stream.cb` | Double-buffered text pipe between two `program` constructs |
+| `process.cb` | Launch and communicate with a child process |
+| `time.cb` | `TimePoint`, `Stopwatch`, `Timer`, `sleep`, `rdtscp`/`lfence` timing |
+| `os.cb` | Platform dispatcher (imports `os.windows.cb` on Windows) |
+| `os.windows.cb` | Windows platform externs: Win32 API and MSVC CRT |
+| `network/socket.cb` | Platform-agnostic TCP/UDP socket API |
+| `network/socket.windows.cb` | Winsock2 raw bindings (pulled in by `socket.cb` on Windows) |
+
+**Serialization & text**
+
+| File | Purpose |
+|------|---------|
+| `json.cb` | `JsonBuilder.toJson<T>` / `fromJson<T>` - JSON serialization |
+| `xml.cb` | `XmlBuilder` - struct-to-XML via the `reflect` intrinsic |
+| `regex.cb` | `Regex` - Thompson-NFA (linear-time) regex; capture groups. See [REGEX.md](REGEX.md) |
+
+**COM / WinRT**
+
+| File | Purpose |
+|------|---------|
+| `com.cb` | Shared COM/WinRT helpers: well-known IIDs and HRESULT codes. See [WINMD.md](WINMD.md) |
+| `winrt.cb` | WinRT runtime plumbing: HSTRING bridge, activation, async polling. See [WINMD.md](WINMD.md) |
+
+**Graphics**
+
+| File | Purpose |
+|------|---------|
+| `graphic/bitmap.cb` | `Bitmap` - load/create/save Windows BMP files; `BitmapPixel` struct |
+
+**HPC** (see [HPC.md](HPC.md))
+
+| File | Purpose |
+|------|---------|
+| `hpc/parallel.cb` | `parallel_for_n` / `parallel_reduce<T>` (raw-thread and ThreadPool) data parallelism |
+| `hpc/vecmath.cb` | BLAS level-1 style dense vector kernels over `double[]` |
+| `hpc/densemat.cb` | Dense row-major matrix kernels (BLAS level-2/3 style) |
+| `hpc/factor.cb` | Dense matrix factorization + triangular solve |
+| `hpc/sparse.cb` | Compressed sparse row (CSR) matrix and sparse mat-vec |
+| `hpc/solvers.cb` | Iterative sparse linear solvers |
+| `hpc/stencil.cb` | Structured-grid stencil kernels (finite-difference PDEs) |
+| `hpc/scan.cb` | Reductions, prefix sums, and streaming statistics over `double[]` |
+| `hpc/fft.cb` | Iterative in-place radix-2 Cooley-Tukey FFT |
+
+**Diagnostics**
+
+| File | Purpose |
+|------|---------|
+| `diagnostic/heap_audit.cb` | Opt-in heap leak detector (front end). See [CLI.md](CLI.md) `--heap-audit` |
+| `diagnostic/thread_fuzz.cb` | Seeded randomized thread-scheduling fuzzer |
 
 ---

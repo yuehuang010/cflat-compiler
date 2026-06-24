@@ -120,7 +120,7 @@ A **pointer-to-struct field** whose pointee is a known (registered) record keeps
 
 The explicit `dev->lpVtbl->CreateCommandQueue(dev, ...)` form above always works, but a thin COM interface - any struct whose **sole field is `lpVtbl`** (exactly the MIDL `{ const <Interface>Vtbl* lpVtbl; }` shape) - also gets **member-call sugar**: a vtable-slot name routes through `lpVtbl` and the receiver is passed as the implicit `this`. So the two lines below are equivalent:
 
-```cflat
+```cpp
 hr = dev->lpVtbl->CreateCommandQueue(dev, &desc, &iid, (void**)&q);  // explicit
 hr = dev->CreateCommandQueue(&desc, &iid, (void**)&q);               // sugar (implicit this)
 rt->Release();                                                       // sugar for rt->lpVtbl->Release(rt)

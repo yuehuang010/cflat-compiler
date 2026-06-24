@@ -46,7 +46,7 @@ CFlat uses **context-based ownership**: local variables and struct fields own th
 
 The `move` keyword on a **parameter definition** transfers ownership into the callee:
 
-```cflat
+```cpp
 void consume(move Resource* r) { ... }  // r is freed when consume() returns
 void borrow(Resource* r)        { ... }  // caller still owns r
 ```

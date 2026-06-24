@@ -11,14 +11,35 @@ CFlat can author, consume, and emit Windows Runtime (WinRT) / COM components:
 
 This page covers what is implemented today. See the end for current limitations.
 
+## Contents
+
+- [WinRT Object Authoring](#winrt-object-authoring)
+  - [The Member-Call Sugar](#the-member-call-sugar)
+  - [The HRESULT ABI (`HResult<T>`)](#the-hresult-abi-hresultt)
+    - [Short-Circuit Chaining](#short-circuit-chaining)
+  - [`com.cb` Helpers](#comcb-helpers)
+- [WinRT Metadata Consumption](#winrt-metadata-consumption)
+  - [The Member-Call Sugar on Imports](#the-member-call-sugar-on-imports)
+  - [Parameterized (Generic) Interfaces](#parameterized-generic-interfaces)
+    - [`iidof(T)` and Derived IIDs](#iidoft-and-derived-iids)
+    - [`foreach` Iteration](#foreach-iteration)
+  - [The `winrt.cb` Runtime](#the-winrtcb-runtime)
+    - [The `lib { }` Clause](#the-lib---clause)
+    - [`wstring` (UTF-16 Strings)](#wstring-utf-16-strings)
+    - [`awaitAsync` (Async Operations)](#awaitasync-async-operations)
+- [`.winmd` Emission](#winmd-emission)
+- [Reference](#reference)
+  - [CLI Flags](#cli-flags)
+  - [Not Yet Implemented](#not-yet-implemented)
+
 ---
 
-## Authoring a COM object: `[winrt] class`
+## WinRT Object Authoring
 
 A `[winrt]` class implements exactly one `[uuid]`-annotated interface and lowers to a thin COM
 object: a struct whose first field is a vtable pointer, followed by a refcount and your fields.
 
-```cflat
+```cpp
 import "com.cb";
 
 [uuid("4d57f3c2-8e1a-4b9d-9d3a-1f2e3c4b5a60")]
@@ -52,11 +73,11 @@ The compiler generates, per `[winrt]` class:
 Object lifetime is **reference-counted** (via `Release`), not owning-pointer auto-free - a `[winrt]`
 object is never auto-deleted at scope exit. Create with `new`, drop with `Release`.
 
-### Calling methods - the member-call sugar
+### The Member-Call Sugar
 
 `recv->Method(args)` dispatches through the vtable with an implicit `this`, hiding `lpVtbl`:
 
-```cflat
+```cpp
 HResult<i32> r = c->Eat();             // interface method -> HResult<T> (see the ABI below)
 u32 rc = c->AddRef();                  // IUnknown method, reached by name
 c->Release();
@@ -68,15 +89,13 @@ i32 hr = c->QueryInterface(&iid, &out);
 `QueryInterface`/`AddRef`/`Release` exist only in the vtable and are reachable **only** through this
 sugar. The explicit form still works if you want it: `c->lpVtbl->Eat(c, &out)`.
 
----
-
-## The HRESULT ABI and `HResult<T>`
+### The HRESULT ABI (`HResult<T>`)
 
 At the COM ABI every interface method returns an `HRESULT`, and its logical return value comes back
 through a trailing `[out, retval]` pointer. CFlat models that with `HResult<T>` (from `com.cb`),
 which carries the status and the value together:
 
-```cflat
+```cpp
 struct HResult<T>
 {
     i32 hr;          // S_OK (0) on success; a failure HRESULT otherwise
@@ -89,7 +108,7 @@ struct HResult<T>
 
 You write the method body in one of two ways, and the compiler generates the right thunk:
 
-```cflat
+```cpp
 [winrt] class Counter : ICounter
 {
     i32 total = default;
@@ -111,18 +130,18 @@ You write the method body in one of two ways, and the compiler generates the rig
 Both emit the same winmd logical signature (`Int32 Add(Int32)`). On the calling side the member-call
 sugar always yields an `HResult<T>` - **no auto-unwrap** - so you check the status explicitly:
 
-```cflat
+```cpp
 HResult<i32> r = k->Add(5);
 if (r.failed()) { /* handle r.hr */ }
 i32 total = r.value;
 ```
 
-### Chaining with `?.`
+#### Short-Circuit Chaining
 
 `?.` short-circuits a chain of COM calls on the first failure. The chain stays an `HResult<U>`, so
 you check once at the end (no early return - that's yours to write):
 
-```cflat
+```cpp
 HResult<i32> r = factory->Make()?.Value();   // Make() -> HResult<Counter*>, then Value()
 if (r.failed()) { log(r.hr); return; }       // r.hr is the FIRST failing HRESULT
 i32 v = r.value;                             // safe: the whole chain succeeded
@@ -130,9 +149,7 @@ i32 v = r.value;                             // safe: the whole chain succeeded
 
 If `Make()` fails, `Value()` is never called and `Make`'s HRESULT propagates straight to `r`.
 
----
-
-## `com.cb` helpers
+### `com.cb` Helpers
 
 `import "com.cb";` brings in the shared COM values:
 
@@ -146,7 +163,7 @@ If `Make()` fails, `Value()` is never called and `Make`'s HRESULT propagates str
 
 ---
 
-## Consuming WinRT metadata: `import "Foo.winmd"`
+## WinRT Metadata Consumption
 
 `.winmd` is an import file type. The interfaces, value structs, and enums become CFlat types you
 drive by hand through the COM vtable - exactly like the hand-written COM demos under `example/COM/`.
@@ -155,7 +172,7 @@ A bare name (`import "Windows.Foundation.winmd";`) resolves against the system W
 (`%SystemRoot%\System32\WinMetadata`), so the in-box winmds need no full path; a relative or absolute
 path also works for a winmd you ship yourself.
 
-```cflat
+```cpp
 import "Windows.Foundation.winmd";       // resolved from %SystemRoot%\System32\WinMetadata
 
 extern int main()
@@ -183,14 +200,14 @@ You get an interface pointer from a WinRT API call and drive it through `lpVtbl`
 map precisely; `String`/`Object`/interfaces/arrays/by-ref map to opaque `void*` (the COM thin
 pointer), which is ABI-correct.
 
-### Calling consumed interfaces - the member-call sugar
+### The Member-Call Sugar on Imports
 
 The same `recv->Method(args)` sugar shown for the produce side applies to **consumed** interfaces -
 both winmd-imported and [header-imported COM](C_INTEROP.md#com-interfaces-straight-from-a-header). A
 vtable-slot name routes through `lpVtbl` and the receiver is supplied as the implicit `this`, so the
 explicit example above can drop both the `->lpVtbl` step and the repeated receiver:
 
-```cflat
+```cpp
 void* str = default;
 i32 hr = s->ToString(&str);   // sugar for: s->lpVtbl->ToString(s, &str)
 s->Release();                 // sugar for: s->lpVtbl->Release(s)
@@ -203,9 +220,7 @@ explicit `s->lpVtbl->ToString(s, &str)` form always works too; reach for it when
 rvalue with no storage (e.g. a freshly cast pointer `((IReference<int>*)boxed)->lpVtbl->QueryInterface(...)`),
 which the storage-based sugar cannot rewrite.
 
----
-
-## Parameterized (generic) interfaces: `IVector<int>`, `IReference<T>`, ...
+### Parameterized (Generic) Interfaces
 
 WinRT's parameterized interfaces (`IVector<T>`, `IVectorView<T>`, `IMap<K,V>`, `IReference<T>`,
 `IIterable<T>`, ...) are not stored per-instantiation in metadata - every projection *synthesizes*
@@ -214,7 +229,7 @@ instantiates a concrete COM vtable + thin pointer from the generic template in t
 and derives the instance's IID (the **PIID**) by the standard RFC 4122 v5 / SHA-1 algorithm over the
 WinRT type signature - byte-for-byte what cppwinrt and windows-rs compute.
 
-```cflat
+```cpp
 import "Windows.Foundation.winmd";
 
 IReference<int>* r = default;            // resolves to a synthesized concrete COM interface
@@ -222,13 +237,13 @@ int v = default;
 i32 hr = r->lpVtbl->get_Value(r, &v);    // drive it through the vtable like any imported interface
 ```
 
-### `iidof(T)` - the derived IID
+#### `iidof(T)` and Derived IIDs
 
 `iidof(T)` yields a `REFIID`-shaped pointer to the type's 16-byte IID - the **derived PIID** for a
 parameterized interface, or the stored IID for a plain interface. Pass it straight to
 `QueryInterface`:
 
-```cflat
+```cpp
 // boxed is an IInspectable* from a WinRT API (e.g. PropertyValue.CreateInt32).
 IReference<int>* obj = (IReference<int>*)boxed;
 IReference<int>* ref = default;
@@ -242,7 +257,7 @@ read it back). Type arguments must be an explicit-width scalar (`i32`/`u32`/`f32
 `object`, or the `int`/`uint`/`float`/`double` aliases) or an imported winmd type; arrays are not
 permitted as type arguments (a WinRT rule).
 
-### `foreach` over a WinRT collection
+#### `foreach` Iteration
 
 `for (T x in coll)` works when `coll` is any imported winmd interface that is (or *requires*)
 `IIterable<T>` - `IVector<T>`, `IVectorView<T>`, `IIterable<T>` itself, and so on. The compiler
@@ -250,9 +265,9 @@ synthesizes `IIterable<T>` / `IIterator<T>` on demand, `QueryInterface`s the rec
 `IIterable<T>` with the derived PIID, then drives `First` / `get_HasCurrent` / `get_Current` /
 `MoveNext` and `Release`s the iterator afterwards:
 
-```cflat
-import "Windows.Foundation.winmd";   // IIterable`1 / IIterator`1 (from system WinMetadata)
-import "Windows.Data.winmd";         // JsonArray, IJsonValue
+```cpp
+import "winrt.cb";              // brings in Windows.Foundation.winmd (IIterable`1 / IIterator`1) + WinRT libs
+import "Windows.Data.winmd";   // JsonArray, IJsonValue
 
 // arr is an IJsonArray* (an IVector<IJsonValue>) from JsonArray.Parse("[10,20,30]").
 double sum = 0.0;
@@ -265,17 +280,104 @@ for (IJsonValue* x in arr)
 ```
 
 The element type is the loop variable's type (a scalar, or a named winmd type held by pointer for
-interface elements). `Windows.Foundation.winmd` must be imported so the `IIterable`/`IIterator`
-templates are available. See `example/COM/winrt_foreach_demo.cb` for the full live program. A
+interface elements). `Windows.Foundation.winmd` must be available so the `IIterable`/`IIterator`
+templates can be synthesized - `import "winrt.cb";` pulls it in (and links the WinRT libs), or
+import it directly. See `example/COM/winrt_foreach_demo.cb` for the full live program. A
 receiver that does not actually implement `IIterable<T>` fails the runtime `QueryInterface` and
 iterates zero times (there is no compile-time iterability check yet).
 
 > Projecting `IVector<T>`/`IMap<K,V>` onto CFlat's core `list`/`dictionary` is not done - use the
 > interfaces directly.
 
+### The `winrt.cb` Runtime
+
+Driving WinRT by hand means the same plumbing every program repeats: initialize the apartment,
+marshal strings to/from `HSTRING`, fetch an activation factory, and wait on async operations.
+`core/winrt.cb` packages all of it. Importing it also **imports `Windows.Foundation.winmd`**
+(the `IReference`1` / `IIterable`1` / `IAsync*` foundation every WinRT API builds on) **and links
+the WinRT import libs** (`RuntimeObject.lib`, `ole32.lib`), so a consumer needs only:
+
+```cpp
+import "winrt.cb";                 // + Windows.Foundation.winmd + WinRT libs, no lib clause needed
+import "Windows.Storage.winmd";    // plus the .winmd of whatever specific API you call
+```
+
+What `winrt.cb` provides:
+
+- `winrtInit()` / `winrtUninit()` - apartment lifecycle (`RO_INIT_MULTITHREADED`).
+- `activationFactory(className, iid, out)` - build the class-name `HSTRING`, call
+  `RoGetActivationFactory`, free the string, return the HRESULT. Pass `iidof(TFactory)` for `iid`.
+- `hstring(string) -> void*` / `fromHString(void*) -> string` / `freeHString(void*)` - the
+  `HSTRING` bridge (UTF-8 <-> UTF-16, built on `wstring` below). You own an `HSTRING` from
+  `hstring()` and must `freeHString` it.
+- `awaitAsync(void*) -> i32` - block on an `IAsyncAction*` / `IAsyncOperation<T>*` (see Async below).
+
+```cpp
+winrtInit();
+IPathIOStatics* pathIO = nullptr;
+i32 hr = activationFactory("Windows.Storage.PathIO", iidof(IPathIOStatics), (void**)&pathIO);
+```
+
+#### The `lib { }` Clause
+
+`winrt.cb` hides the link step, but if you import a `.winmd` yourself you supply the runtime libs
+with a `lib` clause on the import - the same clause used for header binds:
+
+```cpp
+import "Windows.Foundation.winmd" lib { "RuntimeObject.lib", "ole32.lib" };
+```
+
+#### `wstring` (UTF-16 Strings)
+
+CFlat's `string` is UTF-8 (byte-oriented); Windows wide APIs (`...W`) and `HSTRING` want UTF-16.
+`core/wstring.cb` is its UTF-16 complement: an **owning value type** holding a heap buffer of `u16`
+code units and a count. Conversion is a real UTF-8 <-> UTF-16 transcode via the OS (surrogate
+pairs and all), not a byte-widen, so non-ASCII text round-trips correctly.
+
+```cpp
+import "wstring.cb";   // (winrt.cb already pulls this in)
+
+wstring w = s.toWString();          // string (UTF-8) -> owned wstring (UTF-16)
+u16* p   = w.data();                // NUL-terminated UTF-16 buffer for a ...W API
+i32  n   = w.length();              // code-unit count (excludes the terminator)
+string back = w.toString();         // wstring -> owned UTF-8 string
+wstring fromRaw = wstring.fromUtf16(rawU16, len);   // take ownership of a transient u16* (e.g. an HSTRING buffer)
+```
+
+Like every owning value type, a `wstring` frees its buffer on scope exit and is **move-by-default**
+(`wstring b = a` transfers the buffer and consumes `a`; use `b = a.copy()` for an independent copy).
+Unlike `string`, it has no compiler support (no wide literals) - it is a pure library type.
+
+#### `awaitAsync` (Async Operations)
+
+Most of the useful WinRT surface is asynchronous - a method hands back an `IAsyncAction` (no result)
+or an `IAsyncOperation<T>` (a future `T`). The simplest correct way to consume one without a
+completion-handler delegate is to **poll**: `awaitAsync` `QueryInterface`s the object to `IAsyncInfo`
+and spins on `get_Status` until it leaves the `Started` state, then returns the terminal
+`AsyncStatus` (`Completed`=1, `Canceled`=2, `Error`=3, or -1 if `IAsyncInfo` was unavailable).
+
+```cpp
+void* readOp = nullptr;
+pathIO->ReadTextAsync(hPath, &readOp);          // -> IAsyncOperation<String>
+if (awaitAsync(readOp) == 1) {
+    void* hOut = nullptr;
+    ((IAsyncOperation<string>*)readOp)->lpVtbl->GetResults(readOp, &hOut);
+    string text = fromHString(hOut);
+    freeHString(hOut);
+}
+((IAsyncOperation<string>*)readOp)->lpVtbl->Release(readOp);
+```
+
+`IAsyncOperation<String>` is not stored in metadata; CFlat synthesizes its vtable and parameterized
+IID on demand from the generic `IAsyncOperation`1` template in `Windows.Foundation.winmd`, exactly as
+for `IReference<int>`. See `example/COM/winrt_async_demo.cb` for a full `PathIO` write/read round-trip.
+
+> Async **delegates / completion handlers** are not projected - polling with `awaitAsync` is the
+> supported model.
+
 ---
 
-## Emitting a `.winmd`: `--emit-winmd`
+## `.winmd` Emission
 
 After a successful compile, `--emit-winmd <path>` writes a valid ECMA-335 `.winmd` describing the
 program's `[winrt]` interfaces and classes (IIDs, method signatures, runtime classes):
@@ -290,26 +392,21 @@ for tooling / projection.
 
 ---
 
-## CLI flags
+## Reference
 
-| Switch | Value | Description |
-|--------|-------|-------------|
-| `--emit-winmd` | path | After compiling, write the program's `[winrt]` types to a `.winmd`. |
-| `--dump-winmd` | path | Read a `.winmd` into the projection model and print it (diagnostic), then exit. |
-| `--winmd-instantiate` | path | Import a `.winmd` and instantiate well-known parameterized interfaces (`IVector<i32>`, `IReference<i32>`, ...), checking each derived PIID + vtable shape, then exit. |
-| `--winmd-sig-selftest` | | Validate the parameterized-type signature encoder + PIID derivation against published reference IIDs and the RFC 4122 v5 vector, then exit. |
-| `--check` | | A `.winmd` passed to `--check` is parsed-verified (no registration). `test_winmd.bat` uses this to batch-validate every SDK `.winmd`. |
+### CLI Flags
 
-A `.winmd` brought in via `import "x.winmd";` registers its types (consume). A `.winmd` passed to
-`--dump-winmd`/`--check` is only read/verified.
+The WinMD / COM switches (`--emit-winmd`, `--dump-winmd`, `--winmd-instantiate`,
+`--winmd-sig-selftest`, and `--check` on a `.winmd`) are documented in the command-line reference:
+[`doc/CLI.md` -> WinMD / COM](CLI.md#winmd--com).
 
----
+### Not Yet Implemented
 
-## Current limitations
-
-- **No activation factory / DLL output.** A `[winrt]` object is created in-process with `new`. The
-  activation factory + `DllGetActivationFactory` (for an external WinRT host to `RoActivateInstance`
-  across a DLL boundary) is intentionally not generated - CFlat does not output DLLs.
+- **No activation factory / DLL output (produce side).** A `[winrt]` object *you author* is created
+  in-process with `new`; the activation factory + `DllGetActivationFactory` (for an external WinRT
+  host to `RoActivateInstance` across a DLL boundary) is intentionally not generated - CFlat does not
+  output DLLs. (Consuming a system component's factory is fully supported - see `winrt.cb`'s
+  `activationFactory`.)
 - **Parameterized (generic) WinRT interfaces** (`IVector<T>`, `IReference<T>`, ...) are instantiated
   on consume and support `foreach` (see above), but projection onto core `list`/`dictionary` is not
   yet provided; non-iterating method calls drive the COM vtable by hand.
