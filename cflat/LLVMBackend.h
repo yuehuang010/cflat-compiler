@@ -2720,6 +2720,7 @@ private:
         return true;
     }
 
+    void RunModulePasses(llvm::ModulePassManager& MPM);
     void RunBaselinePasses();
     void RunGlobalDCE();
     void OptimizeModule(int optimizationLevel);

@@ -1377,7 +1377,9 @@ void LLVMBackend::ProcessPendingMacroSources()
     }
 }
 
-void LLVMBackend::RunBaselinePasses()
+// Build fresh analysis managers, wire the standard proxies, and run the given
+// module pass manager. Shared by RunBaselinePasses and RunGlobalDCE.
+void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
 {
     llvm::PassBuilder PB;
     llvm::LoopAnalysisManager LAM;
@@ -1391,6 +1393,11 @@ void LLVMBackend::RunBaselinePasses()
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
+    MPM.run(*module, MAM);
+}
+
+void LLVMBackend::RunBaselinePasses()
+{
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::PromotePass());
@@ -1399,7 +1406,7 @@ void LLVMBackend::RunBaselinePasses()
 
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
-    MPM.run(*module, MAM);
+    RunModulePasses(MPM);
 }
 
 // At -O0 no module-level reachability pass runs, so every internal-linkage function
@@ -1410,21 +1417,9 @@ void LLVMBackend::RunBaselinePasses()
 // O1+ already get this via buildPerModuleDefaultPipeline, so this is the -O0-only path.
 void LLVMBackend::RunGlobalDCE()
 {
-    llvm::PassBuilder PB;
-    llvm::LoopAnalysisManager LAM;
-    llvm::FunctionAnalysisManager FAM;
-    llvm::CGSCCAnalysisManager CGAM;
-    llvm::ModuleAnalysisManager MAM;
-
-    PB.registerModuleAnalyses(MAM);
-    PB.registerCGSCCAnalyses(CGAM);
-    PB.registerFunctionAnalyses(FAM);
-    PB.registerLoopAnalyses(LAM);
-    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::GlobalDCEPass());
-    MPM.run(*module, MAM);
+    RunModulePasses(MPM);
 }
 
 namespace {
