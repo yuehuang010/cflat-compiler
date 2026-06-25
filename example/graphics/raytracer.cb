@@ -10,46 +10,10 @@
 //   out\raytracer.exe          -> writes render.bmp (400x300) to the current directory
 
 import "graphic/bitmap.cb";
-import "math.cb";
+import "linear_math.cb";    // vec3 + operator-overloaded vector math
 
-// ─── vec3: the whole point of the exercise is to lean on operator overloading ───
-
-struct vec3
-{
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-
-    vec3 operator+(vec3 o) { vec3 r; r.x = x + o.x; r.y = y + o.y; r.z = z + o.z; return r; }
-    vec3 operator-(vec3 o) { vec3 r; r.x = x - o.x; r.y = y - o.y; r.z = z - o.z; return r; }
-
-    // scalar multiply
-    vec3 operator*(double s) { vec3 r; r.x = x * s; r.y = y * s; r.z = z * s; return r; }
-    // component-wise multiply (used for color modulation)
-    vec3 operator*(vec3 o)   { vec3 r; r.x = x * o.x; r.y = y * o.y; r.z = z * o.z; return r; }
-
-    double dot(vec3 o)   { return x * o.x + y * o.y + z * o.z; }
-    vec3   cross(vec3 o) { vec3 r; r.x = y * o.z - z * o.y; r.y = z * o.x - x * o.z; r.z = x * o.y - y * o.x; return r; }
-
-    double length()      { return Math.sqrt(x * x + y * y + z * z); }
-
-    vec3 normalize()
-    {
-        double l = length();
-        vec3 r; r.x = x / l; r.y = y / l; r.z = z / l; return r;
-    }
-};
-
-vec3 makeVec(double x, double y, double z)
-{
-    vec3 v; v.x = x; v.y = y; v.z = z; return v;
-}
-
-// reflect direction d about surface normal n (both assumed normalized)
-vec3 reflectDir(vec3 d, vec3 n)
-{
-    return d - n * (2.0 * d.dot(n));
-}
+// vec3 (double), its operators, dot/cross/length/normalize, and reflect all live
+// in core/linear_math.cb now. makeVec -> vec3.make, reflectDir -> vec3.reflect.
 
 // ─── scene ──────────────────────────────────────────────────────────────────
 
@@ -116,8 +80,8 @@ bool inShadow(vec3 p)
 vec3 skyColor(vec3 d)
 {
     double t = 0.5 * (d.y + 1.0);
-    vec3 white = makeVec(1.0, 1.0, 1.0);
-    vec3 blue  = makeVec(0.5, 0.7, 1.0);
+    vec3 white = vec3.make(1.0, 1.0, 1.0);
+    vec3 blue  = vec3.make(0.5, 0.7, 1.0);
     return white * (1.0 - t) + blue * t;
 }
 
@@ -127,8 +91,8 @@ vec3 groundColor(vec3 p)
     int cx = (int)Math.floor(p.x);
     int cz = (int)Math.floor(p.z);
     bool even = ((cx + cz) & 1) == 0;
-    if (even) return makeVec(0.9, 0.9, 0.9);
-    return makeVec(0.2, 0.2, 0.2);
+    if (even) return vec3.make(0.9, 0.9, 0.9);
+    return vec3.make(0.2, 0.2, 0.2);
 }
 
 // Recursive trace: returns the color seen along ray (o + t*d).
@@ -158,7 +122,7 @@ vec3 trace(vec3 o, vec3 d, int depth)
 
     if (bestIx == -2)
     {
-        normal       = makeVec(0.0, 1.0, 0.0);
+        normal       = vec3.make(0.0, 1.0, 0.0);
         baseColor    = groundColor(hitPt);
         reflectivity = 0.2;
     }
@@ -180,7 +144,7 @@ vec3 trace(vec3 o, vec3 d, int depth)
 
     if (reflectivity > 0.0 && depth > 0)
     {
-        vec3 rdir = reflectDir(d, normal).normalize();
+        vec3 rdir = vec3.reflect(d, normal).normalize();
         vec3 rcol = trace(hitPt + normal * EPS, rdir, depth - 1);
         local = local * (1.0 - reflectivity) + rcol * reflectivity;
     }
@@ -201,32 +165,32 @@ extern int main()
     int maxDepth = 4;
 
     // Build the scene.
-    g_spheres[0].center = makeVec(0.0, 1.0, 0.0);
+    g_spheres[0].center = vec3.make(0.0, 1.0, 0.0);
     g_spheres[0].radius = 1.0;
-    g_spheres[0].color  = makeVec(0.8, 0.3, 0.3);
+    g_spheres[0].color  = vec3.make(0.8, 0.3, 0.3);
     g_spheres[0].reflectivity = 0.3;
 
-    g_spheres[1].center = makeVec(-2.2, 0.8, -1.0);
+    g_spheres[1].center = vec3.make(-2.2, 0.8, -1.0);
     g_spheres[1].radius = 0.8;
-    g_spheres[1].color  = makeVec(0.3, 0.8, 0.3);
+    g_spheres[1].color  = vec3.make(0.3, 0.8, 0.3);
     g_spheres[1].reflectivity = 0.1;
 
-    g_spheres[2].center = makeVec(2.2, 0.7, -0.5);
+    g_spheres[2].center = vec3.make(2.2, 0.7, -0.5);
     g_spheres[2].radius = 0.7;
-    g_spheres[2].color  = makeVec(0.3, 0.4, 0.9);
+    g_spheres[2].color  = vec3.make(0.3, 0.4, 0.9);
     g_spheres[2].reflectivity = 0.5;
 
-    g_spheres[3].center = makeVec(0.4, 0.4, 1.6);
+    g_spheres[3].center = vec3.make(0.4, 0.4, 1.6);
     g_spheres[3].radius = 0.4;
-    g_spheres[3].color  = makeVec(0.9, 0.9, 0.2);
+    g_spheres[3].color  = vec3.make(0.9, 0.9, 0.2);
     g_spheres[3].reflectivity = 0.8;
 
-    g_lightDir = makeVec(-1.0, 1.5, 0.6).normalize();
+    g_lightDir = vec3.make(-1.0, 1.5, 0.6).normalize();
 
     // Camera: a look-at basis built with the cross product.
-    vec3 camPos = makeVec(0.0, 1.5, 5.0);
-    vec3 target = makeVec(0.0, 0.8, 0.0);
-    vec3 worldUp = makeVec(0.0, 1.0, 0.0);
+    vec3 camPos = vec3.make(0.0, 1.5, 5.0);
+    vec3 target = vec3.make(0.0, 0.8, 0.0);
+    vec3 worldUp = vec3.make(0.0, 1.0, 0.0);
 
     vec3 fwdTmp  = target - camPos;
     vec3 forward = fwdTmp.normalize();

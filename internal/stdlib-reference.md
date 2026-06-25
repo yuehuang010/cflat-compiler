@@ -37,6 +37,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | File | Exports |
 |------|---------|
 | `math.cb` | `Math` namespace: `abs`/`min`/`max`/`pow`/`sqrt`/`clamp`/`fma`, trig, rounding; constants `Math.PI` / `TAU` / `E` / `SQRT2` / `LN2` / `LN10` |
+| `linear_math.cb` | Small fixed-size geometry value types with operator overloading: `vec2`/`vec3`/`vec4` (+ `vec2f`/`vec3f`/`vec4f`), `mat4`/`mat4f` (row-major, D3D left-handed), `quat`/`quatf` rotation. dot/cross/normalize/lerp/reflect, project/lookAt/inverse, quaternion slerp. GLM-style; for *small* vectors - contrast `hpc/vecmath.cb` (large `double[]` BLAS) |
 | `random.cb` | `Random` - splitmix64 PRNG; independent substreams via `jump`/`split` |
 | `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()` (x86 spin-loop hint) |
 
@@ -115,7 +116,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | File | Exports |
 |------|---------|
 | `hpc/parallel.cb` | `parallel_for_n` / `parallel_reduce<T>` (raw-thread) and `..._pool` (ThreadPool) - across-core data parallelism over `[0,n)` |
-| `hpc/vecmath.cb` | BLAS level-1 style dense vector kernels over `double[]` |
+| `hpc/vecmath.cb` | BLAS level-1 style dense vector kernels over `double[]` (large dynamic vectors; for small fixed `vec3`/`mat4` geometry see `linear_math.cb`) |
 | `hpc/densemat.cb` | Dense row-major matrix kernels (BLAS level-2/3 style) |
 | `hpc/factor.cb` | Dense matrix factorization + triangular solve |
 | `hpc/sparse.cb` | Compressed sparse row (CSR) matrix and sparse mat-vec |

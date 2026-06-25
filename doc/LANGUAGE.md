@@ -2223,6 +2223,7 @@ table is a file index of what each library is for.
 | File | Purpose |
 |------|---------|
 | `math.cb` | `Math` namespace: `abs`/`min`/`max`/`pow`/`sqrt`/`clamp`/`fma`, trig, rounding; constants `Math.PI`/`TAU`/`E`/`SQRT2`/`LN2`/`LN10` |
+| `linear_math.cb` | Small fixed-size geometry value types with operator overloading: `vec2`/`vec3`/`vec4` (+ `f` float variants), `mat4`/`mat4f` (row-major, D3D left-handed), `quat`/`quatf`. dot/cross/normalize/lerp/reflect, project/lookAt/inverse, quaternion slerp. GLM-style; for *small* vectors - contrast `hpc/vecmath.cb` |
 | `random.cb` | `Random` - splitmix64 PRNG with independent substreams (`jump`/`split`) |
 | `intrinsic.cb` | Compiler intrinsics: `popcount`, `ctz`, `clz`, `prefetch`, `likely`/`unlikely`, `pause()` |
 
@@ -2301,7 +2302,7 @@ table is a file index of what each library is for.
 | File | Purpose |
 |------|---------|
 | `hpc/parallel.cb` | `parallel_for_n` / `parallel_reduce<T>` (raw-thread and ThreadPool) data parallelism |
-| `hpc/vecmath.cb` | BLAS level-1 style dense vector kernels over `double[]` |
+| `hpc/vecmath.cb` | BLAS level-1 style dense vector kernels over `double[]` (large dynamic vectors; small fixed `vec3`/`mat4` geometry is in `linear_math.cb`) |
 | `hpc/densemat.cb` | Dense row-major matrix kernels (BLAS level-2/3 style) |
 | `hpc/factor.cb` | Dense matrix factorization + triangular solve |
 | `hpc/sparse.cb` | Compressed sparse row (CSR) matrix and sparse mat-vec |

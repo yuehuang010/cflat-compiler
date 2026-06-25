@@ -27,6 +27,7 @@ import "com.cb";
 import { "windows.h", "d3d11.h", "d3dcompiler.h" }
     lib { "user32.lib", "gdi32.lib", "d3d11.lib", "d3dcompiler.lib", "dxgi.lib" } cache;
 import "math.cb";
+import "linear_math.cb";   // mat4f - row-major float 4x4 matrix math
 
 const i32 W = 640;
 const i32 H = 480;
@@ -47,87 +48,19 @@ ComPtr<ID3D11RenderTargetView> g_rtv = default;
 ComPtr<ID3D11DepthStencilView> g_dsv = default;
 ComPtr<ID3D11Buffer> g_cb = default;
 
-// ---- 4x4 matrix helpers (row-major; a row vector v transforms as v*M) ----------------
+// ---- model-view-projection matrix (row-major mat4f from core/geometry.cb) -------------
+//
+// mat4f is row-major with the row-vector convention (v transforms as v*M), and its
+// rotX/rotY/translate/perspectiveLH factories use the same Direct3D left-handed
+// formulas the hand-rolled helpers did, so the result is unchanged.
 
-void mat4Identity(float* m)
+// World(spin) * View(push back) * Projection for rotation angle `a`.
+mat4f computeMvp(float a)
 {
-    i32 i = 0;
-    while (i < 16) { m[i] = 0.0f; i = i + 1; }
-    m[0] = 1.0f; m[5] = 1.0f; m[10] = 1.0f; m[15] = 1.0f;
-}
-
-// out = a * b. out must not alias a or b.
-void mat4Mul(float* a, float* b, float* out)
-{
-    i32 r = 0;
-    while (r < 4)
-    {
-        i32 c = 0;
-        while (c < 4)
-        {
-            float s = 0.0f;
-            i32 k = 0;
-            while (k < 4) { s = s + a[r * 4 + k] * b[k * 4 + c]; k = k + 1; }
-            out[r * 4 + c] = s;
-            c = c + 1;
-        }
-        r = r + 1;
-    }
-}
-
-void mat4RotY(float* m, float a)
-{
-    mat4Identity(m);
-    float cs = Math.cos(a);
-    float sn = Math.sin(a);
-    m[0] = cs; m[2] = -sn; m[8] = sn; m[10] = cs;
-}
-
-void mat4RotX(float* m, float a)
-{
-    mat4Identity(m);
-    float cs = Math.cos(a);
-    float sn = Math.sin(a);
-    m[5] = cs; m[6] = sn; m[9] = -sn; m[10] = cs;
-}
-
-void mat4Translate(float* m, float tx, float ty, float tz)
-{
-    mat4Identity(m);
-    m[12] = tx; m[13] = ty; m[14] = tz;
-}
-
-// Left-handed perspective projection (Direct3D convention), row-major: clip.w = view.z.
-void mat4PerspectiveLH(float* m, float fovY, float aspect, float zn, float zf)
-{
-    i32 i = 0;
-    while (i < 16) { m[i] = 0.0f; i = i + 1; }
-    float ys = 1.0f / Math.tan(fovY * 0.5f);
-    float xs = ys / aspect;
-    m[0] = xs;
-    m[5] = ys;
-    m[10] = zf / (zf - zn);
-    m[11] = 1.0f;
-    m[14] = -zn * zf / (zf - zn);
-}
-
-// World(spin) * View(push back) * Projection into mvp[16] for rotation angle `a`.
-void computeMvp(float* mvp, float a)
-{
-    float[16] ry = default;
-    float[16] rx = default;
-    float[16] tr = default;
-    float[16] pr = default;
-    mat4RotY(&ry[0], a);
-    mat4RotX(&rx[0], a * 0.7f);
-    mat4Translate(&tr[0], 0.0f, 0.0f, 4.0f);
-    mat4PerspectiveLH(&pr[0], 1.0f, (float)W / (float)H, 0.1f, 100.0f);
-
-    float[16] m1 = default;
-    float[16] m2 = default;
-    mat4Mul(&ry[0], &rx[0], &m1[0]);   // model rotation
-    mat4Mul(&m1[0], &tr[0], &m2[0]);   // + view translate
-    mat4Mul(&m2[0], &pr[0], mvp);      // + projection
+    mat4f model = mat4f.rotY(a) * mat4f.rotX(a * 0.7f);
+    mat4f view  = mat4f.translate(0.0f, 0.0f, 4.0f);
+    mat4f proj  = mat4f.perspectiveLH(1.0f, (float)W / (float)H, 0.1f, 100.0f);
+    return model * view * proj;
 }
 
 // Compile one HLSL entry point to bytecode, or report the compiler's error blob and exit.
@@ -152,8 +85,7 @@ void renderFrame()
 {
     // Spin from the wall clock so the rate is frame-rate independent.
     float a = (float)GetTickCount() * 0.001f;
-    float[16] mvp = default;
-    computeMvp(&mvp[0], a);
+    mat4f mvp = computeMvp(a);
 
     // Upload the matrix into the dynamic constant buffer (DISCARD = rename, no GPU stall).
     D3D11_MAPPED_SUBRESOURCE ms = default;
@@ -162,7 +94,7 @@ void renderFrame()
     {
         float* dst = (float*)ms.pData;
         i32 i = 0;
-        while (i < 16) { dst[i] = mvp[i]; i = i + 1; }
+        while (i < 16) { dst[i] = mvp.m[i]; i = i + 1; }
         g_ctx->Unmap((ID3D11Resource*)g_cb.get(), 0);
     }
 

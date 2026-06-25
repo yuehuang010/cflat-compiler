@@ -1,0 +1,438 @@
+// test_linear_mat.cb - comprehensive tests for core/linear_math.cb.
+//
+// Covers every vector type (vec2/3/4 and vec2f/3f/4f) and both matrices
+// (mat4/mat4f): construction, operators, geometric methods (dot/cross/length/
+// normalize/lerp/reflect), and the matrix factories, product, and transform.
+//
+// Test() in test_helper.cb has no double overload and compares exactly, which
+// is wrong for sqrt/trig results, so this file uses its own tolerance-based
+// checks with global pass/total counters.
+
+import "linear_math.cb";   // transitively imports math.cb, so Math.* is available
+
+int g_passed = 0;
+int g_total  = 0;
+
+// Tolerance check; doubles use a tight tolerance, float-derived values a looser one.
+void chk(const char* name, double actual, double expected, double tolerance)
+{
+    g_total = g_total + 1;
+    double d = actual - expected;
+    if (d < 0.0) d = -d;
+    if (d <= tolerance) { g_passed = g_passed + 1; return; }
+    printf("FAIL %s: expected %f got %f\n", name, expected, actual);
+}
+
+void chkd(const char* name, double actual, double expected) { chk(name, actual, expected, 1e-9); }
+void chkf(const char* name, double actual, double expected) { chk(name, actual, expected, 1e-5); }
+
+void chkb(const char* name, bool cond)
+{
+    g_total = g_total + 1;
+    if (cond) { g_passed = g_passed + 1; return; }
+    printf("FAIL %s: condition false\n", name);
+}
+
+// ─── vec2 (double) ─────────────────────────────────────────────────────────────
+
+void testVec2()
+{
+    vec2 z = default;
+    chkd("vec2 default x", z.x, 0.0);
+    chkd("vec2 default y", z.y, 0.0);
+
+    vec2 a = vec2.make(1.0, 2.0);
+    vec2 b = vec2.make(4.0, 5.0);
+    chkd("vec2 make x", a.x, 1.0);
+    chkd("vec2 make y", a.y, 2.0);
+
+    vec2 s = a + b;
+    chkd("vec2 add x", s.x, 5.0);  chkd("vec2 add y", s.y, 7.0);
+    vec2 d = b - a;
+    chkd("vec2 sub x", d.x, 3.0);  chkd("vec2 sub y", d.y, 3.0);
+    vec2 n = -a;
+    chkd("vec2 neg x", n.x, -1.0); chkd("vec2 neg y", n.y, -2.0);
+    vec2 m = a * 3.0;
+    chkd("vec2 scalar mul x", m.x, 3.0); chkd("vec2 scalar mul y", m.y, 6.0);
+    vec2 q = b / 2.0;
+    chkd("vec2 scalar div x", q.x, 2.0); chkd("vec2 scalar div y", q.y, 2.5);
+    vec2 cw = a * b;
+    chkd("vec2 cwise mul x", cw.x, 4.0); chkd("vec2 cwise mul y", cw.y, 10.0);
+
+    chkb("vec2 eq true",  a == vec2.make(1.0, 2.0));
+    chkb("vec2 eq false", !(a == b));
+
+    chkd("vec2 dot", a.dot(b), 14.0);            // 1*4 + 2*5
+    chkd("vec2 lengthSq", vec2.make(3.0, 4.0).lengthSq(), 25.0);
+    chkd("vec2 length",   vec2.make(3.0, 4.0).length(),   5.0);
+
+    vec2 u = vec2.make(0.0, 5.0).normalize();
+    chkd("vec2 normalize x", u.x, 0.0); chkd("vec2 normalize y", u.y, 1.0);
+
+    vec2 lp = vec2.lerp(vec2.make(0.0, 0.0), vec2.make(10.0, 20.0), 0.5);
+    chkd("vec2 lerp x", lp.x, 5.0); chkd("vec2 lerp y", lp.y, 10.0);
+}
+
+// ─── vec3 (double) ─────────────────────────────────────────────────────────────
+
+void testVec3()
+{
+    vec3 z = default;
+    chkd("vec3 default z", z.z, 0.0);
+
+    vec3 a = vec3.make(1.0, 2.0, 3.0);
+    vec3 b = vec3.make(4.0, 5.0, 6.0);
+
+    vec3 s = a + b;
+    chkd("vec3 add x", s.x, 5.0); chkd("vec3 add y", s.y, 7.0); chkd("vec3 add z", s.z, 9.0);
+    vec3 d = b - a;
+    chkd("vec3 sub z", d.z, 3.0);
+    vec3 n = -vec3.make(1.0, -2.0, 3.0);
+    chkd("vec3 neg x", n.x, -1.0); chkd("vec3 neg y", n.y, 2.0); chkd("vec3 neg z", n.z, -3.0);
+    vec3 m = a * 2.0;
+    chkd("vec3 scalar mul z", m.z, 6.0);
+    vec3 q = vec3.make(2.0, 4.0, 6.0) / 2.0;
+    chkd("vec3 scalar div z", q.z, 3.0);
+    vec3 cw = vec3.make(2.0, 3.0, 4.0) * vec3.make(5.0, 6.0, 7.0);
+    chkd("vec3 cwise mul x", cw.x, 10.0); chkd("vec3 cwise mul y", cw.y, 18.0); chkd("vec3 cwise mul z", cw.z, 28.0);
+
+    chkb("vec3 eq true",  a == vec3.make(1.0, 2.0, 3.0));
+    chkb("vec3 eq false", !(a == b));
+
+    chkd("vec3 dot", a.dot(b), 32.0);            // 4 + 10 + 18
+    chkd("vec3 lengthSq", vec3.make(2.0, 3.0, 6.0).lengthSq(), 49.0);
+    chkd("vec3 length",   vec3.make(2.0, 3.0, 6.0).length(),   7.0);
+
+    // Right-handed basis: x cross y = z, y cross z = x.
+    vec3 cx = vec3.make(1.0, 0.0, 0.0).cross(vec3.make(0.0, 1.0, 0.0));
+    chkd("vec3 cross xy.x", cx.x, 0.0); chkd("vec3 cross xy.y", cx.y, 0.0); chkd("vec3 cross xy.z", cx.z, 1.0);
+    vec3 cy = vec3.make(0.0, 1.0, 0.0).cross(vec3.make(0.0, 0.0, 1.0));
+    chkd("vec3 cross yz.x", cy.x, 1.0); chkd("vec3 cross yz.y", cy.y, 0.0); chkd("vec3 cross yz.z", cy.z, 0.0);
+
+    vec3 u = vec3.make(0.0, 0.0, 5.0).normalize();
+    chkd("vec3 normalize z", u.z, 1.0);
+    chkd("vec3 normalize unit length", u.length(), 1.0);
+
+    vec3 lp = vec3.lerp(vec3.make(0.0, 0.0, 0.0), vec3.make(10.0, 20.0, 30.0), 0.5);
+    chkd("vec3 lerp x", lp.x, 5.0); chkd("vec3 lerp z", lp.z, 15.0);
+
+    // reflect (1,-1,0) about up normal (0,1,0) -> (1,1,0).
+    vec3 rf = vec3.reflect(vec3.make(1.0, -1.0, 0.0), vec3.make(0.0, 1.0, 0.0));
+    chkd("vec3 reflect x", rf.x, 1.0); chkd("vec3 reflect y", rf.y, 1.0); chkd("vec3 reflect z", rf.z, 0.0);
+}
+
+// ─── vec4 (double) ─────────────────────────────────────────────────────────────
+
+void testVec4()
+{
+    vec4 a = vec4.make(1.0, 2.0, 3.0, 4.0);
+    vec4 b = vec4.make(5.0, 6.0, 7.0, 8.0);
+
+    vec4 s = a + b;
+    chkd("vec4 add w", s.w, 12.0);
+    vec4 d = b - a;
+    chkd("vec4 sub w", d.w, 4.0);
+    vec4 n = -a;
+    chkd("vec4 neg w", n.w, -4.0);
+    vec4 m = a * 2.0;
+    chkd("vec4 scalar mul w", m.w, 8.0);
+    vec4 q = b / 2.0;
+    chkd("vec4 scalar div w", q.w, 4.0);
+    vec4 cw = a * b;
+    chkd("vec4 cwise mul w", cw.w, 32.0);
+
+    chkb("vec4 eq true",  a == vec4.make(1.0, 2.0, 3.0, 4.0));
+    chkb("vec4 eq false", !(a == b));
+
+    chkd("vec4 dot", a.dot(b), 70.0);            // 5 + 12 + 21 + 32
+    chkd("vec4 lengthSq", vec4.make(1.0, 2.0, 2.0, 4.0).lengthSq(), 25.0);
+    chkd("vec4 length",   vec4.make(1.0, 2.0, 2.0, 4.0).length(),   5.0);
+
+    vec4 u = vec4.make(0.0, 0.0, 0.0, 5.0).normalize();
+    chkd("vec4 normalize w", u.w, 1.0);
+
+    vec4 lp = vec4.lerp(vec4.make(0.0, 0.0, 0.0, 0.0), vec4.make(2.0, 4.0, 6.0, 8.0), 0.25);
+    chkd("vec4 lerp w", lp.w, 2.0);
+}
+
+// ─── float vectors (vec2f / vec3f / vec4f) ──────────────────────────────────────
+
+void testFloatVecs()
+{
+    vec2f a2 = vec2f.make(3.0f, 4.0f);
+    chkf("vec2f length", (double)a2.length(), 5.0);
+    vec2f s2 = vec2f.make(1.0f, 2.0f) + vec2f.make(4.0f, 5.0f);
+    chkf("vec2f add x", (double)s2.x, 5.0); chkf("vec2f add y", (double)s2.y, 7.0);
+    chkb("vec2f eq", a2 == vec2f.make(3.0f, 4.0f));
+
+    vec3f a3 = vec3f.make(2.0f, 3.0f, 6.0f);
+    chkf("vec3f length", (double)a3.length(), 7.0);
+    chkf("vec3f dot", (double)vec3f.make(1.0f, 2.0f, 3.0f).dot(vec3f.make(4.0f, 5.0f, 6.0f)), 32.0);
+    vec3f cx = vec3f.make(1.0f, 0.0f, 0.0f).cross(vec3f.make(0.0f, 1.0f, 0.0f));
+    chkf("vec3f cross z", (double)cx.z, 1.0);
+    vec3f u3 = vec3f.make(0.0f, 0.0f, 9.0f).normalize();
+    chkf("vec3f normalize z", (double)u3.z, 1.0);
+    vec3f rf = vec3f.reflect(vec3f.make(1.0f, -1.0f, 0.0f), vec3f.make(0.0f, 1.0f, 0.0f));
+    chkf("vec3f reflect y", (double)rf.y, 1.0);
+    vec3f m3 = vec3f.make(1.0f, 2.0f, 3.0f) * 2.0f;
+    chkf("vec3f scalar mul z", (double)m3.z, 6.0);
+
+    vec4f a4 = vec4f.make(1.0f, 2.0f, 2.0f, 4.0f);
+    chkf("vec4f length", (double)a4.length(), 5.0);
+    chkf("vec4f dot", (double)a4.dot(vec4f.make(1.0f, 1.0f, 1.0f, 1.0f)), 9.0);
+    vec4f lp = vec4f.lerp(vec4f.make(0.0f, 0.0f, 0.0f, 0.0f), vec4f.make(4.0f, 4.0f, 4.0f, 8.0f), 0.5f);
+    chkf("vec4f lerp w", (double)lp.w, 4.0);
+}
+
+// ─── mat4 (double) ─────────────────────────────────────────────────────────────
+
+void testMat4()
+{
+    double HALF_PI = Math.PI * 0.5;
+
+    // identity leaves a vector unchanged.
+    mat4 id = mat4.identity();
+    vec4 iv = id.transform(vec4.make(5.0, 6.0, 7.0, 1.0));
+    chkd("mat4 identity x", iv.x, 5.0); chkd("mat4 identity y", iv.y, 6.0);
+    chkd("mat4 identity z", iv.z, 7.0); chkd("mat4 identity w", iv.w, 1.0);
+
+    // translate shifts a point (w = 1).
+    mat4 t = mat4.translate(2.0, 3.0, 4.0);
+    vec4 tv = t.transform(vec4.make(1.0, 1.0, 1.0, 1.0));
+    chkd("mat4 translate x", tv.x, 3.0); chkd("mat4 translate y", tv.y, 4.0); chkd("mat4 translate z", tv.z, 5.0);
+
+    // scale.
+    mat4 sc = mat4.scale(2.0, 3.0, 4.0);
+    vec4 sv = sc.transform(vec4.make(1.0, 1.0, 1.0, 1.0));
+    chkd("mat4 scale x", sv.x, 2.0); chkd("mat4 scale y", sv.y, 3.0); chkd("mat4 scale z", sv.z, 4.0);
+
+    // rotZ(90): +x -> +y.
+    vec4 rz = mat4.rotZ(HALF_PI).transform(vec4.make(1.0, 0.0, 0.0, 0.0));
+    chkd("mat4 rotZ x", rz.x, 0.0); chkd("mat4 rotZ y", rz.y, 1.0);
+    // rotX(90): +y -> +z.
+    vec4 rx = mat4.rotX(HALF_PI).transform(vec4.make(0.0, 1.0, 0.0, 0.0));
+    chkd("mat4 rotX y", rx.y, 0.0); chkd("mat4 rotX z", rx.z, 1.0);
+    // rotY(90): +x -> -z.
+    vec4 ry = mat4.rotY(HALF_PI).transform(vec4.make(1.0, 0.0, 0.0, 0.0));
+    chkd("mat4 rotY x", ry.x, 0.0); chkd("mat4 rotY z", ry.z, -1.0);
+
+    // identity * M == M.
+    mat4 im = mat4.identity() * t;
+    vec4 imv = im.transform(vec4.make(0.0, 0.0, 0.0, 1.0));
+    chkd("mat4 identity*T x", imv.x, 2.0); chkd("mat4 identity*T z", imv.z, 4.0);
+
+    // composing translations: (v * T1) * T2 adds both offsets.
+    mat4 comp = mat4.translate(1.0, 0.0, 0.0) * mat4.translate(0.0, 1.0, 0.0);
+    vec4 cv = comp.transform(vec4.make(0.0, 0.0, 0.0, 1.0));
+    chkd("mat4 compose x", cv.x, 1.0); chkd("mat4 compose y", cv.y, 1.0);
+
+    // get / set round-trip.
+    mat4 g = mat4.identity();
+    g.set(1, 2, 9.0);
+    chkd("mat4 set/get", g.get(1, 2), 9.0);
+    chkd("mat4 set storage", g.m[1 * 4 + 2], 9.0);
+
+    // perspectiveLH known entries. zn=2, zf=4 makes the depth terms exact in
+    // both float and double: m10 = zf/(zf-zn) = 2, m14 = -zn*zf/(zf-zn) = -4.
+    mat4 p = mat4.perspectiveLH(HALF_PI, 1.0, 2.0, 4.0);
+    chkd("mat4 persp m0",  p.m[0],  1.0);
+    chkd("mat4 persp m5",  p.m[5],  1.0);
+    chkd("mat4 persp m10", p.m[10], 2.0);
+    chkd("mat4 persp m11", p.m[11], 1.0);
+    chkd("mat4 persp m14", p.m[14], -4.0);
+}
+
+// ─── mat4f (float) ─────────────────────────────────────────────────────────────
+
+void testMat4f()
+{
+    float HALF_PI = (float)(Math.PI * 0.5);
+
+    mat4f id = mat4f.identity();
+    vec4f iv = id.transform(vec4f.make(5.0f, 6.0f, 7.0f, 1.0f));
+    chkf("mat4f identity x", (double)iv.x, 5.0); chkf("mat4f identity w", (double)iv.w, 1.0);
+
+    mat4f t = mat4f.translate(2.0f, 3.0f, 4.0f);
+    vec4f tv = t.transform(vec4f.make(1.0f, 1.0f, 1.0f, 1.0f));
+    chkf("mat4f translate x", (double)tv.x, 3.0); chkf("mat4f translate z", (double)tv.z, 5.0);
+
+    vec4f rz = mat4f.rotZ(HALF_PI).transform(vec4f.make(1.0f, 0.0f, 0.0f, 0.0f));
+    chkf("mat4f rotZ x", (double)rz.x, 0.0); chkf("mat4f rotZ y", (double)rz.y, 1.0);
+
+    mat4f comp = mat4f.translate(1.0f, 0.0f, 0.0f) * mat4f.translate(0.0f, 1.0f, 0.0f);
+    vec4f cv = comp.transform(vec4f.make(0.0f, 0.0f, 0.0f, 1.0f));
+    chkf("mat4f compose x", (double)cv.x, 1.0); chkf("mat4f compose y", (double)cv.y, 1.0);
+
+    mat4f g = mat4f.identity();
+    g.set(2, 3, 9.0f);
+    chkf("mat4f set/get", (double)g.get(2, 3), 9.0);
+    chkf("mat4f set storage", (double)g.m[2 * 4 + 3], 9.0);
+}
+
+// ─── vector utilities (distance / min / max / clamp / abs / project / refract) ───
+
+void testVecUtil()
+{
+    chkd("vec2 distanceTo", vec2.make(0.0, 0.0).distanceTo(vec2.make(3.0, 4.0)), 5.0);
+    chkd("vec3 distanceTo", vec3.make(0.0, 0.0, 0.0).distanceTo(vec3.make(2.0, 3.0, 6.0)), 7.0);
+    chkd("vec4 distanceTo", vec4.make(0.0, 0.0, 0.0, 0.0).distanceTo(vec4.make(1.0, 2.0, 2.0, 4.0)), 5.0);
+
+    chkd("vec2 perpDot", vec2.make(1.0, 0.0).perpDot(vec2.make(0.0, 1.0)), 1.0);
+    chkd("vec2 angleTo 90", vec2.make(1.0, 0.0).angleTo(vec2.make(0.0, 1.0)), Math.PI * 0.5);
+    chkd("vec3 angleTo 90", vec3.make(1.0, 0.0, 0.0).angleTo(vec3.make(0.0, 1.0, 0.0)), Math.PI * 0.5);
+
+    vec3 lo = vec3.make(1.0, 5.0, 3.0);
+    vec3 hi = vec3.make(4.0, 2.0, 6.0);
+    vec3 mn = lo.min(hi);
+    chkd("vec3 min x", mn.x, 1.0); chkd("vec3 min y", mn.y, 2.0); chkd("vec3 min z", mn.z, 3.0);
+    vec3 mx = lo.max(hi);
+    chkd("vec3 max x", mx.x, 4.0); chkd("vec3 max y", mx.y, 5.0); chkd("vec3 max z", mx.z, 6.0);
+
+    vec3 cl = vec3.make(-1.0, 0.5, 9.0).clamp(vec3.make(0.0, 0.0, 0.0), vec3.make(1.0, 1.0, 1.0));
+    chkd("vec3 clamp lo", cl.x, 0.0); chkd("vec3 clamp mid", cl.y, 0.5); chkd("vec3 clamp hi", cl.z, 1.0);
+
+    vec3 ab = vec3.make(-1.0, 2.0, -3.0).abs();
+    chkd("vec3 abs x", ab.x, 1.0); chkd("vec3 abs z", ab.z, 3.0);
+    vec3 sa = vec3.make(-0.5, 0.5, 2.0).saturate();
+    chkd("vec3 saturate lo", sa.x, 0.0); chkd("vec3 saturate mid", sa.y, 0.5); chkd("vec3 saturate hi", sa.z, 1.0);
+
+    vec3 pj = vec3.make(2.0, 3.0, 0.0).project(vec3.make(1.0, 0.0, 0.0));
+    chkd("vec3 project x", pj.x, 2.0); chkd("vec3 project y", pj.y, 0.0);
+    vec3 rj = vec3.make(2.0, 3.0, 0.0).reject(vec3.make(1.0, 0.0, 0.0));
+    chkd("vec3 reject x", rj.x, 0.0); chkd("vec3 reject y", rj.y, 3.0);
+
+    // eta=1 with normal opposite the incident dir -> straight through.
+    vec3 rf = vec3.refract(vec3.make(0.0, -1.0, 0.0), vec3.make(0.0, 1.0, 0.0), 1.0);
+    chkd("vec3 refract x", rf.x, 0.0); chkd("vec3 refract y", rf.y, -1.0);
+
+    chkf("vec3f distanceTo", (double)vec3f.make(0.0f, 0.0f, 0.0f).distanceTo(vec3f.make(2.0f, 3.0f, 6.0f)), 7.0);
+    vec3f fsa = vec3f.make(-0.5f, 0.5f, 2.0f).saturate();
+    chkf("vec3f saturate hi", (double)fsa.z, 1.0);
+}
+
+// ─── mat4 extras (transpose / determinant / inverse / lookAt / ortho / axis) ────
+
+void testMat4Extra()
+{
+    // translate(vec3) / scale(vec3) overloads.
+    mat4 tv = mat4.translate(vec3.make(2.0, 3.0, 4.0));
+    vec4 tvp = tv.transform(vec4.make(0.0, 0.0, 0.0, 1.0));
+    chkd("mat4 translate(vec3) x", tvp.x, 2.0); chkd("mat4 translate(vec3) z", tvp.z, 4.0);
+    mat4 sv = mat4.scale(vec3.make(2.0, 3.0, 4.0));
+    chkd("mat4 scale(vec3) m5", sv.m[5], 3.0);
+
+    // transpose swaps (r,c) <-> (c,r).
+    mat4 A = mat4.translate(1.0, 2.0, 3.0) * mat4.rotZ(0.5);
+    mat4 At = A.transpose();
+    chkd("mat4 transpose m1<->m4",  At.m[4], A.m[1]);
+    chkd("mat4 transpose m12<->m3", At.m[3], A.m[12]);
+
+    chkd("mat4 det identity", mat4.identity().determinant(), 1.0);
+    chkd("mat4 det scale", mat4.scale(2.0, 3.0, 4.0).determinant(), 24.0);
+
+    // A * inverse(A) == I.
+    mat4 inv = A.inverse();
+    mat4 prod = A * inv;
+    for (int r = 0; r < 4; r = r + 1)
+        for (int c = 0; c < 4; c = c + 1)
+            chkd("mat4 inverse->identity", prod.m[r * 4 + c], r == c ? 1.0 : 0.0);
+
+    // rotationAxis about z equals rotZ.
+    mat4 ra = mat4.rotationAxis(vec3.make(0.0, 0.0, 1.0), 0.7);
+    mat4 rz = mat4.rotZ(0.7);
+    for (int i = 0; i < 16; i = i + 1) chkd("mat4 rotationAxis(z)==rotZ", ra.m[i], rz.m[i]);
+
+    // orthographicLH exact entries: w=2,h=4,zn=0,zf=2 -> m0=1, m5=0.5, m10=0.5.
+    mat4 o = mat4.orthographicLH(2.0, 4.0, 0.0, 2.0);
+    chkd("mat4 ortho m0",  o.m[0],  1.0);
+    chkd("mat4 ortho m5",  o.m[5],  0.5);
+    chkd("mat4 ortho m10", o.m[10], 0.5);
+    chkd("mat4 ortho m15", o.m[15], 1.0);
+
+    // lookAtLH: target maps straight ahead at the eye distance (0,0,5).
+    mat4 V = mat4.lookAtLH(vec3.make(0.0, 0.0, -5.0), vec3.make(0.0, 0.0, 0.0), vec3.make(0.0, 1.0, 0.0));
+    vec3 atv = V.transformPoint(vec3.make(0.0, 0.0, 0.0));
+    chkd("mat4 lookAt x", atv.x, 0.0); chkd("mat4 lookAt y", atv.y, 0.0); chkd("mat4 lookAt z", atv.z, 5.0);
+
+    // transformPoint applies translation; transformDir does not.
+    mat4 T = mat4.translate(10.0, 20.0, 30.0);
+    vec3 pt = T.transformPoint(vec3.make(1.0, 1.0, 1.0));
+    chkd("mat4 transformPoint x", pt.x, 11.0); chkd("mat4 transformPoint z", pt.z, 31.0);
+    vec3 dr = T.transformDir(vec3.make(1.0, 1.0, 1.0));
+    chkd("mat4 transformDir x", dr.x, 1.0); chkd("mat4 transformDir z", dr.z, 1.0);
+
+    // mat4f inverse round-trip (float tolerance).
+    mat4f Af = mat4f.translate(1.0f, 2.0f, 3.0f) * mat4f.rotY(0.6f);
+    mat4f Pf = Af * Af.inverse();
+    for (int r = 0; r < 4; r = r + 1)
+        for (int c = 0; c < 4; c = c + 1)
+            chkf("mat4f inverse->identity", (double)Pf.m[r * 4 + c], r == c ? 1.0 : 0.0);
+}
+
+// ─── quaternion (quat / quatf) ──────────────────────────────────────────────────
+
+void testQuat()
+{
+    double HALF_PI = Math.PI * 0.5;
+
+    // identity rotates nothing.
+    vec3 iv = quat.identity().rotate(vec3.make(1.0, 2.0, 3.0));
+    chkd("quat identity x", iv.x, 1.0); chkd("quat identity y", iv.y, 2.0); chkd("quat identity z", iv.z, 3.0);
+
+    // fromAxisAngle(z, 90) sends +x -> +y, matching rotZ.
+    quat qz = quat.fromAxisAngle(vec3.make(0.0, 0.0, 1.0), HALF_PI);
+    vec3 rx = qz.rotate(vec3.make(1.0, 0.0, 0.0));
+    chkd("quat rotZ x", rx.x, 0.0); chkd("quat rotZ y", rx.y, 1.0); chkd("quat rotZ z", rx.z, 0.0);
+
+    // rotate(v) equals toMat4().transformDir(v).
+    mat4 mz = qz.toMat4();
+    vec3 mv = mz.transformDir(vec3.make(1.0, 0.0, 0.0));
+    chkd("quat rotate==toMat4 x", mv.x, rx.x); chkd("quat rotate==toMat4 y", mv.y, rx.y);
+
+    // toMat4 equals the matching rotZ matrix.
+    mat4 rzm = mat4.rotZ(HALF_PI);
+    for (int i = 0; i < 16; i = i + 1) chkd("quat toMat4==rotZ", mz.m[i], rzm.m[i]);
+
+    // composition: (a * b).toMat4 == a.toMat4 * b.toMat4.
+    quat a = quat.fromAxisAngle(vec3.make(1.0, 0.0, 0.0), 0.5);
+    quat b = quat.fromAxisAngle(vec3.make(0.0, 1.0, 0.0), 0.8);
+    quat ab = a * b;
+    mat4 mc = ab.toMat4();
+    mat4 ma = a.toMat4();
+    mat4 mb = b.toMat4();
+    mat4 mm = ma * mb;
+    for (int i = 0; i < 16; i = i + 1) chkd("quat compose==mat compose", mc.m[i], mm.m[i]);
+
+    // normalize / conjugate.
+    quat un = quat.make(1.0, 2.0, 3.0, 4.0).normalize();
+    chkd("quat normalize unit length", un.length(), 1.0);
+    quat cj = quat.make(1.0, 2.0, 3.0, 4.0).conjugate();
+    chkd("quat conjugate x", cj.x, -1.0); chkd("quat conjugate w", cj.w, 4.0);
+
+    // slerp endpoints land on a and b.
+    quat s0 = quat.slerp(a, b, 0.0);
+    chkd("quat slerp t0 x", s0.x, a.x); chkd("quat slerp t0 w", s0.w, a.w);
+    quat s1 = quat.slerp(a, b, 1.0);
+    chkd("quat slerp t1 y", s1.y, b.y); chkd("quat slerp t1 w", s1.w, b.w);
+
+    // float quaternion spot check.
+    quatf qf = quatf.fromAxisAngle(vec3f.make(0.0f, 0.0f, 1.0f), (float)HALF_PI);
+    vec3f rfx = qf.rotate(vec3f.make(1.0f, 0.0f, 0.0f));
+    chkf("quatf rotZ y", (double)rfx.y, 1.0);
+}
+
+extern int main()
+{
+    testVec2();
+    testVec3();
+    testVec4();
+    testFloatVecs();
+    testMat4();
+    testMat4f();
+    testVecUtil();
+    testMat4Extra();
+    testQuat();
+
+    printf("\n%d / %d linear_math tests passed.\n", g_passed, g_total);
+    return g_passed == g_total ? 0 : 1;
+}
