@@ -193,7 +193,9 @@
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <ClInclude Include="LLVMBackend.h" />
-    <ClCompile Include="CClangExtract.cpp" />
+    <ClCompile Include="CClangExtract.cpp">
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClInclude Include="CClangExtract.h" />
     <ClCompile Include="WinmdExtract.cpp" />
     <ClInclude Include="WinmdExtract.h" />

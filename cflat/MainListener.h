@@ -1660,6 +1660,16 @@ private:
     // Active pack substitutions during instantiation: pack-param-name -> ["int", "float", "string"]
     std::unordered_map<std::string, std::vector<std::string>> activePackSubstitutions;
 
+    // True while monomorphizing a generic template body. The body's tokens come from the
+    // template's own file (e.g. core/list.cb), but currentSourceFilePath_ is the use-site
+    // file that triggered the instantiation, so a token's line number does not map onto it.
+    // Unused-decl candidates must not be recorded here: the faded "never used" hint would
+    // land at a bogus location in the instantiating file (e.g. on an import line).
+    bool InGenericInstantiation() const
+    {
+        return !activeTypeSubstitutions.empty() || !activePackSubstitutions.empty();
+    }
+
     // Struct scope stack: pushed when parsing fields/methods of a struct/class so that
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
@@ -4798,7 +4808,8 @@ public:
         // extern function's signature is part of an external contract - flagging either
         // would be noise. A leading underscore is the opt-out convention (`_unused`).
         if (auto* s = compiler->GetSymbolSink();
-            s && structName.empty() && !returnType.external && paramTypeList && paramTypeList->parameterList())
+            s && structName.empty() && !returnType.external && paramTypeList && paramTypeList->parameterList()
+            && !InGenericInstantiation())
         {
             for (auto* paramDecl : paramTypeList->parameterList()->parameterDeclaration())
             {
@@ -5962,7 +5973,7 @@ public:
                     // Record an unused-local candidate. RAII locals (a type with a
                     // destructor, e.g. `lock`) are exempt: the declaration itself is the
                     // point even when the name is never read again.
-                    if (auto* s = compiler->GetSymbolSink())
+                    if (auto* s = compiler->GetSymbolSink(); s && !InGenericInstantiation())
                     {
                         UnusedCandidate cand;
                         cand.name = name;

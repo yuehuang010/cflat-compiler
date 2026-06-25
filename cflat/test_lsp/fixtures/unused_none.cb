@@ -1,8 +1,15 @@
 // $expect no_diagnostic
 import "string.cb";
+import "list.cb";
 int doubleIt(int n) { return n + n; }
 extern int main() {
     string s = "hi";
-    int total = doubleIt(21);
-    return total + s.length();
+    // Instantiating list<int> monomorphizes list.cb's template bodies (e.g. _grow,
+    // whose local `newCap` lives at list.cb:14). Those candidates must NOT leak a
+    // faded "never used" hint onto this file - regression for the bug where a
+    // template local landed on an unrelated line (an import) in the use-site file.
+    list<int> xs = default;
+    xs.add(doubleIt(21));
+    int total = xs.get(0);
+    return total + s.length() + xs.count();
 }

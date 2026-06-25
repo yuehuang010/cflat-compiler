@@ -3589,6 +3589,25 @@ private:
             if (dataStructures.find(alias) != dataStructures.end()) continue;  // real type wins
             if (typeAliases.find(alias) != typeAliases.end()) continue;        // first-writer-wins
             RegisterTypeAlias(alias, target);
+
+            // Surface the typedef name itself as a navigable LSP symbol. Type resolution already
+            // follows the alias, but the symbol index only knew the underlying tag, so --symbol /
+            // hover / go-to-def on the alias name (e.g. ID3DBlob -> ID3D10Blob) found nothing.
+            // Inherit the target struct's location (registered just before us by RegisterCRecords)
+            // so go-to-def jumps to the aliased definition.
+            if (auto* s = GetSymbolSink())
+            {
+                std::string file;
+                int line = 0, col = 0;
+                if (const SymbolDef* td = s->Lookup(target))
+                {
+                    file = td->file;
+                    line = td->line;
+                    col = td->column;
+                }
+                s->Register(SymbolKind::TypeAlias, alias, file, line, col,
+                            "typedef " + target + " " + alias);
+            }
         }
     }
 
