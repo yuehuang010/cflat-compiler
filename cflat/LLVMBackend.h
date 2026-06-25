@@ -41,6 +41,7 @@
 #include <llvm\IR\LLVMContext.h>
 #include <llvm\IR\Module.h>
 #include <llvm\IR\Verifier.h>
+#include <llvm\IR\Dominators.h>   // llvm::DominatorTree (dominance-aware owned-temp flush)
 #include <llvm\IR\DIBuilder.h>
 #include <llvm\IR\LegacyPassManager.h>
 #include <llvm\Bitcode\BitcodeWriter.h>
@@ -1472,6 +1473,23 @@ private:
         return b != nullptr && b->getTerminator() == nullptr;
     }
 
+    // Free-safety check for a pending owned temp registered in block `bb`: the value
+    // defined there may be freed at `curBlock` iff `bb` dominates `curBlock` (every
+    // path to here passed through its definition). Same-block is the trivial case;
+    // a plain `bb == curBlock` test is too conservative when an intermediate temp's
+    // block precedes - and dominates - a later child's closure-built block in the
+    // same full-expression. The DominatorTree is built lazily (only on the first
+    // cross-block temp) and reused across one flush via the caller-owned `dt`.
+    bool OwnedTempDominatesHere(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock,
+                                std::optional<llvm::DominatorTree>& dt) const
+    {
+        if (bb == nullptr || curBlock == nullptr) return false;
+        if (bb == curBlock) return true;
+        if (bb->getParent() != curBlock->getParent()) return false;
+        if (!dt) dt.emplace(*curBlock->getParent());
+        return dt->dominates(bb, curBlock);
+    }
+
     void FlushOwnedStringTemps()
     {
         if (pendingOwnedStringTemps.empty()) return;
@@ -1479,10 +1497,11 @@ private:
         auto* curBlock = builder->GetInsertBlock();
         if (IsInsertBlockLive())
         {
+            std::optional<llvm::DominatorTree> domTree;
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");
             for (auto& [value, bb] : pendingOwnedStringTemps)
             {
-                if (value == nullptr || bb != curBlock) continue;     // dominance safety
+                if (value == nullptr || !OwnedTempDominatesHere(bb, curBlock, domTree)) continue; // dominance safety
                 if (strTy == nullptr || value->getType() != strTy) continue;
                 EnsureStringDtorRegistered();
                 auto it = dataStructures.find("string");
@@ -1532,9 +1551,10 @@ private:
             auto* dtor = GetOrCreateFullDestructor("__closure_fat_ptr");
             if (dtor != nullptr)
             {
+                std::optional<llvm::DominatorTree> domTree;
                 for (auto& [value, bb] : pendingOwnedClosureTemps)
                 {
-                    if (value == nullptr || bb != curBlock) continue;     // dominance safety
+                    if (value == nullptr || !OwnedTempDominatesHere(bb, curBlock, domTree)) continue; // dominance safety
                     if (value->getType() != closureTy) continue;
                     // The dtor takes a __closure_fat_ptr*; spill the SSA value to an entry-block
                     // alloca (never a loop body - see AllocaAtEntry) and free through it.
@@ -1562,9 +1582,10 @@ private:
         auto* curBlock = builder->GetInsertBlock();
         if (IsInsertBlockLive())
         {
+            std::optional<llvm::DominatorTree> domTree;
             for (auto& t : pendingOwnedStructTemps)
             {
-                if (t.Alloca == nullptr || t.Block != curBlock) continue;   // dominance safety
+                if (t.Alloca == nullptr || !OwnedTempDominatesHere(t.Block, curBlock, domTree)) continue; // dominance safety
                 if (auto* dtor = GetOrCreateFullDestructor(t.TypeName))
                     builder->CreateCall(dtor->getFunctionType(), dtor, { t.Alloca });
             }
@@ -5712,12 +5733,28 @@ public:
         bool returnsOwned = false;
         bool returnIsArrayView = false;
         std::string returnTypeName;
+        // The enclosing function's not-yet-flushed owned temps. A nested function emitted
+        // mid-body (lambda invoker, global init, program shim) runs its OWN end-of-expression
+        // flushes; those must not see - and drop - the outer function's temps, which are
+        // registered in outer blocks and freed by the outer flush after we return here.
+        std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingStringTemps;
+        std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingClosureTemps;
+        std::vector<PendingOwnedStructTemp> pendingStructTemps;
     };
 
-    BuilderState SaveBuilderState() const
+    BuilderState SaveBuilderState()
     {
-        return { builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
-                 currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName };
+        BuilderState s{ builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
+                        currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName };
+        // Park the outer function's pending owned temps in the saved state and start the
+        // nested emission with empty lists (see the BuilderState field comment).
+        s.pendingStringTemps  = std::move(pendingOwnedStringTemps);
+        s.pendingClosureTemps = std::move(pendingOwnedClosureTemps);
+        s.pendingStructTemps  = std::move(pendingOwnedStructTemps);
+        pendingOwnedStringTemps.clear();
+        pendingOwnedClosureTemps.clear();
+        pendingOwnedStructTemps.clear();
+        return s;
     }
 
     void RestoreBuilderState(const BuilderState& state)
@@ -5729,6 +5766,9 @@ public:
         currentFunctionReturnsOwned = state.returnsOwned;
         currentFunctionReturnIsArrayView = state.returnIsArrayView;
         currentFunctionReturnTypeName = state.returnTypeName;
+        pendingOwnedStringTemps  = state.pendingStringTemps;
+        pendingOwnedClosureTemps = state.pendingClosureTemps;
+        pendingOwnedStructTemps  = state.pendingStructTemps;
     }
 
     void CreateInterfaceDefinition(const std::string& name, const std::vector<std::string>& parentNames, std::vector<InterfaceMethod> methods)
@@ -7644,7 +7684,22 @@ public:
             }
         }
 
-        return builder->CreateCall(fnTy, fnPtr, callArgs);
+        auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
+
+        // Classify the virtual result's ownership exactly like the direct-call path
+        // (CreateOverloadedFunctionCall): a 'move string' / 'move T*' / 'move <interface>'
+        // return hands an owned value to the caller. Set the side-channel so a binding site
+        // (decl-init / assignment / move-param / return) re-homes it and clears the flag; an
+        // inline-used owned STRING result is registered for end-of-full-expression cleanup
+        // (mirrors the direct path's RegisterOwnedStringTemp) so e.g. `tree.toJson().data()`
+        // does not leak. Without this the virtual path left the result classified as a borrow.
+        const auto& rt = methodInfo->ReturnType;
+        lastCallReturnsOwned = rt.IsMove && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
+        if (lastCallReturnsOwned
+            && callResult->getType() == llvm::StructType::getTypeByName(*context, "string"))
+            RegisterOwnedStringTemp(callResult);
+
+        return callResult;
     }
 
     // Helper for building string NamedVariables for reflection visitor calls.

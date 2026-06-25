@@ -57,8 +57,7 @@ extern int main()
     app.addCounter("beta");
 
     Element committed = app.render(&ctx);
-    string initialJson = committed.toJson();
-    printf("initial:  %s\n", initialJson.data());
+    printf("initial:  %s\n", committed.toJson().data());
 
     // Drive state changes through the child components (persist via pointer),
     // then reconcile a fresh render into the live tree.
@@ -71,8 +70,7 @@ extern int main()
     committed = reconcile(committed, wip, &patches);
 
     printf("patches:  %d\n", patches.count());
-    string updatedJson = committed.toJson();
-    printf("updated:  %s\n", updatedJson.data());
+    printf("updated:  %s\n", committed.toJson().data());
 
     deleteTree(committed);
     // app (stack) is destroyed here; its list<Counter*> frees the child Counters.

@@ -16,13 +16,13 @@ class CounterJsx : Component
 
     Element render(UiContext* ctx)
     {
-        // Hoist the interpolated label into a local. An owned-string expression used
-        // directly as a child attribute alongside a sibling capturing closure trips a
-        // known temp-flush limitation (internal/issue/element-sibling-temp-flush-leak.md);
-        // binding it first is the leak-clean idiom and reads clearly besides.
-        string label = "Count: " + this.count.toString();
+        // An owned-string expression (the interpolated label) used directly as a child
+        // attribute alongside a sibling capturing closure is leak-clean: the intermediate
+        // temp is freed by the outer function's end-of-expression flush, which the nested
+        // closure invoker's own flush no longer clobbers. example.bat's --heap-audit gate
+        // covers this exact shape.
         return <View style={makeStyle(16, 0, 0)}>
-                 <Text text={label} />
+                 <Text text={"Count: " + this.count.toString()} />
                  <Button title="+1" onPress={() => { this.count = this.count + 1; }} />
                </View>;
     }

@@ -26,11 +26,11 @@ extern int main()
     Counter c;
     c.count = 0;
 
-    // First render: Count: 0. Bind the owned JSON to a local so its buffer is
-    // freed at scope exit (toJson returns a `move string`).
+    // First render: Count: 0. toJson() returns a `move string`; using its result
+    // inline (.data() straight into printf) is leak-clean - the owned virtual-call
+    // temp is freed at end-of-expression like a free-function result.
     Element tree = c.render(&ctx);
-    string json1 = tree.toJson();
-    printf("render 1: %s\n", json1.data());
+    printf("render 1: %s\n", tree.toJson().data());
 
     // Reach the Button (children[1]) and fire its onClick twice.
     View* rootView = tree as View;
@@ -54,8 +54,7 @@ extern int main()
 
     // Re-render reflects the mutated state: Count: 2.
     Element tree2 = c.render(&ctx);
-    string json2 = tree2.toJson();
-    printf("render 2: %s\n", json2.data());
+    printf("render 2: %s\n", tree2.toJson().data());
 
     // Tear down both trees (the recursive destroyTree + delete-through-interface
     // path is sound now; the old v1 leak posture is closed).

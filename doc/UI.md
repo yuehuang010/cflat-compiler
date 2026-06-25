@@ -55,10 +55,10 @@ interface Element
 ```
 
 Notes:
-- `toJson()` returns a `move string` (owned). Bind it to a local before using
-  `.data()` - e.g. `string j = tree.toJson(); printf("%s", j.data());` - so the
-  buffer is freed at scope exit. (Inline `.data()` on the virtual result currently
-  leaks; see `internal/issue/virtual-move-string-result-inline-use-leak.md`.)
+- `toJson()` returns a `move string` (owned). Using its result inline -
+  `printf("%s", tree.toJson().data())` - is leak-clean: the owned virtual-call temp
+  is freed at end-of-expression, just like a free-function result. Binding to a
+  local (`string j = tree.toJson();`) is equally fine.
 - `destroyTree()` frees a node's owning DESCENDANTS only; the node itself is freed
   by its owner. Use the free helper `deleteTree(move Element root)` to tear down a
   whole tree (descendants then root), and `delete` dispatches virtually.
@@ -265,13 +265,12 @@ return <View style={makeStyle(16, 0, 0)}>
   `return <View/>` or assigning to an `Element` slot.
 - `counter_jsx.cb` asserts the sugar desugars to a tree identical to the
   hand-written `counter.cb` form.
-
-Gotcha: an owned-string expression used directly as a child attribute next to a
-sibling capturing closure (e.g. `<Text text={"Count: " + n.toString()} />` beside
-`<Button onPress={() => {...}} />`) leaks the intermediate string temp - a known
-temp-flush limitation (`internal/issue/element-sibling-temp-flush-leak.md`). Bind
-the string to a local first (`string label = ...; <Text text={label} />`); this is
-the leak-clean idiom and reads clearly besides.
+- An owned-string expression used directly as a child attribute next to a sibling
+  capturing closure (e.g. `<Text text={"Count: " + n.toString()} />` beside
+  `<Button onPress={() => {...}} />`) is leak-clean - the intermediate temp is
+  freed by the outer flush, which a nested closure invoker no longer clobbers. No
+  bind-to-local workaround is needed; `counter_jsx.cb` exercises this exact shape
+  under example.bat's `--heap-audit` gate.
 
 ### Sugar-compatible element contract
 
