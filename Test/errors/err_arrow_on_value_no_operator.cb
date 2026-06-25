@@ -1,0 +1,15 @@
+// CFlat's `.` and `->` are flexible: `->` on a plain value reaches its own members
+// (no operator-> required). Forwarding via operator-> only fires when the member is
+// missing AND the type defines operator->. A genuinely missing member on a value with
+// no operator-> produces the normal "unknown member" error, not a "requires operator->"
+// gate. Here Plain has no `missing` field and no operator->.
+
+struct Plain { int value = 0; };
+
+extern int main()
+{
+    Plain p;
+    expect_error("Unknown identifier 'missing'");
+    int v = p->missing;
+    return 0;
+}

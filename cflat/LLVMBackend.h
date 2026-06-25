@@ -2541,6 +2541,38 @@ private:
         return false;
     }
 
+    // True when `typeName` defines `operator->` (its implicit `this` is the sole parameter).
+    // Drives the operator-> forward-on-miss path for both `.` and `->`.
+    bool HasArrowOverloadFor(const std::string& typeName) const
+    {
+        auto it = functionTable.find("operator->");
+        if (it == functionTable.end()) return false;
+        for (const auto& sym : it->second)
+            if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
+                return true;
+        return false;
+    }
+
+    // True when `typeName` has a directly-accessible member `memberName`: a field, a
+    // bitfield, a member function (any overload whose first param is this type), or a
+    // winrt vtable slot. Own members take priority over operator-> forwarding, so this
+    // is the miss test that gates forwarding (own member shadows a forwarded one).
+    bool TypeHasMember(const std::string& typeName, const std::string& memberName) const
+    {
+        if (auto ds = dataStructures.find(typeName); ds != dataStructures.end())
+        {
+            for (const auto& f : ds->second.StructFields)
+                if (f.VariableName == memberName) return true;
+            for (const auto& b : ds->second.Bitfields)
+                if (b.Name == memberName) return true;
+        }
+        if (auto fn = functionTable.find(memberName); fn != functionTable.end())
+            for (const auto& sym : fn->second)
+                if (!sym.Parameters.empty() && sym.Parameters[0].TypeName == typeName)
+                    return true;
+        return GetWinrtSlot(typeName, memberName) != nullptr;
+    }
+
     llvm::Function* GetOrCreateMemberwiseCopy(const std::string& typeName)
     {
         if (auto it = memberwiseCopyCache_.find(typeName); it != memberwiseCopyCache_.end())

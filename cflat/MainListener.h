@@ -116,6 +116,7 @@ inline std::string getOperatorName(CFlatParser::OperatorFunctionIdContext* opId)
     if (opId->Greater().size() == 2) return "operator>>";
     if (opId->Greater().size() == 1) return "operator>";
     if (opId->LeftBracket())  return "operator[]";
+    if (opId->Arrow())        return "operator->";
     if (opId->Not())          return "operator!";
     if (opId->Tilde())        return "operator~";
     return "";
@@ -11058,6 +11059,27 @@ public:
         }
     }
 
+    // Returns the member-name text immediately following `opNode` (a `.`/`->` token) in the
+    // postfix child list, or "" if the next child is not an Identifier/`move` name. Used by
+    // [PFX-1a] to peek the member before resolution so operator-> forwards only on a miss.
+    static std::string NextMemberName(CFlatParser::PostfixExpressionContext* ctx,
+                                      antlr4::tree::ParseTree* opNode)
+    {
+        const auto& children = ctx->children;
+        for (size_t i = 0; i + 1 < children.size(); ++i)
+        {
+            if (children[i] != opNode) continue;
+            auto* next = children[i + 1];
+            if (next->getTreeType() != antlr4::tree::ParseTreeType::TERMINAL) return "";
+            auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(next);
+            auto tok = term->getSymbol()->getType();
+            if (tok == CFlatParser::Identifier || tok == CFlatParser::Move)
+                return term->getText();
+            return "";
+        }
+        return "";
+    }
+
     // §3.7 ParsePostfixExpression - walks `primary (suffix)*`, threading the running receiver
     // through structVar/interfaceVar/namedVar. Each suffix is one loop iteration. Internal map
     // (grep the "// [PFX-n]" anchors to jump):
@@ -11142,6 +11164,61 @@ public:
                     {
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        // [PFX-1a] user operator-> : forward-on-miss. CFlat's `.` and `->` are flexible
+                        // (either token works on a value or a pointer). When the member that follows is
+                        // NOT a member of a value-type receiver but that type defines `operator->`, forward
+                        // member access to the returned pointer; chain through value wrappers until a raw
+                        // pointer (or a wrapper that DOES have the member) is reached. The terminal pointer
+                        // then flows through the normal pointer handling below (regular struct or thin-COM
+                        // lpVtbl dispatch), so the wrapper composes with existing dispatch. Own members
+                        // shadow forwarded ones (the miss test gates forwarding). Applies to `.`, `->`,
+                        // and `?.`: for `?.` the `?` is recognized first (nullConditionalPending set above),
+                        // then operator-> forwards on a miss and the null-conditional guard applies to the
+                        // forwarded pointer.
+                        if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow
+                             || tokenType == CFlatParser::QuestionDot)
+                            && !namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.IsInterface
+                            && !namedVar.TypeAndValue.TypeName.empty()
+                            && Compiler(ctx)->GetDataStructure(namedVar.TypeAndValue.TypeName).StructType != nullptr)
+                        {
+                            auto* compiler = Compiler(ctx);
+                            std::string memberName = NextMemberName(ctx, parseTree);
+                            int arrowGuard = 0;
+                            while (!memberName.empty()
+                                   && !namedVar.TypeAndValue.Pointer
+                                   && !namedVar.TypeAndValue.TypeName.empty()
+                                   && !compiler->TypeHasMember(namedVar.TypeAndValue.TypeName, memberName)
+                                   && compiler->HasArrowOverloadFor(namedVar.TypeAndValue.TypeName))
+                            {
+                                auto sd = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                                if (sd.StructType == nullptr) break;
+
+                                // operator-> takes `this`; materialize a slot if we only hold an rvalue.
+                                LLVMBackend::NamedVariable thisNV = namedVar;
+                                thisNV.TypeAndValue.VariableName = "";
+                                if (thisNV.Storage == nullptr && thisNV.Primary != nullptr)
+                                {
+                                    auto* temp = compiler->CreateAlloca(sd.StructType);
+                                    compiler->CreateAssignment(thisNV.Primary, temp);
+                                    thisNV.Storage = temp;
+                                }
+
+                                auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
+                                if (arrowResult == nullptr) break;
+
+                                namedVar = {};
+                                namedVar.Primary      = arrowResult;
+                                namedVar.BaseType     = arrowResult->getType();
+                                namedVar.TypeAndValue = compiler->lastCallReturnType;
+
+                                if (++arrowGuard > 32)
+                                {
+                                    LogErrorContext(ctx, "operator-> chain did not resolve to a pointer (possible cycle)");
+                                    break;
+                                }
+                            }
+                        }
                         // For any member access on a pointer to a known struct, load the pointer
                         // so subsequent field/method lookups work. '.' auto-deduces the dereference
                         // just like '->'; '?.' does the same but also arms the null-conditional check.

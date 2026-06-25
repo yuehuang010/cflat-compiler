@@ -792,6 +792,7 @@ operatorFunctionId
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
                | LeftShift | Greater Greater
                | LeftBracket RightBracket
+               | Arrow
                | Not | Tilde)
     ;
 

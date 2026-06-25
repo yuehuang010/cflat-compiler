@@ -81,6 +81,37 @@ struct Counter
     bool operator<(Counter other)    { return value < other.value; }
 };
 
+// ── operator->: forwarding / drill-down member access ────────────────────────
+
+struct Inner
+{
+    int value = 0;
+    int triple() { return value * 3; }
+    int who() { return 1; }   // shadowed by Box::who - never reached through a Box
+};
+
+// Box forwards member access to the contained Inner* via operator->.
+// It also has its OWN members (tag, who) to prove own-member-first resolution:
+// `.`/`->` reach these directly and they shadow Inner's same-named members.
+struct Box
+{
+    Inner* p = nullptr;
+    int tag = 0;
+    Inner* operator->() { return p; }
+    int who() { return 2; }   // own member - shadows Inner::who
+};
+
+// Plain has no operator->; flexible `.`/`->` both reach its own members directly.
+struct Plain { int value = 0; };
+
+// OuterBox holds a Box (a value type that itself defines operator->); `ob->member`
+// must chain operator-> until a raw pointer is reached (Box -> Inner*).
+struct OuterBox
+{
+    Box inner;
+    Box operator->() { return inner; }
+};
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 import "test_helper.cb";
@@ -182,6 +213,60 @@ extern int main()
 
     Bits zero; zero.value = 0;
     Test("Bits ~ 0", ~zero, ~0);
+
+    // ── operator-> forwarding ──────────────────────────────────────────────────
+
+    // Wrapper over a plain struct pointer: w->field reads and w->method() calls
+    // forward to the contained Inner.
+    Inner item; item.value = 7;
+    Box w; w.p = &item;
+    Test("Box-> field read",   w->value,    7);
+    Test("Box-> method call",  w->triple(), 21);
+
+    // Mutate through the forwarded pointer, then read back.
+    w->value = 9;
+    Test("Box-> field write",  item.value,  9);
+    Test("Box-> method after write", w->triple(), 27);
+
+    // Chaining: OuterBox::operator-> returns a Box, which itself defines
+    // operator-> - the chain must continue until the raw Inner* is reached.
+    OuterBox ob; ob.inner = w;
+    Test("OuterBox-> chained field",  ob->value,    9);
+    Test("OuterBox-> chained method", ob->triple(), 27);
+
+    // ── Flexible model: own-member-first, forward only on a miss ──────────────
+
+    // (a) `.` (not just `->`) forwards when the member is NOT on the wrapper.
+    Test("Box. forwards field (miss)",  w.value,    9);
+    Test("Box. forwards method (miss)", w.triple(), 27);
+
+    // (b) `->` resolves an OWN member of the wrapper directly (no forwarding).
+    w.tag = 5;
+    Test("Box-> own field",  w->tag,   5);
+    Test("Box-> own method", w->who(), 2);
+
+    // (c) Shadowing: `who` exists on BOTH Box and Inner; access resolves to the
+    // wrapper's Box::who (2), never the forwarded Inner::who (1) - via both tokens.
+    Test("Box. own shadows forwarded", w.who(),  2);
+    Test("Box-> own shadows forwarded", w->who(), 2);
+
+    // Flexible `->` on a plain value (no operator->) reaches its own member,
+    // exactly like `.` would - `->` on a value is not an error.
+    Plain pl; pl.value = 42;
+    Test("Plain-> own field",  pl->value, 42);
+    Test("Plain. own field",   pl.value,  42);
+
+    // ── ?. (null-conditional) composes with operator-> forwarding ──────────────
+    // The `?` is recognized first, then operator-> forwards on a miss and the
+    // null guard applies to the forwarded pointer (w.p is &item, non-null here).
+    Test("Box?. forwards field (non-null)",  w?.value,    9);
+    Test("Box?. forwards method (non-null)", w?.triple(), 27);
+
+    // When the wrapped pointer is null, the forwarded `?.` short-circuits to the
+    // default instead of dereferencing.
+    Box wn; wn.p = nullptr;
+    Test("Box?. null field short-circuits", wn?.value,       0);
+    Test("Box?. null with coalesce",        wn?.value ?? -1, -1);
 
     return 0;
 }
