@@ -23,6 +23,7 @@ import "string.cb";
 //   s.close();              // flush remaining data + send EOF sentinel
 //   p2.WaitForExit();
 
+// stream - double-buffered text pipe between two 'program' constructs (one mutex, two condition variables).
 struct stream {
     int bufferSize = 65536;
 

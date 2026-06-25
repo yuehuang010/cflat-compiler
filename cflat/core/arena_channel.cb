@@ -46,6 +46,7 @@ import "page_arena.cb";
 // acquire_arena() spawns a page_arena drawing chunks from the same bucket.
 // Maintains a lock-free Treiber stack of recycled page_arena* for fast reuse.
 
+// block_pool<T> - program thread allocator backed by a bucket; spawns recyclable page_arena<T> units.
 class block_pool<T> where T : IMessage
 {
     BucketAllocator _bucket    = default;
@@ -82,6 +83,7 @@ class block_pool<T> where T : IMessage
 
     // ── Treiber stack pop (lock-free) ─────────────────────────────────────────
 
+    // _pop - lock-free Treiber stack pop; returns a recycled page_arena<T> or nullptr.
     page_arena<T>* _pop()
     {
         i64 old = __atomic_i64_load(&_top);
@@ -104,6 +106,7 @@ class block_pool<T> where T : IMessage
 
     // ── Treiber stack push (lock-free) ────────────────────────────────────────
 
+    // _push - lock-free Treiber stack push of a recycled page_arena<T> node.
     void _push(page_arena<T>* node)
     {
         i64 old = __atomic_i64_load(&_top);
@@ -118,6 +121,7 @@ class block_pool<T> where T : IMessage
 
     // ── IAllocator - day-to-day allocation, delegates to bucket ───────────────
 
+    // alloc - day-to-day allocation; delegates to the embedded bucket.
     void* alloc(i64 size)    { return _bucket.alloc(size); }
     // Free a bucket allocation.
     void  dealloc(void* ptr) { _bucket.dealloc(ptr); }
@@ -169,6 +173,7 @@ class block_pool<T> where T : IMessage
 // Composes a block_pool (thread allocator + arena spawner) with a bounded MPMC
 // ring for zero-copy page_arena transfer between threads.
 
+// arena_channel<T> - block_pool plus a bounded MPMC ring for zero-copy page_arena transfer between threads.
 class arena_channel<T> where T : IMessage
 {
     block_pool<T>  _pool   = default;

@@ -8,6 +8,7 @@
 
 import "hashset.cb";
 
+// dictionary<K,V> - open-addressing hash map; owns the values when V is a pointer type.
 struct dictionary<K, V>
 {
     K*    _keys     = nullptr;

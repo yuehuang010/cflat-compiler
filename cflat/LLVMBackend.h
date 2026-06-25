@@ -8323,7 +8323,8 @@ public:
         namedVariable.BaseType = type;
 
         if (symbolSink_ && !typeValue.VariableName.empty())
-            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
+                                          GetSourceFilePath(), (int)line, 0);
 
         if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {

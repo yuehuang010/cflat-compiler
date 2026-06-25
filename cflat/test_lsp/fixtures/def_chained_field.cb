@@ -1,0 +1,5 @@
+// $cursor line=2 col=55
+// $expect definition line=0
+struct Queue { int push(int v) { return v; } };
+struct Worker { Queue* q = nullptr; };
+extern int main() { Worker* w = nullptr; return w->q->push(3); }

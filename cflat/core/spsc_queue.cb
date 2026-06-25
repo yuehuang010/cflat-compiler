@@ -33,6 +33,7 @@ import "intrinsic.cb";   // pause() - spin-loop hint for the full/empty busy-wai
 extern int  __atomic_i32_load(int* ptr);
 extern void __atomic_i32_store(int* ptr, int val);
 
+// spsc_queue<T> - wait-free single-producer single-consumer ring queue (one slot is a sentinel).
 class spsc_queue<T>
 {
     T*  _buf  = nullptr;   // ring buffer (cap slots; cap-1 are usable)

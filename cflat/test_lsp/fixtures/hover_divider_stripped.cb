@@ -1,0 +1,5 @@
+// $cursor line=1 col=2
+// $expect hover contains="generic atomic for 32-bit" not_contains="-----"
+import "atomic.cb";
+atomic__i32 g = default;
+extern int main() { return g.load(); }

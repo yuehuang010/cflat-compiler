@@ -1,0 +1,4 @@
+// $cursor line=1 col=56
+// $expect definition line=0
+struct ThreadArgs { int ctx = 0; };
+extern int main() { ThreadArgs* a = nullptr; return a->ctx; }

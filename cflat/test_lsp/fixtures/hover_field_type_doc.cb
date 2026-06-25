@@ -1,0 +1,6 @@
+// $cursor line=3 col=51
+// $expect hover contains="Task - a unit of work."
+// Task - a unit of work.
+struct Task { int id = 0; };
+struct Worker { Task _token = default; };
+extern int main() { Worker w = default; return w._token.id; }

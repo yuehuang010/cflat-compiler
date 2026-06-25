@@ -2,6 +2,7 @@
 // Use init(size) to allocate; the destructor frees and calls ~T() on each element.
 // Stackable or heap-allocated: array<T> a; a.init(n);  or  array<T>* a = new array<T>;  a->init(n);
 
+// array<T> - owning fixed-size heap array; init(size) allocates, the destructor frees and ~T()s each element.
 struct array<T>
 {
     T*  _ptr = nullptr;

@@ -90,6 +90,7 @@ struct KeyEvent {
 // eventFlags values: 0=button press/release, MOUSE_MOVED=1, MOUSE_WHEELED=4.
 // buttonState bits:  MOUSE_BTN_LEFT=1, MOUSE_BTN_RIGHT=2, MOUSE_BTN_MIDDLE=4.
 
+// MouseEvent - one console mouse event (position, button state, wheel) from pollMouse()/pollEvent().
 struct MouseEvent {
     i16 x           = 0;  // column (0-based)
     i16 y           = 0;  // row    (0-based)
@@ -122,6 +123,7 @@ struct MouseEvent {
 // TODO: on non-Windows, this should switch the tty to cbreak mode via termios
 // (ICANON/ECHO off) and read one byte from stdin.
 
+// readKey - read one key press; extended keys return 0/0xE0, then the scan code on the next call.
 int readKey() {
     return os.windows._getch();
 }
@@ -499,6 +501,7 @@ void termPixel(int tr, int tg, int tb, int br, int bg, int bb) {
 // Holds a captured frame of the console screen buffer. Obtained via
 // TerminalDriver.snapshot(). Rows and columns are 1-based.
 
+// TerminalSnapshot - a captured frame of the console screen buffer (1-based rows/cols) from snapshot().
 struct TerminalSnapshot {
     os.windows._CHAR_INFO* _buf = nullptr;
     int width        = 0;
@@ -580,6 +583,7 @@ struct TerminalSnapshot {
 //   driver.snapshot(&snap);
 //   assert(snap.contains("score: 1"));
 
+// TerminalDriver - drives a child console for automated testing (input injection + screen snapshots).
 struct TerminalDriver {
     void* _hOut = nullptr;
     void* _hIn  = nullptr;

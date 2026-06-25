@@ -7,6 +7,7 @@
 //   t.item_2 = true;
 //   int n = t.size();   // 3
 
+// tuple<T...> - fixed heterogeneous aggregate; fields item_0..item_N, size() returns the element count.
 struct tuple<T...>
 {
     T item = default;

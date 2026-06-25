@@ -163,6 +163,9 @@ def run_fixture(client: LspClient, fixture_path: Path) -> str | None:
         needle = expect_kv.get("contains", "")
         if needle and needle not in value:
             return f"hover: expected {needle!r} in markdown, got: {value!r}"
+        absent = expect_kv.get("not_contains", "")
+        if absent and absent in value:
+            return f"hover: did not expect {absent!r} in markdown, got: {value!r}"
         return None
 
     if expect_kind == "definition":

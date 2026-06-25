@@ -1,0 +1,3 @@
+// $cursor line=0 col=42
+// $expect definition line=0
+extern int main() { int _ctx = 5; return _ctx; }

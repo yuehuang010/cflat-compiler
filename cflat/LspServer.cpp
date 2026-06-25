@@ -208,17 +208,45 @@ std::pair<std::string, std::string> extractReceiverAt(const std::string& text, i
         partialStart--;
     std::string partial = lineText.substr(partialStart, col - partialStart);
 
-    // Expect a '.' immediately before the partial
-    if (partialStart == 0 || lineText[partialStart - 1] != '.')
+    // Expect a '.' or '->' member-access operator immediately before the partial.
+    size_t recvEnd;
+    if (partialStart >= 1 && lineText[partialStart - 1] == '.')
+        recvEnd = partialStart - 1;
+    else if (partialStart >= 2 && lineText[partialStart - 2] == '-' && lineText[partialStart - 1] == '>')
+        recvEnd = partialStart - 2;
+    else
         return {"", ""};
 
     // Scan backward over the receiver identifier
-    size_t dotPos = partialStart - 1;
-    size_t recvEnd = dotPos;
-    size_t recvStart = dotPos;
+    size_t recvStart = recvEnd;
     while (recvStart > 0 && isWordChar(lineText[recvStart - 1]))
         recvStart--;
     if (recvStart == recvEnd) return {"", ""};
+
+    // Absorb preceding "." and "->" segments so a fully namespace-qualified
+    // receiver ("os.windows") or a member chain ("wctx->qNormal") is captured
+    // whole rather than just its last segment; the chain is split and resolved
+    // later.
+    for (;;)
+    {
+        if (recvStart >= 2 && lineText[recvStart - 1] == '.' && isWordChar(lineText[recvStart - 2]))
+        {
+            size_t segStart = recvStart - 1;
+            while (segStart > 0 && isWordChar(lineText[segStart - 1]))
+                segStart--;
+            recvStart = segStart;
+        }
+        else if (recvStart >= 3 && lineText[recvStart - 1] == '>' && lineText[recvStart - 2] == '-'
+                 && isWordChar(lineText[recvStart - 3]))
+        {
+            size_t segStart = recvStart - 2;
+            while (segStart > 0 && isWordChar(lineText[segStart - 1]))
+                segStart--;
+            recvStart = segStart;
+        }
+        else
+            break;
+    }
 
     return {lineText.substr(recvStart, recvEnd - recvStart), partial};
 }
@@ -493,15 +521,34 @@ private:
 
         std::string word = extractWordAt(text, line, character);
         auto index = GetCurrentIndex();
-        const SymbolDef* def = word.empty() ? nullptr : index->Lookup(word);
+        std::string receiver;
+        const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
 
-        if (!def) { SendResponse(id, nullptr); return; }
+        std::string value;
+        if (def)
+        {
+            value = def->signatureMarkdown;
+            for (const auto& sig : def->overloadSignatures)
+                value += "\n\n" + sig;
+            if (!def->docComment.empty())
+                value += "\n\n" + def->docComment;
+            // For a field, also show the description of the field's own type.
+            if (def->kind == SymbolKind::Field)
+                AppendTypeDoc(value, def->signatureMarkdown, index.get());
+        }
+        else if (!word.empty() && receiver.empty())
+        {
+            // Locals and parameters live in the variable table, not the symbol
+            // table, so a plain Lookup misses them. Surface their type, plus the
+            // description of that type when it is a struct/interface.
+            if (const std::string* vt = index->LookupVariableType(word); vt && !vt->empty())
+            {
+                value = *vt + " " + word;
+                AppendTypeDoc(value, *vt, index.get());
+            }
+        }
 
-        std::string value = def->signatureMarkdown;
-        for (const auto& sig : def->overloadSignatures)
-            value += "\n\n" + sig;
-        if (!def->docComment.empty())
-            value += "\n\n" + def->docComment;
+        if (value.empty()) { SendResponse(id, nullptr); return; }
 
         SendResponse(id, {
             {"contents", {
@@ -517,6 +564,120 @@ private:
     {
         size_t dunder = name.find("__");
         return dunder != std::string::npos ? name.substr(0, dunder) : name;
+    }
+
+    // Leading type-name path of a decorated type or a "Type name" signature, e.g.
+    // "Context* ctx" -> "Context", "list<int> xs" -> "list", "os.ns.T v" -> "os.ns.T".
+    // Skips any leading "[annotation] " groups that field signatures may carry.
+    static std::string BaseTypeName(const std::string& s)
+    {
+        size_t i = 0;
+        for (;;)
+        {
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+            if (i < s.size() && s[i] == '[')
+            {
+                size_t close = s.find(']', i);
+                if (close == std::string::npos) break;
+                i = close + 1;
+                continue;
+            }
+            break;
+        }
+        size_t start = i;
+        while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' || s[i] == ':'))
+            ++i;
+        return s.substr(start, i - start);
+    }
+
+    // Strip trailing pointer stars / spaces from a type name ("Foo*" -> "Foo").
+    static std::string StripPointer(std::string t)
+    {
+        while (!t.empty() && (t.back() == '*' || t.back() == ' '))
+            t.pop_back();
+        return t;
+    }
+
+    // Split a receiver chain into segments across "." and "->" separators, e.g.
+    // "wctx->qNormal" -> {"wctx","qNormal"}, "os.windows" -> {"os","windows"}.
+    static std::vector<std::string> SplitReceiverChain(const std::string& r)
+    {
+        std::vector<std::string> segs;
+        std::string cur;
+        for (size_t i = 0; i < r.size(); )
+        {
+            if (r[i] == '.') { if (!cur.empty()) { segs.push_back(cur); cur.clear(); } ++i; }
+            else if (r[i] == '-' && i + 1 < r.size() && r[i + 1] == '>')
+            { if (!cur.empty()) { segs.push_back(cur); cur.clear(); } i += 2; }
+            else { cur.push_back(r[i]); ++i; }
+        }
+        if (!cur.empty()) segs.push_back(cur);
+        return segs;
+    }
+
+    // Look up "Type.member", tolerating a pointer/qualified/generic-mangled type.
+    static const SymbolDef* LookupMember(LspSymbolIndex* index, const std::string& type, const std::string& member)
+    {
+        std::string base = StripPointer(type);
+        if (const SymbolDef* d = index->Lookup(base + "." + member)) return d;
+        size_t dot = base.rfind('.');
+        if (dot != std::string::npos)
+            if (const SymbolDef* d = index->Lookup(base.substr(dot + 1) + "." + member)) return d;
+        return index->Lookup(StripGenericSuffix(base) + "." + member);
+    }
+
+    // Resolve the symbol a cursor word refers to, honoring a "receiver."/"receiver->"
+    // qualifier (including chains like "wctx->qNormal->member") so field/method
+    // accesses resolve to "Type.member". receiverOut reports the qualifier text
+    // (empty if the word was a bare identifier).
+    const SymbolDef* ResolveQualifiedSymbol(LspSymbolIndex* index, const std::string& text,
+                                            int line, int character, const std::string& word,
+                                            std::string& receiverOut)
+    {
+        receiverOut.clear();
+        if (word.empty()) return nullptr;
+        receiverOut = extractReceiverAt(text, line, character).first;
+        if (receiverOut.empty())
+            return index->Lookup(word);
+
+        std::vector<std::string> segs = SplitReceiverChain(receiverOut);
+        if (segs.empty())
+            return index->Lookup(word);
+
+        // Member chain: the first segment is a known variable. Walk each
+        // intermediate field to its type, then resolve the final word on it.
+        if (const std::string* vt = index->LookupVariableType(segs[0]))
+        {
+            std::string curType = *vt;
+            for (size_t i = 1; i < segs.size(); ++i)
+            {
+                const SymbolDef* f = LookupMember(index, curType, segs[i]);
+                if (!f) return nullptr;
+                curType = BaseTypeName(f->signatureMarkdown);
+                if (curType.empty()) return nullptr;
+            }
+            return LookupMember(index, curType, word);
+        }
+
+        // Namespace or type path (no variable head): "Math.square", "os.windows._SystemInfo".
+        std::string joined;
+        for (size_t i = 0; i < segs.size(); ++i) { if (i) joined += '.'; joined += segs[i]; }
+        return index->Lookup(joined + "." + word);
+    }
+
+    // Append a struct/interface type's own description to a field/variable hover so
+    // hovering "ctx" also shows what its type is. No-op for primitives (no symbol).
+    void AppendTypeDoc(std::string& value, const std::string& typeSig, LspSymbolIndex* index)
+    {
+        std::string base = BaseTypeName(typeSig);
+        if (base.empty()) return;
+        const SymbolDef* td = index->Lookup(base);
+        if (!td) td = index->Lookup(StripGenericSuffix(base));
+        if (!td || (td->kind != SymbolKind::Struct && td->kind != SymbolKind::Interface))
+            return;
+        value += "\n\n---\n\n" + td->signatureMarkdown;
+        if (!td->docComment.empty())
+            value += "\n\n" + td->docComment;
     }
 
     void HandleDefinition(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
@@ -554,47 +715,12 @@ private:
 
         std::string word = extractWordAt(text, line, character);
         auto index = GetCurrentIndex();
-        const SymbolDef* def = nullptr;
 
-        // If the cursor follows "receiver.", resolve via the receiver first.
-        // Otherwise an unqualified Lookup(word) on a method name like "get" can
-        // hijack the answer with a same-named top-level function from elsewhere
-        // (e.g. string.cb's `get`).
+        // Resolve via "receiver."/"receiver->" qualifier when present, else a plain
+        // lookup. An unqualified Lookup(word) on a method name like "get" could
+        // otherwise hijack the answer with a same-named top-level function.
         std::string receiver;
-        if (!word.empty())
-        {
-            auto rp = extractReceiverAt(text, line, character);
-            receiver = rp.first;
-        }
-        if (!receiver.empty())
-        {
-            const std::string* typeName = index->LookupVariableType(receiver);
-            if (typeName)
-            {
-                // Variable receiver: try "Circle.center", then unqualified type "Circle.center".
-                def = index->Lookup(*typeName + "." + word);
-                if (!def)
-                {
-                    size_t dot = typeName->rfind('.');
-                    if (dot != std::string::npos)
-                        def = index->Lookup(typeName->substr(dot + 1) + "." + word);
-                }
-                // Generic instantiation: type is mangled (e.g. "array__Explosion").
-                // Fall back to the template name ("array") so the method on the
-                // generic template definition is discoverable.
-                if (!def)
-                    def = index->Lookup(StripGenericSuffix(*typeName) + "." + word);
-            }
-            else
-            {
-                // Namespace or type name used directly (e.g. "Math.square", "MyStruct.staticFn").
-                def = index->Lookup(receiver + "." + word);
-            }
-        }
-
-        // Plain identifier (no receiver): direct symbol lookup.
-        if (!def && receiver.empty() && !word.empty())
-            def = index->Lookup(word);
+        const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
 
         // Cursor is on a variable name. Prefer jumping to the variable's own
         // declaration site when we recorded one; otherwise fall through to

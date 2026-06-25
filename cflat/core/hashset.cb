@@ -4,6 +4,7 @@
 // The set does NOT own its elements - callers are responsible for freeing any
 // heap-allocated objects stored in the set.
 
+// hashset<T> - unordered set using open addressing with linear probing; does not own its elements.
 struct hashset<T>
 {
     T*    _keys   = nullptr;

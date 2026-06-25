@@ -1,0 +1,7 @@
+// $cursor line=4 col=33
+// $expect definition line=2
+namespace app.config
+{
+    struct AppSettings { int x = 0; };
+}
+extern int main() { app.config.AppSettings cfg = default; return cfg.x; }

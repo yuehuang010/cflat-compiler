@@ -3,6 +3,7 @@
 
 import "memory.cb";   // __active_allocator (for copy(IAllocator))
 
+// list<T> - mutable growable owning array (vector<T>-like) for any value type T.
 class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
 {
     T*  _data     = nullptr;

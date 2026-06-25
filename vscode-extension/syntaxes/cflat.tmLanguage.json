@@ -12,17 +12,20 @@
     { "include": "#keywords-control" },
     { "include": "#keywords-storage" },
     { "include": "#struct-declaration" },
+    { "include": "#where-clause" },
     { "include": "#namespace-declaration" },
     { "include": "#using-alias" },
     { "include": "#interface-declaration" },
     { "include": "#keywords-type" },
     { "include": "#keywords-qualifier" },
     { "include": "#new-expression" },
+    { "include": "#sizeof-type" },
     { "include": "#keywords-cflat-extension" },
     { "include": "#keywords-c11" },
     { "include": "#constants" },
     { "include": "#generic-type-args" },
     { "include": "#type-in-declaration" },
+    { "include": "#cast-expression" },
     { "include": "#function-definition" },
     { "include": "#function-call" },
     { "include": "#named-parameter" },
@@ -173,7 +176,7 @@
         },
         {
           "name": "storage.modifier.ownership.cflat",
-          "match": "\\b(move|bond)\\b"
+          "match": "\\b(move|bond|alias)\\b"
         },
         {
           "name": "keyword.other.operator-overload.cflat",
@@ -246,6 +249,27 @@
         }
       ]
     },
+    "where-clause": {
+      "comment": "Generic constraint clause: 'where T : IMessage, U : IFoo'. Color the keyword and treat every identifier (type params and constraint interfaces) as a type, so the clause stops at the body brace or a forward-declaration semicolon.",
+      "begin": "\\b(where)\\b",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.where.cflat" }
+      },
+      "end": "(?=\\{|;)",
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#generic-type-args" },
+        { "name": "entity.name.type.cflat", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "sizeof-type": {
+      "comment": "Type-taking operators: sizeof(Type), typeof(Type), alignof(Type), nameof(Type). Color the keyword and the leading type-name argument; the trailing '*' or ')' is left to other rules. Runs before #keywords-cflat-extension/#keywords-c11 so the whole 'sizeof(Type' span wins over the bare keyword.",
+      "match": "\\b(sizeof|typeof|alignof|_Alignof|nameof)\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_:]*(?:\\s*<[^>]*>)?)",
+      "captures": {
+        "1": { "name": "keyword.operator.expression.cflat" },
+        "2": { "name": "entity.name.type.cflat" }
+      }
+    },
     "new-expression": {
       "comment": "new TypeName - color the keyword and the type name separately",
       "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
@@ -269,12 +293,19 @@
       "name": "entity.name.type.cflat",
       "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:<[^>]*>)?\\s*\\*?\\s+[A-Za-z_][A-Za-z0-9_]*\\s*[;=,\\[\\)\\{])"
     },
-    "function-definition": {
-      "comment": "Function definition: returnType funcName(...) {",
-      "name": "meta.function.definition.cflat",
-      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*)\\s+([A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\([^;]*\\)\\s*(?:const\\s*)?(?:\\{|;))",
+    "cast-expression": {
+      "comment": "Pointer cast: (TypeName*)expr. The star immediately before ')' distinguishes a cast from a parenthesized multiplication like (a*b), so only the type name is captured.",
+      "match": "(?<=\\()\\s*([A-Za-z_][A-Za-z0-9_:]*(?:\\s*<[^>]*>)?)(?=\\s*\\*+\\s*\\))",
       "captures": {
-        "1": { "name": "storage.type.return-type.cflat" },
+        "1": { "name": "entity.name.type.cflat" }
+      }
+    },
+    "function-definition": {
+      "comment": "Function definition: returnType funcName(...) {. Primitive return types are colored earlier by #keywords-type, so this rule only reaches user-defined struct/class/generic return types - scope them as entity.name.type for the same teal color those names get elsewhere.",
+      "name": "meta.function.definition.cflat",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*(?:\\s*<[^>]*>)?\\s*\\*?)\\s+(operator\\s*[-+*/%<>=!&|^~\\[\\]]+|[A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\([^;]*\\)\\s*(?:const\\s*)?(?:\\{|;|$))",
+      "captures": {
+        "1": { "name": "entity.name.type.cflat" },
         "2": { "name": "entity.name.function.cflat" }
       }
     },

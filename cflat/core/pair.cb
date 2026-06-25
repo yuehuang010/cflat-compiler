@@ -1,5 +1,4 @@
 // Pair<T,U> - a generic pair holding two values of possibly different types.
-
 struct Pair<T, U>
 {
     T first = default;

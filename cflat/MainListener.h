@@ -463,6 +463,21 @@ static std::string ExtractLeadingDoc(antlr4::BufferedTokenStream* tokens, antlr4
         }
     }
 
+    // Drop decorative divider lines (e.g. "-----", "=====", box-drawing rules) so a
+    // description framed by dividers does not render as an oversized, contentless hover.
+    auto isSeparatorLine = [](const std::string& s) {
+        int visible = 0, sep = 0;
+        for (unsigned char c : s)
+        {
+            if (c == ' ' || c == '\t') continue;
+            ++visible;
+            if (std::isalnum(c)) return false;  // any real text -> keep the line
+            if (c == '-' || c == '=' || c == '_' || c == '~' || c == '*' || c == '#' || c >= 0x80) ++sep;
+        }
+        return visible >= 3 && sep >= 3;
+    };
+    std::erase_if(outLines, [&](const std::string& ln) { return isSeparatorLine(ln); });
+
     while (!outLines.empty() && outLines.front().empty()) outLines.erase(outLines.begin());
     while (!outLines.empty() && outLines.back().empty()) outLines.pop_back();
     if (outLines.empty()) return "";
