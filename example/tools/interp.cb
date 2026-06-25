@@ -1,4 +1,4 @@
-// main.cb - a tiny expression/scripting interpreter.
+// interp.cb - a tiny expression/scripting interpreter.
 //
 // Pipeline:  source text -> Lexer (tokens) -> Parser (AST) -> Evaluator (tree walk).
 //
@@ -19,10 +19,10 @@
 //   operators: + - * /  ( )  and  == != < <= > >=
 //
 // Build:
-//   x64/Debug/cflat.exe example/customer/interpreter/main.cb -o example/customer/interpreter/app.exe
+//   x64/Debug/cflat.exe example/tools/interp.cb -o out/interp.exe
 // Run:
-//   example\customer\interpreter\app.exe                 (runs the embedded demo)
-//   example\customer\interpreter\app.exe demo.script     (runs a script file)
+//   out\interp.exe                            (runs the embedded demo)
+//   out\interp.exe example/tools/demo.script  (runs a script file)
 
 import "list.cb";
 import "dictionary.cb";

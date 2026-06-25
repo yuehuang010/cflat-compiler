@@ -1,4 +1,4 @@
-// weather-cli/main.cb - fetch current weather over WinRT HTTP and print it.
+// weather_cli_demo.cb - fetch current weather over WinRT HTTP and print it.
 //
 // Uses Windows.Web.Http.HttpClient (WinRT, async) to GET a JSON forecast from
 // wttr.in (no API key needed), then parses it with CFlat's json.cb.
@@ -8,8 +8,8 @@
 // (HttpClient over https returns 0x80072F8F WININET_E_SECURE_FAILURE). On a host
 // with a correct clock, switch the URL back to https and it works unchanged.
 //
-// Build: x64/Release/cflat.exe example/customer/weather-cli/main.cb -o example/customer/weather-cli/weather.exe
-// Run:   example/customer/weather-cli/weather.exe
+// Build: x64/Release/cflat.exe example/COM/weather_cli_demo.cb -o out/weather_cli_demo.exe
+// Run:   out\weather_cli_demo.exe
 
 import "winrt.cb";              // winrtInit / hstring / activationFactory / awaitAsync + Foundation.winmd
 import "Windows.Web.winmd";     // IHttpClient

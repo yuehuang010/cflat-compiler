@@ -1,4 +1,4 @@
-// main.cb - A config-driven tool demonstrating a full JSON round-trip.
+// json_config.cb - A config-driven tool demonstrating a full JSON round-trip.
 //
 // Reads an application config from disk (config.json), deserializes it into a
 // struct with `JsonBuilder.fromJson<T>`, drives some work from the values
@@ -6,9 +6,9 @@
 // modification, then serializes the result back out with `JsonBuilder.toJson<T>`
 // and writes it to config.out.json.
 //
-// Build & run:
-//   x64/Debug/cflat.exe example/customer/json-config/main.cb -o example/customer/json-config/app.exe
-//   cd example/customer/json-config && ..\..\..\x64\Debug\cflat.exe ... (see README at bottom)
+// Build & run (from the repository root):
+//   x64/Debug/cflat.exe example/tools/json_config.cb -o out/json_config.exe
+//   out\json_config.exe
 //
 // Exercises JSON serialization for:
 //   - scalar fields: string, int, float, bool
@@ -86,8 +86,8 @@ int validate(AppConfig* c)
 
 extern int main()
 {
-    string inPath  = "example/customer/json-config/config.json";
-    string outPath = "example/customer/json-config/config.out.json";
+    string inPath  = "example/tools/config.json";
+    string outPath = "example/tools/config.out.json";
 
     if (!File.exists(inPath)) {
         printf("ERROR: input config not found: %s\n", inPath.data());

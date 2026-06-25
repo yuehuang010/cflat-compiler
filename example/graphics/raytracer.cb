@@ -1,13 +1,13 @@
-// main.cb - a small recursive CPU raytracer.
+// raytracer.cb - a small recursive CPU raytracer.
 //
 // Renders several spheres on a checkered ground plane to a BMP file using
 // operator-overloaded vec3 math, a diffuse+ambient shading model, and one
 // or more bounces of mirror reflection.
 //
 // Build:
-//   x64/Debug/cflat.exe example/customer/raytracer/main.cb -o example/customer/raytracer/app.exe
+//   x64/Debug/cflat.exe example/graphics/raytracer.cb -o out/raytracer.exe
 // Run:
-//   example\customer\raytracer\app.exe          -> writes render.bmp (400x300)
+//   out\raytracer.exe          -> writes render.bmp (400x300) to the current directory
 
 import "graphic/bitmap.cb";
 import "math.cb";

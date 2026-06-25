@@ -1,10 +1,10 @@
-// main.cb - a small Huffman compression tool.
+// huffman.cb - a small Huffman compression tool.
 //
 // Build:
-//   x64/Debug/cflat.exe example/customer/compress/main.cb -o example/customer/compress/huff.exe
+//   x64/Debug/cflat.exe example/tools/huffman.cb -o out/huffman.exe
 // Run:
-//   huff compress   <input> <output>
-//   huff decompress <input> <output>
+//   out\huffman.exe compress   <input> <output>
+//   out\huffman.exe decompress <input> <output>
 //
 // File format (all multi-byte integers little-endian):
 //   magic     : 4 bytes  "HUF1"
