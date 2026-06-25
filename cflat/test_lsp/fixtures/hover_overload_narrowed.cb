@@ -1,0 +1,5 @@
+// $cursor line=2 col=28
+// $expect hover contains="int area(int w, int h)" not_contains="int area(int s)"
+int area(int s) { return s * s; }
+int area(int w, int h) { return w * h; }
+extern int main() { return area(3, 4); }

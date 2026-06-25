@@ -1,5 +1,5 @@
 // $cursor line=2 col=25
-// $expect hover contains="int _ctx"
+// $expect hover contains="int ThreadPool._ctx"
 class ThreadPool {
     int _ctx = 0;
     int read() { return _ctx; }

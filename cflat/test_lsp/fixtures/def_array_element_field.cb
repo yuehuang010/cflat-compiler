@@ -1,0 +1,6 @@
+// $cursor line=3 col=47
+// $expect definition line=1
+struct vec3 { double x = 0.0; double y = 0.0; double z = 0.0; };
+struct Sphere { vec3 center = default; double radius = 0.0; };
+Sphere[4] g_spheres = {};
+extern int main() { return (int)g_spheres[0].center.x; }

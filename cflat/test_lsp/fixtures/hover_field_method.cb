@@ -1,0 +1,11 @@
+// $cursor line=6 col=27
+// $expect hover contains="int Counter.bump"
+class Counter {
+    int _n = 0;
+    int bump() { return _n; }
+};
+class App {
+    Counter _c;
+    int run() { return _c.bump(); }
+};
+extern int main() { return 0; }

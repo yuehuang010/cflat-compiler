@@ -217,36 +217,41 @@ std::pair<std::string, std::string> extractReceiverAt(const std::string& text, i
     else
         return {"", ""};
 
-    // Scan backward over the receiver identifier
+    // Scan backward over the receiver: a chain of identifier/subscript atoms joined
+    // by '.' or '->' (e.g. "g_spheres[0]", "wctx->qNormal", "os.windows"). A trailing
+    // "[...]" subscript on an atom is absorbed so element accesses resolve.
     size_t recvStart = recvEnd;
-    while (recvStart > 0 && isWordChar(lineText[recvStart - 1]))
-        recvStart--;
-    if (recvStart == recvEnd) return {"", ""};
-
-    // Absorb preceding "." and "->" segments so a fully namespace-qualified
-    // receiver ("os.windows") or a member chain ("wctx->qNormal") is captured
-    // whole rather than just its last segment; the chain is split and resolved
-    // later.
     for (;;)
     {
-        if (recvStart >= 2 && lineText[recvStart - 1] == '.' && isWordChar(lineText[recvStart - 2]))
+        size_t p = recvStart;
+        // Absorb trailing balanced "[...]" subscripts on this atom.
+        while (p > 0 && lineText[p - 1] == ']')
         {
-            size_t segStart = recvStart - 1;
-            while (segStart > 0 && isWordChar(lineText[segStart - 1]))
-                segStart--;
-            recvStart = segStart;
+            int depth = 0;
+            do {
+                --p;
+                if (lineText[p] == ']') ++depth;
+                else if (lineText[p] == '[') --depth;
+            } while (p > 0 && depth > 0);
+            if (depth != 0) return {"", ""};
         }
-        else if (recvStart >= 3 && lineText[recvStart - 1] == '>' && lineText[recvStart - 2] == '-'
-                 && isWordChar(lineText[recvStart - 3]))
-        {
-            size_t segStart = recvStart - 2;
-            while (segStart > 0 && isWordChar(lineText[segStart - 1]))
-                segStart--;
-            recvStart = segStart;
-        }
-        else
-            break;
+        // Absorb the atom's identifier.
+        size_t w = p;
+        while (w > 0 && isWordChar(lineText[w - 1])) --w;
+        if (w == p) break;            // no identifier -> stop
+        recvStart = w;
+        // Continue to a preceding atom across a '.' or '->' separator, but only if a
+        // plausible atom (identifier or subscript close) precedes the separator.
+        size_t sepEnd;
+        if (recvStart >= 1 && lineText[recvStart - 1] == '.') sepEnd = recvStart - 1;
+        else if (recvStart >= 2 && lineText[recvStart - 1] == '>' && lineText[recvStart - 2] == '-') sepEnd = recvStart - 2;
+        else break;
+        if (sepEnd == 0) break;
+        char pc = lineText[sepEnd - 1];
+        if (pc != ']' && !isWordChar(pc)) break;
+        recvStart = sepEnd;
     }
+    if (recvStart == recvEnd) return {"", ""};
 
     return {lineText.substr(recvStart, recvEnd - recvStart), partial};
 }
@@ -580,6 +585,75 @@ private:
         }
     }
 
+    // Wrap a signature in a cflat fenced code block so VS Code colorizes it with
+    // the extension's TextMate grammar (and so '*'/'_' in the signature are not
+    // eaten by markdown emphasis). Doc-comment prose stays outside the fence.
+    static std::string CodeFence(const std::string& sig)
+    {
+        return "```cflat\n" + sig + "\n```";
+    }
+
+    // Count top-level, comma-separated items from an opening bracket at index 'open'
+    // to its matching close. Returns 0 for an empty pair, -1 if unbalanced. Skips
+    // string/char literals and tracks () [] {} (and, when wantAngles, <>) nesting.
+    static int CountItemsFromOpen(const std::string& s, size_t open, bool wantAngles)
+    {
+        int depth = 0, count = 0;
+        bool sawItem = false;
+        for (size_t i = open; i < s.size(); ++i)
+        {
+            char c = s[i];
+            if (c == '"' || c == '\'')
+            {
+                char q = c;
+                for (++i; i < s.size() && s[i] != q; ++i)
+                    if (s[i] == '\\') ++i;
+                sawItem = true;
+                continue;
+            }
+            if (c == '(' || c == '[' || c == '{' || (wantAngles && c == '<'))
+            { ++depth; if (depth > 1) sawItem = true; continue; }
+            if (c == ')' || c == ']' || c == '}' || (wantAngles && c == '>'))
+            {
+                --depth;
+                if (depth == 0 && (c == ')' || c == ']' || c == '}'))
+                    return (count == 0 && !sawItem) ? 0 : count + 1;
+                continue;
+            }
+            if (depth == 1)
+            {
+                if (c == ',') { ++count; continue; }
+                if (!std::isspace((unsigned char)c)) sawItem = true;
+            }
+        }
+        return -1;
+    }
+
+    // Number of arguments in the call immediately following the word at the cursor,
+    // or -1 if the cursor word is not followed by a '(' call.
+    static int CountCallArgsAtCursor(const std::string& text, int line, int character)
+    {
+        size_t off = 0;
+        for (int cur = 0; cur < line && off < text.size(); ++off)
+            if (text[off] == '\n') ++cur;
+        off += (size_t)(character < 0 ? 0 : character);
+        if (off > text.size()) off = text.size();
+        while (off < text.size() && isWordChar(text[off])) ++off;
+        while (off < text.size() && (text[off] == ' ' || text[off] == '\t')) ++off;
+        if (off >= text.size() || text[off] != '(') return -1;
+        return CountItemsFromOpen(text, off, /*wantAngles=*/false);
+    }
+
+    // Number of parameters declared in a signature like "ret name(T a, U b)".
+    // Angle brackets are tracked so commas inside generics (e.g. dictionary<K, V>)
+    // are not counted as separators. Returns -1 if the signature has no '('.
+    static int SigParamCount(const std::string& sig)
+    {
+        size_t open = sig.find('(');
+        if (open == std::string::npos) return -1;
+        return CountItemsFromOpen(sig, open, /*wantAngles=*/true);
+    }
+
     void HandleHover(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
         const auto* params = GetParams(msg);
@@ -609,7 +683,7 @@ private:
             // Lookup misses them; surface their type plus that type's description.
             if (const std::string* vt = index->LookupVariableType(word); vt && !vt->empty())
             {
-                value = *vt + " " + word;
+                value = CodeFence(*vt + " " + word);
                 AppendTypeDoc(value, *vt, index.get());
             }
             else
@@ -621,10 +695,34 @@ private:
 
         if (def)
         {
-            value = def->signatureMarkdown;
-            for (const auto& sig : def->overloadSignatures)
-                value += "\n\n" + sig;
-            if (!def->docComment.empty())
+            std::vector<std::string> cands;
+            cands.push_back(def->signatureMarkdown);
+            for (const auto& s : def->overloadSignatures)
+                cands.push_back(s);
+
+            // For an overloaded call, narrow to the single overload whose parameter
+            // count matches the call's argument count. Only narrow on an unambiguous
+            // single match - otherwise show the full set so the real target is never
+            // hidden (default parameters and varargs are not reflected in the count).
+            bool narrowed = false;
+            if (def->kind == SymbolKind::Function && cands.size() > 1)
+            {
+                int argc = CountCallArgsAtCursor(text, line, character);
+                if (argc >= 0)
+                {
+                    std::vector<std::string> matched;
+                    for (const auto& c : cands)
+                        if (SigParamCount(c) == argc) matched.push_back(c);
+                    if (matched.size() == 1) { cands = std::move(matched); narrowed = true; }
+                }
+            }
+
+            std::string sig;
+            for (size_t i = 0; i < cands.size(); ++i) { if (i) sig += "\n"; sig += cands[i]; }
+            value = CodeFence(sig);
+            // The overload set carries no per-overload doc, so only show the doc when
+            // not narrowed to a non-primary overload.
+            if (!def->docComment.empty() && (!narrowed || cands[0] == def->signatureMarkdown))
                 value += "\n\n" + def->docComment;
             // For a field, also show the description of the field's own type.
             if (def->kind == SymbolKind::Field)
@@ -681,6 +779,33 @@ private:
         return t;
     }
 
+    // Element type of an indexed container/array/pointer type:
+    //   "array__Sphere" -> "Sphere", "Sphere[10]"/"Sphere[]" -> "Sphere",
+    //   "Sphere*" -> "Sphere". A fixed array stores its element type directly, so a
+    // plain "Sphere" (no container wrapper) is returned unchanged.
+    static std::string ElementType(const std::string& type)
+    {
+        std::string t = type;
+        if (size_t br = t.find('['); br != std::string::npos)
+            t = t.substr(0, br);
+        while (!t.empty() && t.back() == ' ') t.pop_back();
+        if (!t.empty() && t.back() == '*') return StripPointer(t);
+        if (size_t u = t.find("__"); u != std::string::npos && u > 0)
+            return t.substr(u + 2);
+        return t;
+    }
+
+    // Split a receiver segment into its base name and the number of "[...]" subscript
+    // groups, e.g. "g_spheres[0]" -> {"g_spheres", 1}, "m[a][b]" -> {"m", 2}.
+    static std::pair<std::string, int> SplitSubscript(const std::string& seg)
+    {
+        size_t b = seg.find('[');
+        if (b == std::string::npos) return {seg, 0};
+        int groups = 0;
+        for (char c : seg) if (c == '[') ++groups;
+        return {seg.substr(0, b), groups};
+    }
+
     // Split a receiver chain into segments across "." and "->" separators, e.g.
     // "wctx->qNormal" -> {"wctx","qNormal"}, "os.windows" -> {"os","windows"}.
     static std::vector<std::string> SplitReceiverChain(const std::string& r)
@@ -727,17 +852,35 @@ private:
         if (segs.empty())
             return index->Lookup(word);
 
-        // Member chain: the first segment is a known variable. Walk each
-        // intermediate field to its type, then resolve the final word on it.
-        if (const std::string* vt = index->LookupVariableType(segs[0]))
+        // Member chain: resolve the head segment's type. It is either a local/param
+        // variable, or a field of the enclosing type reached via implicit 'this'
+        // (e.g. '_lock.sleep_cv()' where _lock is a class field). A "[...]" subscript
+        // on a segment (e.g. 'g_spheres[0].center') steps to the element type. Then
+        // walk each intermediate field to its type and resolve the final word on it.
+        auto [head, headSubs] = SplitSubscript(segs[0]);
+        std::string curType;
+        if (const std::string* vt = index->LookupVariableType(head))
         {
-            std::string curType = *vt;
+            curType = *vt;
+        }
+        else
+        {
+            std::string encl = findEnclosingTypeName(text, line, character);
+            if (!encl.empty())
+                if (const SymbolDef* h = LookupMember(index, encl, head))
+                    curType = BaseTypeName(h->signatureMarkdown);
+        }
+        if (!curType.empty())
+        {
+            for (int k = 0; k < headSubs; ++k) curType = ElementType(curType);
             for (size_t i = 1; i < segs.size(); ++i)
             {
-                const SymbolDef* f = LookupMember(index, curType, segs[i]);
+                auto [seg, subs] = SplitSubscript(segs[i]);
+                const SymbolDef* f = LookupMember(index, curType, seg);
                 if (!f) return nullptr;
                 curType = BaseTypeName(f->signatureMarkdown);
                 if (curType.empty()) return nullptr;
+                for (int k = 0; k < subs; ++k) curType = ElementType(curType);
             }
             return LookupMember(index, curType, word);
         }
@@ -795,7 +938,7 @@ private:
         if (!td) td = index->Lookup(StripGenericSuffix(base));
         if (!td || (td->kind != SymbolKind::Struct && td->kind != SymbolKind::Interface))
             return;
-        value += "\n\n---\n\n" + td->signatureMarkdown;
+        value += "\n\n---\n\n" + CodeFence(td->signatureMarkdown);
         if (!td->docComment.empty())
             value += "\n\n" + td->docComment;
     }

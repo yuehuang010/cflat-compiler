@@ -1100,6 +1100,7 @@ private:
         TypeAndValue ret;
         std::vector<TypeAndValue> params;
         bool variadic = false;
+        std::string file;  // declaring header (presumed loc), for go-to-definition
         int line = 1;
         int col = 0;
     };
@@ -3446,7 +3447,10 @@ private:
                     if (!p.VariableName.empty()) sig += " " + p.VariableName;
                 }
                 sig += ")";
-                s->Register(SymbolKind::Function, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col, sig);
+                // Prefer the declaration's own header (presumed loc) so go-to-definition
+                // lands on the real prototype, not the umbrella header that was imported.
+                const std::string& declFile = e.file.empty() ? fileForLsp : e.file;
+                s->Register(SymbolKind::Function, e.name, declFile, e.line, e.col < 0 ? 0 : e.col, sig);
             }
         }
 
@@ -3483,6 +3487,7 @@ private:
         e = CSigEntry();
         e.name     = r.name;
         e.variadic = r.variadic;
+        e.file     = r.file;
         e.line     = r.line ? r.line : 1;
         e.col      = r.col < 0 ? 0 : r.col;
         if (!MapCTypeToTypeAndValue(r.retType, e.ret))
@@ -13189,8 +13194,10 @@ public:
     {
         nlohmann::json ps = nlohmann::json::array();
         for (const auto& p : e.params) ps.push_back(TvToJson(p));
-        return {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
-                {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
+        nlohmann::json j = {{"n", e.name}, {"r", TvToJson(e.ret)}, {"ps", ps},
+                            {"va", e.variadic}, {"ln", e.line}, {"co", e.col}};
+        if (!e.file.empty()) j["f"] = e.file;
+        return j;
     }
     static CSigEntry SigFromJson(const SjVal& j)
     {
@@ -13198,6 +13205,7 @@ public:
         e.name     = j.value("n",  std::string{});
         e.ret      = TvFromJson(j.at("r"));
         e.variadic = j.value("va", false);
+        e.file     = j.value("f",  std::string{});
         e.line     = j.value("ln", 1);
         e.col      = j.value("co", 0);
         if (j.contains("ps")) for (const auto& p : j["ps"]) e.params.push_back(TvFromJson(p));
@@ -13373,7 +13381,9 @@ public:
         // v7 extends that synthesis to an *array* of an unnamed record element
         // (RETRIEVAL_POINTERS_BUFFER.Extents[1]); a v6 entry would still have dropped that
         // field and left the enclosing record an incomplete shell.
-        if (version != 7) return false;
+        // v8 records each C function's own declaring header (CSigEntry.file) so
+        // go-to-definition lands on the real prototype, not the imported umbrella header.
+        if (version != 8) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -13435,7 +13445,7 @@ public:
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 7;
+        j["version"] = 8;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

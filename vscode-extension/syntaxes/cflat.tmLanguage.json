@@ -144,7 +144,7 @@
       "patterns": [
         {
           "name": "storage.type.primitive.cflat",
-          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string)\\b"
+          "match": "\\b(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string|simd)\\b"
         },
         {
           "name": "storage.type.struct.cflat",
@@ -274,7 +274,7 @@
       "patterns": [
         {
           "comment": "new <primitive> (e.g. new double[n]) - keep the primitive's own color, not the user-type color.",
-          "match": "\\b(new)\\s+(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string)\\b",
+          "match": "\\b(new)\\s+(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string|simd)\\b",
           "captures": {
             "1": { "name": "keyword.operator.expression.cflat" },
             "2": { "name": "storage.type.primitive.cflat" }
@@ -301,9 +301,9 @@
       ]
     },
     "type-in-declaration": {
-      "comment": "User-defined type name in variable/parameter declaration: 'TypeName varName;' or 'TypeName* varName ='",
+      "comment": "User-defined type name in variable/parameter declaration: 'TypeName varName;' or 'TypeName* varName ='. The '$' terminator also colors a bare 'TypeName varName' signature line (e.g. in an LSP hover fenced block), which real source never ends a declaration on. The '.' in the name allows a qualified member signature like 'vec3 Sphere.center'.",
       "name": "entity.name.type.cflat",
-      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:<[^>]*>)?\\s*\\*?\\s+[A-Za-z_][A-Za-z0-9_]*\\s*[;=,\\[\\)\\{])"
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*(?:<[^>]*>)?\\s*\\*?\\s+[A-Za-z_][A-Za-z0-9_.]*\\s*(?:[;=,\\[\\)\\{]|$))"
     },
     "cast-expression": {
       "comment": "Pointer cast: (TypeName*)expr. The star immediately before ')' distinguishes a cast from a parenthesized multiplication like (a*b), so only the type name is captured.",
@@ -313,9 +313,9 @@
       }
     },
     "function-definition": {
-      "comment": "Function definition: returnType funcName(...) {. Primitive return types are colored earlier by #keywords-type, so this rule only reaches user-defined struct/class/generic return types - scope them as entity.name.type for the same teal color those names get elsewhere.",
+      "comment": "Function definition: returnType funcName(...) {. Primitive return types are colored earlier by #keywords-type, so this rule only reaches user-defined struct/class/generic return types - scope them as entity.name.type for the same teal color those names get elsewhere. The '.' in the name group also matches a qualified member signature like 'vec3 vec3.refract(...)' shown in an LSP hover.",
       "name": "meta.function.definition.cflat",
-      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*(?:\\s*<[^>]*>)?\\s*\\*?)\\s+(operator\\s*[-+*/%<>=!&|^~\\[\\]]+|[A-Za-z_][A-Za-z0-9_:]*)\\s*(?=\\([^;]*\\)\\s*(?:const\\s*)?(?:\\{|;|$))",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_:]*(?:\\s*<[^>]*>)?\\s*\\*?)\\s+(operator\\s*[-+*/%<>=!&|^~\\[\\]]+|[A-Za-z_][A-Za-z0-9_:.]*)\\s*(?=\\([^;]*\\)\\s*(?:const\\s*)?(?:\\{|;|$))",
       "captures": {
         "1": { "name": "entity.name.type.cflat" },
         "2": { "name": "entity.name.function.cflat" }

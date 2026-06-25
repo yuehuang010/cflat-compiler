@@ -851,7 +851,10 @@ private:
 
         if (auto* s = compiler->GetSymbolSink())
         {
-            std::string sig = returnType.TypeName + (returnType.Pointer ? "*" : "") + " " + name + "(";
+            // Qualify member methods with their owning type ("double vec3.dot(...)"),
+            // mirroring how namespace functions already carry their namespace in `name`.
+            std::string displayName = structName.empty() ? name : structName + "." + rawFuncName;
+            std::string sig = returnType.TypeName + (returnType.Pointer ? "*" : "") + " " + displayName + "(";
             bool first = true;
             for (const auto& p : params)
             {
@@ -16382,7 +16385,7 @@ public:
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + field.VariableName);
+                            annSig + typeSig + " " + structName + "." + field.VariableName);
             }
         }
 
@@ -18191,7 +18194,7 @@ public:
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + field.VariableName);
+                            annSig + typeSig + " " + name + "." + field.VariableName);
             }
         }
 
@@ -18581,7 +18584,7 @@ public:
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + field.VariableName);
+                            annSig + typeSig + " " + structName + "." + field.VariableName);
             }
         }
 
