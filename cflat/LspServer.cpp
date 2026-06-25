@@ -251,6 +251,83 @@ std::pair<std::string, std::string> extractReceiverAt(const std::string& text, i
     return {lineText.substr(recvStart, recvEnd - recvStart), partial};
 }
 
+// Name of the struct/class/interface whose body encloses the cursor, or "" if the
+// cursor is not inside a type body. Used to resolve bare member references made via
+// implicit 'this' inside a method. Brace-tracks the text up to the cursor, skipping
+// comments and string/char literals so braces inside them do not corrupt the stack.
+inline std::string findEnclosingTypeName(const std::string& text, int line, int character)
+{
+    size_t offset = 0;
+    int curLine = 0;
+    while (curLine < line && offset < text.size())
+    {
+        if (text[offset] == '\n') ++curLine;
+        ++offset;
+    }
+    offset += static_cast<size_t>(character);
+    if (offset > text.size()) offset = text.size();
+
+    std::vector<std::string> stack;   // type name (or "") for each open brace
+    std::string pending;              // candidate name awaiting its '{'
+    std::string word;
+    bool expectName = false;          // saw struct/class/interface; next word is the name
+    auto flushWord = [&]() {
+        if (word.empty()) return;
+        if (word == "struct" || word == "class" || word == "interface")
+        {
+            expectName = true;
+            pending.clear();
+        }
+        else if (expectName)
+        {
+            pending = word;
+            expectName = false;
+        }
+        word.clear();
+    };
+
+    for (size_t i = 0; i < offset; ++i)
+    {
+        char c = text[i];
+        if (c == '/' && i + 1 < offset && text[i + 1] == '/')
+        {
+            flushWord();
+            while (i < offset && text[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < offset && text[i + 1] == '*')
+        {
+            flushWord();
+            i += 2;
+            while (i + 1 < offset && !(text[i] == '*' && text[i + 1] == '/')) ++i;
+            ++i;
+            continue;
+        }
+        if (c == '"' || c == '\'')
+        {
+            flushWord();
+            char quote = c;
+            ++i;
+            while (i < offset && text[i] != quote)
+            {
+                if (text[i] == '\\') ++i;
+                ++i;
+            }
+            continue;
+        }
+        if (isWordChar(c)) { word.push_back(c); continue; }
+
+        flushWord();
+        if (c == '{') { stack.push_back(pending); pending.clear(); expectName = false; }
+        else if (c == '}') { if (!stack.empty()) stack.pop_back(); pending.clear(); }
+        else if (c == ';') { pending.clear(); expectName = false; }
+    }
+
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+        if (!it->empty()) return *it;
+    return "";
+}
+
 struct OpenDocument
 {
     std::string uri;
@@ -525,6 +602,23 @@ private:
         const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character, word, receiver);
 
         std::string value;
+        if (!def && !word.empty() && receiver.empty())
+        {
+            // A local/parameter takes precedence over an implicit-this field.
+            // Locals live in the variable table, not the symbol table, so a plain
+            // Lookup misses them; surface their type plus that type's description.
+            if (const std::string* vt = index->LookupVariableType(word); vt && !vt->empty())
+            {
+                value = *vt + " " + word;
+                AppendTypeDoc(value, *vt, index.get());
+            }
+            else
+            {
+                // Bare member reference via implicit 'this' inside a method.
+                def = ResolveImplicitThisMember(index.get(), text, line, character, word);
+            }
+        }
+
         if (def)
         {
             value = def->signatureMarkdown;
@@ -535,17 +629,6 @@ private:
             // For a field, also show the description of the field's own type.
             if (def->kind == SymbolKind::Field)
                 AppendTypeDoc(value, def->signatureMarkdown, index.get());
-        }
-        else if (!word.empty() && receiver.empty())
-        {
-            // Locals and parameters live in the variable table, not the symbol
-            // table, so a plain Lookup misses them. Surface their type, plus the
-            // description of that type when it is a struct/interface.
-            if (const std::string* vt = index->LookupVariableType(word); vt && !vt->empty())
-            {
-                value = *vt + " " + word;
-                AppendTypeDoc(value, *vt, index.get());
-            }
         }
 
         if (value.empty()) { SendResponse(id, nullptr); return; }
@@ -665,6 +748,43 @@ private:
         return index->Lookup(joined + "." + word);
     }
 
+    // Resolve a bare word as a member accessed via implicit 'this' inside a method,
+    // by resolving it against the struct/class whose body encloses the cursor.
+    const SymbolDef* ResolveImplicitThisMember(LspSymbolIndex* index, const std::string& text,
+                                               int line, int character, const std::string& word)
+    {
+        if (word.empty()) return nullptr;
+        std::string encl = findEnclosingTypeName(text, line, character);
+        if (encl.empty()) return nullptr;
+        return LookupMember(index, encl, word);
+    }
+
+    // True if the word at the cursor is the name being declared (preceded by a type),
+    // e.g. the 'inner' in "InnerStruct inner;". Such a site is itself a definition, so
+    // go-to-definition should not resolve it as a member use.
+    bool isDeclarationContext(const std::string& text, int line, int character, LspSymbolIndex* index)
+    {
+        std::string lineText = getLineText(text, line);
+        size_t col = static_cast<size_t>(character) < lineText.size() ? (size_t)character : lineText.size();
+        size_t ws = col;
+        while (ws > 0 && isWordChar(lineText[ws - 1])) --ws;
+        size_t e = ws;
+        while (e > 0 && (lineText[e - 1] == ' ' || lineText[e - 1] == '\t')) --e;
+        size_t p = e;
+        while (p > 0 && isWordChar(lineText[p - 1])) --p;
+        if (p == e) return false;
+        std::string prev = lineText.substr(p, e - p);
+        static const char* const prims[] = {
+            "void", "char", "short", "int", "long", "float", "double", "bool", "_Bool", "string",
+            "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "signed", "unsigned"
+        };
+        for (const char* t : prims)
+            if (prev == t) return true;
+        const SymbolDef* d = index->Lookup(prev);
+        return d && (d->kind == SymbolKind::Struct || d->kind == SymbolKind::Interface
+                     || d->kind == SymbolKind::TypeAlias);
+    }
+
     // Append a struct/interface type's own description to a field/variable hover so
     // hovering "ctx" also shows what its type is. No-op for primitives (no symbol).
     void AppendTypeDoc(std::string& value, const std::string& typeSig, LspSymbolIndex* index)
@@ -751,6 +871,12 @@ private:
                 }
             }
         }
+
+        // Bare member reference via implicit 'this' inside a method. Skip declaration
+        // sites ("Type name;") - the cursor is already at a definition there.
+        if (!def && receiver.empty() && !word.empty()
+            && !isDeclarationContext(text, line, character, index.get()))
+            def = ResolveImplicitThisMember(index.get(), text, line, character, word);
 
         if (!def) { SendResponse(id, nullptr); return; }
 

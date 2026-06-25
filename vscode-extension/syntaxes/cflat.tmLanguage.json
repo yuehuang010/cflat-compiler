@@ -271,12 +271,24 @@
       }
     },
     "new-expression": {
-      "comment": "new TypeName - color the keyword and the type name separately",
-      "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
-      "captures": {
-        "1": { "name": "keyword.operator.expression.cflat" },
-        "2": { "name": "entity.name.type.cflat" }
-      }
+      "patterns": [
+        {
+          "comment": "new <primitive> (e.g. new double[n]) - keep the primitive's own color, not the user-type color.",
+          "match": "\\b(new)\\s+(void|char|short|int|long|float|double|bool|_Bool|_Complex|_Imaginary|signed|unsigned|__int8|__int16|__int32|__int64|i8|i16|i32|i64|u8|u16|u32|u64|string)\\b",
+          "captures": {
+            "1": { "name": "keyword.operator.expression.cflat" },
+            "2": { "name": "storage.type.primitive.cflat" }
+          }
+        },
+        {
+          "comment": "new TypeName - color the keyword and the user type name separately",
+          "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.operator.expression.cflat" },
+            "2": { "name": "entity.name.type.cflat" }
+          }
+        }
+      ]
     },
     "generic-type-args": {
       "comment": "Type names inside generic angle brackets, e.g. array<Explosion>, list<Foo*>, dictionary<string, int>. The lookbehind requires an identifier immediately before '<' and the lookahead requires the content to look like a type-arg list, which avoids matching arithmetic comparisons.",
